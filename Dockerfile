@@ -55,9 +55,9 @@ RUN apt-get update && apt-get upgrade -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# Download and install patched Chrome for Testing (142.0.7444.137) - fixes CVE-2025-12429/12438/12432/12726/12428/12727/12430/12437
+# Download and install patched Chrome for Testing (142.0.7444.175) - fixes CVE-2025-13223/13224/13042 and earlier CVEs
 RUN apt-get update && apt-get install -y wget unzip \
-    && wget -q https://storage.googleapis.com/chrome-for-testing-public/142.0.7444.137/linux64/chrome-linux64.zip \
+    && wget -q https://storage.googleapis.com/chrome-for-testing-public/142.0.7444.175/linux64/chrome-linux64.zip \
     && unzip chrome-linux64.zip \
     && mv chrome-linux64 /opt/chrome \
     && rm chrome-linux64.zip \
