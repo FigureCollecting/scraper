@@ -209,7 +209,7 @@ The scraper includes comprehensive test coverage with enhanced testing infrastru
 
 - **Total Test Suites**: 10 test suites
 - **Total Tests**: 215 passing tests
-- **Code Coverage**: 80%+ (SonarCloud quality gate achieved)
+- **Code Coverage**: 80%+ (Codecov quality gate)
 - **Testing Framework**: Jest + TypeScript + Supertest
 - **Mocking Strategy**: Complete Puppeteer API mocking
 - **Containerized Testing**: Docker-based test execution with coverage extraction
@@ -424,7 +424,7 @@ module.exports = {
 - Improved healthcheck security (no shell substitution)
 
 **Test Coverage Improvements:**
-- Achieved 80%+ code coverage (SonarCloud quality gate)
+- Achieved 80%+ code coverage (Codecov quality gate)
 - Added comprehensive test suites for all routes
 - Enhanced security testing for protected endpoints
 - Improved mock implementations for async operations
