@@ -1,0 +1,18 @@
+# Grype vulnerability scanner configuration
+# https://github.com/anchore/grype#specifying-matches-to-ignore
+
+ignore:
+  # GHSA-5j98-mcp5-4vw2: glob CLI command injection
+  # This vulnerability only affects the glob CLI (-c/--cmd option), not the library API.
+  # TypeScript declares "glob": "^10.4.5" as a dependency but never actually installs it
+  # because it's optional. The glob package is not present in typescript/node_modules.
+  # npm ls typescript shows no glob dependency in the tree.
+  # This is a grype false positive - flagging a declared but uninstalled dependency.
+  - vulnerability: GHSA-5j98-mcp5-4vw2
+    package:
+      name: glob
+      type: npm
+    reason: |
+      False positive: TypeScript declares glob as a dependency but doesn't install it.
+      The vulnerability is CLI-only and glob CLI is not used in this application.
+      Verified: no glob binary in node_modules, npm ls shows no glob for typescript.

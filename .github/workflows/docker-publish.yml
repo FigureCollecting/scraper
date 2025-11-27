@@ -137,8 +137,8 @@ jobs:
 
       - name: Run vulnerability scan
         run: |
-          # Run grype and check for HIGH or CRITICAL vulnerabilities
-          grype local-scan:latest -o table > vuln-report.txt
+          # Run grype with config file for ignores
+          grype local-scan:latest -c .grype.yaml -o table > vuln-report.txt
           if grep -E "High|Critical" vuln-report.txt | grep -v "SEVERITY"; then
             echo "Found HIGH or CRITICAL vulnerabilities:"
             grep -E "High|Critical" vuln-report.txt | head -20
