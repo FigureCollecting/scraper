@@ -160,7 +160,7 @@ jobs:
 
       # Upload all reports
       - name: Upload security artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: security-scan-${{ github.run_id }}
           path: |
