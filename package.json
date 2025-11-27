@@ -25,6 +25,9 @@
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2"
   },
+  "overrides": {
+    "glob": "^10.5.0"
+  },
   "devDependencies": {
     "@types/cheerio": "^1.0.0",
     "@types/cors": "^2.8.14",
