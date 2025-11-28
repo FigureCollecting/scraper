@@ -600,8 +600,8 @@ export async function scrapeGeneric(url: string, config: ScrapeConfig): Promise<
     const pageTitle = await page.title();
     const bodyText = await page.evaluate(() => document.body.innerText);
 
-    console.log('[DEBUG] Page title:', pageTitle);
-    console.log('[DEBUG] Body text preview:', bodyText.substring(0, 200));
+    console.log('[DEBUG] Page title:', sanitizeForLog(pageTitle));
+    console.log('[DEBUG] Body text preview:', sanitizeForLog(bodyText.substring(0, 200)));
 
     // Detect MFC 404 page (could be truly not found OR NSFW requiring auth)
     // Use proper URL validation to prevent bypass attacks

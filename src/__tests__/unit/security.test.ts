@@ -10,6 +10,7 @@
 
 import {
   sanitizeForLog,
+  sanitizeObjectForLog,
   isValidMfcUrl,
   capWaitTime,
   truncateString,
@@ -66,6 +67,69 @@ describe('Security Utilities', () => {
     it('should preserve normal URLs', () => {
       const url = 'https://myfigurecollection.net/item/123456';
       expect(sanitizeForLog(url)).toBe(url);
+    });
+  });
+
+  describe('sanitizeObjectForLog', () => {
+    it('should convert objects to sanitized JSON strings', () => {
+      const obj = { name: 'Test', value: 123 };
+      const result = sanitizeObjectForLog(obj);
+
+      expect(result).toContain('Test');
+      expect(result).toContain('123');
+    });
+
+    it('should sanitize newlines in object values', () => {
+      const obj = { malicious: 'line1\nline2\nline3' };
+      const result = sanitizeObjectForLog(obj);
+
+      expect(result).not.toContain('\n');
+    });
+
+    it('should sanitize ANSI escape sequences in object values', () => {
+      const obj = { colored: '\x1b[31mRed\x1b[0m' };
+      const result = sanitizeObjectForLog(obj);
+
+      expect(result).not.toContain('\x1b');
+    });
+
+    it('should truncate large objects', () => {
+      const largeObj = { data: 'x'.repeat(1000) };
+      const result = sanitizeObjectForLog(largeObj, 100);
+
+      expect(result.length).toBeLessThanOrEqual(100);
+    });
+
+    it('should handle non-serializable objects gracefully', () => {
+      const circular: any = { name: 'test' };
+      circular.self = circular;
+
+      const result = sanitizeObjectForLog(circular);
+      expect(result).toBe('[Unable to serialize object]');
+    });
+
+    it('should handle null and undefined', () => {
+      expect(sanitizeObjectForLog(null)).toBe('null');
+      expect(sanitizeObjectForLog(undefined)).toBe('undefined');
+    });
+
+    it('should handle arrays', () => {
+      const arr = [1, 2, 'test'];
+      const result = sanitizeObjectForLog(arr);
+
+      expect(result).toContain('1');
+      expect(result).toContain('test');
+      // Pretty-printed JSON newlines are replaced with spaces
+      expect(result).not.toContain('\n');
+    });
+
+    it('should remove newlines from pretty-printed JSON output', () => {
+      const obj = { key: 'value', nested: { deep: true } };
+      const result = sanitizeObjectForLog(obj);
+
+      // JSON.stringify with indent would normally have newlines
+      // Our sanitizer removes them
+      expect(result).not.toContain('\n');
     });
   });
 

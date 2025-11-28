@@ -1,6 +1,6 @@
 import express from 'express';
 import { scrapeMFC, scrapeGeneric, SITE_CONFIGS, ScrapeConfig, BrowserPool } from '../services/genericScraper';
-import { sanitizeForLog, isValidMfcUrl } from '../utils/security';
+import { sanitizeForLog, sanitizeObjectForLog, isValidMfcUrl } from '../utils/security';
 
 const router = express.Router();
 
@@ -36,11 +36,11 @@ router.post('/scrape', async (req, res) => {
     }
     
     console.log(`[SCRAPER API] Processing generic URL: ${sanitizeForLog(url)}`);
-    console.log('[SCRAPER API] Using config:', JSON.stringify(config, null, 2).substring(0, 500));
+    console.log('[SCRAPER API] Using config:', sanitizeObjectForLog(config));
     
     const scrapedData = await scrapeGeneric(url, config);
     
-    console.log('[SCRAPER API] Generic scraping completed:', scrapedData);
+    console.log('[SCRAPER API] Generic scraping completed:', sanitizeObjectForLog(scrapedData));
     
     res.json({
       success: true,
@@ -96,7 +96,7 @@ router.post('/scrape/mfc', async (req, res) => {
 
     const scrapedData = await scrapeMFC(url, mfcAuth);
     
-    console.log('[SCRAPER API] MFC scraping completed:', scrapedData);
+    console.log('[SCRAPER API] MFC scraping completed:', sanitizeObjectForLog(scrapedData));
     
     res.json({
       success: true,

@@ -89,3 +89,20 @@ export function truncateString(str: string, maxLength: number = MAX_STRING_LENGT
   if (typeof str !== 'string') return '';
   return str.substring(0, maxLength);
 }
+
+/**
+ * Sanitizes an object for safe logging by converting it to JSON
+ * and sanitizing the resulting string.
+ *
+ * @param obj - Object to sanitize
+ * @param maxLength - Maximum output length (default: 500)
+ * @returns Sanitized JSON string safe for logging
+ */
+export function sanitizeObjectForLog(obj: unknown, maxLength: number = 500): string {
+  try {
+    const json = JSON.stringify(obj, null, 2);
+    return sanitizeForLog(json).substring(0, maxLength);
+  } catch {
+    return '[Unable to serialize object]';
+  }
+}
