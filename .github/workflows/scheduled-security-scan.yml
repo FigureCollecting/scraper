@@ -44,8 +44,7 @@ jobs:
             tag: latest
           - name: scraper
             tag: latest
-          - name: version-manager
-            tag: latest
+          # version-manager removed - repo archived
 
     steps:
       - name: Checkout code

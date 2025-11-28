@@ -603,7 +603,10 @@ export async function scrapeGeneric(url: string, config: ScrapeConfig): Promise<
     const pageTitle = await page.title();
     const bodyText = await page.evaluate(() => document.body.innerText);
 
+    // Data is sanitized via sanitizeForLog() which removes newlines, ANSI codes, and control chars
+    // lgtm[js/log-injection]
     console.log('[DEBUG] Page title:', sanitizeForLog(pageTitle));
+    // lgtm[js/log-injection]
     console.log('[DEBUG] Body text preview:', sanitizeForLog(bodyText.substring(0, 200)));
 
     // Detect MFC 404 page (could be truly not found OR NSFW requiring auth)
