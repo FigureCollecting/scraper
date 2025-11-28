@@ -1,0 +1,28 @@
+# CodeQL Model Extension for Custom Security Functions
+# This file documents our sanitization approach for taint analysis.
+#
+# For JavaScript/TypeScript, custom sanitizers require a .ql query extension
+# because the YAML model extension system doesn't support sanitizerModel.
+# See: https://codeql.github.com/docs/codeql-language-guides/customizing-library-models-for-javascript/
+#
+# Our sanitizer functions:
+# - sanitizeForLog(input): Removes newlines, ANSI codes, control chars from strings
+# - sanitizeObjectForLog(obj): Sanitizes object serialization for safe logging
+# - isValidMfcUrl(url): Validates URLs to prevent SSRF
+# - capWaitTime(ms): Caps wait times to prevent DoS
+# - truncateString(str): Limits string length to prevent resource exhaustion
+#
+# These functions are in src/utils/security.ts and are used to sanitize
+# user-controlled data before logging or other sensitive operations.
+
+extensions:
+  # Define the package containing our sanitizers for type tracking
+  - addsTo:
+      pack: codeql/javascript-all
+      extensible: typeModel
+    data:
+      # No type models needed - included for documentation purposes
+      []
+
+  # Note: For proper sanitizer recognition, see the companion .ql file
+  # at .github/codeql/queries/custom-sanitizers.ql
