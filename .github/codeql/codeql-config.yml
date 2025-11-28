@@ -1,0 +1,19 @@
+# CodeQL Configuration
+# Defines custom sanitizers for taint analysis
+
+name: "Custom CodeQL Configuration"
+
+# Use the default queries plus security-extended
+queries:
+  - uses: security-extended
+
+# Include our custom query library that defines sanitizers
+packs:
+  javascript:
+    - ./.github/codeql/queries
+
+# Path filters to exclude test files from analysis
+paths-ignore:
+  - "**/__tests__/**"
+  - "**/node_modules/**"
+  - "**/dist/**"

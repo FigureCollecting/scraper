@@ -238,10 +238,30 @@ describe('Scraper Routes Integration Tests', () => {
 
       expect(response.body).toEqual({
         success: false,
-        message: 'URL must be from myfigurecollection.net',
+        message: 'URL must be from myfigurecollection.net domain',
       });
 
       expect(mockedGenericScraper.scrapeMFC).not.toHaveBeenCalled();
+    });
+
+    it('should reject URL bypass attempts (security fix for CodeQL alert)', async () => {
+      // Test that subdomain attacks are properly rejected
+      const bypassAttempts = [
+        'https://myfigurecollection.net.evil.com/item/123', // Attacker's subdomain
+        'https://evil.com/myfigurecollection.net/item/123', // MFC in path
+        'https://fakemyfigurecollection.net/item/123', // Similar domain
+      ];
+
+      for (const url of bypassAttempts) {
+        const response = await request(app)
+          .post('/scrape/mfc')
+          .send({ url })
+          .expect(400);
+
+        expect(response.body.success).toBe(false);
+        expect(response.body.message).toContain('myfigurecollection.net');
+        expect(mockedGenericScraper.scrapeMFC).not.toHaveBeenCalled();
+      }
     });
 
     it('should accept various MFC URL formats', async () => {

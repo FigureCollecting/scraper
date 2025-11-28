@@ -1,5 +1,6 @@
 import express from 'express';
 import { scrapeMFC, scrapeGeneric, SITE_CONFIGS, ScrapeConfig, BrowserPool } from '../services/genericScraper';
+import { sanitizeForLog, sanitizeObjectForLog, isValidMfcUrl } from '../utils/security';
 
 const router = express.Router();
 
@@ -34,12 +35,12 @@ router.post('/scrape', async (req, res) => {
       });
     }
     
-    console.log(`[SCRAPER API] Processing generic URL: ${url}`);
-    console.log(`[SCRAPER API] Using config:`, config);
+    console.log(`[SCRAPER API] Processing generic URL: ${sanitizeForLog(url)}`);
+    console.log('[SCRAPER API] Using config:', sanitizeObjectForLog(config));
     
     const scrapedData = await scrapeGeneric(url, config);
     
-    console.log('[SCRAPER API] Generic scraping completed:', scrapedData);
+    console.log('[SCRAPER API] Generic scraping completed:', sanitizeObjectForLog(scrapedData));
     
     res.json({
       success: true,
@@ -80,22 +81,22 @@ router.post('/scrape/mfc', async (req, res) => {
       });
     }
 
-    // Check if it's an MFC URL
-    if (!url.includes('myfigurecollection.net')) {
+    // Check if it's a valid MFC URL (proper domain validation, not substring match)
+    if (!isValidMfcUrl(url)) {
       return res.status(400).json({
         success: false,
-        message: 'URL must be from myfigurecollection.net'
+        message: 'URL must be from myfigurecollection.net domain'
       });
     }
 
-    console.log(`[SCRAPER API] Processing MFC URL: ${url}`);
+    console.log(`[SCRAPER API] Processing MFC URL: ${sanitizeForLog(url)}`);
     if (mfcAuth) {
       console.log('[SCRAPER API] MFC authentication cookies provided');
     }
 
     const scrapedData = await scrapeMFC(url, mfcAuth);
     
-    console.log('[SCRAPER API] MFC scraping completed:', scrapedData);
+    console.log('[SCRAPER API] MFC scraping completed:', sanitizeObjectForLog(scrapedData));
     
     res.json({
       success: true,

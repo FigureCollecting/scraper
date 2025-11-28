@@ -1,0 +1,57 @@
+# Codecov configuration
+# https://docs.codecov.com/docs/codecov-yaml
+
+coverage:
+  # Overall project coverage settings
+  # Industry recommendation: 70-80% for mature projects
+  status:
+    project:
+      default:
+        # Require 70% overall project coverage (realistic starting point)
+        target: 70%
+        # Allow 3% drop from base branch (handles refactoring scenarios)
+        threshold: 3%
+        # Only check files that changed
+        only_changed_files: true
+        # Fail PR check if project coverage is below target
+        informational: false
+
+    # Patch coverage - CRITICAL: enforces coverage on new/modified code
+    # This is the most important metric - new code MUST be tested
+    patch:
+      default:
+        # Require 80% coverage on changed lines (industry standard)
+        target: 80%
+        # No threshold - must meet 80% on new/modified lines
+        threshold: 0%
+        # Fail PR check if patch coverage is below target
+        informational: false
+
+# Comment settings for PR
+comment:
+  # Post comment on PR with coverage report
+  layout: "header, diff, flags, files"
+  # Update existing comment instead of posting new ones
+  behavior: default
+  # Always require head and base coverage
+  require_head: true
+  require_base: true
+
+# Flags for different test types (optional future use)
+flags:
+  unit:
+    paths:
+      - src/
+    carryforward: true
+  integration:
+    paths:
+      - src/
+    carryforward: true
+
+# Ignore patterns
+ignore:
+  - "**/*.test.ts"
+  - "**/__tests__/**"
+  - "**/__mocks__/**"
+  - "**/node_modules/**"
+  - "**/dist/**"

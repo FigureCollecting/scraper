@@ -791,5 +791,6 @@ describe('Browser Pool Management', () => {
       // Restore console.log
       consoleLogSpy.mockRestore();
     });
+
   });
 });
