@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to the Page Scraper service will be documented in this file.
+All notable changes to the Scraper service will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -116,17 +116,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## Version Compatibility
-
-| page-scraper | figure-collector-backend | figure-collector-frontend | version-manager |
-|-------------|--------------------------|---------------------------|-----------------|
-| 2.0.3       | 2.0.2                   | 2.0.2                    | 1.1.3          |
-| 2.0.2       | 2.0.2                   | 2.0.2                    | 1.1.2          |
-| 2.0.1       | 2.0.1                   | 2.0.1                    | 1.1.1          |
-| 2.0.0       | 2.0.0                   | 2.0.0                    | 1.1.0          |
-
----
-
 ## Migration Guide
 
 ### Upgrading from 2.0.2 to 2.0.3
@@ -160,7 +149,7 @@ To enable NSFW content access, provide MFC session cookies:
 
 ## Links
 
-- [Repository](https://github.com/rpgoldberg/page-scraper)
-- [Issues](https://github.com/rpgoldberg/page-scraper/issues)
-- [Pull Requests](https://github.com/rpgoldberg/page-scraper/pulls)
+- [Repository](https://github.com/rpgoldberg/scraper)
+- [Issues](https://github.com/rpgoldberg/scraper/issues)
+- [Pull Requests](https://github.com/rpgoldberg/scraper/pulls)
 
