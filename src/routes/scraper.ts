@@ -35,11 +35,14 @@ router.post('/scrape', async (req, res) => {
       });
     }
     
+    // lgtm[js/log-injection] - sanitized via sanitizeForLog/sanitizeObjectForLog
     console.log(`[SCRAPER API] Processing generic URL: ${sanitizeForLog(url)}`);
+    // lgtm[js/log-injection]
     console.log('[SCRAPER API] Using config:', sanitizeObjectForLog(config));
-    
+
     const scrapedData = await scrapeGeneric(url, config);
-    
+
+    // lgtm[js/log-injection]
     console.log('[SCRAPER API] Generic scraping completed:', sanitizeObjectForLog(scrapedData));
     
     res.json({
@@ -89,13 +92,15 @@ router.post('/scrape/mfc', async (req, res) => {
       });
     }
 
+    // lgtm[js/log-injection] - sanitized via sanitizeForLog
     console.log(`[SCRAPER API] Processing MFC URL: ${sanitizeForLog(url)}`);
     if (mfcAuth) {
       console.log('[SCRAPER API] MFC authentication cookies provided');
     }
 
     const scrapedData = await scrapeMFC(url, mfcAuth);
-    
+
+    // lgtm[js/log-injection] - sanitized via sanitizeObjectForLog
     console.log('[SCRAPER API] MFC scraping completed:', sanitizeObjectForLog(scrapedData));
     
     res.json({
