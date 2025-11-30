@@ -38,13 +38,8 @@ jobs:
     strategy:
       matrix:
         service:
-          - name: fc-backend
-            tag: latest
-          - name: fc-frontend
-            tag: latest
           - name: scraper
             tag: latest
-          # version-manager removed - repo archived
 
     steps:
       - name: Checkout code
