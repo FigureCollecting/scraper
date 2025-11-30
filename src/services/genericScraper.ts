@@ -433,6 +433,13 @@ export async function initializeBrowserPool(): Promise<void> {
   await BrowserPool.initialize();
 }
 
+// Allowlist of known MFC cookie names for security validation
+// Can be extended via MFC_ALLOWED_COOKIES env var (comma-separated)
+const DEFAULT_COOKIE_NAMES = ['PHPSESSID', 'sesUID', 'sesDID', 'cf_clearance', 'TBv4_Iden', 'TBv4_Hash'];
+const ALLOWED_COOKIE_NAMES = process.env.MFC_ALLOWED_COOKIES
+  ? process.env.MFC_ALLOWED_COOKIES.split(',').map(s => s.trim())
+  : DEFAULT_COOKIE_NAMES;
+
 /**
  * Sanitize sensitive data from config before logging
  * Prevents exposure of session cookies and other sensitive information
@@ -440,13 +447,14 @@ export async function initializeBrowserPool(): Promise<void> {
 function sanitizeConfigForLogging(config: ScrapeConfig): any {
   const sanitized: any = { ...config };
 
-  // Redact MFC authentication cookies (dynamic - redacts all cookie names)
+  // Redact MFC authentication cookies
   if (sanitized.mfcAuth?.sessionCookies) {
     const redactedCookies: Record<string, string> = {};
-    for (const cookieName of Object.keys(sanitized.mfcAuth.sessionCookies)) {
-      // Sanitize cookie name to prevent property injection (CodeQL security)
-      const safeName = sanitizeForLog(cookieName);
-      redactedCookies[safeName] = '[REDACTED]';
+    // Iterate over allowlist (not user input) to prevent property injection
+    for (const allowedName of ALLOWED_COOKIE_NAMES) {
+      if (allowedName in sanitized.mfcAuth.sessionCookies) {
+        redactedCookies[allowedName] = '[REDACTED]';
+      }
     }
     sanitized.mfcAuth = { sessionCookies: redactedCookies };
   }
@@ -513,8 +521,16 @@ export async function scrapeGeneric(url: string, config: ScrapeConfig): Promise<
 
       // Build cookie array dynamically from whatever cookies the user provides
       // Filter out undefined/empty values to prevent Puppeteer errors
+      // Validate cookie names against allowlist of known MFC cookies for security
       const cookieArray = Object.entries(cookies)
-        .filter(([_, value]) => value != null && value !== '')
+        .filter(([name, value]) => {
+          // Only allow known cookie names (prevents injection attacks)
+          if (!ALLOWED_COOKIE_NAMES.includes(name)) {
+            console.log(`[GENERIC SCRAPER] Ignoring unknown cookie: ${sanitizeForLog(name)}`); // lgtm[js/log-injection]
+            return false;
+          }
+          return value != null && value !== '';
+        })
         .map(([name, value]) => {
           const cookieObj: any = {
             name,
@@ -534,6 +550,7 @@ export async function scrapeGeneric(url: string, config: ScrapeConfig): Promise<
       if (cookieArray.length === 0) {
         console.log('[GENERIC SCRAPER] Warning: No valid cookies provided in mfcAuth');
       } else {
+        // Cookie names are from allowlist, safe to log
         console.log(`[GENERIC SCRAPER] Setting ${cookieArray.length} cookies: ${cookieArray.map(c => c.name).join(', ')}`);
         await page.setCookie(...cookieArray);
       }
