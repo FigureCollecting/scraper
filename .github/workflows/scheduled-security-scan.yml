@@ -187,21 +187,17 @@ jobs:
               issue.title.includes(serviceName) && issue.title.includes('Security:')
             );
 
-            const body = report + `
-
----
-**Scan Date**: ${new Date().toISOString()}
-**Image**: ghcr.io/rpgoldberg/${serviceName}:${{ matrix.service.tag }}
-**Threshold**: ${process.env.SEVERITY_THRESHOLD}
-
-### Recommended Actions:
-1. Review the vulnerabilities in detail
-2. Update base images if available
-3. Upgrade vulnerable dependencies
-4. Apply security patches
-
-This issue was automatically created by the scheduled security scan workflow.
-            `;
+            const body = report + '\n\n' +
+              '---\n' +
+              '**Scan Date**: ' + new Date().toISOString() + '\n' +
+              '**Image**: ghcr.io/rpgoldberg/' + serviceName + ':${{ matrix.service.tag }}\n' +
+              '**Threshold**: ' + process.env.SEVERITY_THRESHOLD + '\n\n' +
+              '### Recommended Actions:\n' +
+              '1. Review the vulnerabilities in detail\n' +
+              '2. Update base images if available\n' +
+              '3. Upgrade vulnerable dependencies\n' +
+              '4. Apply security patches\n\n' +
+              'This issue was automatically created by the scheduled security scan workflow.';
 
             if (existingIssue) {
               // Update existing issue
