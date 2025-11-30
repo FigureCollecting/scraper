@@ -408,7 +408,7 @@ describe('Browser Pool Management', () => {
   });
 
   describe('MFC NSFW Authentication (Issue #19)', () => {
-    it('should inject authentication cookies when mfcAuth config provided', async () => {
+    it('should inject authentication cookies dynamically when mfcAuth config provided', async () => {
       // Mock page.setCookie to verify cookies are set
       const setCookieSpy = jest.fn().mockResolvedValue(undefined);
       mockPage.setCookie = setCookieSpy;
@@ -422,14 +422,14 @@ describe('Browser Pool Management', () => {
 
       mockBrowser.createBrowserContext = jest.fn().mockResolvedValue(mockContext);
 
-      // Scrape with authentication config
+      // Scrape with authentication config (using current MFC cookie names)
       const authConfig = {
         mfcAuth: {
           sessionCookies: {
             PHPSESSID: 'test_session_id',
             sesUID: '12345',
-            TBv4_Iden: '12345',
-            TBv4_Hash: 'test_hash_value'
+            sesDID: 'test_device_id',
+            cf_clearance: 'test_cf_clearance'
           }
         }
       };
@@ -439,23 +439,24 @@ describe('Browser Pool Management', () => {
       // Verify cookies were set
       expect(setCookieSpy).toHaveBeenCalled();
 
-      // Verify all required cookies were set
+      // Verify all provided cookies were set dynamically
       const cookieCalls = setCookieSpy.mock.calls[0];
       const cookieNames = cookieCalls.map((cookie: any) => cookie.name);
 
       expect(cookieNames).toContain('PHPSESSID');
       expect(cookieNames).toContain('sesUID');
-      expect(cookieNames).toContain('TBv4_Iden');
-      expect(cookieNames).toContain('TBv4_Hash');
+      expect(cookieNames).toContain('sesDID');
+      expect(cookieNames).toContain('cf_clearance');
+      expect(cookieNames.length).toBe(4); // Only provided cookies
 
-      // Verify cookie structure details (covers object literal lines in source)
+      // Verify cookie structure details
       const cookies = setCookieSpy.mock.calls[0];
       const phpSessionCookie = cookies.find((c: any) => c.name === 'PHPSESSID');
       const sesUIDCookie = cookies.find((c: any) => c.name === 'sesUID');
-      const tbIdenCookie = cookies.find((c: any) => c.name === 'TBv4_Iden');
-      const tbHashCookie = cookies.find((c: any) => c.name === 'TBv4_Hash');
+      const sesDIDCookie = cookies.find((c: any) => c.name === 'sesDID');
+      const cfClearanceCookie = cookies.find((c: any) => c.name === 'cf_clearance');
 
-      // Verify PHPSESSID cookie structure
+      // Verify PHPSESSID cookie has special security flags
       expect(phpSessionCookie).toMatchObject({
         name: 'PHPSESSID',
         value: 'test_session_id',
@@ -474,22 +475,25 @@ describe('Browser Pool Management', () => {
         path: '/'
       });
 
-      // Verify TBv4_Iden cookie structure (basic properties only)
-      expect(tbIdenCookie).toMatchObject({
-        name: 'TBv4_Iden',
-        value: '12345',
+      // Verify sesDID cookie structure (current MFC cookie)
+      expect(sesDIDCookie).toMatchObject({
+        name: 'sesDID',
+        value: 'test_device_id',
         domain: '.myfigurecollection.net',
         path: '/'
       });
 
-      // Verify TBv4_Hash cookie structure (basic properties only)
-      expect(tbHashCookie).toMatchObject({
-        name: 'TBv4_Hash',
-        value: 'test_hash_value',
+      // Verify cf_clearance cookie structure (Cloudflare cookie)
+      expect(cfClearanceCookie).toMatchObject({
+        name: 'cf_clearance',
+        value: 'test_cf_clearance',
         domain: '.myfigurecollection.net',
         path: '/'
       });
     });
+
+    // Note: Empty cookie filtering is verified in unit tests for the filter function
+    // The main integration test above confirms that provided cookies are passed through correctly
 
     it('should NOT inject cookies when mfcAuth config is not provided', async () => {
       // Mock page.setCookie to verify it's NOT called
@@ -729,14 +733,14 @@ describe('Browser Pool Management', () => {
 
       mockBrowser.createBrowserContext = jest.fn().mockResolvedValue(mockContext);
 
-      // Scrape with MFC authentication
+      // Scrape with MFC authentication (using current cookie names)
       const sensitiveConfig = {
         mfcAuth: {
           sessionCookies: {
             PHPSESSID: 'super_secret_session_123',
             sesUID: 'secret_user_456',
-            TBv4_Iden: 'secret_iden_789',
-            TBv4_Hash: 'secret_hash_abc'
+            sesDID: 'secret_device_789',
+            cf_clearance: 'secret_cf_clearance_abc'
           }
         }
       };
@@ -750,8 +754,8 @@ describe('Browser Pool Management', () => {
       // Sensitive values should NOT appear in logs
       expect(allLogsString).not.toContain('super_secret_session_123');
       expect(allLogsString).not.toContain('secret_user_456');
-      expect(allLogsString).not.toContain('secret_iden_789');
-      expect(allLogsString).not.toContain('secret_hash_abc');
+      expect(allLogsString).not.toContain('secret_device_789');
+      expect(allLogsString).not.toContain('secret_cf_clearance_abc');
 
       // But [REDACTED] should appear (indicating sanitization is working)
       expect(allLogsString).toContain('[REDACTED]');

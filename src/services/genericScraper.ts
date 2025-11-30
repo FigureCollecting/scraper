@@ -10,12 +10,9 @@ export interface ScrapedData {
 }
 
 export interface MFCAuthConfig {
-  sessionCookies: {
-    PHPSESSID: string;
-    sesUID: string;
-    TBv4_Iden: string;
-    TBv4_Hash: string;
-  };
+  // Dynamic cookie structure - accepts any cookies the user provides
+  // This allows adapting to MFC cookie name changes without code updates
+  sessionCookies: Record<string, string>;
 }
 
 export interface ScrapeConfig {
@@ -436,6 +433,13 @@ export async function initializeBrowserPool(): Promise<void> {
   await BrowserPool.initialize();
 }
 
+// Allowlist of MFC cookie names for security validation
+// MUST be set via MFC_ALLOWED_COOKIES env var (comma-separated)
+// Example: MFC_ALLOWED_COOKIES=PHPSESSID,sesUID,sesDID,cf_clearance
+const ALLOWED_COOKIE_NAMES = process.env.MFC_ALLOWED_COOKIES
+  ? process.env.MFC_ALLOWED_COOKIES.split(',').map(s => s.trim()).filter(s => s.length > 0)
+  : [];
+
 /**
  * Sanitize sensitive data from config before logging
  * Prevents exposure of session cookies and other sensitive information
@@ -445,14 +449,14 @@ function sanitizeConfigForLogging(config: ScrapeConfig): any {
 
   // Redact MFC authentication cookies
   if (sanitized.mfcAuth?.sessionCookies) {
-    sanitized.mfcAuth = {
-      sessionCookies: {
-        PHPSESSID: '[REDACTED]',
-        sesUID: '[REDACTED]',
-        TBv4_Iden: '[REDACTED]',
-        TBv4_Hash: '[REDACTED]'
+    const redactedCookies: Record<string, string> = {};
+    // Iterate over allowlist (not user input) to prevent property injection
+    for (const allowedName of ALLOWED_COOKIE_NAMES) {
+      if (allowedName in sanitized.mfcAuth.sessionCookies) {
+        redactedCookies[allowedName] = '[REDACTED]';
       }
-    };
+    }
+    sanitized.mfcAuth = { sessionCookies: redactedCookies };
   }
 
   return sanitized;
@@ -514,35 +518,42 @@ export async function scrapeGeneric(url: string, config: ScrapeConfig): Promise<
       });
 
       const cookies = config.mfcAuth.sessionCookies;
-      await page.setCookie(
-        {
-          name: 'PHPSESSID',
-          value: cookies.PHPSESSID,
-          domain: '.myfigurecollection.net',
-          path: '/',
-          httpOnly: true,
-          secure: true,
-          sameSite: 'Lax'
-        },
-        {
-          name: 'sesUID',
-          value: cookies.sesUID,
-          domain: '.myfigurecollection.net',
-          path: '/',
-        },
-        {
-          name: 'TBv4_Iden',
-          value: cookies.TBv4_Iden,
-          domain: '.myfigurecollection.net',
-          path: '/',
-        },
-        {
-          name: 'TBv4_Hash',
-          value: cookies.TBv4_Hash,
-          domain: '.myfigurecollection.net',
-          path: '/',
-        }
-      );
+
+      // Build cookie array dynamically from whatever cookies the user provides
+      // Filter out undefined/empty values to prevent Puppeteer errors
+      // Validate cookie names against allowlist of known MFC cookies for security
+      const cookieArray = Object.entries(cookies)
+        .filter(([name, value]) => {
+          // Only allow known cookie names (prevents injection attacks)
+          if (!ALLOWED_COOKIE_NAMES.includes(name)) {
+            console.log(`[GENERIC SCRAPER] Ignoring unknown cookie: ${sanitizeForLog(name)}`); // lgtm[js/log-injection]
+            return false;
+          }
+          return value != null && value !== '';
+        })
+        .map(([name, value]) => {
+          const cookieObj: any = {
+            name,
+            value,
+            domain: '.myfigurecollection.net',
+            path: '/'
+          };
+          // PHPSESSID needs special security flags
+          if (name === 'PHPSESSID') {
+            cookieObj.httpOnly = true;
+            cookieObj.secure = true;
+            cookieObj.sameSite = 'Lax';
+          }
+          return cookieObj;
+        });
+
+      if (cookieArray.length === 0) {
+        console.log('[GENERIC SCRAPER] Warning: No valid cookies provided in mfcAuth');
+      } else {
+        // Cookie names are from allowlist, safe to log
+        console.log(`[GENERIC SCRAPER] Setting ${cookieArray.length} cookies: ${cookieArray.map(c => c.name).join(', ')}`);
+        await page.setCookie(...cookieArray);
+      }
 
       console.log('[GENERIC SCRAPER] MFC authentication applied successfully');
     }

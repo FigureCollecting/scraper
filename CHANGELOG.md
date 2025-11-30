@@ -5,6 +5,22 @@ All notable changes to the Scraper service will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.5] - 2025-11-29
+
+### Changed
+- **Dynamic MFC Cookie Handling**: Cookie injection now accepts any cookie names dynamically
+  - Changed `MFCAuthConfig.sessionCookies` from fixed structure to `Record<string, string>`
+  - Supports current MFC cookies (`sesDID`, `cf_clearance`) and any future cookie changes
+  - Filters out empty/undefined cookie values to prevent Puppeteer errors
+  - Admin config script determines which cookies to extract, scraper passes them through
+
+### Fixed
+- **MFC Cookie Names**: Updated to support current MFC cookie names
+  - MFC changed from `TBv4_Iden`/`TBv4_Hash` to `sesDID`/`cf_clearance`
+  - Scraper now adapts to cookie changes via admin config without code updates
+
+---
+
 ## [2.0.4] - 2025-11-28
 
 ### Added

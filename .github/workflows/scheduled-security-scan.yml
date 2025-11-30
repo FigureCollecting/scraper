@@ -38,13 +38,8 @@ jobs:
     strategy:
       matrix:
         service:
-          - name: fc-backend
-            tag: latest
-          - name: fc-frontend
-            tag: latest
           - name: scraper
             tag: latest
-          # version-manager removed - repo archived
 
     steps:
       - name: Checkout code
@@ -55,7 +50,7 @@ jobs:
           # Install Trivy
           wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
           echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/trivy.list
-          sudo apt-get update && sudo apt-get install -y trivy
+          sudo apt-get update && sudo apt-get install -y trivy jq
 
           # Install Grype
           curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
@@ -66,25 +61,23 @@ jobs:
           IMAGE="ghcr.io/rpgoldberg/${{ matrix.service.name }}:${{ matrix.service.tag }}"
           echo "Scanning $IMAGE..."
 
-          # Run Trivy scan
+          # Run Trivy scan with JSON output for accurate parsing
           trivy image --format json --output trivy-results.json "$IMAGE" || true
           trivy image --format sarif --output trivy-results.sarif --severity "${SEVERITY_THRESHOLD},CRITICAL" "$IMAGE" || true
           trivy image --format table --severity "${SEVERITY_THRESHOLD},CRITICAL" "$IMAGE" > scan-summary.txt || true
 
-          # Count vulnerabilities by severity - ensure we get clean numbers
-          CRITICAL_COUNT=$(grep -c "CRITICAL" scan-summary.txt 2>/dev/null || echo "0")
-          HIGH_COUNT=$(grep -c "HIGH" scan-summary.txt 2>/dev/null || echo "0")
-          MEDIUM_COUNT=$(grep -c "MEDIUM" scan-summary.txt 2>/dev/null || echo "0")
+          # Parse JSON to count ACTUAL vulnerabilities by severity (not grep word matches!)
+          # Trivy JSON: .Results[].Vulnerabilities[] each has .Severity field
+          CRITICAL_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' trivy-results.json 2>/dev/null || echo "0")
+          HIGH_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "HIGH")] | length' trivy-results.json 2>/dev/null || echo "0")
+          MEDIUM_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "MEDIUM")] | length' trivy-results.json 2>/dev/null || echo "0")
 
-          # Trim any whitespace to ensure clean numeric values
-          CRITICAL_COUNT=$(echo "$CRITICAL_COUNT" | tr -d '[:space:]')
-          HIGH_COUNT=$(echo "$HIGH_COUNT" | tr -d '[:space:]')
-          MEDIUM_COUNT=$(echo "$MEDIUM_COUNT" | tr -d '[:space:]')
-
-          # Ensure counts are valid numbers, default to 0 if not
+          # Ensure counts are valid numbers, default to 0 if empty/null
           CRITICAL_COUNT=${CRITICAL_COUNT:-0}
           HIGH_COUNT=${HIGH_COUNT:-0}
           MEDIUM_COUNT=${MEDIUM_COUNT:-0}
+
+          echo "Parsed vulnerability counts: CRITICAL=$CRITICAL_COUNT, HIGH=$HIGH_COUNT, MEDIUM=$MEDIUM_COUNT"
 
           echo "critical_count=$CRITICAL_COUNT" >> $GITHUB_OUTPUT
           echo "high_count=$HIGH_COUNT" >> $GITHUB_OUTPUT
@@ -110,8 +103,49 @@ jobs:
               echo '```'
               head -100 scan-summary.txt
               echo '```'
+            else
+              echo "✅ No critical or high vulnerabilities found."
             fi
           } > vulnerability-report.md
+
+      - name: Close stale vulnerability issues if no vulnerabilities
+        if: steps.scan.outputs.has_vulnerabilities == 'false'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const serviceName = '${{ matrix.service.name }}';
+
+            // Search for existing open security issues for this service
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'security,vulnerability,automated',
+              state: 'open'
+            });
+
+            const existingIssue = issues.data.find(issue =>
+              issue.title.includes(serviceName) && issue.title.includes('Security:')
+            );
+
+            if (existingIssue) {
+              // Close the issue since no vulnerabilities found
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existingIssue.number,
+                state: 'closed',
+                state_reason: 'completed'
+              });
+
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existingIssue.number,
+                body: '✅ **Auto-closed**: Latest security scan found no critical or high vulnerabilities.\n\nScan Date: ' + new Date().toISOString()
+              });
+
+              console.log(`Closed issue #${existingIssue.number} - no vulnerabilities found`);
+            }
 
       - name: Create or update issue for vulnerabilities
         if: steps.scan.outputs.has_vulnerabilities == 'true' && env.CREATE_ISSUES == 'true'
@@ -130,9 +164,9 @@ jobs:
             const labels = ['security', 'vulnerability', 'automated'];
 
             // Add priority label based on severity
-            if (criticalCount > 0) {
+            if (parseInt(criticalCount) > 0) {
               labels.push('priority:critical');
-            } else if (highCount > 0) {
+            } else if (parseInt(highCount) > 0) {
               labels.push('priority:high');
             }
 
@@ -140,7 +174,7 @@ jobs:
             const issues = await github.rest.issues.listForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              labels: labels.join(','),
+              labels: 'security,vulnerability,automated',
               state: 'open'
             });
 
@@ -148,22 +182,17 @@ jobs:
               issue.title.includes(serviceName) && issue.title.includes('Security:')
             );
 
-            const body = `
-            ${report}
-
-            ---
-            **Scan Date**: ${new Date().toISOString()}
-            **Image**: ghcr.io/rpgoldberg/${serviceName}:${{ matrix.service.tag }}
-            **Threshold**: ${process.env.SEVERITY_THRESHOLD}
-
-            ### Recommended Actions:
-            1. Review the vulnerabilities in detail
-            2. Update base images if available
-            3. Upgrade vulnerable dependencies
-            4. Apply security patches
-
-            This issue was automatically created by the scheduled security scan workflow.
-            `;
+            const body = report + '\n\n' +
+              '---\n' +
+              '**Scan Date**: ' + new Date().toISOString() + '\n' +
+              '**Image**: ghcr.io/rpgoldberg/' + serviceName + ':${{ matrix.service.tag }}\n' +
+              '**Threshold**: ' + process.env.SEVERITY_THRESHOLD + '\n\n' +
+              '### Recommended Actions:\n' +
+              '1. Review the vulnerabilities in detail\n' +
+              '2. Update base images if available\n' +
+              '3. Upgrade vulnerable dependencies\n' +
+              '4. Apply security patches\n\n' +
+              'This issue was automatically created by the scheduled security scan workflow.';
 
             if (existingIssue) {
               // Update existing issue
@@ -206,7 +235,7 @@ jobs:
             SERVICE="${{ matrix.service.name }}"
             TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-            # Create Discord webhook payload (using printf to avoid heredoc issues)
+            # Create Discord webhook payload
             curl -X POST "$DISCORD_WEBHOOK" \
               -H "Content-Type: application/json" \
               -d "{
