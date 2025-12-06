@@ -1,6 +1,6 @@
 {
   "name": "scraper",
-  "version": "2.0.5",
+  "version": "2.0.6",
   "description": "Generic web page scraping service with browser automation",
   "main": "dist/index.js",
   "scripts": {
