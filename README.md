@@ -611,6 +611,14 @@ See `.env.example` for complete configuration template.
   - Required for `/reset-pool` endpoint in non-production environments
   - Simple string token for basic protection
 
+**MFC Cookie Security:**
+- `MFC_ALLOWED_COOKIES`: Whitelist of cookie names allowed during authenticated MFC scraping
+  - **Default**: `PHPSESSID,sesUID,sesDID,cf_clearance`
+  - **Purpose**: Security filter that only allows known MFC session cookies
+  - **Format**: Comma-separated list of cookie names (case-sensitive)
+  - **Why needed**: Prevents users from accidentally or maliciously injecting arbitrary cookies
+  - Users provide session cookies via the API; this env var controls which ones are actually used
+
 **Debug Logging:**
 - `DEBUG`: Enable debug namespaces (e.g., `scraper:*`, `scraper:mfc`, `scraper:browser`)
 - `SERVICE_AUTH_TOKEN_DEBUG`: Show partial tokens in logs for debugging (default: false)

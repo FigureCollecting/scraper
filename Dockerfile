@@ -1,10 +1,10 @@
 # =============================================================================
-# BASE STAGE - Secure Ubuntu 24.04 + Node 24 + Patched Chrome 142.0.7444.175
+# BASE STAGE - Secure Ubuntu 24.04 + Node 24 + Patched Chrome 143.0.7499.41
 # =============================================================================
 FROM ubuntu:24.04 AS base
 
 # Cache-bust ARG to invalidate Docker layers when dependencies change
-ARG CACHE_BUST=2025-11-27-v2
+ARG CACHE_BUST=2025-12-05-chrome-143
 
 # Install Node.js 24 using official binaries (avoids NodeSource CVE false positives)
 RUN apt-get update && apt-get install -y \
@@ -58,9 +58,9 @@ RUN apt-get update && apt-get upgrade -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# Download and install patched Chrome for Testing (142.0.7444.175) - fixes CVE-2025-13223/13224/13042 and earlier CVEs
+# Download and install patched Chrome for Testing (143.0.7499.41) - fixes CVE-2025-13223/13224/13042 and earlier CVEs
 RUN apt-get update && apt-get install -y wget unzip \
-    && wget -q https://storage.googleapis.com/chrome-for-testing-public/142.0.7444.175/linux64/chrome-linux64.zip \
+    && wget -q https://storage.googleapis.com/chrome-for-testing-public/143.0.7499.41/linux64/chrome-linux64.zip \
     && unzip chrome-linux64.zip \
     && mv chrome-linux64 /opt/chrome \
     && rm chrome-linux64.zip \
