@@ -20,7 +20,7 @@
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
-    "express": "^5.2.0",
+    "express": "^5.2.1",
     "puppeteer": "^24.25.0",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2"
@@ -34,15 +34,15 @@
   "devDependencies": {
     "@types/cheerio": "^1.0.0",
     "@types/cors": "^2.8.14",
-    "@types/express": "^5.0.3",
+    "@types/express": "^5.0.6",
     "@types/jest": "^30.0.0",
-    "@types/node": "^24.9.1",
+    "@types/node": "^24.10.2",
     "@types/supertest": "^6.0.3",
     "cheerio": "^1.1.2",
     "jest": "^30.2.0",
     "supertest": "^7.1.4",
     "testcontainers": "^11.7.1",
-    "ts-jest": "^29.4.5",
+    "ts-jest": "^29.4.6",
     "ts-node": "^10.9.1",
     "ts-node-dev": "^2.0.0",
     "typescript": "^5.9.3"
