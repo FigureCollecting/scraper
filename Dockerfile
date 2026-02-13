@@ -4,10 +4,12 @@
 FROM ubuntu:24.04 AS base
 
 # Cache-bust ARG to invalidate Docker layers when dependencies change
-ARG CACHE_BUST=2026-02-12-chrome-145-node-24.13
+ARG CACHE_BUST=2026-02-12-npm-11.10-openssl-gnupg-patches
 
+# Update all packages for latest security patches (openssl, gnupg, glibc)
 # Install Node.js 24 using official binaries (avoids NodeSource CVE false positives)
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install -y \
     curl \
     xz-utils \
     && NODE_VERSION=v24.13.1 \
