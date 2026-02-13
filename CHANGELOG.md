@@ -218,7 +218,7 @@ To enable NSFW content access, provide MFC session cookies:
 
 ## Links
 
-- [Repository](https://github.com/rpgoldberg/scraper)
-- [Issues](https://github.com/rpgoldberg/scraper/issues)
-- [Pull Requests](https://github.com/rpgoldberg/scraper/pulls)
+- [Repository](https://github.com/FigureCollecting/scraper)
+- [Issues](https://github.com/FigureCollecting/scraper/issues)
+- [Pull Requests](https://github.com/FigureCollecting/scraper/pulls)
 

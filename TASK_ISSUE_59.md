@@ -2,7 +2,7 @@
 
 **FROM**: Master Orchestrator
 **TO**: Page-Scraper Service Orchestrator
-**ISSUE**: https://github.com/rpgoldberg/scraper/issues/59
+**ISSUE**: https://github.com/FigureCollecting/scraper/issues/59
 **BRANCH**: feature/browser-context-reuse-v2.1.0 (created)
 **TARGET**: scraper v2.1.0
 
@@ -378,7 +378,7 @@ Commit 2: "Add cookie authentication for MFC NSFW access"
 
 - [Puppeteer Browser Contexts](https://pptr.dev/api/puppeteer.browser.createbrowsercontext)
 - [Puppeteer Cookie Management](https://pptr.dev/api/puppeteer.page.setcookie)
-- [Issue #59](https://github.com/rpgoldberg/scraper/issues/59)
+- [Issue #59](https://github.com/FigureCollecting/scraper/issues/59)
 - [Release Plan v2.1.0](/RELEASE_PLAN_v2.1.0.md)
 
 ---

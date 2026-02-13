@@ -58,7 +58,7 @@ jobs:
       - name: Scan image for vulnerabilities
         id: scan
         run: |
-          IMAGE="ghcr.io/rpgoldberg/${{ matrix.service.name }}:${{ matrix.service.tag }}"
+          IMAGE="ghcr.io/figurecollecting/${{ matrix.service.name }}:${{ matrix.service.tag }}"
           echo "Scanning $IMAGE..."
 
           # Run Trivy scan with JSON output for accurate parsing
@@ -185,7 +185,7 @@ jobs:
             const body = report + '\n\n' +
               '---\n' +
               '**Scan Date**: ' + new Date().toISOString() + '\n' +
-              '**Image**: ghcr.io/rpgoldberg/' + serviceName + ':${{ matrix.service.tag }}\n' +
+              '**Image**: ghcr.io/figurecollecting/' + serviceName + ':${{ matrix.service.tag }}\n' +
               '**Threshold**: ' + process.env.SEVERITY_THRESHOLD + '\n\n' +
               '### Recommended Actions:\n' +
               '1. Review the vulnerabilities in detail\n' +
