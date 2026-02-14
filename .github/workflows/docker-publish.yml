@@ -33,10 +33,15 @@ jobs:
     outputs:
       tags: ${{ steps.meta.outputs.tags }}
       digest: ${{ steps.build.outputs.digest }}
+      image-name-lowercase: ${{ steps.image-name.outputs.lowercase }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
+
+      - name: Compute lowercase image name
+        id: image-name
+        run: echo "lowercase=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
 
       - name: Read service version from package.json
         id: service-version
@@ -118,7 +123,8 @@ jobs:
           # Verify version tag on main branch
           if [ "${{ github.ref }}" == "refs/heads/main" ]; then
             VERSION="${{ steps.service-version.outputs.version }}"
-            VERSION_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION}"
+            # OCI registries require lowercase image names; use pre-computed value
+            VERSION_TAG="${{ env.REGISTRY }}/${{ steps.image-name.outputs.lowercase }}:${VERSION}"
             echo "Checking version tag: ${VERSION_TAG}"
 
             if docker manifest inspect "${VERSION_TAG}" >/dev/null 2>&1; then
@@ -139,7 +145,7 @@ jobs:
       image-tags: ${{ needs.build-and-push.outputs.tags }}
       image-digest: ${{ needs.build-and-push.outputs.digest }}
       registry: ghcr.io
-      image-name: ghcr.io/${{ github.repository }}
+      image-name: ghcr.io/${{ needs.build-and-push.outputs.image-name-lowercase }}
     permissions:
       contents: read
       packages: write
