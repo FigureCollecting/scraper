@@ -5,6 +5,18 @@ All notable changes to the Scraper service will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.2] - 2026-02-13
+
+### Changed
+- **Organization Migration**: Moved repository from `rpgoldberg` to `FigureCollecting` org
+- **Docker Publish Workflow**: Fixed OCI case-sensitivity bug in image verification step
+- **Security Scan Workflow**: Added `security-events: write` permission for SARIF uploads
+
+### Fixed
+- **Cheerio Production Dependency**: Moved cheerio from devDependencies to dependencies
+
+---
+
 ## [2.0.6] - 2026-01-01
 
 ### Fixed
