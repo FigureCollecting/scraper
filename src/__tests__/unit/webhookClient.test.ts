@@ -10,6 +10,7 @@ import {
   notifyItemSuccess,
   notifyItemFailed,
   notifyItemSkipped,
+  webhookRetryConfig,
   WebhookConfig,
   ItemCompletePayload,
   PhaseChangePayload,
@@ -26,12 +27,24 @@ describe('webhookClient', () => {
     sessionId: 'session-abc-123',
   };
 
+  // Store original retry config to restore after tests
+  const originalRetryConfig = { ...webhookRetryConfig };
+
   beforeEach(() => {
     jest.clearAllMocks();
     mockFetch.mockReset();
+    // Use near-zero delays for fast tests
+    webhookRetryConfig.baseDelayMs = 1;
+    webhookRetryConfig.maxRetries = 3;
     // Clean up any registered configs
     unregisterWebhookConfig('session-abc-123');
     unregisterWebhookConfig('session-xyz-789');
+  });
+
+  afterEach(() => {
+    // Restore original config
+    webhookRetryConfig.baseDelayMs = originalRetryConfig.baseDelayMs;
+    webhookRetryConfig.maxRetries = originalRetryConfig.maxRetries;
   });
 
   describe('registerWebhookConfig', () => {
@@ -113,11 +126,12 @@ describe('webhookClient', () => {
       expect(options.headers['X-Webhook-Signature'].length).toBeGreaterThan(0);
     });
 
-    it('should return false on fetch failure', async () => {
+    it('should retry on 500 and return false after exhausting retries', async () => {
       registerWebhookConfig(testConfig);
       mockFetch.mockResolvedValue({
         ok: false,
         status: 500,
+        headers: new Map(),
         json: () => Promise.resolve({ message: 'Internal Server Error' }),
       });
 
@@ -130,9 +144,11 @@ describe('webhookClient', () => {
 
       const result = await notifyItemComplete(payload);
       expect(result).toBe(false);
+      // 1 initial + 3 retries = 4 total attempts
+      expect(mockFetch).toHaveBeenCalledTimes(4);
     });
 
-    it('should return false on network error', async () => {
+    it('should retry on network error and return false after exhausting retries', async () => {
       registerWebhookConfig(testConfig);
       mockFetch.mockRejectedValue(new Error('Network error'));
 
@@ -144,13 +160,57 @@ describe('webhookClient', () => {
 
       const result = await notifyItemComplete(payload);
       expect(result).toBe(false);
+      expect(mockFetch).toHaveBeenCalledTimes(4);
     });
 
-    it('should handle json parse failure in error response', async () => {
+    it('should retry on 429 and succeed when backend recovers', async () => {
+      registerWebhookConfig(testConfig);
+      mockFetch
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 429,
+          headers: new Map(),
+          json: () => Promise.resolve({ message: 'Too many requests' }),
+        })
+        .mockResolvedValueOnce({ ok: true });
+
+      const payload: ItemCompletePayload = {
+        sessionId: 'session-abc-123',
+        mfcId: '12345',
+        status: 'completed',
+      };
+
+      const result = await notifyItemComplete(payload);
+      expect(result).toBe(true);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('should not retry on 4xx errors other than 429', async () => {
+      registerWebhookConfig(testConfig);
+      mockFetch.mockResolvedValue({
+        ok: false,
+        status: 401,
+        json: () => Promise.resolve({ message: 'Unauthorized' }),
+      });
+
+      const payload: ItemCompletePayload = {
+        sessionId: 'session-abc-123',
+        mfcId: '12345',
+        status: 'completed',
+      };
+
+      const result = await notifyItemComplete(payload);
+      expect(result).toBe(false);
+      // No retries for 401
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('should handle json parse failure in error response after retries', async () => {
       registerWebhookConfig(testConfig);
       mockFetch.mockResolvedValue({
         ok: false,
         status: 502,
+        headers: new Map(),
         json: () => Promise.reject(new Error('Invalid JSON')),
       });
 
@@ -162,6 +222,31 @@ describe('webhookClient', () => {
 
       const result = await notifyItemComplete(payload);
       expect(result).toBe(false);
+      // 502 is retryable: 1 initial + 3 retries
+      expect(mockFetch).toHaveBeenCalledTimes(4);
+    });
+
+    it('should respect Retry-After header on 429', async () => {
+      registerWebhookConfig(testConfig);
+      const headersWithRetryAfter = new Map([['retry-after', '1']]);
+      mockFetch
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 429,
+          headers: headersWithRetryAfter,
+          json: () => Promise.resolve({ message: 'Rate limited' }),
+        })
+        .mockResolvedValueOnce({ ok: true });
+
+      const payload: ItemCompletePayload = {
+        sessionId: 'session-abc-123',
+        mfcId: '12345',
+        status: 'completed',
+      };
+
+      const result = await notifyItemComplete(payload);
+      expect(result).toBe(true);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
     });
   });
 

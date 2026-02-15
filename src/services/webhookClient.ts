@@ -97,8 +97,14 @@ function signPayload(payload: string, secret: string): string {
   return crypto.createHmac('sha256', secret).update(payload).digest('hex');
 }
 
+/** Webhook retry configuration */
+export const webhookRetryConfig = {
+  maxRetries: 3,
+  baseDelayMs: 1000,
+};
+
 /**
- * Send webhook request to backend.
+ * Send webhook request to backend with retry for transient failures.
  * Non-blocking - doesn't throw on failure, just logs.
  */
 async function sendWebhook<T extends object>(
@@ -106,34 +112,59 @@ async function sendWebhook<T extends object>(
   payload: T,
   config: WebhookConfig
 ): Promise<boolean> {
-  try {
-    const body = JSON.stringify(payload);
-    const signature = signPayload(body, config.webhookSecret);
+  const body = JSON.stringify(payload);
+  const signature = signPayload(body, config.webhookSecret);
+  const { maxRetries, baseDelayMs } = webhookRetryConfig;
 
-    // Use trusted base URL from environment configuration (not user input)
-    // This prevents SSRF by ensuring the fetch target is server-controlled
-    const url = `${TRUSTED_WEBHOOK_BASE_URL}/${endpoint}`;
+  // Use trusted base URL from environment configuration (not user input)
+  // This prevents SSRF by ensuring the fetch target is server-controlled
+  const url = `${TRUSTED_WEBHOOK_BASE_URL}/${endpoint}`;
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Webhook-Signature': signature,
-      },
-      body,
-    });
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Webhook-Signature': signature,
+        },
+        body,
+      });
 
-    if (!response.ok) {
+      if (response.ok) {
+        return true;
+      }
+
+      // Retry on 429 (rate limited) or 5xx (server error)
+      const isRetryable = response.status === 429 || response.status >= 500;
+      if (isRetryable && attempt < maxRetries) {
+        const retryAfter = response.headers.get('retry-after');
+        const delay = retryAfter
+          ? parseInt(retryAfter, 10) * 1000
+          : baseDelayMs * Math.pow(2, attempt);
+        console.warn(`[WEBHOOK CLIENT] ${endpoint} got ${response.status}, retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+
+      // Non-retryable error or exhausted retries
       const errorData = await response.json().catch(() => ({}));
-      console.error(`[WEBHOOK CLIENT] ${endpoint} failed: ${response.status} ${errorData.message || ''}`);
+      console.error(`[WEBHOOK CLIENT] ${endpoint} failed: ${response.status} ${(errorData as any).message || ''}`);
+      return false;
+    } catch (error: any) {
+      // Network errors are retryable
+      if (attempt < maxRetries) {
+        const delay = baseDelayMs * Math.pow(2, attempt);
+        console.warn(`[WEBHOOK CLIENT] ${endpoint} network error, retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries}): ${error.message}`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+      console.error(`[WEBHOOK CLIENT] ${endpoint} error after ${maxRetries} retries:`, error.message);
       return false;
     }
-
-    return true;
-  } catch (error: any) {
-    console.error(`[WEBHOOK CLIENT] ${endpoint} error:`, error.message);
-    return false;
   }
+
+  return false;
 }
 
 /**
