@@ -12,7 +12,7 @@
  */
 
 import { MfcCookies, exportMfcCsv, validateMfcCookies, CsvExportResult } from './mfcCsvExporter';
-import { fetchUserLists, fetchCollectionCategory, MfcList, MfcListItem } from './mfcListsFetcher';
+import { fetchUserLists, fetchListItems, fetchCollectionCategory, MfcList, MfcListItem } from './mfcListsFetcher';
 import { getScrapeQueue, QueuePriority, ItemStatus, EnqueueResult, QueueStats } from './scrapeQueue';
 import { calculateCacheTtl, isCacheValid } from './cacheConfig';
 import { sanitizeForLog } from '../utils/security';
@@ -20,6 +20,7 @@ import {
   registerWebhookConfig,
   unregisterWebhookConfig,
   notifyPhaseChange,
+  notifyListsSync,
   WebhookConfig
 } from './webhookClient';
 
@@ -69,7 +70,7 @@ export interface SyncRequest {
 }
 
 export interface SyncProgress {
-  phase: 'validating' | 'exporting' | 'parsing' | 'fetching_lists' | 'queueing' | 'enriching' | 'completed' | 'failed';
+  phase: 'validating' | 'exporting' | 'parsing' | 'fetching_activity_order' | 'fetching_lists' | 'queueing' | 'enriching' | 'completed' | 'failed';
   message: string;
   itemsProcessed?: number;
   itemsTotal?: number;
@@ -87,6 +88,8 @@ export interface ParsedMfcItem {
   price?: string;
   imageUrl?: string;
   isNsfw?: boolean;
+  mfcActivityOrder?: number;
+  isOrphan?: boolean;
 }
 
 export interface SyncResult {
@@ -361,6 +364,16 @@ export async function executeMfcSync(request: SyncRequest): Promise<SyncResult> 
       return result;
     }
 
+    if (!validation.canExportCsv) {
+      result.errors.push('Cookie validation passed but CSV export is not available on the Manager page');
+      await reportProgress({
+        phase: 'failed',
+        message: 'CSV export not available - session may be invalid or MFC page structure changed',
+        errors: result.errors,
+      });
+      return result;
+    }
+
     // Phase 2: Export CSV
     await reportProgress({
       phase: 'exporting',
@@ -405,6 +418,69 @@ export async function executeMfcSync(request: SyncRequest): Promise<SyncResult> 
       itemsTotal: result.parsedItems.length,
     });
 
+    // Phase 3.5: Fetch activity ordering from collection pages
+    // Browse MFC collection pages sorted by activity to capture the order items were added
+    await reportProgress({
+      phase: 'fetching_activity_order',
+      message: 'Capturing collection activity ordering...',
+    });
+
+    const statusesToFetch: Array<'owned' | 'ordered' | 'wished'> = [];
+    if (result.stats.owned > 0) statusesToFetch.push('owned');
+    if (result.stats.ordered > 0) statusesToFetch.push('ordered');
+    if (result.stats.wished > 0) statusesToFetch.push('wished');
+
+    // If statusFilter is provided (even empty), respect it; undefined means sync all
+    const activityStatuses = statusFilter !== undefined
+      ? statusesToFetch.filter(s => statusFilter.includes(s))
+      : statusesToFetch;
+
+    for (const activityStatus of activityStatuses) {
+      try {
+        console.log(`[SYNC] Fetching activity ordering for ${activityStatus}...`);
+        const activityResult = await fetchCollectionCategory(cookies, activityStatus);
+
+        if (activityResult.success && activityResult.items) {
+          // Build mfcId → mfcActivityOrder map from activity-sorted pages
+          const orderMap = new Map<string, number>();
+          for (const item of activityResult.items) {
+            if (item.mfcActivityOrder !== undefined) {
+              orderMap.set(item.mfcId, item.mfcActivityOrder);
+            }
+          }
+
+          // Merge activity ordering into parsed items
+          let merged = 0;
+          for (const parsedItem of result.parsedItems) {
+            if (parsedItem.status === activityStatus) {
+              const order = orderMap.get(parsedItem.mfcId);
+              if (order !== undefined) {
+                parsedItem.mfcActivityOrder = order;
+                merged++;
+              }
+            }
+          }
+
+          console.log(`[SYNC] Merged activity ordering for ${merged}/${result.stats[activityStatus === 'wished' ? 'wished' : activityStatus]} ${activityStatus} items`);
+        } else {
+          console.warn(`[SYNC] Activity ordering fetch failed for ${activityStatus}: ${activityResult.error}`);
+          result.errors.push(`Activity ordering failed for ${activityStatus}: ${activityResult.error}`);
+        }
+      } catch (activityError: any) {
+        console.warn(`[SYNC] Activity ordering error for ${activityStatus}: ${activityError.message}`);
+        result.errors.push(`Activity ordering error for ${activityStatus}: ${activityError.message}`);
+        // Non-fatal: continue sync without activity ordering
+      }
+    }
+
+    await reportProgress({
+      phase: 'fetching_activity_order',
+      message: `Activity ordering captured for ${activityStatuses.join(', ')}`,
+    });
+
+    // Orphan items: list items not in the CSV collection (computed during Phase 4)
+    let orphanItems: ParsedMfcItem[] = [];
+
     // Phase 4: Fetch lists (optional)
     if (includeLists) {
       await reportProgress({
@@ -420,6 +496,83 @@ export async function executeMfcSync(request: SyncRequest): Promise<SyncResult> 
           message: `Found ${listsResult.lists.length} lists`,
           listsFound: listsResult.lists.length,
         });
+
+        // Fetch detail pages (description + item IDs) for each list
+        const listsWithDetails = await Promise.all(
+          listsResult.lists.map(async (l) => {
+            try {
+              const detail = await fetchListItems(l.id, cookies);
+              const itemMfcIds = detail.success && detail.items
+                ? detail.items.map(item => parseInt(item.mfcId, 10)).filter(id => !isNaN(id))
+                : undefined;
+              // Preserve per-item metadata (name, imageUrl) scraped from list pages
+              const itemDetails = detail.success && detail.items
+                ? detail.items.map(item => ({
+                    mfcId: parseInt(item.mfcId, 10),
+                    name: item.name,
+                    imageUrl: item.imageUrl,
+                  })).filter(d => !isNaN(d.mfcId))
+                : undefined;
+              return {
+                mfcId: parseInt(l.id, 10),
+                name: l.name,
+                teaser: l.teaser,
+                description: detail.success ? detail.description : undefined,
+                privacy: l.privacy,
+                iconUrl: l.iconUrl,
+                itemCount: l.itemCount,
+                itemMfcIds,
+                itemDetails,
+                mfcCreatedAt: l.createdAt,
+              };
+            } catch (err: any) {
+              console.warn(`[SYNC] Failed to fetch details for list ${l.id}: ${err.message}`);
+              return {
+                mfcId: parseInt(l.id, 10),
+                name: l.name,
+                teaser: l.teaser,
+                privacy: l.privacy,
+                iconUrl: l.iconUrl,
+                itemCount: l.itemCount,
+                mfcCreatedAt: l.createdAt,
+              };
+            }
+          })
+        );
+
+        // Send lists to backend via webhook
+        if (webhookConfig && listsWithDetails.length > 0) {
+          await notifyListsSync({
+            sessionId,
+            lists: listsWithDetails,
+          });
+        }
+
+        // Compute orphan items: MFC IDs that appear in lists but not in CSV collection.
+        // These get enriched (MFCItem catalog entry) but NOT turned into user Figures.
+        const collectionMfcIds = new Set(result.parsedItems.map(i => i.mfcId));
+        const listMfcIds = new Set<string>();
+        for (const list of listsWithDetails) {
+          if (list.itemMfcIds) {
+            for (const id of list.itemMfcIds) {
+              listMfcIds.add(String(id));
+            }
+          }
+        }
+
+        for (const mfcId of listMfcIds) {
+          if (!collectionMfcIds.has(mfcId)) {
+            orphanItems.push({
+              mfcId,
+              status: 'wished' as ItemStatus,
+              isOrphan: true,
+            });
+          }
+        }
+
+        if (orphanItems.length > 0) {
+          console.log(`[SYNC] Found ${orphanItems.length} orphan list items to enrich`);
+        }
       } else {
         result.errors.push(`Lists fetch failed: ${listsResult.error}`);
         console.warn(`[SYNC] Lists fetch failed: ${listsResult.error}`);
@@ -435,40 +588,48 @@ export async function executeMfcSync(request: SyncRequest): Promise<SyncResult> 
     const queue = getScrapeQueue();
     const queueResults: EnqueueResult[] = [];
 
-    // Filter items by status if statusFilter is provided
-    const itemsToQueue = statusFilter && statusFilter.length > 0
+    // Filter items by status if statusFilter is provided (even empty = queue nothing)
+    const itemsToQueue = statusFilter !== undefined
       ? result.parsedItems.filter(item => statusFilter.includes(item.status))
       : result.parsedItems;
 
-    console.log(`[SYNC] Queueing ${itemsToQueue.length} items (filtered from ${result.parsedItems.length}, filter: ${JSON.stringify(statusFilter?.join(',') || 'all')})`);
+    // Combine collection items with orphan list items for queueing
+    const allItemsToQueue = [...itemsToQueue, ...orphanItems];
 
-    // Send filtered items list with queueing phase for backend SyncJob tracking
+    const filterLabel = statusFilter !== undefined ? JSON.stringify(statusFilter) : '"all"';
+    console.log(`[SYNC] Queueing ${allItemsToQueue.length} items (${itemsToQueue.length} collection + ${orphanItems.length} orphans, filter: ${filterLabel})`);
+
+    // Send items list with queueing phase for backend SyncJob tracking
     if (webhookConfig) {
       await notifyPhaseChange({
         sessionId,
         phase: 'queueing',
-        message: `Queueing ${itemsToQueue.length} items for enrichment`,
-        items: itemsToQueue.map(item => ({
+        message: `Queueing ${allItemsToQueue.length} items for enrichment`,
+        items: allItemsToQueue.map(item => ({
           mfcId: item.mfcId,
           name: item.name,
           collectionStatus: item.status,
           isNsfw: item.isNsfw,
+          mfcActivityOrder: item.mfcActivityOrder,
+          isOrphan: item.isOrphan,
         })),
       }).catch(() => {
         console.warn('[SYNC] Webhook notification failed for queueing phase with items');
       });
     };
 
-    for (const item of itemsToQueue) {
+    for (const item of allItemsToQueue) {
       // Skip cached items if requested
       if (skipCached) {
         // Note: In a real implementation, you'd check against your cache/DB here
         // For now, we queue everything
       }
 
-      // Determine priority
+      // Determine priority: orphans always COLD (background enrichment)
       let priority: QueuePriority = 'WARM';
-      if (item.isNsfw) {
+      if (item.isOrphan) {
+        priority = 'COLD'; // Orphan list items are background enrichment
+      } else if (item.isNsfw) {
         priority = 'HOT'; // NSFW items highest priority
       } else if (item.status === 'wished') {
         priority = 'COLD'; // Wished items are lower priority
@@ -505,36 +666,64 @@ export async function executeMfcSync(request: SyncRequest): Promise<SyncResult> 
       itemsTotal: result.parsedItems.length,
     });
 
-    // Queueing complete - enrichment begins in background
-    // NOTE: Do NOT report 'completed' here! Items are still being processed.
-    // The backend SyncJob.recalculateStats() will set phase to 'completed'
-    // when all items are done (pending=0 && processing=0).
+    // Queueing complete
     result.success = true;
-
-    // Notify backend that queueing is complete, enrichment phase begins
-    if (webhookConfig) {
-      await notifyPhaseChange({
-        sessionId,
-        phase: 'enriching',
-        message: `Enriching ${result.queuedItems} items in background...`,
-      }).catch(() => {
-        console.warn('[SYNC] Webhook notification failed for enriching phase');
-      });
-    }
-
-    // Report enriching phase (not completed - items still being processed!)
-    await reportProgress({
-      phase: 'enriching',
-      message: `Enriching ${result.queuedItems} items in background...`,
-      itemsQueued: result.queuedItems,
-      itemsProcessed: 0, // No items processed yet - enrichment just starting
-      itemsTotal: result.queuedItems,
-      listsFound: result.lists?.length,
-    });
 
     console.log(`[SYNC] Queueing complete: ${result.queuedItems} queued, ${result.skippedItems} deduped, ${result.errors.length} errors`);
     console.log(`[SYNC] Queue stats: HOT=${queueStats.hot}, WARM=${queueStats.warm}, COLD=${queueStats.cold}`);
-    console.log(`[SYNC] Enrichment running in background - completion will be reported by backend when all items done`);
+
+    if (result.queuedItems === 0) {
+      // No items to enrich — skip enriching phase and report completed immediately.
+      // This happens when all items were deduplicated, or when statusFilter is empty
+      // AND no orphan list items were found.
+      const completedMessage = result.lists
+        ? `Sync complete: ${result.lists.length} lists synced, no figures to enrich`
+        : 'Sync complete: no figures to enrich';
+
+      if (webhookConfig) {
+        await notifyPhaseChange({
+          sessionId,
+          phase: 'completed',
+          message: completedMessage,
+        }).catch(() => {
+          console.warn('[SYNC] Webhook notification failed for completed phase');
+        });
+      }
+
+      await reportProgress({
+        phase: 'completed',
+        message: completedMessage,
+        listsFound: result.lists?.length,
+      });
+
+      console.log(`[SYNC] ${completedMessage}`);
+    } else {
+      // Items queued — enrichment begins in background.
+      // NOTE: Do NOT report 'completed' here! Items are still being processed.
+      // The backend SyncJob.recalculateStats() will set phase to 'completed'
+      // when all items are done (pending=0 && processing=0).
+
+      if (webhookConfig) {
+        await notifyPhaseChange({
+          sessionId,
+          phase: 'enriching',
+          message: `Enriching ${result.queuedItems} items in background...`,
+        }).catch(() => {
+          console.warn('[SYNC] Webhook notification failed for enriching phase');
+        });
+      }
+
+      await reportProgress({
+        phase: 'enriching',
+        message: `Enriching ${result.queuedItems} items in background...`,
+        itemsQueued: result.queuedItems,
+        itemsProcessed: 0, // No items processed yet - enrichment just starting
+        itemsTotal: result.queuedItems,
+        listsFound: result.lists?.length,
+      });
+
+      console.log(`[SYNC] Enrichment running in background - completion will be reported by backend when all items done`);
+    }
 
     return result;
 

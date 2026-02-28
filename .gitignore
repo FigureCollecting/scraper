@@ -10,6 +10,7 @@ node_modules/
 .env.development
 .env.test
 .env.production
+.env.audit
 
 # Logs
 logs

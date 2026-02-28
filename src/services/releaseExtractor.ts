@@ -1,4 +1,5 @@
 import { load, CheerioAPI } from 'cheerio';
+import { lookupLabel } from './mfcLabelRegistry';
 
 export interface IRelease {
   date?: Date;
@@ -30,9 +31,11 @@ export function extractReleases(html: string): IRelease[] {
   const $ = load(html);
   const releases: IRelease[] = [];
 
-  // Find the "Releases" data-field
+  // Find the "Releases" data-field (registry-based matching for label resilience)
   const releasesField = $('.data-field').filter((_, el) => {
-    return $(el).find('.data-label').text().trim() === 'Releases';
+    const label = $(el).find('.data-label').text().trim();
+    const match = lookupLabel(label);
+    return match?.strategy === 'releases-field';
   });
 
   if (releasesField.length === 0) {
@@ -54,9 +57,12 @@ export function extractReleases(html: string): IRelease[] {
   while (nextSibling.length > 0) {
     const label = nextSibling.find('.data-label').text().trim();
 
-    // If we hit a labeled field (like "Materials"), stop looking for releases
-    if (label && label !== 'Releases') {
-      break;
+    // If we hit a labeled field that isn't a release, stop looking
+    if (label) {
+      const siblingMatch = lookupLabel(label);
+      if (siblingMatch?.strategy !== 'releases-field') {
+        break;
+      }
     }
 
     // If no label or label is "Releases", try to extract release data

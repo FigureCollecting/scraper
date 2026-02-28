@@ -26,6 +26,7 @@ jest.mock('../../services/mfcCsvExporter', () => ({
 
 jest.mock('../../services/mfcListsFetcher', () => ({
   fetchUserLists: jest.fn(),
+  fetchListItems: jest.fn(),
   fetchCollectionCategory: jest.fn(),
 }));
 
@@ -38,12 +39,13 @@ jest.mock('../../services/webhookClient', () => ({
   registerWebhookConfig: jest.fn(),
   unregisterWebhookConfig: jest.fn(),
   notifyPhaseChange: jest.fn().mockResolvedValue(true),
+  notifyListsSync: jest.fn().mockResolvedValue(true),
 }));
 
 import { validateMfcCookies, exportMfcCsv } from '../../services/mfcCsvExporter';
-import { fetchUserLists } from '../../services/mfcListsFetcher';
+import { fetchUserLists, fetchListItems, fetchCollectionCategory } from '../../services/mfcListsFetcher';
 import { getScrapeQueue } from '../../services/scrapeQueue';
-import { registerWebhookConfig, notifyPhaseChange } from '../../services/webhookClient';
+import { registerWebhookConfig, notifyPhaseChange, notifyListsSync } from '../../services/webhookClient';
 import {
   executeMfcSync,
   syncFromCsv,
@@ -55,6 +57,8 @@ import {
 const mockValidate = validateMfcCookies as jest.MockedFunction<typeof validateMfcCookies>;
 const mockExportCsv = exportMfcCsv as jest.MockedFunction<typeof exportMfcCsv>;
 const mockFetchLists = fetchUserLists as jest.MockedFunction<typeof fetchUserLists>;
+const mockFetchListItems = fetchListItems as jest.MockedFunction<typeof fetchListItems>;
+const mockFetchCollection = fetchCollectionCategory as jest.MockedFunction<typeof fetchCollectionCategory>;
 const mockNotifyPhaseChange = notifyPhaseChange as jest.MockedFunction<typeof notifyPhaseChange>;
 
 describe('syncOrchestrator - extended', () => {
@@ -64,6 +68,24 @@ describe('syncOrchestrator - extended', () => {
     // Re-establish mock implementations after clearAllMocks
     (getScrapeQueue as jest.Mock).mockImplementation(() => mockQueueInstance);
     mockNotifyPhaseChange.mockResolvedValue(true);
+    (notifyListsSync as jest.Mock).mockResolvedValue(true);
+
+    // Default: activity ordering returns items with positions
+    mockFetchCollection.mockResolvedValue({
+      success: true,
+      items: [{ mfcId: '12345', name: 'Fig', status: 'owned', mfcActivityOrder: 0 }],
+      listName: 'Owned Collection',
+      totalItems: 1,
+    });
+
+    // Default: list detail fetch returns items and description
+    mockFetchListItems.mockResolvedValue({
+      success: true,
+      items: [{ mfcId: '100', name: 'List Item' }],
+      listName: 'Test List',
+      description: '<p>Test description</p>',
+      totalItems: 1,
+    });
 
     // Reset default return values for queue instance
     mockQueueInstance.enqueue.mockImplementation((mfcId: string) => ({
@@ -101,6 +123,20 @@ describe('syncOrchestrator - extended', () => {
       const result = await executeMfcSync(baseRequest);
       expect(result.success).toBe(false);
       expect(result.errors).toContainEqual(expect.stringContaining('Cookie validation failed'));
+    });
+
+    it('should fail when validation passes but CSV export is not available', async () => {
+      mockValidate.mockResolvedValue({
+        valid: true,
+        canAccessManager: true,
+        canExportCsv: false,
+      });
+
+      const result = await executeMfcSync(baseRequest);
+      expect(result.success).toBe(false);
+      expect(result.errors).toContainEqual(
+        expect.stringContaining('CSV export is not available')
+      );
     });
 
     it('should fail when CSV export fails', async () => {
@@ -165,6 +201,95 @@ describe('syncOrchestrator - extended', () => {
 
       expect(result.success).toBe(true);
       expect(result.lists?.length).toBe(1);
+      // Should have fetched detail for each list
+      expect(mockFetchListItems).toHaveBeenCalledWith('1', baseRequest.cookies);
+    });
+
+    it('should include description and itemMfcIds from list detail fetch', async () => {
+      mockValidate.mockResolvedValue({
+        valid: true,
+        canAccessManager: true,
+        canExportCsv: true,
+      });
+
+      mockExportCsv.mockResolvedValue({
+        success: true,
+        csvContent: 'ID,Name,Status\n12345,Fig,Owned',
+        itemCount: 1,
+      });
+
+      mockFetchLists.mockResolvedValue({
+        success: true,
+        lists: [{ id: '42', name: 'My Wishlist', itemCount: 3, privacy: 'public' as const, url: '' }],
+      });
+
+      mockFetchListItems.mockResolvedValue({
+        success: true,
+        items: [
+          { mfcId: '100', name: 'Item A' },
+          { mfcId: '200', name: 'Item B' },
+          { mfcId: '300', name: 'Item C' },
+        ],
+        listName: 'My Wishlist',
+        description: '<p>My favorite figures</p>',
+        totalItems: 3,
+      });
+
+      const result = await executeMfcSync({
+        ...baseRequest,
+        includeLists: true,
+        webhookConfig: {
+          webhookUrl: 'http://backend/webhooks',
+          webhookSecret: 'secret',
+          sessionId: 'session456',
+        },
+      });
+
+      expect(result.success).toBe(true);
+      expect(mockFetchListItems).toHaveBeenCalledWith('42', baseRequest.cookies);
+      // Verify webhook payload includes description and itemMfcIds
+      expect(notifyListsSync).toHaveBeenCalledWith(
+        expect.objectContaining({
+          lists: expect.arrayContaining([
+            expect.objectContaining({
+              mfcId: 42,
+              name: 'My Wishlist',
+              description: '<p>My favorite figures</p>',
+              itemMfcIds: [100, 200, 300],
+            }),
+          ]),
+        })
+      );
+    });
+
+    it('should handle list detail fetch failure gracefully', async () => {
+      mockValidate.mockResolvedValue({
+        valid: true,
+        canAccessManager: true,
+        canExportCsv: true,
+      });
+
+      mockExportCsv.mockResolvedValue({
+        success: true,
+        csvContent: 'ID,Name,Status\n12345,Fig,Owned',
+        itemCount: 1,
+      });
+
+      mockFetchLists.mockResolvedValue({
+        success: true,
+        lists: [{ id: '1', name: 'List 1', itemCount: 5, privacy: 'public' as const, url: '' }],
+      });
+
+      // List detail fetch fails but sync should still succeed
+      mockFetchListItems.mockRejectedValue(new Error('Timeout'));
+
+      const result = await executeMfcSync({
+        ...baseRequest,
+        includeLists: true,
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.lists?.length).toBe(1);
     });
 
     it('should handle lists fetch failure gracefully', async () => {
@@ -191,8 +316,7 @@ describe('syncOrchestrator - extended', () => {
       });
 
       expect(result.success).toBe(true); // Main sync still succeeds
-      expect(result.errors.length).toBe(1);
-      expect(result.errors[0]).toContain('Lists fetch failed');
+      expect(result.errors.some((e: string) => e.includes('Lists fetch failed'))).toBe(true);
     });
 
     it('should call onProgress callback', async () => {
