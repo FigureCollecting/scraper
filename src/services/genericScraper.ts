@@ -1,7 +1,8 @@
 import puppeteer, { Browser, Page } from 'puppeteer';
 import { sanitizeForLog, isValidMfcUrl, capWaitTime, truncateString, MAX_STRING_LENGTH } from '../utils/security';
-import { ICompanyEntry, IArtistEntry, IMfcFieldData, extractCompanies, extractArtists, extractMfcFields } from './companyArtistExtractor';
+import { ICompanyEntry, IArtistEntry, extractCompanies, extractArtists, extractMfcFields, extractRelatedItems } from './companyArtistExtractor';
 import { IRelease, extractReleases } from './releaseExtractor';
+import { auditMfcFields, appendFieldAuditLog } from './fieldAuditCollector';
 
 // Re-export IRelease for backward compatibility
 export type { IRelease } from './releaseExtractor';
@@ -878,9 +879,27 @@ export async function scrapeGeneric(url: string, config: ScrapeConfig): Promise<
           }
         }
         
+        // User's personal rating (only present if user owns the figure)
+        const scoreInput = document.querySelector('input[name="score"]:checked') as HTMLInputElement;
+        if (scoreInput) {
+          const val = parseInt(scoreInput.value, 10);
+          if (!isNaN(val) && val >= 1 && val <= 10) {
+            data.userScore = val;
+          }
+        }
+
+        // User's wishability (only present if figure is wished)
+        const wishInput = document.querySelector('input[name="wishability"]:checked') as HTMLInputElement;
+        if (wishInput) {
+          const val = parseInt(wishInput.value, 10);
+          if (!isNaN(val) && val >= 1 && val <= 5) {
+            data.userWishRating = val;
+          }
+        }
+
         // Debug: Log what we found
         console.log('Extracted data:', data);
-        
+
       } catch (extractError) {
         console.error('Error during data extraction:', extractError);
       }
@@ -939,9 +958,50 @@ export async function scrapeGeneric(url: string, config: ScrapeConfig): Promise<
       if (mfcFields.jan) scrapedData.jan = mfcFields.jan;
       if (mfcFields.tags && mfcFields.tags.length > 0) scrapedData.tags = mfcFields.tags;
 
+      // Community stats from MFC fields
+      if (mfcFields.communityOwnedCount !== undefined || mfcFields.communityOrderedCount !== undefined ||
+          mfcFields.communityWishedCount !== undefined || mfcFields.communityListedCount !== undefined ||
+          mfcFields.communityScore !== undefined) {
+        scrapedData.communityStats = {
+          ownedCount: mfcFields.communityOwnedCount,
+          orderedCount: mfcFields.communityOrderedCount,
+          wishedCount: mfcFields.communityWishedCount,
+          listedInCount: mfcFields.communityListedCount,
+          ...(mfcFields.communityScore !== undefined && { averageScore: mfcFields.communityScore }),
+        };
+      }
+
+      // Related items
+      const relatedItems = extractRelatedItems(pageHtml);
+      if (relatedItems.length > 0) {
+        scrapedData.relatedItems = relatedItems;
+      }
+
+      // Log unknown fields for developer observability
+      if (mfcFields.unknownFields && mfcFields.unknownFields.length > 0) {
+        console.warn('[GENERIC SCRAPER] Unknown MFC field labels:', mfcFields.unknownFields);
+      }
+
       // Use mfcTitle as the name if we don't have one yet
       if (!scrapedData.name && mfcFields.title) {
         scrapedData.name = mfcFields.title;
+      }
+
+      // Optional field audit (enabled via MFC_FIELD_AUDIT=true env var)
+      if (process.env.MFC_FIELD_AUDIT === 'true') {
+        try {
+          const mfcIdMatch = url.match(/\/item\/(\d+)/);
+          const auditMfcId = mfcIdMatch ? parseInt(mfcIdMatch[1], 10) : 0;
+          const auditResult = auditMfcFields(pageHtml, auditMfcId);
+          const jsonlLine = appendFieldAuditLog(auditResult);
+          // Write to stdout as JSONL for capture by external tooling
+          console.log('[FIELD AUDIT]', jsonlLine);
+          if (auditResult.unknownLabels.length > 0) {
+            console.warn('[FIELD AUDIT] Unknown labels:', auditResult.unknownLabels);
+          }
+        } catch (auditError) {
+          console.warn('[FIELD AUDIT] Audit collection failed:', auditError);
+        }
       }
     } catch (extractionError) {
       console.error('[GENERIC SCRAPER] Schema v3 extraction failed:', extractionError);

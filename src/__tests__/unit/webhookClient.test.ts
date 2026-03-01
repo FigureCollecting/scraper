@@ -7,6 +7,7 @@ import {
   getWebhookConfig,
   notifyItemComplete,
   notifyPhaseChange,
+  notifyListsSync,
   notifyItemSuccess,
   notifyItemFailed,
   notifyItemSkipped,
@@ -14,6 +15,7 @@ import {
   WebhookConfig,
   ItemCompletePayload,
   PhaseChangePayload,
+  ListsSyncPayload,
 } from '../../services/webhookClient';
 
 // Mock global fetch
@@ -280,6 +282,89 @@ describe('webhookClient', () => {
       const [url] = mockFetch.mock.calls[0];
       // URL comes from TRUSTED_WEBHOOK_BASE_URL env var (defaults to localhost:5080/sync/webhook)
       expect(url).toBe('http://localhost:5080/sync/webhook/phase-change');
+    });
+  });
+
+  describe('notifyListsSync', () => {
+    it('should return false when no webhook config registered', async () => {
+      const payload: ListsSyncPayload = {
+        sessionId: 'unknown-session',
+        lists: [{ mfcId: 100, name: 'Wishlist', privacy: 'public', itemCount: 5 }],
+      };
+      const result = await notifyListsSync(payload);
+      expect(result).toBe(false);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('should send lists sync webhook with correct endpoint and payload', async () => {
+      registerWebhookConfig(testConfig);
+      mockFetch.mockResolvedValue({ ok: true });
+
+      const payload: ListsSyncPayload = {
+        sessionId: 'session-abc-123',
+        lists: [
+          {
+            mfcId: 100,
+            name: 'My Wishlist',
+            teaser: 'Figures I want',
+            privacy: 'public',
+            iconUrl: 'https://static.myfigurecollection.net/icon.jpg',
+            itemCount: 12,
+            itemMfcIds: [1001, 1002, 1003],
+            mfcCreatedAt: '2024-01-15',
+          },
+          {
+            mfcId: 200,
+            name: 'Private Collection',
+            privacy: 'private',
+            itemCount: 3,
+          },
+        ],
+      };
+
+      const result = await notifyListsSync(payload);
+      expect(result).toBe(true);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+
+      const [url, options] = mockFetch.mock.calls[0];
+      expect(url).toBe('http://localhost:5080/sync/webhook/lists-sync');
+      expect(options.method).toBe('POST');
+      expect(options.headers['Content-Type']).toBe('application/json');
+      expect(options.headers['X-Webhook-Signature']).toBeDefined();
+
+      const body = JSON.parse(options.body);
+      expect(body.sessionId).toBe('session-abc-123');
+      expect(body.lists).toHaveLength(2);
+      expect(body.lists[0].mfcId).toBe(100);
+      expect(body.lists[0].name).toBe('My Wishlist');
+      expect(body.lists[0].teaser).toBe('Figures I want');
+      expect(body.lists[0].privacy).toBe('public');
+      expect(body.lists[0].iconUrl).toBe('https://static.myfigurecollection.net/icon.jpg');
+      expect(body.lists[0].itemCount).toBe(12);
+      expect(body.lists[0].itemMfcIds).toEqual([1001, 1002, 1003]);
+      expect(body.lists[0].mfcCreatedAt).toBe('2024-01-15');
+      expect(body.lists[1].mfcId).toBe(200);
+      expect(body.lists[1].privacy).toBe('private');
+    });
+
+    it('should retry on server error and return false after exhausting retries', async () => {
+      registerWebhookConfig(testConfig);
+      mockFetch.mockResolvedValue({
+        ok: false,
+        status: 503,
+        headers: new Map(),
+        json: () => Promise.resolve({ message: 'Service Unavailable' }),
+      });
+
+      const payload: ListsSyncPayload = {
+        sessionId: 'session-abc-123',
+        lists: [{ mfcId: 100, name: 'Test List', privacy: 'public', itemCount: 1 }],
+      };
+
+      const result = await notifyListsSync(payload);
+      expect(result).toBe(false);
+      // 1 initial + 3 retries = 4 total attempts
+      expect(mockFetch).toHaveBeenCalledTimes(4);
     });
   });
 
