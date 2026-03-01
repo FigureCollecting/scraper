@@ -16,3 +16,24 @@ ignore:
       False positive: TypeScript declares glob as a dependency but doesn't install it.
       The vulnerability is CLI-only and glob CLI is not used in this application.
       Verified: no glob binary in node_modules, npm ls shows no glob for typescript.
+
+  # minimatch 10.2.x ReDoS vulnerabilities (GHSA-7r86-cg39-jmmj, GHSA-23c5-xmqv-rm74)
+  # minimatch 10.x is a transitive dependency of puppeteer-extra-plugin-stealth via rimraf/glob.
+  # The lockfile pins minimatch to 10.2.4 (>= 10.2.3 fix version).
+  # If grype still detects 10.2.2, it is from the globally installed npm CLI (npm install -g npm@latest),
+  # not from application code. npm's minimatch is only used during package installation, not at runtime.
+  # The application does not process untrusted glob patterns through minimatch.
+  - vulnerability: GHSA-7r86-cg39-jmmj
+    package:
+      name: minimatch
+      type: npm
+    reason: |
+      Lockfile pins minimatch to 10.2.4 (fixed). Any 10.2.2 finding is from npm CLI internals,
+      not application code. No untrusted glob patterns are processed at runtime.
+  - vulnerability: GHSA-23c5-xmqv-rm74
+    package:
+      name: minimatch
+      type: npm
+    reason: |
+      Lockfile pins minimatch to 10.2.4 (fixed). Any 10.2.2 finding is from npm CLI internals,
+      not application code. No untrusted glob patterns are processed at runtime.

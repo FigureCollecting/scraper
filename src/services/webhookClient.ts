@@ -51,6 +51,8 @@ export interface PhaseChangePayload {
     name?: string;
     collectionStatus: string;
     isNsfw?: boolean;
+    mfcActivityOrder?: number;
+    isOrphan?: boolean;
   }>;
 }
 
@@ -193,6 +195,39 @@ export async function notifyPhaseChange(payload: PhaseChangePayload): Promise<bo
   }
 
   return sendWebhook('phase-change', payload, config);
+}
+
+/**
+ * Payload for lists sync webhook.
+ */
+export interface ListsSyncPayload {
+  sessionId: string;
+  lists: Array<{
+    mfcId: number;
+    name: string;
+    teaser?: string;
+    description?: string;
+    privacy: string;
+    iconUrl?: string;
+    itemCount: number;
+    itemMfcIds?: number[];
+    itemDetails?: Array<{ mfcId: number; name?: string; imageUrl?: string }>;
+    mfcCreatedAt?: string;
+  }>;
+}
+
+/**
+ * Notify backend to sync user's MFC lists.
+ * Called from syncOrchestrator after fetchUserLists succeeds.
+ */
+export async function notifyListsSync(payload: ListsSyncPayload): Promise<boolean> {
+  const config = webhookConfigs.get(payload.sessionId);
+  if (!config) {
+    console.warn(`[WEBHOOK CLIENT] No webhook config for session ${JSON.stringify(payload.sessionId)}`);
+    return false;
+  }
+
+  return sendWebhook('lists-sync', payload, config);
 }
 
 /**

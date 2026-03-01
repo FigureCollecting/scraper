@@ -35,7 +35,7 @@ export interface CookieValidationResult {
 
 // MFC Manager URLs
 const MFC_BASE_URL = 'https://myfigurecollection.net';
-const MFC_MANAGER_URL = `${MFC_BASE_URL}/manager/`;
+const MFC_MANAGER_URL = `${MFC_BASE_URL}/?_tb=manager`;
 
 // CSS Selectors for MFC CSV Export dialog (from user-provided HTML)
 const SELECTORS = {
@@ -124,9 +124,17 @@ async function applyCookies(page: Page, cookies: MfcCookies): Promise<void> {
 
 /**
  * Check if the page shows we're logged in to MFC
+ * Also verifies the page isn't an error page (MFC renders header chrome on error pages too)
  */
 async function isLoggedIn(page: Page): Promise<boolean> {
   try {
+    // First check we're not on an error page
+    const title = await page.title();
+    if (title.toLowerCase().includes('error')) {
+      console.log(`[MFC CSV] Page title indicates error: "${title}"`);
+      return false;
+    }
+
     // Look for user menu or logout link
     const userElement = await page.$(SELECTORS.userMenu);
     return userElement !== null;
@@ -241,7 +249,45 @@ export async function exportMfcCsv(
     // Find and click the CSV Export link
     const exportLink = await page.$(SELECTORS.exportTrigger);
     if (!exportLink) {
-      console.log('[MFC CSV] CSV Export link not found on page');
+      // Diagnostic: dump page structure to find the new export selector
+      const pageDiag = await page.evaluate(() => {
+        const diag: any = {};
+        // Look for any export-related links
+        const allLinks = document.querySelectorAll('a');
+        const exportLinks: string[] = [];
+        const actionLinks: string[] = [];
+        const tbxLinks: string[] = [];
+        allLinks.forEach(a => {
+          const text = (a.textContent || '').trim().toLowerCase();
+          const cls = a.className || '';
+          const href = a.getAttribute('href') || '';
+          if (text.includes('export') || text.includes('csv') || cls.includes('export') || href.includes('export')) {
+            exportLinks.push(`text="${a.textContent?.trim()}" class="${cls}" href="${href}"`);
+          }
+          if (cls.includes('action')) {
+            actionLinks.push(`text="${a.textContent?.trim()}" class="${cls}" href="${href}"`);
+          }
+          if (cls.includes('tbx')) {
+            tbxLinks.push(`text="${a.textContent?.trim()}" class="${cls}" href="${href}"`);
+          }
+        });
+        diag.exportLinks = exportLinks;
+        diag.actionLinks = actionLinks.slice(0, 20);
+        diag.tbxLinks = tbxLinks.slice(0, 20);
+        diag.pageTitle = document.title;
+        diag.url = window.location.href;
+        // Capture toolbar/nav area HTML
+        const toolbar = document.querySelector('.toolbar, .manager-toolbar, .actions, nav');
+        diag.toolbarHtml = toolbar?.outerHTML?.substring(0, 3000) || 'no toolbar found';
+        // Look for any element with "export" in text
+        const body = document.body.innerText || '';
+        const exportIdx = body.toLowerCase().indexOf('export');
+        if (exportIdx >= 0) {
+          diag.exportContext = body.substring(Math.max(0, exportIdx - 100), exportIdx + 200);
+        }
+        return diag;
+      });
+      console.log('[MFC CSV] CSV Export link not found. Page diagnostic:', JSON.stringify(pageDiag, null, 2));
       return {
         success: false,
         error: 'MFC_EXPORT_NOT_FOUND: CSV Export option not found. The page structure may have changed.'

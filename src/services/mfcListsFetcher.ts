@@ -9,6 +9,9 @@ export interface MfcList {
   itemCount: number;
   privacy: 'public' | 'friends' | 'private';
   url: string;
+  teaser?: string;
+  createdAt?: string;
+  iconUrl?: string;
 }
 
 export interface MfcListItem {
@@ -16,6 +19,7 @@ export interface MfcListItem {
   name?: string;
   status?: 'owned' | 'ordered' | 'wished';
   imageUrl?: string;
+  mfcActivityOrder?: number;
 }
 
 export interface ListsFetchResult {
@@ -28,6 +32,7 @@ export interface ListItemsFetchResult {
   success: boolean;
   items?: MfcListItem[];
   listName?: string;
+  description?: string;
   totalItems?: number;
   error?: string;
 }
@@ -47,23 +52,24 @@ function buildListUrl(listId: string): string {
 
 // CSS Selectors for MFC Lists pages
 const SELECTORS = {
-  // Lists page
-  listItems: '.item-list .item-icons li, .lists-list li.item',
-  listLink: 'a[href*="/list/"]',
-  listName: '.name, h3',
-  listItemCount: '.count, .meta',
-  listPrivacy: '.meta.category, .privacy',
+  // Lists overview page (manager view)
+  listEntries: '.dgst.list-dgst .dgst-wrapper',
+  listAnchor: '.dgst-anchor a[href*="/list/"]',
+  listTeaser: '.dgst-meta div.meta[title]',
+  listItemCount: '.dgst-meta span.meta',
+  listPrivacy: '.meta.category',
+  listIcon: '.dgst-icon img',
+  listCreatedDate: '.dgst-meta span.meta span[title]',
 
-  // Individual list page
-  figureItems: '.item-icons li, .item-list li',
-  figureLink: 'a[href*="/item/"]',
-  figureName: '.name, .item-name',
-  figureImage: 'img[src*="static.myfigurecollection"]',
+  // Individual list detail page
+  detailTitle: 'h1.title',
+  detailIcon: '.content-icon .thumbnail',
+  detailDescription: '.object-wrapper .bbcode',
+  detailTotalItems: '.object-stats',
+  detailItemIcons: '.item-icon a[href*="/item/"]',
 
   // Pagination
-  pagination: '.pagination, .pager',
   nextPage: 'a[rel="next"], .pagination .next a',
-  lastPage: '.pagination a:last-child',
 
   // Login indicator
   userMenu: '.user-menu, .user-avatar, [href*="logout"]',
@@ -123,6 +129,40 @@ function parsePrivacy(text: string): 'public' | 'friends' | 'private' {
 }
 
 /**
+ * Parse MFC date format (MM/DD/YYYY, HH:MM:SS) to ISO string.
+ * Returns undefined if the input is falsy or doesn't match the expected format.
+ */
+export function parseMfcDate(dateStr: string | null | undefined): string | undefined {
+  if (!dateStr) return undefined;
+  const trimmed = dateStr.trim();
+  if (!trimmed) return undefined;
+
+  const match = trimmed.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4}),\s*(\d{2}):(\d{2}):(\d{2})$/);
+  if (!match) return undefined;
+
+  const [, month, day, year, hours, minutes, seconds] = match;
+  const m = parseInt(month, 10);
+  const d = parseInt(day, 10);
+
+  // Basic validation
+  if (m < 1 || m > 12 || d < 1 || d > 31) return undefined;
+
+  const date = new Date(Date.UTC(
+    parseInt(year, 10),
+    m - 1,
+    d,
+    parseInt(hours, 10),
+    parseInt(minutes, 10),
+    parseInt(seconds, 10)
+  ));
+
+  // Verify the date is valid (catches things like Feb 30)
+  if (isNaN(date.getTime())) return undefined;
+
+  return date.toISOString();
+}
+
+/**
  * Extract list ID from URL
  */
 function extractListId(url: string): string | null {
@@ -136,6 +176,24 @@ function extractListId(url: string): string | null {
 function extractMfcId(url: string): string | null {
   const match = url.match(/\/item\/(\d+)/);
   return match ? match[1] : null;
+}
+
+/**
+ * Extract the logged-in user's MFC username from an authenticated page.
+ * Looks for profile links in the page header/navigation.
+ */
+async function extractMfcUsername(page: Page): Promise<string | null> {
+  return page.evaluate(() => {
+    const links = document.querySelectorAll('a[href*="/profile/"]');
+    for (const link of Array.from(links)) {
+      const href = (link as HTMLAnchorElement).getAttribute('href') || '';
+      const match = href.match(/\/profile\/([^/?#]+)/);
+      if (match && match[1]) {
+        return match[1];
+      }
+    }
+    return null;
+  });
 }
 
 /**
@@ -204,44 +262,62 @@ export async function fetchUserLists(
     while (hasMorePages) {
       console.log(`[MFC LISTS] Processing page ${currentPage}...`);
 
-      // Extract lists from current page
+      // Extract lists from current page using real MFC selectors
       const pageListData = await page.evaluate((selectors) => {
         const items: any[] = [];
 
-        // Find all list items - MFC uses various selectors
-        const listElements = document.querySelectorAll(
-          '.item-list li, .lists-container li, [class*="list-item"], .list-entry'
-        );
+        // MFC lists overview uses .dgst.list-dgst .dgst-wrapper entries
+        const listElements = document.querySelectorAll(selectors.listEntries);
 
         listElements.forEach(el => {
-          // Find the link to the list
-          const link = el.querySelector('a[href*="/list/"]') as HTMLAnchorElement;
+          // Extract list link and ID from .dgst-anchor a[href*="/list/"]
+          const link = el.querySelector(selectors.listAnchor) as HTMLAnchorElement;
           if (!link) return;
 
-          const href = link.href;
+          const href = link.getAttribute('href') || link.href || '';
           const idMatch = href.match(/\/list\/(\d+)/);
           if (!idMatch) return;
 
-          // Get list name
-          const nameEl = el.querySelector('.name, h3, .title, a[href*="/list/"]');
-          const name = nameEl?.textContent?.trim() || `List ${idMatch[1]}`;
+          // Name from the title attribute of the anchor (most reliable)
+          const name = link.getAttribute('title') || link.textContent?.trim() || `List ${idMatch[1]}`;
 
-          // Get item count (often in format "X items")
-          const countEl = el.querySelector('.count, .meta:not(.category), .item-count');
-          const countText = countEl?.textContent || '';
-          const countMatch = countText.match(/(\d+)/);
-          const itemCount = countMatch ? parseInt(countMatch[1], 10) : 0;
+          // Teaser: div.meta with a title attribute inside .dgst-meta
+          const teaserEl = el.querySelector(selectors.listTeaser) as HTMLElement;
+          const teaser = teaserEl?.getAttribute('title') || teaserEl?.textContent?.trim() || null;
 
-          // Get privacy level
-          const privacyEl = el.querySelector('.meta.category, .privacy, [class*="privacy"]');
-          const privacyText = privacyEl?.textContent || 'public';
+          // Item count: span.meta text matching /(\d+)\s*item/
+          let itemCount = 0;
+          const metaSpans = el.querySelectorAll(selectors.listItemCount);
+          metaSpans.forEach(span => {
+            const text = span.textContent || '';
+            const countMatch = text.match(/(\d+)\s*item/);
+            if (countMatch) {
+              itemCount = parseInt(countMatch[1], 10);
+            }
+          });
+
+          // Privacy from .meta.category text
+          const privacyEl = el.querySelector(selectors.listPrivacy);
+          const privacyText = privacyEl?.textContent?.trim() || 'Public';
+
+          // Icon URL from .dgst-icon img src
+          const iconEl = el.querySelector(selectors.listIcon) as HTMLImageElement;
+          const iconUrl = iconEl?.src || iconEl?.getAttribute('src') || null;
+
+          // Created date from span[title] inside .dgst-meta span.meta
+          // The title attribute contains the full date: MM/DD/YYYY, HH:MM:SS
+          const dateEl = el.querySelector(selectors.listCreatedDate) as HTMLElement;
+          const createdAt = dateEl?.getAttribute('title') || null;
 
           items.push({
             id: idMatch[1],
             name,
             itemCount,
             privacyText,
-            url: href
+            url: href,
+            teaser,
+            createdAt,
+            iconUrl,
           });
         });
 
@@ -259,7 +335,10 @@ export async function fetchUserLists(
           name: item.name,
           itemCount: item.itemCount,
           privacy: parsePrivacy(item.privacyText),
-          url: item.url
+          url: item.url,
+          teaser: item.teaser || undefined,
+          createdAt: parseMfcDate(item.createdAt),
+          iconUrl: item.iconUrl || undefined,
         });
       }
 
@@ -366,6 +445,7 @@ export async function fetchListItems(
     let currentPage = 1;
     let hasMorePages = true;
     let listName: string | undefined;
+    let description: string | undefined;
     let totalItems: number | undefined;
 
     // Paginate through all items in the list
@@ -375,38 +455,30 @@ export async function fetchListItems(
       const pageData = await page.evaluate((selectors) => {
         const itemsOnPage: any[] = [];
 
-        // Get list title (first page only)
-        const titleEl = document.querySelector('h1, .list-title, .title');
+        // Get list title from h1.title (real MFC selector)
+        const titleEl = document.querySelector(selectors.detailTitle);
         const title = titleEl?.textContent?.trim();
 
-        // Get total count if available
-        const countEl = document.querySelector('.total-count, .item-count');
+        // Get total count from .object-stats (contains "{N} items" text)
+        const countEl = document.querySelector(selectors.detailTotalItems);
         const countText = countEl?.textContent || '';
-        const countMatch = countText.match(/(\d+)/);
+        const countMatch = countText.match(/(\d+)\s*item/);
         const total = countMatch ? parseInt(countMatch[1], 10) : undefined;
 
-        // Find all figure items - MFC uses item-icons or similar
-        const figureElements = document.querySelectorAll(
-          '.item-icons li, .item-list li, .gallery li, [class*="figure-item"]'
-        );
+        // Find all item icons using .item-icon a[href*="/item/"]
+        const itemLinks = document.querySelectorAll(selectors.detailItemIcons);
 
-        figureElements.forEach(el => {
-          // Find link to the item page
-          const link = el.querySelector('a[href*="/item/"]') as HTMLAnchorElement;
-          if (!link) return;
-
-          const href = link.href;
+        itemLinks.forEach(link => {
+          const anchor = link as HTMLAnchorElement;
+          const href = anchor.getAttribute('href') || anchor.href || '';
           const idMatch = href.match(/\/item\/(\d+)/);
           if (!idMatch) return;
 
-          // Get figure name
-          const nameEl = el.querySelector('.name, .title, img[alt]');
-          const name = nameEl instanceof HTMLImageElement
-            ? nameEl.alt
-            : nameEl?.textContent?.trim();
+          // Get figure name from img alt text (contains origin, character, scale, manufacturer)
+          const img = anchor.querySelector('img') as HTMLImageElement;
+          const name = img?.alt || undefined;
 
           // Get thumbnail image — upgrade to full-resolution /items/2/ if available
-          const img = el.querySelector('img') as HTMLImageElement;
           const rawImgUrl = img?.src || img?.getAttribute('data-src');
           const imageUrl = rawImgUrl?.replace(/\/upload\/items\/[01]\//, '/upload/items/2/');
 
@@ -417,17 +489,22 @@ export async function fetchListItems(
           });
         });
 
+        // Extract description HTML (only present on first page)
+        const descEl = document.querySelector(selectors.detailDescription);
+        const descriptionHtml = descEl?.innerHTML?.trim() || undefined;
+
         // Check for next page
         const nextLink = document.querySelector(selectors.nextPage);
         const hasNext = nextLink !== null;
 
-        return { items: itemsOnPage, hasNext, title, total };
+        return { items: itemsOnPage, hasNext, title, total, descriptionHtml };
       }, SELECTORS);
 
       // Store list metadata from first page
       if (currentPage === 1) {
         listName = pageData.title;
         totalItems = pageData.total;
+        description = pageData.descriptionHtml;
       }
 
       // Add items from this page
@@ -461,6 +538,7 @@ export async function fetchListItems(
       success: true,
       items,
       listName,
+      description,
       totalItems: totalItems || items.length
     };
 
@@ -523,16 +601,9 @@ export async function fetchCollectionCategory(
 
     await applyCookies(page, cookies);
 
-    // Build collection URL with status filter
-    const collectionUrl = `${MFC_BASE_URL}/?mode=view&tab=collection&page=1&status=${status}&current=keywords&_tb=manager`;
-
-    console.log(`[MFC LISTS] Navigating to collection (${category})...`);
-    await page.goto(collectionUrl, {
-      waitUntil: 'networkidle2',
-      timeout: 30000
-    });
-
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    // Reload to see authenticated view (cookies are now in the browser's cookie jar)
+    await page.reload({ waitUntil: 'networkidle2', timeout: 30000 });
+    await new Promise(resolve => setTimeout(resolve, 1500));
 
     // Check login status
     const userMenu = await page.$(SELECTORS.userMenu);
@@ -543,18 +614,154 @@ export async function fetchCollectionCategory(
       };
     }
 
+    // Extract username for collection URLs
+    // MFC collection pages require &username= parameter (without it, root URL returns 404)
+    const username = await extractMfcUsername(page);
+    if (!username) {
+      console.log('[MFC LISTS] Could not extract MFC username from authenticated page');
+      return {
+        success: false,
+        error: 'MFC_USERNAME_NOT_FOUND: Could not determine MFC username - no profile link found on page'
+      };
+    }
+    console.log(`[MFC LISTS] Detected MFC username: ${sanitizeForLog(username)}`);
+
+    const buildCollectionUrl = (pageNum: number, output: number) => {
+      if (output === 2) {
+        return `${MFC_BASE_URL}/?mode=view&username=${encodeURIComponent(username)}&tab=collection&page=${pageNum}&status=${status}&current=keywords&rootId=-1&categoryId=-1&output=2&sort=activity&order=desc&_tb=user`;
+      }
+      return `${MFC_BASE_URL}/?mode=view&username=${encodeURIComponent(username)}&tab=collection&page=${pageNum}&status=${status}&sort=activity&order=desc&output=${output}&_tb=user`;
+    };
+
+    // Navigate to detailed view first for date field diagnostic
+    const detailedUrl = buildCollectionUrl(1, 0);
+    console.log(`[MFC LISTS] Navigating to collection detailed view (${category})...`);
+    await page.goto(detailedUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+    await new Promise(resolve => setTimeout(resolve, 2000));
+
+    const diagnosticData = await page.evaluate(() => {
+      // Capture the first few item elements in detailed view
+      const results: any[] = [];
+
+      // Try multiple selector patterns MFC might use for detailed view
+      const detailSelectors = [
+        '.result .dgst',
+        '.collection-item',
+        '.item-detail',
+        '.item-entry',
+        'table.listing tr',
+        '.result',
+      ];
+
+      for (const sel of detailSelectors) {
+        const els = document.querySelectorAll(sel);
+        if (els.length > 0) {
+          results.push({
+            selector: sel,
+            count: els.length,
+            // Capture outerHTML of first 2 items (truncated for logging)
+            samples: Array.from(els).slice(0, 2).map(el => el.outerHTML.substring(0, 2000)),
+          });
+        }
+      }
+
+      // Also look for any span[title] with date patterns anywhere on the page
+      const dateSpans = document.querySelectorAll('span[title]');
+      const dateCandidates: string[] = [];
+      dateSpans.forEach(span => {
+        const title = span.getAttribute('title') || '';
+        if (title.match(/\d{1,2}\/\d{1,2}\/\d{4}/) || title.match(/\d{4}-\d{2}-\d{2}/)) {
+          dateCandidates.push(title);
+        }
+      });
+
+      // Check for time elements
+      const timeEls = document.querySelectorAll('time[datetime]');
+      const timeValues: string[] = [];
+      timeEls.forEach(el => {
+        timeValues.push(el.getAttribute('datetime') || '');
+      });
+
+      // Capture page title and a broader DOM snapshot
+      const pageTitle = document.title;
+      const pageUrl = window.location.href;
+
+      // Get all elements with item links to see what's actually on the page
+      const itemLinks = document.querySelectorAll('a[href*="/item/"]');
+      const itemLinkCount = itemLinks.length;
+      const firstItemLinks = Array.from(itemLinks).slice(0, 3).map(a => ({
+        href: (a as HTMLAnchorElement).href,
+        parentTag: a.parentElement?.tagName,
+        parentClass: a.parentElement?.className?.substring(0, 100),
+        grandParentTag: a.parentElement?.parentElement?.tagName,
+        grandParentClass: a.parentElement?.parentElement?.className?.substring(0, 100),
+      }));
+
+      // Get top-level content structure
+      const mainContent = document.querySelector('.content, #content, main, .tbx-target-USER');
+      const contentPreview = mainContent?.innerHTML?.substring(0, 500) || 'NO_MAIN_CONTENT_FOUND';
+
+      return {
+        results, dateCandidates, timeValues, bodyClasses: document.body.className,
+        pageTitle, pageUrl, itemLinkCount, firstItemLinks, contentPreview,
+      };
+    });
+
+    console.log(`[MFC LISTS] Detailed view diagnostic (${category}):`, JSON.stringify(diagnosticData, null, 2));
+
+    // Now switch to grid view (output=2) for the main extraction
     const items: MfcListItem[] = [];
     let currentPage = 1;
     let hasMorePages = true;
+    let globalOffset = 0; // Track position across pages for activity ordering
+
+    // Navigate to first page of grid view
+    const collectionGridUrl = buildCollectionUrl(1, 2);
+    await page.goto(collectionGridUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+    await new Promise(resolve => setTimeout(resolve, 2000));
+
+    // Grid view diagnostic - understand DOM structure
+    const gridDiag = await page.evaluate(() => {
+      const pageTitle = document.title;
+      const pageUrl = window.location.href;
+
+      // Check candidate selectors for grid items
+      const selectorCounts: Record<string, number> = {};
+      for (const sel of ['.item-icons li', '.collection-item', '.item-icon', '.result', '.result-icon', 'li.tbx-btn', '.medium-icon']) {
+        selectorCounts[sel] = document.querySelectorAll(sel).length;
+      }
+
+      // Check for item links and their parent structure
+      const itemLinks = document.querySelectorAll('a[href*="/item/"]');
+      const itemLinkSamples = Array.from(itemLinks).slice(0, 3).map(a => ({
+        href: (a as HTMLAnchorElement).href,
+        parentTag: a.parentElement?.tagName,
+        parentClass: a.parentElement?.className?.substring(0, 100),
+        gpTag: a.parentElement?.parentElement?.tagName,
+        gpClass: a.parentElement?.parentElement?.className?.substring(0, 100),
+      }));
+
+      return { pageTitle, pageUrl, selectorCounts, itemLinkCount: itemLinks.length, itemLinkSamples };
+    });
+    console.log(`[MFC LISTS] Grid view diagnostic (${category}):`, JSON.stringify(gridDiag, null, 2));
+
+    // Check if grid view loaded successfully (MFC renders full header chrome on error pages)
+    if (gridDiag.pageTitle.toLowerCase().includes('error') || gridDiag.pageTitle.includes('404')) {
+      console.log(`[MFC LISTS] Grid view returned error page - collection URL may need updating`);
+      return {
+        success: false,
+        error: `MFC_COLLECTION_URL_ERROR: Collection page returned "${gridDiag.pageTitle}"`
+      };
+    }
 
     while (hasMorePages) {
-      console.log(`[MFC LISTS] Processing ${category} page ${currentPage}...`);
+      console.log(`[MFC LISTS] Processing ${category} page ${currentPage} (globalOffset=${globalOffset})...`);
 
       const pageData = await page.evaluate((catStatus: string) => {
         const itemsOnPage: any[] = [];
 
-        // MFC Manager uses item-icons for collection view
-        const figureElements = document.querySelectorAll('.item-icons li, .collection-item');
+        // MFC grid view uses .item-icon containers (each wraps an anchor to /item/ID)
+        const figureElements = document.querySelectorAll('.item-icon');
 
         figureElements.forEach(el => {
           const link = el.querySelector('a[href*="/item/"]') as HTMLAnchorElement;
@@ -578,18 +785,25 @@ export async function fetchCollectionCategory(
           });
         });
 
-        // Check for next page
-        const nextLink = document.querySelector('a[rel="next"], .pagination .next a');
-        const hasNext = nextLink !== null;
-
-        return { items: itemsOnPage, hasNext };
+        return { items: itemsOnPage };
       }, category);
+
+      // Assign activity order based on position in activity-sorted pages
+      for (const item of pageData.items) {
+        item.mfcActivityOrder = globalOffset;
+        globalOffset++;
+      }
 
       items.push(...pageData.items);
 
-      if (pageData.hasNext) {
+      console.log(`[MFC LISTS] Page ${currentPage}: ${pageData.items.length} items, globalOffset now ${globalOffset}`);
+
+      // Keep paginating until MFC returns an empty page. The toolbox UI
+      // doesn't render reliable rel="next" links, and the last page may
+      // contain exactly MFC_GRID_PAGE_SIZE items, so we can't stop early.
+      if (pageData.items.length > 0) {
         currentPage++;
-        const nextUrl = `${MFC_BASE_URL}/?mode=view&tab=collection&page=${currentPage}&status=${status}&current=keywords&_tb=manager`;
+        const nextUrl = buildCollectionUrl(currentPage, 2);
         await page.goto(nextUrl, {
           waitUntil: 'networkidle2',
           timeout: 30000
