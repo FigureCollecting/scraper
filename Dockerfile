@@ -145,7 +145,7 @@ COPY package*.json ./
 
 # Install only production dependencies
 RUN npm config set fetch-timeout 300000 && npm config set fetch-retry-maxtimeout 300000
-RUN timeout 600 npm ci --no-audit --no-fund --omit=dev
+RUN timeout 600 npm install --no-audit --no-fund --omit=dev
 
 # Remove any Chrome that might have been downloaded by Puppeteer
 RUN rm -rf /root/.cache/puppeteer \
