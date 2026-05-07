@@ -1,7 +1,7 @@
 # =============================================================================
 # BASE STAGE - Secure Ubuntu 24.04 + Node 24.13.1 LTS + Chrome 146.0.7680.31
 # =============================================================================
-FROM ubuntu:24.04 AS base
+FROM ubuntu:26.04 AS base
 
 # Cache-bust ARG to invalidate Docker layers when dependencies change
 ARG CACHE_BUST=2026-02-28-chrome-146-vuln-fix
