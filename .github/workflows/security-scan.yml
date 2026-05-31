@@ -117,7 +117,8 @@ jobs:
 
       - name: Check for critical vulnerabilities
         run: |
-          audit_output=$(npm audit --json --omit=dev)
+          # Use || true because npm audit returns exit code 1 for ANY vulnerability
+          audit_output=$(npm audit --json --omit=dev 2>/dev/null || true)
           critical_count=$(echo "$audit_output" | jq '.metadata.vulnerabilities.critical // 0')
           high_count=$(echo "$audit_output" | jq '.metadata.vulnerabilities.high // 0')
 

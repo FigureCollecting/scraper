@@ -1,10 +1,10 @@
 # =============================================================================
-# BASE STAGE - Secure Ubuntu 24.04 + Node 24.13.1 LTS + Chrome 146.0.7680.31
+# BASE STAGE - Secure Ubuntu 24.04 + Node 24.16.0 LTS + Chrome 149.0.7827.54
 # =============================================================================
 FROM ubuntu:24.04 AS base
 
 # Cache-bust ARG to invalidate Docker layers when dependencies change
-ARG CACHE_BUST=2026-02-28-chrome-146-vuln-fix
+ARG CACHE_BUST=2026-05-31-chrome-149-node-24.16-vuln-fix
 
 # Update all packages for latest security patches (openssl, gnupg, glibc)
 # Install Node.js 24 using official binaries (avoids NodeSource CVE false positives)
@@ -12,7 +12,7 @@ RUN apt-get update && apt-get upgrade -y \
     && apt-get install -y \
     curl \
     xz-utils \
-    && NODE_VERSION=v24.13.1 \
+    && NODE_VERSION=v24.16.0 \
     && curl -fsSLO https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-linux-x64.tar.xz \
     && tar -xJf node-${NODE_VERSION}-linux-x64.tar.xz -C /usr/local --strip-components=1 \
     && rm node-${NODE_VERSION}-linux-x64.tar.xz \
@@ -63,9 +63,9 @@ RUN apt-get update && apt-get upgrade -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# Download and install Chrome for Testing (146.0.7680.31) - latest stable, fixes all known CVEs
+# Download and install Chrome for Testing (149.0.7827.54) - latest stable, fixes all known CVEs
 RUN apt-get update && apt-get install -y wget unzip \
-    && wget -q https://storage.googleapis.com/chrome-for-testing-public/146.0.7680.31/linux64/chrome-linux64.zip \
+    && wget -q https://storage.googleapis.com/chrome-for-testing-public/149.0.7827.54/linux64/chrome-linux64.zip \
     && unzip chrome-linux64.zip \
     && mv chrome-linux64 /opt/chrome \
     && rm chrome-linux64.zip \
