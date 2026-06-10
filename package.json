@@ -29,6 +29,9 @@
   "overrides": {
     "qs": "^6.14.1",
     "rimraf": "^6.1.2",
+    "basic-ftp": "^5.3.1",
+    "undici": "^7.24.0",
+    "path-to-regexp": "^8.4.0",
     "typescript": {
       "glob": "^10.5.0"
     }
@@ -41,9 +44,10 @@
     "@types/supertest": "^6.0.3",
     "jest": "^30.2.0",
     "mongodb": "^7.1.0",
+    "msw": "^2.14.6",
     "supertest": "^7.1.4",
     "testcontainers": "^11.7.1",
-    "ts-jest": "^29.4.5",
+    "ts-jest": "^29.4.11",
     "ts-node": "^10.9.1",
     "ts-node-dev": "^2.0.0",
     "tsx": "^4.21.0",
