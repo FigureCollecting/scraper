@@ -1,3 +1,6 @@
+// Tracing must initialise before any instrumented module (express, http) is
+// imported, so OpenTelemetry auto-instrumentation can patch them. Keep first.
+import './tracing';
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';

@@ -42,7 +42,9 @@ tmp
 *.crt
 *.p12
 *.pfx
-.npmrc
+# .npmrc is intentionally NOT ignored: it carries only the @figurecollecting
+# registry mapping with a ${NODE_AUTH_TOKEN} placeholder (never a real token).
+# The token is injected at build time via a BuildKit secret mount, not a layer.
 .yarnrc
 secrets
 secrets.*
