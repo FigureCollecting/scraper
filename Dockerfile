@@ -84,11 +84,12 @@ ENV PUPPETEER_SKIP_DOWNLOAD=true
 FROM base AS development
 
 # Copy package files
-COPY package*.json ./
+COPY package*.json .npmrc ./
 
 # Install all dependencies (Puppeteer won't download Chrome due to ENV vars)
 RUN npm config set fetch-timeout 300000 && npm config set fetch-retry-maxtimeout 300000
-RUN timeout 600 npm install --no-audit --no-fund
+RUN --mount=type=secret,id=node_auth_token \
+    NODE_AUTH_TOKEN="$(cat /run/secrets/node_auth_token)" timeout 600 npm install --no-audit --no-fund
 
 # Remove any Chrome that might have been downloaded by Puppeteer
 RUN rm -rf /root/.cache/puppeteer \
@@ -118,11 +119,12 @@ CMD ["npm", "run", "test:ci"]
 FROM base AS builder
 
 # Copy package files
-COPY package*.json ./
+COPY package*.json .npmrc ./
 
 # Install all dependencies for build
 RUN npm config set fetch-timeout 300000 && npm config set fetch-retry-maxtimeout 300000
-RUN timeout 600 npm install --no-audit --no-fund
+RUN --mount=type=secret,id=node_auth_token \
+    NODE_AUTH_TOKEN="$(cat /run/secrets/node_auth_token)" timeout 600 npm install --no-audit --no-fund
 
 # Remove any Chrome that might have been downloaded by Puppeteer
 RUN rm -rf /root/.cache/puppeteer \
@@ -141,11 +143,12 @@ RUN npm run build
 FROM base AS production
 
 # Copy package files
-COPY package*.json ./
+COPY package*.json .npmrc ./
 
 # Install only production dependencies
 RUN npm config set fetch-timeout 300000 && npm config set fetch-retry-maxtimeout 300000
-RUN timeout 600 npm install --no-audit --no-fund --omit=dev
+RUN --mount=type=secret,id=node_auth_token \
+    NODE_AUTH_TOKEN="$(cat /run/secrets/node_auth_token)" timeout 600 npm install --no-audit --no-fund --omit=dev
 
 # Remove any Chrome that might have been downloaded by Puppeteer
 RUN rm -rf /root/.cache/puppeteer \

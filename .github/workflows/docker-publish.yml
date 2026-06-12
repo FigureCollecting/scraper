@@ -89,6 +89,8 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          secrets: |
+            node_auth_token=${{ secrets.GITHUB_TOKEN }}
 
       - name: Debug - Show generated tags
         run: |
@@ -158,6 +160,9 @@ jobs:
     needs: build-and-push
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -175,6 +180,8 @@ jobs:
           tags: local-scan:latest
           # No cache-from to ensure fresh build with latest package-lock.json
           no-cache: true
+          secrets: |
+            node_auth_token=${{ secrets.GITHUB_TOKEN }}
 
       - name: Install security tools
         run: |
