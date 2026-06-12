@@ -38,6 +38,8 @@
     "rimraf": "^6.1.2",
     "basic-ftp": "^5.3.1",
     "undici": "^7.24.0",
+    "protobufjs": "^7.6.4",
+    "@grpc/grpc-js": "^1.14.4",
     "path-to-regexp": "^8.4.0",
     "typescript": {
       "glob": "^10.5.0"
