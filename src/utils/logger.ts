@@ -12,7 +12,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { getTraceContext } from '@figurecollecting/fc-shared';
+import { getTraceContext, redactValue } from '@figurecollecting/fc-shared';
 
 export interface Logger {
   debug: (namespace: string, message: string, data?: any) => void;
@@ -111,7 +111,7 @@ class DebugLogger implements Logger {
     if (!this.isNamespaceEnabled(namespace)) return;
 
     const timestamp = new Date().toISOString();
-    const sanitizedData = this.sanitizeData(data);
+    const sanitizedData = redactValue(this.sanitizeData(data));
 
     console.log(`[${timestamp}] [DEBUG] [${namespace}]${this.traceTag()} ${message}`,
       sanitizedData ? JSON.stringify(sanitizedData, null, 2) : '');
@@ -119,7 +119,7 @@ class DebugLogger implements Logger {
 
   info(message: string, data?: any): void {
     const timestamp = new Date().toISOString();
-    const sanitizedData = this.sanitizeData(data);
+    const sanitizedData = redactValue(this.sanitizeData(data));
 
     console.log(`[${timestamp}] [INFO]${this.traceTag()} ${message}`,
       sanitizedData ? JSON.stringify(sanitizedData, null, 2) : '');
@@ -127,7 +127,7 @@ class DebugLogger implements Logger {
 
   warn(message: string, data?: any): void {
     const timestamp = new Date().toISOString();
-    const sanitizedData = this.sanitizeData(data);
+    const sanitizedData = redactValue(this.sanitizeData(data));
 
     console.warn(`[${timestamp}] [WARN]${this.traceTag()} ${message}`,
       sanitizedData ? JSON.stringify(sanitizedData, null, 2) : '');
@@ -145,7 +145,7 @@ class DebugLogger implements Logger {
         name: error.name
       };
     } else {
-      errorData = this.sanitizeData(error);
+      errorData = redactValue(this.sanitizeData(error));
     }
 
     console.error(`[${timestamp}] [ERROR]${this.traceTag()} ${message}`,
