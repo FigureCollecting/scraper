@@ -1,18 +1,23 @@
 // Tracing must initialise before any instrumented module (express, http) is
 // imported, so OpenTelemetry auto-instrumentation can patch them. Keep first.
-import './tracing';
+import './tracing.js';
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import scraperRoutes from './routes/scraper';
-import syncRoutes from './routes/sync';
-import * as packageJson from '../package.json';
-import { scraperDebug } from './utils/logger';
+import { createRequire } from 'module';
+import scraperRoutes from './routes/scraper.js';
+import syncRoutes from './routes/sync.js';
+import { scraperDebug } from './utils/logger.js';
+
+// Import browser pool functionality
+import { initializeBrowserPool, BrowserPool } from './services/genericScraper.js';
 
 dotenv.config();
 
-// Import browser pool functionality
-import { initializeBrowserPool, BrowserPool } from './services/genericScraper';
+// Read package.json for the version without a JSON import assertion (keeps the
+// module graph pure ESM and sidesteps the experimental JSON-modules warning).
+const require = createRequire(import.meta.url);
+const packageJson = require('../package.json') as { version: string };
 
 const app = express();
 const PORT = process.env.PORT || 3080;

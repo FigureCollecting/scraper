@@ -16,12 +16,12 @@
  */
 
 import express from 'express';
-import { sanitizeForLog, sanitizeObjectForLog } from '../utils/security';
-import { validateMfcCookies, exportMfcCsv, MfcCookies } from '../services/mfcCsvExporter';
-import { fetchUserLists, fetchListItems, fetchCollectionCategory } from '../services/mfcListsFetcher';
-import { getScrapeQueue, resetScrapeQueue } from '../services/scrapeQueue';
-import { executeMfcSync, syncFromCsv, getSyncStatus, parseMfcCsv } from '../services/syncOrchestrator';
-import { getSessionManager } from '../services/sessionManager';
+import { sanitizeForLog, sanitizeObjectForLog } from '../utils/security.js';
+import { validateMfcCookies, exportMfcCsv, MfcCookies } from '../services/mfcCsvExporter.js';
+import { fetchUserLists, fetchListItems, fetchCollectionCategory } from '../services/mfcListsFetcher.js';
+import { getScrapeQueue, resetScrapeQueue } from '../services/scrapeQueue.js';
+import { executeMfcSync, syncFromCsv, getSyncStatus, parseMfcCsv } from '../services/syncOrchestrator.js';
+import { getSessionManager } from '../services/sessionManager.js';
 
 const router = express.Router();
 

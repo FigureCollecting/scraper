@@ -171,7 +171,7 @@ describe('genericScraper - BrowserPool extended', () => {
     mockBrowser = {
       newPage: jest.fn().mockResolvedValue(mockPage),
       close: jest.fn().mockResolvedValue(undefined),
-      isConnected: jest.fn().mockReturnValue(true),
+      connected: true,
       createBrowserContext: jest.fn().mockResolvedValue(mockContext),
     };
 
@@ -210,7 +210,7 @@ describe('genericScraper - BrowserPool extended', () => {
     it('should warn when browsers are disconnected', async () => {
       const disconnected = {
         ...mockBrowser,
-        isConnected: jest.fn().mockReturnValue(false),
+        connected: false,
       };
       (BrowserPool as any).isInitialized = true;
       (BrowserPool as any).browsers = [mockBrowser, disconnected];
@@ -220,9 +220,11 @@ describe('genericScraper - BrowserPool extended', () => {
       expect(health.warnings.some((w: string) => w.includes('disconnected'))).toBe(true);
     });
 
-    it('should handle isConnected() throwing', async () => {
+    it('should handle the connected getter throwing', async () => {
+      // Puppeteer 25: `connected` is a getter; a throwing getter is the
+      // faithful equivalent of the old isConnected() throwing.
       const broken = {
-        isConnected: jest.fn().mockImplementation(() => { throw new Error('broken'); }),
+        get connected(): boolean { throw new Error('broken'); },
       };
       (BrowserPool as any).isInitialized = true;
       (BrowserPool as any).browsers = [broken];
@@ -251,7 +253,7 @@ describe('genericScraper - BrowserPool extended', () => {
     it('should not return disconnected browser', async () => {
       const disconnected = {
         ...mockBrowser,
-        isConnected: jest.fn().mockReturnValue(false),
+        connected: false,
       };
       (BrowserPool as any).isInitialized = true;
       (BrowserPool as any).browsers = [];
@@ -273,9 +275,10 @@ describe('genericScraper - BrowserPool extended', () => {
       expect(extra.close).toHaveBeenCalled();
     });
 
-    it('should handle isConnected check error', async () => {
+    it('should handle the connected check error', async () => {
+      // Puppeteer 25: `connected` getter throwing must be swallowed by returnBrowser
       const broken = {
-        isConnected: jest.fn().mockImplementation(() => { throw new Error('check failed'); }),
+        get connected(): boolean { throw new Error('check failed'); },
       };
       (BrowserPool as any).isInitialized = true;
       (BrowserPool as any).browsers = [];
@@ -288,7 +291,7 @@ describe('genericScraper - BrowserPool extended', () => {
   describe('closeAll - error handling', () => {
     it('should handle close error gracefully', async () => {
       const errorBrowser = {
-        isConnected: jest.fn().mockReturnValue(true),
+        connected: true,
         close: jest.fn().mockRejectedValue(new Error('Close error')),
       };
       (BrowserPool as any).browsers = [errorBrowser];
@@ -299,7 +302,7 @@ describe('genericScraper - BrowserPool extended', () => {
 
     it('should handle non-Error thrown from close', async () => {
       const errorBrowser = {
-        isConnected: jest.fn().mockReturnValue(true),
+        connected: true,
         close: jest.fn().mockRejectedValue('string error'),
       };
       (BrowserPool as any).browsers = [errorBrowser];
@@ -353,7 +356,7 @@ describe('genericScraper - scrapeMFC', () => {
     mockBrowser = {
       newPage: jest.fn().mockResolvedValue(mockPage),
       close: jest.fn().mockResolvedValue(undefined),
-      isConnected: jest.fn().mockReturnValue(true),
+      connected: true,
       createBrowserContext: jest.fn().mockResolvedValue(mockContext),
     };
 
@@ -442,7 +445,7 @@ describe('genericScraper - scrapeGeneric extended', () => {
     mockBrowser = {
       newPage: jest.fn().mockResolvedValue(mockPage),
       close: jest.fn().mockResolvedValue(undefined),
-      isConnected: jest.fn().mockReturnValue(true),
+      connected: true,
       createBrowserContext: jest.fn().mockResolvedValue(mockContext),
     };
 

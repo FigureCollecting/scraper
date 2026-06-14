@@ -56,8 +56,8 @@ describe('Performance Tests - Browser Pool Efficiency', () => {
       createIncognitoBrowserContext: jest.fn().mockResolvedValue({
         newPage: jest.fn().mockResolvedValue(mockPage),
       } as any),
-      isConnected: jest.fn().mockReturnValue(true),
-    } as jest.Mocked<puppeteer.Browser>;
+      connected: true,
+    } as unknown as jest.Mocked<puppeteer.Browser>;
   });
 
   describe('Browser Pool Initialization Performance', () => {

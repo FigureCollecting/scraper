@@ -17,7 +17,7 @@
  */
 
 import * as cheerio from 'cheerio';
-import { lookupLabel, normalizeRole, type ExtractionStrategy } from './mfcLabelRegistry';
+import { lookupLabel, normalizeRole, type ExtractionStrategy } from './mfcLabelRegistry.js';
 
 /**
  * MFC field data extracted from the page

@@ -1,6 +1,6 @@
-import { BrowserPool } from './genericScraper';
+import { BrowserPool } from './genericScraper.js';
 import { Browser, Page } from 'puppeteer';
-import { sanitizeForLog } from '../utils/security';
+import { sanitizeForLog } from '../utils/security.js';
 
 export interface MfcCookies {
   PHPSESSID: string;

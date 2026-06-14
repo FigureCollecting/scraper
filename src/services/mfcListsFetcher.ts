@@ -1,7 +1,7 @@
-import { BrowserPool } from './genericScraper';
+import { BrowserPool } from './genericScraper.js';
 import { Browser, Page } from 'puppeteer';
-import { MfcCookies } from './mfcCsvExporter';
-import { sanitizeForLog } from '../utils/security';
+import { MfcCookies } from './mfcCsvExporter.js';
+import { sanitizeForLog } from '../utils/security.js';
 
 export interface MfcList {
   id: string;

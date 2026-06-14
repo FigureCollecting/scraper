@@ -11,18 +11,18 @@
  * Maintains "fresh context" promise - cookies are used then discarded.
  */
 
-import { MfcCookies, exportMfcCsv, validateMfcCookies, CsvExportResult } from './mfcCsvExporter';
-import { fetchUserLists, fetchListItems, fetchCollectionCategory, MfcList, MfcListItem } from './mfcListsFetcher';
-import { getScrapeQueue, QueuePriority, ItemStatus, EnqueueResult, QueueStats } from './scrapeQueue';
-import { calculateCacheTtl, isCacheValid } from './cacheConfig';
-import { sanitizeForLog } from '../utils/security';
+import { MfcCookies, exportMfcCsv, validateMfcCookies, CsvExportResult } from './mfcCsvExporter.js';
+import { fetchUserLists, fetchListItems, fetchCollectionCategory, MfcList, MfcListItem } from './mfcListsFetcher.js';
+import { getScrapeQueue, QueuePriority, ItemStatus, EnqueueResult, QueueStats } from './scrapeQueue.js';
+import { calculateCacheTtl, isCacheValid } from './cacheConfig.js';
+import { sanitizeForLog } from '../utils/security.js';
 import {
   registerWebhookConfig,
   unregisterWebhookConfig,
   notifyPhaseChange,
   notifyListsSync,
   WebhookConfig
-} from './webhookClient';
+} from './webhookClient.js';
 
 /**
  * Allowlist of valid MFC cookie property names.

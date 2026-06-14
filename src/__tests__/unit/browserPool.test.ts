@@ -72,9 +72,9 @@ describe('Browser Pool Management', () => {
     mockBrowser = {
       newPage: jest.fn().mockResolvedValue(mockPage),
       close: jest.fn().mockResolvedValue(undefined),
-      isConnected: jest.fn().mockReturnValue(true),
+      connected: true,
       createBrowserContext: jest.fn().mockResolvedValue(mockContext),
-    } as jest.Mocked<puppeteer.Browser>;
+    } as unknown as jest.Mocked<puppeteer.Browser>;
 
     // Setup launch mock to return our mock browser
     (puppeteer.launch as jest.Mock).mockResolvedValue(mockBrowser);
@@ -605,17 +605,17 @@ describe('Browser Pool Management', () => {
       }
     });
 
-    it('should handle browser close with isConnected check', async () => {
+    it('should handle browser close with connected check', async () => {
       const { BrowserPool } = await import('../../services/genericScraper');
 
-      // Create a mock browser with isConnected
+      // Puppeteer 25: connection state is the `connected` getter, not isConnected()
       const connectedBrowser = {
-        isConnected: jest.fn().mockResolvedValue(true),
+        connected: true,
         close: jest.fn().mockResolvedValue(undefined),
       };
 
       const disconnectedBrowser = {
-        isConnected: jest.fn().mockResolvedValue(false),
+        connected: false,
         close: jest.fn().mockResolvedValue(undefined),
       };
 
@@ -625,11 +625,9 @@ describe('Browser Pool Management', () => {
       await BrowserPool.closeAll();
 
       // Connected browser should be closed
-      expect(connectedBrowser.isConnected).toHaveBeenCalled();
       expect(connectedBrowser.close).toHaveBeenCalled();
 
-      // Disconnected browser should check but not close
-      expect(disconnectedBrowser.isConnected).toHaveBeenCalled();
+      // Disconnected browser should be checked but not closed
       expect(disconnectedBrowser.close).not.toHaveBeenCalled();
     });
 

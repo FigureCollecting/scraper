@@ -38,6 +38,7 @@ interface MockPage {
 interface MockBrowser {
   newPage: MockFn;
   close: MockFn;
+  connected: boolean;  // Puppeteer 25: `connected` getter replaced the isConnected() method
   createBrowserContext: MockFn;  // Standard Puppeteer API
   createIncognitoBrowserContext: MockFn;  // Deprecated, kept for compatibility
 }
@@ -92,6 +93,7 @@ export const createMockBrowser = (): MockBrowser => {
   return {
     newPage: jest.fn().mockResolvedValue(createMockPage()) as any,
     close: jest.fn().mockResolvedValue(undefined) as any,
+    connected: true,  // Puppeteer 25: freshly launched browser reports connected via getter
     createBrowserContext: jest.fn().mockResolvedValue(mockContext) as any,  // Standard Puppeteer API
     createIncognitoBrowserContext: jest.fn().mockResolvedValue(mockContext) as any,  // Deprecated
   };

@@ -1,5 +1,5 @@
 import { load, CheerioAPI } from 'cheerio';
-import { lookupLabel } from './mfcLabelRegistry';
+import { lookupLabel } from './mfcLabelRegistry.js';
 
 export interface IRelease {
   date?: Date;
