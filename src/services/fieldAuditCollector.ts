@@ -9,7 +9,7 @@
  */
 
 import * as cheerio from 'cheerio';
-import { lookupLabel } from './mfcLabelRegistry';
+import { lookupLabel } from './mfcLabelRegistry.js';
 
 export interface IFieldAuditEntry {
   label: string;                // Raw .data-label text

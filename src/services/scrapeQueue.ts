@@ -13,12 +13,12 @@
  * - COLD: Background enrichment (lowest priority)
  */
 
-import { scrapeMFC, ScrapedData, BrowserPool } from './genericScraper';
-import { calculateRefreshPriority } from './cacheConfig';
-import { sanitizeForLog } from '../utils/security';
-import { getSessionManager, resetSessionManager, SessionManager, SessionPausedEvent } from './sessionManager';
-import { notifyItemSuccess, notifyItemFailed, notifyItemSkipped } from './webhookClient';
-import { enrichmentLogger } from '../utils/logger';
+import { scrapeMFC, ScrapedData, BrowserPool } from './genericScraper.js';
+import { calculateRefreshPriority } from './cacheConfig.js';
+import { sanitizeForLog } from '../utils/security.js';
+import { getSessionManager, resetSessionManager, SessionManager, SessionPausedEvent } from './sessionManager.js';
+import { notifyItemSuccess, notifyItemFailed, notifyItemSkipped } from './webhookClient.js';
+import { enrichmentLogger } from '../utils/logger.js';
 
 // ============================================================================
 // Types and Interfaces

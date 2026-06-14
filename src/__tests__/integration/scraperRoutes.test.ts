@@ -334,7 +334,7 @@ describe('Scraper Routes Integration Tests', () => {
     });
 
     it('should return configs even if empty', async () => {
-      mockedGenericScraper.SITE_CONFIGS = {};
+      mockedGenericScraper.SITE_CONFIGS = {} as typeof mockedGenericScraper.SITE_CONFIGS;
 
       const response = await request(app)
         .get('/configs')
@@ -440,7 +440,7 @@ describe('Scraper Routes Integration Tests', () => {
 
     it('should successfully reset browser pool with valid token', async () => {
       // Mock BrowserPool.reset as async
-      const mockReset = jest.fn().mockResolvedValue(undefined);
+      const mockReset = jest.fn<(...args: any[]) => any>().mockResolvedValue(undefined);
       mockedGenericScraper.BrowserPool = {
         reset: mockReset,
         initialize: jest.fn(),
@@ -463,7 +463,7 @@ describe('Scraper Routes Integration Tests', () => {
 
     it('should return 500 if pool reset fails', async () => {
       const resetError = new Error('Pool reset failed');
-      const mockReset = jest.fn().mockRejectedValue(resetError);
+      const mockReset = jest.fn<(...args: any[]) => any>().mockRejectedValue(resetError);
       
       mockedGenericScraper.BrowserPool = {
         reset: mockReset,
@@ -512,7 +512,7 @@ describe('Scraper Routes Integration Tests', () => {
     });
 
     it('should handle pool reset with no errors even if pool is already reset', async () => {
-      const mockReset = jest.fn().mockResolvedValue(undefined);
+      const mockReset = jest.fn<(...args: any[]) => any>().mockResolvedValue(undefined);
       mockedGenericScraper.BrowserPool = {
         reset: mockReset,
         initialize: jest.fn(),

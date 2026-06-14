@@ -1,6 +1,6 @@
 import express from 'express';
-import { scrapeMFC, scrapeGeneric, SITE_CONFIGS, ScrapeConfig, BrowserPool } from '../services/genericScraper';
-import { sanitizeForLog, sanitizeObjectForLog, isValidMfcUrl } from '../utils/security';
+import { scrapeMFC, scrapeGeneric, SITE_CONFIGS, ScrapeConfig, BrowserPool } from '../services/genericScraper.js';
+import { sanitizeForLog, sanitizeObjectForLog, isValidMfcUrl } from '../utils/security.js';
 
 const router = express.Router();
 

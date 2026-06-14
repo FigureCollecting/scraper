@@ -47,9 +47,15 @@ module.exports = {
   maxWorkers: 4,
   forceExit: true, // Force Jest to exit after all tests complete
 
-  // Enhanced Puppeteer Mocking
+  // Enhanced Puppeteer Mocking + ESM-import resolution.
+  // Source is now pure ESM (NodeNext): relative imports carry explicit `.js`
+  // extensions. Tests still run through ts-jest's CommonJS transform (so
+  // jest.mock hoisting keeps working), so we strip the trailing `.js` from
+  // relative specifiers back to the `.ts` source. The puppeteer mock mapping
+  // MUST stay first — moduleNameMapper is evaluated top-to-bottom.
   moduleNameMapper: {
-    '^puppeteer$': '<rootDir>/src/__tests__/__mocks__/puppeteer.ts'
+    '^puppeteer$': '<rootDir>/src/__tests__/__mocks__/puppeteer.ts',
+    '^(\\.{1,2}/.*)\\.js$': '$1'
   },
   
   // Comprehensive Mock Management
