@@ -144,7 +144,7 @@ describe('genericScraper - BrowserPool extended', () => {
     mockPage = {
       goto: jest.fn().mockResolvedValue({ status: () => 200 }),
       title: jest.fn().mockResolvedValue('Test Page'),
-      evaluate: jest.fn().mockImplementation((fn: any, ...args: any[]) => {
+      evaluate: jest.fn().mockImplementation((fn: any) => {
         if (typeof fn === 'function') {
           const fnStr = fn.toString();
           if (fnStr.includes('document.body.innerText') || fnStr.includes('document.body.textContent')) {
@@ -329,7 +329,7 @@ describe('genericScraper - scrapeMFC', () => {
     mockPage = {
       goto: jest.fn().mockResolvedValue({ status: () => 200 }),
       title: jest.fn().mockResolvedValue('Test Page'),
-      evaluate: jest.fn().mockImplementation((fn: any, ...args: any[]) => {
+      evaluate: jest.fn().mockImplementation((fn: any) => {
         if (typeof fn === 'function') {
           const fnStr = fn.toString();
           if (fnStr.includes('document.body.innerText') || fnStr.includes('document.body.textContent')) {
@@ -418,7 +418,7 @@ describe('genericScraper - scrapeGeneric extended', () => {
     mockPage = {
       goto: jest.fn().mockResolvedValue({ status: () => 200 }),
       title: jest.fn().mockResolvedValue('Test Page'),
-      evaluate: jest.fn().mockImplementation((fn: any, ...args: any[]) => {
+      evaluate: jest.fn().mockImplementation((fn: any) => {
         if (typeof fn === 'function') {
           const fnStr = fn.toString();
           if (fnStr.includes('document.body.innerText') || fnStr.includes('document.body.textContent')) {

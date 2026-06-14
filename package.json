@@ -9,6 +9,8 @@
     "start": "node --import ./dist/tracing.js dist/index.js",
     "dev": "tsx watch --env-file=.env src/index.ts",
     "lint": "echo 'No linter configured'",
+    "typecheck": "tsc --noEmit",
+    "typecheck:tests": "tsc --noEmit -p tsconfig.test.json",
     "test": "jest --config jest.config.cjs --testPathIgnorePatterns='inter-service'",
     "test:unit": "jest --config jest.config.cjs src/__tests__/unit",
     "test:integration": "jest --config jest.config.cjs src/__tests__/integration --testPathIgnorePatterns='inter-service'",

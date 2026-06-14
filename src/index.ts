@@ -16,8 +16,10 @@ dotenv.config();
 
 // Read package.json for the version without a JSON import assertion (keeps the
 // module graph pure ESM and sidesteps the experimental JSON-modules warning).
-const require = createRequire(import.meta.url);
-const packageJson = require('../package.json') as { version: string };
+// Named `requireJson` (not `require`) so a CommonJS transpile of this file does
+// not collide with the ambient module-level `require`.
+const requireJson = createRequire(import.meta.url);
+const packageJson = requireJson('../package.json') as { version: string };
 
 const app = express();
 const PORT = process.env.PORT || 3080;

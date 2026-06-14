@@ -1,13 +1,14 @@
 import { jest } from '@jest/globals';
 import puppeteer from 'puppeteer';
+import type { Page, Browser } from 'puppeteer';
 import { scrapeGeneric, initializeBrowserPool, BrowserPool } from '../../services/genericScraper';
 import { createMockBrowser } from '../__mocks__/puppeteer';
 
 // Centralized Puppeteer mock from moduleNameMapper
 
 describe('Performance Tests - Browser Pool Efficiency', () => {
-  let mockPage: jest.Mocked<puppeteer.Page>;
-  let mockBrowser: jest.Mocked<puppeteer.Browser>;
+  let mockPage: jest.Mocked<Page>;
+  let mockBrowser: jest.Mocked<Browser>;
   let launchCallCount: number;
 
   beforeEach(() => {
@@ -22,42 +23,42 @@ describe('Performance Tests - Browser Pool Efficiency', () => {
     (BrowserPool as any).browsers = [];
     
     // Setup launch mock to track calls
-    (puppeteer.launch as jest.Mock).mockImplementation(() => {
+    jest.mocked(puppeteer.launch).mockImplementation(() => {
       launchCallCount++;
-      return Promise.resolve(createMockBrowser());
+      return Promise.resolve(createMockBrowser() as unknown as Browser);
     });
-    
+
     // Mock BrowserPool.getBrowser method
-    jest.spyOn(BrowserPool, 'getBrowser').mockResolvedValue(createMockBrowser());
+    jest.spyOn(BrowserPool, 'getBrowser').mockResolvedValue(createMockBrowser() as unknown as Browser);
     
     // Create mock page with resolved methods
     mockPage = {  
-      goto: jest.fn().mockResolvedValue({ status: () => 200 }),
-      content: jest.fn().mockResolvedValue('<html>Mock Content</html>'),
-      title: jest.fn().mockResolvedValue('Performance Test Page'),
-      screenshot: jest.fn().mockResolvedValue(Buffer.from('screenshot')),
-      evaluate: jest.fn().mockResolvedValue({ performance: 'test' }),
-      waitForFunction: jest.fn().mockResolvedValue(undefined),
-      close: jest.fn().mockResolvedValue(undefined),
-      setViewport: jest.fn().mockResolvedValue(undefined),
-      setUserAgent: jest.fn().mockResolvedValue(undefined),
-      setExtraHTTPHeaders: jest.fn().mockResolvedValue(undefined),
-      waitForSelector: jest.fn().mockResolvedValue(undefined),
-      waitForTimeout: jest.fn().mockResolvedValue(undefined),
-      on: jest.fn().mockReturnValue(undefined),
+      goto: jest.fn<(...args: any[]) => any>().mockResolvedValue({ status: () => 200 }),
+      content: jest.fn<(...args: any[]) => any>().mockResolvedValue('<html>Mock Content</html>'),
+      title: jest.fn<(...args: any[]) => any>().mockResolvedValue('Performance Test Page'),
+      screenshot: jest.fn<(...args: any[]) => any>().mockResolvedValue(Buffer.from('screenshot')),
+      evaluate: jest.fn<(...args: any[]) => any>().mockResolvedValue({ performance: 'test' }),
+      waitForFunction: jest.fn<(...args: any[]) => any>().mockResolvedValue(undefined),
+      close: jest.fn<(...args: any[]) => any>().mockResolvedValue(undefined),
+      setViewport: jest.fn<(...args: any[]) => any>().mockResolvedValue(undefined),
+      setUserAgent: jest.fn<(...args: any[]) => any>().mockResolvedValue(undefined),
+      setExtraHTTPHeaders: jest.fn<(...args: any[]) => any>().mockResolvedValue(undefined),
+      waitForSelector: jest.fn<(...args: any[]) => any>().mockResolvedValue(undefined),
+      waitForTimeout: jest.fn<(...args: any[]) => any>().mockResolvedValue(undefined),
+      on: jest.fn<(...args: any[]) => any>().mockReturnValue(undefined),
       $: jest.fn(),
       $$: jest.fn(),
-    } as jest.Mocked<puppeteer.Page>;
+    } as unknown as jest.Mocked<Page>;
 
     // Create mock browser with resolved methods
     mockBrowser = {
-      newPage: jest.fn().mockResolvedValue(mockPage),
-      close: jest.fn().mockResolvedValue(undefined),
-      createIncognitoBrowserContext: jest.fn().mockResolvedValue({
-        newPage: jest.fn().mockResolvedValue(mockPage),
+      newPage: jest.fn<(...args: any[]) => any>().mockResolvedValue(mockPage),
+      close: jest.fn<(...args: any[]) => any>().mockResolvedValue(undefined),
+      createIncognitoBrowserContext: jest.fn<(...args: any[]) => any>().mockResolvedValue({
+        newPage: jest.fn<(...args: any[]) => any>().mockResolvedValue(mockPage),
       } as any),
       connected: true,
-    } as unknown as jest.Mocked<puppeteer.Browser>;
+    } as unknown as jest.Mocked<Browser>;
   });
 
   describe('Browser Pool Initialization Performance', () => {
@@ -84,7 +85,7 @@ describe('Performance Tests - Browser Pool Efficiency', () => {
       expect(endTime - startTime).toBeLessThan(2000);
       
       // Verify launch mock was called (may be more than 3 due to race condition in concurrent calls)
-      const launchMock = (puppeteer.launch as jest.Mock);
+      const launchMock = jest.mocked(puppeteer.launch);
       expect(launchMock).toHaveBeenCalledTimes(15); // 5 concurrent calls × 3 browsers each
     });
   });
@@ -98,6 +99,6 @@ afterEach(() => {
   // Reset mocking to original state
   jest.resetAllMocks();
   if (jest.isMockFunction(puppeteer.launch)) {
-    puppeteer.launch.mockRestore();
+    jest.mocked(puppeteer.launch).mockRestore();
   }
 });
