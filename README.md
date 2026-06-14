@@ -1,6 +1,6 @@
-# Page Scraper Service
+# Scraper Service
 
-A generic web page scraping microservice with browser automation, featuring browser pooling and configurable site support. Designed to bypass Cloudflare protection and handle dynamic content. Includes comprehensive test coverage with enhanced Cloudflare detection and containerized testing infrastructure.
+A web scraping microservice with browser automation, browser pooling, priority queuing, and full MFC collection sync. Designed to bypass Cloudflare protection and handle dynamic content. Features a 3-tier priority queue, HMAC-signed webhook callbacks, session management with pause/resume, and comprehensive test coverage across 26 test suites.
 
 ## Features
 
@@ -10,10 +10,16 @@ A generic web page scraping microservice with browser automation, featuring brow
 - **Cloudflare Bypass**: Real Chromium browsers with fresh sessions per request
 - **MFC NSFW Authentication**: Support for authenticated scraping with user's own session cookies
 - **Stealth Mode**: Anti-detection for authenticated requests (bypasses Cloudflare bot protection)
+- **Full Collection Sync**: End-to-end workflow: validate cookies, export CSV, parse items, queue for scraping
+- **3-Tier Priority Queue**: HOT/WARM/COLD priority lanes with deduplication and adaptive rate limiting
+- **Session Management**: Cookie validation caching, automatic pause on failures, cooldown periods
+- **HMAC Webhook Callbacks**: Signed callbacks to backend with SHA-256 authentication
+- **Schema v3 Extraction**: Company/artist extraction, release date/price parsing, field auditing
+- **Label Registry**: Regex-based MFC label pattern matching
 - **Robust Error Handling**: Handles timeouts, challenges, and extraction failures
-- **RESTful API**: Simple HTTP interface with both generic and site-specific endpoints
-- **Docker Ready**: Optimized container with all browser dependencies
-- **Comprehensive Testing**: Multi-suite test coverage with Jest, Puppeteer mocking, and containerized test execution
+- **RESTful API**: HTTP interface with scraping, sync, and management endpoints
+- **Docker Ready**: Optimized container with Chrome for Testing on Ubuntu 24.04
+- **Comprehensive Testing**: 760+ tests across 26 suites with Jest, Supertest, and testcontainers
 
 ## Ethical Use & Legal Compliance
 
@@ -58,7 +64,28 @@ By using this service, you agree to:
 
 **This software is provided for legitimate personal use only. Users are solely responsible for ensuring their use complies with applicable laws and website terms of service.**
 
+## Services Architecture
+
+The scraper is composed of 12 service modules (6,897 total lines):
+
+| Service | Lines | Purpose |
+|---------|-------|---------|
+| `genericScraper.ts` | 1,110 | Browser pool management, base scraping logic |
+| `scrapeQueue.ts` | 1,050 | 3-tier priority queue (HOT/WARM/COLD), deduplication, rate limiting |
+| `syncOrchestrator.ts` | 862 | Full sync workflow: validate → export → parse → queue |
+| `sessionManager.ts` | 851 | Cookie validation caching, pause/cooldown management |
+| `mfcListsFetcher.ts` | 843 | Fetch user lists and items from MFC |
+| `mfcCsvExporter.ts` | 538 | CSV export from MFC Manager |
+| `companyArtistExtractor.ts` | 461 | Schema v3 company/artist extraction |
+| `cacheConfig.ts` | 326 | Cache TTL calculation |
+| `releaseExtractor.ts` | 304 | Release date and price extraction |
+| `webhookClient.ts` | 277 | HMAC-SHA256 signed callbacks to backend |
+| `mfcLabelRegistry.ts` | 180 | Regex-based MFC label pattern registry |
+| `fieldAuditCollector.ts` | 95 | Field completeness auditing |
+
 ## API Endpoints
+
+### Scraper Routes
 
 ### POST /scrape
 Generic scraping with custom configuration.
@@ -147,6 +174,9 @@ Get available pre-built site configurations.
 ### GET /health
 Health check endpoint for monitoring.
 
+### GET /health/detailed
+Detailed health check with browser pool and queue status.
+
 ### GET /version
 Get service version information for version management.
 
@@ -154,13 +184,16 @@ Get service version information for version management.
 ```json
 {
   "name": "scraper",
-  "version": "1.0.0",
+  "version": "2.2.0",
   "status": "healthy"
 }
 ```
 
+### GET /mfc/cookie-allowlist
+Get the list of allowed MFC cookie names for authenticated scraping.
+
 ### POST /reset-pool (Test Environment Only)
-**⚠️ This endpoint is only available in non-production environments**
+**This endpoint is only available in non-production environments.**
 
 Manually reset the browser pool for testing or emergency situations.
 
@@ -200,6 +233,44 @@ x-admin-token: <admin-token-value>
 - Force browser pool refresh during testing
 - Reset pool after detecting browser fingerprinting changes
 - Emergency recovery from browser cache/session issues in test environments
+
+### Sync Routes
+
+### POST /sync/validate-cookies
+Validate MFC session cookies before starting a sync operation.
+
+### POST /sync/export-csv
+Export user collection data from MFC as CSV.
+
+### POST /sync/from-csv
+Parse a CSV export and queue items for scraping.
+
+### POST /sync/full
+Full sync workflow: validates cookies, exports CSV, parses items, and queues them for scraping.
+
+### GET /sync/status
+Get the current status of the sync operation.
+
+### GET /sync/queue-stats
+Get detailed queue statistics for monitoring.
+
+**Response:**
+```json
+{
+  "success": true,
+  "data": {
+    "queues": { "hot": 10, "warm": 5, "cold": 100 },
+    "total": 115,
+    "processing": 1,
+    "completed": 50,
+    "failed": 2,
+    "rateLimit": {
+      "active": false,
+      "currentDelayMs": 3000
+    }
+  }
+}
+```
 
 ### Session Management Endpoints
 
@@ -251,120 +322,59 @@ Cancel all failed items for a session (removes them from queue).
 }
 ```
 
-### GET /sync/queue-stats
-Get detailed queue statistics for monitoring.
+## Testing
 
-**Response:**
-```json
-{
-  "success": true,
-  "data": {
-    "queues": { "hot": 10, "warm": 5, "cold": 100 },
-    "total": 115,
-    "processing": 1,
-    "completed": 50,
-    "failed": 2,
-    "rateLimit": {
-      "active": false,
-      "currentDelayMs": 3000
-    }
-  }
-}
-```
-
-## 🧪 Testing
-
-The scraper includes comprehensive test coverage with enhanced testing infrastructure and containerized test execution.
+The scraper includes comprehensive test coverage with 26 test suites and containerized test execution.
 
 ### Test Coverage Overview
 
-- **Total Test Suites**: 10 test suites
-- **Total Tests**: 215 passing tests
+- **Total Test Suites**: 26 suites
+- **Total Tests**: ~760 passing tests
 - **Code Coverage**: 80%+ (Codecov quality gate)
-- **Testing Framework**: Jest + TypeScript + Supertest
+- **Testing Framework**: Jest 30 + TypeScript + Supertest 7 + testcontainers
 - **Mocking Strategy**: Complete Puppeteer API mocking
 - **Containerized Testing**: Docker-based test execution with coverage extraction
-- **Enhanced Cloudflare Detection**: Dedicated test suite for Cloudflare bypass validation
 
 ### Test Structure
 
 ```
 src/__tests__/
 ├── unit/
-│   ├── genericScraper.test.ts        # Core scraping functionality
-│   ├── browserPool.test.ts           # Browser pool management
-│   ├── puppeteerAutomation.test.ts   # Browser automation
-│   ├── errorHandling.test.ts         # Error scenarios
-│   ├── mfcScraping.test.ts           # MFC-specific tests
-│   ├── performance.test.ts           # Performance benchmarks
-│   └── cloudflareDetection.test.ts   # Enhanced Cloudflare detection
-└── integration/
-    ├── scraperRoutes.test.ts         # API endpoint tests
-    └── inter-service/
-        └── backendCommunication.test.ts   # Cross-service communication
-```
-
-### Test Categories
-
-**Unit Tests (7 suites):**
-- **Generic Scraper**: SITE_CONFIGS validation, scraping logic, error handling
-- **Browser Pool**: Pool management, concurrency, memory management
-- **Puppeteer Automation**: Browser configuration, navigation, data extraction
-- **Error Handling**: Network failures, timeouts, resource issues
-- **MFC Scraping**: MFC-specific functionality and edge cases
-- **Performance**: Response time benchmarks and efficiency tests
-- **Cloudflare Detection**: Enhanced Cloudflare bypass validation and fuzzy matching
-
-**Integration Tests (1 suite):**
-- **API Routes**: All HTTP endpoints with various scenarios
-
-### Key Testing Features
-
-**Complete Puppeteer Mocking:**
-```typescript
-// Mock browser and page instances
-const mockBrowser = {
-  newPage: jest.fn(),
-  close: jest.fn()
-};
-
-const mockPage = {
-  goto: jest.fn(),
-  evaluate: jest.fn(),
-  close: jest.fn(),
-  setViewport: jest.fn(),
-  setUserAgent: jest.fn()
-};
-```
-
-**Performance Testing:**
-```typescript
-// Example: Testing response time targets
-it('should complete scraping within 5 seconds', async () => {
-  const startTime = Date.now();
-  await genericScraper.scrape(testUrl, config);
-  const duration = Date.now() - startTime;
-  expect(duration).toBeLessThan(5000);
-});
-```
-
-**Error Scenario Testing:**
-```typescript
-// Example: Testing browser failure handling
-it('should handle browser launch failure', async () => {
-  mockPuppeteer.launch.mockRejectedValue(new Error('Browser launch failed'));
-  
-  await expect(browserPool.getBrowser())
-    .rejects
-    .toThrow('Browser launch failed');
-});
+│   ├── browserPool.test.ts                    # Browser pool management
+│   ├── cacheConfig.test.ts                    # Cache TTL calculation
+│   ├── cacheConfigExtended.test.ts            # Extended cache scenarios
+│   ├── companyArtistExtraction.test.ts        # Company/artist extraction
+│   ├── companyArtistExtractorExtended.test.ts # Extended extraction scenarios
+│   ├── fieldAuditCollector.test.ts            # Field completeness auditing
+│   ├── genericScraperExtended.test.ts         # Extended scraper scenarios
+│   ├── mfcCookieRetry.test.ts                 # MFC cookie retry logic
+│   ├── mfcCsvExporter.test.ts                 # CSV export logic
+│   ├── mfcLabelRegistry.test.ts               # Label pattern matching
+│   ├── mfcListsFetcher.test.ts                # MFC list fetching
+│   ├── performance.test.ts                    # Performance benchmarks
+│   ├── releaseExtraction.test.ts              # Release date/price extraction
+│   ├── releaseExtractorExtended.test.ts       # Extended release extraction
+│   ├── scrapeQueue.test.ts                    # Priority queue logic
+│   ├── scrapeQueueExtended.test.ts            # Extended queue scenarios
+│   ├── scrapeQueueProcessing.test.ts          # Queue processing logic
+│   ├── security.test.ts                       # Security and auth tests
+│   ├── sessionManager.test.ts                 # Session management
+│   ├── stringComparison.test.ts               # String comparison utilities
+│   ├── syncOrchestrator.test.ts               # Sync workflow orchestration
+│   ├── syncOrchestratorExtended.test.ts       # Extended sync scenarios
+│   ├── syncRoutes.test.ts                     # Sync route handlers
+│   └── webhookClient.test.ts                  # HMAC webhook callbacks
+├── integration/
+│   ├── scraperRoutes.test.ts                  # Scraper API endpoint tests
+│   ├── syncRoutes.test.ts                     # Sync API endpoint tests
+│   ├── setup.ts                               # Test environment setup
+│   └── inter-service/
+│       └── backendCommunication.test.ts       # Cross-service communication
 ```
 
 ### Running Tests
 
 ```bash
-# WSL Setup Required: Install Node.js via NVM (see ../WSL_TEST_FIX_SOLUTION.md)
-
 # Install dependencies
 npm install
 
@@ -384,10 +394,10 @@ npm run test:ci
 ./test-container-coverage.sh
 
 # Run specific test suite
-npx jest src/__tests__/unit/genericScraper.test.ts
+npx jest src/__tests__/unit/scrapeQueue.test.ts
 
 # Run tests matching pattern
-npx jest --testNamePattern="MFC scraping"
+npx jest --testNamePattern="sync orchestrator"
 ```
 
 ### Test Configuration
@@ -397,15 +407,15 @@ npx jest --testNamePattern="MFC scraping"
 {
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "strict": false,           // Relaxed type checking for tests
-    "noImplicitAny": false,    // Allow implicit 'any' types
-    "strictNullChecks": false, // More flexible null handling
-    "skipLibCheck": true,      // Skip type checking of declaration files
-    "types": ["jest", "node"]  // Include Jest and Node types
+    "strict": false,
+    "noImplicitAny": false,
+    "strictNullChecks": false,
+    "skipLibCheck": true,
+    "types": ["jest", "node"]
   },
   "include": [
-    "src/**/__tests__/**/*",   // Include all test files
-    "src/**/__mocks__/**/*"    // Include mock implementations
+    "src/**/__tests__/**/*",
+    "src/**/__mocks__/**/*"
   ]
 }
 ```
@@ -442,32 +452,19 @@ module.exports = {
   setupFilesAfterEnv: ['<rootDir>/src/__tests__/setup.ts'],
   testTimeout: 30000,
   maxWorkers: 4,
-  
-  // Enhanced Puppeteer Mocking
+
   moduleNameMapper: {
     '^puppeteer$': '<rootDir>/src/__tests__/__mocks__/puppeteer.ts'
   },
-  
-  // Comprehensive Mock Management
+
   clearMocks: true,
   resetMocks: true,
   restoreMocks: true,
-  
-  // Performance and Stability Enhancements
+
   bail: false,
   verbose: true
 };
 ```
-
-**Key Testing Improvements:**
-- Introduced `tsconfig.test.json` for more flexible test compilation
-- Relaxed TypeScript strict mode for easier test writing
-- Added comprehensive type configuration for Jest and Node.js
-- Improved mock type handling to reduce compilation friction
-- Enhanced test file discovery and coverage reporting
-- Added containerized testing with `test-container-coverage.sh` script
-- Enhanced Cloudflare detection testing with fuzzy matching validation
-- Cross-service communication validation tests
 
 ### Performance Benchmarks
 
@@ -476,84 +473,6 @@ module.exports = {
 - Concurrent Capacity: 10+ simultaneous requests
 - Browser Pool Efficiency: <1 second pool operations
 - Memory Management: Proper cleanup after each operation
-
-### Recent Improvements
-
-**MFC Bulk Import Enhancements (Latest):**
-- **Cookie Passthrough for All Items**: Cookies are now passed for ALL items during bulk sync, not just NSFW content
-  - Required for accessing user-specific data (collection status, prices, ownership info)
-  - Ensures consistent authentication across the entire sync operation
-- **Development Server (tsx)**: Switched from `ts-node-dev` to `tsx` for faster startup
-  - Uses esbuild for near-instant TypeScript compilation
-  - Automatic `.env` file loading via `--env-file` flag
-  - Hot reload with `tsx watch` for seamless development
-
-**Security Enhancements:**
-- Protected `/reset-pool` endpoint with authentication (x-admin-token)
-- Conditional endpoint registration (not available in production)
-- Async browser cleanup in `BrowserPool.reset()`
-- Removed sensitive error details from API responses
-- Enhanced Docker security (explicit file copying, no recursive COPY)
-
-**Docker Production Improvements:**
-- Fixed Chromium executable path for Alpine Linux (/usr/bin/chromium-browser)
-- Dynamic healthcheck respects PORT environment variable
-- Removed build fallback for fail-fast behavior
-- Fixed .dockerignore to not exclude Dockerfiles from build context
-- Added writable home directory for non-root user (Chromium requirement)
-- Improved healthcheck security (no shell substitution)
-
-**Test Coverage Improvements:**
-- Achieved 80%+ code coverage (Codecov quality gate)
-- Added comprehensive test suites for all routes
-- Enhanced security testing for protected endpoints
-- Improved mock implementations for async operations
-- Better test isolation using `jest.isolateModules()` instead of `jest.resetModules()`
-- Added try-finally blocks for guaranteed environment cleanup
-
-**BrowserPool Enhancements:**
-- Improved concurrency management
-- Enhanced Cloudflare detection mechanism
-- Optimized static state reset for better test isolation
-- Proper async cleanup of browser resources
-
-**Concurrency Management Strategy:**
-```typescript
-// New BrowserPool concurrency control
-const browserPool = new ConcurrentBrowserPool({
-  maxConcurrent: 10,  // Configurable concurrent browser limit
-  maxQueueSize: 50,   // Prevent overwhelming browser resources
-  timeoutMs: 30000    // Configurable request timeout
-});
-```
-
-### Mock Test Data
-
-**HTML Fixtures:**
-```typescript
-const MFC_FIGURE_HTML = `
-<div class="item-picture">
-  <img src="https://images.goodsmile.info/test.jpg" alt="Test Figure">
-</div>
-<div class="item-details">
-  <span switch="Company">Test Company</span>
-  <span switch="Character">Test Character</span>
-</div>
-`;
-```
-
-### CI/CD Integration
-
-```bash
-# CI test command
-NODE_ENV=test npm run test:ci
-
-# Coverage reporting for CI
-NODE_ENV=test npm run test:coverage
-
-# Containerized testing (isolates dependencies)
-./test-container-coverage.sh
-```
 
 ### Containerized Testing
 
@@ -574,6 +493,19 @@ The service includes a containerized testing script that runs all tests in a Doc
 **Output:**
 - Coverage reports: `./test-results/coverage/lcov-report/index.html`
 - Test results: `./test-results/reports/`
+
+### CI/CD Integration
+
+```bash
+# CI test command
+NODE_ENV=test npm run test:ci
+
+# Coverage reporting for CI
+NODE_ENV=test npm run test:coverage
+
+# Containerized testing (isolates dependencies)
+./test-container-coverage.sh
+```
 
 ### Testing Documentation
 
@@ -629,7 +561,7 @@ npm run test:watch
 
 The build process generates JavaScript files and source maps:
 - `routes/` - Compiled route handlers
-- `services/` - Compiled service modules  
+- `services/` - Compiled service modules
 - `index.js` - Main application entry point
 - Source maps (`.js.map`) for debugging compiled code
 
@@ -650,7 +582,7 @@ npx jest performance.test.ts
 
 ### Docker
 
-The service uses a multi-stage Dockerfile with the following build targets:
+The service uses a multi-stage Dockerfile with Ubuntu 24.04 base and Chrome for Testing 146:
 
 ```bash
 # Development (with hot reload, port 3080)
@@ -667,13 +599,13 @@ docker run -p 3050:3050 -e PORT=3050 --shm-size=2gb scraper:prod
 ```
 
 **Available stages:**
-- `base`: Alpine Linux with Chromium and Puppeteer dependencies
-- `development`: Includes devDependencies and nodemon for hot reload
+- `base`: Ubuntu 24.04 with Chrome for Testing 146 and Puppeteer dependencies
+- `development`: Includes devDependencies and tsx for hot reload
 - `test`: Test environment for CI/CD
 - `builder`: Compiles TypeScript to JavaScript
 - `production`: Optimized image with production dependencies only (default)
 
-**Note**: `--shm-size=2gb` is required for Puppeteer to avoid memory issues with Chromium.
+**Note**: `--shm-size=2gb` is required for Puppeteer to avoid memory issues with Chrome.
 
 ### Environment Variables
 
@@ -727,7 +659,7 @@ const response = await fetch(`${scraperUrl}/scrape/mfc`, {
 const response = await fetch(`${scraperUrl}/scrape`, {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ 
+  body: JSON.stringify({
     url: 'https://example.com/item/123',
     config: { imageSelector: '.product img' }
   })
@@ -738,17 +670,40 @@ const response = await fetch(`${scraperUrl}/scrape`, {
 
 This service runs separately from your main application to:
 - Isolate browser automation resource usage
-- Prevent main app crashes from scraping failures  
+- Prevent main app crashes from scraping failures
 - Allow independent scaling and updates
 - Provide better browser fingerprinting
 
+### Data Flow
+
+```
+Sync Workflow:
+  validate-cookies → export-csv → parse CSV → queue items
+       ↓                                          ↓
+  sessionManager                          scrapeQueue (HOT/WARM/COLD)
+                                                  ↓
+                                          genericScraper (browser pool)
+                                                  ↓
+                                          extractors (company, artist, release, price)
+                                                  ↓
+                                          webhookClient → backend (HMAC-signed)
+```
+
+### Key Design Decisions
+
+- **3-Tier Priority Queue**: HOT items (recently updated) are scraped first, WARM next, COLD last. Deduplication prevents redundant scrapes.
+- **Session Pause/Resume**: Automatic pause after consecutive failures with configurable cooldown, plus manual resume via API.
+- **HMAC Webhooks**: All callbacks to backend are signed with SHA-256 HMAC for authentication.
+- **Browser Pool**: Pre-launched browsers eliminate startup delay. Fresh sessions per request prevent fingerprint accumulation.
+
 ## Performance
 
-- **Browser Pool**: 3 pre-launched browsers eliminate 2-3 second startup delay
+- **Browser Pool**: Pre-launched browsers eliminate 2-3 second startup delay
 - **Fresh Sessions**: Each request gets clean browser to bypass anti-bot detection
 - **Auto-Replenishment**: Pool automatically replaces used browsers in background
 - **Optimized Chrome**: Container-optimized flags for minimal resource usage
 - **Graceful Shutdown**: Proper browser cleanup on service termination
+- **Adaptive Rate Limiting**: Queue automatically adjusts delay based on failure rates
 
 ## Adding New Sites
 

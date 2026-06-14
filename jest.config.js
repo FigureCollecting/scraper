@@ -16,13 +16,19 @@ module.exports = {
     '/__tests__/setup.ts'
   ],
   transform: {
-    '^.+\.ts$': ['ts-jest', {
+    '^.+\\.(ts|tsx|mjs|js|cjs)$': ['ts-jest', {
       tsconfig: '<rootDir>/tsconfig.test.json',
       diagnostics: {
         warnOnly: true
       }
     }]
   },
+  // MSW v2 ships ESM-only deps that jest does not transform by default; the
+  // transform above handles js/mjs/cjs, and this whitelist lets those specific
+  // packages through (everything else in node_modules stays untransformed).
+  transformIgnorePatterns: [
+    '/node_modules/(?!(msw|@mswjs|@open-draft|@bundled-es-modules|until-async|rettime|strict-event-emitter|headers-polyfill|outvariant|is-node-process|tough-cookie|graphql)/)'
+  ],
   collectCoverageFrom: [
     'src/**/*.ts',
     '!src/**/*.d.ts',
