@@ -320,6 +320,143 @@ describe('companyArtistExtractor - extended', () => {
       expect(fields.dimensions).toBe('H=150mm');
     });
 
+    // Multi-dimension figures: MFC renders each labeled dimension as its own
+    // <small>LABEL=</small><strong>value</strong><small>unit</small> triple.
+    // The previous parser ran find('strong').text() across ALL strongs, which
+    // Cheerio concatenates (e.g. 250+210+470 -> "250210470") and then mislabeled
+    // the blob as height. Each dimension must be captured separately by its label.
+    it('should extract multi-dimension figure without concatenating values (Mahina W/L/H)', () => {
+      const html = `
+        <div class="data-field">
+          <span class="data-label">Dimensions</span>
+          <span class="data-value">
+            <a class="item-scale"><small>1/</small>6</a>
+            <small>W=</small><strong>250</strong><small>mm</small>
+            <small>L=</small><strong>210</strong><small>mm</small>
+            <small>H=</small><strong>470</strong><small>mm</small>
+          </span>
+        </div>
+      `;
+      const fields = extractMfcFields(html);
+      expect(fields.dimensions).toBe('1/6, W=250mm, L=210mm, H=470mm');
+      // Regression guard: the corrupted concatenation must never appear.
+      expect(fields.dimensions).not.toContain('250210470');
+    });
+
+    it('should keep height labeled correctly for Yan (W=320 L=330 H=420)', () => {
+      const html = `
+        <div class="data-field">
+          <span class="data-label">Dimensions</span>
+          <span class="data-value">
+            <small>W=</small><strong>320</strong><small>mm</small>
+            <small>L=</small><strong>330</strong><small>mm</small>
+            <small>H=</small><strong>420</strong><small>mm</small>
+          </span>
+        </div>
+      `;
+      const fields = extractMfcFields(html);
+      expect(fields.dimensions).toBe('W=320mm, L=330mm, H=420mm');
+      expect(fields.dimensions).not.toContain('320330420');
+    });
+
+    it('should handle a four-dimension figure including depth (W/L/H/D)', () => {
+      const html = `
+        <div class="data-field">
+          <span class="data-label">Dimensions</span>
+          <span class="data-value">
+            <small>W=</small><strong>195</strong><small>mm</small>
+            <small>L=</small><strong>225</strong><small>mm</small>
+            <small>H=</small><strong>242</strong><small>mm</small>
+            <small>D=</small><strong>90</strong><small>mm</small>
+          </span>
+        </div>
+      `;
+      const fields = extractMfcFields(html);
+      expect(fields.dimensions).toBe('W=195mm, L=225mm, H=242mm, D=90mm');
+    });
+
+    it('should accept full-word labels (Width/Length/Height)', () => {
+      const html = `
+        <div class="data-field">
+          <span class="data-label">Dimensions</span>
+          <span class="data-value">
+            <small>Width=</small><strong>100</strong><small>mm</small>
+            <small>Height=</small><strong>200</strong><small>mm</small>
+          </span>
+        </div>
+      `;
+      const fields = extractMfcFields(html);
+      expect(fields.dimensions).toBe('W=100mm, H=200mm');
+    });
+
+    it('should convert centimeters to millimeters', () => {
+      const html = `
+        <div class="data-field">
+          <span class="data-label">Dimensions</span>
+          <span class="data-value">
+            <small>H=</small><strong>26</strong><small>cm</small>
+          </span>
+        </div>
+      `;
+      const fields = extractMfcFields(html);
+      expect(fields.dimensions).toBe('H=260mm');
+    });
+
+    it('should convert inches to millimeters', () => {
+      const html = `
+        <div class="data-field">
+          <span class="data-label">Dimensions</span>
+          <span class="data-value">
+            <small>H=</small><strong>10</strong><small>in</small>
+          </span>
+        </div>
+      `;
+      const fields = extractMfcFields(html);
+      expect(fields.dimensions).toBe('H=254mm');
+    });
+
+    it('should skip unrecognized dimension labels instead of fabricating height', () => {
+      const html = `
+        <div class="data-field">
+          <span class="data-label">Dimensions</span>
+          <span class="data-value">
+            <small>X=</small><strong>999</strong><small>mm</small>
+            <small>H=</small><strong>300</strong><small>mm</small>
+          </span>
+        </div>
+      `;
+      const fields = extractMfcFields(html);
+      expect(fields.dimensions).toBe('H=300mm');
+      expect(fields.dimensions).not.toContain('999');
+    });
+
+    it('should keep fractional millimeters when converting inches', () => {
+      const html = `
+        <div class="data-field">
+          <span class="data-label">Dimensions</span>
+          <span class="data-value">
+            <small>H=</small><strong>9.5</strong><small>in</small>
+          </span>
+        </div>
+      `;
+      const fields = extractMfcFields(html);
+      expect(fields.dimensions).toBe('H=241.3mm');
+    });
+
+    it('should skip a dimension whose value is not numeric', () => {
+      const html = `
+        <div class="data-field">
+          <span class="data-label">Dimensions</span>
+          <span class="data-value">
+            <small>W=</small><strong>n/a</strong><small>mm</small>
+            <small>H=</small><strong>200</strong><small>mm</small>
+          </span>
+        </div>
+      `;
+      const fields = extractMfcFields(html);
+      expect(fields.dimensions).toBe('H=200mm');
+    });
+
     it('should extract tags from Various field', () => {
       const html = `
         <div class="data-field">
