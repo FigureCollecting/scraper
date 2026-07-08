@@ -1,10 +1,10 @@
 # =============================================================================
-# BASE STAGE - Secure Ubuntu 24.04 + Node 24.13.1 LTS + Chrome 146.0.7680.31
+# BASE STAGE - Secure Ubuntu 24.04 + Node 24.18.0 LTS + Chrome 150.0.7871.47
 # =============================================================================
 FROM ubuntu:24.04 AS base
 
 # Cache-bust ARG to invalidate Docker layers when dependencies change
-ARG CACHE_BUST=2026-02-28-chrome-146-vuln-fix
+ARG CACHE_BUST=2026-07-02-node-24.18.0-chrome-150.0.7871.47-cve-fix
 
 # Update all packages for latest security patches (openssl, gnupg, glibc)
 # Install Node.js 24 using official binaries (avoids NodeSource CVE false positives)
@@ -12,7 +12,7 @@ RUN apt-get update && apt-get upgrade -y \
     && apt-get install -y \
     curl \
     xz-utils \
-    && NODE_VERSION=v24.13.1 \
+    && NODE_VERSION=v24.18.0 \
     && curl -fsSLO https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-linux-x64.tar.xz \
     && tar -xJf node-${NODE_VERSION}-linux-x64.tar.xz -C /usr/local --strip-components=1 \
     && rm node-${NODE_VERSION}-linux-x64.tar.xz \
@@ -63,9 +63,9 @@ RUN apt-get update && apt-get upgrade -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# Download and install Chrome for Testing (146.0.7680.31) - latest stable, fixes all known CVEs
+# Download and install Chrome for Testing (150.0.7871.47) - milestone-150 build, fixes the 149.x High/Critical CVEs
 RUN apt-get update && apt-get install -y wget unzip \
-    && wget -q https://storage.googleapis.com/chrome-for-testing-public/146.0.7680.31/linux64/chrome-linux64.zip \
+    && wget -q https://storage.googleapis.com/chrome-for-testing-public/150.0.7871.47/linux64/chrome-linux64.zip \
     && unzip chrome-linux64.zip \
     && mv chrome-linux64 /opt/chrome \
     && rm chrome-linux64.zip \
@@ -84,11 +84,12 @@ ENV PUPPETEER_SKIP_DOWNLOAD=true
 FROM base AS development
 
 # Copy package files
-COPY package*.json ./
+COPY package*.json .npmrc ./
 
 # Install all dependencies (Puppeteer won't download Chrome due to ENV vars)
 RUN npm config set fetch-timeout 300000 && npm config set fetch-retry-maxtimeout 300000
-RUN timeout 600 npm install --no-audit --no-fund
+RUN --mount=type=secret,id=node_auth_token \
+    NODE_AUTH_TOKEN="$(cat /run/secrets/node_auth_token)" timeout 600 npm install --no-audit --no-fund
 
 # Remove any Chrome that might have been downloaded by Puppeteer
 RUN rm -rf /root/.cache/puppeteer \
@@ -118,11 +119,12 @@ CMD ["npm", "run", "test:ci"]
 FROM base AS builder
 
 # Copy package files
-COPY package*.json ./
+COPY package*.json .npmrc ./
 
 # Install all dependencies for build
 RUN npm config set fetch-timeout 300000 && npm config set fetch-retry-maxtimeout 300000
-RUN timeout 600 npm install --no-audit --no-fund
+RUN --mount=type=secret,id=node_auth_token \
+    NODE_AUTH_TOKEN="$(cat /run/secrets/node_auth_token)" timeout 600 npm install --no-audit --no-fund
 
 # Remove any Chrome that might have been downloaded by Puppeteer
 RUN rm -rf /root/.cache/puppeteer \
@@ -141,11 +143,12 @@ RUN npm run build
 FROM base AS production
 
 # Copy package files
-COPY package*.json ./
+COPY package*.json .npmrc ./
 
 # Install only production dependencies
 RUN npm config set fetch-timeout 300000 && npm config set fetch-retry-maxtimeout 300000
-RUN timeout 600 npm install --no-audit --no-fund --omit=dev
+RUN --mount=type=secret,id=node_auth_token \
+    NODE_AUTH_TOKEN="$(cat /run/secrets/node_auth_token)" timeout 600 npm install --no-audit --no-fund --omit=dev
 
 # Remove any Chrome that might have been downloaded by Puppeteer
 RUN rm -rf /root/.cache/puppeteer \

@@ -43,7 +43,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Install scanning tools
         run: |
@@ -110,7 +110,7 @@ jobs:
 
       - name: Close stale vulnerability issues if no vulnerabilities
         if: steps.scan.outputs.has_vulnerabilities == 'false'
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const serviceName = '${{ matrix.service.name }}';
@@ -149,7 +149,7 @@ jobs:
 
       - name: Create or update issue for vulnerabilities
         if: steps.scan.outputs.has_vulnerabilities == 'true' && env.CREATE_ISSUES == 'true'
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');
@@ -282,7 +282,7 @@ jobs:
 
     steps:
       - name: Create scan summary
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const date = new Date().toISOString().split('T')[0];

@@ -14,8 +14,8 @@
  * - Re-validate when cache expires (default: 10 minutes)
  */
 
-import { validateMfcCookies, MfcCookies, CookieValidationResult } from './mfcCsvExporter';
-import { sanitizeForLog } from '../utils/security';
+import { validateMfcCookies, MfcCookies, CookieValidationResult } from './mfcCsvExporter.js';
+import { sanitizeForLog } from '../utils/security.js';
 
 // ============================================================================
 // Types and Interfaces
@@ -492,7 +492,7 @@ export class SessionManager {
 
     try {
       // Dynamic import to avoid circular dependency
-      const { scrapeMFC } = await import('./genericScraper');
+      const { scrapeMFC } = await import('./genericScraper.js');
 
       const url = `https://myfigurecollection.net/item/${SESSION_CONFIG.PROBE_MFC_ID}`;
       const result = await scrapeMFC(url);

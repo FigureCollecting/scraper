@@ -1,11 +1,11 @@
 import puppeteer, { Browser, Page } from 'puppeteer';
-import { sanitizeForLog, isValidMfcUrl, capWaitTime, truncateString, MAX_STRING_LENGTH } from '../utils/security';
-import { ICompanyEntry, IArtistEntry, extractCompanies, extractArtists, extractMfcFields, extractRelatedItems } from './companyArtistExtractor';
-import { IRelease, extractReleases } from './releaseExtractor';
-import { auditMfcFields, appendFieldAuditLog } from './fieldAuditCollector';
+import { sanitizeForLog, isValidMfcUrl, capWaitTime, truncateString, MAX_STRING_LENGTH } from '../utils/security.js';
+import { ICompanyEntry, IArtistEntry, extractCompanies, extractArtists, extractMfcFields, extractRelatedItems } from './companyArtistExtractor.js';
+import { IRelease, extractReleases } from './releaseExtractor.js';
+import { auditMfcFields, appendFieldAuditLog } from './fieldAuditCollector.js';
 
 // Re-export IRelease for backward compatibility
-export type { IRelease } from './releaseExtractor';
+export type { IRelease } from './releaseExtractor.js';
 
 export interface ScrapedData {
   imageUrl?: string;
@@ -364,7 +364,7 @@ export class BrowserPool {
   static async returnBrowser(browser: Browser): Promise<void> {
     // Check if browser is still connected before returning to pool
     try {
-      const isConnected = browser.isConnected();
+      const isConnected = browser.connected;
       if (!isConnected) {
         console.warn('[BROWSER POOL] Attempted to return disconnected browser - creating replacement');
         // Don't return the dead browser, create a new one instead
@@ -420,11 +420,21 @@ export class BrowserPool {
         return this.stealthBrowser;
       }
 
-      // Production: Use puppeteer-extra with stealth plugin
+      // Production: Use puppeteer-extra with stealth plugin.
+      // Dynamic import() (not static) so these CJS-interop modules load lazily
+      // and ONLY in production — the test path above returns before reaching
+      // here, keeping puppeteer-extra out of the mocked test module graph.
+      // Both packages are CJS; under NodeNext their default export is the
+      // instance/factory. The casts pin the types NodeNext leaves as the raw
+      // module namespace (runtime shape verified: .default is the usable value).
       /* istanbul ignore next - Production-only stealth initialization, conflicts with test mocks */
-      const puppeteerExtra = require('puppeteer-extra');
+      const { default: puppeteerExtra } = (await import('puppeteer-extra')) as unknown as {
+        default: import('puppeteer-extra').PuppeteerExtra;
+      };
       /* istanbul ignore next */
-      const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+      const { default: StealthPlugin } = (await import('puppeteer-extra-plugin-stealth')) as unknown as {
+        default: () => import('puppeteer-extra').PuppeteerExtraPlugin;
+      };
 
       /* istanbul ignore next */
       puppeteerExtra.use(StealthPlugin());
@@ -456,7 +466,7 @@ export class BrowserPool {
       try {
         // Enhanced checks before closing
         if (browser) {
-          const isStillConnected = await browser.isConnected();
+          const isStillConnected = browser.connected;
           if (isStillConnected) {
             await browser.close();
             console.log(`[BROWSER POOL] Browser ${index + 1} closed`);
@@ -509,7 +519,7 @@ export class BrowserPool {
     // Check each browser's connection status
     for (const browser of this.browsers) {
       try {
-        if (browser.isConnected()) {
+        if (browser.connected) {
           connectedCount++;
         }
       } catch {

@@ -17,7 +17,7 @@
  */
 
 import * as cheerio from 'cheerio';
-import { lookupLabel, normalizeRole, type ExtractionStrategy } from './mfcLabelRegistry';
+import { lookupLabel, normalizeRole, type ExtractionStrategy } from './mfcLabelRegistry.js';
 
 /**
  * MFC field data extracted from the page
@@ -126,6 +126,43 @@ export function extractIndividualRoleEntries(
 }
 
 /**
+ * Normalize an MFC dimension label to a single canonical letter.
+ * Accepts abbreviations ("W=", "H=") and full words ("Width", "Height").
+ * Returns undefined for anything unrecognized so bogus values are skipped
+ * rather than fabricated into a height.
+ */
+function normalizeDimensionLabel(raw: string): string | undefined {
+  const key = raw.replace(/[^a-z]/gi, '').toLowerCase();
+  if (key === 'w' || key === 'width') return 'W';
+  if (key === 'h' || key === 'height') return 'H';
+  if (key === 'l' || key === 'length') return 'L';
+  if (key === 'd' || key === 'depth') return 'D';
+  return undefined;
+}
+
+/**
+ * Convert a dimension value to millimeters based on its unit label.
+ * MFC is overwhelmingly millimeters; centimeters and inches are handled for
+ * resilience. Unknown or empty units are assumed to already be millimeters.
+ */
+function toMillimeters(value: number, unit: string): number {
+  const u = unit.trim().toLowerCase();
+  if (u === 'cm') return value * 10;
+  if (u === 'in' || u === 'inch' || u === 'inches' || u === '"' || u === '″') {
+    return value * 25.4;
+  }
+  return value;
+}
+
+/**
+ * Format a numeric millimeter value for the dimensions string, dropping
+ * insignificant decimals (470 stays "470", 234.95 stays "234.95").
+ */
+function formatMillimeters(n: number): string {
+  return Number.isInteger(n) ? String(n) : String(Number(n.toFixed(2)));
+}
+
+/**
  * Extract a text value from a .data-value element based on the strategy.
  * Standalone helper that handles all MFC HTML structures for text fields.
  */
@@ -150,20 +187,28 @@ export function extractTextValue(
     if (catSpan.length > 0) return catSpan.text().trim();
   }
 
-  // Dimensions: scale + height sub-elements
+  // Dimensions: optional scale + one or more labeled dimension triples.
+  // Each dimension is <small>LABEL=</small><strong>value</strong><small>unit</small>
+  // (e.g. W=250mm, L=210mm, H=470mm). Every <strong> must be paired with its own
+  // preceding label and following unit; running .text() across all <strong>
+  // elements at once concatenates their digits into one bogus number
+  // (250 + 210 + 470 -> "250210470") that then gets mislabeled as height.
   if (strategy === 'dimensions-field') {
     const parts: string[] = [];
     // Scale: <a class="item-scale"><small>1/</small>6</a>
     const scaleLink = $dataValue.find('a.item-scale');
     if (scaleLink.length > 0) {
-      parts.push(scaleLink.text().trim());
+      const scale = scaleLink.text().trim();
+      if (scale) parts.push(scale);
     }
-    // Height: <small>H=</small><strong>260</strong><small>mm</small>
-    const heightStrong = $dataValue.find('strong');
-    if (heightStrong.length > 0) {
-      const height = heightStrong.text().trim();
-      parts.push(`H=${height}mm`);
-    }
+    $dataValue.find('strong').each((_, strongEl) => {
+      const $strong = $(strongEl);
+      const label = normalizeDimensionLabel($strong.prev('small').text());
+      const value = parseFloat($strong.text().trim());
+      if (!label || !Number.isFinite(value)) return;
+      const mm = toMillimeters(value, $strong.next('small').text());
+      parts.push(`${label}=${formatMillimeters(mm)}mm`);
+    });
     if (parts.length > 0) return parts.join(', ');
   }
 
