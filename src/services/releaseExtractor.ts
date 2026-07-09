@@ -260,14 +260,14 @@ function extractJanFromValue(_$: CheerioAPI, dataValue: ReturnType<CheerioAPI>):
       return validateJAN(janMatch[1]);
     }
     // Also try the link text itself
-    const linkText = buyLink.text().trim();
+    const linkText = buyLink.first().text().trim();
     return validateJAN(linkText);
   }
 
   // Try tbx-window class links (common MFC pattern)
   const tbxLink = dataValue.find('a.tbx-window');
   if (tbxLink.length > 0) {
-    const linkText = tbxLink.text().trim();
+    const linkText = tbxLink.first().text().trim();
     // Extract just digits
     const digits = linkText.replace(/\D/g, '');
     return validateJAN(digits);

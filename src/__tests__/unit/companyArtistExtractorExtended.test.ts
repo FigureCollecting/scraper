@@ -195,6 +195,60 @@ describe('companyArtistExtractor - extended', () => {
     });
   });
 
+  // Same bug class as the dimensions concat (fixed in 2.3.0): Cheerio's .text()
+  // on a selection matching MULTIPLE elements concatenates them with no
+  // separator. Each of these selectors can legitimately match more than one
+  // element in real MFC HTML, so each must resolve to a single element first.
+  describe('Cheerio multi-element concat guard', () => {
+    it('should not concatenate multiple role <em> in one entry (take first role)', () => {
+      const html = `
+        <div class="data-field">
+          <span class="data-label">Artists</span>
+          <div class="data-value">
+            <div class="item-entries">
+              <a href="/entry/1"><span switch="JP">Multi Role</span></a>
+              <small class="light">as <em>Sculptor</em><em>Painter</em></small>
+            </div>
+          </div>
+        </div>
+      `;
+      const artists = extractArtists(html);
+      expect(artists).toHaveLength(1);
+      expect(artists[0].role).toBe('Sculptor'); // not "SculptorPainter"
+    });
+
+    it('should not concatenate multiple language span[switch] in a name (take first)', () => {
+      const html = `
+        <div class="data-field">
+          <span class="data-label">Artists</span>
+          <div class="data-value">
+            <div class="item-entries">
+              <a href="/entry/2"><span switch="EN">Namae</span><span switch="JP">Name</span></a>
+              <small class="light">as <em>Sculptor</em></small>
+            </div>
+          </div>
+        </div>
+      `;
+      const artists = extractArtists(html);
+      expect(artists).toHaveLength(1);
+      expect(artists[0].name).toBe('Namae'); // not "NamaeName"
+    });
+
+    it('should not concatenate multiple item-category spans (take first/primary)', () => {
+      const html = `
+        <div class="data-field">
+          <span class="data-label">Category</span>
+          <span class="data-value">
+            <span class="item-category-1">Scale Figure</span>
+            <span class="item-category-2">Prepainted</span>
+          </span>
+        </div>
+      `;
+      const fields = extractMfcFields(html);
+      expect(fields.category).toBe('Scale Figure'); // not "Scale FigurePrepainted"
+    });
+  });
+
   // ============================================================================
   // extractMfcFields
   // ============================================================================

@@ -79,10 +79,10 @@ export function extractGroupedEntries(
     const href = $link.attr('href') || '';
 
     // Name is in span[switch] or just the link text
-    const name = $link.find('span[switch]').text().trim() || $link.text().trim();
+    const name = $link.find('span[switch]').first().text().trim() || $link.text().trim();
 
     // Role is in <small class="light">as <em>Role</em></small>
-    const rawRole = $entry.find('small.light em').text().trim() || defaultRole;
+    const rawRole = $entry.find('small.light em').first().text().trim() || defaultRole;
     const role = normalizeRole(rawRole);
 
     if (name) {
@@ -111,7 +111,7 @@ export function extractIndividualRoleEntries(
   $field.find('.item-entries a').each((_, link) => {
     const $link = $(link);
     const href = $link.attr('href') || '';
-    const name = $link.find('span[switch]').text().trim() || $link.text().trim();
+    const name = $link.find('span[switch]').first().text().trim() || $link.text().trim();
 
     if (name) {
       entries.push({
@@ -184,7 +184,7 @@ export function extractTextValue(
   // Category: text in item-category span
   if (strategy === 'category-field') {
     const catSpan = $dataValue.find('span[class^="item-category"]');
-    if (catSpan.length > 0) return catSpan.text().trim();
+    if (catSpan.length > 0) return catSpan.first().text().trim();
   }
 
   // Dimensions: optional scale + one or more labeled dimension triples.
@@ -198,7 +198,7 @@ export function extractTextValue(
     // Scale: <a class="item-scale"><small>1/</small>6</a>
     const scaleLink = $dataValue.find('a.item-scale');
     if (scaleLink.length > 0) {
-      const scale = scaleLink.text().trim();
+      const scale = scaleLink.first().text().trim();
       if (scale) parts.push(scale);
     }
     $dataValue.find('strong').each((_, strongEl) => {
@@ -215,7 +215,7 @@ export function extractTextValue(
   // Title/Version: direct <a switch="jp">English text</a>
   const directLink = $dataValue.children('a[switch]');
   if (directLink.length > 0) {
-    return directLink.text().trim();
+    return directLink.first().text().trim();
   }
 
   // Origin and others: <a><span switch="jp">English</span></a> in .item-entries
