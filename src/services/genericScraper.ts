@@ -1,4 +1,6 @@
 import puppeteer, { Browser, Page } from 'puppeteer';
+import zlib from 'zlib';
+import crypto from 'crypto';
 import { sanitizeForLog, isValidMfcUrl, capWaitTime, truncateString, MAX_STRING_LENGTH } from '../utils/security.js';
 import { ICompanyEntry, IArtistEntry, extractCompanies, extractArtists, extractMfcFields, extractRelatedItems } from './companyArtistExtractor.js';
 import { IRelease, extractReleases } from './releaseExtractor.js';
@@ -26,6 +28,11 @@ export interface ScrapedData {
   dimensions?: string;      // e.g., "1/6, H=260mm"
   jan?: string;             // JAN/UPC barcode
   tags?: string[];          // Various tags (e.g., "18+", "Castoff", "Limited")
+  // Raw HTML capture (only populated when PERSIST_RAW_HTML=true; scraper never persists
+  // this itself, it is only emitted on the item-complete webhook for the backend to store)
+  rawHtmlGz?: string;       // Base64-encoded gzip of the raw page HTML at scrape time
+  htmlSha?: string;         // SHA-256 hex digest of the raw (uncompressed) page HTML
+  rawHtmlBytes?: number;    // Byte length of the raw (uncompressed) page HTML
   [key: string]: any;       // Allow additional fields
 }
 
@@ -928,6 +935,23 @@ export async function scrapeGeneric(url: string, config: ScrapeConfig): Promise<
     // This runs in Node.js context using cheerio, not in browser
     try {
       const pageHtml = await page.content();
+
+      // Optional raw HTML capture (enabled via PERSIST_RAW_HTML=true env var).
+      // Default OFF: zero overhead, no extra fields on the payload.
+      // The scraper only EMITS these fields on the item-complete webhook -- it never
+      // writes them to any store itself (no S3/MinIO creds live in this service).
+      if (process.env.PERSIST_RAW_HTML === 'true') {
+        try {
+          const htmlBuffer = Buffer.from(pageHtml, 'utf-8');
+          scrapedData.rawHtmlGz = zlib.gzipSync(htmlBuffer).toString('base64');
+          scrapedData.htmlSha = crypto.createHash('sha256').update(htmlBuffer).digest('hex');
+          scrapedData.rawHtmlBytes = htmlBuffer.byteLength;
+        } catch (rawHtmlError) {
+          console.error('[GENERIC SCRAPER] Raw HTML capture failed:', rawHtmlError);
+          // Don't fail the scrape - just continue without raw HTML capture
+        }
+      }
+
       const companies = extractCompanies(pageHtml);
       const artists = extractArtists(pageHtml);
 

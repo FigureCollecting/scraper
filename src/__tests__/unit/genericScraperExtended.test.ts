@@ -4,6 +4,8 @@
  * scrapeMFC convenience function, and Cloudflare detection paths
  */
 import puppeteer from 'puppeteer';
+import zlib from 'zlib';
+import crypto from 'crypto';
 import {
   calculateSimilarity,
   getEditDistance,
@@ -616,5 +618,75 @@ describe('genericScraper - scrapeGeneric extended', () => {
     expect(result).toBeDefined();
     // Should NOT have called waitForFunction for Cloudflare (no challenge)
     expect(mockPage.waitForFunction).not.toHaveBeenCalled();
+  });
+
+  describe('raw HTML capture (PERSIST_RAW_HTML)', () => {
+    const originalEnv = process.env.PERSIST_RAW_HTML;
+    const html = '<html><body><div class="data-field">raw capture fixture</div></body></html>';
+
+    afterEach(() => {
+      if (originalEnv === undefined) {
+        delete process.env.PERSIST_RAW_HTML;
+      } else {
+        process.env.PERSIST_RAW_HTML = originalEnv;
+      }
+    });
+
+    it('should emit rawHtmlGz/htmlSha/rawHtmlBytes when PERSIST_RAW_HTML=true', async () => {
+      process.env.PERSIST_RAW_HTML = 'true';
+      mockPage.content.mockResolvedValue(html);
+
+      const result = await scrapeGeneric('https://myfigurecollection.net/item/12345', {});
+
+      expect(result.rawHtmlGz).toBeDefined();
+      expect(typeof result.rawHtmlGz).toBe('string');
+      const gunzipped = zlib.gunzipSync(Buffer.from(result.rawHtmlGz as string, 'base64')).toString('utf-8');
+      expect(gunzipped).toBe(html);
+
+      const expectedSha = crypto.createHash('sha256').update(html, 'utf-8').digest('hex');
+      expect(result.htmlSha).toBe(expectedSha);
+
+      expect(result.rawHtmlBytes).toBe(Buffer.byteLength(html, 'utf-8'));
+    });
+
+    it('should omit rawHtmlGz/htmlSha/rawHtmlBytes when PERSIST_RAW_HTML is unset (default OFF)', async () => {
+      delete process.env.PERSIST_RAW_HTML;
+      mockPage.content.mockResolvedValue(html);
+
+      const result = await scrapeGeneric('https://myfigurecollection.net/item/12345', {});
+
+      expect(result.rawHtmlGz).toBeUndefined();
+      expect(result.htmlSha).toBeUndefined();
+      expect(result.rawHtmlBytes).toBeUndefined();
+    });
+
+    it('should omit rawHtmlGz/htmlSha/rawHtmlBytes when PERSIST_RAW_HTML=false', async () => {
+      process.env.PERSIST_RAW_HTML = 'false';
+      mockPage.content.mockResolvedValue(html);
+
+      const result = await scrapeGeneric('https://myfigurecollection.net/item/12345', {});
+
+      expect(result.rawHtmlGz).toBeUndefined();
+      expect(result.htmlSha).toBeUndefined();
+      expect(result.rawHtmlBytes).toBeUndefined();
+    });
+
+    it('should not fail the scrape when raw HTML capture throws', async () => {
+      process.env.PERSIST_RAW_HTML = 'true';
+      mockPage.content.mockResolvedValue(html);
+      const gzipSpy = jest.spyOn(zlib, 'gzipSync').mockImplementation(() => {
+        throw new Error('gzip failed');
+      });
+
+      const result = await scrapeGeneric('https://myfigurecollection.net/item/12345', {});
+
+      // Capture failure is non-fatal: scrape still succeeds without the raw HTML fields
+      expect(result).toBeDefined();
+      expect(result.rawHtmlGz).toBeUndefined();
+      expect(result.htmlSha).toBeUndefined();
+      expect(result.rawHtmlBytes).toBeUndefined();
+
+      gzipSpy.mockRestore();
+    });
   });
 });
