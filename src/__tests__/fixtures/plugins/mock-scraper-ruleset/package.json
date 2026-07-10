@@ -1,0 +1,6 @@
+{
+  "name": "mock-scraper-ruleset",
+  "version": "1.0.0",
+  "main": "index.js",
+  "keywords": ["scraper-ruleset"]
+}
