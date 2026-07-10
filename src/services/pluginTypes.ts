@@ -1,0 +1,263 @@
+/**
+ * Plugin contract — local mirror of the ScraperPlugin contract.
+ *
+ * The engine intentionally does NOT depend on the private
+ * @figurecollecting/scraper-rulesets package (credential-free, publicly
+ * shippable). These types are a structural mirror of that contract so any
+ * package implementing the shapes below can register itself with the engine
+ * at runtime, without the engine importing anything private.
+ */
+
+export interface ScraperPlugin {
+  name: string;
+  version: string;
+  register(registry: ExtractionRegistry, context: PluginContext): Promise<void>;
+  registerRoutes?(router: ExpressRouter): void;
+  shutdown?(): Promise<void>;
+}
+
+export interface ExtractionRegistry {
+  registerSite(config: SiteConfig): void;
+  registerRuleset(ruleset: ExtractionRuleset): void;
+}
+
+export interface PluginContext {
+  logger: PluginLogger;
+  config: RuntimeConfig;
+  services: EngineServices;
+}
+
+// ============================================================================
+// Engine Services — provided by the scraper engine via PluginContext.services
+// ============================================================================
+
+export interface EngineServices {
+  scraping: ScrapingService;
+  queue: QueueService;
+  sessions: SessionService;
+  webhooks: WebhookService;
+}
+
+export interface ScrapePageOptions {
+  waitTime?: number;
+  userAgent?: string;
+  cookies?: Record<string, string>;
+  cloudflareDetection?: {
+    titleIncludes?: string[];
+    bodyIncludes?: string[];
+  };
+}
+
+export interface ScrapePageResult {
+  html: string;
+  url: string;
+  title: string;
+  statusCode?: number;
+}
+
+export interface PageOptions {
+  stealth?: boolean;
+  viewport?: { width: number; height: number };
+  userAgent?: string;
+}
+
+export interface ScrapingService {
+  scrapePage(url: string, options?: ScrapePageOptions): Promise<ScrapePageResult>;
+  scrapePageStealth(url: string, options?: ScrapePageOptions): Promise<ScrapePageResult>;
+  withBrowser<T>(fn: (browser: any) => Promise<T>): Promise<T>;
+  withPage<T>(fn: (page: any) => Promise<T>, options?: PageOptions): Promise<T>;
+}
+
+export type QueuePriority = 'HOT' | 'WARM' | 'COLD';
+export type ItemStatus = 'owned' | 'ordered' | 'wished';
+
+export interface EnqueueOptions {
+  priority?: QueuePriority;
+  status?: ItemStatus;
+  cookies?: Record<string, string>;
+  sessionId?: string;
+  userId?: string;
+}
+
+export interface EnqueueResult {
+  itemId: string;
+  deduplicated: boolean;
+  position?: number;
+}
+
+export interface QueueStats {
+  hot: number;
+  warm: number;
+  cold: number;
+  total: number;
+  processing: number;
+  completed: number;
+  failed: number;
+  rateLimited: boolean;
+  currentDelay: number;
+}
+
+export interface QueueService {
+  enqueue(itemId: string, options?: EnqueueOptions): EnqueueResult;
+  enqueueBulk(items: Array<{ itemId: string; options?: EnqueueOptions }>): EnqueueResult[];
+  getStats(): QueueStats;
+  resumeSession(sessionId: string): boolean;
+  cancelFailedItems(sessionId: string): number;
+  cancelAllForSession(sessionId: string): number;
+  reset?(): void;
+}
+
+export interface SessionInfo {
+  sessionId: string;
+  isPaused: boolean;
+  inCooldown: boolean;
+  failureCount: number;
+  totalItems: number;
+  processedItems: number;
+}
+
+export interface SessionService {
+  getAllSessions(): SessionInfo[];
+  validateSession(sessionId: string): boolean;
+  reportPause(sessionId: string, reason: string): void;
+  reportFailure(sessionId: string, itemId: string, error: string): void;
+}
+
+export interface WebhookConfig {
+  webhookUrl: string;
+  webhookSecret: string;
+  sessionId: string;
+}
+
+export interface PhaseChangePayload {
+  sessionId: string;
+  phase: string;
+  message?: string;
+  items?: Array<{
+    mfcId: string;
+    name?: string;
+    collectionStatus: string;
+    isNsfw?: boolean;
+    mfcActivityOrder?: number;
+    isOrphan?: boolean;
+  }>;
+}
+
+export interface ListsSyncPayload {
+  sessionId: string;
+  lists: Array<{
+    mfcId: number;
+    name: string;
+    teaser?: string;
+    description?: string;
+    privacy: string;
+    iconUrl?: string;
+    itemCount: number;
+    itemMfcIds?: number[];
+    itemDetails?: Array<{ mfcId: number; name?: string; imageUrl?: string }>;
+    mfcCreatedAt?: string;
+  }>;
+}
+
+export interface ItemCompletePayload {
+  sessionId: string;
+  mfcId: string;
+  status: 'pending' | 'processing' | 'completed' | 'failed' | 'skipped';
+  error?: string;
+  scrapedData?: Record<string, unknown>;
+}
+
+export interface WebhookService {
+  registerConfig(config: WebhookConfig): void;
+  unregisterConfig(sessionId: string): void;
+  notifyItemComplete(payload: ItemCompletePayload): Promise<boolean>;
+  notifyPhaseChange(payload: PhaseChangePayload): Promise<boolean>;
+  notifyListsSync(payload: ListsSyncPayload): Promise<boolean>;
+}
+
+// ============================================================================
+// Site Configuration & Extraction
+// ============================================================================
+
+export interface SiteConfig {
+  siteId: string;
+  name: string;
+  domains: string[];
+  rateLimit: DomainRateLimit;
+  requiresBrowser: boolean;
+  allowedCookies: string[];
+}
+
+export interface DomainRateLimit {
+  domain: string;
+  baseDelayMs: number;
+  minDelayMs: number;
+  maxDelayMs: number;
+  backoffMultiplier: number;
+  recoveryDivisor: number;
+  successThreshold: number;
+}
+
+export interface ExtractionRuleset {
+  siteId: string;
+  version: string;
+  extract(html: string, url: string): ExtractedData;
+  validate(data: ExtractedData): ValidationResult;
+}
+
+export interface ExtractedData {
+  source: {
+    site: string;
+    itemId: string;
+    url: string;
+    extractedAt: Date;
+    rulesetVersion: string;
+  };
+  fields: Record<string, unknown>;
+  warnings: string[];
+}
+
+export interface ValidationResult {
+  valid: boolean;
+  errors: string[];
+  warnings: string[];
+}
+
+export interface RuntimeConfig {
+  get(key: string): unknown;
+  getFeatureFlag(site: string, feature: string): boolean;
+}
+
+export interface PluginLogger {
+  info(message: string, meta?: Record<string, unknown>): void;
+  warn(message: string, meta?: Record<string, unknown>): void;
+  error(message: string, meta?: Record<string, unknown>): void;
+  debug(message: string, meta?: Record<string, unknown>): void;
+}
+
+// Express Router type (lightweight, avoids importing express in the contract)
+export interface ExpressRouter {
+  get(path: string, ...handlers: Function[]): void;
+  post(path: string, ...handlers: Function[]): void;
+  put(path: string, ...handlers: Function[]): void;
+  delete(path: string, ...handlers: Function[]): void;
+  use(path: string, ...handlers: Function[]): void;
+}
+
+/**
+ * Type guard: validates an unknown module export has the minimum shape of a
+ * ScraperPlugin (name/version/register required; registerRoutes/shutdown
+ * optional). Used by the plugin loader to reject malformed packages instead
+ * of crashing the engine at boot.
+ */
+export function isScraperPlugin(value: unknown): value is ScraperPlugin {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.name === 'string' &&
+    typeof candidate.version === 'string' &&
+    typeof candidate.register === 'function' &&
+    (candidate.registerRoutes === undefined || typeof candidate.registerRoutes === 'function') &&
+    (candidate.shutdown === undefined || typeof candidate.shutdown === 'function')
+  );
+}

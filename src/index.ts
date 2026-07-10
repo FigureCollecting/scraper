@@ -11,6 +11,8 @@ import { scraperDebug } from './utils/logger.js';
 
 // Import browser pool functionality
 import { initializeBrowserPool, BrowserPool } from './services/genericScraper.js';
+import { bootstrapPlugins, shutdownPlugins } from './services/pluginBootstrap.js';
+import { ScraperPlugin } from './services/pluginTypes.js';
 
 dotenv.config();
 
@@ -77,24 +79,50 @@ app.use('/', scraperRoutes);
 // Sync routes for MFC collection synchronization
 app.use('/sync', syncRoutes);
 
-// Start server and initialize browser pool
-app.listen(PORT, async () => {
-  console.log(`[PAGE-SCRAPER] Server running on port ${PORT}`);
-  console.log(`[PAGE-SCRAPER] Health check: http://localhost:${PORT}/health`);
-  
-  // Initialize browser pool in background
-  console.log('[PAGE-SCRAPER] Initializing browser pool...');
-  try {
-    await initializeBrowserPool();
-    console.log('[PAGE-SCRAPER] Browser pool ready!');
-  } catch (error) {
-    console.error('[PAGE-SCRAPER] Failed to initialize browser pool:', error);
-  }
-});
+// Plugins loaded at boot (populated by startServer, read by gracefulShutdown)
+let loadedPlugins: ScraperPlugin[] = [];
 
-// Graceful shutdown - properly close browser pool to prevent file descriptor leaks
+// Discover + register plugins (mounting their routes) before accepting
+// connections, then start the server and initialize the browser pool.
+async function startServer(): Promise<void> {
+  try {
+    const { plugins } = await bootstrapPlugins(app);
+    loadedPlugins = plugins;
+    if (plugins.length > 0) {
+      console.log(`[PAGE-SCRAPER] Loaded ${plugins.length} plugin(s): ${plugins.map(p => `${p.name}@${p.version}`).join(', ')}`);
+    }
+  } catch (error) {
+    console.error('[PAGE-SCRAPER] Plugin bootstrap failed:', error);
+  }
+
+  app.listen(PORT, async () => {
+    console.log(`[PAGE-SCRAPER] Server running on port ${PORT}`);
+    console.log(`[PAGE-SCRAPER] Health check: http://localhost:${PORT}/health`);
+
+    // Initialize browser pool in background
+    console.log('[PAGE-SCRAPER] Initializing browser pool...');
+    try {
+      await initializeBrowserPool();
+      console.log('[PAGE-SCRAPER] Browser pool ready!');
+    } catch (error) {
+      console.error('[PAGE-SCRAPER] Failed to initialize browser pool:', error);
+    }
+  });
+}
+
+startServer();
+
+// Graceful shutdown - shut down plugins, then close browser pool to prevent file descriptor leaks
 async function gracefulShutdown(signal: string): Promise<void> {
   console.log(`[PAGE-SCRAPER] Received ${signal}, shutting down gracefully...`);
+
+  try {
+    console.log('[PAGE-SCRAPER] Shutting down plugins...');
+    await shutdownPlugins(loadedPlugins);
+    console.log('[PAGE-SCRAPER] Plugins shut down successfully');
+  } catch (error) {
+    console.error('[PAGE-SCRAPER] Error shutting down plugins:', error);
+  }
 
   try {
     console.log('[PAGE-SCRAPER] Closing browser pool...');

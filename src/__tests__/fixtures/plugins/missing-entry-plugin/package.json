@@ -1,0 +1,6 @@
+{
+  "name": "missing-entry-plugin",
+  "version": "1.0.0",
+  "main": "does-not-exist.js",
+  "keywords": ["scraper-ruleset"]
+}
