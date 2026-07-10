@@ -1,4 +1,6 @@
 import path from 'path';
+import { promises as fsPromises } from 'fs';
+import { jest } from '@jest/globals';
 import { discoverPlugins } from '../../services/pluginLoader';
 
 const FIXTURES_DIR = path.join(__dirname, '..', 'fixtures', 'plugins');
@@ -47,5 +49,38 @@ describe('discoverPlugins', () => {
   it('returns an empty array when node_modules has no candidate packages', async () => {
     const plugins = await discoverPlugins({ nodeModulesDir: path.join(__dirname, '..', 'fixtures') });
     expect(plugins).toEqual([]);
+  });
+
+  it('defaults to the real process node_modules directory when none is provided', async () => {
+    // Smoke test for the no-args path (defaultNodeModulesDir()) — the repo's
+    // real node_modules has no scraper-ruleset packages, so this just
+    // proves it scans without throwing and returns an array.
+    await expect(discoverPlugins()).resolves.toEqual(expect.any(Array));
+  });
+
+  it('skips a scoped package directory whose contents cannot be read, without failing the whole scan', async () => {
+    const realReaddir = fsPromises.readdir.bind(fsPromises);
+    const spy = jest.spyOn(fsPromises, 'readdir').mockImplementation(((dir: any, opts?: any) => {
+      if (typeof dir === 'string' && dir.includes('@mockscope')) {
+        return Promise.reject(new Error('EACCES simulated'));
+      }
+      return realReaddir(dir, opts);
+    }) as typeof fsPromises.readdir);
+
+    try {
+      const plugins = await discoverPlugins({ nodeModulesDir: FIXTURES_DIR });
+      expect(plugins.find(p => p.name === 'mock-scraper-ruleset')).toBeDefined();
+      expect(plugins.find(p => p.name === '@mockscope/scoped-ruleset')).toBeUndefined();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('skips a candidate whose entry file fails to import (e.g. missing main), without failing the whole scan', async () => {
+    const plugins = await discoverPlugins({ nodeModulesDir: FIXTURES_DIR });
+
+    expect(plugins.find(p => p.name === 'missing-entry-plugin')).toBeUndefined();
+    // Sibling valid plugins are still discovered.
+    expect(plugins.find(p => p.name === 'mock-scraper-ruleset')).toBeDefined();
   });
 });
