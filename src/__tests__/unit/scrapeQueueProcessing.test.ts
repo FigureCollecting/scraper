@@ -247,6 +247,31 @@ describe('ScrapeQueue - processing loop', () => {
     expect(mockNotifyItemSuccess).toHaveBeenCalledWith('session1', '12345', expect.any(Object));
   });
 
+  it('should pass raw HTML capture fields through to the item-complete webhook payload unmodified', async () => {
+    // Proves the queue threads scrapedData straight through to the webhook client without
+    // stripping fields -- so whatever genericScraper attaches (e.g. under PERSIST_RAW_HTML)
+    // reaches the backend on the item-complete webhook.
+    const scrapedData = {
+      name: 'Figure',
+      rawHtmlGz: 'base64gzipfixture==',
+      htmlSha: 'a'.repeat(64),
+      rawHtmlBytes: 1234,
+    };
+    mockScrapeMFC.mockResolvedValue(scrapedData);
+
+    queue = new ScrapeQueue(false);
+    const result = queue.enqueue('12345', {
+      priority: 'WARM',
+      sessionId: 'session1',
+    });
+
+    await advanceAndFlush(500);
+    await advanceAndFlush(3000);
+
+    await result.promise;
+    expect(mockNotifyItemSuccess).toHaveBeenCalledWith('session1', '12345', scrapedData);
+  });
+
   it('should call webhook on permanent failure for non-cookie session items', async () => {
     mockScrapeMFC.mockRejectedValue(new Error('AUTH: required'));
 
