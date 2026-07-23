@@ -205,13 +205,19 @@ export interface ExtractionRuleset {
   validate(data: ExtractedData): ValidationResult;
 }
 
+/**
+ * Uniform extraction result. `source` serializes 1:1 onto the aggregation
+ * ingest wire: `extractedAt` MUST be an ISO-8601 UTC string (it becomes the
+ * `as_of` timestamp on every downstream claim row — produce it with
+ * `new Date().toISOString()`, never a Date object).
+ */
 export interface ExtractedData {
   source: {
     site: string;
     itemId: string;
-    url: string;
-    extractedAt: Date;
-    rulesetVersion: string;
+    url?: string;
+    extractedAt: string;
+    rulesetVersion?: string;
   };
   fields: Record<string, unknown>;
   warnings: string[];
