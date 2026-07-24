@@ -86,6 +86,8 @@ FROM base AS development
 
 # Copy package files
 COPY package*.json .npmrc ./
+# patches/ must be present before npm install so the patch-package postinstall applies
+COPY patches ./patches
 
 # Install all dependencies (Puppeteer won't download Chrome due to ENV vars)
 RUN npm config set fetch-timeout 300000 && npm config set fetch-retry-maxtimeout 300000
@@ -121,6 +123,8 @@ FROM base AS builder
 
 # Copy package files
 COPY package*.json .npmrc ./
+# patches/ must be present before npm install so the patch-package postinstall applies
+COPY patches ./patches
 
 # Install all dependencies for build
 RUN npm config set fetch-timeout 300000 && npm config set fetch-retry-maxtimeout 300000
@@ -145,6 +149,8 @@ FROM base AS production
 
 # Copy package files
 COPY package*.json .npmrc ./
+# patches/ must be present before npm install so the patch-package postinstall applies
+COPY patches ./patches
 
 # Install only production dependencies
 RUN npm config set fetch-timeout 300000 && npm config set fetch-retry-maxtimeout 300000

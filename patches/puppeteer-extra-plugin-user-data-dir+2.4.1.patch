@@ -1,0 +1,35 @@
+diff --git a/node_modules/puppeteer-extra-plugin-user-data-dir/index.js b/node_modules/puppeteer-extra-plugin-user-data-dir/index.js
+index 935505a..900854a 100644
+--- a/node_modules/puppeteer-extra-plugin-user-data-dir/index.js
++++ b/node_modules/puppeteer-extra-plugin-user-data-dir/index.js
+@@ -5,7 +5,7 @@ const fs = require('fs')
+ const fse = require('fs-extra')
+ const os = require('os')
+ const path = require('path')
+-const rimraf = require('rimraf')
++const { rimraf } = require('rimraf')
+ const debug = require('debug')('puppeteer-extra-plugin:user-data-dir')
+ const mkdtempAsync = util.promisify(fs.mkdtemp)
+ const { PuppeteerExtraPlugin } = require('puppeteer-extra-plugin')
+@@ -73,15 +73,12 @@ class Plugin extends PuppeteerExtraPlugin {
+ 
+     // We're using rimraf here because it throw errors and don't seem to freeze the process
+     // If ressources busy or locked by chrome try again 4 times, then give up. overall a timout of 400ms
+-    rimraf(
+-      this._userDataDir,
+-      {
+-        maxBusyTries: 4
+-      },
+-      err => {
+-        debug(err)
+-      }
+-    )
++    // rimraf v6: promise API (no callback), maxBusyTries renamed to maxRetries
++    rimraf(this._userDataDir, {
++      maxRetries: 4
++    }).catch(err => {
++      debug(err)
++    })
+   }
+ 
+   async writeFilesToProfile() {

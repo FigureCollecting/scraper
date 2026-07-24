@@ -18,7 +18,8 @@
     "test:all": "jest --config jest.config.cjs",
     "test:watch": "jest --config jest.config.cjs --watch",
     "test:coverage": "jest --config jest.config.cjs --coverage --testPathIgnorePatterns='inter-service'",
-    "test:ci": "jest --config jest.config.cjs --ci --coverage --testPathIgnorePatterns='inter-service'"
+    "test:ci": "jest --config jest.config.cjs --ci --coverage --testPathIgnorePatterns='inter-service'",
+    "postinstall": "patch-package"
   },
   "dependencies": {
     "@figurecollecting/fc-shared": "^1.3.0",
@@ -34,6 +35,7 @@
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^5.2.0",
+    "patch-package": "^8.0.1",
     "puppeteer": "^25.3.0",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2"
