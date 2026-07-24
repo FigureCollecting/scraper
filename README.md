@@ -629,6 +629,11 @@ See `.env.example` for complete configuration template.
 - `ADMIN_TOKEN`: Authentication token for admin endpoints
   - Required for `/reset-pool` endpoint in non-production environments
   - Simple string token for basic protection
+- `PLUGIN_DIR`: Directory scanned for ruleset plugin packages at boot
+  - Default: the service's own `node_modules`
+  - Use when plugins are injected at runtime (e.g. a mounted volume in a container) instead of being installed as dependencies
+  - Example: `/plugins/node_modules`
+  - An explicit `nodeModulesDir` option passed to the plugin bootstrap takes precedence
 
 **MFC Cookie Security:**
 - `MFC_ALLOWED_COOKIES`: Whitelist of cookie names allowed during authenticated MFC scraping
