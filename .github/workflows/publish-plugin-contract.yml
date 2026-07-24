@@ -1,0 +1,58 @@
+name: Publish Plugin Contract
+
+# Publishes @figurecollecting/scraper-plugin-contract to GitHub Packages (npm)
+# when the package changes on develop, using the ephemeral GITHUB_TOKEN (no
+# standing PAT). npm versions are immutable, so a push that does not bump
+# packages/plugin-contract/package.json is skipped instead of failing.
+on:
+  push:
+    branches: [develop]
+    paths:
+      - 'packages/plugin-contract/**'
+  workflow_dispatch: {}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    defaults:
+      run:
+        working-directory: packages/plugin-contract
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@figurecollecting'
+
+      - name: Install build tooling
+        run: npm install --no-audit --no-fund
+
+      - name: Build
+        run: npm run build
+
+      - name: Check whether version is already published
+        id: version-check
+        run: |
+          VERSION="$(node -pe "require('./package.json').version")"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          if npm view "@figurecollecting/scraper-plugin-contract@${VERSION}" version >/dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "Version ${VERSION} already on the registry; skipping publish."
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish to GitHub Packages
+        if: steps.version-check.outputs.published == 'false'
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
