@@ -10,7 +10,7 @@ import {
   notifyPhaseChange,
   notifyListsSync,
 } from '../webhookClient.js';
-import { WebhookService } from '../pluginTypes.js';
+import { WebhookService } from '@figurecollecting/scraper-plugin-contract';
 
 export function createWebhookService(): WebhookService {
   return {

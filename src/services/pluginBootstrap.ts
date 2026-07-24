@@ -15,7 +15,7 @@ import { Router, type Express } from 'express';
 import { discoverPlugins } from './pluginLoader.js';
 import { createExtractionRegistry, ExtractionRegistryImpl } from './extractionRegistry.js';
 import { buildEngineServices, createRuntimeConfig, createPluginLogger } from './engineServices/index.js';
-import { ScraperPlugin, PluginContext, ExpressRouter } from './pluginTypes.js';
+import { ScraperPlugin, PluginContext, ExpressRouter } from '@figurecollecting/scraper-plugin-contract';
 
 export interface BootstrapPluginsOptions {
   /**

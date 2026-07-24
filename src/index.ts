@@ -12,7 +12,7 @@ import { scraperDebug } from './utils/logger.js';
 // Import browser pool functionality
 import { initializeBrowserPool, BrowserPool } from './services/genericScraper.js';
 import { bootstrapPlugins, shutdownPlugins } from './services/pluginBootstrap.js';
-import { ScraperPlugin } from './services/pluginTypes.js';
+import { ScraperPlugin } from '@figurecollecting/scraper-plugin-contract';
 
 dotenv.config();
 

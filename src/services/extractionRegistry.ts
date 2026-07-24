@@ -12,7 +12,7 @@ import {
   ExtractionRegistry,
   SiteConfig,
   ExtractionRuleset,
-} from './pluginTypes.js';
+} from '@figurecollecting/scraper-plugin-contract';
 
 export class ExtractionRegistryImpl implements ExtractionRegistry {
   private readonly sites = new Map<string, SiteConfig>();

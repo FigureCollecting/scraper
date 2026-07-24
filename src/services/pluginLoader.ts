@@ -10,7 +10,7 @@
 import { promises as fs } from 'fs';
 import path from 'path';
 import { pathToFileURL } from 'url';
-import { ScraperPlugin, isScraperPlugin } from './pluginTypes.js';
+import { ScraperPlugin, isScraperPlugin } from '@figurecollecting/scraper-plugin-contract';
 
 const PLUGIN_KEYWORD = 'scraper-ruleset';
 

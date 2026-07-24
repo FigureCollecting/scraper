@@ -8,7 +8,7 @@ import request from 'supertest';
 import express from 'express';
 import { jest } from '@jest/globals';
 import { bootstrapPlugins, shutdownPlugins } from '../../services/pluginBootstrap';
-import { ScraperPlugin, ExtractionRegistry, PluginContext, ExpressRouter } from '../../services/pluginTypes';
+import { ScraperPlugin, ExtractionRegistry, PluginContext, ExpressRouter } from '@figurecollecting/scraper-plugin-contract';
 
 const FIXTURES_DIR = path.join(__dirname, '..', 'fixtures', 'plugins');
 

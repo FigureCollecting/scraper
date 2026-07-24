@@ -5,11 +5,12 @@
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc",
+    "build": "npm run build:contract && tsc",
+    "build:contract": "tsc -p packages/plugin-contract",
     "start": "node --import ./dist/tracing.js dist/index.js",
     "dev": "tsx watch --env-file=.env src/index.ts",
     "lint": "echo 'No linter configured'",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "npm run build:contract && tsc --noEmit",
     "typecheck:tests": "tsc --noEmit -p tsconfig.test.json",
     "test": "jest --config jest.config.cjs --testPathIgnorePatterns='inter-service'",
     "test:unit": "jest --config jest.config.cjs src/__tests__/unit",
@@ -23,6 +24,7 @@
   },
   "dependencies": {
     "@figurecollecting/fc-shared": "^1.5.1",
+    "@figurecollecting/scraper-plugin-contract": "file:packages/plugin-contract",
     "@opentelemetry/api": "^1.9.1",
     "@opentelemetry/auto-instrumentations-node": "^0.79.0",
     "@opentelemetry/core": "^2.10.0",

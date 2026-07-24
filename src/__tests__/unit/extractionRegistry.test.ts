@@ -1,5 +1,5 @@
 import { createExtractionRegistry } from '../../services/extractionRegistry';
-import { SiteConfig, ExtractionRuleset, ExtractedData, ValidationResult } from '../../services/pluginTypes';
+import { SiteConfig, ExtractionRuleset, ExtractedData, ValidationResult } from '@figurecollecting/scraper-plugin-contract';
 
 function buildSiteConfig(overrides: Partial<SiteConfig> = {}): SiteConfig {
   return {

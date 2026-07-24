@@ -3,6 +3,8 @@ node_modules/
 
 # Build outputs
 /dist
+/packages/plugin-contract/dist
+*.tgz
 
 # Environment variables
 .env

@@ -8,7 +8,7 @@
  */
 import type { Browser, Page } from 'puppeteer';
 import { BrowserPool } from '../genericScraper.js';
-import { ScrapingService, ScrapePageOptions, ScrapePageResult, PageOptions } from '../pluginTypes.js';
+import { ScrapingService, ScrapePageOptions, ScrapePageResult, PageOptions } from '@figurecollecting/scraper-plugin-contract';
 
 const DEFAULT_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36';

@@ -88,6 +88,8 @@ FROM base AS development
 COPY package*.json .npmrc ./
 # patches/ must be present before npm install so the patch-package postinstall applies
 COPY patches ./patches
+# plugin-contract manifest must be present so the file: dependency resolves at npm install
+COPY packages/plugin-contract/package.json ./packages/plugin-contract/
 
 # Install all dependencies (Puppeteer won't download Chrome due to ENV vars)
 RUN npm config set fetch-timeout 300000 && npm config set fetch-retry-maxtimeout 300000
@@ -125,6 +127,8 @@ FROM base AS builder
 COPY package*.json .npmrc ./
 # patches/ must be present before npm install so the patch-package postinstall applies
 COPY patches ./patches
+# plugin-contract manifest must be present so the file: dependency resolves at npm install
+COPY packages/plugin-contract/package.json ./packages/plugin-contract/
 
 # Install all dependencies for build
 RUN npm config set fetch-timeout 300000 && npm config set fetch-retry-maxtimeout 300000
@@ -151,6 +155,8 @@ FROM base AS production
 COPY package*.json .npmrc ./
 # patches/ must be present before npm install so the patch-package postinstall applies
 COPY patches ./patches
+# plugin-contract manifest must be present so the file: dependency resolves at npm install
+COPY packages/plugin-contract/package.json ./packages/plugin-contract/
 
 # Install only production dependencies
 RUN npm config set fetch-timeout 300000 && npm config set fetch-retry-maxtimeout 300000
@@ -164,6 +170,7 @@ RUN rm -rf /root/.cache/puppeteer \
 
 # Copy built application from builder
 COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/packages/plugin-contract/dist ./packages/plugin-contract/dist
 
 # Create non-root user for security
 RUN groupadd -r pptruser && useradd -r -g pptruser -G audio,video pptruser \

@@ -1,11 +1,12 @@
 /**
- * Plugin contract — local mirror of the ScraperPlugin contract.
+ * Plugin contract — single source of truth for the ScraperPlugin contract.
  *
- * The engine intentionally does NOT depend on the private
- * @figurecollecting/scraper-rulesets package (credential-free, publicly
- * shippable). These types are a structural mirror of that contract so any
- * package implementing the shapes below can register itself with the engine
- * at runtime, without the engine importing anything private.
+ * Published as @figurecollecting/scraper-plugin-contract and consumed by both
+ * the scraper engine and ruleset plugin packages, so the two sides can never
+ * drift. The engine intentionally does NOT depend on any private ruleset
+ * package (credential-free, publicly shippable): any package implementing the
+ * shapes below can register itself with the engine at runtime, without the
+ * engine importing anything private.
  */
 
 export interface ScraperPlugin {

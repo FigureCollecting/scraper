@@ -55,6 +55,7 @@ module.exports = {
   // MUST stay first — moduleNameMapper is evaluated top-to-bottom.
   moduleNameMapper: {
     '^puppeteer$': '<rootDir>/src/__tests__/__mocks__/puppeteer.ts',
+    '^@figurecollecting/scraper-plugin-contract$': '<rootDir>/packages/plugin-contract/src/index.ts',
     '^(\\.{1,2}/.*)\\.js$': '$1'
   },
   

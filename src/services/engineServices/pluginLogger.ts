@@ -4,7 +4,7 @@
  * attributable (e.g. "[plugin:mock-scraper-ruleset] ...").
  */
 import { logger } from '../../utils/logger.js';
-import { PluginLogger } from '../pluginTypes.js';
+import { PluginLogger } from '@figurecollecting/scraper-plugin-contract';
 
 export function createPluginLogger(namespace: string): PluginLogger {
   return {

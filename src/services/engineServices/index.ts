@@ -2,7 +2,7 @@
  * Barrel: assembles the concrete EngineServices bundle handed to plugins via
  * PluginContext.services.
  */
-import { EngineServices } from '../pluginTypes.js';
+import { EngineServices } from '@figurecollecting/scraper-plugin-contract';
 import { createScrapingService } from './scrapingService.js';
 import { createQueueService } from './queueService.js';
 import { createSessionService } from './sessionService.js';
