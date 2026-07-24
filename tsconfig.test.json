@@ -15,7 +15,11 @@
     "noImplicitReturns": false,
     "noFallthroughCasesInSwitch": false,
     "skipLibCheck": true,
-    "types": ["jest", "node"]
+    "types": ["jest", "node"],
+    "rootDir": ".",
+    "paths": {
+      "@figurecollecting/scraper-plugin-contract": ["./packages/plugin-contract/src/index.ts"]
+    }
   },
   "include": [
     "src/**/__tests__/**/*",

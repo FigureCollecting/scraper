@@ -5,7 +5,7 @@
  * as JSON (booleans, numbers, objects) are returned parsed; anything else is
  * returned as the raw string.
  */
-import { RuntimeConfig } from '../pluginTypes.js';
+import { RuntimeConfig } from '@figurecollecting/scraper-plugin-contract';
 
 function toEnvKey(key: string): string {
   return key.toUpperCase().replace(/[.\-]/g, '_');

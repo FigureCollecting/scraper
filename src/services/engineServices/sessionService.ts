@@ -8,7 +8,7 @@
  */
 import { getSessionManager } from '../sessionManager.js';
 import type { SessionManager } from '../sessionManager.js';
-import { SessionService, SessionInfo } from '../pluginTypes.js';
+import { SessionService, SessionInfo } from '@figurecollecting/scraper-plugin-contract';
 
 export type SessionServiceDeps = Pick<SessionManager, 'getAllSessions' | 'reportCookieFailure'>;
 

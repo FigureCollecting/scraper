@@ -6,7 +6,7 @@
  */
 import { getScrapeQueue } from '../scrapeQueue.js';
 import type { ScrapeQueue } from '../scrapeQueue.js';
-import { QueueService, EnqueueOptions, EnqueueResult } from '../pluginTypes.js';
+import { QueueService, EnqueueOptions, EnqueueResult } from '@figurecollecting/scraper-plugin-contract';
 
 export type QueueServiceDeps = Pick<
   ScrapeQueue,

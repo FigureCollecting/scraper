@@ -1,4 +1,4 @@
-import { isScraperPlugin } from '../../services/pluginTypes';
+import { isScraperPlugin } from '@figurecollecting/scraper-plugin-contract';
 
 describe('isScraperPlugin', () => {
   it('accepts an object with only the required fields (name/version/register)', () => {
