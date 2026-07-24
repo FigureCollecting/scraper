@@ -1,10 +1,10 @@
 # =============================================================================
-# BASE STAGE - Secure Ubuntu 24.04 + Node 24.18.0 LTS + Chrome 150.0.7871.47
+# BASE STAGE - Secure Ubuntu 26.04 + Node 24.18.0 LTS + Chrome 151.0.7922.47
 # =============================================================================
-FROM ubuntu:24.04 AS base
+FROM ubuntu:26.04 AS base
 
 # Cache-bust ARG to invalidate Docker layers when dependencies change
-ARG CACHE_BUST=2026-07-02-node-24.18.0-chrome-150.0.7871.47-cve-fix
+ARG CACHE_BUST=2026-07-24-node-24.18.0-chrome-151.0.7922.47-cve-fix
 
 # Update all packages for latest security patches (openssl, gnupg, glibc)
 # Install Node.js 24 using official binaries (avoids NodeSource CVE false positives)
@@ -63,9 +63,10 @@ RUN apt-get update && apt-get upgrade -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# Download and install Chrome for Testing (150.0.7871.47) - milestone-150 build, fixes the 149.x High/Critical CVEs
+# Download and install Chrome for Testing (151.0.7922.47) - current Stable channel; fixes CVE-2026-15776/-15121/-15132 (all High).
+# Verified: puppeteer 25.3.0 drives 151 with no CDP skew and stealth-evasion is unchanged vs 150 (A/B tested).
 RUN apt-get update && apt-get install -y wget unzip \
-    && wget -q https://storage.googleapis.com/chrome-for-testing-public/150.0.7871.47/linux64/chrome-linux64.zip \
+    && wget -q https://storage.googleapis.com/chrome-for-testing-public/151.0.7922.47/linux64/chrome-linux64.zip \
     && unzip chrome-linux64.zip \
     && mv chrome-linux64 /opt/chrome \
     && rm chrome-linux64.zip \
@@ -85,6 +86,8 @@ FROM base AS development
 
 # Copy package files
 COPY package*.json .npmrc ./
+# patches/ must be present before npm install so the patch-package postinstall applies
+COPY patches ./patches
 
 # Install all dependencies (Puppeteer won't download Chrome due to ENV vars)
 RUN npm config set fetch-timeout 300000 && npm config set fetch-retry-maxtimeout 300000
@@ -120,6 +123,8 @@ FROM base AS builder
 
 # Copy package files
 COPY package*.json .npmrc ./
+# patches/ must be present before npm install so the patch-package postinstall applies
+COPY patches ./patches
 
 # Install all dependencies for build
 RUN npm config set fetch-timeout 300000 && npm config set fetch-retry-maxtimeout 300000
@@ -144,6 +149,8 @@ FROM base AS production
 
 # Copy package files
 COPY package*.json .npmrc ./
+# patches/ must be present before npm install so the patch-package postinstall applies
+COPY patches ./patches
 
 # Install only production dependencies
 RUN npm config set fetch-timeout 300000 && npm config set fetch-retry-maxtimeout 300000
