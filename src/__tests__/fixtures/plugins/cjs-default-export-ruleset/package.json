@@ -1,0 +1,6 @@
+{
+  "name": "cjs-default-export-ruleset",
+  "version": "3.0.0",
+  "main": "index.js",
+  "keywords": ["scraper-ruleset"]
+}

@@ -77,6 +77,34 @@ async function listCandidateDirs(nodeModulesDir: string): Promise<string[]> {
   return candidates;
 }
 
+/**
+ * Resolve the ScraperPlugin object out of a dynamically imported module,
+ * tolerating every interop shape a plugin package can compile to:
+ *
+ * - native ESM `export default plugin`        -> mod.default
+ * - CJS `module.exports = plugin`             -> mod.default (Node wraps the
+ *   whole module.exports as the namespace's `default`)
+ * - CJS `exports.default = plugin` (tsc emit  -> mod.default.default (the
+ *   of `export default plugin`)                  namespace's `default` is the
+ *                                                entire exports bag, so the
+ *                                                plugin sits one level deeper)
+ *
+ * The second unwrap is bounded: exactly one extra level, only when the first
+ * candidate fails the type guard and exposes an object `default` property.
+ */
+export function resolvePluginExport(mod: unknown): ScraperPlugin | null {
+  let candidate: unknown = (mod as { default?: unknown })?.default ?? mod;
+
+  if (!isScraperPlugin(candidate) && candidate !== null && typeof candidate === 'object') {
+    const inner = (candidate as { default?: unknown }).default;
+    if (inner !== null && typeof inner === 'object') {
+      candidate = inner;
+    }
+  }
+
+  return isScraperPlugin(candidate) ? candidate : null;
+}
+
 async function importPlugin(packageDir: string, pkg: CandidatePackageJson): Promise<ScraperPlugin | null> {
   const entryFile = path.join(packageDir, pkg.main || 'index.js');
 
@@ -88,13 +116,13 @@ async function importPlugin(packageDir: string, pkg: CandidatePackageJson): Prom
     return null;
   }
 
-  const candidate = (mod as { default?: unknown })?.default ?? mod;
-  if (!isScraperPlugin(candidate)) {
+  const plugin = resolvePluginExport(mod);
+  if (!plugin) {
     console.warn(`[PLUGIN LOADER] Skipping ${packageDir}: does not implement the ScraperPlugin contract`);
     return null;
   }
 
-  return candidate;
+  return plugin;
 }
 
 /**
