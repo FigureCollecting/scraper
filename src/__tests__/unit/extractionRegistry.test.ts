@@ -27,7 +27,7 @@ function buildRuleset(siteId: string): ExtractionRuleset {
     version: '1.0.0',
     extract(html: string, url: string): ExtractedData {
       return {
-        source: { site: siteId, itemId: '1', url, extractedAt: new Date(), rulesetVersion: '1.0.0' },
+        source: { site: siteId, itemId: '1', url, extractedAt: new Date().toISOString(), rulesetVersion: '1.0.0' },
         fields: { html },
         warnings: [],
       };
