@@ -634,6 +634,12 @@ See `.env.example` for complete configuration template.
   - Use when plugins are injected at runtime (e.g. a mounted volume in a container) instead of being installed as dependencies
   - Example: `/plugins/node_modules`
   - An explicit `nodeModulesDir` option passed to the plugin bootstrap takes precedence
+- `INGEST_BASE_URL`: Base URL of the fc-aggregation SpineIngest gRPC server (h2c/HTTP2)
+  - Example: `http://fc-aggregation:50051`
+  - When set AND a plugin ruleset matches an item's URL, the scrape queue takes the new ingest path: raw page fetch → plugin extraction → gRPC emit to the aggregation spine (no webhook leg on that path)
+  - Unset (default): the new path is disabled and every item uses the legacy scrape+webhook path
+- `INGEST_TIMEOUT_MS`: Per-call deadline in milliseconds for spine ingest RPCs
+  - Default: `30000`
 
 **MFC Cookie Security:**
 - `MFC_ALLOWED_COOKIES`: Whitelist of cookie names allowed during authenticated MFC scraping
