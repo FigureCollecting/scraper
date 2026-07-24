@@ -18,7 +18,13 @@ import { buildEngineServices, createRuntimeConfig, createPluginLogger } from './
 import { ScraperPlugin, PluginContext, ExpressRouter } from './pluginTypes.js';
 
 export interface BootstrapPluginsOptions {
-  /** Directory to scan for candidate plugin packages (forwarded to discoverPlugins). */
+  /**
+   * Directory to scan for candidate plugin packages (forwarded to
+   * discoverPlugins). Falls back to the PLUGIN_DIR environment variable when
+   * not provided, then to the process's own node_modules — so runtime-injected
+   * plugins (e.g. a mounted volume in a container) can live outside
+   * process.cwd()/node_modules.
+   */
   nodeModulesDir?: string;
   /** Full override of plugin discovery — primarily for tests. */
   discover?: () => Promise<ScraperPlugin[]>;
@@ -34,7 +40,8 @@ export async function bootstrapPlugins(app: Express, options: BootstrapPluginsOp
   const config = createRuntimeConfig();
   const services = buildEngineServices();
 
-  const discover = options.discover ?? (() => discoverPlugins({ nodeModulesDir: options.nodeModulesDir }));
+  const nodeModulesDir = options.nodeModulesDir ?? (process.env.PLUGIN_DIR || undefined);
+  const discover = options.discover ?? (() => discoverPlugins({ nodeModulesDir }));
   const candidates = await discover();
 
   const loaded: ScraperPlugin[] = [];

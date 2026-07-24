@@ -150,3 +150,52 @@ describe('bootstrapPlugins', () => {
     await expect(shutdownPlugins([minimalPlugin])).resolves.not.toThrow();
   });
 });
+
+describe('bootstrapPlugins PLUGIN_DIR environment override', () => {
+  const ORIGINAL_PLUGIN_DIR = process.env.PLUGIN_DIR;
+
+  afterEach(() => {
+    if (ORIGINAL_PLUGIN_DIR === undefined) {
+      delete process.env.PLUGIN_DIR;
+    } else {
+      process.env.PLUGIN_DIR = ORIGINAL_PLUGIN_DIR;
+    }
+  });
+
+  it('scans the directory named by PLUGIN_DIR when no nodeModulesDir option is given', async () => {
+    process.env.PLUGIN_DIR = FIXTURES_DIR;
+    const app = buildApp();
+
+    const { plugins } = await bootstrapPlugins(app);
+
+    expect(plugins.map(p => p.name)).toContain('mock-scraper-ruleset');
+  });
+
+  it('falls back to default discovery (process node_modules) when PLUGIN_DIR is unset', async () => {
+    delete process.env.PLUGIN_DIR;
+    const app = buildApp();
+
+    const { plugins } = await bootstrapPlugins(app);
+
+    // The repo's real node_modules contains no scraper-ruleset packages.
+    expect(plugins.map(p => p.name)).not.toContain('mock-scraper-ruleset');
+  });
+
+  it('treats an empty PLUGIN_DIR as unset', async () => {
+    process.env.PLUGIN_DIR = '';
+    const app = buildApp();
+
+    const { plugins } = await bootstrapPlugins(app);
+
+    expect(plugins.map(p => p.name)).not.toContain('mock-scraper-ruleset');
+  });
+
+  it('lets an explicit nodeModulesDir option take precedence over PLUGIN_DIR', async () => {
+    process.env.PLUGIN_DIR = path.join(FIXTURES_DIR, 'does-not-exist');
+    const app = buildApp();
+
+    const { plugins } = await bootstrapPlugins(app, { nodeModulesDir: FIXTURES_DIR });
+
+    expect(plugins.map(p => p.name)).toContain('mock-scraper-ruleset');
+  });
+});
