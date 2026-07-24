@@ -33,7 +33,7 @@
     "@opentelemetry/semantic-conventions": "^1.43.0",
     "cheerio": "^1.1.2",
     "cors": "^2.8.5",
-    "dotenv": "^17.2.3",
+    "dotenv": "^17.4.2",
     "express": "^5.2.0",
     "patch-package": "^8.0.1",
     "puppeteer": "^25.3.0",
