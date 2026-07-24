@@ -23,7 +23,11 @@
     "postinstall": "patch-package"
   },
   "dependencies": {
+    "@bufbuild/protobuf": "^2.13.0",
+    "@connectrpc/connect": "^2.1.2",
+    "@connectrpc/connect-node": "^2.1.2",
     "@figurecollecting/fc-shared": "^1.5.1",
+    "@figurecollecting/ingest-contract": "^0.1.0",
     "@figurecollecting/scraper-plugin-contract": "file:packages/plugin-contract",
     "@opentelemetry/api": "^1.9.1",
     "@opentelemetry/auto-instrumentations-node": "^0.79.0",
