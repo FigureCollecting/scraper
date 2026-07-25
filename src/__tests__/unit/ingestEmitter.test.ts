@@ -1,9 +1,10 @@
 /**
  * IngestEmitter tests — wire-mapping fidelity + retry classification against
- * an IN-PROCESS SpineIngest server (connectNodeAdapter on node:http2, real
- * gRPC over an ephemeral localhost port). Nothing is mocked at the transport
- * boundary: what the stub service captures is exactly what the spine's real
- * server would decode.
+ * an IN-PROCESS SpineIngest server (connectNodeAdapter on node:http, real
+ * Connect-over-HTTP/1.1 on an ephemeral localhost port — the same cleartext
+ * HTTP/1.1 the production spine serves, so Linkerd can mesh it). Nothing is
+ * mocked at the transport boundary: what the stub service captures is exactly
+ * what the spine's real server would decode.
  *
  * Fidelity contract under test (mirrors @figurecollecting/ingest-contract):
  *   - fields_json is the EXACT JSON text of the fields object
@@ -17,8 +18,8 @@
  *   - anything else (e.g. DeadlineExceeded) -> no retry
  *   - SUCCESS = RPC resolved OK, even when stats report zero inserts
  */
-import * as http2 from 'node:http2';
-import type { AddressInfo } from 'node:net';
+import * as http from 'node:http';
+import type { AddressInfo, Socket } from 'node:net';
 import { Code, ConnectError, type ConnectRouter } from '@connectrpc/connect';
 import { connectNodeAdapter } from '@connectrpc/connect-node';
 import { create } from '@bufbuild/protobuf';
@@ -43,7 +44,7 @@ interface StubServer {
   close: () => Promise<void>;
 }
 
-/** In-process SpineIngest stub: real h2c server, ephemeral port. */
+/** In-process SpineIngest stub: real HTTP/1.1 server, ephemeral port. */
 async function startStub(impl: StubImpl): Promise<StubServer> {
   const captured: WireExtractedData[] = [];
   let calls = 0;
@@ -58,9 +59,18 @@ async function startStub(impl: StubImpl): Promise<StubServer> {
     });
   };
 
-  const server = http2.createServer(connectNodeAdapter({ routes }));
-  const sessions: http2.ServerHttp2Session[] = [];
-  server.on('session', s => sessions.push(s));
+  // Plain node:http server — the same cleartext HTTP/1.1 the production spine
+  // (main.ts) serves, and what the emitter's Connect/HTTP/1.1 transport speaks.
+  // (A cleartext http2 server, even with allowHTTP1, cannot serve an h1 client:
+  // it sends the h2 SETTINGS preface immediately.) Connect keeps the socket
+  // alive, so teardown tracks raw connections and destroys them — otherwise
+  // server.close() would hang on an idle keep-alive socket.
+  const server = http.createServer(connectNodeAdapter({ routes }));
+  const sockets = new Set<Socket>();
+  server.on('connection', socket => {
+    sockets.add(socket);
+    socket.once('close', () => sockets.delete(socket));
+  });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const port = (server.address() as AddressInfo).port;
 
@@ -69,7 +79,7 @@ async function startStub(impl: StubImpl): Promise<StubServer> {
     captured,
     callCount: () => calls,
     close: async () => {
-      for (const s of sessions) s.destroy();
+      for (const socket of sockets) socket.destroy();
       await new Promise<void>(resolve => server.close(() => resolve()));
     },
   };

@@ -13,10 +13,12 @@
  *   - warnings travel verbatim; optional source fields stay ABSENT when
  *     absent.
  *
- * TRANSPORT: createGrpcTransport is h2c-hardwired HTTP/2, matching the
- * spine server (node:http2 cleartext behind the mesh). Never swap this for
- * createConnectTransport with httpVersion '1.1' — the server speaks gRPC
- * over h2 only.
+ * TRANSPORT: createConnectTransport with httpVersion '1.1' — the Connect
+ * protocol over plain HTTP/1.1. The spine ingest server serves cleartext
+ * HTTP/1.1, and Linkerd meshes HTTP/1.1 natively (mTLS, no opaque-port
+ * workaround), whereas it mishandles the cleartext-h2c stream on this hop.
+ * Do NOT revert to createGrpcTransport (h2c) — that is the stream the mesh
+ * cannot carry.
  *
  * RETRY (SUCCESS = the RPC resolved OK — never key success on
  * stats.inserted > 0; a post-commit retry legitimately returns all-deduped
@@ -28,7 +30,7 @@
  *   - anything else    -> no retry
  */
 import { Code, ConnectError, createClient, type Client } from '@connectrpc/connect';
-import { createGrpcTransport } from '@connectrpc/connect-node';
+import { createConnectTransport } from '@connectrpc/connect-node';
 import { create } from '@bufbuild/protobuf';
 import {
   SpineIngest,
@@ -62,8 +64,9 @@ export class IngestEmitter {
   private readonly retryDelayMs: number;
 
   constructor(options: IngestEmitterOptions) {
-    // h2c-hardwired HTTP/2 — matches the spine's node:http2 cleartext server.
-    const transport = createGrpcTransport({ baseUrl: options.baseUrl });
+    // Connect over HTTP/1.1 — Linkerd meshes h1 natively (mTLS); the spine
+    // ingest server serves cleartext HTTP/1.1. See the TRANSPORT note in the header.
+    const transport = createConnectTransport({ baseUrl: options.baseUrl, httpVersion: '1.1' });
     this.client = createClient(SpineIngest, transport);
     this.timeoutMs = options.timeoutMs ?? DEFAULT_INGEST_TIMEOUT_MS;
     this.retryDelayMs = options.retryDelayMs ?? 1_000;
