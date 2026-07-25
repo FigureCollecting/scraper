@@ -106,6 +106,12 @@ export interface EnqueueOptions {
   sessionId?: string;
   userId?: string;
   maxRetries?: number;
+  /**
+   * Explicit URL to scrape. When absent the key is treated as an MFC item ID
+   * and the item URL is built from it (legacy shape). Trigger routes pass the
+   * URL itself as both key and option — no faked MFC fields.
+   */
+  url?: string;
 }
 
 export interface EnqueueResult {
@@ -422,10 +428,29 @@ export class ScrapeQueue {
   // ==========================================================================
 
   /**
+   * Whether the spine ingest path is configured (an emitter is present).
+   * Trigger routes use this to answer "ingest not configured" up front
+   * instead of enqueueing items doomed to fail extraction_unavailable.
+   */
+  isIngestConfigured(): boolean {
+    return this.ingestEmitter !== null;
+  }
+
+  /**
+   * Whether the plugin registry resolves an extraction ruleset for this URL
+   * (same lookup the processing loop uses; lookup errors count as no match).
+   */
+  hasRulesetForUrl(url: string): boolean {
+    return this.lookupRuleset(url) !== undefined;
+  }
+
+  /**
    * Add an item to the scrape queue
    *
-   * @param mfcId - MFC item ID to scrape
-   * @param options - Enqueue options (priority, cookies, etc.)
+   * @param mfcId - Dedup key: an MFC item ID (legacy shape) or, when
+   *   options.url is supplied, any caller-chosen key (trigger routes use the
+   *   URL itself)
+   * @param options - Enqueue options (priority, cookies, url, etc.)
    * @returns EnqueueResult with promise that resolves when scraping completes
    */
   enqueue(mfcId: string, options: EnqueueOptions = {}): EnqueueResult {
@@ -438,8 +463,8 @@ export class ScrapeQueue {
       maxRetries = RATE_LIMIT.DEFAULT_MAX_RETRIES,
     } = options;
 
-    // Build URL from MFC ID
-    const url = `https://myfigurecollection.net/item/${mfcId}`;
+    // Caller-supplied URL wins; otherwise build the MFC item URL from the key
+    const url = options.url ?? `https://myfigurecollection.net/item/${mfcId}`;
 
     // Check for deduplication
     const existingItem = this.pendingItems.get(mfcId);
@@ -471,7 +496,8 @@ export class ScrapeQueue {
       // Prevent unhandled rejection crash when items are cancelled
       promise.catch(() => {});
 
-      console.log(`[SCRAPE QUEUE] Deduplicated request for MFC ${mfcId} (${existingItem.waitingUserIds.length} users waiting)`);
+      // mfcId can be a caller-supplied URL (trigger route) — sanitize for log
+      console.log(`[SCRAPE QUEUE] Deduplicated request for MFC ${sanitizeForLog(mfcId)} (${existingItem.waitingUserIds.length} users waiting)`); // lgtm[js/log-injection]
 
       return {
         id: existingItem.id,
@@ -521,7 +547,8 @@ export class ScrapeQueue {
     const itemStatus = status || 'wished';
     this.statusQueued[itemStatus]++;
 
-    console.log(`[SCRAPE QUEUE] Enqueued MFC ${mfcId} at priority ${effectivePriority} (queue size: ${this.getStats().total})`);
+    // mfcId can be a caller-supplied URL (trigger route) — sanitize for log
+    console.log(`[SCRAPE QUEUE] Enqueued MFC ${sanitizeForLog(mfcId)} at priority ${effectivePriority} (queue size: ${this.getStats().total})`); // lgtm[js/log-injection]
 
     // Start processing if not already running (skip in test mode)
     if (!this.testMode) {

@@ -41,14 +41,14 @@ import { createExtractionRegistry, ExtractionRegistryImpl } from '../../services
 const FIXTURE_HTML = '<html><body><h1 class="title">Kitagawa Marin</h1></body></html>';
 
 /** Registry with the fixture site registered against the queue's MFC URLs. */
-function makeRegistry(ruleset: ExtractionRuleset): ExtractionRegistryImpl {
+function makeRegistry(ruleset: ExtractionRuleset, domain = 'myfigurecollection.net'): ExtractionRegistryImpl {
   const registry = createExtractionRegistry();
   registry.registerSite({
     siteId: ruleset.siteId,
     name: 'Mock MFC',
-    domains: ['myfigurecollection.net'],
+    domains: [domain],
     rateLimit: {
-      domain: 'myfigurecollection.net',
+      domain,
       baseDelayMs: 1000,
       minDelayMs: 500,
       maxDelayMs: 5000,
@@ -160,6 +160,27 @@ describe('ScrapeQueue - ingest cutover', () => {
     // waiting callers still resolve (with the extracted field bag)
     expect(data).toEqual({ name: 'Kitagawa Marin', jan: '4530956107891' });
     expect(queue.getStats().completed).toBe(1);
+  });
+
+  it('scrapes the caller-supplied url option instead of building an MFC URL from the key', async () => {
+    const ruleset = makeRuleset();
+    const scraping = makeScrapingStub();
+    const send = jest.fn().mockResolvedValue({ sourceId: 'src-1' });
+
+    queue = new ScrapeQueue(false);
+    queue.setPluginRegistry(makeRegistry(ruleset, 'figures.example.test'));
+    queue.setIngestEmitter({ send });
+    queue.setScrapingService(scraping);
+
+    // Trigger-route shape: the URL itself is the dedup key AND the target.
+    const url = 'https://figures.example.test/item/777';
+    const result = queue.enqueue(url, { url });
+    await advanceAndFlush(500);
+    await result.promise;
+
+    expect(scraping.scrapePage).toHaveBeenCalledWith(url);
+    expect(ruleset.extract).toHaveBeenCalledWith(FIXTURE_HTML, url);
+    expect(send).toHaveBeenCalledTimes(1);
   });
 
   it('uses the stealth fetch when the item carries cookies', async () => {
