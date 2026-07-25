@@ -168,6 +168,11 @@ RUN rm -rf /root/.cache/puppeteer \
     && rm -rf node_modules/puppeteer/.local-chromium \
     && rm -rf node_modules/puppeteer-core/.local-chromium
 
+# Remove the global npm/npx CLI: npm bundles its own transitive deps (e.g. brace-expansion)
+# that scanners flag in the shipped image, though they run only at install time. The runtime
+# launches via `node dist/...` (see CMD), so npm is not needed in the final image.
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
+
 # Copy built application from builder
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/packages/plugin-contract/dist ./packages/plugin-contract/dist
@@ -188,4 +193,4 @@ EXPOSE 3050
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD node -e "require('http').get('http://localhost:3050/health', (res) => process.exit(res.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"
 
-CMD ["npm", "start"]
+CMD ["node", "--import", "./dist/tracing.js", "dist/index.js"]
