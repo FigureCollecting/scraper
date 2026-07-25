@@ -15,7 +15,6 @@ global.console = {
 // Set test environment variables
 process.env.NODE_ENV = 'test';
 process.env.PORT = '0'; // Use random port for tests
-// Note: MFC_ALLOWED_COOKIES is set in jest.config.js (must be set before module imports)
 
 // Global test timeout
 jest.setTimeout(30000);

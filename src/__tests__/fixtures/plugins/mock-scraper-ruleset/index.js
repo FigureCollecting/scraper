@@ -32,7 +32,7 @@ module.exports = {
       version: '1.0.0',
       extract(html, url) {
         return {
-          source: { site: 'mock', itemId: '1', url, extractedAt: new Date(), rulesetVersion: '1.0.0' },
+          source: { site: 'mock', itemId: '1', url, extractedAt: new Date().toISOString(), rulesetVersion: '1.0.0' },
           fields: {},
           warnings: [],
         };

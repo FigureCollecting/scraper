@@ -1,11 +1,13 @@
 /**
  * Tests for ScrapeQueue processing loop
  * Exercises the actual processing pipeline: processNext, handleSuccess,
- * handleFailure, classifyError, shouldRetry, getNextProcessableItem
+ * handleFailure, classifyError, shouldRetry, getNextProcessableItem.
+ *
+ * The queue is ingest-path-only (extraction is plugin territory), so the
+ * work function is driven via the DI seams: setPluginRegistry /
+ * setIngestEmitter / setScrapingService. Failures are injected through the
+ * raw page fetch (scrapePage / scrapePageStealth).
  */
-
-// Mock scrapeMFC to control scraping outcomes
-const mockScrapeMFC = jest.fn();
 
 // Persistent mock objects that survive clearAllMocks
 const mockNotifyItemSuccess = jest.fn().mockResolvedValue(true);
@@ -13,7 +15,6 @@ const mockNotifyItemFailed = jest.fn().mockResolvedValue(true);
 const mockNotifyItemSkipped = jest.fn().mockResolvedValue(true);
 
 jest.mock('../../services/genericScraper', () => ({
-  scrapeMFC: (...args: any[]) => mockScrapeMFC(...args),
   BrowserPool: {
     getStealthBrowser: jest.fn(),
     getBrowser: jest.fn(),
@@ -30,10 +31,72 @@ jest.mock('../../services/webhookClient', () => ({
   notifyItemSkipped: (...args: any[]) => mockNotifyItemSkipped(...args),
 }));
 
+import type { ExtractionRuleset } from '@figurecollecting/scraper-plugin-contract';
 import {
   ScrapeQueue,
   resetScrapeQueue,
 } from '../../services/scrapeQueue';
+import { createExtractionRegistry, ExtractionRegistryImpl } from '../../services/extractionRegistry';
+
+/** Registry with the fixture site registered against the queue's MFC URLs. */
+function makeRegistry(ruleset: ExtractionRuleset): ExtractionRegistryImpl {
+  const registry = createExtractionRegistry();
+  registry.registerSite({
+    siteId: ruleset.siteId,
+    name: 'Mock Site',
+    domains: ['myfigurecollection.net'],
+    rateLimit: {
+      domain: 'myfigurecollection.net',
+      baseDelayMs: 1000,
+      minDelayMs: 500,
+      maxDelayMs: 5000,
+      backoffMultiplier: 1.5,
+      recoveryDivisor: 1.5,
+      successThreshold: 3,
+    },
+    requiresBrowser: false,
+    allowedCookies: [],
+  });
+  registry.registerRuleset(ruleset);
+  return registry;
+}
+
+/** Fixture ruleset whose extract() returns the given field bag. */
+function makeRuleset(fields: Record<string, unknown> = { name: 'Figure' }): ExtractionRuleset {
+  return {
+    siteId: 'mock-site',
+    version: '1.0.0',
+    extract: (html: string, url: string) => ({
+      source: {
+        site: 'mock-site',
+        itemId: '1',
+        url,
+        extractedAt: '2026-07-24T00:00:00.000Z',
+        rulesetVersion: '1.0.0',
+      },
+      fields,
+      warnings: [],
+    }),
+    validate: () => ({ valid: true, errors: [], warnings: [] }),
+  };
+}
+
+function makeScrapingStub() {
+  return {
+    scrapePage: jest.fn().mockResolvedValue({
+      html: '<html></html>',
+      url: 'https://myfigurecollection.net/item/12345',
+      title: 'Item',
+      statusCode: 200,
+    }),
+    scrapePageStealth: jest.fn().mockResolvedValue({
+      html: '<html></html>',
+      url: 'https://myfigurecollection.net/item/12345',
+      title: 'Item',
+      statusCode: 200,
+    }),
+  };
+}
 
 describe('ScrapeQueue - processing loop', () => {
   let queue: ScrapeQueue;
@@ -42,7 +105,6 @@ describe('ScrapeQueue - processing loop', () => {
     jest.clearAllMocks();
     jest.useFakeTimers({ advanceTimers: true });
     resetScrapeQueue();
-    mockScrapeMFC.mockReset();
     // Re-establish mock return values after clearAllMocks
     mockNotifyItemSuccess.mockResolvedValue(true);
     mockNotifyItemFailed.mockResolvedValue(true);
@@ -66,18 +128,27 @@ describe('ScrapeQueue - processing loop', () => {
     }
   }
 
+  /** Build a queue wired for the ingest path with a controllable fetch stub. */
+  function makeIngestQueue(fields?: Record<string, unknown>) {
+    const scraping = makeScrapingStub();
+    const send = jest.fn().mockResolvedValue({ sourceId: 'src-1' });
+    queue = new ScrapeQueue(false);
+    queue.setPluginRegistry(makeRegistry(makeRuleset(fields)));
+    queue.setIngestEmitter({ send });
+    queue.setScrapingService(scraping);
+    return { scraping, send };
+  }
+
   it('should process an item successfully and resolve the promise', async () => {
     const scrapedData = { name: 'Test Figure', imageUrl: 'http://example.com/img.jpg' };
-    mockScrapeMFC.mockResolvedValue(scrapedData);
+    makeIngestQueue(scrapedData);
 
-    queue = new ScrapeQueue(false);
     const result = queue.enqueue('12345', { priority: 'WARM' });
 
     await advanceAndFlush(500);
 
     const data = await result.promise;
     expect(data).toEqual(scrapedData);
-    expect(mockScrapeMFC).toHaveBeenCalled();
 
     const stats = queue.getStats();
     expect(stats.completed).toBe(1);
@@ -85,11 +156,16 @@ describe('ScrapeQueue - processing loop', () => {
   });
 
   it('should retry on timeout error', async () => {
-    mockScrapeMFC
+    const { scraping } = makeIngestQueue({ name: 'Figure' });
+    scraping.scrapePage
       .mockRejectedValueOnce(new Error('Navigation timeout exceeded'))
-      .mockResolvedValueOnce({ name: 'Figure' });
+      .mockResolvedValueOnce({
+        html: '<html></html>',
+        url: 'https://myfigurecollection.net/item/12345',
+        title: 'Item',
+        statusCode: 200,
+      });
 
-    queue = new ScrapeQueue(false);
     const result = queue.enqueue('12345', { priority: 'WARM' });
     // No need to catch - it will succeed on retry
 
@@ -101,15 +177,20 @@ describe('ScrapeQueue - processing loop', () => {
 
     const data = await result.promise;
     expect(data.name).toBe('Figure');
-    expect(mockScrapeMFC).toHaveBeenCalledTimes(2);
+    expect(scraping.scrapePage).toHaveBeenCalledTimes(2);
   });
 
   it('should retry on network error', async () => {
-    mockScrapeMFC
+    const { scraping } = makeIngestQueue({ name: 'Figure' });
+    scraping.scrapePage
       .mockRejectedValueOnce(new Error('ERR_CONNECTION_REFUSED'))
-      .mockResolvedValueOnce({ name: 'Figure' });
+      .mockResolvedValueOnce({
+        html: '<html></html>',
+        url: 'https://myfigurecollection.net/item/12345',
+        title: 'Item',
+        statusCode: 200,
+      });
 
-    queue = new ScrapeQueue(false);
     const result = queue.enqueue('12345', { priority: 'HOT' });
 
     await advanceAndFlush(500);
@@ -121,9 +202,9 @@ describe('ScrapeQueue - processing loop', () => {
   });
 
   it('should NOT retry on auth_required error', async () => {
-    mockScrapeMFC.mockRejectedValue(new Error('AUTH: authentication required'));
+    const { scraping } = makeIngestQueue();
+    scraping.scrapePage.mockRejectedValue(new Error('AUTH: authentication required'));
 
-    queue = new ScrapeQueue(false);
     const result = queue.enqueue('12345', { priority: 'WARM' });
     const promiseRef = result.promise.catch((e: Error) => e);
 
@@ -134,13 +215,13 @@ describe('ScrapeQueue - processing loop', () => {
     expect(error).toBeInstanceOf(Error);
     expect((error as Error).message).toContain('auth_required');
     // Should only have been called once (no retry for auth errors)
-    expect(mockScrapeMFC).toHaveBeenCalledTimes(1);
+    expect(scraping.scrapePage).toHaveBeenCalledTimes(1);
   });
 
   it('should give up after max retries and reject promise', async () => {
-    mockScrapeMFC.mockRejectedValue(new Error('timeout exceeded'));
+    const { scraping } = makeIngestQueue();
+    scraping.scrapePage.mockRejectedValue(new Error('timeout exceeded'));
 
-    queue = new ScrapeQueue(false);
     const result = queue.enqueue('12345', { priority: 'WARM', maxRetries: 1 });
     const promiseRef = result.promise.catch((e: Error) => e);
 
@@ -158,9 +239,9 @@ describe('ScrapeQueue - processing loop', () => {
   });
 
   it('should classify 404 errors as not_found', async () => {
-    mockScrapeMFC.mockRejectedValue(new Error('MFC 404 - not found'));
+    const { scraping } = makeIngestQueue();
+    scraping.scrapePage.mockRejectedValue(new Error('404 - page not found'));
 
-    queue = new ScrapeQueue(false);
     const result = queue.enqueue('12345', { priority: 'WARM', maxRetries: 0 });
     const promiseRef = result.promise.catch((e: Error) => e);
 
@@ -172,9 +253,9 @@ describe('ScrapeQueue - processing loop', () => {
   });
 
   it('should classify rate limit errors and trigger rate limit mode', async () => {
-    mockScrapeMFC.mockRejectedValue(new Error('CLOUDFLARE: Rate limited'));
+    const { scraping } = makeIngestQueue();
+    scraping.scrapePage.mockRejectedValue(new Error('CLOUDFLARE: Rate limited'));
 
-    queue = new ScrapeQueue(false);
     const result = queue.enqueue('12345', { priority: 'WARM', maxRetries: 0 });
     result.promise.catch(() => {});
 
@@ -186,9 +267,7 @@ describe('ScrapeQueue - processing loop', () => {
   });
 
   it('should reduce delay after consecutive successes', async () => {
-    mockScrapeMFC.mockResolvedValue({ name: 'Figure' });
-
-    queue = new ScrapeQueue(false);
+    makeIngestQueue({ name: 'Figure' });
     // First trigger rate limit to increase delay
     queue.triggerRateLimit();
     const highDelay = queue.getStats().currentDelay;
@@ -213,9 +292,7 @@ describe('ScrapeQueue - processing loop', () => {
   });
 
   it('should track per-status completion', async () => {
-    mockScrapeMFC.mockResolvedValue({ name: 'Figure' });
-
-    queue = new ScrapeQueue(false);
+    makeIngestQueue({ name: 'Figure' });
     const r1 = queue.enqueue('1', { priority: 'WARM', status: 'owned' });
     const r2 = queue.enqueue('2', { priority: 'WARM', status: 'ordered' });
 
@@ -230,11 +307,8 @@ describe('ScrapeQueue - processing loop', () => {
     expect(stats.byStatus!.ordered.completed).toBe(1);
   });
 
-  it('should call webhook on success for session items', async () => {
-    mockScrapeMFC.mockResolvedValue({ name: 'Figure' });
-
-    queue = new ScrapeQueue(false);
-    // Use WARM without cookies to avoid session manager cookie-failure path
+  it('should NOT call the success webhook (ingest path emits to the spine only)', async () => {
+    makeIngestQueue({ name: 'Figure' });
     const result = queue.enqueue('12345', {
       priority: 'WARM',
       sessionId: 'session1',
@@ -244,38 +318,13 @@ describe('ScrapeQueue - processing loop', () => {
     await advanceAndFlush(3000);
 
     await result.promise;
-    expect(mockNotifyItemSuccess).toHaveBeenCalledWith('session1', '12345', expect.any(Object));
-  });
-
-  it('should pass raw HTML capture fields through to the item-complete webhook payload unmodified', async () => {
-    // Proves the queue threads scrapedData straight through to the webhook client without
-    // stripping fields -- so whatever genericScraper attaches (e.g. under PERSIST_RAW_HTML)
-    // reaches the backend on the item-complete webhook.
-    const scrapedData = {
-      name: 'Figure',
-      rawHtmlGz: 'base64gzipfixture==',
-      htmlSha: 'a'.repeat(64),
-      rawHtmlBytes: 1234,
-    };
-    mockScrapeMFC.mockResolvedValue(scrapedData);
-
-    queue = new ScrapeQueue(false);
-    const result = queue.enqueue('12345', {
-      priority: 'WARM',
-      sessionId: 'session1',
-    });
-
-    await advanceAndFlush(500);
-    await advanceAndFlush(3000);
-
-    await result.promise;
-    expect(mockNotifyItemSuccess).toHaveBeenCalledWith('session1', '12345', scrapedData);
+    expect(mockNotifyItemSuccess).not.toHaveBeenCalled();
   });
 
   it('should call webhook on permanent failure for non-cookie session items', async () => {
-    mockScrapeMFC.mockRejectedValue(new Error('AUTH: required'));
+    const { scraping } = makeIngestQueue();
+    scraping.scrapePage.mockRejectedValue(new Error('AUTH: required'));
 
-    queue = new ScrapeQueue(false);
     // Use WARM without cookies so the standard retry/failure path runs (not session manager)
     const result = queue.enqueue('12345', {
       priority: 'WARM',
@@ -292,9 +341,9 @@ describe('ScrapeQueue - processing loop', () => {
   });
 
   it('should handle Cloudflare rate limit with session reporting', async () => {
-    mockScrapeMFC.mockRejectedValue(new Error('Cloudflare blocked'));
+    const { scraping } = makeIngestQueue();
+    scraping.scrapePageStealth.mockRejectedValue(new Error('Cloudflare blocked'));
 
-    queue = new ScrapeQueue(false);
     const result = queue.enqueue('12345', {
       priority: 'HOT',
       sessionId: 'session1',
@@ -311,9 +360,9 @@ describe('ScrapeQueue - processing loop', () => {
   });
 
   it('should handle unknown error type', async () => {
-    mockScrapeMFC.mockRejectedValue(new Error('Something weird happened'));
+    const { scraping } = makeIngestQueue();
+    scraping.scrapePage.mockRejectedValue(new Error('Something weird happened'));
 
-    queue = new ScrapeQueue(false);
     const result = queue.enqueue('12345', { priority: 'WARM', maxRetries: 0 });
     const promiseRef = result.promise.catch((e: Error) => e);
 
@@ -325,9 +374,7 @@ describe('ScrapeQueue - processing loop', () => {
   });
 
   it('should stop processing when queue is empty', async () => {
-    mockScrapeMFC.mockResolvedValue({ name: 'Figure' });
-
-    queue = new ScrapeQueue(false);
+    makeIngestQueue({ name: 'Figure' });
     const result = queue.enqueue('12345', { priority: 'WARM' });
 
     await advanceAndFlush(500);
@@ -342,9 +389,9 @@ describe('ScrapeQueue - processing loop', () => {
   });
 
   it('should track per-status failed counts', async () => {
-    mockScrapeMFC.mockRejectedValue(new Error('AUTH: fail'));
+    const { scraping } = makeIngestQueue();
+    scraping.scrapePage.mockRejectedValue(new Error('AUTH: fail'));
 
-    queue = new ScrapeQueue(false);
     const result = queue.enqueue('1', { priority: 'WARM', status: 'owned', maxRetries: 0 });
     result.promise.catch(() => {});
 

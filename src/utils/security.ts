@@ -3,7 +3,6 @@
  *
  * Addresses CodeQL alerts:
  * - Log injection: sanitizeForLog() prevents newlines and special chars
- * - Incomplete URL sanitization: isValidMfcUrl() uses proper URL parsing
  * - Resource exhaustion: MAX_WAIT_TIME caps user-controlled timeouts
  * - Loop bound injection: MAX_STRING_LENGTH caps string processing
  */
@@ -39,28 +38,6 @@ export function sanitizeForLog(input: string): string {
     .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
     // Truncate extremely long inputs
     .substring(0, 2000);
-}
-
-/**
- * Validates that a URL is a legitimate myfigurecollection.net URL.
- * Uses proper URL parsing to prevent bypass attacks like:
- * - myfigurecollection.net.evil.com (subdomain attack)
- * - evil.com/myfigurecollection.net (path attack)
- *
- * @param url - URL to validate
- * @returns true if URL is from myfigurecollection.net domain
- */
-export function isValidMfcUrl(url: string): boolean {
-  try {
-    const parsedUrl = new URL(url);
-    const hostname = parsedUrl.hostname.toLowerCase();
-
-    // Must be exactly myfigurecollection.net or a valid subdomain
-    return hostname === 'myfigurecollection.net' ||
-           hostname.endsWith('.myfigurecollection.net');
-  } catch {
-    return false;
-  }
 }
 
 /**

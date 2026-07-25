@@ -3,8 +3,7 @@
  * singleton. The legacy manager only tracks cookie-auth failure/pause state
  * (no total/processed item counts), so those two SessionInfo fields are
  * reserved at 0 for now; wiring them up is deferred until session tracking
- * is generalized away from cookie-specific semantics (a later task, same as
- * cutting genericScraper's MFC extraction over to the plugin).
+ * is generalized away from cookie-specific semantics.
  */
 import { getSessionManager } from '../sessionManager.js';
 import type { SessionManager } from '../sessionManager.js';

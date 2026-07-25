@@ -3,7 +3,6 @@
  *
  * Tests CodeQL security mitigations:
  * - Log injection prevention
- * - URL sanitization
  * - Resource exhaustion prevention
  * - Loop bound injection prevention
  */
@@ -11,7 +10,6 @@
 import {
   sanitizeForLog,
   sanitizeObjectForLog,
-  isValidMfcUrl,
   capWaitTime,
   truncateString,
   MAX_WAIT_TIME,
@@ -130,43 +128,6 @@ describe('Security Utilities', () => {
       // JSON.stringify with indent would normally have newlines
       // Our sanitizer removes them
       expect(result).not.toContain('\n');
-    });
-  });
-
-  describe('isValidMfcUrl', () => {
-    it('should accept valid myfigurecollection.net URLs', () => {
-      expect(isValidMfcUrl('https://myfigurecollection.net/item/123')).toBe(true);
-      expect(isValidMfcUrl('http://myfigurecollection.net/item/123')).toBe(true);
-      expect(isValidMfcUrl('https://www.myfigurecollection.net/item/123')).toBe(true);
-    });
-
-    it('should accept valid subdomains', () => {
-      expect(isValidMfcUrl('https://static.myfigurecollection.net/image.jpg')).toBe(true);
-      expect(isValidMfcUrl('https://api.myfigurecollection.net/v1/items')).toBe(true);
-    });
-
-    it('should reject URLs with myfigurecollection.net in subdomain of attacker domain', () => {
-      // This is the key security test - prevents bypass attacks
-      expect(isValidMfcUrl('https://myfigurecollection.net.evil.com/item/123')).toBe(false);
-    });
-
-    it('should reject URLs with myfigurecollection.net in path', () => {
-      expect(isValidMfcUrl('https://evil.com/myfigurecollection.net/item/123')).toBe(false);
-    });
-
-    it('should reject non-MFC domains', () => {
-      expect(isValidMfcUrl('https://google.com')).toBe(false);
-      expect(isValidMfcUrl('https://example.com')).toBe(false);
-    });
-
-    it('should reject invalid URLs', () => {
-      expect(isValidMfcUrl('not-a-url')).toBe(false);
-      expect(isValidMfcUrl('')).toBe(false);
-    });
-
-    it('should handle malformed URLs gracefully', () => {
-      expect(isValidMfcUrl('://missing-protocol')).toBe(false);
-      expect(isValidMfcUrl('https://')).toBe(false);
     });
   });
 
