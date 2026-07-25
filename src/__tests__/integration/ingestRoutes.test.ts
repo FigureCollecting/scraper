@@ -247,6 +247,24 @@ describe('POST /ingest/scrape', () => {
       expect(second.body.itemId).toBe(first.body.itemId);
       expect(queue.getStats().total).toBe(1);
     });
+
+    it('never lets a CRLF-bearing URL forge multi-line log entries (log injection)', async () => {
+      // WHATWG URL parsing STRIPS tab/CR/LF, so this passes new URL()
+      // validation while the original string (logged, used as dedup key,
+      // embedded in the item id) still carries the raw control chars.
+      const crlfUrl = 'https://figures.example.test/item/7\r\nFORGED admin login OK\r\n77';
+      const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+
+      const app = makeApp(queue);
+      await request(app).post('/ingest/scrape').send({ url: crlfUrl }).expect(202);
+      // repeat trigger: exercises the dedup/coalesce log lines too
+      await request(app).post('/ingest/scrape').send({ url: crlfUrl }).expect(202);
+
+      expect(logSpy).toHaveBeenCalled();
+      for (const call of logSpy.mock.calls) {
+        expect(String(call[0])).not.toMatch(/[\r\n]/);
+      }
+    });
   });
 
   describe('wiring: enqueued item flows the ingest path', () => {

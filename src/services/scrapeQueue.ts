@@ -496,7 +496,8 @@ export class ScrapeQueue {
       // Prevent unhandled rejection crash when items are cancelled
       promise.catch(() => {});
 
-      console.log(`[SCRAPE QUEUE] Deduplicated request for MFC ${mfcId} (${existingItem.waitingUserIds.length} users waiting)`);
+      // mfcId can be a caller-supplied URL (trigger route) — sanitize for log
+      console.log(`[SCRAPE QUEUE] Deduplicated request for MFC ${sanitizeForLog(mfcId)} (${existingItem.waitingUserIds.length} users waiting)`); // lgtm[js/log-injection]
 
       return {
         id: existingItem.id,
@@ -546,7 +547,8 @@ export class ScrapeQueue {
     const itemStatus = status || 'wished';
     this.statusQueued[itemStatus]++;
 
-    console.log(`[SCRAPE QUEUE] Enqueued MFC ${mfcId} at priority ${effectivePriority} (queue size: ${this.getStats().total})`);
+    // mfcId can be a caller-supplied URL (trigger route) — sanitize for log
+    console.log(`[SCRAPE QUEUE] Enqueued MFC ${sanitizeForLog(mfcId)} at priority ${effectivePriority} (queue size: ${this.getStats().total})`); // lgtm[js/log-injection]
 
     // Start processing if not already running (skip in test mode)
     if (!this.testMode) {

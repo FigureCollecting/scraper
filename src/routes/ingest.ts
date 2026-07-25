@@ -60,17 +60,19 @@ export function createIngestRouter(getQueue: () => ScrapeQueue = getScrapeQueue)
 
     const result = queue.enqueue(url, { url });
 
-    console.log(`[INGEST API] ${result.deduplicated ? 'Coalesced' : 'Enqueued'} ingest scrape for ${sanitizeForLog(url)} (item ${result.id}, position ${result.position})`); // lgtm[js/log-injection]
+    // result.id embeds the URL (it is the dedup key), so it is user-tainted
+    // and must be sanitized wherever it is logged; position is a number.
+    console.log(`[INGEST API] ${result.deduplicated ? 'Coalesced' : 'Enqueued'} ingest scrape for ${sanitizeForLog(url)} (item ${sanitizeForLog(result.id)}, position ${result.position})`); // lgtm[js/log-injection]
 
     // Outcome observability for smoke runs: the queue and emitter already log
     // processing detail; these lines tie completion/failure back to the
     // trigger by item id + URL.
     result.promise
       .then(() => {
-        console.log(`[INGEST API] Ingest scrape completed for ${sanitizeForLog(url)} (item ${result.id})`); // lgtm[js/log-injection]
+        console.log(`[INGEST API] Ingest scrape completed for ${sanitizeForLog(url)} (item ${sanitizeForLog(result.id)})`); // lgtm[js/log-injection]
       })
       .catch((error: Error) => {
-        console.error(`[INGEST API] Ingest scrape failed for ${sanitizeForLog(url)} (item ${result.id}): ${sanitizeForLog(error.message)}`); // lgtm[js/log-injection]
+        console.error(`[INGEST API] Ingest scrape failed for ${sanitizeForLog(url)} (item ${sanitizeForLog(result.id)}): ${sanitizeForLog(error.message)}`); // lgtm[js/log-injection]
       });
 
     return res.status(202).json({
