@@ -94,7 +94,7 @@ COPY packages/plugin-contract/package.json ./packages/plugin-contract/
 # Install all dependencies (Puppeteer won't download Chrome due to ENV vars)
 RUN npm config set fetch-timeout 300000 && npm config set fetch-retry-maxtimeout 300000
 RUN --mount=type=secret,id=node_auth_token \
-    NODE_AUTH_TOKEN="$(cat /run/secrets/node_auth_token)" timeout 600 npm install --no-audit --no-fund
+    NODE_AUTH_TOKEN="$(cat /run/secrets/node_auth_token)" timeout 600 npm ci --no-audit --no-fund
 
 # Remove any Chrome that might have been downloaded by Puppeteer
 RUN rm -rf /root/.cache/puppeteer \
@@ -133,7 +133,7 @@ COPY packages/plugin-contract/package.json ./packages/plugin-contract/
 # Install all dependencies for build
 RUN npm config set fetch-timeout 300000 && npm config set fetch-retry-maxtimeout 300000
 RUN --mount=type=secret,id=node_auth_token \
-    NODE_AUTH_TOKEN="$(cat /run/secrets/node_auth_token)" timeout 600 npm install --no-audit --no-fund
+    NODE_AUTH_TOKEN="$(cat /run/secrets/node_auth_token)" timeout 600 npm ci --no-audit --no-fund
 
 # Remove any Chrome that might have been downloaded by Puppeteer
 RUN rm -rf /root/.cache/puppeteer \
@@ -161,12 +161,17 @@ COPY packages/plugin-contract/package.json ./packages/plugin-contract/
 # Install only production dependencies
 RUN npm config set fetch-timeout 300000 && npm config set fetch-retry-maxtimeout 300000
 RUN --mount=type=secret,id=node_auth_token \
-    NODE_AUTH_TOKEN="$(cat /run/secrets/node_auth_token)" timeout 600 npm install --no-audit --no-fund --omit=dev
+    NODE_AUTH_TOKEN="$(cat /run/secrets/node_auth_token)" timeout 600 npm ci --no-audit --no-fund --omit=dev
 
 # Remove any Chrome that might have been downloaded by Puppeteer
 RUN rm -rf /root/.cache/puppeteer \
     && rm -rf node_modules/puppeteer/.local-chromium \
     && rm -rf node_modules/puppeteer-core/.local-chromium
+
+# Remove the global npm/npx CLI: npm bundles its own transitive deps (e.g. brace-expansion)
+# that scanners flag in the shipped image, though they run only at install time. The runtime
+# launches via `node dist/...` (see CMD), so npm is not needed in the final image.
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
 
 # Copy built application from builder
 COPY --from=builder /app/dist ./dist
@@ -188,4 +193,4 @@ EXPOSE 3050
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD node -e "require('http').get('http://localhost:3050/health', (res) => process.exit(res.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"
 
-CMD ["npm", "start"]
+CMD ["node", "--import", "./dist/tracing.js", "dist/index.js"]
