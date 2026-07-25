@@ -19,6 +19,13 @@ import { sanitizeForLog } from '../utils/security.js';
 import { getSessionManager, resetSessionManager, SessionManager, SessionPausedEvent } from './sessionManager.js';
 import { notifyItemSuccess, notifyItemFailed, notifyItemSkipped } from './webhookClient.js';
 import { enrichmentLogger } from '../utils/logger.js';
+import { createScrapingService } from './engineServices/scrapingService.js';
+import { createIngestEmitterFromEnv } from './ingestEmitter.js';
+import type {
+  ExtractionRuleset,
+  ExtractedData as PluginExtractedData,
+  ScrapingService,
+} from '@figurecollecting/scraper-plugin-contract';
 
 // ============================================================================
 // Types and Interfaces
@@ -106,6 +113,25 @@ export interface EnqueueResult {
   /** Promise that resolves when scraping completes */
   promise: Promise<ScrapedData>;
 }
+
+/**
+ * Narrow view of the plugin extraction registry the queue needs to decide
+ * whether an item's URL has a plugin-provided ruleset (ingest cutover seam).
+ */
+export interface RulesetResolver {
+  getRulesetForUrl(url: string): ExtractionRuleset | undefined;
+}
+
+/**
+ * Narrow view of the spine ingest emitter. Engine plumbing ONLY — plugins
+ * never see the emitter (it is not part of EngineServices or the contract).
+ */
+export interface IngestSender {
+  send(extracted: PluginExtractedData): Promise<unknown>;
+}
+
+/** Raw page-fetch capability the ingest path uses (extraction is the plugin's job). */
+type RawPageFetcher = Pick<ScrapingService, 'scrapePage' | 'scrapePageStealth'>;
 
 // ============================================================================
 // Rate Limiting Configuration
@@ -228,12 +254,24 @@ export class ScrapeQueue {
   // Cooldown wait timer - prevents multiple concurrent timers when all items blocked
   private cooldownWaitTimerId: NodeJS.Timeout | null = null;
 
+  // Ingest cutover seams (engine plumbing, injected — see setters below).
+  // When an emitter is configured (INGEST_BASE_URL) AND the registry resolves
+  // a ruleset for the item's URL, processing takes the NEW path: raw page
+  // fetch -> ruleset.extract() -> spine emit. NO webhook leg on that path.
+  // Otherwise the legacy scrapeMFC+webhook path runs untouched.
+  private pluginRegistry: RulesetResolver | null = null;
+  private ingestEmitter: IngestSender | null = null;
+  private rawPageFetcher: RawPageFetcher | null = null;
+
   constructor(testMode?: boolean) {
     // Auto-detect test environment if not explicitly set
     this.testMode = testMode ?? (
       process.env.NODE_ENV === 'test' ||
       process.env.JEST_WORKER_ID !== undefined
     );
+
+    // New ingest path is enabled by INGEST_BASE_URL; unset = null = disabled.
+    this.ingestEmitter = createIngestEmitterFromEnv();
 
     // Get or create session manager
     this.sessionManager = getSessionManager();
@@ -244,6 +282,30 @@ export class ScrapeQueue {
     });
 
     console.log(`[SCRAPE QUEUE] Initialized (testMode: ${this.testMode})`);
+  }
+
+  /**
+   * Inject the plugin extraction registry (threaded from bootstrapPlugins in
+   * src/index.ts). Without it, or without an emitter, items keep the legacy path.
+   */
+  setPluginRegistry(registry: RulesetResolver | null): void {
+    this.pluginRegistry = registry;
+  }
+
+  /**
+   * Override the spine ingest emitter (tests / DI). The constructor default
+   * comes from INGEST_BASE_URL via createIngestEmitterFromEnv().
+   */
+  setIngestEmitter(emitter: IngestSender | null): void {
+    this.ingestEmitter = emitter;
+  }
+
+  /**
+   * Override the raw page-fetch service used by the ingest path (tests / DI).
+   * Defaults lazily to the same engine scraping service plugins get.
+   */
+  setScrapingService(service: RawPageFetcher | null): void {
+    this.rawPageFetcher = service;
   }
 
   /**
@@ -775,11 +837,18 @@ export class ScrapeQueue {
     console.log(`[SCRAPE QUEUE] Processing MFC ${item.mfcId} (${item.priority}, attempt ${item.retryCount + 1}/${item.maxRetries + 1}, delay=${this.currentDelay}ms, pool=${poolAvailable}/${BrowserPool.getPoolCapacity()})`);
 
     try {
-      // Perform the scrape
-      const result = await scrapeMFC(item.url, item.cookies);
+      // Ingest cutover: emitter configured AND a plugin ruleset matches the
+      // URL -> new path (extract + spine emit, no webhook). Otherwise legacy.
+      const ruleset = this.ingestEmitter ? this.lookupRuleset(item.url) : undefined;
 
-      // Success!
-      this.handleSuccess(item, result);
+      if (this.ingestEmitter && ruleset) {
+        const fields = await this.processViaIngest(item, ruleset);
+        this.handleSuccess(item, fields, { skipWebhook: true });
+      } else {
+        // Legacy path: MFC-specific scrape + webhook callbacks
+        const result = await scrapeMFC(item.url, item.cookies);
+        this.handleSuccess(item, result);
+      }
 
     } catch (error: any) {
       // Handle failure
@@ -792,6 +861,57 @@ export class ScrapeQueue {
     if (!this.cooldownWaitTimerId) {
       setTimeout(() => this.processNext(), this.currentDelay);
     }
+  }
+
+  /**
+   * Resolve a plugin ruleset for a URL. A lookup failure (e.g. unparseable
+   * URL) is treated as "no match" so the legacy path still gets its chance.
+   */
+  private lookupRuleset(url: string): ExtractionRuleset | undefined {
+    if (!this.pluginRegistry) return undefined;
+    try {
+      return this.pluginRegistry.getRulesetForUrl(url);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private getRawPageFetcher(): RawPageFetcher {
+    if (!this.rawPageFetcher) {
+      // Same raw page-fetch machinery plugins get via EngineServices — the
+      // engine only fetches; extraction is the plugin's job.
+      this.rawPageFetcher = createScrapingService();
+    }
+    return this.rawPageFetcher;
+  }
+
+  /**
+   * NEW ingest path: fetch raw HTML, hand it to the plugin's ruleset for
+   * extraction, and emit the result to the aggregation spine. Clean cut —
+   * no webhook leg here. Throws on fetch, extraction, or emit failure so
+   * the item flows through the queue's existing failure handling (never a
+   * silent drop). Returns the extracted field bag so waiting callers'
+   * promises still resolve.
+   */
+  private async processViaIngest(item: QueueItem, ruleset: ExtractionRuleset): Promise<ScrapedData> {
+    const fetcher = this.getRawPageFetcher();
+    const page = item.cookies
+      ? await fetcher.scrapePageStealth(item.url, { cookies: item.cookies })
+      : await fetcher.scrapePage(item.url);
+
+    let extracted: PluginExtractedData;
+    try {
+      extracted = ruleset.extract(page.html, item.url);
+    } catch (error: any) {
+      console.error(
+        `[SCRAPE QUEUE] Extraction failed for ${item.url} (ruleset ${ruleset.siteId}@${ruleset.version}): ${sanitizeForLog(error?.message ?? String(error))}`
+      );
+      throw error instanceof Error ? error : new Error(String(error));
+    }
+
+    await this.ingestEmitter!.send(extracted);
+
+    return extracted.fields as ScrapedData;
   }
 
   /**
@@ -865,7 +985,7 @@ export class ScrapeQueue {
     return false;
   }
 
-  private handleSuccess(item: QueueItem, result: ScrapedData): void {
+  private handleSuccess(item: QueueItem, result: ScrapedData, opts: { skipWebhook?: boolean } = {}): void {
     // Track success
     this.completedCount++;
     this.consecutiveSuccesses++;
@@ -890,11 +1010,14 @@ export class ScrapeQueue {
     if (item.sessionId) {
       this.sessionManager.reportSuccess(item.sessionId);
 
-      // Notify backend via webhook (non-blocking)
-      notifyItemSuccess(item.sessionId, item.mfcId, result as Record<string, unknown>).catch(() => {
-        // Webhook failures are non-fatal, just log
-        console.warn(`[SCRAPE QUEUE] Webhook notification failed for MFC ${item.mfcId}`);
-      });
+      // Notify backend via webhook (non-blocking). The ingest path skips
+      // this leg entirely — it emits to the spine ONLY (clean cut).
+      if (!opts.skipWebhook) {
+        notifyItemSuccess(item.sessionId, item.mfcId, result as Record<string, unknown>).catch(() => {
+          // Webhook failures are non-fatal, just log
+          console.warn(`[SCRAPE QUEUE] Webhook notification failed for MFC ${item.mfcId}`);
+        });
+      }
     }
 
     // Reduce delay if consistently succeeding

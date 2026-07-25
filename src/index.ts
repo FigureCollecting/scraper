@@ -12,6 +12,7 @@ import { scraperDebug } from './utils/logger.js';
 // Import browser pool functionality
 import { initializeBrowserPool, BrowserPool } from './services/genericScraper.js';
 import { bootstrapPlugins, shutdownPlugins } from './services/pluginBootstrap.js';
+import { getScrapeQueue } from './services/scrapeQueue.js';
 import { ScraperPlugin } from '@figurecollecting/scraper-plugin-contract';
 
 dotenv.config();
@@ -86,8 +87,12 @@ let loadedPlugins: ScraperPlugin[] = [];
 // connections, then start the server and initialize the browser pool.
 async function startServer(): Promise<void> {
   try {
-    const { plugins } = await bootstrapPlugins(app);
+    const { registry, plugins } = await bootstrapPlugins(app);
     loadedPlugins = plugins;
+    // Thread the plugin registry into the scrape queue so items whose URLs
+    // resolve to a plugin ruleset take the ingest path (when INGEST_BASE_URL
+    // is configured) instead of the legacy scrapeMFC+webhook path.
+    getScrapeQueue().setPluginRegistry(registry);
     if (plugins.length > 0) {
       console.log(`[PAGE-SCRAPER] Loaded ${plugins.length} plugin(s): ${plugins.map(p => `${p.name}@${p.version}`).join(', ')}`);
     }
