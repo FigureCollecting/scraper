@@ -6,7 +6,6 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { createRequire } from 'module';
 import scraperRoutes from './routes/scraper.js';
-import syncRoutes from './routes/sync.js';
 import { scraperDebug } from './utils/logger.js';
 
 // Import browser pool functionality
@@ -77,9 +76,6 @@ app.get('/version', (req, res) => {
 // Scraper routes (no /api prefix for consistency)
 app.use('/', scraperRoutes);
 
-// Sync routes for MFC collection synchronization
-app.use('/sync', syncRoutes);
-
 // Plugins loaded at boot (populated by startServer, read by gracefulShutdown)
 let loadedPlugins: ScraperPlugin[] = [];
 
@@ -91,7 +87,8 @@ async function startServer(): Promise<void> {
     loadedPlugins = plugins;
     // Thread the plugin registry into the scrape queue so items whose URLs
     // resolve to a plugin ruleset take the ingest path (when INGEST_BASE_URL
-    // is configured) instead of the legacy scrapeMFC+webhook path.
+    // is configured). The engine carries no extraction fallback — items with
+    // no matching ruleset fail cleanly through the queue's failure handling.
     getScrapeQueue().setPluginRegistry(registry);
     if (plugins.length > 0) {
       console.log(`[PAGE-SCRAPER] Loaded ${plugins.length} plugin(s): ${plugins.map(p => `${p.name}@${p.version}`).join(', ')}`);

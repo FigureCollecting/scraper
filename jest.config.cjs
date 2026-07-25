@@ -1,6 +1,3 @@
-// Set env vars BEFORE test files are loaded
-process.env.MFC_ALLOWED_COOKIES = 'PHPSESSID,sesUID,sesDID,cf_clearance';
-
 module.exports = {
   preset: 'ts-jest',
   testEnvironment: 'node',

@@ -1,7 +1,7 @@
 /**
  * Extended unit tests for Generic Scraper
  * Covers pure utility functions, BrowserPool health/return,
- * scrapeMFC convenience function, and Cloudflare detection paths
+ * and Cloudflare detection paths
  */
 import puppeteer from 'puppeteer';
 import zlib from 'zlib';
@@ -10,10 +10,15 @@ import {
   calculateSimilarity,
   getEditDistance,
   BrowserPool,
-  SITE_CONFIGS,
   scrapeGeneric,
-  scrapeMFC,
 } from '../../services/genericScraper';
+
+// Generic Cloudflare pattern set for challenge-detection tests (the engine
+// carries no site configs — callers supply detection patterns per request)
+const CLOUDFLARE_DETECTION = {
+  titleIncludes: ['Just a moment', 'Please wait', 'Checking your browser'],
+  bodyIncludes: ['Just a moment', 'Please wait while we verify', 'DDoS protection'],
+};
 
 // ============================================================================
 // Pure Utility Functions (no browser mocking needed)
@@ -101,32 +106,6 @@ describe('genericScraper - pure utility functions', () => {
     });
   });
 
-  describe('SITE_CONFIGS', () => {
-    it('should have mfc configuration', () => {
-      expect(SITE_CONFIGS.mfc).toBeDefined();
-      expect(SITE_CONFIGS.mfc.imageSelector).toBeDefined();
-      expect(SITE_CONFIGS.mfc.manufacturerSelector).toBeDefined();
-      expect(SITE_CONFIGS.mfc.nameSelector).toBeDefined();
-      expect(SITE_CONFIGS.mfc.scaleSelector).toBeDefined();
-    });
-
-    it('should have Cloudflare detection patterns', () => {
-      expect(SITE_CONFIGS.mfc.cloudflareDetection).toBeDefined();
-      expect(SITE_CONFIGS.mfc.cloudflareDetection!.titleIncludes).toBeInstanceOf(Array);
-      expect(SITE_CONFIGS.mfc.cloudflareDetection!.bodyIncludes).toBeInstanceOf(Array);
-      expect(SITE_CONFIGS.mfc.cloudflareDetection!.titleIncludes!.length).toBeGreaterThan(0);
-    });
-
-    it('should have a user agent string', () => {
-      expect(SITE_CONFIGS.mfc.userAgent).toBeDefined();
-      expect(SITE_CONFIGS.mfc.userAgent).toContain('Mozilla');
-    });
-
-    it('should have a wait time', () => {
-      expect(typeof SITE_CONFIGS.mfc.waitTime).toBe('number');
-      expect(SITE_CONFIGS.mfc.waitTime).toBeGreaterThan(0);
-    });
-  });
 });
 
 // ============================================================================
@@ -315,96 +294,7 @@ describe('genericScraper - BrowserPool extended', () => {
 });
 
 // ============================================================================
-// scrapeMFC convenience function
-// ============================================================================
-
-describe('genericScraper - scrapeMFC', () => {
-  let mockPage: any;
-  let mockContext: any;
-  let mockBrowser: any;
-
-  beforeEach(async () => {
-    jest.clearAllMocks();
-    await BrowserPool.reset();
-    (BrowserPool as any).stealthBrowser = null;
-
-    mockPage = {
-      goto: jest.fn().mockResolvedValue({ status: () => 200 }),
-      title: jest.fn().mockResolvedValue('Test Page'),
-      evaluate: jest.fn().mockImplementation((fn: any) => {
-        if (typeof fn === 'function') {
-          const fnStr = fn.toString();
-          if (fnStr.includes('document.body.innerText') || fnStr.includes('document.body.textContent')) {
-            return Promise.resolve('Normal page content');
-          }
-        }
-        return Promise.resolve({ name: 'Test Figure' });
-      }),
-      content: jest.fn().mockResolvedValue('<div></div>'),
-      close: jest.fn().mockResolvedValue(undefined),
-      setViewport: jest.fn().mockResolvedValue(undefined),
-      setUserAgent: jest.fn().mockResolvedValue(undefined),
-      setExtraHTTPHeaders: jest.fn().mockResolvedValue(undefined),
-      setCookie: jest.fn().mockResolvedValue(undefined),
-      waitForFunction: jest.fn().mockResolvedValue(undefined),
-    };
-
-    mockContext = {
-      newPage: jest.fn().mockResolvedValue(mockPage),
-      close: jest.fn().mockResolvedValue(undefined),
-      pages: jest.fn().mockReturnValue([]),
-    };
-
-    mockBrowser = {
-      newPage: jest.fn().mockResolvedValue(mockPage),
-      close: jest.fn().mockResolvedValue(undefined),
-      connected: true,
-      createBrowserContext: jest.fn().mockResolvedValue(mockContext),
-    };
-
-    (puppeteer.launch as jest.Mock).mockResolvedValue(mockBrowser);
-  });
-
-  it('should scrape without cookies (public scraping)', async () => {
-    const result = await scrapeMFC('https://myfigurecollection.net/item/12345');
-    expect(result).toBeDefined();
-    // Verify it used regular browser (getBrowser), not stealth
-    expect(mockBrowser.createBrowserContext).toHaveBeenCalled();
-  });
-
-  it('should scrape with cookies (authenticated scraping)', async () => {
-    const cookies = { PHPSESSID: 'abc', sesUID: '123', sesDID: 'dev' };
-    const result = await scrapeMFC('https://myfigurecollection.net/item/12345', cookies);
-    expect(result).toBeDefined();
-    // Should have set cookies
-    expect(mockPage.setCookie).toHaveBeenCalled();
-  });
-
-  it('should handle string cookies (JSON parse)', async () => {
-    const cookieStr = JSON.stringify({ PHPSESSID: 'abc', sesUID: '123' });
-    const result = await scrapeMFC('https://myfigurecollection.net/item/12345', cookieStr);
-    expect(result).toBeDefined();
-  });
-
-  it('should throw when authenticated scrape fails', async () => {
-    mockPage.goto.mockRejectedValue(new Error('Navigation failed'));
-
-    await expect(
-      scrapeMFC('https://myfigurecollection.net/item/12345', { PHPSESSID: 'abc' })
-    ).rejects.toThrow('Navigation failed');
-  });
-
-  it('should throw when public scrape fails', async () => {
-    mockPage.goto.mockRejectedValue(new Error('Navigation failed'));
-
-    await expect(
-      scrapeMFC('https://myfigurecollection.net/item/12345')
-    ).rejects.toThrow('Navigation failed');
-  });
-});
-
-// ============================================================================
-// scrapeGeneric - MFC 404 detection and schema v3 extraction
+// scrapeGeneric - Cloudflare detection and raw HTML capture
 // ============================================================================
 
 describe('genericScraper - scrapeGeneric extended', () => {
@@ -454,140 +344,6 @@ describe('genericScraper - scrapeGeneric extended', () => {
     (puppeteer.launch as jest.Mock).mockResolvedValue(mockBrowser);
   });
 
-  it('should detect MFC 404 page without auth', async () => {
-    mockPage.title.mockResolvedValue('Error - MyFigureCollection.net');
-    mockPage.evaluate.mockImplementation((fn: any) => {
-      if (typeof fn === 'function') {
-        const fnStr = fn.toString();
-        if (fnStr.includes('document.body.innerText') || fnStr.includes('document.body.textContent')) {
-          return Promise.resolve('404 Not Found');
-        }
-      }
-      return Promise.resolve({});
-    });
-
-    await expect(
-      scrapeGeneric('https://myfigurecollection.net/item/99999', {})
-    ).rejects.toThrow('MFC_ITEM_NOT_ACCESSIBLE');
-  });
-
-  it('should detect MFC 404 page with auth', async () => {
-    mockPage.title.mockResolvedValue('Error - MyFigureCollection.net');
-    mockPage.evaluate.mockImplementation((fn: any) => {
-      if (typeof fn === 'function') {
-        const fnStr = fn.toString();
-        if (fnStr.includes('document.body.innerText') || fnStr.includes('document.body.textContent')) {
-          return Promise.resolve('404 Not Found');
-        }
-      }
-      return Promise.resolve({});
-    });
-
-    await expect(
-      scrapeGeneric('https://myfigurecollection.net/item/99999', {
-        mfcAuth: { sessionCookies: { PHPSESSID: 'test' } },
-      })
-    ).rejects.toThrow('MFC_ITEM_NOT_ACCESSIBLE');
-  });
-
-  it('should extract v3 schema data from page content', async () => {
-    // Mock page.content to return HTML with companies/artists
-    mockPage.content.mockResolvedValue(`
-      <div class="data-field">
-        <span class="data-label">Companies</span>
-        <div class="data-value">
-          <div class="item-entries">
-            <a href="/entry/100"><span switch="JP">Good Smile Company</span></a>
-            <small class="light">as <em>Manufacturer</em></small>
-          </div>
-        </div>
-      </div>
-      <div class="data-field">
-        <span class="data-label">Title</span>
-        <span class="data-value"><a switch="JP">Hatsune Miku</a></span>
-      </div>
-    `);
-
-    const result = await scrapeGeneric('https://myfigurecollection.net/item/12345', {});
-    expect(result.companies).toBeDefined();
-    expect(result.companies!.length).toBe(1);
-    expect(result.companies![0].name).toBe('Good Smile Company');
-    expect(result.mfcTitle).toBe('Hatsune Miku');
-  });
-
-  it('should set legacy manufacturer from companies', async () => {
-    mockPage.evaluate.mockImplementation((fn: any) => {
-      if (typeof fn === 'function') {
-        const fnStr = fn.toString();
-        if (fnStr.includes('document.body.innerText') || fnStr.includes('document.body.textContent')) {
-          return Promise.resolve('Normal page content');
-        }
-      }
-      return Promise.resolve({}); // No manufacturer from page.evaluate
-    });
-    mockPage.content.mockResolvedValue(`
-      <div class="data-field">
-        <span class="data-label">Companies</span>
-        <div class="data-value">
-          <div class="item-entries">
-            <a href="/entry/100"><span switch="JP">Alter</span></a>
-            <small class="light">as <em>Manufacturer</em></small>
-          </div>
-        </div>
-      </div>
-    `);
-
-    const result = await scrapeGeneric('https://myfigurecollection.net/item/12345', {});
-    expect(result.manufacturer).toBe('Alter');
-  });
-
-  it('should use mfcTitle as name fallback', async () => {
-    mockPage.evaluate.mockImplementation((fn: any) => {
-      if (typeof fn === 'function') {
-        const fnStr = fn.toString();
-        if (fnStr.includes('document.body.innerText') || fnStr.includes('document.body.textContent')) {
-          return Promise.resolve('Normal page content');
-        }
-      }
-      return Promise.resolve({}); // No name from page.evaluate
-    });
-    mockPage.content.mockResolvedValue(`
-      <div class="data-field">
-        <span class="data-label">Title</span>
-        <span class="data-value"><a switch="JP">Mash Kyrielight</a></span>
-      </div>
-    `);
-
-    const result = await scrapeGeneric('https://myfigurecollection.net/item/12345', {});
-    expect(result.name).toBe('Mash Kyrielight');
-  });
-
-  it('should handle v3 extraction errors gracefully', async () => {
-    mockPage.content.mockRejectedValue(new Error('Content retrieval failed'));
-
-    // Should not throw -- v3 extraction failure is non-fatal
-    const result = await scrapeGeneric('https://myfigurecollection.net/item/12345', {});
-    expect(result).toBeDefined();
-  });
-
-  it('should handle empty cookie array (no valid cookies)', async () => {
-    // Set up env to have empty allowlist (no allowed cookies)
-    mockPage.evaluate.mockImplementation((fn: any) => {
-      if (typeof fn === 'function') {
-        const fnStr = fn.toString();
-        if (fnStr.includes('document.body.innerText') || fnStr.includes('document.body.textContent')) {
-          return Promise.resolve('Normal page content');
-        }
-      }
-      return Promise.resolve({});
-    });
-
-    const result = await scrapeGeneric('https://myfigurecollection.net/item/12345', {
-      mfcAuth: { sessionCookies: { unknownCookie: 'value' } },
-    });
-    expect(result).toBeDefined();
-  });
-
   it('should detect Cloudflare challenge page', async () => {
     mockPage.title.mockResolvedValue('Just a moment...');
     mockPage.evaluate.mockImplementation((fn: any) => {
@@ -602,8 +358,8 @@ describe('genericScraper - scrapeGeneric extended', () => {
     mockPage.content.mockResolvedValue('<div></div>');
 
     // Should not throw - Cloudflare detection logs and waits
-    const result = await scrapeGeneric('https://myfigurecollection.net/item/12345', {
-      cloudflareDetection: SITE_CONFIGS.mfc.cloudflareDetection,
+    const result = await scrapeGeneric('https://example.com/item/12345', {
+      cloudflareDetection: CLOUDFLARE_DETECTION,
     });
     expect(result).toBeDefined();
     expect(mockPage.waitForFunction).toHaveBeenCalled();
@@ -612,8 +368,8 @@ describe('genericScraper - scrapeGeneric extended', () => {
   it('should handle Cloudflare detection without challenge present', async () => {
     mockPage.content.mockResolvedValue('<div></div>');
 
-    const result = await scrapeGeneric('https://myfigurecollection.net/item/12345', {
-      cloudflareDetection: SITE_CONFIGS.mfc.cloudflareDetection,
+    const result = await scrapeGeneric('https://example.com/item/12345', {
+      cloudflareDetection: CLOUDFLARE_DETECTION,
     });
     expect(result).toBeDefined();
     // Should NOT have called waitForFunction for Cloudflare (no challenge)

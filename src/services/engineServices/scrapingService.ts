@@ -1,10 +1,8 @@
 /**
  * ScrapingService adapter — generic page-fetch capability built on top of
  * the existing BrowserPool (pooled + stealth browser lifecycle management).
- * Deliberately does NOT reuse genericScraper.scrapeGeneric()/scrapeMFC(): those
- * bake in MFC-specific selectors and schema-v3 extraction. This adapter only
- * navigates and returns raw HTML — extraction is the plugin's job via its
- * own ExtractionRuleset.
+ * This adapter only navigates and returns raw HTML — extraction is the
+ * plugin's job via its own ExtractionRuleset.
  */
 import type { Browser, Page } from 'puppeteer';
 import { BrowserPool } from '../genericScraper.js';

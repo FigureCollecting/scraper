@@ -1,18 +1,16 @@
 /**
- * ScrapeQueue ingest cutover tests — when an IngestEmitter is configured
+ * ScrapeQueue ingest tests — when an IngestEmitter is configured
  * (INGEST_BASE_URL) AND the plugin registry resolves a ruleset for the item's
- * URL, the queue takes the NEW path: raw page fetch (engine's scraping
- * service) -> ruleset.extract() -> ingestEmitter.send(). Clean cut: NO
- * webhook leg on that path. When the emitter is absent OR no ruleset matches,
- * the legacy scrapeMFC+webhook path runs untouched.
+ * URL, the queue processes: raw page fetch (engine's scraping service) ->
+ * ruleset.extract() -> ingestEmitter.send(). Clean cut: NO webhook leg on
+ * success. When the emitter is absent OR no ruleset matches, the item fails
+ * cleanly (extraction_unavailable, non-retryable) — the engine carries no
+ * extraction fallback.
  *
  * The fixture ruleset mirrors src/__tests__/fixtures/plugins/
  * mock-scraper-ruleset (same shape a real plugin registers), pointed at the
  * queue's myfigurecollection.net URLs so registry lookup resolves.
  */
-
-// Mock scrapeMFC to control legacy-path outcomes
-const mockScrapeMFC = jest.fn();
 
 // Persistent mock objects that survive clearAllMocks
 const mockNotifyItemSuccess = jest.fn().mockResolvedValue(true);
@@ -20,7 +18,6 @@ const mockNotifyItemFailed = jest.fn().mockResolvedValue(true);
 const mockNotifyItemSkipped = jest.fn().mockResolvedValue(true);
 
 jest.mock('../../services/genericScraper', () => ({
-  scrapeMFC: (...args: any[]) => mockScrapeMFC(...args),
   BrowserPool: {
     getStealthBrowser: jest.fn(),
     getBrowser: jest.fn(),
@@ -113,7 +110,6 @@ describe('ScrapeQueue - ingest cutover', () => {
     jest.clearAllMocks();
     jest.useFakeTimers({ advanceTimers: true });
     resetScrapeQueue();
-    mockScrapeMFC.mockReset();
     mockNotifyItemSuccess.mockResolvedValue(true);
     mockNotifyItemFailed.mockResolvedValue(true);
     mockNotifyItemSkipped.mockResolvedValue(true);
@@ -136,7 +132,7 @@ describe('ScrapeQueue - ingest cutover', () => {
     }
   }
 
-  it('takes the ingest path when emitter configured and ruleset matches: fetch -> extract -> emit, NO webhook, NO scrapeMFC', async () => {
+  it('takes the ingest path when emitter configured and ruleset matches: fetch -> extract -> emit, NO webhook', async () => {
     const ruleset = makeRuleset();
     const scraping = makeScrapingStub();
     const send = jest.fn().mockResolvedValue({ sourceId: 'src-1' });
@@ -159,8 +155,7 @@ describe('ScrapeQueue - ingest cutover', () => {
     expect(sent.source.site).toBe('mock-mfc');
     expect(sent.source.extractedAt).toBe('2026-07-24T00:00:00.000Z');
     expect(sent.fields).toEqual({ name: 'Kitagawa Marin', jan: '4530956107891' });
-    // clean cut: no legacy scrape, no webhook leg on the new path
-    expect(mockScrapeMFC).not.toHaveBeenCalled();
+    // clean cut: no webhook leg on the ingest path
     expect(mockNotifyItemSuccess).not.toHaveBeenCalled();
     // waiting callers still resolve (with the extracted field bag)
     expect(data).toEqual({ name: 'Kitagawa Marin', jan: '4530956107891' });
@@ -190,31 +185,39 @@ describe('ScrapeQueue - ingest cutover', () => {
     expect(send).toHaveBeenCalledTimes(1);
   });
 
-  it('keeps the legacy scrapeMFC+webhook path when no emitter is configured', async () => {
+  it('fails the item cleanly (non-retryable) when no emitter is configured', async () => {
     const ruleset = makeRuleset();
     const scraping = makeScrapingStub();
-    mockScrapeMFC.mockResolvedValue({ name: 'Legacy Figure' });
 
     queue = new ScrapeQueue(false);
-    // registry present, but INGEST_BASE_URL unset -> no emitter -> legacy path
+    // registry present, but INGEST_BASE_URL unset -> no emitter -> clean failure
     queue.setPluginRegistry(makeRegistry(ruleset));
     queue.setScrapingService(scraping);
 
     const result = queue.enqueue('12345', { priority: 'WARM', sessionId: 'session1' });
+    const promiseRef = result.promise.catch((e: Error) => e);
     await advanceAndFlush(500);
-    const data = await result.promise;
+    await advanceAndFlush(5000);
 
-    expect(mockScrapeMFC).toHaveBeenCalledWith('https://myfigurecollection.net/item/12345', undefined);
+    const error = await promiseRef;
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain('extraction_unavailable');
+    expect((error as Error).message).toContain('no ingest emitter configured');
+    // nothing was fetched or extracted; item failed once, no retries
     expect(ruleset.extract).not.toHaveBeenCalled();
     expect(scraping.scrapePage).not.toHaveBeenCalled();
-    expect(mockNotifyItemSuccess).toHaveBeenCalledWith('session1', '12345', expect.any(Object));
-    expect(data).toEqual({ name: 'Legacy Figure' });
+    expect(queue.getStats().failed).toBe(1);
+    // permanent failure is reported to the backend (well-logged, never silent)
+    expect(mockNotifyItemFailed).toHaveBeenCalledWith(
+      'session1',
+      '12345',
+      expect.stringContaining('EXTRACTION_UNAVAILABLE')
+    );
   });
 
-  it('keeps the legacy path when the emitter is configured but no ruleset matches the URL', async () => {
+  it('fails the item cleanly (non-retryable) when the emitter is configured but no ruleset matches the URL', async () => {
     const scraping = makeScrapingStub();
     const send = jest.fn().mockResolvedValue({ sourceId: 'src-1' });
-    mockScrapeMFC.mockResolvedValue({ name: 'Legacy Figure' });
 
     queue = new ScrapeQueue(false);
     // registry has NO site registered for myfigurecollection.net
@@ -223,13 +226,42 @@ describe('ScrapeQueue - ingest cutover', () => {
     queue.setScrapingService(scraping);
 
     const result = queue.enqueue('12345', { priority: 'WARM', sessionId: 'session1' });
+    const promiseRef = result.promise.catch((e: Error) => e);
     await advanceAndFlush(500);
-    await result.promise;
+    await advanceAndFlush(5000);
 
-    expect(mockScrapeMFC).toHaveBeenCalled();
+    const error = await promiseRef;
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain('extraction_unavailable');
+    expect((error as Error).message).toContain('no plugin ruleset matches');
     expect(send).not.toHaveBeenCalled();
     expect(scraping.scrapePage).not.toHaveBeenCalled();
-    expect(mockNotifyItemSuccess).toHaveBeenCalled();
+    expect(queue.getStats().failed).toBe(1);
+  });
+
+  it('does not trip session pause/cooldown machinery for extraction_unavailable failures on cookie items', async () => {
+    const scraping = makeScrapingStub();
+
+    queue = new ScrapeQueue(false);
+    // no emitter at all -> every item is extraction_unavailable
+    queue.setPluginRegistry(createExtractionRegistry());
+    queue.setScrapingService(scraping);
+
+    const result = queue.enqueue('12345', {
+      priority: 'HOT',
+      sessionId: 'session1',
+      cookies: { PHPSESSID: 'abc' },
+    });
+    const promiseRef = result.promise.catch((e: Error) => e);
+    await advanceAndFlush(500);
+    await advanceAndFlush(5000);
+
+    const error = await promiseRef;
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain('extraction_unavailable');
+    // failed outright — not held in the queue for a cookie-cooldown retry
+    expect(queue.getStats().failed).toBe(1);
+    expect(queue.getStats().total).toBe(0);
   });
 
   it('fails the item through existing failure handling when the emitter gives up (never a silent drop)', async () => {
@@ -252,7 +284,6 @@ describe('ScrapeQueue - ingest cutover', () => {
     expect(error).toBeInstanceOf(Error);
     expect((error as Error).message).toContain('Scrape failed');
     expect(queue.getStats().failed).toBe(1);
-    expect(mockScrapeMFC).not.toHaveBeenCalled();
   });
 
   it('fails the item and logs the error when extraction throws', async () => {

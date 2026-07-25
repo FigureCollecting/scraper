@@ -1,7 +1,7 @@
 /**
  * Scrape Queue Service
  *
- * Manages a priority-based queue for MFC scraping requests with:
+ * Manages a priority-based queue for scraping requests with:
  * - Three-tier priority lanes (HOT, WARM, COLD)
  * - Request deduplication and coalescing
  * - Adaptive rate limiting with exponential backoff
@@ -11,13 +11,18 @@
  * - HOT: NSFW items with active cookies (highest priority)
  * - WARM: SFW items from active imports
  * - COLD: Background enrichment (lowest priority)
+ *
+ * Extraction is plugin-only: items are processed via the ingest path
+ * (raw page fetch -> plugin ruleset extract -> spine emit). The engine has
+ * no extraction fallback — items with no matching ruleset, or with no
+ * ingest emitter configured, fail cleanly through the standard failure
+ * handling (never a crash, never a silent drop).
  */
 
-import { scrapeMFC, ScrapedData, BrowserPool } from './genericScraper.js';
-import { calculateRefreshPriority } from './cacheConfig.js';
+import { ScrapedData, BrowserPool } from './genericScraper.js';
 import { sanitizeForLog } from '../utils/security.js';
 import { getSessionManager, resetSessionManager, SessionManager, SessionPausedEvent } from './sessionManager.js';
-import { notifyItemSuccess, notifyItemFailed, notifyItemSkipped } from './webhookClient.js';
+import { notifyItemFailed } from './webhookClient.js';
 import { enrichmentLogger } from '../utils/logger.js';
 import { createScrapingService } from './engineServices/scrapingService.js';
 import { createIngestEmitterFromEnv } from './ingestEmitter.js';
@@ -33,7 +38,7 @@ import type {
 
 export type QueuePriority = 'HOT' | 'WARM' | 'COLD';
 export type ItemStatus = 'owned' | 'ordered' | 'wished';
-export type ErrorType = 'timeout' | 'not_found' | 'rate_limited' | 'auth_required' | 'network' | 'unknown';
+export type ErrorType = 'timeout' | 'not_found' | 'rate_limited' | 'auth_required' | 'network' | 'extraction_unavailable' | 'unknown';
 
 export interface QueueItem {
   /** Unique identifier for this queue entry */
@@ -170,6 +175,12 @@ const RATE_LIMIT = {
 function classifyError(error: Error | string): ErrorType {
   const message = typeof error === 'string' ? error : error.message;
 
+  // Config-level shortfall (no emitter / no matching ruleset) — checked first
+  // so its reason text can never be mistaken for a transient error.
+  if (message.includes('EXTRACTION_UNAVAILABLE')) {
+    return 'extraction_unavailable';
+  }
+
   if (message.includes('timeout') || message.includes('TIMEOUT')) {
     return 'timeout';
   }
@@ -197,6 +208,12 @@ function classifyError(error: Error | string): ErrorType {
 function shouldRetry(errorType: ErrorType, retryCount: number, maxRetries: number): boolean {
   // Never retry auth errors without new cookies
   if (errorType === 'auth_required') {
+    return false;
+  }
+
+  // Never retry config-level shortfalls — a missing emitter or ruleset will
+  // not appear between attempts
+  if (errorType === 'extraction_unavailable') {
     return false;
   }
 
@@ -254,11 +271,11 @@ export class ScrapeQueue {
   // Cooldown wait timer - prevents multiple concurrent timers when all items blocked
   private cooldownWaitTimerId: NodeJS.Timeout | null = null;
 
-  // Ingest cutover seams (engine plumbing, injected — see setters below).
+  // Ingest seams (engine plumbing, injected — see setters below).
   // When an emitter is configured (INGEST_BASE_URL) AND the registry resolves
-  // a ruleset for the item's URL, processing takes the NEW path: raw page
-  // fetch -> ruleset.extract() -> spine emit. NO webhook leg on that path.
-  // Otherwise the legacy scrapeMFC+webhook path runs untouched.
+  // a ruleset for the item's URL, processing runs: raw page fetch ->
+  // ruleset.extract() -> spine emit. There is no other extraction path —
+  // anything else is a clean item failure.
   private pluginRegistry: RulesetResolver | null = null;
   private ingestEmitter: IngestSender | null = null;
   private rawPageFetcher: RawPageFetcher | null = null;
@@ -286,7 +303,8 @@ export class ScrapeQueue {
 
   /**
    * Inject the plugin extraction registry (threaded from bootstrapPlugins in
-   * src/index.ts). Without it, or without an emitter, items keep the legacy path.
+   * src/index.ts). Without it, or without an emitter, items fail cleanly —
+   * the engine has no extraction fallback.
    */
   setPluginRegistry(registry: RulesetResolver | null): void {
     this.pluginRegistry = registry;
@@ -837,17 +855,19 @@ export class ScrapeQueue {
     console.log(`[SCRAPE QUEUE] Processing MFC ${item.mfcId} (${item.priority}, attempt ${item.retryCount + 1}/${item.maxRetries + 1}, delay=${this.currentDelay}ms, pool=${poolAvailable}/${BrowserPool.getPoolCapacity()})`);
 
     try {
-      // Ingest cutover: emitter configured AND a plugin ruleset matches the
-      // URL -> new path (extract + spine emit, no webhook). Otherwise legacy.
+      // Extraction is plugin-only: an ingest emitter must be configured AND
+      // a plugin ruleset must match the item's URL. Anything else is a
+      // clean, non-retryable item failure (never a crash, never silent).
       const ruleset = this.ingestEmitter ? this.lookupRuleset(item.url) : undefined;
 
       if (this.ingestEmitter && ruleset) {
         const fields = await this.processViaIngest(item, ruleset);
-        this.handleSuccess(item, fields, { skipWebhook: true });
+        this.handleSuccess(item, fields);
       } else {
-        // Legacy path: MFC-specific scrape + webhook callbacks
-        const result = await scrapeMFC(item.url, item.cookies);
-        this.handleSuccess(item, result);
+        const reason = !this.ingestEmitter
+          ? 'no ingest emitter configured (INGEST_BASE_URL unset)'
+          : `no plugin ruleset matches ${item.url}`;
+        throw new Error(`EXTRACTION_UNAVAILABLE: ${reason}`);
       }
 
     } catch (error: any) {
@@ -886,12 +906,12 @@ export class ScrapeQueue {
   }
 
   /**
-   * NEW ingest path: fetch raw HTML, hand it to the plugin's ruleset for
-   * extraction, and emit the result to the aggregation spine. Clean cut —
-   * no webhook leg here. Throws on fetch, extraction, or emit failure so
-   * the item flows through the queue's existing failure handling (never a
-   * silent drop). Returns the extracted field bag so waiting callers'
-   * promises still resolve.
+   * The ingest path: fetch raw HTML, hand it to the plugin's ruleset for
+   * extraction, and emit the result to the aggregation spine. No webhook
+   * leg here. Throws on fetch, extraction, or emit failure so the item
+   * flows through the queue's existing failure handling (never a silent
+   * drop). Returns the extracted field bag so waiting callers' promises
+   * still resolve.
    */
   private async processViaIngest(item: QueueItem, ruleset: ExtractionRuleset): Promise<ScrapedData> {
     const fetcher = this.getRawPageFetcher();
@@ -985,7 +1005,7 @@ export class ScrapeQueue {
     return false;
   }
 
-  private handleSuccess(item: QueueItem, result: ScrapedData, opts: { skipWebhook?: boolean } = {}): void {
+  private handleSuccess(item: QueueItem, result: ScrapedData): void {
     // Track success
     this.completedCount++;
     this.consecutiveSuccesses++;
@@ -1006,18 +1026,10 @@ export class ScrapeQueue {
     };
     enrichmentLogger.success(item.mfcId, item.sessionId, durationMs, fields);
 
-    // Report success to session manager (clears failure count)
+    // Report success to session manager (clears failure count). No webhook
+    // leg on success — the ingest path emits to the spine ONLY (clean cut).
     if (item.sessionId) {
       this.sessionManager.reportSuccess(item.sessionId);
-
-      // Notify backend via webhook (non-blocking). The ingest path skips
-      // this leg entirely — it emits to the spine ONLY (clean cut).
-      if (!opts.skipWebhook) {
-        notifyItemSuccess(item.sessionId, item.mfcId, result as Record<string, unknown>).catch(() => {
-          // Webhook failures are non-fatal, just log
-          console.warn(`[SCRAPE QUEUE] Webhook notification failed for MFC ${item.mfcId}`);
-        });
-      }
     }
 
     // Reduce delay if consistently succeeding
@@ -1075,8 +1087,10 @@ export class ScrapeQueue {
     // Reset success streak on any failure
     this.consecutiveSuccesses = 0;
 
-    // For cookie-authenticated requests, track failures in session manager
-    if (item.cookies && item.sessionId && item.waitingUserIds.length > 0) {
+    // For cookie-authenticated requests, track failures in session manager.
+    // Config-level shortfalls (extraction_unavailable) are not cookie
+    // failures — they skip session pause/cooldown and fail directly below.
+    if (errorType !== 'extraction_unavailable' && item.cookies && item.sessionId && item.waitingUserIds.length > 0) {
       const pendingCount = this.getPendingCountForSession(item.sessionId);
       const userId = item.waitingUserIds[0]; // Primary user for this session
 

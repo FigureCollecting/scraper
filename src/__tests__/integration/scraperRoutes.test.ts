@@ -8,7 +8,7 @@ import * as genericScraper from '../../services/genericScraper';
 // Mock the genericScraper module
 jest.mock('../../services/genericScraper');
 
-const mockedGenericScraper = genericScraper as jest.Mocked<typeof genericScraper> & { SITE_CONFIGS: Record<string, any> };
+const mockedGenericScraper = genericScraper as jest.Mocked<typeof genericScraper>;
 
 describe('Scraper Routes Integration Tests', () => {
   let app: express.Application;
@@ -169,181 +169,20 @@ describe('Scraper Routes Integration Tests', () => {
     });
   });
 
-  describe('POST /scrape/mfc', () => {
-    it('should successfully scrape MFC URL', async () => {
-      const mockMFCData = {
-        imageUrl: 'https://static.myfigurecollection.net/pics/figure/large/123456.jpg',
-        manufacturer: 'Good Smile Company',
-        name: 'Hatsune Miku',
-        scale: '1/7',
-      };
-
-      mockedGenericScraper.scrapeMFC.mockResolvedValueOnce(mockMFCData);
-
-      const response = await request(app)
+  describe('engine route surface (extraction is plugin-only)', () => {
+    it('should NOT mount site-specific scrape routes on the engine', async () => {
+      // /scrape/mfc is registered by the rulesets plugin at bootstrap; the
+      // bare engine (no plugins loaded) must not shadow it.
+      await request(app)
         .post('/scrape/mfc')
-        .send({
-          url: 'https://myfigurecollection.net/item/123456',
-        })
-        .expect(200);
-
-      expect(response.body).toEqual({
-        success: true,
-        data: mockMFCData,
-      });
-
-      expect(mockedGenericScraper.scrapeMFC).toHaveBeenCalledWith(
-        'https://myfigurecollection.net/item/123456',
-        undefined
-      );
+        .send({ url: 'https://myfigurecollection.net/item/123456' })
+        .expect(404);
     });
 
-    it('should return 400 if URL is missing', async () => {
-      const response = await request(app)
-        .post('/scrape/mfc')
-        .send({})
-        .expect(400);
-
-      expect(response.body).toEqual({
-        success: false,
-        message: 'URL is required',
-      });
-
-      expect(mockedGenericScraper.scrapeMFC).not.toHaveBeenCalled();
-    });
-
-    it('should return 400 for invalid URL format', async () => {
-      const response = await request(app)
-        .post('/scrape/mfc')
-        .send({
-          url: 'not-a-valid-url',
-        })
-        .expect(400);
-
-      expect(response.body).toEqual({
-        success: false,
-        message: 'Invalid URL format',
-      });
-
-      expect(mockedGenericScraper.scrapeMFC).not.toHaveBeenCalled();
-    });
-
-    it('should return 400 for non-MFC URL', async () => {
-      const response = await request(app)
-        .post('/scrape/mfc')
-        .send({
-          url: 'https://example.com/product',
-        })
-        .expect(400);
-
-      expect(response.body).toEqual({
-        success: false,
-        message: 'URL must be from myfigurecollection.net domain',
-      });
-
-      expect(mockedGenericScraper.scrapeMFC).not.toHaveBeenCalled();
-    });
-
-    it('should reject URL bypass attempts (security fix for CodeQL alert)', async () => {
-      // Test that subdomain attacks are properly rejected
-      const bypassAttempts = [
-        'https://myfigurecollection.net.evil.com/item/123', // Attacker's subdomain
-        'https://evil.com/myfigurecollection.net/item/123', // MFC in path
-        'https://fakemyfigurecollection.net/item/123', // Similar domain
-      ];
-
-      for (const url of bypassAttempts) {
-        const response = await request(app)
-          .post('/scrape/mfc')
-          .send({ url })
-          .expect(400);
-
-        expect(response.body.success).toBe(false);
-        expect(response.body.message).toContain('myfigurecollection.net');
-        expect(mockedGenericScraper.scrapeMFC).not.toHaveBeenCalled();
-      }
-    });
-
-    it('should accept various MFC URL formats', async () => {
-      const mockData = { name: 'Test Figure' };
-      mockedGenericScraper.scrapeMFC.mockResolvedValue(mockData);
-
-      const validMFCUrls = [
-        'https://myfigurecollection.net/item/123456',
-        'http://myfigurecollection.net/item/123456',
-        'https://www.myfigurecollection.net/item/123456',
-        'https://myfigurecollection.net/browse/123456',
-      ];
-
-      for (const url of validMFCUrls) {
-        await request(app)
-          .post('/scrape/mfc')
-          .send({ url })
-          .expect(200);
-      }
-
-      expect(mockedGenericScraper.scrapeMFC).toHaveBeenCalledTimes(validMFCUrls.length);
-    });
-
-    it('should return 500 if MFC scraping fails', async () => {
-      const scrapingError = new Error('MFC scraping failed');
-      mockedGenericScraper.scrapeMFC.mockRejectedValueOnce(scrapingError);
-
-      const response = await request(app)
-        .post('/scrape/mfc')
-        .send({
-          url: 'https://myfigurecollection.net/item/123456',
-        })
-        .expect(500);
-
-      expect(response.body).toEqual({
-        success: false,
-        message: 'MFC scraping failed',
-        error: 'MFC scraping failed',
-      });
-    });
-  });
-
-  describe('GET /configs', () => {
-    it('should return available site configurations', async () => {
-      const mockSiteConfigs = {
-        mfc: {
-          imageSelector: '.item-picture .main img',
-          manufacturerSelector: '.data-field .data-label:contains("Company") + .data-value .item-entries a span[switch]',
-          nameSelector: '.data-field .data-label:contains("Character") + .data-value .item-entries a span[switch]',
-          scaleSelector: '.item-scale',
-          cloudflareDetection: {
-            titleIncludes: ['Just a moment'],
-            bodyIncludes: ['Just a moment'],
-          },
-          waitTime: 1000,
-          userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
-        },
-      };
-
-      mockedGenericScraper.SITE_CONFIGS = mockSiteConfigs;
-
-      const response = await request(app)
-        .get('/configs')
-        .expect(200);
-
-      expect(response.body).toEqual({
-        success: true,
-        data: mockSiteConfigs,
-      });
-    });
-
-    it('should return configs even if empty', async () => {
-      mockedGenericScraper.SITE_CONFIGS = {} as typeof mockedGenericScraper.SITE_CONFIGS;
-
-      const response = await request(app)
-        .get('/configs')
-        .expect(200);
-
-      expect(response.body).toEqual({
-        success: true,
-        data: {},
-      });
+    it('should NOT expose a flat site-config endpoint', async () => {
+      // Site configs are registered per-plugin via ExtractionRegistry, not
+      // served from a single engine endpoint.
+      await request(app).get('/configs').expect(404);
     });
   });
 

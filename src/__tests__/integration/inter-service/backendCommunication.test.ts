@@ -3,14 +3,15 @@ import app from '../../../index';
 
 describe('Inter-Service Integration: Backend-Scraper Communication', () => {
 
-  describe('MFC Scraping Endpoint', () => {
-    it('should handle invalid MFC scrape request', async () => {
+  describe('Generic Scraping Endpoint', () => {
+    it('should reject a scrape request with an invalid URL', async () => {
       const invalidPayload = {
-        url: 'invalid-url'
+        url: 'invalid-url',
+        config: { nameSelector: '.name' }
       };
 
       const response = await request(app)
-        .post('/scrape/mfc')
+        .post('/scrape')
         .send(invalidPayload)
         .expect(400);
 
