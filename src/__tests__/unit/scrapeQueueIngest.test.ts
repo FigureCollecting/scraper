@@ -86,6 +86,34 @@ function makeRuleset(extract?: jest.Mock): ExtractionRuleset & { extract: jest.M
   };
 }
 
+/** Fixture ruleset exposing the optional async extraction path (e.g. VNDB, AmiAmi). */
+function makeAsyncRuleset(
+  extractAsync?: jest.Mock
+): ExtractionRuleset & { extract: jest.Mock; extractAsync: jest.Mock } {
+  const extractAsyncFn =
+    extractAsync ??
+    jest.fn(async (html: string, url: string) => ({
+      source: {
+        site: 'mock-vndb',
+        itemId: 'v11',
+        url,
+        extractedAt: '2026-07-24T00:00:00.000Z',
+        rulesetVersion: '1.0.0',
+      },
+      fields: { name: 'Fate/stay night' },
+      warnings: [],
+    }));
+  return {
+    siteId: 'mock-vndb',
+    version: '1.0.0',
+    extract: jest.fn(() => {
+      throw new Error('sync extract should not run when extractAsync is present');
+    }),
+    extractAsync: extractAsyncFn,
+    validate: () => ({ valid: true, errors: [], warnings: [] }),
+  };
+}
+
 function makeScrapingStub() {
   return {
     scrapePage: jest.fn().mockResolvedValue({
@@ -160,6 +188,28 @@ describe('ScrapeQueue - ingest cutover', () => {
     // waiting callers still resolve (with the extracted field bag)
     expect(data).toEqual({ name: 'Kitagawa Marin', jan: '4530956107891' });
     expect(queue.getStats().completed).toBe(1);
+  });
+
+  it('awaits ruleset.extractAsync() when the ruleset exposes it, instead of the sync extract', async () => {
+    const ruleset = makeAsyncRuleset();
+    const scraping = makeScrapingStub();
+    const send = jest.fn().mockResolvedValue({ sourceId: 'src-1' });
+
+    queue = new ScrapeQueue(false);
+    queue.setPluginRegistry(makeRegistry(ruleset, 'vndb.example.test'));
+    queue.setIngestEmitter({ send });
+    queue.setScrapingService(scraping);
+
+    const url = 'https://vndb.example.test/item/v11';
+    const result = queue.enqueue(url, { url });
+    await advanceAndFlush(500);
+    const data = await result.promise;
+
+    expect(ruleset.extractAsync).toHaveBeenCalledWith(FIXTURE_HTML, url);
+    expect(ruleset.extract).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][0].fields).toEqual({ name: 'Fate/stay night' });
+    expect(data).toEqual({ name: 'Fate/stay night' });
   });
 
   it('scrapes the caller-supplied url option instead of building an MFC URL from the key', async () => {
