@@ -6,6 +6,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { createRequire } from 'module';
 import scraperRoutes from './routes/scraper.js';
+import ingestRoutes from './routes/ingest.js';
 import { scraperDebug } from './utils/logger.js';
 
 // Import browser pool functionality
@@ -75,6 +76,10 @@ app.get('/version', (req, res) => {
 
 // Scraper routes (no /api prefix for consistency)
 app.use('/', scraperRoutes);
+
+// Ingest trigger route: POST /ingest/scrape enqueues a URL into the queue's
+// plugin-extraction ingest path (registry -> fetch -> extract -> spine emit)
+app.use('/', ingestRoutes);
 
 // Plugins loaded at boot (populated by startServer, read by gracefulShutdown)
 let loadedPlugins: ScraperPlugin[] = [];

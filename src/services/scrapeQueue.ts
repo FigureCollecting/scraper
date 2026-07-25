@@ -428,6 +428,23 @@ export class ScrapeQueue {
   // ==========================================================================
 
   /**
+   * Whether the spine ingest path is configured (an emitter is present).
+   * Trigger routes use this to answer "ingest not configured" up front
+   * instead of enqueueing items doomed to fail extraction_unavailable.
+   */
+  isIngestConfigured(): boolean {
+    return this.ingestEmitter !== null;
+  }
+
+  /**
+   * Whether the plugin registry resolves an extraction ruleset for this URL
+   * (same lookup the processing loop uses; lookup errors count as no match).
+   */
+  hasRulesetForUrl(url: string): boolean {
+    return this.lookupRuleset(url) !== undefined;
+  }
+
+  /**
    * Add an item to the scrape queue
    *
    * @param mfcId - Dedup key: an MFC item ID (legacy shape) or, when
