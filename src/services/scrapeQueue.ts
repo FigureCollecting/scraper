@@ -106,6 +106,12 @@ export interface EnqueueOptions {
   sessionId?: string;
   userId?: string;
   maxRetries?: number;
+  /**
+   * Explicit URL to scrape. When absent the key is treated as an MFC item ID
+   * and the item URL is built from it (legacy shape). Trigger routes pass the
+   * URL itself as both key and option — no faked MFC fields.
+   */
+  url?: string;
 }
 
 export interface EnqueueResult {
@@ -424,8 +430,10 @@ export class ScrapeQueue {
   /**
    * Add an item to the scrape queue
    *
-   * @param mfcId - MFC item ID to scrape
-   * @param options - Enqueue options (priority, cookies, etc.)
+   * @param mfcId - Dedup key: an MFC item ID (legacy shape) or, when
+   *   options.url is supplied, any caller-chosen key (trigger routes use the
+   *   URL itself)
+   * @param options - Enqueue options (priority, cookies, url, etc.)
    * @returns EnqueueResult with promise that resolves when scraping completes
    */
   enqueue(mfcId: string, options: EnqueueOptions = {}): EnqueueResult {
@@ -438,8 +446,8 @@ export class ScrapeQueue {
       maxRetries = RATE_LIMIT.DEFAULT_MAX_RETRIES,
     } = options;
 
-    // Build URL from MFC ID
-    const url = `https://myfigurecollection.net/item/${mfcId}`;
+    // Caller-supplied URL wins; otherwise build the MFC item URL from the key
+    const url = options.url ?? `https://myfigurecollection.net/item/${mfcId}`;
 
     // Check for deduplication
     const existingItem = this.pendingItems.get(mfcId);
