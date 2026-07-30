@@ -4,9 +4,10 @@
  * This adapter only navigates and returns raw HTML — extraction is the
  * plugin's job via its own ExtractionRuleset.
  */
-import type { Browser, Page } from 'puppeteer';
+import type { Browser, Page, HTTPResponse } from 'puppeteer';
 import { BrowserPool } from '../genericScraper.js';
 import { ScrapingService, ScrapePageOptions, ScrapePageResult, PageOptions } from '@figurecollecting/scraper-plugin-contract';
+import { CaptureSink, NoopCaptureSink, buildRawCapture } from '../captureSink.js';
 
 const DEFAULT_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36';
@@ -35,7 +36,12 @@ async function detectChallenge(
   return matchesAny(patterns.titleIncludes) || matchesAny(patterns.bodyIncludes);
 }
 
-async function navigateAndCapture(page: Page, url: string, options: ScrapePageOptions = {}): Promise<ScrapePageResult> {
+async function navigateAndCapture(
+  page: Page,
+  url: string,
+  options: ScrapePageOptions = {},
+  sink: CaptureSink = new NoopCaptureSink()
+): Promise<ScrapePageResult> {
   await page.setViewport({ width: 1280, height: 720 });
   await page.setUserAgent(options.userAgent || DEFAULT_USER_AGENT);
 
@@ -49,24 +55,65 @@ async function navigateAndCapture(page: Page, url: string, options: ScrapePageOp
     }
   }
 
-  const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
-
-  const waitTime = capWaitTime(options.waitTime);
-  if (waitTime > 0) {
-    await new Promise(resolve => setTimeout(resolve, waitTime));
-  }
-
-  if (options.cloudflareDetection) {
-    const challenged = await detectChallenge(page, options.cloudflareDetection);
-    if (challenged) {
-      // Single bounded re-check wait. Plugins needing more elaborate
-      // challenge-clearing behavior can retry from their own workflow layer.
-      await new Promise(resolve => setTimeout(resolve, CHALLENGE_RECHECK_DELAY_MS));
+  // WIRE lane: buffer the main-document response body as it arrives, before JS
+  // runs. `.buffer()` must be called during the response event — after the
+  // browser consumes it for rendering it may no longer be retrievable. A body
+  // that is genuinely unavailable (e.g. a 3xx with no body) is skipped, not fatal.
+  let wire: { bytes: Buffer; statusCode?: number; contentType?: string } | undefined;
+  const onResponse = async (resp: HTTPResponse): Promise<void> => {
+    try {
+      if (resp.request().resourceType() === 'document' && resp.frame() === page.mainFrame()) {
+        const bytes = await resp.buffer();
+        wire = { bytes, statusCode: resp.status(), contentType: resp.headers()['content-type'] };
+      }
+    } catch {
+      /* body unavailable — leave the wire lane unset for this fetch */
     }
+  };
+  page.on('response', onResponse);
+
+  let response;
+  try {
+    response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
+
+    const waitTime = capWaitTime(options.waitTime);
+    if (waitTime > 0) {
+      await new Promise(resolve => setTimeout(resolve, waitTime));
+    }
+
+    if (options.cloudflareDetection) {
+      const challenged = await detectChallenge(page, options.cloudflareDetection);
+      if (challenged) {
+        // Single bounded re-check wait. Plugins needing more elaborate
+        // challenge-clearing behavior can retry from their own workflow layer.
+        await new Promise(resolve => setTimeout(resolve, CHALLENGE_RECHECK_DELAY_MS));
+      }
+    }
+  } finally {
+    page.off('response', onResponse);
   }
 
   const html = await page.content();
   const title = await page.title();
+
+  // Hand both lanes to the sink. Capturing must never break a scrape.
+  const fetchedAt = new Date().toISOString();
+  const finalUrl = response?.url?.() ?? url;
+  try {
+    if (wire) {
+      await sink.capture(buildRawCapture({
+        url, finalUrl, lane: 'wire', bytes: wire.bytes,
+        statusCode: wire.statusCode, contentType: wire.contentType, fetchedAt,
+      }));
+    }
+    await sink.capture(buildRawCapture({
+      url, finalUrl, lane: 'dom', bytes: Buffer.from(html, 'utf8'),
+      statusCode: response?.status(), contentType: 'text/html', fetchedAt,
+    }));
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn(`[CAPTURE] sink failed for ${url}: ${err instanceof Error ? err.message : String(err)}`);
+  }
 
   return {
     html,
@@ -76,7 +123,7 @@ async function navigateAndCapture(page: Page, url: string, options: ScrapePageOp
   };
 }
 
-export function createScrapingService(): ScrapingService {
+export function createScrapingService(captureSink: CaptureSink = new NoopCaptureSink()): ScrapingService {
   async function withPage<T>(fn: (page: Page) => Promise<T>, options: PageOptions = {}): Promise<T> {
     const stealth = options.stealth ?? false;
     const browser: Browser = stealth ? await BrowserPool.getStealthBrowser() : await BrowserPool.getBrowser();
@@ -110,10 +157,10 @@ export function createScrapingService(): ScrapingService {
 
   return {
     scrapePage: (url: string, options?: ScrapePageOptions) =>
-      withPage(page => navigateAndCapture(page, url, options), { stealth: false }),
+      withPage(page => navigateAndCapture(page, url, options, captureSink), { stealth: false }),
 
     scrapePageStealth: (url: string, options?: ScrapePageOptions) =>
-      withPage(page => navigateAndCapture(page, url, options), { stealth: true }),
+      withPage(page => navigateAndCapture(page, url, options, captureSink), { stealth: true }),
 
     withBrowser,
     withPage,
