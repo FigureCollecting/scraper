@@ -218,7 +218,7 @@ jobs:
 
       - name: Upload scan results to GitHub Security
         if: steps.scan.outputs.has_vulnerabilities == 'true'
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@v4.37.3
         with:
           sarif_file: trivy-results.sarif
           category: scheduled-scan-${{ matrix.service.name }}
