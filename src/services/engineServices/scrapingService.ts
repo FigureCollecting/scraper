@@ -8,6 +8,7 @@ import type { Browser, Page, HTTPResponse } from 'puppeteer';
 import { BrowserPool } from '../genericScraper.js';
 import { ScrapingService, ScrapePageOptions, ScrapePageResult, PageOptions } from '@figurecollecting/scraper-plugin-contract';
 import { CaptureSink, NoopCaptureSink, buildRawCapture } from '../captureSink.js';
+import { sanitizeForLog } from '../../utils/security.js';
 
 const DEFAULT_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36';
@@ -112,7 +113,8 @@ async function navigateAndCapture(
     }));
   } catch (err) {
     // eslint-disable-next-line no-console
-    console.warn(`[CAPTURE] sink failed for ${url}: ${err instanceof Error ? err.message : String(err)}`);
+    // lgtm[js/log-injection] — url is caller-influenced; sanitize before logging
+    console.warn(`[CAPTURE] sink failed for ${sanitizeForLog(url)}: ${err instanceof Error ? err.message : String(err)}`);
   }
 
   return {

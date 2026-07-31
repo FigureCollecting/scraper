@@ -18,6 +18,7 @@
  */
 import { gzipSync } from 'node:zlib';
 import type { CaptureSink, RawCapture } from './captureSink.js';
+import { sanitizeForLog } from '../utils/security.js';
 
 /** Options for a single object write. */
 export interface PutOptions {
@@ -46,8 +47,10 @@ export interface RawStoreConfig {
   endpoint: string;
   region: string;
   bucket: string;
-  /** Capture-type prefix, e.g. `raw-html/`. */
+  /** Capture-type prefix for html lanes, e.g. `raw-html/`. */
   prefix: string;
+  /** Capture-type prefix for the json (api) lane, e.g. `raw-json/`. */
+  jsonPrefix?: string;
   /** Key-scheme contract version; this writer only knows `sha256-v1`. */
   keyScheme: string;
   /** Hard bound on each HEAD/PUT so a slow store can't stall the fetch path. */
@@ -68,6 +71,25 @@ export interface SinkStats {
 
 const SUPPORTED_KEY_SCHEME = 'sha256-v1';
 const DEFAULT_PUT_TIMEOUT_MS = 5_000;
+const MAX_METADATA_VALUE_LEN = 1024;
+
+/**
+ * S3 user-metadata is carried in HTTP headers: values must be header-safe (ASCII,
+ * no control chars) and bounded, or the PUT itself fails. A capture's URL is
+ * caller-influenced and may hold non-ASCII (international paths) or hostile bytes,
+ * so we make it header-safe here — a bad URL degrades the convenience tag, never
+ * the byte write.
+ */
+function headerSafe(value: string): string {
+  let s: string;
+  try {
+    s = encodeURI(value); // percent-encodes non-ASCII, preserves URL structure
+  } catch {
+    s = value.replace(/[^\x20-\x7e]/g, '');
+  }
+  s = s.replace(/[\x00-\x1f\x7f]/g, ''); // strip any residual control chars
+  return s.length > MAX_METADATA_VALUE_LEN ? s.slice(0, MAX_METADATA_VALUE_LEN) : s;
+}
 
 export class ObjectStoreCaptureSink implements CaptureSink {
   private readonly putTimeoutMs: number;
@@ -84,7 +106,8 @@ export class ObjectStoreCaptureSink implements CaptureSink {
         `unsupported raw-store key scheme "${config.keyScheme}" — this writer only knows "${SUPPORTED_KEY_SCHEME}"`,
       );
     }
-    this.putTimeoutMs = config.putTimeoutMs ?? DEFAULT_PUT_TIMEOUT_MS;
+    const t = config.putTimeoutMs;
+    this.putTimeoutMs = typeof t === 'number' && Number.isFinite(t) && t > 0 ? t : DEFAULT_PUT_TIMEOUT_MS;
   }
 
   stats(): SinkStats {
@@ -115,27 +138,37 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       this.failed += 1;
       // eslint-disable-next-line no-console
       console.warn(
-        `[RAW-STORE] capture failed for ${c.url} (sha ${c.sha256.slice(0, 12)}…): ${
+        // lgtm[js/log-injection] — url is caller-influenced; sanitize before logging
+        `[RAW-STORE] capture failed for ${sanitizeForLog(c.url)} (sha ${c.sha256.slice(0, 12)}…): ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
     }
   }
 
-  /** `<prefix>sha256/<aa>/<sha256hex><ext>` — json lanes route to a raw-json/ sibling. */
+  /** `<prefix>sha256/<aa>/<sha256hex><ext>` — the json (api) lane uses jsonPrefix. */
   private objectKey(c: RawCapture): string {
     const aa = c.sha256.slice(0, 2);
     const isJson = c.lane === 'api' || (c.contentType ?? '').includes('json');
-    const prefix = isJson ? this.config.prefix.replace('raw-html', 'raw-json') : this.config.prefix;
+    const prefix = isJson ? this.jsonPrefix() : this.config.prefix;
     const ext = isJson ? '.json.gz' : '.html.gz';
     return `${prefix}sha256/${aa}/${c.sha256}${ext}`;
   }
 
+  private jsonPrefix(): string {
+    if (this.config.jsonPrefix) return this.config.jsonPrefix;
+    // Fallback only when unconfigured: derive a raw-json/ sibling from the html
+    // prefix if it follows the raw-html/ convention, else reuse the html prefix.
+    return this.config.prefix.includes('raw-html')
+      ? this.config.prefix.replace('raw-html', 'raw-json')
+      : this.config.prefix;
+  }
+
   private metadata(c: RawCapture): Record<string, string> {
     const url = c.finalUrl ?? c.url;
-    const md: Record<string, string> = { url, 'fetched-at': c.fetchedAt };
+    const md: Record<string, string> = { url: headerSafe(url), 'fetched-at': c.fetchedAt };
     try {
-      md.site = new URL(url).hostname;
+      md.site = headerSafe(new URL(url).hostname);
     } catch {
       /* best-effort — a malformed URL just omits the site tag */
     }

@@ -17,9 +17,11 @@ class FakeObjectStore implements ObjectStore {
   putDelayMs = 0;
   failPut = false;
   hangPut = false;
+  hangExists = false;
 
   async exists(key: string): Promise<boolean> {
     this.headCalls += 1;
+    if (this.hangExists) return new Promise<boolean>(() => {}); // never resolves
     return this.existing.has(key);
   }
 
@@ -90,11 +92,26 @@ describe('ObjectStoreCaptureSink — sha256-v1 contract', () => {
     expect(opts.metadata?.['content-encoding']).toBeUndefined();
   });
 
-  it('attaches convenience metadata (url + fetched-at) on the first PUT', async () => {
+  it('attaches convenience metadata (url + fetched-at + site) on the first PUT', async () => {
     await sink.capture(cap({ url: 'https://x.test/a', finalUrl: 'https://x.test/a?', fetchedAt: '2026-07-31T00:00:00.000Z' }));
     const md = store.puts[0].opts.metadata ?? {};
     expect(md['url']).toBe('https://x.test/a?'); // finalUrl preferred when present
     expect(md['fetched-at']).toBe('2026-07-31T00:00:00.000Z');
+    expect(md['site']).toBe('x.test');
+  });
+
+  it('header-safes a non-ASCII / hostile URL in metadata so it cannot fail the PUT', async () => {
+    await sink.capture(cap({ url: 'https://x.test/日本\r\ninject', finalUrl: undefined }));
+    const urlTag = store.puts[0].opts.metadata?.['url'] ?? '';
+    expect(urlTag).not.toMatch(/[\r\n]/); // no CRLF header injection
+    expect(urlTag).toMatch(/^[\x20-\x7e]*$/); // pure printable ASCII
+  });
+
+  it('omits the site tag when the URL is malformed (best-effort metadata)', async () => {
+    await sink.capture(cap({ url: 'not a valid url', finalUrl: undefined }));
+    const md = store.puts[0].opts.metadata ?? {};
+    expect(md['site']).toBeUndefined();
+    expect(md['url']).toBeDefined();
   });
 
   it('is idempotent: HEAD-then-PUT skips the write when the content address already exists', async () => {
@@ -123,6 +140,20 @@ describe('ObjectStoreCaptureSink — sha256-v1 contract', () => {
     expect(store.puts[0].key).toBe(`raw-json/sha256/${c.sha256.slice(0, 2)}/${c.sha256}.json.gz`);
   });
 
+  it('uses an explicit jsonPrefix for the api lane when configured', async () => {
+    const s = new ObjectStoreCaptureSink(store, { ...CONFIG, jsonPrefix: 'api-raw/' });
+    const c = cap({ lane: 'api', contentType: 'application/json', bytes: Buffer.from('{}', 'utf8') });
+    await s.capture(c);
+    expect(store.puts[0].key).toBe(`api-raw/sha256/${c.sha256.slice(0, 2)}/${c.sha256}.json.gz`);
+  });
+
+  it('does not corrupt a non-raw-html prefix when deriving the json sibling', async () => {
+    const s = new ObjectStoreCaptureSink(store, { ...CONFIG, prefix: 'custom/', jsonPrefix: undefined });
+    const c = cap({ lane: 'api', contentType: 'application/json', bytes: Buffer.from('{}', 'utf8') });
+    await s.capture(c);
+    expect(store.puts[0].key).toBe(`custom/sha256/${c.sha256.slice(0, 2)}/${c.sha256}.json.gz`);
+  });
+
   it('never throws when the store fails — it swallows and counts the failure', async () => {
     store.failPut = true;
     await expect(sink.capture(cap())).resolves.toBeUndefined();
@@ -133,8 +164,22 @@ describe('ObjectStoreCaptureSink — sha256-v1 contract', () => {
     store.hangPut = true;
     const start = Date.now();
     await expect(sink.capture(cap())).resolves.toBeUndefined();
-    const elapsed = Date.now() - start;
-    expect(elapsed).toBeLessThan(1000); // resolved via the 100ms bound, not hung
+    expect(Date.now() - start).toBeLessThan(1000); // resolved via the 100ms bound, not hung
     expect(sink.stats().failed).toBe(1);
+  });
+
+  it('bounds a hung HEAD by putTimeoutMs (not only the PUT)', async () => {
+    store.hangExists = true;
+    const start = Date.now();
+    await expect(sink.capture(cap())).resolves.toBeUndefined();
+    expect(Date.now() - start).toBeLessThan(1000);
+    expect(sink.stats().failed).toBe(1);
+  });
+
+  it('falls back to the default timeout when putTimeoutMs is invalid (NaN/0)', async () => {
+    // A 0/NaN bound must NOT make every op time out immediately.
+    const s = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 0 });
+    await expect(s.capture(cap())).resolves.toBeUndefined();
+    expect(s.stats().stored).toBe(1);
   });
 });
