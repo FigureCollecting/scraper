@@ -80,7 +80,7 @@ export function createScrapingService(): ScrapingService {
   async function withPage<T>(fn: (page: Page) => Promise<T>, options: PageOptions = {}): Promise<T> {
     const stealth = options.stealth ?? false;
     const browser: Browser = stealth ? await BrowserPool.getStealthBrowser() : await BrowserPool.getBrowser();
-    const context = await browser.createBrowserContext();
+    const context = await BrowserPool.openContext(browser);
 
     try {
       const page: Page = await context.newPage();
@@ -92,9 +92,17 @@ export function createScrapingService(): ScrapingService {
       }
       return await fn(page);
     } finally {
-      await context.close().catch(() => {});
-      if (!stealth) {
+      // The browser is intentionally long-lived; the context is the per-request
+      // unit. If it will not close cleanly it has leaked onto that browser, so
+      // retire the browser rather than reuse it (paying the relaunch/Cloudflare
+      // cost only on the rare failure). A clean close returns the pooled browser.
+      const closedCleanly = await BrowserPool.closeContext(context);
+      if (stealth) {
+        if (!closedCleanly) await BrowserPool.retireStealthBrowser(browser);
+      } else if (closedCleanly) {
         await BrowserPool.returnBrowser(browser);
+      } else {
+        await BrowserPool.retirePooledBrowser(browser);
       }
     }
   }
