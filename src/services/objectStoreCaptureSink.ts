@@ -52,6 +52,11 @@ export interface RawStoreConfig {
   keyScheme: string;
   /** Hard bound on each HEAD/PUT so a slow store can't stall the fetch path. */
   putTimeoutMs?: number;
+  /**
+   * S3 addressing style for the adapter. Hetzner uses virtual-hosted style, so
+   * the adapter defaults to `false` (path-style off). Unused by the sink logic.
+   */
+  pathStyle?: boolean;
 }
 
 /** Observable counters — the leak/failure surface for prod (mirrors BrowserPool). */

@@ -7,6 +7,7 @@ import { createScrapingService } from './scrapingService.js';
 import { createQueueService } from './queueService.js';
 import { createSessionService } from './sessionService.js';
 import { createWebhookService } from './webhookService.js';
+import { getRawCaptureSink } from '../s3ObjectStore.js';
 
 export { createRuntimeConfig, EnvRuntimeConfig } from './runtimeConfig.js';
 export { createPluginLogger } from './pluginLogger.js';
@@ -17,7 +18,7 @@ export { createWebhookService } from './webhookService.js';
 
 export function buildEngineServices(): EngineServices {
   return {
-    scraping: createScrapingService(),
+    scraping: createScrapingService(getRawCaptureSink()),
     queue: createQueueService(),
     sessions: createSessionService(),
     webhooks: createWebhookService(),

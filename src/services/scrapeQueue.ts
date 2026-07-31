@@ -25,6 +25,7 @@ import { getSessionManager, resetSessionManager, SessionManager, SessionPausedEv
 import { notifyItemFailed } from './webhookClient.js';
 import { enrichmentLogger } from '../utils/logger.js';
 import { createScrapingService } from './engineServices/scrapingService.js';
+import { getRawCaptureSink } from './s3ObjectStore.js';
 import { createIngestEmitterFromEnv } from './ingestEmitter.js';
 import type {
   ExtractionRuleset,
@@ -927,7 +928,7 @@ export class ScrapeQueue {
     if (!this.rawPageFetcher) {
       // Same raw page-fetch machinery plugins get via EngineServices — the
       // engine only fetches; extraction is the plugin's job.
-      this.rawPageFetcher = createScrapingService();
+      this.rawPageFetcher = createScrapingService(getRawCaptureSink());
     }
     return this.rawPageFetcher;
   }

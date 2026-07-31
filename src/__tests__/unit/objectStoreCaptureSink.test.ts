@@ -1,4 +1,3 @@
-import { jest } from '@jest/globals';
 import { gunzipSync } from 'node:zlib';
 import { buildRawCapture } from '../../services/captureSink';
 import {
