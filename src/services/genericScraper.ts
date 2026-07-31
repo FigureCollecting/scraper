@@ -1,4 +1,4 @@
-import puppeteer, { Browser, Page } from 'puppeteer';
+import puppeteer, { Browser, BrowserContext, Page } from 'puppeteer';
 import zlib from 'zlib';
 import crypto from 'crypto';
 import { sanitizeForLog, sanitizeObjectForLog, capWaitTime, truncateString, MAX_STRING_LENGTH } from '../utils/security.js';
@@ -190,12 +190,26 @@ export class BrowserPool {
   private static readonly POOL_SIZE = 3; // Keep 3 browsers ready
   private static isInitialized = false;
 
+  // Per-context lifecycle counters. Browsers are intentionally long-lived (a
+  // fresh launch costs 4-7s and re-triggers Cloudflare), so the per-request unit
+  // is the BrowserContext. A context that fails to close LEAKS onto its immortal
+  // browser — the historical `context.close().catch(() => {})` swallowed exactly
+  // that failure, which is how the process climbed to ~25 GB and OOM-crashed the
+  // host. These counters make the leak observable; `leaked = opened - closed`.
+  private static contextsOpened = 0;
+  private static contextsClosed = 0;
+  private static contextsFailed = 0;
+  private static readonly CONTEXT_CLOSE_TIMEOUT_MS = 10_000;
+
   // Added for improved test isolation
   static async reset(): Promise<void> {
     // Close all existing browsers first
     await this.closeAll();
     this.browsers = [];
     this.isInitialized = false;
+    this.contextsOpened = 0;
+    this.contextsClosed = 0;
+    this.contextsFailed = 0;
   }
 
 
@@ -332,6 +346,72 @@ export class BrowserPool {
       console.log('[BROWSER POOL] Pool full, browser will be closed');
       browser.close().catch((err: any) => console.error('[BROWSER POOL] Error closing extra browser:', err));
     }
+  }
+
+  /** Open a fresh per-request context on a (long-lived) browser, counting it. */
+  static async openContext(browser: Browser): Promise<BrowserContext> {
+    const context = await browser.createBrowserContext();
+    this.contextsOpened++;
+    return context;
+  }
+
+  /**
+   * Close a per-request context, bounded by a timeout so a hung Cloudflare page
+   * cannot stall teardown. Returns true if it closed cleanly. A false return
+   * means the context LEAKED onto its long-lived browser — the caller must
+   * retire that browser rather than keep reusing it. The failure is logged with
+   * live counters + RSS, never swallowed.
+   */
+  static async closeContext(context: BrowserContext): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        context.close(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('context.close() timed out')), this.CONTEXT_CLOSE_TIMEOUT_MS);
+        }),
+      ]);
+      this.contextsClosed++;
+      return true;
+    } catch (err) {
+      this.contextsFailed++;
+      const rssMb = Math.round(process.memoryUsage().rss / 1048576);
+      console.error(
+        `[BROWSER POOL] context.close() FAILED — leaked context on a long-lived browser ` +
+        `(opened=${this.contextsOpened} closed=${this.contextsClosed} failed=${this.contextsFailed} ` +
+        `leaked=${this.contextsOpened - this.contextsClosed} rss=${rssMb}MB): ` +
+        `${err instanceof Error ? err.message : String(err)}`
+      );
+      return false;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /** Retire a pooled browser that can no longer cleanly release contexts, and
+   *  replenish the pool with a fresh one. */
+  static async retirePooledBrowser(browser: Browser): Promise<void> {
+    console.warn('[BROWSER POOL] Retiring a pooled browser after a context-close failure');
+    await browser.close().catch((err: any) => console.error('[BROWSER POOL] Error closing retired browser:', err));
+    await this.replenishPool();
+  }
+
+  /** Retire the stealth singleton so the next stealth request relaunches it —
+   *  re-passing Cloudflare once, acceptable ONLY on a failure, never per-call. */
+  static async retireStealthBrowser(browser: Browser): Promise<void> {
+    console.warn('[BROWSER POOL] Retiring the stealth browser after a context-close failure');
+    if (this.stealthBrowser === browser) this.stealthBrowser = null;
+    await browser.close().catch((err: any) => console.error('[BROWSER POOL] Error closing retired stealth browser:', err));
+  }
+
+  /** Context lifecycle counters, for leak observability / a metrics endpoint. */
+  static contextStats(): { opened: number; closed: number; failed: number; leaked: number } {
+    return {
+      opened: this.contextsOpened,
+      closed: this.contextsClosed,
+      failed: this.contextsFailed,
+      leaked: this.contextsOpened - this.contextsClosed,
+    };
   }
 
 
