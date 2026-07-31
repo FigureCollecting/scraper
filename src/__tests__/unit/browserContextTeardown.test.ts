@@ -32,6 +32,9 @@ describe('BrowserContext teardown & leak accounting', () => {
       setUserAgent: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
       setCookie: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
       close: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
+      // capture hook (merged from develop) attaches a 'response' listener; no-op stubs
+      on: jest.fn<(...a: any[]) => any>(),
+      off: jest.fn<(...a: any[]) => any>(),
     } as unknown as jest.Mocked<Page>;
 
     mockContext = makeContext(() => Promise.resolve());
