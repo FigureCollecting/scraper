@@ -22,6 +22,10 @@ describe('createScrapingService', () => {
       setViewport: jest.fn<(...args: any[]) => any>().mockResolvedValue(undefined),
       setUserAgent: jest.fn<(...args: any[]) => any>().mockResolvedValue(undefined),
       setCookie: jest.fn<(...args: any[]) => any>().mockResolvedValue(undefined),
+      // capture hook attaches a response listener; provide no-op stubs
+      on: jest.fn(),
+      off: jest.fn(),
+      mainFrame: jest.fn(() => ({ id: 'main' })),
       close: jest.fn<(...args: any[]) => any>().mockResolvedValue(undefined),
     } as unknown as jest.Mocked<Page>;
 
