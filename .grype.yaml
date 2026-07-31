@@ -37,3 +37,24 @@ ignore:
     reason: |
       Lockfile pins minimatch to 10.2.4 (fixed). Any 10.2.2 finding is from npm CLI internals,
       not application code. No untrusted glob patterns are processed at runtime.
+
+  # GO-2026-5026: golang.org/x/net v0.40.0 (fixed 0.55.0), vendored INSIDE the esbuild Go binary.
+  # esbuild is a BUILD-ONLY dependency: it is pulled in transitively by tsx (devDependencies),
+  # which is used only for the local `dev` hot-reload script. `npm run build` uses tsc, not esbuild.
+  # The production image installs with `npm ci --omit=dev`, so esbuild is NOT in the shipped runtime.
+  # Verified 2026-07-31: `find /` and `grype` on the built production image (ghcr.io/figurecollecting/
+  # scraper) show no esbuild and no golang.org/x/net; prod node_modules is 365 pkgs (vs 822 with dev).
+  # The finding surfaces only because the scanner catalogs the multi-stage build's BUILDER layer, where
+  # the full devDependency install briefly exists so `tsc` can run. The vendored x/net (idna/http2/hpack)
+  # is internal to esbuild's own operation and never processes this service's untrusted network input.
+  # No upgrade escapes it: esbuild 0.28.1 is the latest release (and tsx's pinned range) and still
+  # vendors x/net v0.40.0. Revisit when esbuild ships a build vendoring x/net >= 0.55.0.
+  - vulnerability: GO-2026-5026
+    package:
+      name: golang.org/x/net
+      type: go-module
+    reason: |
+      Dev/build-only: esbuild (via tsx, devDependencies) is pruned from the production image by
+      `npm ci --omit=dev` and is absent from the shipped runtime (verified via filesystem + grype scan
+      of the built image). The vendored x/net is internal to esbuild and never in the runtime attack
+      surface. esbuild 0.28.1 is the latest release and still vendors x/net v0.40.0, so no bump removes it.
