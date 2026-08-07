@@ -70,7 +70,7 @@ describe('ExtractionRegistry', () => {
     expect(registry.getSiteConfigForUrl('https://unregistered.example.test/item/1')).toBeUndefined();
   });
 
-  it('resolves the ruleset registered for the same siteId as the matched hostname', () => {
+  it('resolves the ruleset registered for the same siteId as the matched hostname', async () => {
     const registry = createExtractionRegistry();
     registry.registerSite(buildSiteConfig());
     registry.registerRuleset(buildRuleset('alpha'));
@@ -78,7 +78,8 @@ describe('ExtractionRegistry', () => {
     const ruleset = registry.getRulesetForUrl('https://alpha.example.test/item/42');
     expect(ruleset?.siteId).toBe('alpha');
 
-    const extracted = ruleset!.extract('<html></html>', 'https://alpha.example.test/item/42');
+    // extract() is async-capable (E1) — consumers always await the result.
+    const extracted = await ruleset!.extract('<html></html>', 'https://alpha.example.test/item/42');
     expect(extracted.source.site).toBe('alpha');
   });
 

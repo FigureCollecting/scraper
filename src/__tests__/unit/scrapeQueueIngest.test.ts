@@ -34,7 +34,7 @@ jest.mock('../../services/webhookClient', () => ({
   notifyItemSkipped: (...args: any[]) => mockNotifyItemSkipped(...args),
 }));
 
-import type { ExtractionRuleset } from '@figurecollecting/scraper-plugin-contract';
+import type { ExtractContext, ExtractionRuleset } from '@figurecollecting/scraper-plugin-contract';
 import { ScrapeQueue, resetScrapeQueue } from '../../services/scrapeQueue';
 import { createExtractionRegistry, ExtractionRegistryImpl } from '../../services/extractionRegistry';
 
@@ -210,6 +210,50 @@ describe('ScrapeQueue - ingest cutover', () => {
     expect(send).toHaveBeenCalledTimes(1);
     expect(send.mock.calls[0][0].fields).toEqual({ name: 'Fate/stay night' });
     expect(data).toEqual({ name: 'Fate/stay night' });
+  });
+
+  it('awaits extract() when the ruleset returns a Promise from the single contract method (E1)', async () => {
+    // E1 contract evolution: extract() itself is async-capable. This ruleset
+    // is typed straight against ExtractionRuleset — no extractAsync, no casts.
+    // Declaring the optional ctx?: ExtractContext third parameter locks the
+    // E1 seam at compile level; the engine still invokes with two arguments.
+    const extractFn = jest.fn(async (html: string, url: string, _ctx?: ExtractContext) => ({
+      source: {
+        site: 'mock-mfc',
+        itemId: '12345',
+        url,
+        extractedAt: '2026-07-24T00:00:00.000Z',
+        rulesetVersion: '2.0.0',
+      },
+      fields: { name: 'Async Marin', jan: '4530956107891' },
+      warnings: [],
+    }));
+    const ruleset: ExtractionRuleset = {
+      siteId: 'mock-mfc',
+      version: '2.0.0',
+      extract: extractFn,
+      validate: () => ({ valid: true, errors: [], warnings: [] }),
+    };
+    const scraping = makeScrapingStub();
+    const send = jest.fn().mockResolvedValue({ sourceId: 'src-1' });
+
+    queue = new ScrapeQueue(false);
+    queue.setPluginRegistry(makeRegistry(ruleset));
+    queue.setIngestEmitter({ send });
+    queue.setScrapingService(scraping);
+
+    const result = queue.enqueue('12345', { priority: 'WARM', sessionId: 'session1' });
+    await advanceAndFlush(500);
+    const data = await result.promise;
+
+    expect(extractFn).toHaveBeenCalledWith(FIXTURE_HTML, 'https://myfigurecollection.net/item/12345');
+    // the RESOLVED extraction (not a Promise) went to the spine
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][0].fields).toEqual({ name: 'Async Marin', jan: '4530956107891' });
+    expect(send.mock.calls[0][0].source.site).toBe('mock-mfc');
+    // waiting callers resolve with the extracted field bag, not undefined
+    expect(data).toEqual({ name: 'Async Marin', jan: '4530956107891' });
+    expect(queue.getStats().completed).toBe(1);
   });
 
   it('scrapes the caller-supplied url option instead of building an MFC URL from the key', async () => {

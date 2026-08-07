@@ -949,12 +949,13 @@ export class ScrapeQueue {
 
     let extracted: PluginExtractedData;
     try {
-      // Rulesets may optionally expose an async extraction path (API-backed
-      // sites like VNDB, AmiAmi) alongside the required sync extract(); prefer
-      // it when present via duck-typing so the plugin contract stays untouched.
+      // extract() is async-capable (E1): the contract allows it to return
+      // ExtractedData or a Promise, so the result is ALWAYS awaited — sync
+      // rulesets pass through unchanged. The duck-typed extractAsync path
+      // predates E1 and is kept for rulesets that still expose it.
       extracted = typeof (ruleset as { extractAsync?: unknown }).extractAsync === 'function'
         ? await (ruleset as unknown as { extractAsync(h: string, u: string): Promise<PluginExtractedData> }).extractAsync(page.html, item.url)
-        : ruleset.extract(page.html, item.url);
+        : await ruleset.extract(page.html, item.url);
     } catch (error: any) {
       console.error(
         `[SCRAPE QUEUE] Extraction failed for ${item.url} (ruleset ${ruleset.siteId}@${ruleset.version}): ${sanitizeForLog(error?.message ?? String(error))}`
