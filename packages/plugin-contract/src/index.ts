@@ -199,10 +199,34 @@ export interface DomainRateLimit {
   successThreshold: number;
 }
 
+/**
+ * Per-extraction context handed to `extract()` by the engine (E1 seam).
+ * Generic engine surface only: site config, page/batch/API fetch access, and
+ * a logger — so rulesets that need multiple queries per item (search + detail,
+ * batch endpoints, official APIs) can issue them through engine-managed
+ * plumbing instead of owning their own HTTP stack. A minimal engine may not
+ * yet provide `batchFetch`/`officialApi`; rulesets must treat `ctx` as
+ * optional and degrade gracefully when it is absent.
+ */
+export interface ExtractContext {
+  config: SiteConfig;
+  scraping: ScrapingService & {
+    batchFetch(codes: string[], opts?: Record<string, unknown>): Promise<Record<string, unknown>>;
+    officialApi(name: string, params: Record<string, unknown>, auth?: Record<string, unknown>): Promise<unknown>;
+  };
+  logger: PluginLogger;
+}
+
 export interface ExtractionRuleset {
   siteId: string;
   version: string;
-  extract(html: string, url: string): ExtractedData;
+  /**
+   * Extract structured data from a fetched page. Async-capable via this
+   * single method: the engine ALWAYS awaits the result, so a plain
+   * synchronous body remains valid with zero ceremony. `ctx` is optional —
+   * existing two-argument rulesets are unaffected.
+   */
+  extract(html: string, url: string, ctx?: ExtractContext): ExtractedData | Promise<ExtractedData>;
   validate(data: ExtractedData): ValidationResult;
 }
 
