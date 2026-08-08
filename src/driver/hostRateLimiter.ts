@@ -23,7 +23,7 @@ export interface HostRateConfig {
 interface HostState {
   config: HostRateConfig;
   currentDelay: number;
-  lastRequestTime: number; // 0 = never dispatched
+  lastRequestTime: number; // -1 = never dispatched
   consecutiveSuccesses: number;
 }
 
@@ -54,7 +54,7 @@ export class HostRateLimiter {
     let s = this.hosts.get(host);
     if (!s) {
       const config = this.configFor(host) ?? this.defaultConfig;
-      s = { config, currentDelay: config.baseDelayMs, lastRequestTime: 0, consecutiveSuccesses: 0 };
+      s = { config, currentDelay: config.baseDelayMs, lastRequestTime: -1, consecutiveSuccesses: 0 };
       this.hosts.set(host, s);
     }
     return s;
@@ -68,7 +68,7 @@ export class HostRateLimiter {
   /** Ms until the next request to this host may dispatch (0 = ready now). */
   msUntilReady(host: string, now: number): number {
     const s = this.stateFor(host);
-    if (s.lastRequestTime === 0) return 0; // never dispatched → ready
+    if (s.lastRequestTime < 0) return 0; // never dispatched → ready
     return Math.max(0, s.lastRequestTime + s.currentDelay - now);
   }
 

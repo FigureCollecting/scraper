@@ -73,4 +73,10 @@ describe('HostRateLimiter — per-host throttle', () => {
     rl.recordSuccess('a.com'); // only 1 toward threshold now
     expect(rl.currentDelay('a.com')).toBe(2000); // no recovery yet
   });
+
+  it('treats a dispatch at now=0 as real (0 is a valid time, not the never-dispatched sentinel)', () => {
+    const rl = new HostRateLimiter(() => cfg({ baseDelayMs: 1000 }));
+    rl.recordDispatch('a.com', 0);
+    expect(rl.msUntilReady('a.com', 400)).toBe(600); // throttled from t=0, not treated as fresh
+  });
 });
