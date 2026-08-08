@@ -1,10 +1,10 @@
 # =============================================================================
-# BASE STAGE - Secure Ubuntu 26.04 + Node 24.18.0 LTS + Chrome 151.0.7922.47
+# BASE STAGE - Secure Ubuntu 26.04 + Node 24.18.1 LTS + Chrome 151.0.7922.77
 # =============================================================================
 FROM ubuntu:26.04 AS base
 
 # Cache-bust ARG to invalidate Docker layers when dependencies change
-ARG CACHE_BUST=2026-07-24-node-24.18.0-chrome-151.0.7922.47-cve-fix
+ARG CACHE_BUST=2026-08-08-node-24.18.1-chrome-151.0.7922.77-cve-fix
 
 # Update all packages for latest security patches (openssl, gnupg, glibc)
 # Install Node.js 24 using official binaries (avoids NodeSource CVE false positives)
@@ -12,7 +12,7 @@ RUN apt-get update && apt-get upgrade -y \
     && apt-get install -y \
     curl \
     xz-utils \
-    && NODE_VERSION=v24.18.0 \
+    && NODE_VERSION=v24.18.1 \
     && curl -fsSLO https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-linux-x64.tar.xz \
     && tar -xJf node-${NODE_VERSION}-linux-x64.tar.xz -C /usr/local --strip-components=1 \
     && rm node-${NODE_VERSION}-linux-x64.tar.xz \
@@ -63,10 +63,10 @@ RUN apt-get update && apt-get upgrade -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# Download and install Chrome for Testing (151.0.7922.47) - current Stable channel; fixes CVE-2026-15776/-15121/-15132 (all High).
+# Download and install Chrome for Testing (151.0.7922.77) - current Stable channel; clears the CVE-2026-176xx batch (13 Critical + 12 High).
 # Verified: puppeteer 25.3.0 drives 151 with no CDP skew and stealth-evasion is unchanged vs 150 (A/B tested).
 RUN apt-get update && apt-get install -y wget unzip \
-    && wget -q https://storage.googleapis.com/chrome-for-testing-public/151.0.7922.47/linux64/chrome-linux64.zip \
+    && wget -q https://storage.googleapis.com/chrome-for-testing-public/151.0.7922.77/linux64/chrome-linux64.zip \
     && unzip chrome-linux64.zip \
     && mv chrome-linux64 /opt/chrome \
     && rm chrome-linux64.zip \
