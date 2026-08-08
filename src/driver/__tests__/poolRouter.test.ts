@@ -1,67 +1,51 @@
 /**
- * TDD (red first): PoolRouter — routes each store to the browser/mint pool vs the cheap
- * fetch pool by its access tier, and bounds each pool's concurrency against the crawl-rate
- * budget (the binding constraint per infra-budget, NOT connection count).
- *
- * The access->pool classifier is INJECTED so the private access taxonomy (StoreProfile.access)
- * never enters the public engine — same seam as HostRateLimiter's `configFor`. Pure + synchronous.
+ * PoolRouter — a pure by-pool concurrency semaphore. Callers pass the resolved PoolKind (the
+ * driver derives it from a store's public `requiresBrowser`, so the private access taxonomy
+ * never reaches the engine). Capacity is sized against the crawl-rate budget.
  */
-import { PoolRouter, type PoolKind } from '../poolRouter';
+import { PoolRouter } from '../poolRouter';
 
-// A stand-in classifier: challenge / anti-bot tiers need a real browser; the rest fetch cheaply.
-const classify = (access: string): PoolKind =>
-  ['cloudflare', 'datadome', 'robotchecker', 'aws-waf', 'headless-fingerprint'].includes(access)
-    ? 'browser'
-    : 'fetch';
-
-describe('PoolRouter — access-tier routing + per-pool capacity', () => {
-  it('routes access tiers to pools via the injected classifier', () => {
-    const r = new PoolRouter({ browser: 2, fetch: 4 }, classify);
-    expect(r.poolFor('cloudflare')).toBe('browser');
-    expect(r.poolFor('datadome')).toBe('browser');
-    expect(r.poolFor('none')).toBe('fetch');
-    expect(r.poolFor('age-cookie')).toBe('fetch');
-  });
-
+describe('PoolRouter — per-pool capacity', () => {
   it('acquires slots up to the pool capacity, then reports saturation', () => {
-    const r = new PoolRouter({ browser: 2, fetch: 4 }, classify);
-    expect(r.tryAcquire('cloudflare')).toEqual({ ok: true, pool: 'browser' });
-    expect(r.tryAcquire('datadome')).toEqual({ ok: true, pool: 'browser' });
+    const r = new PoolRouter({ browser: 2, fetch: 4 });
+    expect(r.tryAcquire('browser')).toBe(true);
+    expect(r.tryAcquire('browser')).toBe(true);
     expect(r.hasCapacity('browser')).toBe(false);
-    expect(r.tryAcquire('aws-waf')).toEqual({ ok: false, pool: 'browser' }); // saturated
+    expect(r.tryAcquire('browser')).toBe(false); // saturated
   });
 
   it('keeps pool capacities independent (browser saturation does not block fetch)', () => {
-    const r = new PoolRouter({ browser: 1, fetch: 2 }, classify);
-    expect(r.tryAcquire('cloudflare').ok).toBe(true); // browser now full
-    expect(r.tryAcquire('cloudflare').ok).toBe(false);
-    expect(r.tryAcquire('none').ok).toBe(true); // fetch pool unaffected
-    expect(r.tryAcquire('auth').ok).toBe(true);
+    const r = new PoolRouter({ browser: 1, fetch: 2 });
+    expect(r.tryAcquire('browser')).toBe(true);
+    expect(r.tryAcquire('browser')).toBe(false); // browser full
+    expect(r.tryAcquire('fetch')).toBe(true); // fetch unaffected
+    expect(r.tryAcquire('fetch')).toBe(true);
     expect(r.hasCapacity('fetch')).toBe(false);
   });
 
   it('release frees a slot for reuse', () => {
-    const r = new PoolRouter({ browser: 1, fetch: 1 }, classify);
-    expect(r.tryAcquire('cloudflare').ok).toBe(true);
-    expect(r.tryAcquire('cloudflare').ok).toBe(false);
+    const r = new PoolRouter({ browser: 1, fetch: 1 });
+    expect(r.tryAcquire('browser')).toBe(true);
+    expect(r.tryAcquire('browser')).toBe(false);
     r.release('browser');
     expect(r.available('browser')).toBe(1);
-    expect(r.tryAcquire('cloudflare').ok).toBe(true);
+    expect(r.tryAcquire('browser')).toBe(true);
   });
 
   it('release never underflows below zero', () => {
-    const r = new PoolRouter({ browser: 1, fetch: 1 }, classify);
-    r.release('browser'); // nothing in flight
+    const r = new PoolRouter({ browser: 1, fetch: 1 });
+    r.release('browser');
     r.release('browser');
     expect(r.inFlightOf('browser')).toBe(0);
     expect(r.available('browser')).toBe(1);
   });
 
   it('available reflects in-flight and never reports negative', () => {
-    const r = new PoolRouter({ browser: 3, fetch: 1 }, classify);
-    r.tryAcquire('cloudflare');
-    r.tryAcquire('datadome');
+    const r = new PoolRouter({ browser: 3, fetch: 1 });
+    r.tryAcquire('browser');
+    r.tryAcquire('browser');
     expect(r.inFlightOf('browser')).toBe(2);
     expect(r.available('browser')).toBe(1);
+    expect(r.capacityOf('browser')).toBe(3);
   });
 });

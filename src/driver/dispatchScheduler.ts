@@ -3,23 +3,23 @@
  *
  * Composes the two I0 primitives into a single "what can run right now?" decision:
  *   - HostRateLimiter gates by per-host TIMING (a host must be past its rate-limit delay).
- *   - PoolRouter gates by per-pool CAPACITY (the access tier's pool must have a free slot).
+ *   - PoolRouter gates by per-pool CAPACITY (the store's pool must have a free slot).
  * A queued task dispatches only when BOTH gates open. Dispatching acquires both resources
  * (records the host dispatch + takes a pool slot); `settle` returns the pool slot and records
  * the host outcome so the delay recovers on success or backs off on a rate-limit.
  *
- * Pure and synchronous: every time-aware call takes `now` explicitly (delegated to
- * HostRateLimiter), so the scheduler is deterministic and testable without timers. The
- * surrounding driver loop owns the actual sleeping (via `msUntilNext`) and worker execution.
+ * A task is just `{ id, host }` — the engine never carries the private access taxonomy. The
+ * host's pool is resolved through the injected `poolFor` (the ProfileRegistry maps a store's
+ * public `requiresBrowser` → browser/fetch). Pure and synchronous: every time-aware call takes
+ * `now` explicitly, so the scheduler is deterministic and testable without timers.
  */
 import type { HostRateLimiter } from './hostRateLimiter.js';
 import type { PoolRouter, PoolKind } from './poolRouter.js';
 
-/** A unit of crawl work: a host to fetch from and the access tier that selects its pool. */
+/** A unit of crawl work: which host to fetch from. Pool + rate are resolved from the host. */
 export interface CrawlTask {
   id: string;
   host: string;
-  access: string;
 }
 
 export interface Dispatch {
@@ -35,6 +35,8 @@ export class DispatchScheduler {
   constructor(
     private readonly limiter: HostRateLimiter,
     private readonly router: PoolRouter,
+    /** Resolve a host to its pool (ProfileRegistry: public `requiresBrowser` → browser/fetch). */
+    private readonly poolFor: (host: string) => PoolKind,
   ) {}
 
   enqueue(task: CrawlTask): void {
@@ -46,20 +48,20 @@ export class DispatchScheduler {
   }
 
   /**
-   * Pick and dispatch the first queued task that can run at `now` — host past its delay AND
-   * its pool has a free slot. On success the task is removed from the queue, a pool slot is
-   * taken, and the host dispatch is recorded (starting its next delay). Returns null when
-   * nothing is dispatchable right now (every host throttled and/or every needed pool full).
+   * Pick and dispatch the first queued task that can run at `now` — host past its delay AND its
+   * pool has a free slot. On success the task leaves the queue, a pool slot is taken, and the
+   * host dispatch is recorded (starting its next delay). Returns null when nothing is
+   * dispatchable right now (every host throttled and/or every needed pool full).
    */
   dispatch(now: number): Dispatch | null {
     for (let i = 0; i < this.queue.length; i++) {
       const task = this.queue[i];
       if (this.limiter.msUntilReady(task.host, now) > 0) continue; // host still throttled
-      const acquired = this.router.tryAcquire(task.access); // takes a slot iff the pool has room
-      if (!acquired.ok) continue; // pool saturated — leave the task queued
+      const pool = this.poolFor(task.host);
+      if (!this.router.tryAcquire(pool)) continue; // pool saturated — leave the task queued
       this.limiter.recordDispatch(task.host, now);
       this.queue.splice(i, 1);
-      return { task, pool: acquired.pool };
+      return { task, pool };
     }
     return null;
   }
@@ -80,8 +82,7 @@ export class DispatchScheduler {
   msUntilNext(now: number): number {
     let min = Infinity;
     for (const task of this.queue) {
-      const pool = this.router.poolFor(task.access);
-      if (!this.router.hasCapacity(pool)) continue; // needs a settle, not a wait
+      if (!this.router.hasCapacity(this.poolFor(task.host))) continue; // needs a settle, not a wait
       const wait = this.limiter.msUntilReady(task.host, now);
       if (wait <= 0) return 0;
       if (wait < min) min = wait;
