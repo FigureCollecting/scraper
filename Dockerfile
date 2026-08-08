@@ -1,10 +1,10 @@
 # =============================================================================
-# BASE STAGE - Secure Ubuntu 26.04 + Node 24.18.0 LTS + Chrome 151.0.7922.77
+# BASE STAGE - Secure Ubuntu 26.04 + Node 24.18.1 LTS + Chrome 151.0.7922.77
 # =============================================================================
 FROM ubuntu:26.04 AS base
 
 # Cache-bust ARG to invalidate Docker layers when dependencies change
-ARG CACHE_BUST=2026-08-08-node-24.18.0-chrome-151.0.7922.77-cve-fix
+ARG CACHE_BUST=2026-08-08-node-24.18.1-chrome-151.0.7922.77-cve-fix
 
 # Update all packages for latest security patches (openssl, gnupg, glibc)
 # Install Node.js 24 using official binaries (avoids NodeSource CVE false positives)
@@ -12,7 +12,7 @@ RUN apt-get update && apt-get upgrade -y \
     && apt-get install -y \
     curl \
     xz-utils \
-    && NODE_VERSION=v24.18.0 \
+    && NODE_VERSION=v24.18.1 \
     && curl -fsSLO https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-linux-x64.tar.xz \
     && tar -xJf node-${NODE_VERSION}-linux-x64.tar.xz -C /usr/local --strip-components=1 \
     && rm node-${NODE_VERSION}-linux-x64.tar.xz \
