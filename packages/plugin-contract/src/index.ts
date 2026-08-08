@@ -200,6 +200,35 @@ export interface DomainRateLimit {
 }
 
 /**
+ * Targeted-retrieval addressability — how SPECIFIC items are fetched ON REQUEST (by id, a
+ * bounded id range, a batch/list of ids, or a name/keyword search), as opposed to full-catalog
+ * discovery. This is what enables range-limited on-request fetches and cross-store lookup. The
+ * per-store DATA is supplied by the plugin (mapped down from the private profile registry); the
+ * engine consumes only this generic shape.
+ */
+export interface RetrievalCapability {
+  /** Build an item URL/endpoint from an identifier; `{id}` is substituted. `idKind` names the id. */
+  byId?: { urlTemplate: string; idKind?: string };
+  /** Identifiers are sequential/enumerable, so a bounded [from,to] sweep is valid. */
+  byRange?: boolean;
+  /** One endpoint returns up to `maxBatch` items per call (cheaper than N by-id fetches). */
+  byBatch?: { maxBatch: number };
+  /** Map a free-text query (name/keyword) to candidate items; `{q}` is substituted. */
+  bySearch?: { urlTemplate: string };
+}
+
+/**
+ * The engine-facing capability view of a store: its public `SiteConfig` (siteId / domains /
+ * rateLimit / requiresBrowser) plus retrieval addressability. The crawl driver schedules from
+ * this — `rateLimit` → per-host throttle, `requiresBrowser` → pool, `retrieval` → targeted
+ * fetches — without ever importing the private StoreProfile axes. The plugin maps each private
+ * StoreProfile down to this shape at registration.
+ */
+export interface StoreCapabilities extends SiteConfig {
+  retrieval?: RetrievalCapability;
+}
+
+/**
  * Per-extraction context handed to `extract()` by the engine (E1 seam).
  * Generic engine surface only: site config, page/batch/API fetch access, and
  * a logger — so rulesets that need multiple queries per item (search + detail,
