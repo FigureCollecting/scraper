@@ -213,8 +213,15 @@ export interface RetrievalCapability {
   byRange?: boolean;
   /** One endpoint returns up to `maxBatch` items per call (cheaper than N by-id fetches). */
   byBatch?: { maxBatch: number };
-  /** Map a free-text query (name/keyword) to candidate items; `{q}` is substituted. */
-  bySearch?: { urlTemplate: string };
+  /**
+   * Map a free-text query (name/keyword) to candidate items; `{q}` is substituted. `scope`
+   * declares what the endpoint returns: `listed` = ALL matching items incl. sold-out (the
+   * superset — answers "which stores carry this"); `orderable` = only in-stock/buyable items
+   * (some stores' predictive endpoints, e.g. a Shopify `suggest.json` config, silently hide
+   * sold-out). Absent scope defaults to `listed`. A `listed` endpoint + `SearchCandidate.available`
+   * serves BOTH buy-decision modes; an `orderable`-only endpoint cannot answer the `listed` view.
+   */
+  bySearch?: { urlTemplate: string; scope?: 'listed' | 'orderable' };
 }
 
 /**
@@ -308,6 +315,14 @@ export interface SearchCandidate {
   name: string;
   url?: string;
   priceRaw?: string;
+  /**
+   * Orderable status of this hit: `true` = in-stock/buyable, `false` = sold-out, `undefined` =
+   * unknown (the endpoint didn't say). Drives the lookup's two modes — `orderable` keeps
+   * `available !== false`, `listed` keeps all. Distinct from mere presence: a listed store may
+   * carry an item that's currently sold-out (still valuable signal: restock / secondhand / price
+   * history).
+   */
+  available?: boolean;
 }
 
 export interface RuntimeConfig {
