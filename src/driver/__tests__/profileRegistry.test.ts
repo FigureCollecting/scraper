@@ -51,6 +51,15 @@ describe('ProfileRegistry — host-indexed store capabilities', () => {
     expect(r.retrievalFor('nope.com')).toBeUndefined();
   });
 
+  it('requiresBrowserFor: true for browser hosts, false for fetch hosts, false (never routes to browser) for unknown', () => {
+    const r = new ProfileRegistry();
+    r.register(caps({ requiresBrowser: true })); // amiami → browser
+    r.register(caps({ siteId: 'hlj', name: 'HLJ', domains: ['hlj.com'], requiresBrowser: false }));
+    expect(r.requiresBrowserFor('www.amiami.com')).toBe(true);
+    expect(r.requiresBrowserFor('hlj.com')).toBe(false);
+    expect(r.requiresBrowserFor('nope.com')).toBe(false); // unknown host defaults to the cheap fetch path
+  });
+
   it('all() returns one entry per registered site', () => {
     const r = new ProfileRegistry();
     r.register(caps());

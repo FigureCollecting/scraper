@@ -28,15 +28,21 @@ export async function httpFetchBody(url: string): Promise<string> {
   return res.text();
 }
 
-/** Build the cross-store Lookup from the engine's registered stores + a fetch (default: plain HTTP). */
+/**
+ * Build the cross-store Lookup from the engine's registered stores + fetchers. `fetchBody` is the
+ * plain-HTTP default (Tier-1 cookieless JSON); `browserFetch`, when provided, backs the
+ * `requiresBrowser` (CF-fronted / SPA) stores — the lookup routes per host without changing wiring.
+ */
 export function createEngineLookup(
   registry: LookupRegistry,
   fetchBody: (url: string) => Promise<string> = httpFetchBody,
+  browserFetch?: (url: string) => Promise<string>,
 ): Lookup {
   const profiles = buildProfileRegistry(registry.allStores());
   return assembleLookup({
     profiles,
     getRulesetForUrl: (url) => registry.getRulesetForUrl(url),
     fetchBody,
+    browserFetchBody: browserFetch,
   });
 }
