@@ -66,3 +66,14 @@ export class ProfileRegistry {
     return this.forHost(host)?.retrieval;
   }
 }
+
+/**
+ * Build a ProfileRegistry from the engine's registered stores (ExtractionRegistryImpl.allStores()).
+ * Every store is indexed — pool + rate from the SiteConfig base make it schedulable; retrieval
+ * rides through for stores whose profile carries it. This is the driver's single population seam.
+ */
+export function buildProfileRegistry(stores: Iterable<StoreCapabilities>): ProfileRegistry {
+  const registry = new ProfileRegistry();
+  for (const caps of stores) registry.register(caps);
+  return registry;
+}
