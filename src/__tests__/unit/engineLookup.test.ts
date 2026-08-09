@@ -55,6 +55,26 @@ describe('createEngineLookup', () => {
     expect(out.unsupported).toContain('goodsmileus');
     expect(out.results).toEqual([]);
   });
+
+  it('threads browserFetch to requiresBrowser stores while plain fetchBody stays untouched', async () => {
+    const BROWSER_STORE: StoreCapabilities = {
+      ...STORE,
+      siteId: 'amiami',
+      name: 'AmiAmi',
+      domains: ['www.amiami.com'],
+      requiresBrowser: true,
+      retrieval: { bySearch: { urlTemplate: 'https://api.amiami.com/api/v1.0/items?s_keywords={q}', scope: 'listed' } },
+    };
+    const registry: LookupRegistry = { allStores: () => [BROWSER_STORE], getRulesetForUrl: () => RULESET };
+    const fetchBody = jest.fn(async () => JSON.stringify([]));
+    const browserFetch = jest.fn(async () => JSON.stringify([{ h: 'a1', t: 'Tomie' }]));
+
+    const out = await createEngineLookup(registry, fetchBody, browserFetch).lookup('tomie');
+
+    expect(browserFetch).toHaveBeenCalledWith('https://api.amiami.com/api/v1.0/items?s_keywords=tomie');
+    expect(fetchBody).not.toHaveBeenCalled();
+    expect(out.results[0]?.candidates[0]?.name).toBe('Tomie');
+  });
 });
 
 describe('httpFetchBody', () => {

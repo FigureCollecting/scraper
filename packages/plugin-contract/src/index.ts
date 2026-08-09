@@ -62,9 +62,25 @@ export interface PageOptions {
   userAgent?: string;
 }
 
+export interface BrowserFetchOptions {
+  /** Use the stealth browser. Defaults to true — browserFetch exists for CF-fronted / SPA hosts. */
+  stealth?: boolean;
+  userAgent?: string;
+  cookies?: Record<string, string>;
+  /** Extra request headers (e.g. an API key header for a same-origin JSON endpoint). */
+  headers?: Record<string, string>;
+}
+
 export interface ScrapingService {
   scrapePage(url: string, options?: ScrapePageOptions): Promise<ScrapePageResult>;
   scrapePageStealth(url: string, options?: ScrapePageOptions): Promise<ScrapePageResult>;
+  /**
+   * Fetch a URL's raw BODY through a managed browser page — the browser-backed counterpart to a
+   * plain HTTP GET, for CF-fronted / SPA hosts a plain fetch can't reach. Returns the raw JSON body
+   * for a JSON response (bypassing Chrome's JSON-viewer DOM) or the fully-rendered HTML otherwise.
+   * Extraction stays the caller's job (feeds the lookup's per-host `browserFetchBody`).
+   */
+  browserFetch(url: string, options?: BrowserFetchOptions): Promise<string>;
   withBrowser<T>(fn: (browser: any) => Promise<T>): Promise<T>;
   withPage<T>(fn: (page: any) => Promise<T>, options?: PageOptions): Promise<T>;
 }

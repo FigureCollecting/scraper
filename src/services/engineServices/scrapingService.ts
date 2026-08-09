@@ -6,7 +6,7 @@
  */
 import type { Browser, Page, HTTPResponse } from 'puppeteer';
 import { BrowserPool } from '../genericScraper.js';
-import { ScrapingService, ScrapePageOptions, ScrapePageResult, PageOptions } from '@figurecollecting/scraper-plugin-contract';
+import { ScrapingService, ScrapePageOptions, ScrapePageResult, PageOptions, BrowserFetchOptions } from '@figurecollecting/scraper-plugin-contract';
 import { CaptureSink, NoopCaptureSink, buildRawCapture } from '../captureSink.js';
 import { sanitizeForLog } from '../../utils/security.js';
 
@@ -16,9 +16,58 @@ const NAV_TIMEOUT_MS = 20000;
 const MAX_WAIT_TIME_MS = 10000;
 const CHALLENGE_RECHECK_DELAY_MS = 1500;
 
+// JSON-ish content types whose body must be read from the response, not page.content():
+// Chrome wraps a navigated JSON document in a viewer DOM, so page.content() would return markup.
+const JSON_CONTENT_TYPE = /\bjson\b/i;
+
 function capWaitTime(waitTime?: number): number {
   if (!waitTime || waitTime < 0) return 0;
   return Math.min(waitTime, MAX_WAIT_TIME_MS);
+}
+
+/**
+ * Build puppeteer setCookie params for a URL's registrable host from a name→value map, dropping
+ * empty values. Shared by navigateAndCapture and browserFetchBody so cookie scoping is identical.
+ */
+function buildCookieParams(url: string, cookies: Record<string, string>): Parameters<Page['setCookie']> {
+  const hostname = new URL(url).hostname;
+  return Object.entries(cookies)
+    .filter(([, value]) => value != null && value !== '')
+    .map(([name, value]) => ({ name, value, domain: `.${hostname.replace(/^www\./, '')}`, path: '/' })) as Parameters<Page['setCookie']>;
+}
+
+/**
+ * Fetch a URL's raw body through a managed Page: navigate (domcontentloaded), then return the RAW
+ * JSON body for a JSON response (response.text(), bypassing Chrome's JSON-viewer DOM) or the
+ * fully-rendered HTML (page.content()) otherwise. No capture sink — this is a plain body fetch;
+ * `browserFetch` wraps it in the pooled `withPage` lifecycle.
+ */
+export async function browserFetchBody(
+  page: Page,
+  url: string,
+  options: Omit<BrowserFetchOptions, 'stealth'> = {}
+): Promise<string> {
+  await page.setViewport({ width: 1280, height: 720 });
+  await page.setUserAgent(options.userAgent || DEFAULT_USER_AGENT);
+
+  if (options.headers && Object.keys(options.headers).length > 0) {
+    await page.setExtraHTTPHeaders(options.headers);
+  }
+  if (options.cookies) {
+    const cookieArray = buildCookieParams(url, options.cookies);
+    if (cookieArray.length > 0) {
+      await page.setCookie(...cookieArray);
+    }
+  }
+
+  const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
+  if (response) {
+    const contentType = response.headers?.()?.['content-type'] ?? '';
+    if (JSON_CONTENT_TYPE.test(contentType)) {
+      return await response.text();
+    }
+  }
+  return await page.content();
 }
 
 async function detectChallenge(
@@ -47,12 +96,9 @@ async function navigateAndCapture(
   await page.setUserAgent(options.userAgent || DEFAULT_USER_AGENT);
 
   if (options.cookies) {
-    const hostname = new URL(url).hostname;
-    const cookieArray = Object.entries(options.cookies)
-      .filter(([, value]) => value != null && value !== '')
-      .map(([name, value]) => ({ name, value, domain: `.${hostname.replace(/^www\./, '')}`, path: '/' }));
+    const cookieArray = buildCookieParams(url, options.cookies);
     if (cookieArray.length > 0) {
-      await page.setCookie(...(cookieArray as Parameters<Page['setCookie']>));
+      await page.setCookie(...cookieArray);
     }
   }
 
@@ -171,6 +217,10 @@ export function createScrapingService(captureSink: CaptureSink = new NoopCapture
 
     scrapePageStealth: (url: string, options?: ScrapePageOptions) =>
       withPage(page => navigateAndCapture(page, url, options, captureSink), { stealth: true }),
+
+    // browserFetch defaults to the stealth browser — it exists for CF-fronted / SPA hosts.
+    browserFetch: (url: string, options?: BrowserFetchOptions) =>
+      withPage(page => browserFetchBody(page, url, options), { stealth: options?.stealth ?? true }),
 
     withBrowser,
     withPage,

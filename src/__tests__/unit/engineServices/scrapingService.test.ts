@@ -22,6 +22,7 @@ describe('createScrapingService', () => {
       setViewport: jest.fn<(...args: any[]) => any>().mockResolvedValue(undefined),
       setUserAgent: jest.fn<(...args: any[]) => any>().mockResolvedValue(undefined),
       setCookie: jest.fn<(...args: any[]) => any>().mockResolvedValue(undefined),
+      setExtraHTTPHeaders: jest.fn<(...args: any[]) => any>().mockResolvedValue(undefined),
       // capture hook attaches a response listener; provide no-op stubs
       on: jest.fn(),
       off: jest.fn(),
@@ -157,5 +158,57 @@ describe('createScrapingService', () => {
     });
 
     expect(result.title).toBe('Ordinary Page');
+  });
+
+  // browserFetch — the CF-fronted / SPA fetch that returns a raw BODY (not a ScrapePageResult),
+  // so it can back the lookup's `browserFetchBody` for `requiresBrowser` stores.
+  it('browserFetch returns fully-rendered HTML via page.content() for a non-JSON response', async () => {
+    const service = createScrapingService();
+
+    const body = await service.browserFetch('https://cf.example.test/search?q=tomie', { stealth: false });
+
+    expect(mockPage.goto).toHaveBeenCalledWith(
+      'https://cf.example.test/search?q=tomie',
+      expect.objectContaining({ waitUntil: 'domcontentloaded' })
+    );
+    expect(body).toBe('<html><body>mock</body></html>');
+  });
+
+  it('browserFetch returns the RAW JSON body via response.text() (not the JSON-viewer DOM) for a JSON content-type', async () => {
+    mockPage.goto.mockResolvedValue({
+      status: () => 200,
+      headers: () => ({ 'content-type': 'application/json; charset=utf-8' }),
+      text: async () => '{"items":[{"gcode":"FIG-1"}]}',
+    } as any);
+    const service = createScrapingService();
+
+    const body = await service.browserFetch('https://api.amiami.com/api/v1.0/items?s_keywords=tomie', { stealth: false });
+
+    expect(body).toBe('{"items":[{"gcode":"FIG-1"}]}');
+    expect(mockPage.content).not.toHaveBeenCalled(); // JSON read from the response, not the wrapped DOM
+  });
+
+  it('browserFetch uses the stealth browser by default (CF-fronted hosts)', async () => {
+    const service = createScrapingService();
+
+    await service.browserFetch('https://cf.example.test/search?q=tomie');
+
+    // Stealth browser is a singleton, never added to the regular pool.
+    expect(BrowserPool.getPoolSize()).toBe(0);
+  });
+
+  it('browserFetch sets extra request headers and request-scoped cookies when provided', async () => {
+    const service = createScrapingService();
+
+    await service.browserFetch('https://www.amiami.com/api/v1.0/items?s_keywords=tomie', {
+      stealth: false,
+      headers: { 'X-User-Key': 'amiami_dev' },
+      cookies: { cf_clearance: 'token123' },
+    });
+
+    expect(mockPage.setExtraHTTPHeaders).toHaveBeenCalledWith({ 'X-User-Key': 'amiami_dev' });
+    expect(mockPage.setCookie).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'cf_clearance', value: 'token123', domain: '.amiami.com' })
+    );
   });
 });

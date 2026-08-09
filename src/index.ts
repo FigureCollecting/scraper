@@ -9,6 +9,7 @@ import scraperRoutes from './routes/scraper.js';
 import ingestRoutes from './routes/ingest.js';
 import { createLookupRoute } from './routes/lookup.js';
 import { createEngineLookup } from './services/engineLookup.js';
+import { createScrapingService } from './services/engineServices/scrapingService.js';
 import { scraperDebug } from './utils/logger.js';
 
 // Import browser pool functionality
@@ -98,8 +99,11 @@ async function startServer(): Promise<void> {
     // no matching ruleset fail cleanly through the queue's failure handling.
     getScrapeQueue().setPluginRegistry(registry);
     // Mount the cross-store buy-decision search (GET /lookup) now that the registry is populated:
-    // buildProfileRegistry(registry.allStores()) → assembleLookup, fetching via plain HTTP (Tier-1).
-    app.use('/', createLookupRoute(createEngineLookup(registry)));
+    // buildProfileRegistry(registry.allStores()) → assembleLookup. Tier-1 stores fetch via plain
+    // HTTP; `requiresBrowser` (CF-fronted / SPA) stores route through the pooled stealth browser.
+    // createScrapingService wraps the static BrowserPool, so this shares the same pool as the queue.
+    const lookupScraping = createScrapingService();
+    app.use('/', createLookupRoute(createEngineLookup(registry, undefined, (url) => lookupScraping.browserFetch(url))));
     if (plugins.length > 0) {
       console.log(`[PAGE-SCRAPER] Loaded ${plugins.length} plugin(s): ${plugins.map(p => `${p.name}@${p.version}`).join(', ')}`);
     }

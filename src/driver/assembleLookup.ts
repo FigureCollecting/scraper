@@ -31,6 +31,11 @@ export interface LookupServices {
   getRulesetForUrl: (url: string) => ExtractionRuleset | undefined;
   /** Raw response body of a search URL (JSON for Tier-1 API searches; HTML for the 2nd wave). */
   fetchBody: (url: string) => Promise<string>;
+  /**
+   * Browser-backed body fetch for `requiresBrowser` (CF-fronted / SPA) stores. When absent, those
+   * stores fall back to `fetchBody` — so existing wiring keeps working and browserFetch is additive.
+   */
+  browserFetchBody?: (url: string) => Promise<string>;
 }
 
 export interface StoreLookupResult {
@@ -79,7 +84,13 @@ export function assembleLookup(services: LookupServices): Lookup {
           const scope = services.profiles.retrievalFor(p.host)?.bySearch?.scope ?? 'listed';
           if (mode === 'listed' && scope === 'orderable') orderableOnly.push(p.siteId);
           try {
-            const body = await services.fetchBody(p.url);
+            // CF-fronted / SPA stores (requiresBrowser) go through the browser path when one is
+            // wired; everything else uses the cheap plain-HTTP fetch. Same (url)=>body contract.
+            const fetchBody =
+              services.profiles.requiresBrowserFor(p.host) && services.browserFetchBody
+                ? services.browserFetchBody
+                : services.fetchBody;
+            const body = await fetchBody(p.url);
             let candidates = await ruleset.extractCandidates(body, p.url);
             if (mode === 'orderable') candidates = candidates.filter((c) => c.available !== false);
             return { siteId: p.siteId, host: p.host, url: p.url, candidates };

@@ -61,6 +61,15 @@ export class ProfileRegistry {
     return caps ? (caps.requiresBrowser ? 'browser' : 'fetch') : undefined;
   }
 
+  /**
+   * Whether a host needs the browser path (CF-fronted / SPA). Routes the lookup's search fetch
+   * (browserFetch vs plain HTTP). Unknown host → false: default to the cheap fetch path, never
+   * spin up a browser for a store we don't know needs one.
+   */
+  requiresBrowserFor(host: string): boolean {
+    return this.forHost(host)?.requiresBrowser ?? false;
+  }
+
   /** Targeted-retrieval capability for on-request fetches (undefined = enumeration-only). */
   retrievalFor(host: string): RetrievalCapability | undefined {
     return this.forHost(host)?.retrieval;

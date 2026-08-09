@@ -122,6 +122,55 @@ describe('assembleLookup — cross-store buy-decision search, listed + orderable
     expect(out.results.map((r) => r.siteId)).toEqual(['solaris']);
   });
 
+  it('routes requiresBrowser stores through browserFetchBody and plain-fetch stores through fetchBody', async () => {
+    // amiami: CF-fronted, requiresBrowser:true → must go through the browser path, not plain HTTP.
+    const AMIAMI: StoreCapabilities = {
+      ...caps('amiami', 'www.amiami.com', {
+        bySearch: { urlTemplate: 'https://api.amiami.com/api/v1.0/items?s_keywords={q}', scope: 'listed' },
+      }),
+      requiresBrowser: true,
+    };
+    const fetchBody = jest.fn(async () => '{}');
+    const browserFetchBody = jest.fn(async () => '[]');
+    const services: LookupServices = {
+      profiles: buildProfileRegistry([GOODSMILEUS, AMIAMI]),
+      getRulesetForUrl: (url) =>
+        url.includes('goodsmileus') ? stub('goodsmileus', () => GSUS_CANDIDATES)
+        : url.includes('amiami') ? stub('amiami', () => [{ itemId: 'a1', name: 'Tomie', available: true }])
+        : undefined,
+      fetchBody,
+      browserFetchBody,
+    };
+
+    await assembleLookup(services).lookup('tomie');
+
+    // amiami (requiresBrowser) → browserFetchBody; goodsmileus (fetch) → fetchBody. No crossover.
+    expect(browserFetchBody).toHaveBeenCalledWith('https://api.amiami.com/api/v1.0/items?s_keywords=tomie');
+    expect(browserFetchBody).not.toHaveBeenCalledWith(expect.stringContaining('goodsmileus'));
+    expect(fetchBody).toHaveBeenCalledWith(expect.stringContaining('goodsmileus'));
+    expect(fetchBody).not.toHaveBeenCalledWith(expect.stringContaining('amiami'));
+  });
+
+  it('a requiresBrowser store falls back to fetchBody when no browserFetchBody is injected', async () => {
+    const AMIAMI: StoreCapabilities = {
+      ...caps('amiami', 'www.amiami.com', {
+        bySearch: { urlTemplate: 'https://api.amiami.com/api/v1.0/items?s_keywords={q}', scope: 'listed' },
+      }),
+      requiresBrowser: true,
+    };
+    const fetchBody = jest.fn(async () => '[]');
+    const services: LookupServices = {
+      profiles: buildProfileRegistry([AMIAMI]),
+      getRulesetForUrl: () => stub('amiami', () => [{ itemId: 'a1', name: 'Tomie', available: true }]),
+      fetchBody, // no browserFetchBody
+    };
+
+    const out = await assembleLookup(services).lookup('tomie');
+
+    expect(fetchBody).toHaveBeenCalledWith('https://api.amiami.com/api/v1.0/items?s_keywords=tomie');
+    expect(out.results[0]?.siteId).toBe('amiami');
+  });
+
   it('a bySearch store with no explicit scope defaults to listed (not flagged orderableOnly)', async () => {
     const NOSCOPE = caps('woo', 'woo.test', { bySearch: { urlTemplate: 'https://woo.test/api?search={q}' } });
     const services: LookupServices = {
