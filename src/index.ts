@@ -7,6 +7,8 @@ import dotenv from 'dotenv';
 import { createRequire } from 'module';
 import scraperRoutes from './routes/scraper.js';
 import ingestRoutes from './routes/ingest.js';
+import { createLookupRoute } from './routes/lookup.js';
+import { createEngineLookup } from './services/engineLookup.js';
 import { scraperDebug } from './utils/logger.js';
 
 // Import browser pool functionality
@@ -95,6 +97,9 @@ async function startServer(): Promise<void> {
     // is configured). The engine carries no extraction fallback — items with
     // no matching ruleset fail cleanly through the queue's failure handling.
     getScrapeQueue().setPluginRegistry(registry);
+    // Mount the cross-store buy-decision search (GET /lookup) now that the registry is populated:
+    // buildProfileRegistry(registry.allStores()) → assembleLookup, fetching via plain HTTP (Tier-1).
+    app.use('/', createLookupRoute(createEngineLookup(registry)));
     if (plugins.length > 0) {
       console.log(`[PAGE-SCRAPER] Loaded ${plugins.length} plugin(s): ${plugins.map(p => `${p.name}@${p.version}`).join(', ')}`);
     }
