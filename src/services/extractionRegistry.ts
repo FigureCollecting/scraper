@@ -11,11 +11,15 @@
 import {
   ExtractionRegistry,
   SiteConfig,
+  StoreCapabilities,
   ExtractionRuleset,
 } from '@figurecollecting/scraper-plugin-contract';
 
 export class ExtractionRegistryImpl implements ExtractionRegistry {
-  private readonly sites = new Map<string, SiteConfig>();
+  // Stored as StoreCapabilities (SiteConfig + optional retrieval): a plain SiteConfig registered
+  // via registerSite is a valid StoreCapabilities, and a retrieval-bearing one rides through
+  // unchanged — so allStores() can seed the driver's ProfileRegistry without a second registry.
+  private readonly sites = new Map<string, StoreCapabilities>();
   private readonly rulesets = new Map<string, ExtractionRuleset>();
   /** hostname (lowercased) -> siteId */
   private readonly hostnameIndex = new Map<string, string>();
@@ -34,6 +38,15 @@ export class ExtractionRegistryImpl implements ExtractionRegistry {
   getSiteConfigForUrl(url: string): SiteConfig | undefined {
     const siteId = this.resolveSiteId(url);
     return siteId ? this.sites.get(siteId) : undefined;
+  }
+
+  /**
+   * Every registered store as public StoreCapabilities — the source the crawl driver builds its
+   * ProfileRegistry from (all stores, no subset). `retrieval` is present for stores whose plugin
+   * registered a retrieval-bearing capability, absent (enumeration-only) otherwise.
+   */
+  allStores(): StoreCapabilities[] {
+    return [...this.sites.values()];
   }
 
   getRulesetForUrl(url: string): ExtractionRuleset | undefined {

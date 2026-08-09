@@ -1,5 +1,5 @@
 import { createExtractionRegistry } from '../../services/extractionRegistry';
-import { SiteConfig, ExtractionRuleset, ExtractedData, ValidationResult } from '@figurecollecting/scraper-plugin-contract';
+import { SiteConfig, StoreCapabilities, ExtractionRuleset, ExtractedData, ValidationResult } from '@figurecollecting/scraper-plugin-contract';
 
 function buildSiteConfig(overrides: Partial<SiteConfig> = {}): SiteConfig {
   return {
@@ -109,5 +109,31 @@ describe('ExtractionRegistry', () => {
   it('throws a clear error for a malformed URL rather than crashing silently', () => {
     const registry = createExtractionRegistry();
     expect(() => registry.getSiteConfigForUrl('not-a-url')).toThrow();
+  });
+});
+
+describe('ExtractionRegistry.allStores', () => {
+  it('returns every registered store (the ProfileRegistry source — all of them, no subset)', () => {
+    const registry = createExtractionRegistry();
+    registry.registerSite(buildSiteConfig({ siteId: 'alpha', domains: ['alpha.example.test'] }));
+    registry.registerSite(buildSiteConfig({ siteId: 'beta', domains: ['beta.example.test'] }));
+
+    expect(registry.allStores().map((s) => s.siteId).sort()).toEqual(['alpha', 'beta']);
+  });
+
+  it('is empty before any registration', () => {
+    expect(createExtractionRegistry().allStores()).toEqual([]);
+  });
+
+  it("preserves a store's retrieval axis so it rides through to the ProfileRegistry", () => {
+    const registry = createExtractionRegistry();
+    const caps: StoreCapabilities = {
+      ...buildSiteConfig({ siteId: 'amiami', domains: ['amiami.com'] }),
+      retrieval: { byId: { urlTemplate: 'https://amiami.com/detail/{id}' } },
+    };
+    registry.registerSite(caps);
+
+    const stored = registry.allStores().find((s) => s.siteId === 'amiami');
+    expect(stored?.retrieval?.byId?.urlTemplate).toBe('https://amiami.com/detail/{id}');
   });
 });
