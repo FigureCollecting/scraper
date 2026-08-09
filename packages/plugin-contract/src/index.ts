@@ -257,6 +257,19 @@ export interface ExtractionRuleset {
    */
   extract(html: string, url: string, ctx?: ExtractContext): ExtractedData | Promise<ExtractedData>;
   validate(data: ExtractedData): ValidationResult;
+  /**
+   * OPTIONAL: parse a SEARCH-results response body (fetched from the store's `retrieval.bySearch`
+   * endpoint) into candidate items for cross-store lookup — the buy-decision fan-out. Distinct
+   * from `extract()`, which parses ONE product page: this turns a results LIST (Shopify predictive
+   * `suggest.json`, a WooCommerce Store API product array, or an HTML results grid) into
+   * `SearchCandidate[]`. Stores that support targeted search implement it; search-less stores omit
+   * it. Async-capable like `extract()` — the engine always awaits the result.
+   */
+  extractCandidates?(
+    body: string,
+    url: string,
+    ctx?: ExtractContext,
+  ): SearchCandidate[] | Promise<SearchCandidate[]>;
 }
 
 /**
@@ -281,6 +294,20 @@ export interface ValidationResult {
   valid: boolean;
   errors: string[];
   warnings: string[];
+}
+
+/**
+ * A single hit from a store's SEARCH (`bySearch`) results — the cross-store buy-decision entry.
+ * Carries just enough to (a) show/compare and (b) re-fetch the full record: `itemId` feeds the
+ * store's `retrieval.byId`, `name` drives name/ER matching, `url` links the product page. A JAN is
+ * deliberately NOT required here — search hits are often title-indexed, so the barcode is resolved
+ * by the follow-up `byId` fetch. `priceRaw` is the price string when the hit carries one (Shopify).
+ */
+export interface SearchCandidate {
+  itemId: string;
+  name: string;
+  url?: string;
+  priceRaw?: string;
 }
 
 export interface RuntimeConfig {
