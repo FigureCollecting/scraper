@@ -15,10 +15,14 @@
  *
  * TRANSPORT: createConnectTransport with httpVersion '1.1' — the Connect
  * protocol over plain HTTP/1.1. The spine ingest server serves cleartext
- * HTTP/1.1, and Linkerd meshes HTTP/1.1 natively (mTLS, no opaque-port
- * workaround), whereas it mishandles the cleartext-h2c stream on this hop.
- * Do NOT revert to createGrpcTransport (h2c) — that is the stream the mesh
- * cannot carry.
+ * HTTP/1.1, which Linkerd meshes natively (mTLS) with no appProtocol hint or
+ * opaque-port tuning. This RPC is UNARY, so HTTP/2 buys nothing here and h1 is
+ * the lowest-friction meshable transport. (Linkerd CAN mesh cleartext h2c via
+ * protocol detection; an earlier gRPC/h2c attempt on this hop did not mesh
+ * cleanly — an edge-case/version artifact, not a Linkerd limitation.) Keep this
+ * as Connect/h1: do NOT swap back to createGrpcTransport (h2c) without first
+ * re-validating the meshed hop end-to-end (e.g. an explicit
+ * appProtocol: kubernetes.io/h2c on the Service port).
  *
  * RETRY (SUCCESS = the RPC resolved OK — never key success on
  * stats.inserted > 0; a post-commit retry legitimately returns all-deduped
