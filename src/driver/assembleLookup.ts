@@ -20,7 +20,7 @@
  */
 import { planRetrieval } from './retrievalPlanner.js';
 import type { ProfileRegistry } from './profileRegistry.js';
-import type { ExtractionRuleset, SearchCandidate } from '@figurecollecting/scraper-plugin-contract';
+import type { ExtractionRuleset, SearchCandidate, SearchFetch } from '@figurecollecting/scraper-plugin-contract';
 
 export type LookupMode = 'listed' | 'orderable';
 
@@ -29,13 +29,12 @@ export interface LookupServices {
   profiles: ProfileRegistry;
   /** URL → ruleset (engine ExtractionRegistryImpl.getRulesetForUrl); the ruleset parses candidates. */
   getRulesetForUrl: (url: string) => ExtractionRuleset | undefined;
-  /** Raw response body of a search URL (JSON for Tier-1 API searches; HTML for the 2nd wave). */
-  fetchBody: (url: string) => Promise<string>;
   /**
-   * Browser-backed body fetch for `requiresBrowser` (CF-fronted / SPA) stores. When absent, those
-   * stores fall back to `fetchBody` — so existing wiring keeps working and browserFetch is additive.
+   * Fetch a store's search-results body given the store's resolved search transport (http /
+   * impersonate / browser + its per-store headers/profile). Built by the engine (makeFetchSearch)
+   * and injected here, so the fan-out stays deterministic in tests.
    */
-  browserFetchBody?: (url: string) => Promise<string>;
+  fetchSearch: (url: string, searchFetch: SearchFetch) => Promise<string>;
 }
 
 export interface StoreLookupResult {
@@ -84,13 +83,8 @@ export function assembleLookup(services: LookupServices): Lookup {
           const scope = services.profiles.retrievalFor(p.host)?.bySearch?.scope ?? 'listed';
           if (mode === 'listed' && scope === 'orderable') orderableOnly.push(p.siteId);
           try {
-            // CF-fronted / SPA stores (requiresBrowser) go through the browser path when one is
-            // wired; everything else uses the cheap plain-HTTP fetch. Same (url)=>body contract.
-            const fetchBody =
-              services.profiles.requiresBrowserFor(p.host) && services.browserFetchBody
-                ? services.browserFetchBody
-                : services.fetchBody;
-            const body = await fetchBody(p.url);
+            // Fetch via the store's resolved transport (http / impersonate / browser + its headers).
+            const body = await services.fetchSearch(p.url, services.profiles.searchTransportFor(p.host));
             let candidates = await ruleset.extractCandidates(body, p.url);
             if (mode === 'orderable') candidates = candidates.filter((c) => c.available !== false);
             return { siteId: p.siteId, host: p.host, url: p.url, candidates };

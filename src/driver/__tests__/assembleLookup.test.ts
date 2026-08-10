@@ -52,17 +52,17 @@ const stub = (siteId: string, extractCandidates?: ExtractionRuleset['extractCand
 });
 
 const build = (over: Partial<LookupServices> = {}) => {
-  const fetchBody = jest.fn(async () => '{}');
+  const fetchSearch = jest.fn(async () => '{}');
   const services: LookupServices = {
     profiles: buildProfileRegistry([GOODSMILEUS, SOLARIS, CDJAPAN]),
     getRulesetForUrl: (url) =>
       url.includes('goodsmileus') ? stub('goodsmileus', () => GSUS_CANDIDATES)
       : url.includes('solaris') ? stub('solaris', () => SOLARIS_CANDIDATES)
       : undefined,
-    fetchBody,
+    fetchSearch,
     ...over,
   };
-  return { services, fetchBody, lookup: assembleLookup(services) };
+  return { services, fetchSearch, lookup: assembleLookup(services) };
 };
 
 const bySite = (r: Awaited<ReturnType<ReturnType<typeof build>['lookup']['lookup']>>, id: string) =>
@@ -97,20 +97,20 @@ describe('assembleLookup — cross-store buy-decision search, listed + orderable
   });
 
   it('a bySearch store whose ruleset lacks extractCandidates is unsupported (not fetched)', async () => {
-    const { fetchBody, lookup } = build({
+    const { fetchSearch, lookup } = build({
       getRulesetForUrl: (url) => (url.includes('solaris') ? stub('solaris', () => SOLARIS_CANDIDATES) : stub('goodsmileus')),
     });
 
     const out = await lookup.lookup('miku');
 
     expect(out.unsupported).toContain('goodsmileus');
-    expect(fetchBody).not.toHaveBeenCalledWith(expect.stringContaining('goodsmileus'));
+    expect(fetchSearch).not.toHaveBeenCalledWith(expect.stringContaining('goodsmileus'), expect.anything());
     expect(out.results.map((r) => r.siteId)).toEqual(['solaris']);
   });
 
   it('a store whose search fetch throws is reported failed, not silently dropped', async () => {
     const { lookup } = build({
-      fetchBody: jest.fn(async (url: string) => {
+      fetchSearch: jest.fn(async (url: string) => {
         if (url.includes('goodsmileus')) throw new Error('CF block');
         return '{}';
       }),
@@ -122,53 +122,32 @@ describe('assembleLookup — cross-store buy-decision search, listed + orderable
     expect(out.results.map((r) => r.siteId)).toEqual(['solaris']);
   });
 
-  it('routes requiresBrowser stores through browserFetchBody and plain-fetch stores through fetchBody', async () => {
-    // amiami: CF-fronted, requiresBrowser:true → must go through the browser path, not plain HTTP.
+  it('passes each store its RESOLVED search transport to fetchSearch (explicit searchFetch vs http default)', async () => {
+    // amiami declares an explicit impersonate transport with X-User-Key; goodsmileus has none → http.
     const AMIAMI: StoreCapabilities = {
       ...caps('amiami', 'www.amiami.com', {
         bySearch: { urlTemplate: 'https://api.amiami.com/api/v1.0/items?s_keywords={q}', scope: 'listed' },
       }),
-      requiresBrowser: true,
+      searchFetch: { transport: 'impersonate', browser: 'chrome142', headers: { 'X-User-Key': 'amiami_dev' } },
     };
-    const fetchBody = jest.fn(async () => '{}');
-    const browserFetchBody = jest.fn(async () => '[]');
+    const fetchSearch = jest.fn(async () => '[]');
     const services: LookupServices = {
       profiles: buildProfileRegistry([GOODSMILEUS, AMIAMI]),
       getRulesetForUrl: (url) =>
         url.includes('goodsmileus') ? stub('goodsmileus', () => GSUS_CANDIDATES)
         : url.includes('amiami') ? stub('amiami', () => [{ itemId: 'a1', name: 'Tomie', available: true }])
         : undefined,
-      fetchBody,
-      browserFetchBody,
+      fetchSearch,
     };
 
     await assembleLookup(services).lookup('tomie');
 
-    // amiami (requiresBrowser) → browserFetchBody; goodsmileus (fetch) → fetchBody. No crossover.
-    expect(browserFetchBody).toHaveBeenCalledWith('https://api.amiami.com/api/v1.0/items?s_keywords=tomie');
-    expect(browserFetchBody).not.toHaveBeenCalledWith(expect.stringContaining('goodsmileus'));
-    expect(fetchBody).toHaveBeenCalledWith(expect.stringContaining('goodsmileus'));
-    expect(fetchBody).not.toHaveBeenCalledWith(expect.stringContaining('amiami'));
-  });
-
-  it('a requiresBrowser store falls back to fetchBody when no browserFetchBody is injected', async () => {
-    const AMIAMI: StoreCapabilities = {
-      ...caps('amiami', 'www.amiami.com', {
-        bySearch: { urlTemplate: 'https://api.amiami.com/api/v1.0/items?s_keywords={q}', scope: 'listed' },
-      }),
-      requiresBrowser: true,
-    };
-    const fetchBody = jest.fn(async () => '[]');
-    const services: LookupServices = {
-      profiles: buildProfileRegistry([AMIAMI]),
-      getRulesetForUrl: () => stub('amiami', () => [{ itemId: 'a1', name: 'Tomie', available: true }]),
-      fetchBody, // no browserFetchBody
-    };
-
-    const out = await assembleLookup(services).lookup('tomie');
-
-    expect(fetchBody).toHaveBeenCalledWith('https://api.amiami.com/api/v1.0/items?s_keywords=tomie');
-    expect(out.results[0]?.siteId).toBe('amiami');
+    // amiami → its explicit impersonate transport (URL {q}-filled); goodsmileus → the http default.
+    expect(fetchSearch).toHaveBeenCalledWith(
+      'https://api.amiami.com/api/v1.0/items?s_keywords=tomie',
+      { transport: 'impersonate', browser: 'chrome142', headers: { 'X-User-Key': 'amiami_dev' } },
+    );
+    expect(fetchSearch).toHaveBeenCalledWith(expect.stringContaining('goodsmileus'), { transport: 'http' });
   });
 
   it('a bySearch store with no explicit scope defaults to listed (not flagged orderableOnly)', async () => {
@@ -176,7 +155,7 @@ describe('assembleLookup — cross-store buy-decision search, listed + orderable
     const services: LookupServices = {
       profiles: buildProfileRegistry([NOSCOPE]),
       getRulesetForUrl: () => stub('woo', () => [{ itemId: 'w1', name: 'Tomie', available: true }]),
-      fetchBody: jest.fn(async () => '{}'),
+      fetchSearch: jest.fn(async () => '{}'),
     };
 
     const out = await assembleLookup(services).lookup('tomie'); // listed (default)

@@ -41,6 +41,7 @@
     "cors": "^2.8.5",
     "dotenv": "^17.4.2",
     "express": "^5.2.0",
+    "impit": "0.14.3",
     "minio": "^8.0.7",
     "patch-package": "^8.0.1",
     "puppeteer": "^25.3.0",

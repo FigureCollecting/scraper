@@ -240,6 +240,32 @@ export interface RetrievalCapability {
   bySearch?: { urlTemplate: string; scope?: 'listed' | 'orderable' };
 }
 
+export type SearchTransport = 'http' | 'impersonate' | 'browser';
+
+/**
+ * Per-store fetch decoration for the cross-store SEARCH (`bySearch`) request: how the engine should
+ * FETCH this store's search endpoint, and with what request headers/UA/cookies. Opaque to the engine
+ * and filled by the plugin from the private profile (same pattern as `allowedCookies`/`rateLimit`).
+ *   - `http`        — a plain HTTP GET (Tier-1 cookieless JSON; the implicit default when absent).
+ *   - `impersonate` — a browser-TLS-impersonating HTTP GET (impit) with `browser` profile + `headers`;
+ *                     reaches a Cloudflare-fronted JSON API (e.g. amiami) WITHOUT a real browser.
+ *   - `browser`     — a full pooled browser navigation (rendered-DOM / JS-challenge stores).
+ */
+export interface SearchFetch {
+  transport?: SearchTransport;
+  /**
+   * Impersonation profile for `transport: 'impersonate'` (the impit browser, e.g. 'chrome142').
+   * A LIVE TUNABLE — bump it when Cloudflare tightens and an older profile's TLS fingerprint stops
+   * passing (chrome110 already went stale). The engine supplies a recent default if omitted.
+   */
+  browser?: string;
+  /** Extra request headers (e.g. amiami's static `X-User-Key: amiami_dev`). */
+  headers?: Record<string, string>;
+  userAgent?: string;
+  /** Request-scoped cookies (e.g. a `cf_clearance` for the `browser` transport). */
+  cookies?: Record<string, string>;
+}
+
 /**
  * The engine-facing capability view of a store: its public `SiteConfig` (siteId / domains /
  * rateLimit / requiresBrowser) plus retrieval addressability. The crawl driver schedules from
@@ -249,6 +275,11 @@ export interface RetrievalCapability {
  */
 export interface StoreCapabilities extends SiteConfig {
   retrieval?: RetrievalCapability;
+  /**
+   * How to FETCH this store's `bySearch` endpoint (transport + request decoration). Absent ⇒ the
+   * engine defaults the transport from `requiresBrowser` (`browser` if true, else `http`).
+   */
+  searchFetch?: SearchFetch;
 }
 
 /**

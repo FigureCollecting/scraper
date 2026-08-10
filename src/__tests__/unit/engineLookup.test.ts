@@ -29,7 +29,7 @@ describe('createEngineLookup', () => {
     const registry: LookupRegistry = { allStores: () => [STORE], getRulesetForUrl: () => RULESET };
     const fetchBody = jest.fn(async () => JSON.stringify([{ h: 'gyaru-tomie-hk', t: 'Gyaru Tomie x Hello Kitty' }]));
 
-    const lookup = createEngineLookup(registry, fetchBody);
+    const lookup = createEngineLookup(registry, { http: fetchBody });
     const out = await lookup.lookup('tomie', { mode: 'listed' });
 
     expect(fetchBody).toHaveBeenCalledWith('https://www.goodsmileus.com/search/suggest.json?q=tomie');
@@ -37,12 +37,12 @@ describe('createEngineLookup', () => {
     expect(out.results[0]?.candidates[0]?.name).toBe('Gyaru Tomie x Hello Kitty');
   });
 
-  it('defaults fetchBody to httpFetchBody when not provided', async () => {
+  it('defaults the http transport to httpFetchBody when none is provided', async () => {
     const orig = global.fetch;
     global.fetch = jest.fn(async () => ({ text: async () => JSON.stringify([{ h: 'x', t: 'X' }]) })) as unknown as typeof fetch;
     try {
       const registry: LookupRegistry = { allStores: () => [STORE], getRulesetForUrl: () => RULESET };
-      const out = await createEngineLookup(registry).lookup('tomie'); // no fetchBody → uses httpFetchBody
+      const out = await createEngineLookup(registry).lookup('tomie'); // no transports → http = httpFetchBody
       expect(out.results[0]?.candidates[0]?.name).toBe('X');
     } finally {
       global.fetch = orig;
@@ -51,28 +51,32 @@ describe('createEngineLookup', () => {
 
   it('a store with no ruleset parser is unsupported', async () => {
     const registry: LookupRegistry = { allStores: () => [STORE], getRulesetForUrl: () => undefined };
-    const out = await createEngineLookup(registry, jest.fn(async () => '[]')).lookup('miku');
+    const out = await createEngineLookup(registry, { http: jest.fn(async () => '[]') }).lookup('miku');
     expect(out.unsupported).toContain('goodsmileus');
     expect(out.results).toEqual([]);
   });
 
-  it('threads browserFetch to requiresBrowser stores while plain fetchBody stays untouched', async () => {
-    const BROWSER_STORE: StoreCapabilities = {
+  it('routes a store that declares the impersonate transport to the impit fetcher (not http)', async () => {
+    const AMIAMI_STORE: StoreCapabilities = {
       ...STORE,
       siteId: 'amiami',
       name: 'AmiAmi',
       domains: ['www.amiami.com'],
       requiresBrowser: true,
       retrieval: { bySearch: { urlTemplate: 'https://api.amiami.com/api/v1.0/items?s_keywords={q}', scope: 'listed' } },
+      searchFetch: { transport: 'impersonate', browser: 'chrome142', headers: { 'X-User-Key': 'amiami_dev' } },
     };
-    const registry: LookupRegistry = { allStores: () => [BROWSER_STORE], getRulesetForUrl: () => RULESET };
-    const fetchBody = jest.fn(async () => JSON.stringify([]));
-    const browserFetch = jest.fn(async () => JSON.stringify([{ h: 'a1', t: 'Tomie' }]));
+    const registry: LookupRegistry = { allStores: () => [AMIAMI_STORE], getRulesetForUrl: () => RULESET };
+    const http = jest.fn(async () => JSON.stringify([]));
+    const impersonate = jest.fn(async () => JSON.stringify([{ h: 'a1', t: 'Tomie' }]));
 
-    const out = await createEngineLookup(registry, fetchBody, browserFetch).lookup('tomie');
+    const out = await createEngineLookup(registry, { http, impersonate }).lookup('tomie');
 
-    expect(browserFetch).toHaveBeenCalledWith('https://api.amiami.com/api/v1.0/items?s_keywords=tomie');
-    expect(fetchBody).not.toHaveBeenCalled();
+    expect(impersonate).toHaveBeenCalledWith(
+      'https://api.amiami.com/api/v1.0/items?s_keywords=tomie',
+      { browser: 'chrome142', headers: { 'X-User-Key': 'amiami_dev' }, userAgent: undefined },
+    );
+    expect(http).not.toHaveBeenCalled();
     expect(out.results[0]?.candidates[0]?.name).toBe('Tomie');
   });
 });

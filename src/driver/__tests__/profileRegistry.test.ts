@@ -51,13 +51,15 @@ describe('ProfileRegistry — host-indexed store capabilities', () => {
     expect(r.retrievalFor('nope.com')).toBeUndefined();
   });
 
-  it('requiresBrowserFor: true for browser hosts, false for fetch hosts, false (never routes to browser) for unknown', () => {
+  it('searchTransportFor: explicit searchFetch wins; else defaults the transport from requiresBrowser; unknown → http', () => {
     const r = new ProfileRegistry();
-    r.register(caps({ requiresBrowser: true })); // amiami → browser
-    r.register(caps({ siteId: 'hlj', name: 'HLJ', domains: ['hlj.com'], requiresBrowser: false }));
-    expect(r.requiresBrowserFor('www.amiami.com')).toBe(true);
-    expect(r.requiresBrowserFor('hlj.com')).toBe(false);
-    expect(r.requiresBrowserFor('nope.com')).toBe(false); // unknown host defaults to the cheap fetch path
+    r.register(caps({ searchFetch: { transport: 'impersonate', browser: 'chrome142', headers: { 'X-User-Key': 'amiami_dev' } } })); // amiami
+    r.register(caps({ siteId: 'surugaya', name: 'Surugaya', domains: ['surugaya.jp'], requiresBrowser: true })); // no searchFetch → browser
+    r.register(caps({ siteId: 'hlj', name: 'HLJ', domains: ['hlj.com'], requiresBrowser: false })); // no searchFetch → http
+    expect(r.searchTransportFor('www.amiami.com')).toEqual({ transport: 'impersonate', browser: 'chrome142', headers: { 'X-User-Key': 'amiami_dev' } });
+    expect(r.searchTransportFor('surugaya.jp')).toEqual({ transport: 'browser' }); // requiresBrowser default
+    expect(r.searchTransportFor('hlj.com')).toEqual({ transport: 'http' });
+    expect(r.searchTransportFor('nope.com')).toEqual({ transport: 'http' }); // unknown → cheap http
   });
 
   it('all() returns one entry per registered site', () => {

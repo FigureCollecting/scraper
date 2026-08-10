@@ -4,13 +4,15 @@
  * from the plugin-populated ExtractionRegistry (`allStores()`) and resolves rulesets +
  * candidate-parsers through `getRulesetForUrl`. The result is a ready `Lookup` the HTTP route calls.
  *
- * `httpFetchBody` is the default fetch: a plain HTTP GET returning the RAW body — correct for the
- * Tier-1 cookieless JSON stores (Shopify suggest.json, Woo Store API). CF-gated stores (amiami, the
- * HTML-search stores) need a browser context; that `browserFetch` is a follow-on that swaps in as
- * the `fetchBody` for `requiresBrowser` hosts without changing this wiring.
+ * Each store's search body is fetched via the transport it declares (StoreCapabilities.searchFetch):
+ * `http` = plain GET (Tier-1 cookieless JSON — the default), `impersonate` = impit TLS-impersonation
+ * (CF-fronted JSON APIs like amiami), `browser` = pooled browser nav (rendered-DOM stores). The
+ * `browser` transport is wired at the mount from the ScrapingService; unset here → it degrades to http.
  */
 import { buildProfileRegistry } from '../driver/profileRegistry.js';
 import { assembleLookup, type Lookup } from '../driver/assembleLookup.js';
+import { makeFetchSearch, type FetchSearchTransports } from './fetchSearch.js';
+import { impitFetchBody } from './impitFetch.js';
 import type { ExtractionRuleset, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
 
 /** The slice of the engine ExtractionRegistry the lookup needs. */
@@ -29,20 +31,24 @@ export async function httpFetchBody(url: string): Promise<string> {
 }
 
 /**
- * Build the cross-store Lookup from the engine's registered stores + fetchers. `fetchBody` is the
- * plain-HTTP default (Tier-1 cookieless JSON); `browserFetch`, when provided, backs the
- * `requiresBrowser` (CF-fronted / SPA) stores — the lookup routes per host without changing wiring.
+ * Build the cross-store Lookup from the engine's registered stores + the three search transports.
+ * `http` and `impersonate` default to the real engine fetchers (plain fetch / impit); `browser` is
+ * wired at the mount from the ScrapingService (left unset in tests → the browser transport degrades
+ * to http). Per-store transport selection is data-driven via `StoreCapabilities.searchFetch`.
  */
 export function createEngineLookup(
   registry: LookupRegistry,
-  fetchBody: (url: string) => Promise<string> = httpFetchBody,
-  browserFetch?: (url: string) => Promise<string>,
+  transports: Partial<FetchSearchTransports> = {},
 ): Lookup {
   const profiles = buildProfileRegistry(registry.allStores());
+  const fetchSearch = makeFetchSearch({
+    http: transports.http ?? httpFetchBody,
+    impersonate: transports.impersonate ?? impitFetchBody,
+    browser: transports.browser,
+  });
   return assembleLookup({
     profiles,
     getRulesetForUrl: (url) => registry.getRulesetForUrl(url),
-    fetchBody,
-    browserFetchBody: browserFetch,
+    fetchSearch,
   });
 }

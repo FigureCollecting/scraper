@@ -17,6 +17,7 @@
 import type {
   DomainRateLimit,
   RetrievalCapability,
+  SearchFetch,
   StoreCapabilities,
 } from '@figurecollecting/scraper-plugin-contract';
 import type { PoolKind } from './poolRouter.js';
@@ -62,12 +63,15 @@ export class ProfileRegistry {
   }
 
   /**
-   * Whether a host needs the browser path (CF-fronted / SPA). Routes the lookup's search fetch
-   * (browserFetch vs plain HTTP). Unknown host → false: default to the cheap fetch path, never
-   * spin up a browser for a store we don't know needs one.
+   * The effective search-fetch transport+decoration for a host: the store's explicit `searchFetch`
+   * when declared, otherwise a default transport derived from `requiresBrowser` (`browser` if the
+   * store needs a browser, else the cheap `http`). Unknown host → `http` (never spin a browser for a
+   * store we don't know needs one). Feeds the lookup's `fetchSearch` dispatcher.
    */
-  requiresBrowserFor(host: string): boolean {
-    return this.forHost(host)?.requiresBrowser ?? false;
+  searchTransportFor(host: string): SearchFetch {
+    const caps = this.forHost(host);
+    if (caps?.searchFetch) return caps.searchFetch;
+    return { transport: caps?.requiresBrowser ? 'browser' : 'http' };
   }
 
   /** Targeted-retrieval capability for on-request fetches (undefined = enumeration-only). */
