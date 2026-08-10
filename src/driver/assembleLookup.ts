@@ -19,6 +19,7 @@
  * record. Everything is injected so the fan-out is deterministic in tests.
  */
 import { planRetrieval } from './retrievalPlanner.js';
+import { sanitizeForLog } from '../utils/security.js';
 import type { ProfileRegistry } from './profileRegistry.js';
 import type { ExtractionRuleset, SearchCandidate, SearchFetch } from '@figurecollecting/scraper-plugin-contract';
 
@@ -88,7 +89,11 @@ export function assembleLookup(services: LookupServices): Lookup {
             let candidates = await ruleset.extractCandidates(body, p.url);
             if (mode === 'orderable') candidates = candidates.filter((c) => c.available !== false);
             return { siteId: p.siteId, host: p.host, url: p.url, candidates };
-          } catch {
+          } catch (err) {
+            // Surface WHY a store dropped out (CF block / invalid impersonation profile / parse
+            // error) — otherwise every failure collapses into an indistinguishable `failed` entry.
+            // eslint-disable-next-line no-console
+            console.warn(`[lookup] ${sanitizeForLog(p.siteId)} search failed: ${sanitizeForLog(err instanceof Error ? err.message : String(err))}`);
             failed.push(p.siteId);
             return null;
           }

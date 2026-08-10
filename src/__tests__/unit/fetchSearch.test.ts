@@ -40,9 +40,10 @@ describe('makeFetchSearch', () => {
     expect(await makeFetchSearch(t)('https://gsus.test/s', {})).toBe('HTTP'); // no transport → http default
   });
 
-  it("degrades 'browser' to http when no browser transport is wired", async () => {
-    const { t } = transports();
+  it("throws when 'browser' is requested but no browser transport is wired (fails loud, not a silent http fallback)", async () => {
+    const { t, calls } = transports();
     const noBrowser: FetchSearchTransports = { http: t.http, impersonate: t.impersonate }; // browser omitted
-    expect(await makeFetchSearch(noBrowser)('https://x.test/s', { transport: 'browser' })).toBe('HTTP');
+    await expect(makeFetchSearch(noBrowser)('https://x.test/s', { transport: 'browser' })).rejects.toThrow(/browser/);
+    expect(calls).toEqual([]); // did NOT silently fall through to http
   });
 });

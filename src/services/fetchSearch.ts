@@ -26,9 +26,11 @@ export function makeFetchSearch(t: FetchSearchTransports) {
       case 'impersonate':
         return t.impersonate(url, { browser: searchFetch.browser, headers: searchFetch.headers, userAgent: searchFetch.userAgent });
       case 'browser':
-        return t.browser
-          ? t.browser(url, { headers: searchFetch.headers, userAgent: searchFetch.userAgent, cookies: searchFetch.cookies })
-          : t.http(url);
+        // A store that explicitly needs a browser must NOT silently fall back to a plain GET — that
+        // returns a Cloudflare challenge PAGE the parser would treat as empty. Fail loud (→ the
+        // lookup's failed[]) instead of returning garbage.
+        if (!t.browser) throw new Error('search transport "browser" requested but no browser fetcher is wired');
+        return t.browser(url, { headers: searchFetch.headers, userAgent: searchFetch.userAgent, cookies: searchFetch.cookies });
       case 'http':
       default:
         return t.http(url);

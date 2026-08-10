@@ -108,7 +108,8 @@ describe('assembleLookup — cross-store buy-decision search, listed + orderable
     expect(out.results.map((r) => r.siteId)).toEqual(['solaris']);
   });
 
-  it('a store whose search fetch throws is reported failed, not silently dropped', async () => {
+  it('a store whose search fetch throws is reported failed AND the reason is logged (not silently dropped)', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
     const { lookup } = build({
       fetchSearch: jest.fn(async (url: string) => {
         if (url.includes('goodsmileus')) throw new Error('CF block');
@@ -120,6 +121,10 @@ describe('assembleLookup — cross-store buy-decision search, listed + orderable
 
     expect(out.failed).toContain('goodsmileus');
     expect(out.results.map((r) => r.siteId)).toEqual(['solaris']);
+    // the reason is surfaced, not swallowed — distinguishes CF-block from parse-error etc.
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('goodsmileus'));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('CF block'));
+    warn.mockRestore();
   });
 
   it('passes each store its RESOLVED search transport to fetchSearch (explicit searchFetch vs http default)', async () => {
