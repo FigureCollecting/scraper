@@ -98,12 +98,14 @@ async function startServer(): Promise<void> {
     // is configured). The engine carries no extraction fallback — items with
     // no matching ruleset fail cleanly through the queue's failure handling.
     getScrapeQueue().setPluginRegistry(registry);
-    // Mount the cross-store buy-decision search (GET /lookup) now that the registry is populated:
-    // buildProfileRegistry(registry.allStores()) → assembleLookup. Tier-1 stores fetch via plain
-    // HTTP; `requiresBrowser` (CF-fronted / SPA) stores route through the pooled stealth browser.
-    // createScrapingService wraps the static BrowserPool, so this shares the same pool as the queue.
+    // Mount the cross-store buy-decision search (GET /lookup) now that the registry is populated.
+    // Each store fetches via the transport its `searchFetch` declares (http / impersonate / browser);
+    // http + impersonate use the engine defaults, and the `browser` transport is backed here by the
+    // pooled ScrapingService (createScrapingService wraps the static BrowserPool → shares the queue's pool).
     const lookupScraping = createScrapingService();
-    app.use('/', createLookupRoute(createEngineLookup(registry, undefined, (url) => lookupScraping.browserFetch(url))));
+    app.use('/', createLookupRoute(createEngineLookup(registry, {
+      browser: (url, opts) => lookupScraping.browserFetch(url, opts),
+    })));
     if (plugins.length > 0) {
       console.log(`[PAGE-SCRAPER] Loaded ${plugins.length} plugin(s): ${plugins.map(p => `${p.name}@${p.version}`).join(', ')}`);
     }
