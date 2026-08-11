@@ -9,6 +9,8 @@ import scraperRoutes from './routes/scraper.js';
 import ingestRoutes from './routes/ingest.js';
 import { createLookupRoute } from './routes/lookup.js';
 import { createEngineLookup } from './services/engineLookup.js';
+import { createResolveRoute } from './routes/resolve.js';
+import { createEngineResolve } from './services/engineResolve.js';
 import { createScrapingService } from './services/engineServices/scrapingService.js';
 import { scraperDebug } from './utils/logger.js';
 
@@ -106,6 +108,9 @@ async function startServer(): Promise<void> {
     app.use('/', createLookupRoute(createEngineLookup(registry, {
       browser: (url, opts) => lookupScraping.browserFetch(url, opts),
     })));
+    // POST /resolve — byId confirm (detail fetch + ruleset.extract → full ExtractedData incl gtin14),
+    // the matcher pass-2 bridge. Detail fetch shares the same pooled ScrapingService as /lookup.
+    app.use('/', createResolveRoute(createEngineResolve(registry, (url) => lookupScraping.scrapePage(url))));
     if (plugins.length > 0) {
       console.log(`[PAGE-SCRAPER] Loaded ${plugins.length} plugin(s): ${plugins.map(p => `${p.name}@${p.version}`).join(', ')}`);
     }
