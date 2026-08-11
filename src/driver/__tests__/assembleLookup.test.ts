@@ -169,3 +169,49 @@ describe('assembleLookup — cross-store buy-decision search, listed + orderable
     expect(out.results[0]?.siteId).toBe('woo');
   });
 });
+
+describe('lookupByIdentity — record mode (typed identity → per-store query)', () => {
+  const JAN = '4570232591424';
+  // amiami full-texts the JAN (acceptsGtin); plazajapan resolves the JAN straight to a detail page.
+  const AMIAMI = caps('amiami', 'api.amiami.com', { bySearch: { urlTemplate: 'https://api.amiami.com/items?s_keywords={q}', acceptsGtin: true } });
+  const PLAZA = caps('plazajapan', 'plazajapan.com', { byId: { urlTemplate: 'https://plazajapan.com/{id}', idKind: 'barcode' } });
+
+  it('routes JAN-exact / name / barcode-byId per store from one IdentityQuery', async () => {
+    const fetchSearch = jest.fn(async () => '[]');
+    const services: LookupServices = {
+      profiles: buildProfileRegistry([AMIAMI, GOODSMILEUS, PLAZA]),
+      getRulesetForUrl: (url) =>
+        url.includes('amiami') ? stub('amiami', () => [{ itemId: 'a1', name: 'Tomie', available: true }])
+        : url.includes('goodsmileus') ? stub('goodsmileus', () => GSUS_CANDIDATES)
+        : undefined,
+      fetchSearch,
+    };
+
+    const out = await assembleLookup(services).lookupByIdentity({ gtin14: JAN, name: 'Gyaru Tomie x Hello Kitty' });
+
+    // amiami: JAN-exact search (the JAN is in the fetched URL).
+    expect(fetchSearch).toHaveBeenCalledWith(expect.stringContaining(JAN), expect.anything());
+    // goodsmileus (title-index, no acceptsGtin): name search — the NAME is in the URL, not the JAN.
+    expect(fetchSearch).toHaveBeenCalledWith(expect.stringContaining('Gyaru'), expect.anything());
+    expect(fetchSearch).not.toHaveBeenCalledWith(expect.stringContaining('goodsmileus.com/search?q=' + JAN), expect.anything());
+    // plazajapan: barcode-byId → a RESOLVE TARGET (segregated), NOT a phantom candidate in results.
+    expect(out.results.find((r) => r.siteId === 'plazajapan')).toBeUndefined();
+    expect(out.resolveTargets).toContainEqual({ siteId: 'plazajapan', host: 'plazajapan.com', itemId: JAN, url: `https://plazajapan.com/${JAN}` });
+    expect(out.query).toBe(JAN); // the result's query label is the JAN
+  });
+
+  it('a name-only identity searches by name and skips JAN-only stores gracefully', async () => {
+    const fetchSearch = jest.fn(async () => JSON.stringify(GSUS_CANDIDATES));
+    const services: LookupServices = {
+      profiles: buildProfileRegistry([GOODSMILEUS, PLAZA]), // PLAZA is barcode-byId only → no name path
+      getRulesetForUrl: () => stub('goodsmileus', () => GSUS_CANDIDATES),
+      fetchSearch,
+    };
+
+    const out = await assembleLookup(services).lookupByIdentity({ name: 'Tomie' });
+
+    expect(out.results.map((r) => r.siteId)).toContain('goodsmileus');
+    expect(out.unsupported).toContain('plazajapan'); // no name search + no gtin14 for its byId
+    expect(out.query).toBe('Tomie');
+  });
+});

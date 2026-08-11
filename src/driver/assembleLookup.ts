@@ -1,27 +1,19 @@
 /**
- * assembleLookup — the cross-store SEARCH runtime: the buy-decision fan-out. Given a query (a JAN,
- * or a studio+character/name(+ver)+scale combo when there's no JAN), it fans across every store
- * with a `retrieval.bySearch` axis, fetches each store's search endpoint, and parses the results
- * into `SearchCandidate[]` via that store's ruleset `extractCandidates` (contract 0.3.1).
+ * assembleLookup — the cross-store SEARCH runtime: the buy-decision fan-out. Two entrypoints over
+ * one shared fan-out:
+ *   - `lookup(query)`            — DISCOVERY: a free-text query fanned across every store's bySearch.
+ *   - `lookupByIdentity(identity)` — RECORD-MODE: a typed IdentityQuery (the caller has a catalogued
+ *     figure); the planner composes EACH store's query server-side — JAN-exact where the store's
+ *     bySearch `acceptsGtin`, a barcode-byId detail plan (plazajapan), else a composed name/ER query.
  *
- * TWO MODES over ONE fetch (no double-searching):
- *   - `listed`    — every item the store carries, incl. sold-out ("which stores have this?").
- *   - `orderable` — only in-stock/buyable items ("what can I buy right now?"), i.e. drop
- *     candidates whose `available === false`.
- * The store's `bySearch` should target the LISTED (complete) endpoint + each `SearchCandidate`
- * carries `available`, so both modes are views over the same result. Where a store's ONLY search
- * is `orderable`-scope (a predictive endpoint that hides sold-out), a `listed` query can't confirm
- * its sold-out items — that store is reported in `orderableOnly` rather than silently
- * under-counted (the false-negative that hid a sold-out solaris figure).
- *
- * Distinct from the byId currency crawl (assembleCrawlDriver): search DISCOVERS on demand. The
- * next stage (a follow-on) matches candidates by JAN-equality / ER and byId-fetches the full
- * record. Everything is injected so the fan-out is deterministic in tests.
+ * TWO MODES over ONE fetch: `listed` (all, incl. sold-out) vs `orderable` (drop `available === false`).
+ * A barcode-byId store yields a single "direct-hit" candidate (itemId = the gtin14) the caller
+ * confirms via /resolve — no search/parse. Everything is injected so the fan-out is deterministic.
  */
-import { planRetrieval } from './retrievalPlanner.js';
+import { planRetrieval, composeNameQuery } from './retrievalPlanner.js';
 import { sanitizeForLog } from '../utils/security.js';
 import type { ProfileRegistry } from './profileRegistry.js';
-import type { ExtractionRuleset, SearchCandidate, SearchFetch } from '@figurecollecting/scraper-plugin-contract';
+import type { ExtractionRuleset, IdentityQuery, SearchCandidate, SearchFetch } from '@figurecollecting/scraper-plugin-contract';
 
 export type LookupMode = 'listed' | 'orderable';
 
@@ -45,6 +37,18 @@ export interface StoreLookupResult {
   candidates: SearchCandidate[];
 }
 
+/**
+ * A barcode-byId direct hit (record-mode): a store whose byId URL IS the barcode, so a JAN resolves
+ * straight to a product page. It is NOT a screen candidate — it is UNVERIFIED (never fetched), so it
+ * is segregated here rather than surfaced as a phantom candidate; the caller confirms it via /resolve.
+ */
+export interface ResolveTarget {
+  siteId: string;
+  host: string;
+  itemId: string;
+  url: string;
+}
+
 export interface LookupResult {
   query: string;
   mode: LookupMode;
@@ -52,62 +56,90 @@ export interface LookupResult {
   /** Stores that cannot serve the search: no `bySearch` axis, or no `extractCandidates` parser. */
   unsupported: string[];
   /**
-   * Stores that DID return results but whose search is `orderable`-scope — so a `listed` query
-   * can't confirm their sold-out items (coverage caveat, not a failure). Always empty in
-   * `orderable` mode (where that scope is exactly what's wanted).
+   * Stores that DID return results but whose search is `orderable`-scope — a `listed` query can't
+   * confirm their sold-out items (coverage caveat, not a failure). Always empty in `orderable` mode.
    */
   orderableOnly: string[];
   /** Stores whose search fetch or parse errored (transparency, not silent drop). */
   failed: string[];
+  /**
+   * Barcode-byId direct hits (record-mode only): stores where the JAN resolves straight to a byId
+   * URL. UNVERIFIED — the caller confirms each via /resolve (which returns the full record incl
+   * price/availability). Kept OUT of `results` so an unfetched hit never poses as a real candidate.
+   */
+  resolveTargets: ResolveTarget[];
 }
 
 export interface Lookup {
+  /** DISCOVERY: fan a free-text query across every store's bySearch. */
   lookup(query: string, opts?: { mode?: LookupMode }): Promise<LookupResult>;
+  /** RECORD-MODE: fan a typed identity across stores, composing each store's query server-side. */
+  lookupByIdentity(identity: IdentityQuery, opts?: { mode?: LookupMode }): Promise<LookupResult>;
 }
 
+/** Representative `query` label for a record-mode result: the JAN if present, else the composed name. */
+const identityLabel = (identity: IdentityQuery): string => identity.gtin14 ?? composeNameQuery(identity) ?? '';
+
 export function assembleLookup(services: LookupServices): Lookup {
+  const runFanout = async (
+    plan: ReturnType<typeof planRetrieval>,
+    mode: LookupMode,
+    query: string,
+  ): Promise<LookupResult> => {
+    const unsupported = [...plan.unsupported];
+    const orderableOnly: string[] = [];
+    const failed: string[] = [];
+    const resolveTargets: ResolveTarget[] = [];
+
+    const settled = await Promise.all(
+      plan.plans.map(async (p): Promise<StoreLookupResult | null> => {
+        // Barcode-byId direct hit (record-mode): a RESOLVE TARGET, not a screen candidate. It is
+        // UNVERIFIED (we haven't fetched it), so segregate it into resolveTargets — never surface it
+        // as a phantom candidate (no name=barcode into the matcher, no unfetched hit in orderable mode).
+        if (p.kind === 'detail') {
+          resolveTargets.push({ siteId: p.siteId, host: p.host, itemId: p.itemId ?? '', url: p.url });
+          return null;
+        }
+
+        const ruleset = services.getRulesetForUrl(p.url);
+        if (!ruleset?.extractCandidates) {
+          unsupported.push(p.siteId); // has a bySearch URL but no parser yet
+          return null;
+        }
+        const scope = services.profiles.retrievalFor(p.host)?.bySearch?.scope ?? 'listed';
+        if (mode === 'listed' && scope === 'orderable') orderableOnly.push(p.siteId);
+        try {
+          const body = await services.fetchSearch(p.url, services.profiles.searchTransportFor(p.host));
+          let candidates = await ruleset.extractCandidates(body, p.url);
+          if (mode === 'orderable') candidates = candidates.filter((c) => c.available !== false);
+          return { siteId: p.siteId, host: p.host, url: p.url, candidates };
+        } catch (err) {
+          // Surface WHY a store dropped out (CF block / invalid impersonation profile / parse error).
+          // eslint-disable-next-line no-console
+          console.warn(`[lookup] ${sanitizeForLog(p.siteId)} search failed: ${sanitizeForLog(err instanceof Error ? err.message : String(err))}`);
+          failed.push(p.siteId);
+          return null;
+        }
+      }),
+    );
+
+    return {
+      query,
+      mode,
+      results: settled.filter((r): r is StoreLookupResult => r !== null),
+      unsupported,
+      orderableOnly,
+      failed,
+      resolveTargets,
+    };
+  };
+
   return {
     async lookup(query, opts = {}) {
-      const mode: LookupMode = opts.mode ?? 'listed';
-      const plan = planRetrieval(services.profiles, { mode: 'lookup', query });
-      const unsupported = [...plan.unsupported];
-      const orderableOnly: string[] = [];
-      const failed: string[] = [];
-
-      const settled = await Promise.all(
-        plan.plans.map(async (p): Promise<StoreLookupResult | null> => {
-          const ruleset = services.getRulesetForUrl(p.url);
-          if (!ruleset?.extractCandidates) {
-            unsupported.push(p.siteId); // has a bySearch URL but no parser yet
-            return null;
-          }
-          const scope = services.profiles.retrievalFor(p.host)?.bySearch?.scope ?? 'listed';
-          if (mode === 'listed' && scope === 'orderable') orderableOnly.push(p.siteId);
-          try {
-            // Fetch via the store's resolved transport (http / impersonate / browser + its headers).
-            const body = await services.fetchSearch(p.url, services.profiles.searchTransportFor(p.host));
-            let candidates = await ruleset.extractCandidates(body, p.url);
-            if (mode === 'orderable') candidates = candidates.filter((c) => c.available !== false);
-            return { siteId: p.siteId, host: p.host, url: p.url, candidates };
-          } catch (err) {
-            // Surface WHY a store dropped out (CF block / invalid impersonation profile / parse
-            // error) — otherwise every failure collapses into an indistinguishable `failed` entry.
-            // eslint-disable-next-line no-console
-            console.warn(`[lookup] ${sanitizeForLog(p.siteId)} search failed: ${sanitizeForLog(err instanceof Error ? err.message : String(err))}`);
-            failed.push(p.siteId);
-            return null;
-          }
-        }),
-      );
-
-      return {
-        query,
-        mode,
-        results: settled.filter((r): r is StoreLookupResult => r !== null),
-        unsupported,
-        orderableOnly,
-        failed,
-      };
+      return runFanout(planRetrieval(services.profiles, { mode: 'lookup', query }), opts.mode ?? 'listed', query);
+    },
+    async lookupByIdentity(identity, opts = {}) {
+      return runFanout(planRetrieval(services.profiles, { mode: 'record', identity }), opts.mode ?? 'listed', identityLabel(identity));
     },
   };
 }
