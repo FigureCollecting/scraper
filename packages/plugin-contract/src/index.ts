@@ -236,8 +236,11 @@ export interface RetrievalCapability {
    * (some stores' predictive endpoints, e.g. a Shopify `suggest.json` config, silently hide
    * sold-out). Absent scope defaults to `listed`. A `listed` endpoint + `SearchCandidate.available`
    * serves BOTH buy-decision modes; an `orderable`-only endpoint cannot answer the `listed` view.
+   * `acceptsGtin` = the endpoint full-texts a GTIN/barcode as the `{q}` (amiami/Woo/PrestaShop), so
+   * record-mode can substitute a JAN for a JAN-EXACT hit; absent = title-only (Shopify suggest), so
+   * record-mode falls back to a composed name/ER query. Filled by the plugin from `identity.keys`.
    */
-  bySearch?: { urlTemplate: string; scope?: 'listed' | 'orderable' };
+  bySearch?: { urlTemplate: string; scope?: 'listed' | 'orderable'; acceptsGtin?: boolean };
 }
 
 export type SearchTransport = 'http' | 'impersonate' | 'browser';
@@ -370,6 +373,26 @@ export interface SearchCandidate {
    * history).
    */
   available?: boolean;
+}
+
+/**
+ * A typed cross-store identity for RECORD-MODE lookup (POST /lookup) — the caller has a catalogued
+ * figure and wants current cross-store price/availability. The engine's per-store query composer
+ * turns this into each store's search query: a JAN-exact `{q}` where the store's bySearch
+ * `acceptsGtin` (or a barcode-byId detail plan), else a composed name/ER string from the remaining
+ * fields. All optional; a valid query needs at least a `gtin14` or a `name` (or studio+character/series).
+ */
+export interface IdentityQuery {
+  /** Canonical GTIN-14 (JAN/UPC/EAN folded) — the strongest cross-store anchor; used JAN-exact where supported. */
+  gtin14?: string;
+  studio?: string;
+  character?: string;
+  series?: string;
+  scale?: string;
+  figureType?: string;
+  version?: string;
+  /** Display name / title — the fallback query for title-indexed stores (Shopify) and no-JAN statues. */
+  name?: string;
 }
 
 export interface RuntimeConfig {
