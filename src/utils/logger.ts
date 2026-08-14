@@ -179,7 +179,7 @@ export const scraperDebug = {
  */
 export interface EnrichmentEvent {
   event: 'start' | 'success' | 'failure' | 'retry' | 'skip' | 'rate_limited';
-  mfcId: string;
+  sourceUrl: string;
   sessionId?: string;
   status?: 'owned' | 'ordered' | 'wished';
   errorType?: string;
@@ -215,10 +215,10 @@ export const enrichmentLogger = {
     const timestamp = new Date().toISOString();
     const entry = {
       timestamp,
-      component: 'ENRICHMENT',
+      component: 'INGEST',
       ...event,
     };
-    const logLine = `[${timestamp}] [ENRICHMENT] ${event.event.toUpperCase()} mfcId=${event.mfcId} ${JSON.stringify(entry)}`;
+    const logLine = `[${timestamp}] [INGEST] ${event.event.toUpperCase()} sourceUrl=${event.sourceUrl} ${JSON.stringify(entry)}`;
 
     // Console output
     console.log(logLine);
@@ -230,7 +230,7 @@ export const enrichmentLogger = {
   /**
    * Log successful enrichment with field completeness for analysis
    */
-  success(mfcId: string, sessionId?: string, durationMs?: number, fields?: {
+  success(sourceUrl: string, sessionId?: string, durationMs?: number, fields?: {
     imageUrl?: boolean;
     name?: boolean;
     manufacturer?: boolean;
@@ -238,13 +238,13 @@ export const enrichmentLogger = {
     releaseDate?: boolean;
     price?: boolean;
   }): void {
-    this.log({ event: 'success', mfcId, sessionId, durationMs, fields });
+    this.log({ event: 'success', sourceUrl, sessionId, durationMs, fields });
   },
 
   /**
    * Log failed enrichment with error details
    */
-  failure(mfcId: string, errorType: string, reason: string, opts?: {
+  failure(sourceUrl: string, errorType: string, reason: string, opts?: {
     sessionId?: string;
     httpStatus?: number;
     retryCount?: number;
@@ -253,7 +253,7 @@ export const enrichmentLogger = {
   }): void {
     this.log({
       event: 'failure',
-      mfcId,
+      sourceUrl,
       errorType,
       reason,
       ...opts,
@@ -261,28 +261,28 @@ export const enrichmentLogger = {
   },
 
   /**
-   * Log rate limit event (MFC busy)
+   * Log rate limit event (site busy / rate limited)
    */
-  rateLimited(mfcId: string, sessionId?: string, isCloudflare?: boolean): void {
+  rateLimited(sourceUrl: string, sessionId?: string, isCloudflare?: boolean): void {
     this.log({
       event: 'rate_limited',
-      mfcId,
+      sourceUrl,
       sessionId,
-      reason: isCloudflare ? 'Cloudflare block' : 'MFC rate limit (429/503)',
+      reason: isCloudflare ? 'Cloudflare block' : 'Rate limited (429/503)',
     });
   },
 
   /**
    * Log retry attempt
    */
-  retry(mfcId: string, retryCount: number, maxRetries: number, sessionId?: string): void {
-    this.log({ event: 'retry', mfcId, retryCount, maxRetries, sessionId });
+  retry(sourceUrl: string, retryCount: number, maxRetries: number, sessionId?: string): void {
+    this.log({ event: 'retry', sourceUrl, retryCount, maxRetries, sessionId });
   },
 
   /**
    * Log skipped item (already exists, duplicate, etc.)
    */
-  skip(mfcId: string, reason: string, sessionId?: string): void {
-    this.log({ event: 'skip', mfcId, reason, sessionId });
+  skip(sourceUrl: string, reason: string, sessionId?: string): void {
+    this.log({ event: 'skip', sourceUrl, reason, sessionId });
   },
 };
