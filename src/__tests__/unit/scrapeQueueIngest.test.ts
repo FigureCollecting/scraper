@@ -401,6 +401,40 @@ describe('ScrapeQueue - ingest cutover', () => {
     expect(queue.getStats().failed).toBe(1);
   });
 
+  it('logs ingest failures without MFC-era wording, keyed by the item URL as sourceUrl', async () => {
+    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+    const ruleset = makeRuleset();
+    const scraping = makeScrapingStub();
+    const send = jest.fn().mockRejectedValue(new Error('spine unavailable after retries'));
+
+    queue = new ScrapeQueue(false);
+    queue.setPluginRegistry(makeRegistry(ruleset, 'sentaifilmworks.example.test'));
+    queue.setIngestEmitter({ send });
+    queue.setScrapingService(scraping);
+
+    const url = 'https://sentaifilmworks.example.test/products/some-figure.js';
+    const result = queue.enqueue(url, { url, priority: 'WARM', maxRetries: 0 });
+    const promiseRef = result.promise.catch((e: Error) => e);
+
+    await advanceAndFlush(500);
+    await advanceAndFlush(5000);
+    await promiseRef;
+
+    const loggedLines = logSpy.mock.calls.map((call) => String(call[0]));
+    const queueFailureLine = loggedLines.find((line) => line.includes('[SCRAPE QUEUE] Failed'));
+    const ingestFailureLine = loggedLines.find((line) => line.includes('[INGEST]') && line.includes('FAILURE'));
+
+    expect(queueFailureLine).toBeDefined();
+    expect(queueFailureLine).not.toContain('MFC');
+    expect(queueFailureLine).toContain(url);
+
+    expect(ingestFailureLine).toBeDefined();
+    expect(ingestFailureLine).not.toContain('ENRICHMENT');
+    expect(ingestFailureLine).toContain(`sourceUrl=${url}`);
+
+    logSpy.mockRestore();
+  });
+
   it('fails the item and logs the error when extraction throws', async () => {
     const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
     const ruleset = makeRuleset(

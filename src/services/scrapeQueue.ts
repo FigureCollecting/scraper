@@ -543,7 +543,7 @@ export class ScrapeQueue {
       promise.catch(() => {});
 
       // mfcId can be a caller-supplied URL (trigger route) — sanitize for log
-      console.log(`[SCRAPE QUEUE] Deduplicated request for MFC ${sanitizeForLog(mfcId)} (${existingItem.waitingUserIds.length} users waiting)`); // lgtm[js/log-injection]
+      console.log(`[SCRAPE QUEUE] Deduplicated request for ${sanitizeForLog(mfcId)} (${existingItem.waitingUserIds.length} users waiting)`); // lgtm[js/log-injection]
 
       return {
         id: existingItem.id,
@@ -594,7 +594,7 @@ export class ScrapeQueue {
     this.statusQueued[itemStatus]++;
 
     // mfcId can be a caller-supplied URL (trigger route) — sanitize for log
-    console.log(`[SCRAPE QUEUE] Enqueued MFC ${sanitizeForLog(mfcId)} at priority ${effectivePriority} (queue size: ${this.getStats().total})`); // lgtm[js/log-injection]
+    console.log(`[SCRAPE QUEUE] Enqueued ${sanitizeForLog(mfcId)} at priority ${effectivePriority} (queue size: ${this.getStats().total})`); // lgtm[js/log-injection]
 
     // Start processing if not already running (skip in test mode)
     if (!this.testMode) {
@@ -685,7 +685,7 @@ export class ScrapeQueue {
     const cancelError = new Error('Request cancelled');
     item.resolvers.forEach(({ reject }) => reject(cancelError));
 
-    console.log(`[SCRAPE QUEUE] Cancelled request for MFC ${mfcId}`);
+    console.log(`[SCRAPE QUEUE] Cancelled request for ${mfcId}`);
     return true;
   }
 
@@ -811,7 +811,7 @@ export class ScrapeQueue {
     item.priority = newPriority;
     this.addToQueue(item);
 
-    console.log(`[SCRAPE QUEUE] Upgraded MFC ${item.mfcId} to ${newPriority}`);
+    console.log(`[SCRAPE QUEUE] Upgraded ${item.mfcId} to ${newPriority}`);
   }
 
   private comparePriority(a: QueuePriority, b: QueuePriority): number {
@@ -925,7 +925,7 @@ export class ScrapeQueue {
     this.lastRequestTime = now;
 
     const poolAvailable = BrowserPool.getPoolSize();
-    console.log(`[SCRAPE QUEUE] Processing MFC ${item.mfcId} (${item.priority}, attempt ${item.retryCount + 1}/${item.maxRetries + 1}, delay=${this.currentDelay}ms, pool=${poolAvailable}/${BrowserPool.getPoolCapacity()})`);
+    console.log(`[SCRAPE QUEUE] Processing ${item.mfcId} (${item.priority}, attempt ${item.retryCount + 1}/${item.maxRetries + 1}, delay=${this.currentDelay}ms, pool=${poolAvailable}/${BrowserPool.getPoolCapacity()})`);
 
     try {
       // Extraction is plugin-only: an ingest emitter must be configured AND
@@ -1157,7 +1157,7 @@ export class ScrapeQueue {
     // Resolve all waiting promises
     item.resolvers.forEach(({ resolve }) => resolve(result));
 
-    console.log(`[SCRAPE QUEUE] Completed MFC ${item.mfcId} (${item.waitingUserIds.length} users notified, delay=${this.currentDelay}ms)`);
+    console.log(`[SCRAPE QUEUE] Completed ${item.mfcId} (${item.waitingUserIds.length} users notified, delay=${this.currentDelay}ms)`);
   }
 
   private handleFailure(item: QueueItem, error: Error): void {
@@ -1167,7 +1167,7 @@ export class ScrapeQueue {
     item.retryCount++;
 
     const durationMs = Date.now() - item.queuedAt;
-    console.log(`[SCRAPE QUEUE] Failed MFC ${item.mfcId}: ${errorType} - ${sanitizeForLog(error.message)}`);
+    console.log(`[SCRAPE QUEUE] Failed ${item.mfcId}: ${errorType} - ${sanitizeForLog(error.message)}`);
 
     // Log enrichment failure for analysis
     enrichmentLogger.failure(item.mfcId, errorType, error.message, {
@@ -1181,7 +1181,7 @@ export class ScrapeQueue {
     if (errorType === 'rate_limited') {
       this.handleRateLimit();
 
-      // Log rate limit event specifically for MFC busy analysis
+      // Log rate limit event for rate-limit analysis
       const isCloudflare = error.message.toLowerCase().includes('cloudflare');
       enrichmentLogger.rateLimited(item.mfcId, item.sessionId, isCloudflare);
 
@@ -1219,7 +1219,7 @@ export class ScrapeQueue {
 
       if (failureResult.shouldRetry && failureResult.cooldownMs > 0) {
         // Apply cooldown delay before retry
-        console.log(`[SCRAPE QUEUE] Cookie failure - retrying MFC ${item.mfcId} after ${failureResult.cooldownMs / 1000}s cooldown`);
+        console.log(`[SCRAPE QUEUE] Cookie failure - retrying ${item.mfcId} after ${failureResult.cooldownMs / 1000}s cooldown`);
         this.addToQueue(item);
         return;
       }
@@ -1230,7 +1230,7 @@ export class ScrapeQueue {
       // Re-queue for retry
       this.addToQueue(item);
       enrichmentLogger.retry(item.mfcId, item.retryCount, item.maxRetries, item.sessionId);
-      console.log(`[SCRAPE QUEUE] Retrying MFC ${item.mfcId} (attempt ${item.retryCount + 1})`);
+      console.log(`[SCRAPE QUEUE] Retrying ${item.mfcId} (attempt ${item.retryCount + 1})`);
     } else {
       // Give up
       this.failedCount++;
@@ -1243,7 +1243,7 @@ export class ScrapeQueue {
       // Notify backend of permanent failure via webhook (non-blocking)
       if (item.sessionId) {
         notifyItemFailed(item.sessionId, item.mfcId, `${errorType}: ${error.message}`).catch(() => {
-          console.warn(`[SCRAPE QUEUE] Webhook notification failed for MFC ${item.mfcId}`);
+          console.warn(`[SCRAPE QUEUE] Webhook notification failed for ${item.mfcId}`);
         });
       }
 
@@ -1251,7 +1251,7 @@ export class ScrapeQueue {
       const finalError = new Error(`Scrape failed: ${errorType} - ${error.message}`);
       item.resolvers.forEach(({ reject }) => reject(finalError));
 
-      console.log(`[SCRAPE QUEUE] Gave up on MFC ${item.mfcId} after ${item.retryCount} attempts`);
+      console.log(`[SCRAPE QUEUE] Gave up on ${item.mfcId} after ${item.retryCount} attempts`);
     }
   }
 
