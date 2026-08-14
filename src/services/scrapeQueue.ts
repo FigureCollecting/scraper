@@ -25,12 +25,19 @@ import { getSessionManager, resetSessionManager, SessionManager, SessionPausedEv
 import { notifyItemFailed } from './webhookClient.js';
 import { enrichmentLogger } from '../utils/logger.js';
 import { createScrapingService } from './engineServices/scrapingService.js';
+import { createCapturingFetch, type CapturingFetch, type CapturingFetchTransports } from './engineServices/capturingFetch.js';
 import { getRawCaptureSink } from './s3ObjectStore.js';
 import { createIngestEmitterFromEnv } from './ingestEmitter.js';
+import { impitFetchBody } from './impitFetch.js';
+import { httpFetchBody } from './engineLookup.js';
+import { buildProfileRegistry, ProfileRegistry } from '../driver/profileRegistry.js';
+import type { CaptureSink } from './captureSink.js';
 import type {
   ExtractionRuleset,
   ExtractedData as PluginExtractedData,
   ScrapingService,
+  StoreCapabilities,
+  SearchFetch,
 } from '@figurecollecting/scraper-plugin-contract';
 
 // ============================================================================
@@ -127,11 +134,14 @@ export interface EnqueueResult {
 }
 
 /**
- * Narrow view of the plugin extraction registry the queue needs to decide
- * whether an item's URL has a plugin-provided ruleset (ingest cutover seam).
+ * Narrow view of the plugin extraction registry the queue needs: resolving a ruleset for an
+ * item's URL (ingest cutover seam), and every registered store's capabilities — so the queue can
+ * resolve a store's declared raw-fetch transport (searchFetch) the same way the /lookup path does
+ * via ProfileRegistry.
  */
 export interface RulesetResolver {
   getRulesetForUrl(url: string): ExtractionRuleset | undefined;
+  allStores(): StoreCapabilities[];
 }
 
 /**
@@ -287,6 +297,18 @@ export class ScrapeQueue {
   private ingestEmitter: IngestSender | null = null;
   private rawPageFetcher: RawPageFetcher | null = null;
 
+  // Store-capability index (searchFetch/rateLimit/etc.), rebuilt alongside pluginRegistry — the
+  // ingest path's transport lookup (getSearchFetchFor) reads a store's declared searchFetch from
+  // here, same as the /lookup path's ProfileRegistry.
+  private profiles: ProfileRegistry | null = null;
+  // Non-browser raw-fetch transports for the ingest path (tests / DI); default lazily to the
+  // engine's real impit/http fetchers — the same ones /lookup uses.
+  private impersonateFetch: CapturingFetchTransports['impersonate'] | null = null;
+  private httpFetch: CapturingFetchTransports['http'] | null = null;
+  // Raw-capture sink for the ingest path's impit/http lanes (tests / DI); defaults lazily to the
+  // shared engine sink — the same one the browser lane's navigateAndCapture writes to.
+  private captureSink: CaptureSink | null = null;
+
   constructor(testMode?: boolean) {
     // Auto-detect test environment if not explicitly set
     this.testMode = testMode ?? (
@@ -315,6 +337,9 @@ export class ScrapeQueue {
    */
   setPluginRegistry(registry: RulesetResolver | null): void {
     this.pluginRegistry = registry;
+    // Rebuild the capability index whenever the registry changes so getSearchFetchFor never
+    // reads a stale store list (mirrors how createEngineLookup/createEngineResolve build theirs).
+    this.profiles = registry ? buildProfileRegistry(registry.allStores()) : null;
   }
 
   /**
@@ -326,11 +351,31 @@ export class ScrapeQueue {
   }
 
   /**
-   * Override the raw page-fetch service used by the ingest path (tests / DI).
+   * Override the raw page-fetch service used by the ingest path's browser lane (tests / DI).
    * Defaults lazily to the same engine scraping service plugins get.
    */
   setScrapingService(service: RawPageFetcher | null): void {
     this.rawPageFetcher = service;
+  }
+
+  /**
+   * Override the ingest path's non-browser raw-fetch transports (tests / DI). Only the keys
+   * supplied are replaced; omitted keys keep their current fetcher (real or previously injected).
+   */
+  setIngestTransports(transports: {
+    impersonate?: CapturingFetchTransports['impersonate'];
+    http?: CapturingFetchTransports['http'];
+  }): void {
+    if (transports.impersonate) this.impersonateFetch = transports.impersonate;
+    if (transports.http) this.httpFetch = transports.http;
+  }
+
+  /**
+   * Override the raw-capture sink used by the ingest path's impit/http lanes (tests / DI).
+   * Defaults lazily to the shared engine sink (getRawCaptureSink()).
+   */
+  setCaptureSink(sink: CaptureSink | null): void {
+    this.captureSink = sink;
   }
 
   /**
@@ -934,18 +979,46 @@ export class ScrapeQueue {
   }
 
   /**
-   * The ingest path: fetch raw HTML, hand it to the plugin's ruleset for
-   * extraction, and emit the result to the aggregation spine. No webhook
-   * leg here. Throws on fetch, extraction, or emit failure so the item
-   * flows through the queue's existing failure handling (never a silent
-   * drop). Returns the extracted field bag so waiting callers' promises
+   * The item URL's store's declared search transport (undefined = undeclared → the ingest fetch
+   * defaults to the browser lane). A lookup failure (e.g. unparseable URL, or no registry yet)
+   * is treated the same as "undeclared" rather than throwing — the raw fetch still gets a lane.
+   */
+  private getSearchFetchFor(url: string): SearchFetch | undefined {
+    if (!this.profiles) return undefined;
+    try {
+      return this.profiles.forHost(new URL(url).hostname)?.searchFetch;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Build the ingest path's transport-aware capturing fetch. Rebuilt per call (cheap — it's a
+   * thin dispatcher) so DI overrides from setIngestTransports/setCaptureSink/setScrapingService
+   * are always picked up, including ones applied after this queue instance already fetched once.
+   */
+  private getCapturingFetch(): CapturingFetch {
+    return createCapturingFetch(
+      {
+        impersonate: this.impersonateFetch ?? impitFetchBody,
+        http: this.httpFetch ?? httpFetchBody,
+        browser: this.getRawPageFetcher(),
+      },
+      this.captureSink ?? getRawCaptureSink(),
+    );
+  }
+
+  /**
+   * The ingest path: fetch the item's raw body via the store's declared transport (impersonate /
+   * http / browser — undeclared defaults to browser), hand it to the plugin's ruleset for
+   * extraction, and emit the result to the aggregation spine. No webhook leg here. Throws on
+   * fetch, extraction, or emit failure so the item flows through the queue's existing failure
+   * handling (never a silent drop). Returns the extracted field bag so waiting callers' promises
    * still resolve.
    */
   private async processViaIngest(item: QueueItem, ruleset: ExtractionRuleset): Promise<ScrapedData> {
-    const fetcher = this.getRawPageFetcher();
-    const page = item.cookies
-      ? await fetcher.scrapePageStealth(item.url, { cookies: item.cookies })
-      : await fetcher.scrapePage(item.url);
+    const searchFetch = this.getSearchFetchFor(item.url);
+    const page = await this.getCapturingFetch()(item.url, searchFetch, { cookies: item.cookies });
 
     let extracted: PluginExtractedData;
     try {

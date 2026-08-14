@@ -59,6 +59,25 @@ ignore:
       of the built image). The vendored x/net is internal to esbuild and never in the runtime attack
       surface. esbuild 0.28.1 is the latest release and still vendors x/net v0.40.0, so no bump removes it.
 
+  # 2026-08-14: GO-2026-5026 ALSO matches the Go STDLIB (go1.26.5) of the SAME esbuild binary
+  # covered by the x/net entry above — esbuild 0.28.1 is compiled with go1.26.5, and the finding
+  # was surfacing under package "stdlib" (not "golang.org/x/net"), so the entry above did not cover it.
+  # The stdlib fix is go1.26.6 (current stable per context7/grype; 1.25.13 is the 1.25 backport,
+  # 1.27.0-rc.3 is a release candidate, not stable). Identical containment: esbuild is dev/build-only
+  # (tsx devDependency, used only by the `dev` hot-reload; `npm run build` uses tsc, not esbuild),
+  # pruned from the production image by `npm ci --omit=dev`, and present ONLY in the multi-stage
+  # BUILDER layer — never in the shipped runtime. No esbuild release ships a go1.26.6 build yet, so
+  # there is nothing to bump to. REVIEW: remove when esbuild ships a build compiled with go >= 1.26.6.
+  - vulnerability: GO-2026-5026
+    package:
+      name: stdlib
+      type: go-module
+    reason: |
+      Same esbuild build-only binary as the golang.org/x/net entry above (dev/tsx, pruned from prod
+      by `npm ci --omit=dev`, builder-layer-only, absent from the shipped runtime). esbuild 0.28.1 is
+      compiled with go1.26.5; the stdlib fix is go1.26.6, not yet in any esbuild release, so no bump
+      removes it. Not runtime-reachable. Dated 2026-08-14; remove when esbuild rebuilds on go>=1.26.6.
+
   # 2026-08-08: brace-expansion / ip-address flagged by grype come from the Node runtime's
   # BUNDLED npm (/usr/local/lib/node_modules/npm/...), NOT this app's dependencies. Our app
   # deps are fixed (brace-expansion 5.0.9, ip-address 10.4.0) and pass NPM Audit + Trivy +
