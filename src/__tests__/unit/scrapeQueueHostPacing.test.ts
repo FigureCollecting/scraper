@@ -203,6 +203,27 @@ describe('ScrapeQueue — live queue per-host pacing (H1)', () => {
     expect(scraping.scrapePage.mock.calls[2][0]).toBe('https://host-a.test/item/a1');
   });
 
+  it("falls back to DEFAULT_FETCH_BODY_GAP_MS (2000ms) — not the store's declared baseDelayMs — when the item's host has no resolved store profile, even though its ruleset matched via the subdomain fallback", async () => {
+    // The registered store's declared floor is 5000ms, but the items below hit a SUBDOMAIN
+    // ('sub.host-a.test') that extractionRegistry's own subdomain fallback resolves to the
+    // 'host-a' ruleset, while ProfileRegistry's byHost index (exact-domain only, no subdomain
+    // wildcard) does NOT resolve it — so profiles.forHost('sub.host-a.test') is undefined and
+    // hostBaseDelayMs() must take the `?? DEFAULT_FETCH_BODY_GAP_MS` branch, not the 5000ms one.
+    const { scraping } = makeQueue([{ siteId: 'host-a', domain: 'host-a.test', baseDelayMs: 5000 }]);
+
+    queue.enqueue('u1', { priority: 'WARM', url: 'https://sub.host-a.test/item/u1' });
+    queue.enqueue('u2', { priority: 'WARM', url: 'https://sub.host-a.test/item/u2' });
+
+    await advanceAndFlush(100);
+    expect(scraping.scrapePage).toHaveBeenCalledTimes(1); // u1 dispatches (ruleset DID match)
+
+    // Past the DEFAULT gap (2000ms) but well short of the store's declared 5000ms floor: if the
+    // fallback were wrongly reading the store's own baseDelayMs, u2 would still be blocked here.
+    await advanceAndFlush(2200);
+    expect(scraping.scrapePage).toHaveBeenCalledTimes(2);
+    expect(scraping.scrapePage.mock.calls[1][0]).toBe('https://sub.host-a.test/item/u2');
+  });
+
   it('treats an item with an unparseable URL as having no host — never blocks on the pacing floor, never crashes or hangs', async () => {
     makeQueue([{ siteId: 'host-a', domain: 'host-a.test', baseDelayMs: 5000 }]);
 
