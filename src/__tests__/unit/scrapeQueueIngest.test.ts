@@ -176,7 +176,9 @@ describe('ScrapeQueue - ingest cutover', () => {
 
     // engine fetched the raw page; extraction was the plugin's job
     expect(scraping.scrapePage).toHaveBeenCalledWith('https://myfigurecollection.net/item/12345');
-    expect(ruleset.extract).toHaveBeenCalledWith(FIXTURE_HTML, 'https://myfigurecollection.net/item/12345');
+    // B3: extractRecords always forwards the built ExtractContext as extract's 3rd arg (ctx.scraping.fetchBody
+    // is the extractMany-only seam; a 2-arg ruleset like this one simply ignores it).
+    expect(ruleset.extract).toHaveBeenCalledWith(FIXTURE_HTML, 'https://myfigurecollection.net/item/12345', expect.anything());
     // the extraction went to the spine, verbatim
     expect(send).toHaveBeenCalledTimes(1);
     const sent = send.mock.calls[0][0];
@@ -205,7 +207,8 @@ describe('ScrapeQueue - ingest cutover', () => {
     await advanceAndFlush(500);
     const data = await result.promise;
 
-    expect(ruleset.extractAsync).toHaveBeenCalledWith(FIXTURE_HTML, url);
+    // B3: extractRecords forwards ctx to extractAsync too (same rationale as the extract() case above).
+    expect(ruleset.extractAsync).toHaveBeenCalledWith(FIXTURE_HTML, url, expect.anything());
     expect(ruleset.extract).not.toHaveBeenCalled();
     expect(send).toHaveBeenCalledTimes(1);
     expect(send.mock.calls[0][0].fields).toEqual({ name: 'Fate/stay night' });
@@ -246,7 +249,8 @@ describe('ScrapeQueue - ingest cutover', () => {
     await advanceAndFlush(500);
     const data = await result.promise;
 
-    expect(extractFn).toHaveBeenCalledWith(FIXTURE_HTML, 'https://myfigurecollection.net/item/12345');
+    // B3: extractRecords forwards ctx as the 3rd arg (see the "fetch -> extract -> emit" test above).
+    expect(extractFn).toHaveBeenCalledWith(FIXTURE_HTML, 'https://myfigurecollection.net/item/12345', expect.anything());
     // the RESOLVED extraction (not a Promise) went to the spine
     expect(send).toHaveBeenCalledTimes(1);
     expect(send.mock.calls[0][0].fields).toEqual({ name: 'Async Marin', jan: '4530956107891' });
@@ -273,7 +277,8 @@ describe('ScrapeQueue - ingest cutover', () => {
     await result.promise;
 
     expect(scraping.scrapePage).toHaveBeenCalledWith(url);
-    expect(ruleset.extract).toHaveBeenCalledWith(FIXTURE_HTML, url);
+    // B3: extractRecords forwards ctx as the 3rd arg (see the "fetch -> extract -> emit" test above).
+    expect(ruleset.extract).toHaveBeenCalledWith(FIXTURE_HTML, url, expect.anything());
     expect(send).toHaveBeenCalledTimes(1);
   });
 

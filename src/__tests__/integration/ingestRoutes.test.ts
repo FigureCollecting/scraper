@@ -284,7 +284,8 @@ describe('POST /ingest/scrape', () => {
 
       // engine fetched the raw page; extraction was the plugin's job
       expect(scraping.scrapePage).toHaveBeenCalledWith(FIXTURE_URL);
-      expect(ruleset.extract).toHaveBeenCalledWith(FIXTURE_HTML, FIXTURE_URL);
+      // B3: extractRecords forwards the built ExtractContext as extract's 3rd arg.
+      expect(ruleset.extract).toHaveBeenCalledWith(FIXTURE_HTML, FIXTURE_URL, expect.anything());
       // the extraction went to the spine, verbatim
       const sent = send.mock.calls[0][0];
       expect(sent.source.site).toBe('mock-site');

@@ -177,3 +177,93 @@ describe('makeCrawlWorker — per-item fetch → extract → emit', () => {
     expect(outcome).toBe('rate-limited');
   });
 });
+
+/**
+ * B3 driver parity (spec.md orzgk Slice B D7): extractRecords/emitAll wired into the worker —
+ * dormant behind `extractMany` (no non-test importer calls it yet), unit-tested here so it soaks
+ * ready. `extractMany` folds through the SAME extractRecords helper the live queue uses
+ * (engineServices/extractRecords.ts), so a multi-record ruleset gets identical array-emit +
+ * ordering-guard behavior on both paths.
+ */
+describe('makeCrawlWorker — extractMany array emit (B3 driver parity)', () => {
+  const multiRuleset = (extractMany: jest.Mock): ExtractionRuleset =>
+    ruleset({
+      extract: jest.fn(() => {
+        throw new Error('extract() should not run when extractMany is present');
+      }),
+      extractMany,
+    });
+
+  it('extractMany present: emits every record in array order, markDone once, returns success', async () => {
+    const records: ExtractedData[] = [
+      extracted({ source: { site: 'amiami', itemId: 'P', extractedAt: 't0' } }),
+      extracted({ source: { site: 'amiami', itemId: 'C1', extractedAt: 't0' }, fields: { editionOf: 'P' } }),
+    ];
+    const extractMany = jest.fn().mockResolvedValue(records);
+    const rs = multiRuleset(extractMany);
+    const { deps, ledger, worker } = build({ lookupRuleset: jest.fn().mockReturnValue(rs) });
+
+    const outcome = await worker(TASK);
+
+    expect(extractMany).toHaveBeenCalledWith('<html>ok</html>', URL, undefined);
+    expect(deps.emit).toHaveBeenCalledTimes(2);
+    expect((deps.emit as jest.Mock).mock.calls[0][0]).toEqual(records[0]);
+    expect((deps.emit as jest.Mock).mock.calls[1][0]).toEqual(records[1]);
+    const order = (deps.emit as jest.Mock).mock.invocationCallOrder;
+    expect(order[0]).toBeLessThan(order[1]);
+    expect(ledger.done).toEqual(['abc123']);
+    expect(ledger.failed).toEqual([]);
+    expect(outcome).toBe('success');
+  });
+
+  it('emit throws on the SECOND record: the third is never sent, item stays pending (not markFailed), rate-limited', async () => {
+    const records: ExtractedData[] = [
+      extracted({ source: { site: 'amiami', itemId: 'P', extractedAt: 't0' } }),
+      extracted({ source: { site: 'amiami', itemId: 'C1', extractedAt: 't0' }, fields: { editionOf: 'P' } }),
+      extracted({ source: { site: 'amiami', itemId: 'C2', extractedAt: 't0' }, fields: { editionOf: 'P' } }),
+    ];
+    const extractMany = jest.fn().mockResolvedValue(records);
+    const rs = multiRuleset(extractMany);
+    const emit = jest
+      .fn()
+      .mockResolvedValueOnce({ sourceId: 'p' })
+      .mockRejectedValueOnce(new Error('spine UNAVAILABLE'));
+    const { deps, ledger, worker } = build({ lookupRuleset: jest.fn().mockReturnValue(rs), emit });
+
+    const outcome = await worker(TASK);
+
+    expect(deps.emit).toHaveBeenCalledTimes(2); // P (ok), C1 (fails) — C2 never attempted
+    expect(ledger.done).toEqual([]);
+    expect(ledger.failed).toEqual([]); // pending — delivery failed, not the item
+    expect(outcome).toBe('rate-limited');
+  });
+
+  it('threads resolveContext\'s ExtractContext into extractMany (not just extract)', async () => {
+    const ctx = { config: {}, scraping: {}, logger: {} } as never;
+    const extractMany = jest.fn().mockResolvedValue([extracted()]);
+    const rs = multiRuleset(extractMany);
+    const resolveContext = jest.fn().mockReturnValue(ctx);
+    const { worker } = build({ lookupRuleset: jest.fn().mockReturnValue(rs), resolveContext });
+
+    await worker(TASK);
+
+    expect(extractMany).toHaveBeenCalledWith('<html>ok</html>', URL, ctx);
+  });
+
+  it('an extractRecords ordering-guard violation (D11) is a content failure: markFailed + success, no emit', async () => {
+    // child (editionOf=P) BEFORE its target P — target-first ordering violated.
+    const extractMany = jest.fn().mockResolvedValue([
+      extracted({ source: { site: 'amiami', itemId: 'C1', extractedAt: 't0' }, fields: { editionOf: 'P' } }),
+      extracted({ source: { site: 'amiami', itemId: 'P', extractedAt: 't0' } }),
+    ]);
+    const rs = multiRuleset(extractMany);
+    const { deps, ledger, worker } = build({ lookupRuleset: jest.fn().mockReturnValue(rs) });
+
+    const outcome = await worker(TASK);
+
+    expect(deps.emit).not.toHaveBeenCalled();
+    expect(ledger.failed).toEqual(['abc123']);
+    expect(ledger.done).toEqual([]);
+    expect(outcome).toBe('success');
+  });
+});

@@ -26,11 +26,13 @@ import { CrawlLoop, type CrawlLoopStats } from './crawlLoop.js';
 import { CoverageLedger, type CoverageCounts } from './coverageLedger.js';
 import type { PoolCapacity } from './poolRouter.js';
 import type {
+  ExtractContext,
   ExtractedData,
   ExtractionRuleset,
   ScrapePageResult,
   StoreCapabilities,
 } from '@figurecollecting/scraper-plugin-contract';
+import type { CrawlTask } from './dispatchScheduler.js';
 
 export interface CrawlDriverServices {
   /** Engine registry: the registered stores (→ ProfileRegistry) + URL→ruleset lookup. */
@@ -47,6 +49,14 @@ export interface CrawlDriverServices {
   sleep: (ms: number) => Promise<void>;
   /** Per-pool worker capacity (browser/fetch), sized vs the crawl-rate budget. */
   capacity: PoolCapacity;
+  /**
+   * OPTIONAL per-extraction ExtractContext resolver (B3, spec.md orzgk Slice B D7) — reaches
+   * `extractRecords`/`extractMany` through `assembleCrawlWorker` (`crawlWorker.ts`'s
+   * `resolveContext?: (task, url) => ExtractContext | undefined` seam) for multi-query rulesets.
+   * `siteId` is supplied by `crawlSite` (already in scope there) since `CrawlTask` itself only
+   * carries `host`. Dormant until A3 — no non-test importer of `src/driver/` yet.
+   */
+  resolveContext?: (siteId: string, task: CrawlTask, url: string) => ExtractContext | undefined;
 }
 
 export interface CrawlSiteResult {
@@ -84,6 +94,9 @@ export function assembleCrawlDriver(services: CrawlDriverServices): CrawlDriver 
         retrievalFor: (h) => profiles.retrievalFor(h),
         emit: services.emit,
         ledger,
+        ...(services.resolveContext
+          ? { resolveContext: (task, url) => services.resolveContext!(siteId, task, url) }
+          : {}),
       });
 
       const { scheduler } = assembleScheduler(profiles, services.capacity);

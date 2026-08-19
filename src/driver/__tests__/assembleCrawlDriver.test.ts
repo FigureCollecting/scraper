@@ -106,4 +106,35 @@ describe('assembleCrawlDriver — end-to-end crawl runtime', () => {
     const { driver } = build();
     expect(driver.profiles.retrievalFor('www.amiami.com')?.byId?.urlTemplate).toContain('{id}');
   });
+
+  /**
+   * B3 driver parity (spec.md orzgk Slice B D7): `resolveContext` on CrawlDriverServices reaches
+   * the ruleset's `extractMany` through the full assembled chain (dormant until A3 — no
+   * non-test importer wires a real resolveContext yet, but the seam must reach end-to-end now).
+   */
+  it("passes resolveContext through to the worker, reaching a ruleset's extractMany with the resolved ExtractContext", async () => {
+    const ctx = { config: {}, scraping: {}, logger: {} } as never;
+    const extractMany = jest.fn((_html: string, url: string) => [extracted(gcodeOf(url))]);
+    const rs: ExtractionRuleset = {
+      siteId: 'amiami',
+      version: '1.1',
+      extract: jest.fn(() => {
+        throw new Error('extract() should not run when extractMany is present');
+      }),
+      extractMany,
+      validate: () => ({ valid: true, errors: [], warnings: [] }),
+    };
+    const resolveContext = jest.fn().mockReturnValue(ctx);
+    const { sends, driver } = build({
+      extraction: { allStores: () => [AMIAMI], getRulesetForUrl: () => rs },
+      resolveContext,
+    });
+
+    const result = await driver.crawlSite('amiami', ['A1']);
+
+    expect(resolveContext).toHaveBeenCalledWith('amiami', { id: 'A1', host: 'www.amiami.com' }, expect.any(String));
+    expect(extractMany).toHaveBeenCalledWith('<html/>', expect.any(String), ctx);
+    expect(sends.map((e) => e.source.itemId)).toEqual(['A1']);
+    expect(result.coverage.done).toBe(1);
+  });
 });
