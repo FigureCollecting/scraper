@@ -89,6 +89,72 @@ describe('buildExtractContext — scraping.fetchBody', () => {
     expect(capturingFetch).toHaveBeenCalled();
   });
 
+  it('re-gaps a SECOND fetchBody call to the SAME host against the FIRST call\'s own dispatch — not just primaryFetchedAt', async () => {
+    let clock = 1_000_000;
+    const now = jest.fn(() => clock);
+    const sleep = jest.fn(async (ms: number) => {
+      clock += ms;
+    });
+    const capturingFetch = jest.fn().mockResolvedValue({ html: '{"variations":[]}' });
+
+    const ctx = buildExtractContext({
+      config: CONFIG,
+      logger: LOGGER,
+      scraping: makeScraping(),
+      capturingFetch,
+      searchFetch: { transport: 'http' },
+      primaryUrl: 'https://orzgk.com/wp-json/wc/store/v1/products/1',
+      primaryFetchedAt: 1_000_000, // == now() at t0
+      baseDelayMs: 3000,
+      now,
+      sleep,
+    });
+
+    const followUpUrl = 'https://orzgk.com/wp-json/wc/store/v1/products?type=variation&parent=1';
+    await ctx.scraping.fetchBody!(followUpUrl); // gapped against primaryFetchedAt: waits 3000
+    await ctx.scraping.fetchBody!(followUpUrl); // SAME host again: must wait ANOTHER 3000, not 0
+
+    expect(sleep).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenNthCalledWith(1, 3000);
+    expect(sleep).toHaveBeenNthCalledWith(2, 3000);
+    expect(capturingFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('tracks the courtesy gap PER HOST — a follow-up to a different host does not disturb the primary host\'s own gap tracking', async () => {
+    let clock = 1_000_000;
+    const now = jest.fn(() => clock);
+    const sleep = jest.fn(async (ms: number) => {
+      clock += ms;
+    });
+    const capturingFetch = jest.fn().mockResolvedValue({ html: '{}' });
+
+    const ctx = buildExtractContext({
+      config: CONFIG,
+      logger: LOGGER,
+      scraping: makeScraping(),
+      capturingFetch,
+      searchFetch: { transport: 'http' },
+      primaryUrl: 'https://orzgk.com/wp-json/wc/store/v1/products/1',
+      primaryFetchedAt: 1_000_000,
+      baseDelayMs: 3000,
+      now,
+      sleep,
+    });
+
+    // Same-host follow-up first: waits the 3000ms gap against primaryFetchedAt, clock -> 1_003_000.
+    await ctx.scraping.fetchBody!('https://orzgk.com/wp-json/wc/store/v1/products?type=variation&parent=1');
+    // A DIFFERENT host in between: no gap owed against it (it has no prior fetch of its own).
+    await ctx.scraping.fetchBody!('https://a-totally-different-store.example/api/x');
+    // Back to the primary host again, immediately (clock unchanged since the different-host call
+    // didn't advance it): still gapped against the FIRST same-host call, not reset by the detour.
+    await ctx.scraping.fetchBody!('https://orzgk.com/wp-json/wc/store/v1/products?type=variation&parent=1');
+
+    expect(sleep).toHaveBeenCalledTimes(2); // 1st same-host call + 3rd same-host call; NOT the different-host call
+    expect(sleep).toHaveBeenNthCalledWith(1, 3000);
+    expect(sleep).toHaveBeenNthCalledWith(2, 3000);
+    expect(capturingFetch).toHaveBeenCalledTimes(3);
+  });
+
   it('does NOT apply the courtesy gap when the follow-up targets a DIFFERENT host than the primary fetch', async () => {
     const now = jest.fn(() => 1_000_000);
     const sleep = jest.fn().mockResolvedValue(undefined);
