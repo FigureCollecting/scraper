@@ -173,6 +173,13 @@ RUN rm -rf /root/.cache/puppeteer \
 # launches via `node dist/...` (see CMD), so npm is not needed in the final image.
 RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
 
+# Remove Canonical's Pebble service manager: baked into the ubuntu:26.04 base layer
+# (not dpkg-owned, no apt rdepends) but never invoked here — the container runs
+# `node dist/index.js` directly (see CMD), never pebble. Its bundled Go stdlib trips
+# grype High/Critical advisories (GO-2026-5026/6089/6090/5972) that block the PR
+# security gate for every change. (2026-08-19)
+RUN rm -rf /usr/bin/pebble /var/lib/pebble
+
 # Copy built application from builder
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/packages/plugin-contract/dist ./packages/plugin-contract/dist
