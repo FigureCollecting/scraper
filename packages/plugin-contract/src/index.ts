@@ -290,15 +290,26 @@ export interface StoreCapabilities extends SiteConfig {
  * Generic engine surface only: site config, page/batch/API fetch access, and
  * a logger — so rulesets that need multiple queries per item (search + detail,
  * batch endpoints, official APIs) can issue them through engine-managed
- * plumbing instead of owning their own HTTP stack. A minimal engine may not
- * yet provide `batchFetch`/`officialApi`; rulesets must treat `ctx` as
- * optional and degrade gracefully when it is absent.
+ * plumbing instead of owning their own HTTP stack. `batchFetch`/`officialApi`/
+ * `fetchBody` are all OPTIONAL — a minimal engine may not yet provide them;
+ * rulesets must treat `ctx` (and each of these members) as possibly absent
+ * and degrade gracefully.
  */
 export interface ExtractContext {
   config: SiteConfig;
   scraping: ScrapingService & {
-    batchFetch(codes: string[], opts?: Record<string, unknown>): Promise<Record<string, unknown>>;
-    officialApi(name: string, params: Record<string, unknown>, auth?: Record<string, unknown>): Promise<unknown>;
+    batchFetch?(codes: string[], opts?: Record<string, unknown>): Promise<Record<string, unknown>>;
+    officialApi?(name: string, params: Record<string, unknown>, auth?: Record<string, unknown>): Promise<unknown>;
+    /**
+     * Added for orzgk Slice B (spec.md D1/D9, §3.1): a lightweight, NON-browser same-store
+     * follow-up GET, issued through the engine's declared transport for this store (raw-captured
+     * to the raw sink like any other fetch) and courtesy-gapped by the engine against the
+     * primary fetch — the ruleset just awaits it, the engine enforces the gap. Used by
+     * `extractMany()` implementations that need a second call off the same host (e.g. a
+     * variation-batch endpoint) without owning their own HTTP stack. Optional: an engine that
+     * doesn't yet provide it leaves this undefined; rulesets must check before calling.
+     */
+    fetchBody?(url: string, opts?: { cookies?: Record<string, string> }): Promise<{ html: string; statusCode?: number }>;
   };
   logger: PluginLogger;
 }
@@ -314,6 +325,19 @@ export interface ExtractionRuleset {
    */
   extract(html: string, url: string, ctx?: ExtractContext): ExtractedData | Promise<ExtractedData>;
   validate(data: ExtractedData): ValidationResult;
+  /**
+   * OPTIONAL: extract MULTIPLE records from one fetched page — added for orzgk Slice B
+   * (spec.md D1/D9, §1.2, §3.1, §6 B1) so a variable-product listing can emit its own record
+   * plus one record per edition/offer found on the same page (or a courtesy-gapped follow-up
+   * fetch via `ctx.scraping.fetchBody`). Contract: (a) `result[0]` is the page's own record —
+   * exactly what `extract()` would return for this page; (b) every record shares `source.site`
+   * but carries a DISTINCT `source.itemId`; (c) each record must independently pass
+   * `validate()`; (d) ordering is TARGET-FIRST — a record naming another record via
+   * `fields.offerOf`/`fields.editionOf` must appear AFTER the record it targets, since the
+   * engine emits records sequentially in array order. Engines that don't call `extractMany`
+   * keep calling `extract()` — existing 2-argument rulesets are unaffected.
+   */
+  extractMany?(html: string, url: string, ctx?: ExtractContext): ExtractedData[] | Promise<ExtractedData[]>;
   /**
    * OPTIONAL: parse a SEARCH-results response body (fetched from the store's `retrieval.bySearch`
    * endpoint) into candidate items for cross-store lookup — the buy-decision fan-out. Distinct
