@@ -97,6 +97,16 @@ export function buildExtractContext(options: BuildExtractContextOptions): Extrac
   const gapMs = options.baseDelayMs ?? DEFAULT_FETCH_BODY_GAP_MS;
   const primaryHost = safeHostname(options.primaryUrl);
 
+  // Last-fetch-per-host (re-gap, spec.md D8 follow-on): a ruleset issuing MULTIPLE fetchBody
+  // calls to the SAME host must be courtesy-gapped against its OWN previous call, not just the
+  // primary page fetch — otherwise only the FIRST follow-up ever waits, and every call after it
+  // is gapped against a primaryFetchedAt that has long since elapsed. Seeded with the primary
+  // fetch's own host/time so the first same-host follow-up's behaviour is unchanged.
+  const lastFetchedAt = new Map<string, number>();
+  if (primaryHost !== undefined) {
+    lastFetchedAt.set(primaryHost, options.primaryFetchedAt);
+  }
+
   return {
     config: options.config,
     logger: options.logger,
@@ -109,16 +119,20 @@ export function buildExtractContext(options: BuildExtractContextOptions): Extrac
 
       async fetchBody(url, fetchOpts) {
         const targetHost = safeHostname(url);
-        // Same-host-only courtesy: an unrelated host owes nothing against THIS primary fetch.
-        if (targetHost !== undefined && targetHost === primaryHost) {
-          const waitUntil = options.primaryFetchedAt + gapMs;
+        const last = targetHost !== undefined ? lastFetchedAt.get(targetHost) : undefined;
+        if (last !== undefined) {
+          const waitUntil = last + gapMs;
           const remaining = waitUntil - now();
           if (remaining > 0) {
             await sleep(remaining);
           }
         }
         const cookies = fetchOpts?.cookies ?? options.cookies;
-        return options.capturingFetch(url, options.searchFetch, cookies ? { cookies } : {});
+        const result = await options.capturingFetch(url, options.searchFetch, cookies ? { cookies } : {});
+        if (targetHost !== undefined) {
+          lastFetchedAt.set(targetHost, now());
+        }
+        return result;
       },
     },
   };

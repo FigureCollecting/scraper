@@ -137,4 +137,140 @@ describe('assembleCrawlDriver — end-to-end crawl runtime', () => {
     expect(sends.map((e) => e.source.itemId)).toEqual(['A1']);
     expect(result.coverage.done).toBe(1);
   });
+
+  /**
+   * H1 seam 2 (spec.md orzgk Slice B D8 follow-on): a ruleset's in-slot `ctx.scraping.fetchBody`
+   * follow-up must be routed through the SAME HostRateLimiter the scheduler paces primary
+   * dispatches with — otherwise the NEXT primary dispatch to that host only knows about the
+   * PRIMARY fetch's timing, understating how recently the host was really hit. A single fetch-pool
+   * slot serializes A1/A2 so A2's dispatch time exposes exactly what the limiter believes host-a's
+   * last-contact time is. A fully deterministic virtual clock (now/sleep linked, no real timers)
+   * makes the two possible outcomes (1000ms vs 1500ms) an exact, non-flaky assertion.
+   */
+  it("routes a ruleset's ctx.scraping.fetchBody through the HostRateLimiter, so slot pacing for the NEXT item accounts for it", async () => {
+    const PACED: StoreCapabilities = { ...AMIAMI, rateLimit: { ...AMIAMI.rateLimit, baseDelayMs: 1000 } };
+    let clock = 0;
+    const now = () => clock;
+    const sleep = async (ms: number) => { clock += ms; };
+    const scrapeTimes: number[] = [];
+
+    const extractMany = jest.fn(async (_html: string, url: string, ctx: any) => {
+      // Simulate real elapsed work BEFORE the in-slot follow-up fires, so the follow-up's own
+      // dispatch time is provably later than the primary fetch's.
+      await sleep(500);
+      await ctx.scraping.fetchBody('https://www.amiami.com/api/follow-up');
+      return [extracted(gcodeOf(url))];
+    });
+    const rs: ExtractionRuleset = {
+      siteId: 'amiami',
+      version: '2.0',
+      extract: jest.fn(() => { throw new Error('extract() should not run when extractMany is present'); }),
+      extractMany,
+      validate: () => ({ valid: true, errors: [], warnings: [] }),
+    };
+    const resolveContext = jest.fn(() => ({
+      config: {},
+      logger: {},
+      scraping: { fetchBody: jest.fn().mockResolvedValue({ html: 'follow-up' }) },
+    } as never));
+
+    const { driver } = build({
+      extraction: { allStores: () => [PACED], getRulesetForUrl: () => rs },
+      scrape: jest.fn(async (url: string): Promise<ScrapePageResult> => {
+        scrapeTimes.push(now());
+        return { html: '<html/>', url, title: '', statusCode: 200 };
+      }),
+      now,
+      sleep,
+      capacity: { browser: 0, fetch: 1 }, // one slot: serializes A1 then A2
+      resolveContext,
+    });
+
+    await driver.crawlSite('amiami', ['A1', 'A2']);
+
+    // A1 dispatches at t=0. Its extractMany advances the clock to t=500 before issuing the
+    // in-slot fetchBody follow-up. Routed through the limiter, that becomes host-a's real
+    // last-dispatch time — so A2 (same host, baseDelayMs=1000) cannot dispatch before t=1500.
+    // (Unrouted, A2 would dispatch at t=1000 — gated only by the primary fetch at t=0.)
+    expect(scrapeTimes).toEqual([0, 1500]);
+  });
+
+  /**
+   * Challenger H1 finding (blocker, seam-2 host-key mismatch): the store's registered
+   * `domains[0]` (CrawlTask.host) and the fetchBody follow-up URL's own hostname are not
+   * guaranteed to be the same raw string — this repo's own fixtures already mix 'amiami.com'
+   * (assembleScheduler.test.ts) and 'www.amiami.com' (this file's AMIAMI, above) for the SAME
+   * siteId. Reruns the seam-2 wiring test with domains[0]='amiami.com' (no www) while the
+   * follow-up still hits 'www.amiami.com' — the mismatched-convention case — and asserts pacing
+   * still holds, proving the two forms are collapsed to one host entry rather than silently
+   * landing in separate ones.
+   */
+  it("routes ctx.scraping.fetchBody through the HostRateLimiter even when the store's domains[0] and the follow-up URL's hostname use different www conventions", async () => {
+    const BARE_DOMAIN: StoreCapabilities = {
+      ...AMIAMI,
+      domains: ['amiami.com'], // no www — mismatches the 'www.amiami.com' follow-up URL below
+      rateLimit: { ...AMIAMI.rateLimit, baseDelayMs: 1000 },
+    };
+    let clock = 0;
+    const now = () => clock;
+    const sleep = async (ms: number) => { clock += ms; };
+    const scrapeTimes: number[] = [];
+
+    const extractMany = jest.fn(async (_html: string, url: string, ctx: any) => {
+      await sleep(500);
+      await ctx.scraping.fetchBody('https://www.amiami.com/api/follow-up');
+      return [extracted(gcodeOf(url))];
+    });
+    const rs: ExtractionRuleset = {
+      siteId: 'amiami',
+      version: '2.0',
+      extract: jest.fn(() => { throw new Error('extract() should not run when extractMany is present'); }),
+      extractMany,
+      validate: () => ({ valid: true, errors: [], warnings: [] }),
+    };
+    const resolveContext = jest.fn(() => ({
+      config: {},
+      logger: {},
+      scraping: { fetchBody: jest.fn().mockResolvedValue({ html: 'follow-up' }) },
+    } as never));
+
+    const { driver } = build({
+      extraction: { allStores: () => [BARE_DOMAIN], getRulesetForUrl: () => rs },
+      scrape: jest.fn(async (url: string): Promise<ScrapePageResult> => {
+        scrapeTimes.push(now());
+        return { html: '<html/>', url, title: '', statusCode: 200 };
+      }),
+      now,
+      sleep,
+      capacity: { browser: 0, fetch: 1 },
+      resolveContext,
+    });
+
+    await driver.crawlSite('amiami', ['A1', 'A2']);
+
+    // Same expectation as the matching-convention test above: the follow-up recorded at t=500
+    // becomes host-a's real last-contact time, so A2 cannot dispatch before t=1500 — even though
+    // domains[0] ('amiami.com') and the follow-up URL's hostname ('www.amiami.com') differ.
+    expect(scrapeTimes).toEqual([0, 1500]);
+  });
+
+  it('resolveContext returning undefined is passed through untouched (nothing to wrap)', async () => {
+    const rs: ExtractionRuleset = {
+      siteId: 'amiami',
+      version: '1.0',
+      extract: jest.fn((_html: string, url: string) => extracted(gcodeOf(url))),
+      validate: () => ({ valid: true, errors: [], warnings: [] }),
+    };
+    const resolveContext = jest.fn().mockReturnValue(undefined);
+    const { sends, driver } = build({
+      extraction: { allStores: () => [AMIAMI], getRulesetForUrl: () => rs },
+      resolveContext,
+    });
+
+    const result = await driver.crawlSite('amiami', ['A1']);
+
+    expect(rs.extract).toHaveBeenCalledWith('<html/>', expect.any(String), undefined);
+    expect(sends.map((e) => e.source.itemId)).toEqual(['A1']);
+    expect(result.coverage.done).toBe(1);
+  });
 });

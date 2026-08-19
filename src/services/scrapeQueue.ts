@@ -32,7 +32,7 @@ import { impitFetchBody } from './impitFetch.js';
 import { httpFetchBody } from './engineLookup.js';
 import { buildProfileRegistry, ProfileRegistry } from '../driver/profileRegistry.js';
 import { extractRecords } from './engineServices/extractRecords.js';
-import { buildExtractContext } from './engineServices/extractContext.js';
+import { buildExtractContext, DEFAULT_FETCH_BODY_GAP_MS } from './engineServices/extractContext.js';
 import { createPluginLogger } from './engineServices/pluginLogger.js';
 import type { CaptureSink } from './captureSink.js';
 import type {
@@ -292,6 +292,13 @@ export class ScrapeQueue {
 
   // Cooldown wait timer - prevents multiple concurrent timers when all items blocked
   private cooldownWaitTimerId: NodeJS.Timeout | null = null;
+
+  // Per-host pacing floor (H1, spec.md orzgk Slice B D8/§4 Rate row): last time an item was
+  // DISPATCHED to each host, keyed by normalized (lowercased, www-stripped) hostname — same
+  // normalization as ProfileRegistry so domain variants collapse to one entry. Independent of
+  // `currentDelay` (the GLOBAL lane): an item is only dispatched once BOTH the global lane AND
+  // this per-host floor are satisfied.
+  private hostLastDispatch: Map<string, number> = new Map();
 
   // Ingest seams (engine plumbing, injected — see setters below).
   // When an emitter is configured (INGEST_BASE_URL) AND the registry resolves
@@ -906,8 +913,8 @@ export class ScrapeQueue {
       return;
     }
 
-    // Get next item, considering paused sessions and cooldowns
-    const item = this.getNextProcessableItem();
+    // Get next item, considering paused sessions, cooldowns, and per-host pacing
+    const item = this.getNextProcessableItem(now);
     if (!item) {
       // Queue empty or all items blocked, stop processing
       this.isProcessing = false;
@@ -1135,11 +1142,35 @@ export class ScrapeQueue {
   /**
    * Get the next processable item, skipping paused sessions and respecting cooldowns
    */
-  private getNextProcessableItem(): QueueItem | null {
+  /** Lowercased, `www.`-stripped hostname (same normalization as ProfileRegistry); undefined on an unparseable URL. */
+  private hostOf(url: string): string | undefined {
+    try {
+      return new URL(url).hostname.toLowerCase().replace(/^www\./, '');
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * The per-host pacing floor (H1): the store's own declared `rateLimit.baseDelayMs` (the SAME
+   * store-caps index the ingest path's transport lookup already reads — buildIngestExtractContext
+   * above), falling back to `DEFAULT_FETCH_BODY_GAP_MS` (engineServices/extractContext.ts) for a
+   * host with no resolved store profile — mirroring that seam's own undeclared-store default
+   * rather than inventing a second one.
+   */
+  private hostBaseDelayMs(host: string): number {
+    return this.profiles?.forHost(host)?.rateLimit?.baseDelayMs ?? DEFAULT_FETCH_BODY_GAP_MS;
+  }
+
+  private getNextProcessableItem(now: number): QueueItem | null {
     // Try each priority queue in order
     const queues = [this.hotQueue, this.warmQueue, this.coldQueue];
     let pausedCount = 0;
     let cooldownCount = 0;
+    let hostPacedCount = 0;
+    // Smallest remaining wait among host-paced items, so a purely-pacing block can re-check
+    // precisely instead of falling back to the generic 5s cooldown poll below.
+    let minHostWaitMs = Infinity;
 
     for (const queue of queues) {
       for (let i = 0; i < queue.length; i++) {
@@ -1162,25 +1193,51 @@ export class ScrapeQueue {
           }
         }
 
-        // This item is processable - remove from queue and return
+        // Per-host floor: an item whose host was dispatched to more recently than its declared
+        // baseDelayMs must wait — but ONLY this item; other hosts' items (including lower-priority
+        // ones further down the lanes) are unaffected, so a paced host never stalls the rest of
+        // the queue.
+        const host = this.hostOf(item.url);
+        if (host !== undefined) {
+          const lastDispatch = this.hostLastDispatch.get(host);
+          if (lastDispatch !== undefined) {
+            const remaining = lastDispatch + this.hostBaseDelayMs(host) - now;
+            if (remaining > 0) {
+              hostPacedCount++;
+              if (remaining < minHostWaitMs) minHostWaitMs = remaining;
+              continue;
+            }
+          }
+        }
+
+        // This item is processable - remove from queue, record its host dispatch, and return
         queue.splice(i, 1);
+        if (host !== undefined) this.hostLastDispatch.set(host, now);
         return item;
       }
     }
 
-    // No processable items found - check if there are items waiting in cooldown
-    const totalBlocked = pausedCount + cooldownCount;
+    // No processable items found - check if there are items waiting in cooldown or host-paced
+    const totalBlocked = pausedCount + cooldownCount + hostPacedCount;
     if (totalBlocked > 0 && !this.cooldownWaitTimerId) {
+      // Purely host-paced (no paused/cooldown items in the mix): re-check exactly when the
+      // soonest-ready host clears, rather than the generic 5s poll below.
+      const waitMs = pausedCount === 0 && cooldownCount === 0 && minHostWaitMs !== Infinity
+        ? minHostWaitMs
+        : 5000;
       // Log summary once and schedule SINGLE retry timer
       // Guard with cooldownWaitTimerId to prevent multiple concurrent timers
-      console.log(`[SCRAPE QUEUE] All ${totalBlocked} items blocked (${pausedCount} paused, ${cooldownCount} in cooldown), waiting 5s...`);
+      console.log(`[SCRAPE QUEUE] All ${totalBlocked} items blocked (${pausedCount} paused, ${cooldownCount} in cooldown, ${hostPacedCount} host-paced), waiting ${waitMs}ms...`);
       this.cooldownWaitTimerId = setTimeout(() => {
         this.cooldownWaitTimerId = null; // Clear before retry to allow future timers
-        if (!this.isProcessing) {
-          this.isProcessing = true;
-          this.processNext();
-        }
-      }, 5000); // Check again in 5 seconds
+        // Always re-drive: `isProcessing` may already be true (e.g. a DIFFERENT item for another
+        // host dispatched successfully while this one stayed blocked — see H1), in which case
+        // nothing else schedules a further attempt for the item(s) that caused this timer.
+        // processNext() is itself re-entrancy-safe (guarded by the processingItem lock), so
+        // calling it unconditionally here is always correct, never a double-dispatch risk.
+        this.isProcessing = true;
+        this.processNext();
+      }, waitMs);
     }
 
     return null;

@@ -10,6 +10,8 @@
  * `now` explicitly, so behaviour is deterministic and testable without timers.
  */
 
+import type { ExtractContext } from '@figurecollecting/scraper-plugin-contract';
+
 /** The rate knobs the limiter needs. `DomainRateLimit` is structurally assignable. */
 export interface HostRateConfig {
   baseDelayMs: number;
@@ -28,6 +30,18 @@ interface HostState {
 }
 
 const clamp = (v: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, v));
+
+/**
+ * Host key: lowercased, trimmed, `www.`-stripped, so domain variants collapse to ONE state entry
+ * (same normalization as ProfileRegistry.normalizeHost). Callers pass whatever raw string form
+ * they have on hand — CrawlTask.host is StoreCapabilities.domains[0] verbatim, while a fetchBody
+ * follow-up's key is parsed straight off the request URL (hostnameOf, below) — and this repo's
+ * own fixtures already mix 'amiami.com'/'www.amiami.com' for the SAME store, so those two forms
+ * are not guaranteed to be byte-identical. Normalizing here, at the single state-lookup seam
+ * every method already funnels through, is what makes a fetchBody dispatch land on the SAME host
+ * entry a primary dispatch created, regardless of which raw form either side used.
+ */
+const normalizeHost = (host: string): string => host.trim().toLowerCase().replace(/^www\./, '');
 
 const DEFAULT_CONFIG: HostRateConfig = {
   baseDelayMs: 2067,
@@ -50,7 +64,8 @@ export class HostRateLimiter {
     private readonly defaultConfig: HostRateConfig = DEFAULT_CONFIG,
   ) {}
 
-  private stateFor(host: string): HostState {
+  private stateFor(rawHost: string): HostState {
+    const host = normalizeHost(rawHost);
     let s = this.hosts.get(host);
     if (!s) {
       const config = this.configFor(host) ?? this.defaultConfig;
@@ -101,4 +116,52 @@ export class HostRateLimiter {
     );
     s.consecutiveSuccesses = 0;
   }
+}
+
+/**
+ * Lowercased hostname, undefined on an unparseable URL. Handed to HostRateLimiter as-is — its own
+ * `stateFor` normalizes (www-strip/trim/lowercase) on the way in, so this need not match
+ * CrawlTask.host's raw string form; the limiter is what makes the two forms collapse.
+ */
+function hostnameOf(url: string): string | undefined {
+  try {
+    return new URL(url).hostname.trim().toLowerCase();
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Wrap an ExtractContext's `scraping.fetchBody` so every in-slot follow-up call ALSO records a
+ * dispatch on the given HostRateLimiter (H1 seam 2, spec.md orzgk Slice B): without this, a
+ * ruleset's `ctx.scraping.fetchBody` (extractMany's same-store follow-up, courtesy-gapped by
+ * buildExtractContext against ITS OWN prior call) is invisible to the driver's scheduler — the
+ * NEXT primary dispatch to that host would only know about the earlier PRIMARY fetch's timing,
+ * understating how recently the host was actually contacted. A context with no `fetchBody`
+ * (nothing to route) is returned UNCHANGED (same reference), so callers that don't touch it see
+ * no behavioural difference.
+ */
+export function wrapFetchBodyWithLimiter(
+  ctx: ExtractContext,
+  limiter: HostRateLimiter,
+  now: () => number = Date.now,
+): ExtractContext {
+  const original = ctx.scraping.fetchBody;
+  if (!original) return ctx;
+
+  return {
+    ...ctx,
+    scraping: {
+      ...ctx.scraping,
+      fetchBody: async (url, opts) => {
+        // Record at CALL time (matching DispatchScheduler.dispatch's own convention for primary
+        // dispatches), not once the fetch resolves — a same-host primary dispatch decision made
+        // WHILE this follow-up is still in flight must already see it, or the two can be paced
+        // far closer together than baseDelayMs intends (H1 finding: dispatch-time race).
+        const host = hostnameOf(url);
+        if (host !== undefined) limiter.recordDispatch(host, now());
+        return original(url, opts);
+      },
+    },
+  };
 }
