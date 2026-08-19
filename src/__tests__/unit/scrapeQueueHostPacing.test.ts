@@ -202,4 +202,17 @@ describe('ScrapeQueue — live queue per-host pacing (H1)', () => {
     expect(scraping.scrapePage).toHaveBeenCalledTimes(3);
     expect(scraping.scrapePage.mock.calls[2][0]).toBe('https://host-a.test/item/a1');
   });
+
+  it('treats an item with an unparseable URL as having no host — never blocks on the pacing floor, never crashes or hangs', async () => {
+    makeQueue([{ siteId: 'host-a', domain: 'host-a.test', baseDelayMs: 5000 }]);
+
+    const result = queue.enqueue('bad1', { priority: 'WARM', url: 'not a url at all', maxRetries: 0 });
+    const outcome = result.promise.catch((e: Error) => e);
+
+    await advanceAndFlush(500);
+
+    // No ruleset matches an unparseable URL — the item fails cleanly (EXTRACTION_UNAVAILABLE)
+    // rather than hanging forever behind a pacing check that can't resolve a host.
+    expect(await outcome).toBeInstanceOf(Error);
+  });
 });

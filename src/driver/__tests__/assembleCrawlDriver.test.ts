@@ -194,4 +194,24 @@ describe('assembleCrawlDriver — end-to-end crawl runtime', () => {
     // (Unrouted, A2 would dispatch at t=1000 — gated only by the primary fetch at t=0.)
     expect(scrapeTimes).toEqual([0, 1500]);
   });
+
+  it('resolveContext returning undefined is passed through untouched (nothing to wrap)', async () => {
+    const rs: ExtractionRuleset = {
+      siteId: 'amiami',
+      version: '1.0',
+      extract: jest.fn((_html: string, url: string) => extracted(gcodeOf(url))),
+      validate: () => ({ valid: true, errors: [], warnings: [] }),
+    };
+    const resolveContext = jest.fn().mockReturnValue(undefined);
+    const { sends, driver } = build({
+      extraction: { allStores: () => [AMIAMI], getRulesetForUrl: () => rs },
+      resolveContext,
+    });
+
+    const result = await driver.crawlSite('amiami', ['A1']);
+
+    expect(rs.extract).toHaveBeenCalledWith('<html/>', expect.any(String), undefined);
+    expect(sends.map((e) => e.source.itemId)).toEqual(['A1']);
+    expect(result.coverage.done).toBe(1);
+  });
 });
