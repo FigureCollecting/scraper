@@ -22,6 +22,7 @@
 import { buildProfileRegistry, type ProfileRegistry } from './profileRegistry.js';
 import { assembleScheduler } from './assembleScheduler.js';
 import { assembleCrawlWorker } from './assembleCrawlWorker.js';
+import { wrapFetchBodyWithLimiter } from './hostRateLimiter.js';
 import { CrawlLoop, type CrawlLoopStats } from './crawlLoop.js';
 import { CoverageLedger, type CoverageCounts } from './coverageLedger.js';
 import type { PoolCapacity } from './poolRouter.js';
@@ -88,18 +89,27 @@ export function assembleCrawlDriver(services: CrawlDriverServices): CrawlDriver 
       const ledger = new CoverageLedger(siteId);
       ledger.add(itemIds);
 
+      const { scheduler, limiter } = assembleScheduler(profiles, services.capacity);
+
       const worker = assembleCrawlWorker({
         scrape: services.scrape,
         getRulesetForUrl: services.extraction.getRulesetForUrl,
         retrievalFor: (h) => profiles.retrievalFor(h),
         emit: services.emit,
         ledger,
+        // H1 seam 2: route a resolved ExtractContext's ctx.scraping.fetchBody (the ruleset's
+        // in-slot same-host follow-up) through the SAME HostRateLimiter that paces primary
+        // dispatches — otherwise the follow-up is invisible to it, and the NEXT primary dispatch
+        // to that host understates how recently it was really contacted.
         ...(services.resolveContext
-          ? { resolveContext: (task, url) => services.resolveContext!(siteId, task, url) }
+          ? {
+              resolveContext: (task, url) => {
+                const ctx = services.resolveContext!(siteId, task, url);
+                return ctx ? wrapFetchBodyWithLimiter(ctx, limiter, services.now) : ctx;
+              },
+            }
           : {}),
       });
-
-      const { scheduler } = assembleScheduler(profiles, services.capacity);
       // Seed from remaining() (pending + retryable-failed) so a restored ledger resumes cleanly.
       for (const id of ledger.remaining()) scheduler.enqueue({ id, host });
 

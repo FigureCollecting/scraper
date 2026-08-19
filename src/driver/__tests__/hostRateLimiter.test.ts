@@ -5,7 +5,8 @@
  * `rateLimit`), so parallel stores never share a throttle and a Cloudflare
  * block on one host cannot slow another.
  */
-import { HostRateLimiter, type HostRateConfig } from '../hostRateLimiter';
+import { HostRateLimiter, wrapFetchBodyWithLimiter, type HostRateConfig } from '../hostRateLimiter';
+import type { ExtractContext } from '@figurecollecting/scraper-plugin-contract';
 
 const cfg = (over: Partial<HostRateConfig> = {}): HostRateConfig => ({
   baseDelayMs: 1000,
@@ -78,5 +79,65 @@ describe('HostRateLimiter — per-host throttle', () => {
     const rl = new HostRateLimiter(() => cfg({ baseDelayMs: 1000 }));
     rl.recordDispatch('a.com', 0);
     expect(rl.msUntilReady('a.com', 400)).toBe(600); // throttled from t=0, not treated as fresh
+  });
+});
+
+/**
+ * TDD (red first): H1 seam 2 — the crawl driver's in-slot `ctx.scraping.fetchBody` follow-up is
+ * invisible to HostRateLimiter today (it is issued mid-slot, entirely outside DispatchScheduler's
+ * dispatch/settle cycle), so slot pacing for the NEXT primary dispatch to that host only knows
+ * about the PRIMARY fetch's own timing, understating how recently the host was actually hit.
+ * `wrapFetchBodyWithLimiter` closes that gap: it wraps an ExtractContext's `fetchBody` so every
+ * call also records a dispatch on the limiter for the target host.
+ */
+const STUB_SCRAPING = {
+  scrapePage: jest.fn(),
+  scrapePageStealth: jest.fn(),
+  browserFetch: jest.fn(),
+  withBrowser: jest.fn(),
+  withPage: jest.fn(),
+};
+
+describe('wrapFetchBodyWithLimiter — routes driver fetchBody dispatches through the limiter', () => {
+  it("records a dispatch on the limiter, at the call's own time, when fetchBody is invoked", async () => {
+    const rl = new HostRateLimiter(() => cfg({ baseDelayMs: 1000 }));
+    const fetchBody = jest.fn().mockResolvedValue({ html: 'x' });
+    const ctx = { config: {}, logger: {}, scraping: { ...STUB_SCRAPING, fetchBody } } as unknown as ExtractContext;
+
+    const wrapped = wrapFetchBodyWithLimiter(ctx, rl, () => 5000);
+    expect(rl.msUntilReady('orzgk.com', 5000)).toBe(0); // never dispatched yet
+
+    const result = await wrapped.scraping.fetchBody!('https://orzgk.com/api/x');
+
+    expect(result).toEqual({ html: 'x' });
+    expect(fetchBody).toHaveBeenCalledWith('https://orzgk.com/api/x', undefined);
+    expect(rl.msUntilReady('orzgk.com', 5000)).toBe(1000); // just recorded as dispatched at t=5000
+  });
+
+  it('leaves an ExtractContext with no fetchBody unchanged (same reference — nothing to wrap)', () => {
+    const rl = new HostRateLimiter(() => cfg());
+    const ctx = { config: {}, logger: {}, scraping: { ...STUB_SCRAPING } } as unknown as ExtractContext;
+
+    expect(wrapFetchBodyWithLimiter(ctx, rl)).toBe(ctx);
+  });
+
+  it('never throws and skips recording for an unparseable url', async () => {
+    const rl = new HostRateLimiter(() => cfg());
+    const fetchBody = jest.fn().mockResolvedValue({ html: 'x' });
+    const ctx = { config: {}, logger: {}, scraping: { ...STUB_SCRAPING, fetchBody } } as unknown as ExtractContext;
+    const wrapped = wrapFetchBodyWithLimiter(ctx, rl, () => 1000);
+
+    await expect(wrapped.scraping.fetchBody!('not a url')).resolves.toEqual({ html: 'x' });
+  });
+
+  it('passes opts through to the original fetchBody untouched', async () => {
+    const rl = new HostRateLimiter(() => cfg());
+    const fetchBody = jest.fn().mockResolvedValue({ html: 'x' });
+    const ctx = { config: {}, logger: {}, scraping: { ...STUB_SCRAPING, fetchBody } } as unknown as ExtractContext;
+    const wrapped = wrapFetchBodyWithLimiter(ctx, rl, () => 1000);
+
+    await wrapped.scraping.fetchBody!('https://orzgk.com/api/x', { cookies: { a: 'b' } });
+
+    expect(fetchBody).toHaveBeenCalledWith('https://orzgk.com/api/x', { cookies: { a: 'b' } });
   });
 });

@@ -10,6 +10,8 @@
  * `now` explicitly, so behaviour is deterministic and testable without timers.
  */
 
+import type { ExtractContext } from '@figurecollecting/scraper-plugin-contract';
+
 /** The rate knobs the limiter needs. `DomainRateLimit` is structurally assignable. */
 export interface HostRateConfig {
   baseDelayMs: number;
@@ -101,4 +103,52 @@ export class HostRateLimiter {
     );
     s.consecutiveSuccesses = 0;
   }
+}
+
+/**
+ * Lowercased hostname, undefined on an unparseable URL. Deliberately NOT `www.`-stripped: the
+ * driver's own host keys (CrawlTask.host, HostRateLimiter/DispatchScheduler's map keys) are the
+ * RAW domain string from StoreCapabilities.domains (e.g. 'www.amiami.com') — ProfileRegistry
+ * strips `www.` only for its OWN internal lookup index, never for the keys it hands back out.
+ * Matching that raw form here is what lets a fetchBody dispatch land on the SAME host entry a
+ * primary dispatch already created.
+ */
+function hostnameOf(url: string): string | undefined {
+  try {
+    return new URL(url).hostname.trim().toLowerCase();
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Wrap an ExtractContext's `scraping.fetchBody` so every in-slot follow-up call ALSO records a
+ * dispatch on the given HostRateLimiter (H1 seam 2, spec.md orzgk Slice B): without this, a
+ * ruleset's `ctx.scraping.fetchBody` (extractMany's same-store follow-up, courtesy-gapped by
+ * buildExtractContext against ITS OWN prior call) is invisible to the driver's scheduler — the
+ * NEXT primary dispatch to that host would only know about the earlier PRIMARY fetch's timing,
+ * understating how recently the host was actually contacted. A context with no `fetchBody`
+ * (nothing to route) is returned UNCHANGED (same reference), so callers that don't touch it see
+ * no behavioural difference.
+ */
+export function wrapFetchBodyWithLimiter(
+  ctx: ExtractContext,
+  limiter: HostRateLimiter,
+  now: () => number = Date.now,
+): ExtractContext {
+  const original = ctx.scraping.fetchBody;
+  if (!original) return ctx;
+
+  return {
+    ...ctx,
+    scraping: {
+      ...ctx.scraping,
+      fetchBody: async (url, opts) => {
+        const result = await original(url, opts);
+        const host = hostnameOf(url);
+        if (host !== undefined) limiter.recordDispatch(host, now());
+        return result;
+      },
+    },
+  };
 }
