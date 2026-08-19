@@ -195,6 +195,65 @@ describe('assembleCrawlDriver — end-to-end crawl runtime', () => {
     expect(scrapeTimes).toEqual([0, 1500]);
   });
 
+  /**
+   * Challenger H1 finding (blocker, seam-2 host-key mismatch): the store's registered
+   * `domains[0]` (CrawlTask.host) and the fetchBody follow-up URL's own hostname are not
+   * guaranteed to be the same raw string — this repo's own fixtures already mix 'amiami.com'
+   * (assembleScheduler.test.ts) and 'www.amiami.com' (this file's AMIAMI, above) for the SAME
+   * siteId. Reruns the seam-2 wiring test with domains[0]='amiami.com' (no www) while the
+   * follow-up still hits 'www.amiami.com' — the mismatched-convention case — and asserts pacing
+   * still holds, proving the two forms are collapsed to one host entry rather than silently
+   * landing in separate ones.
+   */
+  it("routes ctx.scraping.fetchBody through the HostRateLimiter even when the store's domains[0] and the follow-up URL's hostname use different www conventions", async () => {
+    const BARE_DOMAIN: StoreCapabilities = {
+      ...AMIAMI,
+      domains: ['amiami.com'], // no www — mismatches the 'www.amiami.com' follow-up URL below
+      rateLimit: { ...AMIAMI.rateLimit, baseDelayMs: 1000 },
+    };
+    let clock = 0;
+    const now = () => clock;
+    const sleep = async (ms: number) => { clock += ms; };
+    const scrapeTimes: number[] = [];
+
+    const extractMany = jest.fn(async (_html: string, url: string, ctx: any) => {
+      await sleep(500);
+      await ctx.scraping.fetchBody('https://www.amiami.com/api/follow-up');
+      return [extracted(gcodeOf(url))];
+    });
+    const rs: ExtractionRuleset = {
+      siteId: 'amiami',
+      version: '2.0',
+      extract: jest.fn(() => { throw new Error('extract() should not run when extractMany is present'); }),
+      extractMany,
+      validate: () => ({ valid: true, errors: [], warnings: [] }),
+    };
+    const resolveContext = jest.fn(() => ({
+      config: {},
+      logger: {},
+      scraping: { fetchBody: jest.fn().mockResolvedValue({ html: 'follow-up' }) },
+    } as never));
+
+    const { driver } = build({
+      extraction: { allStores: () => [BARE_DOMAIN], getRulesetForUrl: () => rs },
+      scrape: jest.fn(async (url: string): Promise<ScrapePageResult> => {
+        scrapeTimes.push(now());
+        return { html: '<html/>', url, title: '', statusCode: 200 };
+      }),
+      now,
+      sleep,
+      capacity: { browser: 0, fetch: 1 },
+      resolveContext,
+    });
+
+    await driver.crawlSite('amiami', ['A1', 'A2']);
+
+    // Same expectation as the matching-convention test above: the follow-up recorded at t=500
+    // becomes host-a's real last-contact time, so A2 cannot dispatch before t=1500 — even though
+    // domains[0] ('amiami.com') and the follow-up URL's hostname ('www.amiami.com') differ.
+    expect(scrapeTimes).toEqual([0, 1500]);
+  });
+
   it('resolveContext returning undefined is passed through untouched (nothing to wrap)', async () => {
     const rs: ExtractionRuleset = {
       siteId: 'amiami',
