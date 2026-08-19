@@ -186,7 +186,8 @@ describe('ScrapeQueue - ingest raw-fetch honors ruleset transport', () => {
     expect(scraping.scrapePage).not.toHaveBeenCalled();
     expect(scraping.scrapePageStealth).not.toHaveBeenCalled();
     // the RAW json body (not a browser-rendered wrapper) reached extract()
-    expect(ruleset.extract).toHaveBeenCalledWith('{"name":"Sentai Figure"}', url);
+    // B3: extractRecords forwards the built ExtractContext as extract's 3rd arg.
+    expect(ruleset.extract).toHaveBeenCalledWith('{"name":"Sentai Figure"}', url, expect.anything());
     expect(data).toEqual({ name: 'Sentai Figure' });
     // spine emit happened — this is the "zero claims" bug, fixed
     expect(send).toHaveBeenCalledTimes(1);
@@ -218,7 +219,8 @@ describe('ScrapeQueue - ingest raw-fetch honors ruleset transport', () => {
 
     expect(http).toHaveBeenCalledWith(url);
     expect(scraping.scrapePage).not.toHaveBeenCalled();
-    expect(ruleset.extract).toHaveBeenCalledWith('{"name":"Tier1 Figure"}', url);
+    // B3: extractRecords forwards the built ExtractContext as extract's 3rd arg.
+    expect(ruleset.extract).toHaveBeenCalledWith('{"name":"Tier1 Figure"}', url, expect.anything());
     expect(send).toHaveBeenCalledTimes(1);
     expect(sink.captures).toHaveLength(1);
     expect(sink.captures[0].lane).toBe('api');
@@ -245,7 +247,8 @@ describe('ScrapeQueue - ingest raw-fetch honors ruleset transport', () => {
     expect(scraping.scrapePage).toHaveBeenCalledWith('https://myfigurecollection.net/item/12345');
     expect(impersonate).not.toHaveBeenCalled();
     expect(http).not.toHaveBeenCalled();
-    expect(ruleset.extract).toHaveBeenCalledWith('<html><body><h1>Kitagawa Marin</h1></body></html>', 'https://myfigurecollection.net/item/12345');
+    // B3: extractRecords forwards the built ExtractContext as extract's 3rd arg.
+    expect(ruleset.extract).toHaveBeenCalledWith('<html><body><h1>Kitagawa Marin</h1></body></html>', 'https://myfigurecollection.net/item/12345', expect.anything());
     expect(send).toHaveBeenCalledTimes(1);
   });
 

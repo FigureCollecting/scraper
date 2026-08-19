@@ -31,11 +31,16 @@ import { createIngestEmitterFromEnv } from './ingestEmitter.js';
 import { impitFetchBody } from './impitFetch.js';
 import { httpFetchBody } from './engineLookup.js';
 import { buildProfileRegistry, ProfileRegistry } from '../driver/profileRegistry.js';
+import { extractRecords } from './engineServices/extractRecords.js';
+import { buildExtractContext } from './engineServices/extractContext.js';
+import { createPluginLogger } from './engineServices/pluginLogger.js';
 import type { CaptureSink } from './captureSink.js';
 import type {
   ExtractionRuleset,
+  ExtractContext,
   ExtractedData as PluginExtractedData,
   ScrapingService,
+  SiteConfig,
   StoreCapabilities,
   SearchFetch,
 } from '@figurecollecting/scraper-plugin-contract';
@@ -1019,16 +1024,21 @@ export class ScrapeQueue {
   private async processViaIngest(item: QueueItem, ruleset: ExtractionRuleset): Promise<ScrapedData> {
     const searchFetch = this.getSearchFetchFor(item.url);
     const page = await this.getCapturingFetch()(item.url, searchFetch, { cookies: item.cookies });
+    // Anchor for the courtesy gap (D8): the instant the PRIMARY fetch completed, so a same-store
+    // `ctx.scraping.fetchBody` follow-up (extractMany's second call) waits the store's declared
+    // gap against THIS fetch, not against whenever the follow-up happens to be invoked.
+    const primaryFetchedAt = Date.now();
+    const ctx = this.buildIngestExtractContext(item, ruleset, searchFetch, primaryFetchedAt);
 
-    let extracted: PluginExtractedData;
+    let records: PluginExtractedData[];
     try {
-      // extract() is async-capable (E1): the contract allows it to return
-      // ExtractedData or a Promise, so the result is ALWAYS awaited — sync
-      // rulesets pass through unchanged. The duck-typed extractAsync path
-      // predates E1 and is kept for rulesets that still expose it.
-      extracted = typeof (ruleset as { extractAsync?: unknown }).extractAsync === 'function'
-        ? await (ruleset as unknown as { extractAsync(h: string, u: string): Promise<PluginExtractedData> }).extractAsync(page.html, item.url)
-        : await ruleset.extract(page.html, item.url);
+      // extractRecords folds extractMany > extractAsync > extract into one always-array result
+      // (engineServices/extractRecords.ts) — a single-record ruleset's own extraction call is
+      // byte-for-byte what it was before this dispatch existed; only the caller-facing shape
+      // (array vs bare object) is new. D11 guards (empty / dup itemId / target-before-source) run
+      // inside it: a violation throws here, so nothing is emitted, same as any other extraction
+      // failure.
+      records = await extractRecords(ruleset, page.html, item.url, ctx);
     } catch (error: any) {
       console.error(
         `[SCRAPE QUEUE] Extraction failed for ${item.url} (ruleset ${ruleset.siteId}@${ruleset.version}): ${sanitizeForLog(error?.message ?? String(error))}`
@@ -1036,9 +1046,90 @@ export class ScrapeQueue {
       throw error instanceof Error ? error : new Error(String(error));
     }
 
-    await this.ingestEmitter!.send(extracted);
+    // D2: N sequential unary Ingest calls in array order, parent FIRST, each awaited — STOP at
+    // the first failure. The ingest server commits a record before the call resolves, so an
+    // awaited prefix guarantees every later (dependent, e.g. editionOf/offerOf) record's target
+    // already landed before it is sent. A failure here is a PARTIAL-EMIT state: logged and
+    // counted (never silently swallowed), then rethrown through the queue's existing failure
+    // handling — the retry re-fetches, re-extracts, and re-emits ALL records as new honest
+    // observations (no partial-batch ambiguity: there is no batch, only a resumable prefix).
+    let emittedCount = 0;
+    try {
+      for (const record of records) {
+        await this.ingestEmitter!.send(record);
+        emittedCount++;
+      }
+    } catch (error: any) {
+      console.error(
+        `[SCRAPE QUEUE] Ingest emit failed for ${item.url} after ${emittedCount}/${records.length} records emitted ` +
+          `(ruleset ${ruleset.siteId}@${ruleset.version}): ${sanitizeForLog(error?.message ?? String(error))}`
+      );
+      throw error instanceof Error ? error : new Error(String(error));
+    }
 
-    return extracted.fields as ScrapedData;
+    console.log(
+      `[SCRAPE QUEUE] Ingest complete for ${item.url}: records emitted=${emittedCount}/${records.length} (ruleset ${ruleset.siteId}@${ruleset.version})`
+    );
+
+    // [0] is always the page's own record (extractMany's documented contract; the single-record
+    // fallback's one-element array trivially satisfies it too) — handleSuccess/the /ingest/scrape
+    // response stay parent-shaped, unchanged from today.
+    return records[0].fields as ScrapedData;
+  }
+
+  /**
+   * Build the ExtractContext for one item's extraction (B3, spec.md D1/D8/D9). Only
+   * `scraping.fetchBody` is truly implemented (engineServices/extractContext.ts); it reuses the
+   * SAME capturing fetch + the store's OWN declared `searchFetch` transport as the primary fetch,
+   * so a same-store follow-up (e.g. orzgk's variation-batch endpoint) still lands in the capture
+   * sink under the 'api' lane, courtesy-gapped against `primaryFetchedAt`.
+   */
+  private buildIngestExtractContext(
+    item: QueueItem,
+    ruleset: ExtractionRuleset,
+    searchFetch: SearchFetch | undefined,
+    primaryFetchedAt: number,
+  ): ExtractContext {
+    let hostname: string | undefined;
+    try {
+      hostname = new URL(item.url).hostname;
+    } catch {
+      hostname = undefined;
+    }
+    const caps = hostname ? this.profiles?.forHost(hostname) : undefined;
+    // Fallback SiteConfig for the (should-be-rare) case a ruleset resolved but its store isn't in
+    // the capability index — e.g. a stale/DI'd registry in tests. Mirrors the queue's own global
+    // adaptive-lane defaults (RATE_LIMIT above) so a missing profile degrades to a sane, documented
+    // gap rather than an undefined one.
+    const config: SiteConfig =
+      caps ?? {
+        siteId: ruleset.siteId,
+        name: ruleset.siteId,
+        domains: hostname ? [hostname] : [],
+        rateLimit: {
+          domain: hostname ?? '',
+          baseDelayMs: RATE_LIMIT.BASE_DELAY,
+          minDelayMs: RATE_LIMIT.MIN_DELAY,
+          maxDelayMs: RATE_LIMIT.MAX_DELAY,
+          backoffMultiplier: RATE_LIMIT.BACKOFF_MULTIPLIER,
+          recoveryDivisor: RATE_LIMIT.RECOVERY_DIVISOR,
+          successThreshold: RATE_LIMIT.SUCCESS_THRESHOLD,
+        },
+        requiresBrowser: false,
+        allowedCookies: [],
+      };
+
+    return buildExtractContext({
+      config,
+      logger: createPluginLogger(ruleset.siteId),
+      scraping: this.getRawPageFetcher(),
+      capturingFetch: this.getCapturingFetch(),
+      searchFetch,
+      cookies: item.cookies,
+      primaryUrl: item.url,
+      primaryFetchedAt,
+      baseDelayMs: caps?.rateLimit?.baseDelayMs,
+    });
   }
 
   /**

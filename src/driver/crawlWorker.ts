@@ -2,7 +2,7 @@
  * crawlWorker — the crawl driver's I2 worker: the `(task) => Promise<Outcome>` function the
  * CrawlLoop launches per dispatch. It composes the injected engine ports into one item pipeline:
  *
- *   resolveUrl(task) → fetch(url) → lookupRuleset(url).extract(html, url, ctx) → emit(extracted)
+ *   resolveUrl(task) → fetch(url) → extractRecords(lookupRuleset(url), html, url, ctx) → emit(each)
  *
  * and records the item's fate on the CoverageLedger. Everything is injected (no ScrapingService /
  * ExtractionRegistry / IngestEmitter imports here) so the worker is a pure composition unit,
@@ -18,7 +18,7 @@
  *   fetch throws / 429 / 503 → (pending)  + 'rate-limited' host throttled/blocked → back off, retry
  *   extract throws           → markFailed + 'success'      page fetched OK; CONTENT failed (see note)
  *   emit throws              → (pending)  + 'rate-limited' delivery failed → backpressure, retry
- *   emit OK                  → markDone   + 'success'      covered
+ *   emit OK (every record)   → markDone   + 'success'      covered
  *
  * LAYERING NOTE — why "extract throws" is a content failure, not a block: Cloudflare / throttle
  * detection is the FETCH port's contract (it throws or returns a 429/503). So by the time control
@@ -26,10 +26,23 @@
  * failure (the plugin wraps extract with the coverage gate), which backing off the host would not
  * fix. Spine-down backpressure via 'rate-limited' on emit failure is deliberately crude — a
  * spine-health circuit breaker belongs at the loop/driver level (I3), not per item.
+ *
+ * B3 DRIVER PARITY (spec.md orzgk Slice B D7): extraction is dispatched through `extractRecords`
+ * (engineServices/extractRecords.ts — the SAME helper the live ingest queue uses), which folds
+ * `extractMany` (if the ruleset has it) into an always-array result and enforces the D11
+ * ordering/uniqueness guards; a violation throws, landing in the SAME "extract throws → markFailed
+ * + success" bucket as any other content failure. `emit` then runs sequentially over EVERY record
+ * in array order (D2: parent-first, each awaited) — the first emit failure stops the loop (later,
+ * dependent records are never sent) and lands in the SAME "emit throws → pending + rate-limited"
+ * bucket as today's single-record path. A single-record ruleset (no `extractMany`) is therefore
+ * byte-for-byte unaffected: `extractRecords` wraps its one record in a 1-element array, so the
+ * `emit` loop runs exactly once, exactly as it does today. Dormant until A3 (no non-test importer
+ * of `src/driver/` yet).
  */
 import type { CrawlTask, Outcome } from './dispatchScheduler.js';
 import type { CoverageLedger } from './coverageLedger.js';
 import type { ExtractContext, ExtractedData, ExtractionRuleset } from '@figurecollecting/scraper-plugin-contract';
+import { extractRecords } from '../services/engineServices/extractRecords.js';
 
 /** What the fetch port yields. It MUST throw on CF-block / network error (→ treated as throttle). */
 export interface FetchResult {
@@ -85,16 +98,21 @@ export function makeCrawlWorker(deps: CrawlWorkerDeps): (task: CrawlTask) => Pro
       return 'rate-limited'; // host throttled → back off, leave the item pending
     }
 
-    let extracted: ExtractedData;
+    let records: ExtractedData[];
     try {
-      extracted = await ruleset.extract(page.html, url, deps.resolveContext?.(task, url));
+      records = await extractRecords(ruleset, page.html, url, deps.resolveContext?.(task, url));
     } catch {
       deps.ledger.markFailed(task.id); // page came back fine; content/coverage failed — not a throttle
       return 'success';
     }
 
     try {
-      await deps.emit(extracted);
+      // D2: sequential unary emit, array order (parent-first), each awaited — stop at the first
+      // failure so a dependent (editionOf/offerOf) record is never sent ahead of a target that
+      // never landed. A single-record ruleset's one-element array runs this loop exactly once.
+      for (const record of records) {
+        await deps.emit(record);
+      }
     } catch {
       return 'rate-limited'; // delivery failed (spine) → backpressure; item stays pending for retry
     }
