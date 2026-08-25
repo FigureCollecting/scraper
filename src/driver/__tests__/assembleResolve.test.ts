@@ -154,6 +154,25 @@ describe('assembleResolve — byId confirm', () => {
     expect(fetchedAt[1]! - fetchedAt[0]!).toBeGreaterThanOrEqual(3000);
   });
 
+  it('paces with REAL time when no clock/sleep are injected (the default now/sleep path) — the same-host gap is measurable', async () => {
+    const store: StoreCapabilities = {
+      ...caps('amiami', 'amiami.com', { byId: { urlTemplate: 'https://www.amiami.com/eng/detail/?gcode={id}', idKind: 'store-internal' } }),
+      rateLimit: { domain: 'amiami.com', baseDelayMs: 25, minDelayMs: 0, maxDelayMs: 100, backoffMultiplier: 2, recoveryDivisor: 2, successThreshold: 3 },
+    };
+    const fetchedAt: number[] = [];
+    const fetchDetail = jest.fn(async () => { fetchedAt.push(Date.now()); return { html: 'ok', statusCode: 200 }; });
+
+    const out = await assembleResolve({
+      profiles: buildProfileRegistry([store]),
+      getRulesetForUrl: () => stub(() => extracted('1')),
+      fetchDetail,
+    }).resolve('amiami', ['R-1', 'R-2']);
+
+    expect(out.failed).toEqual([]);
+    // Real setTimeout floor — allow scheduler slack, but the ~25ms courtesy gap must be visible.
+    expect(fetchedAt[1]! - fetchedAt[0]!).toBeGreaterThanOrEqual(20);
+  });
+
   it('a throw from URL building / ruleset lookup fails THAT id only — siblings still resolve (no batch poisoning)', async () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
     // getRulesetForUrl deliberately propagates new URL() throws (extractionRegistry), and

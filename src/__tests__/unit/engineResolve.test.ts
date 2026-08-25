@@ -192,6 +192,80 @@ describe('createEngineResolve', () => {
     expect(out.results[0]?.records).toEqual([edition]);
   });
 
+  it('falls back to forSite when the byId template\'s host sits OUTSIDE the store\'s indexed domains — store caps still resolve', async () => {
+    // The forHost-miss → forSite-HIT branch's motivating case (engineResolve's own comment): the
+    // detail host is not in domains[], but the ruleset's siteId IS registered — the ctx must carry
+    // the STORE's config, gap, and transport, not the synthesized last-resort default.
+    const SOLARIS: StoreCapabilities = {
+      siteId: 'solaris', name: 'Solaris Japan', domains: ['solaris-japan.com'], requiresBrowser: false, allowedCookies: [],
+      rateLimit: { domain: 'solaris-japan.com', baseDelayMs: 1234, minDelayMs: 500, maxDelayMs: 10000, backoffMultiplier: 2, recoveryDivisor: 2, successThreshold: 3 },
+      retrieval: { byId: { urlTemplate: 'https://details.solaris-cdn.example/item/{id}', idKind: 'store-internal' } },
+      searchFetch: { transport: 'http' },
+    };
+    let seenCtx: ExtractContext | undefined;
+    const ruleset: ExtractionRuleset = {
+      siteId: 'solaris',
+      version: '1.0.0',
+      extract: async (_html, _url, ctx) => {
+        seenCtx = ctx;
+        await ctx!.scraping.fetchBody!('https://details.solaris-cdn.example/api/item/9');
+        return record('solaris', '9', { name: 'ok' });
+      },
+      validate: () => ({ valid: true, errors: [], warnings: [] }),
+    };
+    const registry: LookupRegistry = { allStores: () => [SOLARIS], getRulesetForUrl: () => ruleset };
+    const http = jest.fn(async () => '{}');
+    const { now, sleep } = fakeClock(1_000_000);
+
+    const out = await createEngineResolve(
+      registry,
+      jest.fn(async () => ({ html: '<html/>', statusCode: 200 })),
+      { scraping: fakeScraping(), transports: { http }, sink: { capture: jest.fn(async () => undefined) }, now, sleep },
+    ).resolve('solaris', ['9']);
+
+    expect(out.failed).toEqual([]);
+    // forHost('details.solaris-cdn.example') misses; forSite('solaris') hits → the STORE's caps:
+    expect(seenCtx?.config.name).toBe('Solaris Japan');
+    expect(seenCtx?.config.rateLimit.baseDelayMs).toBe(1234);
+    // …the same-host follow-up waited the STORE's declared gap, not the synthesized default…
+    expect(sleep).toHaveBeenCalledWith(1234);
+    // …and the store's declared http transport carried it (searchFetch resolved via the caps too).
+    expect(http).toHaveBeenCalledWith('https://details.solaris-cdn.example/api/item/9');
+  });
+
+  it('synthesizes a SiteConfig carrying the PARSED hostname as its domain when neither forHost nor forSite resolves', async () => {
+    // Line-77 truthy half (`domains: hostname ? [hostname] : []`): parseable template URL, but the
+    // ruleset's siteId is unregistered and the host is outside every indexed domain.
+    const HOST_STORE: StoreCapabilities = {
+      siteId: 'host-store', name: 'host-store', domains: ['host-store.example'], requiresBrowser: false, allowedCookies: [],
+      rateLimit: { domain: 'host-store.example', baseDelayMs: 100, minDelayMs: 0, maxDelayMs: 100, backoffMultiplier: 2, recoveryDivisor: 2, successThreshold: 3 },
+      retrieval: { byId: { urlTemplate: 'https://unindexed.example/item/{id}', idKind: 'store-internal' } },
+    };
+    let seenCtx: ExtractContext | undefined;
+    const ruleset: ExtractionRuleset = {
+      siteId: 'phantom',
+      version: '1.0.0',
+      extract: (_html, _url, ctx) => {
+        seenCtx = ctx;
+        return record('phantom', 'X1', { name: 'ok' });
+      },
+      validate: () => ({ valid: true, errors: [], warnings: [] }),
+    };
+    const registry: LookupRegistry = { allStores: () => [HOST_STORE], getRulesetForUrl: () => ruleset };
+    const { now, sleep } = fakeClock(1_000_000);
+
+    const out = await createEngineResolve(
+      registry,
+      jest.fn(async () => ({ html: '<html/>', statusCode: 200 })),
+      { scraping: fakeScraping(), sink: { capture: jest.fn(async () => undefined) }, now, sleep },
+    ).resolve('host-store', ['X1']);
+
+    expect(out.failed).toEqual([]);
+    expect(seenCtx?.config.siteId).toBe('phantom');
+    expect(seenCtx?.config.domains).toEqual(['unindexed.example']);
+    expect(seenCtx?.config.rateLimit.baseDelayMs).toBe(DEFAULT_FETCH_BODY_GAP_MS);
+  });
+
   it('degrades to the synthesized SiteConfig + browser-lane fetchBody when the ruleset has no registered profile', async () => {
     // Unparseable byId URL (no hostname) + a ruleset whose siteId is NOT a registered store —
     // the ctx must still build: default gap, undeclared transport → browser lane, no crash.
