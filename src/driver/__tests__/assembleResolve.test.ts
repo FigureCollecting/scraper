@@ -105,6 +105,55 @@ describe('assembleResolve — byId confirm', () => {
     warn.mockRestore();
   });
 
+  it('processes ids SEQUENTIALLY — the next id\'s detail fetch waits for the previous id to finish (no same-host burst)', async () => {
+    let releaseFirst!: () => void;
+    const gate = new Promise<void>((r) => { releaseFirst = r; });
+    const fetchDetail = jest.fn(async (url: string) => {
+      if (url.includes('ID-1')) await gate;
+      return { html: 'ok', statusCode: 200 };
+    });
+
+    const pending = assembleResolve({
+      profiles: buildProfileRegistry([AMIAMI]),
+      getRulesetForUrl: () => stub(() => extracted('1')),
+      fetchDetail,
+    }).resolve('amiami', ['ID-1', 'ID-2']);
+
+    await new Promise((r) => setImmediate(r));
+    // Only ID-1's fetch may be in flight — a Promise.all fan-out would have fired both already.
+    expect(fetchDetail).toHaveBeenCalledTimes(1);
+
+    releaseFirst();
+    const out = await pending;
+    expect(fetchDetail).toHaveBeenCalledTimes(2);
+    expect(out.results.map((r) => r.itemId)).toEqual(['ID-1', 'ID-2']);
+  });
+
+  it('courtesy-gaps sibling ids\' SAME-HOST primary fetches by the store\'s baseDelayMs (H1 parity), on the injected clock', async () => {
+    const store: StoreCapabilities = {
+      ...caps('amiami', 'amiami.com', { byId: { urlTemplate: 'https://www.amiami.com/eng/detail/?gcode={id}', idKind: 'store-internal' } }),
+      rateLimit: { domain: 'amiami.com', baseDelayMs: 3000, minDelayMs: 500, maxDelayMs: 10000, backoffMultiplier: 2, recoveryDivisor: 2, successThreshold: 3 },
+    };
+    let clock = 1_000_000;
+    const now = jest.fn(() => clock);
+    const sleep = jest.fn(async (ms: number) => { clock += ms; });
+    const fetchedAt: number[] = [];
+    const fetchDetail = jest.fn(async () => { fetchedAt.push(now()); return { html: 'ok', statusCode: 200 }; });
+
+    const out = await assembleResolve({
+      profiles: buildProfileRegistry([store]),
+      getRulesetForUrl: () => stub(() => extracted('1')),
+      fetchDetail,
+      now,
+      sleep,
+    }).resolve('amiami', ['A-1', 'A-2']);
+
+    expect(out.failed).toEqual([]);
+    expect(sleep).toHaveBeenCalledWith(3000);
+    // The per-host floor held: the second primary dispatched >= baseDelayMs after the first.
+    expect(fetchedAt[1]! - fetchedAt[0]!).toBeGreaterThanOrEqual(3000);
+  });
+
   it('a throw from URL building / ruleset lookup fails THAT id only — siblings still resolve (no batch poisoning)', async () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
     // getRulesetForUrl deliberately propagates new URL() throws (extractionRegistry), and
@@ -197,7 +246,7 @@ describe('assembleResolve — extraction dispatch parity (extractRecords)', () =
     expect(out.results[0]?.records).toEqual([editionA, editionB]);
   });
 
-  it('threads the resolveContext seam: ctx built per id (ruleset, url, primaryFetchedAt=now()) and handed to the extraction', async () => {
+  it('threads the resolveContext seam: ctx built per id (ruleset, url, primaryFetchedAt=now(), shared host map) and handed to the extraction', async () => {
     const ctx = { marker: 'built-by-buildExtractContext' } as unknown as ExtractContext;
     const resolveContext = jest.fn(() => ctx);
     const extract = jest.fn(() => record('FIGURE-1', { name: 'x' }));
@@ -214,7 +263,7 @@ describe('assembleResolve — extraction dispatch parity (extractRecords)', () =
     }).resolve('amiami', ['FIGURE-1']);
 
     expect(out.failed).toEqual([]);
-    expect(resolveContext).toHaveBeenCalledWith(ruleset, 'https://www.amiami.com/eng/detail/?gcode=FIGURE-1', 777_000);
+    expect(resolveContext).toHaveBeenCalledWith(ruleset, 'https://www.amiami.com/eng/detail/?gcode=FIGURE-1', 777_000, expect.any(Map));
     expect(extract).toHaveBeenCalledWith('<html/>', 'https://www.amiami.com/eng/detail/?gcode=FIGURE-1', ctx);
   });
 

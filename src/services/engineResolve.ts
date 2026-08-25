@@ -9,7 +9,9 @@
  * one layer out): an extractAsync/extractMany ruleset's follow-up `ctx.scraping.fetchBody` rides
  * the store's OWN declared `searchFetch` transport (impersonate for amiami / http / browser)
  * through the capturing fetch, so the raw bytes land in the capture sink under the 'api' lane and
- * the D8 courtesy gap is enforced against the primary detail fetch. `transports`/`sink` default to
+ * the D8 courtesy gap is enforced against the call's LAST fetch to that host — the primary detail
+ * fetch or a SIBLING id's fetch, via the per-call shared map assembleResolve threads through
+ * (sequential ids + one map = the queue's H1 per-host floor). `transports`/`sink` default to
  * the real engine fetchers (impit / plain HTTP / the raw sink); `now`/`sleep` default to real time —
  * all injectable so tests run on fakes with zero live fetches or waiting.
  */
@@ -58,7 +60,8 @@ export function createEngineResolve(
     getRulesetForUrl: (url) => registry.getRulesetForUrl(url),
     fetchDetail,
     ...(extract.now ? { now: extract.now } : {}),
-    resolveContext: (ruleset, url, primaryFetchedAt) => {
+    ...(extract.sleep ? { sleep: extract.sleep } : {}),
+    resolveContext: (ruleset, url, primaryFetchedAt, lastFetchedAt) => {
       let hostname: string | undefined;
       try {
         hostname = new URL(url).hostname;
@@ -96,6 +99,9 @@ export function createEngineResolve(
         searchFetch: caps?.searchFetch,
         primaryUrl: url,
         primaryFetchedAt,
+        // The call-wide shared map (assembleResolve's pacer): follow-ups re-gap against SIBLING
+        // ids' fetches to the same host, not just this id's own (H1 parity, cross-id).
+        lastFetchedAt,
         baseDelayMs: caps?.rateLimit?.baseDelayMs,
         ...(extract.now ? { now: extract.now } : {}),
         ...(extract.sleep ? { sleep: extract.sleep } : {}),

@@ -122,6 +122,40 @@ describe('createEngineResolve', () => {
     expect(() => seenCtx!.scraping.browserFetch('https://x/')).toThrow(/not available via ExtractContext/);
   });
 
+  it('holds a per-host floor ACROSS sibling ids: follow-up hits to the store\'s API host land >= baseDelayMs apart (no cross-id burst)', async () => {
+    const ruleset: ExtractionRuleset & {
+      extractAsync?: (html: string, url: string, ctx?: ExtractContext) => Promise<ExtractedData>;
+    } = {
+      siteId: 'amiami',
+      version: '1.0.0',
+      extract: () => record('amiami', 'x', {}),
+      extractAsync: async (_html, url, ctx) => {
+        const gcode = new URL(url).searchParams.get('gcode') ?? 'x';
+        const api = await ctx!.scraping.fetchBody!(`https://api.amiami.com/api/v1.0/item?gcode=${gcode}`);
+        const parsed = JSON.parse(api.html) as { jan: string };
+        return record('amiami', gcode, { jan: parsed.jan });
+      },
+      validate: () => ({ valid: true, errors: [], warnings: [] }),
+    };
+    const registry: LookupRegistry = { allStores: () => [AMIAMI], getRulesetForUrl: () => ruleset };
+    const { now, sleep } = fakeClock(1_000_000);
+    const apiHitAt: number[] = [];
+    const impersonate = jest.fn(async () => { apiHitAt.push(now()); return JSON.stringify({ jan: '4570232591424' }); });
+
+    const out = await createEngineResolve(
+      registry,
+      jest.fn(async () => ({ html: '<div id="__nuxt"></div>', statusCode: 200 })),
+      { scraping: fakeScraping(), transports: { impersonate }, sink: { capture: jest.fn(async () => undefined) }, now, sleep },
+    ).resolve('amiami', ['FIGURE-1', 'FIGURE-2']);
+
+    expect(out.failed).toEqual([]);
+    expect(apiHitAt).toHaveLength(2);
+    // The floor: amiami's declared baseDelayMs (3000) separates the two API hits. Before the
+    // shared per-call pacing, both ids ran concurrently with private per-ctx maps and the
+    // cross-host D8 gate — so the CF-fronted API took both hits in one synchronized burst.
+    expect(apiHitAt[1]! - apiHitAt[0]!).toBeGreaterThanOrEqual(3000);
+  });
+
   it('courtesy-gaps a SAME-host extractMany follow-up against the primary detail fetch, and surfaces children via records[]', async () => {
     const followUpUrl = 'https://orzgk.com/wp-json/wc/store/v1/products?type=variation&parent=77';
     const parent = record('orzgk', '77', { name: 'WLOP GK' });

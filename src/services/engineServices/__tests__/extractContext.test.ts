@@ -179,6 +179,39 @@ describe('buildExtractContext — scraping.fetchBody', () => {
     expect(capturingFetch).toHaveBeenCalled();
   });
 
+  it('accepts a SHARED lastFetchedAt map: gaps against a SIBLING context\'s fetch to the same host, seeds the primary, records its own', async () => {
+    let clock = 1_000_000;
+    const now = jest.fn(() => clock);
+    const sleep = jest.fn(async (ms: number) => { clock += ms; });
+    const capturingFetch = jest.fn().mockResolvedValue({ html: '{}' });
+    // A sibling context (a previous id in the same resolve call) hit the API host at t0.
+    const shared = new Map<string, number>([['api.amiami.com', 1_000_000]]);
+
+    const ctx = buildExtractContext({
+      config: CONFIG,
+      logger: LOGGER,
+      scraping: makeScraping(),
+      capturingFetch,
+      searchFetch: { transport: 'http' },
+      primaryUrl: 'https://www.amiami.com/eng/detail/?gcode=F-2',
+      primaryFetchedAt: 1_000_500,
+      baseDelayMs: 3000,
+      now,
+      sleep,
+      lastFetchedAt: shared,
+    });
+
+    await ctx.scraping.fetchBody!('https://api.amiami.com/api/v1.0/item?gcode=F-2');
+
+    // Cross-host vs THIS context's own primary — but the SHARED map knows the sibling's API hit,
+    // so the courtesy gap still applies against it.
+    expect(sleep).toHaveBeenCalledWith(3000);
+    // The primary fetch was seeded into the shared map for the NEXT sibling to gap against...
+    expect(shared.get('amiami.com')).toBe(1_000_500);
+    // ...and this dispatch was recorded there too.
+    expect(shared.get('api.amiami.com')).toBe(1_003_000);
+  });
+
   it('dispatches via capturingFetch using the STORE\'s declared searchFetch transport', async () => {
     const capturingFetch = jest.fn().mockResolvedValue({ html: 'body' });
     const searchFetch = { transport: 'impersonate' as const, browser: 'chrome142' };
