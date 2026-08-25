@@ -105,6 +105,25 @@ describe('assembleResolve — byId confirm', () => {
     warn.mockRestore();
   });
 
+  it('a throw from URL building / ruleset lookup fails THAT id only — siblings still resolve (no batch poisoning)', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    // getRulesetForUrl deliberately propagates new URL() throws (extractionRegistry), and
+    // resolveByIdUrl's encodeURIComponent throws URIError on a lone-surrogate id — either must
+    // land in failed[] through the per-id isolation, not reject the whole resolve() batch.
+    const out = await assembleResolve({
+      profiles: buildProfileRegistry([AMIAMI]),
+      getRulesetForUrl: (url) => {
+        if (url.includes('BOOM')) throw new Error('Invalid URL');
+        return stub(() => extracted('123'));
+      },
+      fetchDetail: jest.fn(async () => ({ html: 'ok', statusCode: 200 })),
+    }).resolve('amiami', ['GOOD', 'BOOM']);
+
+    expect(out.results.map((r) => r.itemId)).toEqual(['GOOD']);
+    expect(out.failed).toEqual(['BOOM']);
+    warn.mockRestore();
+  });
+
   it('an id with no matching ruleset is failed (not fetched)', async () => {
     const fetchDetail = jest.fn(async () => ({ html: 'x' }));
     const out = await assembleResolve({ profiles: buildProfileRegistry([AMIAMI]), getRulesetForUrl: () => undefined, fetchDetail })

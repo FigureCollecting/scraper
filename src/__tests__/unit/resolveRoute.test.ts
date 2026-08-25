@@ -126,6 +126,26 @@ describe('POST /resolve — engine-wired extraction dispatch', () => {
     expect('records' in res.body.results[0]).toBe(false);
   });
 
+  it('a malformed id (lone surrogate — encodeURIComponent throws) lands in failed[]; siblings resolve, no batch 502', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    // '\ud800' passes the route's string/trim filter (lone surrogates are not whitespace) but
+    // resolveByIdUrl's encodeURIComponent throws URIError on it — that throw must fail ONLY this
+    // id, not poison the sibling into a batch-wide 502.
+    const ruleset: ExtractionRuleset = {
+      siteId: 'amiami',
+      version: '1.0.0',
+      extract: () => record('OK-1', { name: 'ok' }),
+      validate: () => ({ valid: true, errors: [], warnings: [] }),
+    };
+
+    const res = await request(engineApp(ruleset)).post('/resolve').send({ site: 'amiami', ids: ['OK-1', '\ud800'] });
+
+    expect(res.status).toBe(200);
+    expect(res.body.results.map((r: { itemId: string }) => r.itemId)).toEqual(['OK-1']);
+    expect(res.body.failed).toHaveLength(1);
+    warn.mockRestore();
+  });
+
   it('an extractMany store returns data=record[0] plus the additive records[] through the route JSON', async () => {
     const parent = record('LISTING-9', { name: 'GK Statue' });
     const edition = record('LISTING-9__a', { name: 'GK Statue — 1/4', editionOf: 'LISTING-9' });

@@ -81,13 +81,16 @@ export function assembleResolve(services: ResolveServices): Resolve {
       const failed: string[] = [];
       const settled = await Promise.all(
         ids.map(async (itemId): Promise<ResolveItem | null> => {
-          const url = resolveByIdUrl(caps.retrieval, itemId);
-          const ruleset = url ? services.getRulesetForUrl(url) : undefined;
-          if (!url || !ruleset) {
-            failed.push(itemId);
-            return null;
-          }
           try {
+            // INSIDE the try: resolveByIdUrl's encodeURIComponent throws on a lone-surrogate id,
+            // and getRulesetForUrl deliberately propagates new URL() errors — either must fail
+            // ONLY this id (failed[]), never reject the whole batch into the route's 502.
+            const url = resolveByIdUrl(caps.retrieval, itemId);
+            const ruleset = url ? services.getRulesetForUrl(url) : undefined;
+            if (!url || !ruleset) {
+              failed.push(itemId);
+              return null;
+            }
             const { html, statusCode } = await services.fetchDetail(url);
             // A 4xx/5xx page (CF challenge / gone / error) is NOT a confirm — extract would happily
             // parse the error body into empty fields WITHOUT throwing, so gate on status explicitly.
