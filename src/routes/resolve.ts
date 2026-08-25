@@ -1,8 +1,12 @@
 /**
  * POST /resolve { site, ids: [...] } — the byId CONFIRM endpoint. Fetches each id's detail page and
- * runs the store ruleset's extract() → full ExtractedData (incl fields.gtin14), returning per-id
- * results + `failed`/`unsupported`. The matcher's pass-2 bridge: turns a record-mode lookup's
- * `resolveTargets` (or a picked candidate) into confirmed records. Never emits to the spine. Injected.
+ * dispatches the store ruleset via extractRecords (extractMany > extractAsync > extract — the same
+ * dispatch as the ingest path) → full ExtractedData (incl fields.gtin14), returning per-id results
+ * + `failed`/`unsupported`. Each result's `data` is the page's own record (records[0], today's
+ * shape); a multi-record ruleset's extra records (editions/offers) ride the ADDITIVE per-result
+ * `records` array — absent for single-record confirms. The matcher's pass-2 bridge: turns a
+ * record-mode lookup's `resolveTargets` (or a picked candidate) into confirmed records. Never
+ * emits to the spine. Injected.
  */
 import { Router, type Request, type Response } from 'express';
 import type { Resolve } from '../driver/assembleResolve.js';

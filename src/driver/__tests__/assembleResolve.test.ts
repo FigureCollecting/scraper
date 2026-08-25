@@ -6,7 +6,7 @@
  */
 import { assembleResolve, type ResolveServices } from '../assembleResolve';
 import { buildProfileRegistry } from '../profileRegistry';
-import type { ExtractedData, ExtractionRuleset, RetrievalCapability, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
+import type { ExtractContext, ExtractedData, ExtractionRuleset, RetrievalCapability, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
 
 const caps = (siteId: string, host: string, retrieval?: RetrievalCapability): StoreCapabilities => ({
   siteId, name: siteId, domains: [host], requiresBrowser: false, allowedCookies: [],
@@ -113,5 +113,124 @@ describe('assembleResolve — byId confirm', () => {
     expect(out.failed).toEqual(['x']);
     expect(out.results).toEqual([]);
     expect(fetchDetail).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Extraction dispatch parity with the ingest path (extractRecords: extractMany > extractAsync >
+ * extract). The prod bug this pins: /resolve called bare extract(), so async-only stores (amiami)
+ * confirmed with EMPTY fields + a "use extractAsync()" warning while the ingest path resolved the
+ * same page fully.
+ */
+describe('assembleResolve — extraction dispatch parity (extractRecords)', () => {
+  type AsyncCapableRuleset = ExtractionRuleset & {
+    extractAsync?: (html: string, url: string, ctx?: ExtractContext) => Promise<ExtractedData>;
+  };
+
+  const record = (itemId: string, fields: Record<string, unknown>, warnings: string[] = []): ExtractedData => ({
+    source: { site: 'amiami', itemId, extractedAt: '2026-08-25T00:00:00.000Z' },
+    fields,
+    warnings,
+  });
+
+  it('dispatches an async-only ruleset via extractAsync — fields POPULATED, not bare extract()\'s empty bag', async () => {
+    // Mirrors prod amiami: extract() cannot parse the client-rendered page; extractAsync can.
+    const ruleset: AsyncCapableRuleset = {
+      siteId: 'amiami',
+      version: '1.0.0',
+      extract: () => record('FIGURE-190355-R', {}, ['AmiAmi product pages render client-side (Nuxt) — use extractAsync() so the item API is used']),
+      extractAsync: async () => record('FIGURE-190355-R', { name: 'Gyaru Tomie x Hello Kitty', jan: '4570232591424' }),
+      validate: () => ({ valid: true, errors: [], warnings: [] }),
+    };
+
+    const out = await assembleResolve({
+      profiles: buildProfileRegistry([AMIAMI]),
+      getRulesetForUrl: () => ruleset,
+      fetchDetail: jest.fn(async () => ({ html: '<div id="__nuxt"></div>', statusCode: 200 })),
+    }).resolve('amiami', ['FIGURE-190355-R']);
+
+    expect(out.failed).toEqual([]);
+    expect(out.results[0]?.data?.fields).toEqual({ name: 'Gyaru Tomie x Hello Kitty', jan: '4570232591424' });
+    expect(out.results[0]?.data?.warnings).toEqual([]);
+  });
+
+  it('extractMany: data = record[0] (the listing) and the additive records[] carries the children', async () => {
+    const parent = record('LISTING-1', { name: 'GK Statue', gtin14: '04570232591424' });
+    const editionA = record('LISTING-1__a', { name: 'GK Statue — 1/4', editionOf: 'LISTING-1' });
+    const editionB = record('LISTING-1__b', { name: 'GK Statue — 1/6', editionOf: 'LISTING-1' });
+    const ruleset: ExtractionRuleset = {
+      siteId: 'amiami',
+      version: '1.0.0',
+      extract: () => record('LISTING-1', { name: 'WRONG — extractMany must win' }),
+      extractMany: () => [parent, editionA, editionB],
+      validate: () => ({ valid: true, errors: [], warnings: [] }),
+    };
+
+    const out = await assembleResolve({
+      profiles: buildProfileRegistry([AMIAMI]),
+      getRulesetForUrl: () => ruleset,
+      fetchDetail: jest.fn(async () => ({ html: '<html/>', statusCode: 200 })),
+    }).resolve('amiami', ['LISTING-1']);
+
+    expect(out.failed).toEqual([]);
+    expect(out.results[0]?.data).toEqual(parent);
+    expect(out.results[0]?.gtin14).toBe('04570232591424');
+    expect(out.results[0]?.records).toEqual([editionA, editionB]);
+  });
+
+  it('threads the resolveContext seam: ctx built per id (ruleset, url, primaryFetchedAt=now()) and handed to the extraction', async () => {
+    const ctx = { marker: 'built-by-buildExtractContext' } as unknown as ExtractContext;
+    const resolveContext = jest.fn(() => ctx);
+    const extract = jest.fn(() => record('FIGURE-1', { name: 'x' }));
+    const ruleset: ExtractionRuleset = {
+      siteId: 'amiami', version: '1.0.0', extract, validate: () => ({ valid: true, errors: [], warnings: [] }),
+    };
+
+    const out = await assembleResolve({
+      profiles: buildProfileRegistry([AMIAMI]),
+      getRulesetForUrl: () => ruleset,
+      fetchDetail: jest.fn(async () => ({ html: '<html/>', statusCode: 200 })),
+      resolveContext,
+      now: () => 777_000,
+    }).resolve('amiami', ['FIGURE-1']);
+
+    expect(out.failed).toEqual([]);
+    expect(resolveContext).toHaveBeenCalledWith(ruleset, 'https://www.amiami.com/eng/detail/?gcode=FIGURE-1', 777_000);
+    expect(extract).toHaveBeenCalledWith('<html/>', 'https://www.amiami.com/eng/detail/?gcode=FIGURE-1', ctx);
+  });
+
+  it('a single-record ruleset keeps today\'s response shape exactly — NO records field', async () => {
+    const out = await assembleResolve({
+      profiles: buildProfileRegistry([AMIAMI]),
+      getRulesetForUrl: () => stub(() => extracted('04570232591424')),
+      fetchDetail: jest.fn(async () => ({ html: '<html/>', statusCode: 200 })),
+    }).resolve('amiami', ['FIGURE-1']);
+
+    expect(out.results[0]?.data?.fields.gtin14).toBe('04570232591424');
+    expect(out.results[0] && 'records' in out.results[0]).toBe(false);
+  });
+
+  it('a D11 guard violation (duplicate itemIds from extractMany) fails THAT id only — others still resolve', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const good = record('GOOD', { name: 'ok' });
+    const dup = record('BAD', { name: 'dup' });
+    const ruleset: ExtractionRuleset = {
+      siteId: 'amiami',
+      version: '1.0.0',
+      extract: () => good,
+      extractMany: (_html, url) => (url.includes('BAD') ? [dup, dup] : [good]),
+      validate: () => ({ valid: true, errors: [], warnings: [] }),
+    };
+
+    const out = await assembleResolve({
+      profiles: buildProfileRegistry([AMIAMI]),
+      getRulesetForUrl: () => ruleset,
+      fetchDetail: jest.fn(async () => ({ html: '<html/>', statusCode: 200 })),
+    }).resolve('amiami', ['GOOD', 'BAD']);
+
+    expect(out.results.map((r) => r.itemId)).toEqual(['GOOD']);
+    expect(out.failed).toEqual(['BAD']);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('duplicate source.itemId'));
+    warn.mockRestore();
   });
 });

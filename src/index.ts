@@ -108,9 +108,14 @@ async function startServer(): Promise<void> {
     app.use('/', createLookupRoute(createEngineLookup(registry, {
       browser: (url, opts) => lookupScraping.browserFetch(url, opts),
     })));
-    // POST /resolve — byId confirm (detail fetch + ruleset.extract → full ExtractedData incl gtin14),
-    // the matcher pass-2 bridge. Detail fetch shares the same pooled ScrapingService as /lookup.
-    app.use('/', createResolveRoute(createEngineResolve(registry, (url) => lookupScraping.scrapePage(url))));
+    // POST /resolve — byId confirm (detail fetch + extractRecords dispatch → full ExtractedData incl
+    // gtin14), the matcher pass-2 bridge. Detail fetch shares the same pooled ScrapingService as
+    // /lookup; that service also backs the ExtractContext (extractAsync/extractMany follow-ups ride
+    // the store's declared transport — impit/http default inside createEngineResolve — into the
+    // capture sink, courtesy-gapped, exactly like the ingest queue's extraction).
+    app.use('/', createResolveRoute(createEngineResolve(registry, (url) => lookupScraping.scrapePage(url), {
+      scraping: lookupScraping,
+    })));
     if (plugins.length > 0) {
       console.log(`[PAGE-SCRAPER] Loaded ${plugins.length} plugin(s): ${plugins.map(p => `${p.name}@${p.version}`).join(', ')}`);
     }

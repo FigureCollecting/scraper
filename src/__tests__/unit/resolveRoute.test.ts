@@ -5,7 +5,15 @@
 import express from 'express';
 import request from 'supertest';
 import { createResolveRoute } from '../../routes/resolve';
+import { createEngineResolve } from '../../services/engineResolve';
+import type { LookupRegistry } from '../../services/engineLookup';
 import type { Resolve, ResolveResult } from '../../driver/assembleResolve';
+import type {
+  ExtractContext,
+  ExtractedData,
+  ExtractionRuleset,
+  StoreCapabilities,
+} from '@figurecollecting/scraper-plugin-contract';
 
 const result = (over: Partial<ResolveResult> = {}): ResolveResult => ({
   site: 'amiami', results: [], unsupported: false, failed: [], ...over,
@@ -60,5 +68,79 @@ describe('POST /resolve', () => {
     const res = await request(appWith(resolve)).post('/resolve').send({ site: 'amiami', ids: ['x'] });
     expect(res.status).toBe(502);
     expect(res.body.detail).toBe('pool dead');
+  });
+});
+
+/**
+ * Full route → engine chain (createResolveRoute over createEngineResolve): extraction must
+ * dispatch through extractRecords (extractMany > extractAsync > extract), same as the ingest
+ * path. Pins the prod bug: POST /resolve {site:'amiami', ids:[...]} returned fields {} + a
+ * "use extractAsync()" warning because the resolve leg called bare extract().
+ */
+describe('POST /resolve — engine-wired extraction dispatch', () => {
+  const AMIAMI: StoreCapabilities = {
+    siteId: 'amiami', name: 'AmiAmi', domains: ['amiami.com'], requiresBrowser: false, allowedCookies: [],
+    rateLimit: { domain: 'amiami.com', baseDelayMs: 0, minDelayMs: 0, maxDelayMs: 100, backoffMultiplier: 2, recoveryDivisor: 2, successThreshold: 3 },
+    retrieval: { byId: { urlTemplate: 'https://www.amiami.com/eng/detail/?gcode={id}', idKind: 'store-internal' } },
+    searchFetch: { transport: 'impersonate', browser: 'chrome142' },
+  };
+
+  const record = (itemId: string, fields: Record<string, unknown>, warnings: string[] = []): ExtractedData => ({
+    source: { site: 'amiami', itemId, extractedAt: '2026-08-25T00:00:00.000Z' },
+    fields,
+    warnings,
+  });
+
+  const engineApp = (ruleset: ExtractionRuleset) => {
+    const registry: LookupRegistry = { allStores: () => [AMIAMI], getRulesetForUrl: () => ruleset };
+    const scraping = {
+      scrapePage: jest.fn(async () => ({ html: '<page/>', url: '', title: '', statusCode: 200 })),
+      scrapePageStealth: jest.fn(async () => ({ html: '<page/>', url: '', title: '', statusCode: 200 })),
+    };
+    const resolve = createEngineResolve(
+      registry,
+      jest.fn(async () => ({ html: '<div id="__nuxt"></div>', statusCode: 200 })),
+      { scraping, sink: { capture: jest.fn(async () => undefined) }, now: () => 1_000_000, sleep: jest.fn(async () => undefined) },
+    );
+    return appWith(resolve);
+  };
+
+  it('an async-only store (amiami) confirms with POPULATED fields — no Nuxt warning, no empty bag', async () => {
+    const ruleset: ExtractionRuleset & {
+      extractAsync?: (html: string, url: string, ctx?: ExtractContext) => Promise<ExtractedData>;
+    } = {
+      siteId: 'amiami',
+      version: '1.0.0',
+      extract: () => record('FIGURE-190355-R', {}, ['AmiAmi product pages render client-side (Nuxt) — use extractAsync() so the item API is used']),
+      extractAsync: async () => record('FIGURE-190355-R', { name: 'Gyaru Tomie x Hello Kitty', jan: '4570232591424' }),
+      validate: () => ({ valid: true, errors: [], warnings: [] }),
+    };
+
+    const res = await request(engineApp(ruleset)).post('/resolve').send({ site: 'amiami', ids: ['FIGURE-190355-R'] });
+
+    expect(res.status).toBe(200);
+    expect(res.body.failed).toEqual([]);
+    expect(res.body.results[0].data.fields).toEqual({ name: 'Gyaru Tomie x Hello Kitty', jan: '4570232591424' });
+    expect(res.body.results[0].data.warnings).toEqual([]);
+    // Single record → today's response shape exactly: no additive records field.
+    expect('records' in res.body.results[0]).toBe(false);
+  });
+
+  it('an extractMany store returns data=record[0] plus the additive records[] through the route JSON', async () => {
+    const parent = record('LISTING-9', { name: 'GK Statue' });
+    const edition = record('LISTING-9__a', { name: 'GK Statue — 1/4', editionOf: 'LISTING-9' });
+    const ruleset: ExtractionRuleset = {
+      siteId: 'amiami',
+      version: '1.0.0',
+      extract: () => record('LISTING-9', { name: 'WRONG — extractMany must win' }),
+      extractMany: () => [parent, edition],
+      validate: () => ({ valid: true, errors: [], warnings: [] }),
+    };
+
+    const res = await request(engineApp(ruleset)).post('/resolve').send({ site: 'amiami', ids: ['LISTING-9'] });
+
+    expect(res.status).toBe(200);
+    expect(res.body.results[0].data.fields.name).toBe('GK Statue');
+    expect(res.body.results[0].records).toEqual([edition]);
   });
 });
