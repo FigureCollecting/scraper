@@ -24,9 +24,21 @@ export interface LookupRegistry {
 const DESKTOP_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36';
 
-/** Raw response body of a search URL via plain HTTP (Tier-1 cookieless JSON). */
+/**
+ * Abort ceiling for the plain-HTTP lane, matching impit's own 15s cap (impitFetch TIMEOUT_MS) so
+ * neither non-browser transport can outlive the other. Without it a tarpitted endpoint rides
+ * undici's ~300s header/body defaults — tolerable for the ingest queue, not for the synchronous
+ * /lookup and /resolve callers this lane also serves.
+ */
+export const HTTP_FETCH_TIMEOUT_MS = 15_000;
+
+/** Raw response body of a search URL via plain HTTP (Tier-1 cookieless JSON), abort-bounded. */
 export async function httpFetchBody(url: string): Promise<string> {
-  const res = await fetch(url, { headers: { 'user-agent': DESKTOP_UA, accept: 'application/json, text/html' } });
+  const res = await fetch(url, {
+    headers: { 'user-agent': DESKTOP_UA, accept: 'application/json, text/html' },
+    // One signal bounds headers AND body: text() streams under the same abort.
+    signal: AbortSignal.timeout(HTTP_FETCH_TIMEOUT_MS),
+  });
   return res.text();
 }
 
