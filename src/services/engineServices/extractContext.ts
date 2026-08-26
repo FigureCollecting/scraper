@@ -62,6 +62,15 @@ export interface BuildExtractContextOptions {
   primaryFetchedAt: number;
   /** Courtesy gap in ms; defaults to `DEFAULT_FETCH_BODY_GAP_MS` when the store declares none. */
   baseDelayMs?: number;
+  /**
+   * OPTIONAL shared per-host last-fetch map (epoch ms, keyed by `safeHostname`). When several
+   * contexts serve ONE caller-level operation (assembleResolve's sequential multi-id confirm),
+   * passing one map threads the courtesy gap ACROSS them — a follow-up gaps against a SIBLING
+   * context's fetch to the same host, not just this context's own (H1 parity, cross-id).
+   * Callers must not run sharing contexts concurrently (the gap check is check-then-sleep).
+   * Default: a private per-context map (single-extraction behavior, unchanged).
+   */
+  lastFetchedAt?: Map<string, number>;
   /** Injectable clock (default `Date.now`). */
   now?: () => number;
   /** Injectable sleep (default a real `setTimeout` promise). */
@@ -69,7 +78,7 @@ export interface BuildExtractContextOptions {
 }
 
 /** Lowercased, `www.`-stripped hostname; `undefined` on an unparseable URL (never throws). */
-function safeHostname(url: string): string | undefined {
+export function safeHostname(url: string): string | undefined {
   try {
     return new URL(url).hostname.toLowerCase().replace(/^www\./, '');
   } catch {
@@ -102,9 +111,14 @@ export function buildExtractContext(options: BuildExtractContextOptions): Extrac
   // primary page fetch — otherwise only the FIRST follow-up ever waits, and every call after it
   // is gapped against a primaryFetchedAt that has long since elapsed. Seeded with the primary
   // fetch's own host/time so the first same-host follow-up's behaviour is unchanged.
-  const lastFetchedAt = new Map<string, number>();
+  const lastFetchedAt = options.lastFetchedAt ?? new Map<string, number>();
   if (primaryHost !== undefined) {
-    lastFetchedAt.set(primaryHost, options.primaryFetchedAt);
+    // Monotonic seed: never regress a SHARED map's entry (a sibling context may have touched the
+    // primary host even more recently than this context's own primary fetch).
+    const seeded = lastFetchedAt.get(primaryHost);
+    if (seeded === undefined || seeded < options.primaryFetchedAt) {
+      lastFetchedAt.set(primaryHost, options.primaryFetchedAt);
+    }
   }
 
   return {

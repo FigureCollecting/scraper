@@ -11,7 +11,7 @@ import { createLookupRoute } from './routes/lookup.js';
 import { createEngineLookup } from './services/engineLookup.js';
 import { createResolveRoute } from './routes/resolve.js';
 import { createEngineResolve } from './services/engineResolve.js';
-import { createScrapingService } from './services/engineServices/scrapingService.js';
+import { createCapturingScrapingService } from './services/engineServices/capturingScrapingService.js';
 import { scraperDebug } from './utils/logger.js';
 
 // Import browser pool functionality
@@ -103,14 +103,22 @@ async function startServer(): Promise<void> {
     // Mount the cross-store buy-decision search (GET /lookup) now that the registry is populated.
     // Each store fetches via the transport its `searchFetch` declares (http / impersonate / browser);
     // http + impersonate use the engine defaults, and the `browser` transport is backed here by the
-    // pooled ScrapingService (createScrapingService wraps the static BrowserPool → shares the queue's pool).
-    const lookupScraping = createScrapingService();
+    // pooled ScrapingService (wraps the static BrowserPool → shares the queue's pool). The surface
+    // is RAW-CAPTURE-SINK backed (queue parity): /resolve's primary detail fetches and browser-lane
+    // follow-ups navigate through it, and their wire+dom bytes must land in the raw store — a bare
+    // createScrapingService() would default to a Noop sink and silently drop them.
+    const lookupScraping = createCapturingScrapingService();
     app.use('/', createLookupRoute(createEngineLookup(registry, {
       browser: (url, opts) => lookupScraping.browserFetch(url, opts),
     })));
-    // POST /resolve — byId confirm (detail fetch + ruleset.extract → full ExtractedData incl gtin14),
-    // the matcher pass-2 bridge. Detail fetch shares the same pooled ScrapingService as /lookup.
-    app.use('/', createResolveRoute(createEngineResolve(registry, (url) => lookupScraping.scrapePage(url))));
+    // POST /resolve — byId confirm (detail fetch + extractRecords dispatch → full ExtractedData incl
+    // gtin14), the matcher pass-2 bridge. Detail fetch shares the same pooled ScrapingService as
+    // /lookup; that service also backs the ExtractContext (extractAsync/extractMany follow-ups ride
+    // the store's declared transport — impit/http default inside createEngineResolve — into the
+    // capture sink, courtesy-gapped, exactly like the ingest queue's extraction).
+    app.use('/', createResolveRoute(createEngineResolve(registry, (url) => lookupScraping.scrapePage(url), {
+      scraping: lookupScraping,
+    })));
     if (plugins.length > 0) {
       console.log(`[PAGE-SCRAPER] Loaded ${plugins.length} plugin(s): ${plugins.map(p => `${p.name}@${p.version}`).join(', ')}`);
     }

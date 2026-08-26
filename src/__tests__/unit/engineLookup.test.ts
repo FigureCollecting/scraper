@@ -92,4 +92,18 @@ describe('httpFetchBody', () => {
       global.fetch = orig;
     }
   });
+
+  it('bounds the fetch with an abort signal — a tarpitted endpoint must not ride undici\'s ~300s defaults on a synchronous caller', async () => {
+    const orig = global.fetch;
+    const fetchMock = jest.fn(async (_url: string, _init?: RequestInit) => ({ text: async () => 'ok' }));
+    global.fetch = fetchMock as unknown as typeof fetch;
+    try {
+      await httpFetchBody('https://store.example/api.json');
+      const init = fetchMock.mock.calls[0]?.[1];
+      expect(init?.signal).toBeInstanceOf(AbortSignal);
+      expect(init?.signal?.aborted).toBe(false);
+    } finally {
+      global.fetch = orig;
+    }
+  });
 });
