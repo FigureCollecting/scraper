@@ -26,6 +26,22 @@ describe('makeFetchSearch', () => {
       { browser: 'chrome142', headers: { 'X-User-Key': 'amiami_dev' }, userAgent: 'python-amiami_dev' }]);
   });
 
+  it("threads a session-prime (target origin) to impit for a sessionPrime store", async () => {
+    const { t, calls } = transports();
+    const body = await makeFetchSearch(t)('https://www.gkloot.com/search/?Keyword=lucy', {
+      transport: 'impersonate', sessionPrime: true,
+    });
+    expect(body).toBe('IMPIT');
+    expect(calls[0]).toEqual(['impersonate', 'https://www.gkloot.com/search/?Keyword=lucy',
+      { browser: undefined, headers: undefined, userAgent: undefined, prime: { url: 'https://www.gkloot.com' } }]);
+  });
+
+  it("adds NO prime key for an impersonate store WITHOUT sessionPrime (byte-identical)", async () => {
+    const { t, calls } = transports();
+    await makeFetchSearch(t)('https://api.amiami.com/items?s_keywords=tomie', { transport: 'impersonate', browser: 'chrome142' });
+    expect(calls[0][2]).not.toHaveProperty('prime');
+  });
+
   it("routes 'browser' to the browser transport with headers/cookies", async () => {
     const { t, calls } = transports();
     const body = await makeFetchSearch(t)('https://surugaya.test/s', { transport: 'browser', cookies: { cf_clearance: 'x' } });

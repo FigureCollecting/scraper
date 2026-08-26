@@ -62,6 +62,32 @@ describe('createCapturingFetch', () => {
     expect(sink.captures[0].bytes.toString('utf8')).toBe('{"json":"BODY"}');
   });
 
+  it("threads a session-prime (target origin) to the impit transport for a sessionPrime store", async () => {
+    const { t, calls } = makeTransports();
+    const fetch = createCapturingFetch(t, new CollectingCaptureSink());
+
+    await fetch('https://www.anitoysgk.com/lucy-p29358268.html', {
+      transport: 'impersonate',
+      browser: 'chrome142',
+      sessionPrime: true,
+    });
+
+    expect(calls[0]).toEqual([
+      'impersonate',
+      'https://www.anitoysgk.com/lucy-p29358268.html',
+      { browser: 'chrome142', headers: undefined, userAgent: undefined, prime: { url: 'https://www.anitoysgk.com' } },
+    ]);
+  });
+
+  it("adds NO prime key for an impersonate store WITHOUT sessionPrime (undeclared → byte-identical)", async () => {
+    const { t, calls } = makeTransports();
+    const fetch = createCapturingFetch(t, new CollectingCaptureSink());
+
+    await fetch('https://api.sentai.example.test/item/1', { transport: 'impersonate', browser: 'chrome142' });
+
+    expect(calls[0][2]).not.toHaveProperty('prime');
+  });
+
   it("routes 'http' to the plain fetch transport and captures the raw body", async () => {
     const { t, calls } = makeTransports();
     const sink = new CollectingCaptureSink();
