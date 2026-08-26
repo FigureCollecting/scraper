@@ -46,7 +46,8 @@
     "patch-package": "^8.0.1",
     "puppeteer": "^25.3.0",
     "puppeteer-extra": "^3.3.6",
-    "puppeteer-extra-plugin-stealth": "^2.11.2"
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "tough-cookie": "6.0.1"
   },
   "overrides": {
     "qs": "^6.14.1",

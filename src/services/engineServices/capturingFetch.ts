@@ -20,6 +20,7 @@ import type { SearchFetch, ScrapePageOptions, ScrapePageResult } from '@figureco
 import type { CaptureSink } from '../captureSink.js';
 import { buildRawCapture } from '../captureSink.js';
 import { sanitizeForLog } from '../../utils/security.js';
+import { resolvePrime } from '../sessionPrime.js';
 
 export interface CapturingFetchResult {
   html: string;
@@ -34,8 +35,8 @@ export interface BrowserLaneFetcher {
 export interface CapturingFetchTransports {
   /** Plain HTTP GET (Tier-1 cookieless JSON/HTML). */
   http: (url: string) => Promise<string>;
-  /** impit TLS-impersonating GET (Cloudflare-fronted JSON APIs). */
-  impersonate: (url: string, opts: { browser?: string; headers?: Record<string, string>; userAgent?: string }) => Promise<string>;
+  /** impit TLS-impersonating GET (Cloudflare-fronted JSON APIs). `prime` primes a session-gated host. */
+  impersonate: (url: string, opts: { browser?: string; headers?: Record<string, string>; userAgent?: string; prime?: { url: string } }) => Promise<string>;
   /** Pooled browser navigation — the fallback for `browser`/undeclared transports. */
   browser: BrowserLaneFetcher;
 }
@@ -69,10 +70,16 @@ export function createCapturingFetch(transports: CapturingFetchTransports, sink:
   return async function capturingFetch(url, searchFetch, options = {}) {
     switch (searchFetch?.transport) {
       case 'impersonate': {
+        // Session-gated stores (403-cold) declare `sessionPrime`; the impit transport primes the
+        // host once per session before this fetch. Undeclared → no `prime` key (byte-identical). The
+        // prime GET happens INSIDE the transport and its body is discarded there, so only THIS
+        // target body is captured below — a prime never produces a raw.capture (capture-neutral).
+        const prime = resolvePrime(searchFetch, url);
         const html = await transports.impersonate(url, {
           browser: searchFetch.browser,
           headers: searchFetch.headers,
           userAgent: searchFetch.userAgent,
+          ...(prime ? { prime } : {}),
         });
         await captureApiBody(sink, url, html);
         return { html };

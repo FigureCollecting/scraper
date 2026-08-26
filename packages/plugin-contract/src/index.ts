@@ -246,6 +246,19 @@ export interface RetrievalCapability {
 export type SearchTransport = 'http' | 'impersonate' | 'browser';
 
 /**
+ * Session-prime declaration for a fully session-gated store (Cloudflare / 403-cold). A COLD fetch
+ * (no prior same-session homepage GET) is challenged/blocked; the store returns real content only
+ * after a SAME-SESSION homepage GET mints the clearance cookie. When declared, the engine's
+ * impersonate (impit) transport GETs the prime URL ONCE per Impit session before the target fetch,
+ * so the cached cookie jar carries the clearance into it. Honored by both the ingest raw-fetch and
+ * the cross-store search; the impersonate lane is where it applies (the impit session persists
+ * cookies per profile).
+ *   - `true`               — prime the target URL's ORIGIN (its homepage).
+ *   - `{ primeUrl: '…' }`  — prime an explicit URL instead of the origin.
+ */
+export type SessionPrime = boolean | { primeUrl?: string };
+
+/**
  * Per-store fetch decoration for the cross-store SEARCH (`bySearch`) request: how the engine should
  * FETCH this store's search endpoint, and with what request headers/UA/cookies. Opaque to the engine
  * and filled by the plugin from the private profile (same pattern as `allowedCookies`/`rateLimit`).
@@ -267,6 +280,11 @@ export interface SearchFetch {
   userAgent?: string;
   /** Request-scoped cookies (e.g. a `cf_clearance` for the `browser` transport). */
   cookies?: Record<string, string>;
+  /**
+   * Session-priming for a session-gated store (see {@link SessionPrime}). Absent ⇒ no prime
+   * (behavior byte-identical for undeclared stores). Applies to the `impersonate` transport.
+   */
+  sessionPrime?: SessionPrime;
 }
 
 /**

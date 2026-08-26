@@ -198,6 +198,37 @@ describe('ScrapeQueue - ingest raw-fetch honors ruleset transport', () => {
     expect(sink.captures[0].bytes.toString('utf8')).toBe('{"name":"Sentai Figure"}');
   });
 
+  it("primes a session-gated store's ingest fetch (sessionPrime → prime the origin before the impit GET)", async () => {
+    // The GOAL path: a 403-cold session-gated store (anitoys) declares sessionPrime; processViaIngest
+    // must thread the prime to the impit transport so the target fetch is PRIMED (200), not COLD (403
+    // → zero claims). This proves the ingest wiring end-to-end; impitFetch itself does the prime-once.
+    const ruleset = makeJsonRuleset();
+    const send = jest.fn().mockResolvedValue({ sourceId: 'src-1' });
+    const impersonate = jest.fn().mockResolvedValue('{"name":"Lucy"}');
+
+    queue = new ScrapeQueue(false);
+    queue.setPluginRegistry(
+      makeRegistry(ruleset, 'www.anitoysgk.com', { transport: 'impersonate', browser: 'chrome142', sessionPrime: true }),
+    );
+    queue.setIngestEmitter({ send });
+    queue.setScrapingService(makeScrapingStub());
+    queue.setIngestTransports({ impersonate });
+    queue.setCaptureSink(new CollectingCaptureSink());
+
+    const url = 'https://www.anitoysgk.com/lucy-p29358268.html';
+    const result = queue.enqueue(url, { url });
+    await advanceAndFlush(500);
+    await result.promise;
+
+    expect(impersonate).toHaveBeenCalledWith(url, {
+      browser: 'chrome142',
+      headers: undefined,
+      userAgent: undefined,
+      prime: { url: 'https://www.anitoysgk.com' },
+    });
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
   it("routes an http-transport store's ingest fetch through plain HTTP and captures the body", async () => {
     const ruleset = makeJsonRuleset();
     const scraping = makeScrapingStub();

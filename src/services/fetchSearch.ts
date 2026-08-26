@@ -9,12 +9,13 @@
  * compositions still work. Replaces the earlier boolean browser-vs-http routing.
  */
 import type { SearchFetch } from '@figurecollecting/scraper-plugin-contract';
+import { resolvePrime } from './sessionPrime.js';
 
 export interface FetchSearchTransports {
   /** Plain HTTP GET (Tier-1 cookieless JSON). */
   http: (url: string) => Promise<string>;
-  /** impit TLS-impersonating GET (Cloudflare-fronted JSON APIs). */
-  impersonate: (url: string, opts: { browser?: string; headers?: Record<string, string>; userAgent?: string }) => Promise<string>;
+  /** impit TLS-impersonating GET (Cloudflare-fronted JSON APIs). `prime` primes a session-gated host. */
+  impersonate: (url: string, opts: { browser?: string; headers?: Record<string, string>; userAgent?: string; prime?: { url: string } }) => Promise<string>;
   /** Pooled browser navigation (rendered-DOM / JS-challenge). Optional — degrades to http if absent. */
   browser?: (url: string, opts?: { headers?: Record<string, string>; userAgent?: string; cookies?: Record<string, string> }) => Promise<string>;
 }
@@ -23,8 +24,12 @@ export interface FetchSearchTransports {
 export function makeFetchSearch(t: FetchSearchTransports) {
   return async function fetchSearch(url: string, searchFetch: SearchFetch): Promise<string> {
     switch (searchFetch.transport) {
-      case 'impersonate':
-        return t.impersonate(url, { browser: searchFetch.browser, headers: searchFetch.headers, userAgent: searchFetch.userAgent });
+      case 'impersonate': {
+        // A session-gated store (sessionPrime) is primed once per Impit session before the search
+        // GET; undeclared → no `prime` key (byte-identical).
+        const prime = resolvePrime(searchFetch, url);
+        return t.impersonate(url, { browser: searchFetch.browser, headers: searchFetch.headers, userAgent: searchFetch.userAgent, ...(prime ? { prime } : {}) });
+      }
       case 'browser':
         // A store that explicitly needs a browser must NOT silently fall back to a plain GET — that
         // returns a Cloudflare challenge PAGE the parser would treat as empty. Fail loud (→ the
