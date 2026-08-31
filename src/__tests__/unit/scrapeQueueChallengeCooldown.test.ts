@@ -130,7 +130,7 @@ describe('ScrapeQueue × challenge cooldown', () => {
 
   function buildQueue(opts: { http: jest.Mock; send: jest.Mock; registry?: ExtractionRegistryImpl; domain?: string }): ScrapeQueue {
     const q = new ScrapeQueue(false);
-    q.setPluginRegistry(opts.registry ?? makeRegistry(makeRuleset('anitoys', 'x'), opts.domain ?? 'anitoysgk.com', { transport: 'http' }));
+    q.setPluginRegistry(opts.registry ?? makeRegistry(makeRuleset('coolstore', 'x'), opts.domain ?? 'coolhost.example.test', { transport: 'http' }));
     q.setIngestEmitter({ send: opts.send });
     q.setScrapingService(makeScrapingStub());
     q.setIngestTransports({ http: opts.http });
@@ -144,7 +144,7 @@ describe('ScrapeQueue × challenge cooldown', () => {
     const send = jest.fn().mockResolvedValue(emptyStats());
     queue = buildQueue({ http, send }); // default maxRetries = 3 → proves fail-fast despite retries allowed
 
-    const url = 'https://anitoysgk.com/product/12345';
+    const url = 'https://coolhost.example.test/product/12345';
     const result = queue.enqueue(url, { url, sessionId: 's1' });
     result.promise.catch(() => {});
     await advanceUntil(() => queue.getStats().failed === 1);
@@ -159,19 +159,19 @@ describe('ScrapeQueue × challenge cooldown', () => {
     expect(reason).toContain('rate_limited');
     expect(reason).toContain('Cloudflare challenge page received');
     // the cooldown is now OPEN for the host
-    expect(cd.isOpen('anitoysgk.com')).toBe(true);
-    expect(warn.mock.calls.map((c) => String(c[0])).some((l) => l.startsWith('[COOLDOWN] opened anitoysgk.com'))).toBe(true);
+    expect(cd.isOpen('coolhost.example.test')).toBe(true);
+    expect(warn.mock.calls.map((c) => String(c[0])).some((l) => l.startsWith('[COOLDOWN] opened coolhost.example.test'))).toBe(true);
     warn.mockRestore();
   });
 
   it('FAST-FAIL: a second item for a cooling host fails immediately WITHOUT fetching, reason names the minutes left', async () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
-    cd.open('anitoysgk.com', 'challenge page'); // host already cooling (opened by an earlier attempt)
+    cd.open('coolhost.example.test', 'challenge page'); // host already cooling (opened by an earlier attempt)
     const http = jest.fn().mockResolvedValue(FIXTURE_HTML); // would succeed IF it were allowed to fetch
     const send = jest.fn().mockResolvedValue(healthyStats());
     queue = buildQueue({ http, send }); // default maxRetries = 3
 
-    const url = 'https://anitoysgk.com/product/999';
+    const url = 'https://coolhost.example.test/product/999';
     const result = queue.enqueue(url, { url, sessionId: 's2' });
     result.promise.catch(() => {});
     await advanceUntil(() => queue.getStats().failed === 1);
@@ -182,24 +182,24 @@ describe('ScrapeQueue × challenge cooldown', () => {
     const reason = mockNotifyItemFailed.mock.calls[0][2] as string;
     expect(reason).toContain('challenge_cooldown');
     expect(reason).toContain('min remaining'); // remaining minutes surfaced to the operator
-    expect(reason).toContain('anitoysgk.com');
+    expect(reason).toContain('coolhost.example.test');
     // the skipped line was logged with the url + host + minutes-left
     const skipped = warn.mock.calls.map((c) => String(c[0])).find((l) => l.startsWith('[COOLDOWN] skipped'));
-    expect(skipped).toContain('https://anitoysgk.com/product/999');
-    expect(skipped).toContain('anitoysgk.com cooling');
+    expect(skipped).toContain('https://coolhost.example.test/product/999');
+    expect(skipped).toContain('coolhost.example.test cooling');
     expect(skipped).toContain('min left');
     warn.mockRestore();
   });
 
   it('EXPIRY + CLEAR: after the window a clean fetch proceeds and clears the cooldown', async () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
-    cd.open('anitoysgk.com', 'challenge page'); // opened at cdNow=1_000_000, until=1_060_000
+    cd.open('coolhost.example.test', 'challenge page'); // opened at cdNow=1_000_000, until=1_060_000
     cdNow += MIN + 1; // advance PAST the window — the host is no longer cooling
     const http = jest.fn().mockResolvedValue(FIXTURE_HTML); // a clean, non-challenge body now
     const send = jest.fn().mockResolvedValue(healthyStats());
     queue = buildQueue({ http, send });
 
-    const url = 'https://anitoysgk.com/product/1';
+    const url = 'https://coolhost.example.test/product/1';
     const result = queue.enqueue(url, { url });
     await advanceUntil(() => queue.getStats().completed === 1 || queue.getStats().failed === 1);
     await result.promise;
@@ -207,20 +207,20 @@ describe('ScrapeQueue × challenge cooldown', () => {
     expect(http).toHaveBeenCalledTimes(1);   // fetch proceeded (cooldown expired)
     expect(queue.getStats().completed).toBe(1);
     expect(queue.getStats().failed).toBe(0);
-    expect(cd.isOpen('anitoysgk.com')).toBe(false);
+    expect(cd.isOpen('coolhost.example.test')).toBe(false);
     // the clean fetch cleared the (now-expired) cooldown entry
-    expect(warn.mock.calls.map((c) => String(c[0]))).toContain('[COOLDOWN] cleared anitoysgk.com');
+    expect(warn.mock.calls.map((c) => String(c[0]))).toContain('[COOLDOWN] cleared coolhost.example.test');
     expect(cd.list()).toEqual([]);
     warn.mockRestore();
   });
 
   it('a cookie-session item under cooldown lands FAILED and never enters the auth-pause path', async () => {
-    cd.open('anitoysgk.com', 'challenge page');
+    cd.open('coolhost.example.test', 'challenge page');
     const http = jest.fn().mockResolvedValue(FIXTURE_HTML);
     const send = jest.fn().mockResolvedValue(healthyStats());
     queue = buildQueue({ http, send });
 
-    const url = 'https://anitoysgk.com/product/777';
+    const url = 'https://coolhost.example.test/product/777';
     const result = queue.enqueue(url, { url, cookies: { PHPSESSID: 'abc' }, sessionId: 'sess-cf', userId: 'u1' });
     result.promise.catch(() => {});
     await advanceUntil(() => queue.getStats().failed === 1 || getSessionManager().isSessionPaused('sess-cf'));
@@ -233,7 +233,7 @@ describe('ScrapeQueue × challenge cooldown', () => {
   });
 
   it('other hosts are unaffected: a cooling host does not block a different host', async () => {
-    cd.open('anitoysgk.com', 'challenge page'); // hostA cooling
+    cd.open('coolhost.example.test', 'challenge page'); // hostA cooling
     const http = jest.fn().mockResolvedValue(FIXTURE_HTML);
     const send = jest.fn().mockResolvedValue(healthyStats());
     // registry serves hostB (fnc.example.test) only; hostA isn't even registered — cooldown is host-keyed.
@@ -247,6 +247,6 @@ describe('ScrapeQueue × challenge cooldown', () => {
 
     expect(http).toHaveBeenCalledTimes(1);   // hostB fetched normally
     expect(queue.getStats().completed).toBe(1);
-    expect(cd.isOpen('anitoysgk.com')).toBe(true); // hostA's cooldown untouched
+    expect(cd.isOpen('coolhost.example.test')).toBe(true); // hostA's cooldown untouched
   });
 });

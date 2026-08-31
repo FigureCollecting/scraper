@@ -21,7 +21,7 @@ const MAX = 24 * 60 * 60_000; // 24 hours
 const DEFAULT = 30 * 60_000; // 30 minutes
 
 describe('challengeCooldown — per-host CF cooldown (time-injectable)', () => {
-  const HOST = 'anitoysgk.com';
+  const HOST = 'coolhost.example.test';
 
   afterEach(() => {
     delete process.env.CHALLENGE_COOLDOWN_MS;
@@ -69,24 +69,24 @@ describe('challengeCooldown — per-host CF cooldown (time-injectable)', () => {
     expect(cd.clear(HOST)).toBe(true);
     expect(cd.isOpen(HOST)).toBe(false);
     expect(cd.clear(HOST)).toBe(false); // nothing left to clear
-    expect(warn).toHaveBeenCalledWith('[COOLDOWN] cleared anitoysgk.com');
+    expect(warn).toHaveBeenCalledWith('[COOLDOWN] cleared coolhost.example.test');
     warn.mockRestore();
   });
 
   it('normalizes the host key (lowercase, strip www.) so domain variants collapse to one', () => {
     const cd = new ChallengeCooldown({ now: () => 1, windowMs: MIN });
-    cd.open('WWW.AnitoysGK.com', 'r');
-    expect(cd.isOpen('anitoysgk.com')).toBe(true);
-    expect(cd.isOpen('www.anitoysgk.com')).toBe(true);
-    expect(cd.remaining('AnitoysGK.com')).toBe(MIN);
-    expect(cd.list()[0].host).toBe('anitoysgk.com'); // canonical key stored
+    cd.open('WWW.CoolHost.example.test', 'r');
+    expect(cd.isOpen('coolhost.example.test')).toBe(true);
+    expect(cd.isOpen('www.coolhost.example.test')).toBe(true);
+    expect(cd.remaining('CoolHost.example.test')).toBe(MIN);
+    expect(cd.list()[0].host).toBe('coolhost.example.test'); // canonical key stored
   });
 
   it('logs [COOLDOWN] opened <host> for <m> min (<reason>)', () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
     const cd = new ChallengeCooldown({ now: () => 1, windowMs: 2 * MIN });
     cd.open(HOST, 'search challenge page');
-    expect(warn).toHaveBeenCalledWith('[COOLDOWN] opened anitoysgk.com for 2 min (search challenge page)');
+    expect(warn).toHaveBeenCalledWith('[COOLDOWN] opened coolhost.example.test for 2 min (search challenge page)');
     warn.mockRestore();
   });
 
@@ -158,7 +158,7 @@ describe('challengeCooldown — per-host CF cooldown (time-injectable)', () => {
       expect(err.name).toBe('ChallengeCooldownError');
       expect(err.host).toBe(HOST);
       expect(err.remainingMs).toBe(90_000);
-      expect(err.message).toContain('anitoysgk.com');
+      expect(err.message).toContain('coolhost.example.test');
       expect(err.message).toContain('2 min');
       expect(err.message.toLowerCase()).toContain('cooling');
     });
