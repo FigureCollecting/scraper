@@ -8,6 +8,7 @@ import { assembleLookup, type LookupServices } from '../assembleLookup';
 import { buildProfileRegistry } from '../profileRegistry';
 import type {
   ExtractionRuleset,
+  IdentityQuery,
   SearchCandidate,
   StoreCapabilities,
 } from '@figurecollecting/scraper-plugin-contract';
@@ -315,5 +316,32 @@ describe('lookupByIdentity — substring-match store post-filter + observability
     expect(gk.filtered).toBe(1);
     expect(warn).not.toHaveBeenCalled(); // no false "search failed" log
     warn.mockRestore();
+  });
+
+  it('matches identity tokens across intra-token punctuation variance (apostrophe/hyphen) — no silent false exclusion', async () => {
+    // The store wrote the apostrophe/hyphen and the identity did not (or vice-versa). normalizeText
+    // spaces punctuation, so a token spanning it ("girls" ⊄ "girl s house") would be falsely excluded.
+    // The post-filter also tests the space-collapsed name, so cross-store title variance keeps the target.
+    const only = async (identity: IdentityQuery, name: string) => {
+      const cand: SearchCandidate[] = [{ itemId: 'x', name, available: true }];
+      const services: LookupServices = {
+        profiles: buildProfileRegistry([SUBSTORE]),
+        getRulesetForUrl: () => stub('gkloot', () => cand),
+        fetchSearch: jest.fn(async () => JSON.stringify(cand)),
+      };
+      return (await assembleLookup(services).lookupByIdentity(identity)).results.find((r) => r.siteId === 'gkloot')!;
+    };
+
+    // apostrophe variance: identity "Girls House" vs store title "GIRL'S HOUSE …" → KEPT (was dropped).
+    const ap = await only({ studio: 'Girls House', character: 'Lucy' }, "GIRL'S HOUSE GK Studio Lucy Figure");
+    expect(ap.candidates.map((c) => c.itemId)).toEqual(['x']);
+    expect(ap.filtered).toBe(0);
+    // hyphen/space variance inside a token: identity "WuKong Studio" vs "Wu-Kong Studio Lucy" → KEPT.
+    const hy = await only({ studio: 'WuKong Studio', character: 'Lucy' }, 'Wu-Kong Studio Lucy');
+    expect(hy.candidates.map((c) => c.itemId)).toEqual(['x']);
+    // a genuine off-identity decoy is STILL dropped — the gate did not become a pass-through.
+    const decoy = await only({ studio: 'Star Origin Studio', character: 'Lucy' }, 'Crown Studio Lucy 1/4');
+    expect(decoy.candidates).toEqual([]);
+    expect(decoy.filtered).toBe(1);
   });
 });

@@ -129,7 +129,11 @@ export function assembleLookup(services: LookupServices): Lookup {
               // Plugin output is untrusted at runtime: a non-string name can't match identity, so
               // drop it as a non-match — never let it throw and take the WHOLE store into `failed`.
               const name = typeof c.name === 'string' ? normalizeText(c.name) : '';
-              return p.filter!.every((tok) => name.includes(tok));
+              // Also test the space-collapsed name so an identity token that spans punctuation the
+              // store wrote but the identity didn't ("girls" vs "GIRL'S HOUSE") still matches — the
+              // same cross-store title variance the substring gate exists to see through.
+              const compact = name.replace(/ /g, '');
+              return p.filter!.every((tok) => name.includes(tok) || compact.includes(tok));
             });
             filtered = candidates.length - kept.length;
             candidates = kept;
