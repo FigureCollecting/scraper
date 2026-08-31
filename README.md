@@ -640,6 +640,11 @@ See `.env.example` for complete configuration template.
   - Unset (default): the new path is disabled and every item uses the legacy scrape+webhook path
 - `INGEST_TIMEOUT_MS`: Per-call deadline in milliseconds for spine ingest RPCs
   - Default: `30000`
+- `IMPIT_TIMEOUT_MS`: Per-request timeout (ms) for the impit browser-TLS transport
+  - Applies to each impit GET independently — a session-gated store's homepage prime and the target fetch each get the full budget
+  - Raise for slow session-gated stores (e.g. Ueeshop) whose prime/search can take 15–30 s
+  - Unset/invalid → default; any value is clamped to `[5000, 120000]`
+  - Default: `30000`
 
 **MFC Cookie Security:**
 - `MFC_ALLOWED_COOKIES`: Whitelist of cookie names allowed during authenticated MFC scraping
