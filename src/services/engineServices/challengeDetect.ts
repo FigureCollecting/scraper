@@ -42,8 +42,14 @@ const TOKEN_MARKERS = [
  */
 const CHALLENGE_LOADER = /challenge-platform\/h\/[^/"']+\/orchestrate\/chl_page/i;
 
-/** The CF managed-challenge document <title> ("Just a moment..."), required inside a <title> tag. */
-const CHALLENGE_TITLE = /<title>\s*Just a moment/i;
+/**
+ * The CF managed-challenge document <title> — exactly "Just a moment..." (three dots) immediately
+ * before </title>. Tightened from a loose "starts with Just a moment" to the full interstitial form
+ * so a real product whose name merely opens with those words (e.g. "Just A Moment Figure") is not a
+ * false positive. Corpus-verified: every genuine interstitial ALSO carries _cf_chl_opt/__cf_chl_
+ * (TOKEN_MARKERS above), so nothing is lost by requiring the exact title.
+ */
+const CHALLENGE_TITLE = /<title>\s*Just a moment\.{3}\s*<\/title>/i;
 
 /** The classic IUAM interstitial body copy. */
 const IUAM_BODY_COPY = 'Checking your browser before accessing';

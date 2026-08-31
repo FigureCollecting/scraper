@@ -81,6 +81,15 @@ describe('isCloudflareChallenge', () => {
         '<div class="challenge">Weekly painting challenge results</div></body></html>';
       expect(isCloudflareChallenge(html)).toBe(false);
     });
+
+    it('does NOT flag a real product titled "Just A Moment Figure" (title must be the exact interstitial form)', () => {
+      // The interstitial title is exactly "Just a moment..." (three dots) immediately before </title>.
+      // A product whose name merely opens with those words is NOT a challenge — the genuine
+      // interstitial always ALSO carries _cf_chl_opt/__cf_chl_, so tightening loses no real detection.
+      const html =
+        '<html><head><title>Just A Moment Figure</title></head><body><h1>Buy the Just A Moment figure</h1></body></html>';
+      expect(isCloudflareChallenge(html)).toBe(false);
+    });
   });
 
   describe('real store pages carrying Cloudflare Bot-Management telemetry → false (RS-1/RD-1/F1 regression)', () => {
