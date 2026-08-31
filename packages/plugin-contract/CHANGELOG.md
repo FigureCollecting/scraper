@@ -4,6 +4,20 @@ All notable changes to `@figurecollecting/scraper-plugin-contract` will be docum
 file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this
 package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-08-31
+
+Additive, backward-compatible: every existing `bySearch` capability still compiles unchanged — the
+new field is optional and its absence keeps today's token-match behavior. Built for cross-store
+lookup against substring-match search stores (Ueeshop/gkloot).
+
+### Added
+- `RetrievalCapability.bySearch.queryMatch?: 'tokens' | 'substring'` — how the store's search
+  interprets `{q}`: `tokens` (the default, today's behavior) matches the query WORDS against the
+  product name; `substring` matches `{q}` as ONE contiguous case-insensitive substring of the
+  product name (Ueeshop/gkloot), so a multi-term identity phrase matches nothing. For a `substring`
+  store the engine issues the single most selective identity term as `{q}` and post-filters the
+  candidates by the remaining identity terms.
+
 ## [0.4.0] - 2026-08-19
 
 Additive, backward-compatible: every existing 2-argument ruleset and every existing
