@@ -292,4 +292,28 @@ describe('lookupByIdentity — substring-match store post-filter + observability
     expect(gk.candidates.map((c) => c.itemId)).toEqual(['17412', '9003']);
     expect(gk.storeQuery).toBe('Lucy');
   });
+
+  it('a candidate with a non-string name is dropped as a non-match, not thrown — the substring store survives (not `failed`)', async () => {
+    // Untrusted plugin output: a substring-store SERP emits a candidate whose name is undefined. The
+    // identity post-filter must treat it as a non-match (drop it) — NOT throw and lose the WHOLE store.
+    const withBadName: SearchCandidate[] = [
+      { itemId: '17412', name: 'Star Origin Studio 1/6 Cyberpunk Lucyna Kushinada Statue', available: true },
+      { itemId: 'nameless', name: undefined as unknown as string, available: true },
+    ];
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const services: LookupServices = {
+      profiles: buildProfileRegistry([SUBSTORE]),
+      getRulesetForUrl: () => stub('gkloot', () => withBadName),
+      fetchSearch: jest.fn(async () => JSON.stringify(withBadName)),
+    };
+
+    const out = await assembleLookup(services).lookupByIdentity(IDENTITY);
+
+    expect(out.failed).toEqual([]); // no crash → store is NOT reported failed
+    const gk = out.results.find((r) => r.siteId === 'gkloot')!;
+    expect(gk.candidates.map((c) => c.itemId)).toEqual(['17412']); // nameless candidate dropped
+    expect(gk.filtered).toBe(1);
+    expect(warn).not.toHaveBeenCalled(); // no false "search failed" log
+    warn.mockRestore();
+  });
 });

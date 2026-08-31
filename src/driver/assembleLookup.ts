@@ -126,7 +126,9 @@ export function assembleLookup(services: LookupServices): Lookup {
           let filtered: number | undefined;
           if (p.filter?.length) {
             const kept = candidates.filter((c) => {
-              const name = normalizeText(c.name);
+              // Plugin output is untrusted at runtime: a non-string name can't match identity, so
+              // drop it as a non-match — never let it throw and take the WHOLE store into `failed`.
+              const name = typeof c.name === 'string' ? normalizeText(c.name) : '';
               return p.filter!.every((tok) => name.includes(tok));
             });
             filtered = candidates.length - kept.length;
