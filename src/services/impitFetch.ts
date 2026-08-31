@@ -7,6 +7,7 @@
  * instance — WITH a per-profile cookie jar — is cached per impersonation profile.
  */
 import { CookieJar } from 'tough-cookie';
+import { isCloudflareChallenge } from './engineServices/challengeDetect.js';
 
 /** Default impersonation profile. A LIVE TUNABLE — chrome110 already went stale to Cloudflare; keep recent. */
 const DEFAULT_PROFILE = 'chrome142';
@@ -102,11 +103,11 @@ function hostOf(url: string): string | undefined {
  * misread as a challenge: at worst a false positive costs one wasted re-prime + refetch, never a loop.
  */
 function looksLikeChallenge(body: string): boolean {
-  return (
-    body.includes('Just a moment') ||
-    body.includes('/cdn-cgi/challenge-platform/') ||
-    body.includes('cf-mitigated')
-  );
+  // Delegate to the shared, conservative detector (engineServices/challengeDetect) rather than keep
+  // a second copy of the markers; 'Just a moment' (loose) and 'cf-mitigated' remain impit's own
+  // extra triggers so this stays a strict SUPERSET of the shared detector — never narrower —
+  // preserving the pre-existing re-prime sensitivity.
+  return isCloudflareChallenge(body) || body.includes('Just a moment') || body.includes('cf-mitigated');
 }
 
 /**

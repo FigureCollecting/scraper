@@ -21,9 +21,28 @@ import type { CaptureSink } from '../captureSink.js';
 import { buildRawCapture } from '../captureSink.js';
 import { sanitizeForLog } from '../../utils/security.js';
 import { resolvePrime } from '../sessionPrime.js';
+import { isCloudflareChallenge } from './challengeDetect.js';
 
 export interface CapturingFetchResult {
   html: string;
+}
+
+/**
+ * A non-browser lane (impersonate / http) received a Cloudflare challenge interstitial instead of
+ * the real page — a TRANSPORT failure, not an empty success. Thrown AFTER the bytes are handed to
+ * the capture sink (provenance is still recorded), so the queue's existing failure handling
+ * (attempts / backoff / FAILED) owns it rather than a ruleset silently lifting zero rows. The
+ * message names Cloudflare so the queue's classifyError treats it as a rate-limit/block class.
+ */
+export class ChallengePageError extends Error {
+  readonly url: string;
+  readonly transport: string;
+  constructor(url: string, transport: string) {
+    super(`Cloudflare challenge page received for ${sanitizeForLog(url)} via ${transport} transport`);
+    this.name = 'ChallengePageError';
+    this.url = url;
+    this.transport = transport;
+  }
 }
 
 /** The browser lane's raw-fetch surface — it already captures internally via navigateAndCapture. */
@@ -81,12 +100,16 @@ export function createCapturingFetch(transports: CapturingFetchTransports, sink:
           userAgent: searchFetch.userAgent,
           ...(prime ? { prime } : {}),
         });
+        // Capture FIRST (provenance is recorded even for a challenge body), THEN reject a challenge
+        // interstitial as a transport failure — a ruleset would silently lift zero rows from it.
         await captureApiBody(sink, url, html);
+        if (isCloudflareChallenge(html)) throw new ChallengePageError(url, 'impersonate');
         return { html };
       }
       case 'http': {
         const html = await transports.http(url);
         await captureApiBody(sink, url, html);
+        if (isCloudflareChallenge(html)) throw new ChallengePageError(url, 'http');
         return { html };
       }
       case 'browser':

@@ -4,7 +4,7 @@
  * fetchSearch's dispatcher, but ALWAYS captures the fetched bytes to the sink (today only the
  * browser lane's navigateAndCapture does that) and returns the ingest path's `{ html }` shape.
  */
-import { createCapturingFetch, type CapturingFetchTransports } from '../../../services/engineServices/capturingFetch';
+import { createCapturingFetch, ChallengePageError, type CapturingFetchTransports } from '../../../services/engineServices/capturingFetch';
 import { CollectingCaptureSink } from '../../../services/captureSink';
 
 function makeTransports() {
@@ -147,5 +147,85 @@ describe('createCapturingFetch', () => {
     await expect(
       fetch('https://api.sentai.example.test/item/1', { transport: 'impersonate' })
     ).resolves.toEqual({ html: '{"json":"BODY"}' });
+  });
+
+  describe('Cloudflare challenge → ChallengePageError (transport failure, not empty success)', () => {
+    // Title-form managed-challenge interstitial (same shape impitFetch's re-prime fixture uses).
+    const CHALLENGE = '<html><head><title>Just a moment...</title></head><body>cf challenge</body></html>';
+
+    it('throws ChallengePageError on the impersonate lane AFTER capturing the raw body (provenance preserved)', async () => {
+      const sink = new CollectingCaptureSink();
+      const t: CapturingFetchTransports = {
+        http: jest.fn(),
+        impersonate: jest.fn(async () => CHALLENGE),
+        browser: { scrapePage: jest.fn(), scrapePageStealth: jest.fn() },
+      };
+      const fetch = createCapturingFetch(t, sink);
+      const url = 'https://www.anitoysgk.com/lucy-p29358268.html';
+
+      const err = await fetch(url, { transport: 'impersonate', browser: 'chrome142' }).then(
+        () => { throw new Error('expected ChallengePageError'); },
+        e => e,
+      );
+      expect(err).toBeInstanceOf(ChallengePageError);
+      expect(err.name).toBe('ChallengePageError');
+      expect(err.url).toBe(url);
+      expect(err.transport).toBe('impersonate');
+      // the challenge bytes STILL reached the sink before the throw (raw-capture integrity)
+      expect(sink.captures).toHaveLength(1);
+      expect(sink.captures[0]).toMatchObject({ url, lane: 'api' });
+      expect(sink.captures[0].bytes.toString('utf8')).toBe(CHALLENGE);
+    });
+
+    it('throws ChallengePageError on the http lane AFTER capturing the raw body', async () => {
+      const sink = new CollectingCaptureSink();
+      const t: CapturingFetchTransports = {
+        http: jest.fn(async () => CHALLENGE),
+        impersonate: jest.fn(),
+        browser: { scrapePage: jest.fn(), scrapePageStealth: jest.fn() },
+      };
+      const fetch = createCapturingFetch(t, sink);
+      const url = 'https://json.example.test/item/1';
+
+      const err = await fetch(url, { transport: 'http' }).then(
+        () => { throw new Error('expected ChallengePageError'); },
+        e => e,
+      );
+      expect(err).toBeInstanceOf(ChallengePageError);
+      expect(err.transport).toBe('http');
+      expect(sink.captures).toHaveLength(1);
+      expect(sink.captures[0].bytes.toString('utf8')).toBe(CHALLENGE);
+    });
+
+    it('does NOT throw for a real body on the impersonate lane (only a challenge body throws)', async () => {
+      const sink = new CollectingCaptureSink();
+      const t: CapturingFetchTransports = {
+        http: jest.fn(),
+        impersonate: jest.fn(async () => '{"json":"REAL"}'),
+        browser: { scrapePage: jest.fn(), scrapePageStealth: jest.fn() },
+      };
+      const fetch = createCapturingFetch(t, sink);
+      await expect(
+        fetch('https://api.sentai.example.test/item/1', { transport: 'impersonate' })
+      ).resolves.toEqual({ html: '{"json":"REAL"}' });
+      expect(sink.captures).toHaveLength(1);
+    });
+
+    it('does NOT throw on the browser lane even when its body looks like a challenge (browser lane owns its own detection — regression pin)', async () => {
+      const sink = new CollectingCaptureSink();
+      const t: CapturingFetchTransports = {
+        http: jest.fn(),
+        impersonate: jest.fn(),
+        browser: {
+          scrapePage: jest.fn(async (url: string) => ({ html: CHALLENGE, url, title: 'Just a moment...', statusCode: 200 })),
+          scrapePageStealth: jest.fn(),
+        },
+      };
+      const fetch = createCapturingFetch(t, sink);
+
+      const result = await fetch('https://myfigurecollection.net/item/12345', { transport: 'browser' });
+      expect(result).toEqual({ html: CHALLENGE }); // returned, NOT thrown
+      expect(sink.captures).toHaveLength(0);        // browser lane captures itself, not here
+    });
   });
 });
