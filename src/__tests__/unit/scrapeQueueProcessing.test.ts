@@ -37,6 +37,7 @@ import {
   resetScrapeQueue,
 } from '../../services/scrapeQueue';
 import { createExtractionRegistry, ExtractionRegistryImpl } from '../../services/extractionRegistry';
+import { okWriteStats } from '../helpers/ingestWriteStats';
 
 /** Registry with the fixture site registered against the queue's MFC URLs. */
 function makeRegistry(ruleset: ExtractionRuleset): ExtractionRegistryImpl {
@@ -131,7 +132,7 @@ describe('ScrapeQueue - processing loop', () => {
   /** Build a queue wired for the ingest path with a controllable fetch stub. */
   function makeIngestQueue(fields?: Record<string, unknown>) {
     const scraping = makeScrapingStub();
-    const send = jest.fn().mockResolvedValue({ sourceId: 'src-1' });
+    const send = jest.fn().mockResolvedValue(okWriteStats());
     queue = new ScrapeQueue(false);
     queue.setPluginRegistry(makeRegistry(makeRuleset(fields)));
     queue.setIngestEmitter({ send });

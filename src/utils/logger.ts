@@ -188,14 +188,13 @@ export interface EnrichmentEvent {
   maxRetries?: number;
   durationMs?: number;
   reason?: string;
-  // Field completeness tracking for partial re-enrichment analysis
+  // Plugin-shaped field-presence tracking for the ingest path. Derived from the emitted record's
+  // OWN fields (title/price/images/fieldCount), NOT the legacy ScrapedData keys plugins never set.
   fields?: {
-    imageUrl?: boolean;
-    name?: boolean;
-    manufacturer?: boolean;
-    origin?: boolean;
-    releaseDate?: boolean;
+    title?: boolean;
     price?: boolean;
+    images?: number;
+    fieldCount?: number;
   };
 }
 
@@ -231,12 +230,10 @@ export const enrichmentLogger = {
    * Log successful enrichment with field completeness for analysis
    */
   success(sourceUrl: string, sessionId?: string, durationMs?: number, fields?: {
-    imageUrl?: boolean;
-    name?: boolean;
-    manufacturer?: boolean;
-    origin?: boolean;
-    releaseDate?: boolean;
+    title?: boolean;
     price?: boolean;
+    images?: number;
+    fieldCount?: number;
   }): void {
     this.log({ event: 'success', sourceUrl, sessionId, durationMs, fields });
   },

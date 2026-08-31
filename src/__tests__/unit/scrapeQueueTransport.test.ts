@@ -35,6 +35,7 @@ jest.mock('../../services/webhookClient', () => ({
 import type { ExtractionRuleset, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
 import { ScrapeQueue, resetScrapeQueue } from '../../services/scrapeQueue';
 import { createExtractionRegistry, ExtractionRegistryImpl } from '../../services/extractionRegistry';
+import { okWriteStats } from '../helpers/ingestWriteStats';
 import { CollectingCaptureSink } from '../../services/captureSink';
 
 /**
@@ -164,7 +165,7 @@ describe('ScrapeQueue - ingest raw-fetch honors ruleset transport', () => {
   it("routes an impersonate-transport store's ingest fetch through impit, not the browser, and hands the raw JSON to extract()", async () => {
     const ruleset = makeJsonRuleset();
     const scraping = makeScrapingStub(); // would render JSON as HTML — must NOT be called
-    const send = jest.fn().mockResolvedValue({ sourceId: 'src-1' });
+    const send = jest.fn().mockResolvedValue(okWriteStats());
     const impersonate = jest.fn().mockResolvedValue('{"name":"Sentai Figure"}');
     const sink = new CollectingCaptureSink();
 
@@ -203,7 +204,7 @@ describe('ScrapeQueue - ingest raw-fetch honors ruleset transport', () => {
     // must thread the prime to the impit transport so the target fetch is PRIMED (200), not COLD (403
     // → zero claims). This proves the ingest wiring end-to-end; impitFetch itself does the prime-once.
     const ruleset = makeJsonRuleset();
-    const send = jest.fn().mockResolvedValue({ sourceId: 'src-1' });
+    const send = jest.fn().mockResolvedValue(okWriteStats());
     const impersonate = jest.fn().mockResolvedValue('{"name":"Lucy"}');
 
     queue = new ScrapeQueue(false);
@@ -232,7 +233,7 @@ describe('ScrapeQueue - ingest raw-fetch honors ruleset transport', () => {
   it("routes an http-transport store's ingest fetch through plain HTTP and captures the body", async () => {
     const ruleset = makeJsonRuleset();
     const scraping = makeScrapingStub();
-    const send = jest.fn().mockResolvedValue({ sourceId: 'src-1' });
+    const send = jest.fn().mockResolvedValue(okWriteStats());
     const http = jest.fn().mockResolvedValue('{"name":"Tier1 Figure"}');
     const sink = new CollectingCaptureSink();
 
@@ -260,7 +261,7 @@ describe('ScrapeQueue - ingest raw-fetch honors ruleset transport', () => {
   it('a browser-transport (or no-transport) store still uses the browser lane (regression guard)', async () => {
     const ruleset = makeHtmlRuleset();
     const scraping = makeScrapingStub('<html><body><h1>Kitagawa Marin</h1></body></html>');
-    const send = jest.fn().mockResolvedValue({ sourceId: 'src-1' });
+    const send = jest.fn().mockResolvedValue(okWriteStats());
     const impersonate = jest.fn();
     const http = jest.fn();
 
@@ -286,7 +287,7 @@ describe('ScrapeQueue - ingest raw-fetch honors ruleset transport', () => {
   it('an explicit browser-transport store also uses the browser lane and keeps cookie-driven stealth fetch', async () => {
     const ruleset = makeHtmlRuleset();
     const scraping = makeScrapingStub();
-    const send = jest.fn().mockResolvedValue({ sourceId: 'src-1' });
+    const send = jest.fn().mockResolvedValue(okWriteStats());
 
     queue = new ScrapeQueue(false);
     queue.setPluginRegistry(makeRegistry(ruleset, 'myfigurecollection.net', { transport: 'browser' }));

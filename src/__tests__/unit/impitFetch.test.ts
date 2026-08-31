@@ -239,4 +239,63 @@ describe('createImpitFetch — session-prime (jar-carried clearance, prime-once,
     expect(g.primes()).toBe(2);         // initial prime + exactly one re-prime, then stop
     expect(g.targets()).toBe(2);        // target fetched twice (initial + one retry) — no infinite loop
   });
+
+  /**
+   * A gate whose target ALWAYS returns `targetBody` after the prime seeds the jar — pins exactly
+   * which bodies the challenge-detection re-prime treats as a CHALLENGE (re-prime once) vs REAL
+   * content (no re-prime). Guards impit's `looksLikeChallenge` (which delegates to the shared
+   * conservative detector): the injected Bot-Management telemetry script that rides on ordinary 200
+   * pages must NOT trigger a re-prime (RS-1/RD-1), while genuine challenge/block markers must.
+   */
+  function fixedTargetJarImpit(targetBody: string) {
+    let primes = 0;
+    let targets = 0;
+    const make = (_browser: string, jar?: CookieJarLike): ImpitLike => ({
+      fetch: async (url) => {
+        if (isPrime(url)) { primes++; await jar?.setCookie?.('cf_clearance=ok; Path=/', url); return { text: async () => 'homepage' }; }
+        targets++;
+        return { text: async () => targetBody };
+      },
+    });
+    return { make, primes: () => primes, targets: () => targets };
+  }
+
+  it('does NOT re-prime a primed host whose 200 page carries only injected Bot-Management telemetry (real page, RS-1)', async () => {
+    // /cdn-cgi/challenge-platform/scripts/jsd/main.js is telemetry Cloudflare injects into ORDINARY
+    // 200 pages — NOT the orchestrate/chl_page challenge loader. looksLikeChallenge must read it as
+    // real content, so a primed host is not needlessly re-primed and the real body is returned as-is.
+    const TELEMETRY_200 =
+      '<html><head><title>Lucy 1/6 — Star Origin Studio</title>' +
+      '<script>var a=document.createElement("script");a.src="/cdn-cgi/challenge-platform/scripts/jsd/main.js";document.head.appendChild(a);</script>' +
+      '</head><body>real product page, in stock</body></html>';
+    const g = fixedTargetJarImpit(TELEMETRY_200);
+    const impitFetch = createImpitFetch(g.make);
+    const body = await impitFetch(TARGET, { browser: 'chrome142', prime: { url: PRIME_URL } });
+    expect(body).toBe(TELEMETRY_200); // real content returned as-is
+    expect(g.primes()).toBe(1);       // primed ONCE — telemetry is not a challenge, no re-prime
+    expect(g.targets()).toBe(1);      // target fetched once, not retried
+  });
+
+  it('re-primes ONCE for a primed host returning genuine __cf_chl_ / _cf_chl_opt challenge markers', async () => {
+    const CHL_MARKERS =
+      '<html><head></head><body><script>window._cf_chl_opt={cvId:"3"};window.__cf_chl_managed_tk__="x";</script></body></html>';
+    const g = fixedTargetJarImpit(CHL_MARKERS);
+    const impitFetch = createImpitFetch(g.make);
+    const body = await impitFetch(TARGET, { browser: 'chrome142', prime: { url: PRIME_URL } });
+    expect(body).toBe(CHL_MARKERS); // still challenged after the one bounded retry — returned, not looped
+    expect(g.primes()).toBe(2);     // initial prime + exactly one challenge-triggered re-prime
+    expect(g.targets()).toBe(2);    // target fetched twice (initial + one retry)
+  });
+
+  it('re-primes ONCE for a primed host returning a CF block/error page (cf-error-details / Attention Required!)', async () => {
+    const BLOCK =
+      '<html><head><title>Attention Required! | Cloudflare</title></head>' +
+      '<body><div id="cf-error-details">Sorry, you have been blocked</div></body></html>';
+    const g = fixedTargetJarImpit(BLOCK);
+    const impitFetch = createImpitFetch(g.make);
+    const body = await impitFetch(TARGET, { browser: 'chrome142', prime: { url: PRIME_URL } });
+    expect(body).toBe(BLOCK);
+    expect(g.primes()).toBe(2);     // a block page also triggers exactly one bounded re-prime
+    expect(g.targets()).toBe(2);
+  });
 });
