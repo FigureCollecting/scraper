@@ -344,4 +344,24 @@ describe('lookupByIdentity — substring-match store post-filter + observability
     expect(decoy.candidates).toEqual([]);
     expect(decoy.filtered).toBe(1);
   });
+
+  it('reports filtered: 0 when the identity filter ran but removed nothing (distinct from no-filter)', async () => {
+    // Every candidate already contains all filter tokens → the filter runs but drops nobody. `filtered`
+    // must still be PRESENT as 0, so "filter ran, all matched" stays distinguishable from "no filter".
+    const allMatch: SearchCandidate[] = [
+      { itemId: '17412', name: 'Star Origin Studio Lucy A', available: true },
+      { itemId: '9003', name: 'Star Origin Studio Lucy B', available: true },
+    ];
+    const services: LookupServices = {
+      profiles: buildProfileRegistry([SUBSTORE]),
+      getRulesetForUrl: () => stub('gkloot', () => allMatch),
+      fetchSearch: jest.fn(async () => JSON.stringify(allMatch)),
+    };
+
+    const gk = (await assembleLookup(services).lookupByIdentity(IDENTITY)).results.find((r) => r.siteId === 'gkloot')!;
+
+    expect(gk.candidates.map((c) => c.itemId)).toEqual(['17412', '9003']); // nobody removed
+    expect(gk.filtered).toBe(0);
+    expect(Object.prototype.hasOwnProperty.call(gk, 'filtered')).toBe(true); // present, not omitted
+  });
 });
