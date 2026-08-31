@@ -239,8 +239,13 @@ export interface RetrievalCapability {
    * `acceptsGtin` = the endpoint full-texts a GTIN/barcode as the `{q}` (amiami/Woo/PrestaShop), so
    * record-mode can substitute a JAN for a JAN-EXACT hit; absent = title-only (Shopify suggest), so
    * record-mode falls back to a composed name/ER query. Filled by the plugin from `identity.keys`.
+   * `queryMatch` = how the store's search interprets `{q}`: `tokens` (the default, today's behavior)
+   * matches the query WORDS against the product name (token/keyword index); `substring` matches `{q}`
+   * as ONE contiguous case-insensitive substring of the product name (Ueeshop/gkloot), so a multi-term
+   * identity PHRASE matches nothing. For a `substring` store the engine issues the single most
+   * selective identity term as `{q}` and POST-FILTERS the candidates by the remaining identity terms.
    */
-  bySearch?: { urlTemplate: string; scope?: 'listed' | 'orderable'; acceptsGtin?: boolean };
+  bySearch?: { urlTemplate: string; scope?: 'listed' | 'orderable'; acceptsGtin?: boolean; queryMatch?: 'tokens' | 'substring' };
 }
 
 export type SearchTransport = 'http' | 'impersonate' | 'browser';
