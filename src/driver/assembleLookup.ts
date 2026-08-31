@@ -116,6 +116,19 @@ export function assembleLookup(services: LookupServices): Lookup {
     const cooldown: string[] = [];
     const resolveTargets: ResolveTarget[] = [];
     const cd = services.challengeCooldown ?? getChallengeCooldown();
+    // CHALLENGE COOLDOWN gate (shared by detail AND search plans): this host is cooling from a recent
+    // CF challenge — SKIP it WITHOUT fetching (a challenge fetch degrades the egress IP's CF
+    // reputation) and list it under the additive `cooldown` list (the store is fine, we are
+    // deliberately leaving its host alone). A cooling byId host must be gated HERE too, so its detail
+    // target is never handed to the caller as a /resolve confirm that would fetch the cooling host.
+    const skipCooling = (p: { host: string; url: string; siteId: string }): boolean => {
+      if (!cd.isOpen(p.host)) return false;
+      const minsLeft = Math.max(1, Math.ceil(cd.remaining(p.host) / 60_000));
+      // eslint-disable-next-line no-console
+      console.warn(`[COOLDOWN] skipped ${sanitizeForLog(p.url)} (${normalizeHost(p.host)} cooling, ${minsLeft} min left)`);
+      cooldown.push(p.siteId);
+      return true;
+    };
 
     const settled = await Promise.all(
       plan.plans.map(async (p): Promise<StoreLookupResult | null> => {
@@ -123,6 +136,7 @@ export function assembleLookup(services: LookupServices): Lookup {
         // UNVERIFIED (we haven't fetched it), so segregate it into resolveTargets — never surface it
         // as a phantom candidate (no name=barcode into the matcher, no unfetched hit in orderable mode).
         if (p.kind === 'detail') {
+          if (skipCooling(p)) return null; // cooling host → cooldown list, never a resolveTarget
           resolveTargets.push({ siteId: p.siteId, host: p.host, itemId: p.itemId ?? '', url: p.url });
           return null;
         }
@@ -132,16 +146,7 @@ export function assembleLookup(services: LookupServices): Lookup {
           unsupported.push(p.siteId); // has a bySearch URL but no parser yet
           return null;
         }
-        // CHALLENGE COOLDOWN: this host is cooling from a recent CF challenge — SKIP it WITHOUT
-        // fetching (a challenge fetch degrades the egress IP's CF reputation). Additive `cooldown`
-        // list: the store is fine, we are deliberately leaving its host alone until the window ends.
-        if (cd.isOpen(p.host)) {
-          const minsLeft = Math.max(1, Math.ceil(cd.remaining(p.host) / 60_000));
-          // eslint-disable-next-line no-console
-          console.warn(`[COOLDOWN] skipped ${sanitizeForLog(p.url)} (${normalizeHost(p.host)} cooling, ${minsLeft} min left)`);
-          cooldown.push(p.siteId);
-          return null;
-        }
+        if (skipCooling(p)) return null;
         const scope = services.profiles.retrievalFor(p.host)?.bySearch?.scope ?? 'listed';
         if (mode === 'listed' && scope === 'orderable') orderableOnly.push(p.siteId);
         try {
