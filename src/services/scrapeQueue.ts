@@ -157,6 +157,78 @@ export interface IngestSender {
   send(extracted: PluginExtractedData): Promise<unknown>;
 }
 
+/**
+ * Structural view of the ingest server's WriteStats accounting (the emitter resolves the full
+ * @figurecollecting/ingest-contract WriteStats; the narrow IngestSender above types send()'s result
+ * as unknown). Only the per-table fields the honesty gate + [INGEST STATS] log read.
+ */
+interface IngestRecordStats {
+  claims?: { inserted?: number; deduped?: number; dropped?: number; quarantined?: number };
+  identifiers?: { inserted?: number; deduped?: number; dropped?: number };
+  prices?: { inserted?: number; deduped?: number; skipped?: number; dropped?: number };
+  availability?: { inserted?: number; deduped?: number; dropped?: number };
+  warnings?: string[];
+}
+
+/**
+ * The spine accepted the RPC but persisted 0 rows for a record — inserted+deduped == 0 across ALL
+ * four tables. An empty ingest is a FAILURE, never the "[INGEST] SUCCESS" the old emit-count path
+ * reported (a Cloudflare challenge / dead ruleset lifts an empty field bag the server can persist
+ * nothing from). Thrown from processViaIngest so the item flows through the queue's existing
+ * attempts/backoff/FAILED handling. Classifies as 'unknown' (retryable, bounded by maxRetries) so a
+ * permanently-empty store exhausts its attempts and lands FAILED rather than looping.
+ */
+export class EmptyIngestRecordError extends Error {
+  readonly site: string;
+  readonly itemId: string;
+  readonly warnings: string[];
+  constructor(site: string, itemId: string, warnings: string[]) {
+    const tail = warnings.length
+      ? ` server warnings: ${warnings.map(sanitizeForLog).join(' | ')}`
+      : ' (no server warnings)';
+    super(
+      `EMPTY_INGEST_RECORD for ${site}:${itemId}: spine persisted 0 rows ` +
+        `(inserted+deduped=0 across claims/identifiers/prices/availability).${tail}`
+    );
+    this.name = 'EmptyIngestRecordError';
+    this.site = site;
+    this.itemId = itemId;
+    this.warnings = warnings;
+  }
+}
+
+/**
+ * inserted+deduped summed across all four tables — the rows that actually LANDED. An idempotent
+ * re-ingest legitimately lands as all-deduped (inserted=0, deduped>0), so deduped counts as
+ * persisted. An absent table contributes 0.
+ */
+function persistedRows(stats: IngestRecordStats): number {
+  const t = (s?: { inserted?: number; deduped?: number }): number => (s ? (s.inserted ?? 0) + (s.deduped ?? 0) : 0);
+  return t(stats.claims) + t(stats.identifiers) + t(stats.prices) + t(stats.availability);
+}
+
+/**
+ * One [INGEST STATS] line per record surfacing the server WriteStats, then up to the first 3
+ * warnings (each sanitized). Field order: claims=ins/dedup/drop/quar prices=ins/dedup/skip/drop
+ * identifiers=ins/dedup/drop availability=ins/dedup/drop warnings=N.
+ */
+function logIngestStats(label: string, stats: IngestRecordStats): void {
+  const n = (x?: number): number => x ?? 0;
+  const c = stats.claims, id = stats.identifiers, p = stats.prices, av = stats.availability;
+  const warnings = stats.warnings ?? [];
+  console.log(
+    `[INGEST STATS] ${sanitizeForLog(label)} ` +
+      `claims=${n(c?.inserted)}/${n(c?.deduped)}/${n(c?.dropped)}/${n(c?.quarantined)} ` +
+      `prices=${n(p?.inserted)}/${n(p?.deduped)}/${n(p?.skipped)}/${n(p?.dropped)} ` +
+      `identifiers=${n(id?.inserted)}/${n(id?.deduped)}/${n(id?.dropped)} ` +
+      `availability=${n(av?.inserted)}/${n(av?.deduped)}/${n(av?.dropped)} ` +
+      `warnings=${warnings.length}`
+  );
+  for (const w of warnings.slice(0, 3)) {
+    console.log(`[INGEST STATS]   warn: ${sanitizeForLog(w)}`);
+  }
+}
+
 /** Raw page-fetch capability the ingest path uses (extraction is the plugin's job). */
 type RawPageFetcher = Pick<ScrapingService, 'scrapePage' | 'scrapePageStealth'>;
 
@@ -1061,9 +1133,21 @@ export class ScrapeQueue {
     // handling — the retry re-fetches, re-extracts, and re-emits ALL records as new honest
     // observations (no partial-batch ambiguity: there is no batch, only a resumable prefix).
     let emittedCount = 0;
+    let totalPersisted = 0;
     try {
       for (const record of records) {
-        await this.ingestEmitter!.send(record);
+        // send() resolves the server WriteStats (any OK RPC); the queue's IngestSender narrows it to
+        // unknown, so read it through the structural IngestRecordStats view.
+        const stats = (await this.ingestEmitter!.send(record)) as IngestRecordStats;
+        const label = `${record.source.site}:${record.source.itemId}`;
+        logIngestStats(label, stats);
+        const persisted = persistedRows(stats);
+        // HONESTY GATE: an OK RPC that persisted nothing (inserted+deduped==0 across all four tables)
+        // is a FAILURE, not success. All-deduped (idempotent re-run) has deduped>0 and passes.
+        if (persisted === 0) {
+          throw new EmptyIngestRecordError(record.source.site, record.source.itemId, stats.warnings ?? []);
+        }
+        totalPersisted += persisted;
         emittedCount++;
       }
     } catch (error: any) {
@@ -1075,7 +1159,7 @@ export class ScrapeQueue {
     }
 
     console.log(
-      `[SCRAPE QUEUE] Ingest complete for ${item.url}: records emitted=${emittedCount}/${records.length} (ruleset ${ruleset.siteId}@${ruleset.version})`
+      `[SCRAPE QUEUE] Ingest complete for ${item.url}: persisted=${totalPersisted} emitted=${emittedCount}/${records.length} (ruleset ${ruleset.siteId}@${ruleset.version})`
     );
 
     // [0] is always the page's own record (extractMany's documented contract; the single-record

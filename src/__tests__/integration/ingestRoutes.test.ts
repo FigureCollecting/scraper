@@ -42,6 +42,7 @@ import type { ExtractionRuleset } from '@figurecollecting/scraper-plugin-contrac
 import { createIngestRouter } from '../../routes/ingest';
 import { ScrapeQueue, resetScrapeQueue } from '../../services/scrapeQueue';
 import { createExtractionRegistry, ExtractionRegistryImpl } from '../../services/extractionRegistry';
+import { okWriteStats } from '../helpers/ingestWriteStats';
 
 const FIXTURE_HTML = '<html><body><h1 class="title">Kitagawa Marin</h1></body></html>';
 const FIXTURE_URL = 'https://figures.example.test/item/777';
@@ -146,7 +147,7 @@ describe('POST /ingest/scrape', () => {
       // Fully configured queue: validation failures must trip BEFORE config checks
       queue = new ScrapeQueue(true);
       queue.setPluginRegistry(makeRegistry(makeRuleset()));
-      queue.setIngestEmitter({ send: jest.fn().mockResolvedValue({ sourceId: 'src-1' }) });
+      queue.setIngestEmitter({ send: jest.fn().mockResolvedValue(okWriteStats()) });
     });
 
     it('returns 400 when url is missing', async () => {
@@ -196,7 +197,7 @@ describe('POST /ingest/scrape', () => {
       queue = new ScrapeQueue(true);
       // registry present but empty: nothing matches the URL's domain
       queue.setPluginRegistry(createExtractionRegistry());
-      queue.setIngestEmitter({ send: jest.fn().mockResolvedValue({ sourceId: 'src-1' }) });
+      queue.setIngestEmitter({ send: jest.fn().mockResolvedValue(okWriteStats()) });
 
       const response = await request(makeApp(queue))
         .post('/ingest/scrape')
@@ -215,7 +216,7 @@ describe('POST /ingest/scrape', () => {
     beforeEach(() => {
       queue = new ScrapeQueue(true); // test mode: enqueue without auto-processing
       queue.setPluginRegistry(makeRegistry(makeRuleset()));
-      queue.setIngestEmitter({ send: jest.fn().mockResolvedValue({ sourceId: 'src-1' }) });
+      queue.setIngestEmitter({ send: jest.fn().mockResolvedValue(okWriteStats()) });
     });
 
     it('enqueues the URL (key = url, options.url = url) and answers 202', async () => {
@@ -271,7 +272,7 @@ describe('POST /ingest/scrape', () => {
     it('drives fetch -> ruleset.extract -> ingestEmitter.send for the triggered URL', async () => {
       const ruleset = makeRuleset();
       const scraping = makeScrapingStub();
-      const send = jest.fn().mockResolvedValue({ sourceId: 'src-1' });
+      const send = jest.fn().mockResolvedValue(okWriteStats());
 
       queue = new ScrapeQueue(false); // real processing loop
       queue.setPluginRegistry(makeRegistry(ruleset));

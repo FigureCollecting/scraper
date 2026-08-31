@@ -37,6 +37,7 @@ jest.mock('../../services/webhookClient', () => ({
 import type { ExtractContext, ExtractionRuleset } from '@figurecollecting/scraper-plugin-contract';
 import { ScrapeQueue, resetScrapeQueue } from '../../services/scrapeQueue';
 import { createExtractionRegistry, ExtractionRegistryImpl } from '../../services/extractionRegistry';
+import { okWriteStats } from '../helpers/ingestWriteStats';
 
 const FIXTURE_HTML = '<html><body><h1 class="title">Kitagawa Marin</h1></body></html>';
 
@@ -163,7 +164,7 @@ describe('ScrapeQueue - ingest cutover', () => {
   it('takes the ingest path when emitter configured and ruleset matches: fetch -> extract -> emit, NO webhook', async () => {
     const ruleset = makeRuleset();
     const scraping = makeScrapingStub();
-    const send = jest.fn().mockResolvedValue({ sourceId: 'src-1' });
+    const send = jest.fn().mockResolvedValue(okWriteStats());
 
     queue = new ScrapeQueue(false);
     queue.setPluginRegistry(makeRegistry(ruleset));
@@ -195,7 +196,7 @@ describe('ScrapeQueue - ingest cutover', () => {
   it('awaits ruleset.extractAsync() when the ruleset exposes it, instead of the sync extract', async () => {
     const ruleset = makeAsyncRuleset();
     const scraping = makeScrapingStub();
-    const send = jest.fn().mockResolvedValue({ sourceId: 'src-1' });
+    const send = jest.fn().mockResolvedValue(okWriteStats());
 
     queue = new ScrapeQueue(false);
     queue.setPluginRegistry(makeRegistry(ruleset, 'vndb.example.test'));
@@ -238,7 +239,7 @@ describe('ScrapeQueue - ingest cutover', () => {
       validate: () => ({ valid: true, errors: [], warnings: [] }),
     };
     const scraping = makeScrapingStub();
-    const send = jest.fn().mockResolvedValue({ sourceId: 'src-1' });
+    const send = jest.fn().mockResolvedValue(okWriteStats());
 
     queue = new ScrapeQueue(false);
     queue.setPluginRegistry(makeRegistry(ruleset));
@@ -263,7 +264,7 @@ describe('ScrapeQueue - ingest cutover', () => {
   it('scrapes the caller-supplied url option instead of building an MFC URL from the key', async () => {
     const ruleset = makeRuleset();
     const scraping = makeScrapingStub();
-    const send = jest.fn().mockResolvedValue({ sourceId: 'src-1' });
+    const send = jest.fn().mockResolvedValue(okWriteStats());
 
     queue = new ScrapeQueue(false);
     queue.setPluginRegistry(makeRegistry(ruleset, 'figures.example.test'));
@@ -285,7 +286,7 @@ describe('ScrapeQueue - ingest cutover', () => {
   it('uses the stealth fetch when the item carries cookies', async () => {
     const ruleset = makeRuleset();
     const scraping = makeScrapingStub();
-    const send = jest.fn().mockResolvedValue({ sourceId: 'src-1' });
+    const send = jest.fn().mockResolvedValue(okWriteStats());
 
     queue = new ScrapeQueue(false);
     queue.setPluginRegistry(makeRegistry(ruleset));
@@ -337,7 +338,7 @@ describe('ScrapeQueue - ingest cutover', () => {
 
   it('fails the item cleanly (non-retryable) when the emitter is configured but no ruleset matches the URL', async () => {
     const scraping = makeScrapingStub();
-    const send = jest.fn().mockResolvedValue({ sourceId: 'src-1' });
+    const send = jest.fn().mockResolvedValue(okWriteStats());
 
     queue = new ScrapeQueue(false);
     // registry has NO site registered for myfigurecollection.net
@@ -448,7 +449,7 @@ describe('ScrapeQueue - ingest cutover', () => {
       })
     );
     const scraping = makeScrapingStub();
-    const send = jest.fn().mockResolvedValue({ sourceId: 'src-1' });
+    const send = jest.fn().mockResolvedValue(okWriteStats());
 
     queue = new ScrapeQueue(false);
     queue.setPluginRegistry(makeRegistry(ruleset));
