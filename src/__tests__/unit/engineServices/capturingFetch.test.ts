@@ -269,4 +269,42 @@ describe('createCapturingFetch', () => {
       expect(sink.captures).toHaveLength(1);
     });
   });
+
+  describe('Cloudflare block / rate-limit error page → ChallengePageError (RD-2)', () => {
+    it('throws on the impersonate lane for a real CF 1020 block body AFTER capturing it', async () => {
+      const block = fixture('cf-block-1020-amiami.html');
+      const sink = new CollectingCaptureSink();
+      const t: CapturingFetchTransports = {
+        http: jest.fn(),
+        impersonate: jest.fn(async () => block),
+        browser: { scrapePage: jest.fn(), scrapePageStealth: jest.fn() },
+      };
+      const fetch = createCapturingFetch(t, sink);
+      const url = 'https://www.amiami.com/item/1';
+
+      const err = await fetch(url, { transport: 'impersonate', browser: 'chrome142' }).then(
+        () => { throw new Error('expected ChallengePageError'); },
+        e => e,
+      );
+      expect(err).toBeInstanceOf(ChallengePageError);
+      expect(err.transport).toBe('impersonate');
+      // provenance still captured even for a block body
+      expect(sink.captures).toHaveLength(1);
+      expect(sink.captures[0].bytes.toString('utf8')).toBe(block);
+    });
+
+    it('throws on the http lane for a real CF 1020 block body', async () => {
+      const block = fixture('cf-block-1020-sugo.html');
+      const sink = new CollectingCaptureSink();
+      const t: CapturingFetchTransports = {
+        http: jest.fn(async () => block),
+        impersonate: jest.fn(),
+        browser: { scrapePage: jest.fn(), scrapePageStealth: jest.fn() },
+      };
+      const fetch = createCapturingFetch(t, sink);
+
+      await expect(fetch('https://sugo.example.test/item/1', { transport: 'http' })).rejects.toBeInstanceOf(ChallengePageError);
+      expect(sink.captures).toHaveLength(1);
+    });
+  });
 });

@@ -49,9 +49,24 @@ const CHALLENGE_TITLE = /<title>\s*Just a moment/i;
 const IUAM_BODY_COPY = 'Checking your browser before accessing';
 
 /**
- * Whether `html` is a Cloudflare managed-JS / IUAM challenge interstitial rather than real content.
- * Conservative: true only when a challenge-specific token is present, OR the challenge loader path is
- * present, OR the challenge <title> is present, OR the IUAM body copy is present. Non-string / empty
+ * CF block / rate-limit ERROR-page markers (Error 1020 "Attention Required!" / the newer "Access
+ * denied … used Cloudflare to restrict access", Error 1015 "You are being rate limited"). These
+ * 403/429 bodies are served in place of the real page and lift an empty field bag exactly like a
+ * challenge, so the transport must reject them too — otherwise the empty record is sent to the spine
+ * and misclassified 'unknown' instead of rate_limited (RD-2). Corpus-verified across 700+ real
+ * captures: these strings occur ONLY on genuine CF error bodies, never on a product page.
+ *   - <title> … Attention Required! | Cloudflare   — the 1020 block / 1015 rate-limit page title
+ *   - <title> … used Cloudflare to restrict access — the newer "Access denied" 1020 variant title
+ *   - cf-error-details                              — the CF error-page detail container id/class
+ */
+const BLOCK_TITLE = /<title>[^<]*(?:Attention Required! \| Cloudflare|used Cloudflare to restrict access)/i;
+const BLOCK_MARKER = 'cf-error-details';
+
+/**
+ * Whether `html` is a Cloudflare interstitial — a managed-JS / IUAM challenge OR a block / rate-limit
+ * error page — rather than real content. Conservative: true only when a challenge-specific token is
+ * present, OR the challenge loader path is present, OR the challenge <title> is present, OR the IUAM
+ * body copy is present, OR a CF block/rate-limit error-page marker is present. Non-string / empty
  * input is never a challenge.
  */
 export function isCloudflareChallenge(html: string): boolean {
@@ -60,5 +75,7 @@ export function isCloudflareChallenge(html: string): boolean {
   if (CHALLENGE_LOADER.test(html)) return true;
   if (CHALLENGE_TITLE.test(html)) return true;
   if (html.includes(IUAM_BODY_COPY)) return true;
+  if (BLOCK_TITLE.test(html)) return true;
+  if (html.includes(BLOCK_MARKER)) return true;
   return false;
 }

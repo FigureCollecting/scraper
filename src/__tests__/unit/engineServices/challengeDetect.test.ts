@@ -133,6 +133,42 @@ describe('isCloudflareChallenge', () => {
     });
   });
 
+  describe('Cloudflare block / rate-limit error pages → true (RD-2)', () => {
+    // A CF 1020 block / 1015 rate-limit body is NOT the product page either — a ruleset lifts an
+    // empty bag from it exactly like a challenge, so the transport must reject it (else it is sent
+    // to the spine as an empty record and misclassified 'unknown' instead of rate_limited).
+    it.each(['cf-block-1020-amiami.html', 'cf-block-1020-sugo.html'])(
+      'flags a real CF 1020 "Attention Required!" block page: %s',
+      (name) => {
+        const html = fixture(name);
+        expect(html).toContain('Attention Required! | Cloudflare');
+        expect(isCloudflareChallenge(html)).toBe(true);
+      },
+    );
+
+    it('flags a CF 1015 rate-limit body ("You are being rate limited")', () => {
+      const html =
+        '<!DOCTYPE html><html><head><title>Attention Required! | Cloudflare</title></head><body>' +
+        '<div id="cf-error-details" class="cf-error-details-wrapper"><h1>Sorry, you have been blocked</h1>' +
+        '<span data-translate="error">Error 1015</span><p>You are being rate limited</p></div></body></html>';
+      expect(isCloudflareChallenge(html)).toBe(true);
+    });
+
+    it('flags the newer "Access denied … used Cloudflare to restrict access" 1020 title', () => {
+      const html =
+        '<!DOCTYPE html><html><head><title>Access denied | www.anitoysgk.com used Cloudflare to restrict access</title>' +
+        '</head><body><h1>Error 1020</h1><p>This website is using a security service to protect itself.</p></body></html>';
+      expect(isCloudflareChallenge(html)).toBe(true);
+    });
+
+    it('does NOT flag a real page merely using the words "attention" or "blocked" in prose (conservative)', () => {
+      const html =
+        '<html><head><title>Blocked Colors — Nendoroid Store</title></head><body>' +
+        '<p>Attention: limited stock. This colorway sold out and was blocked from reorders.</p></body></html>';
+      expect(isCloudflareChallenge(html)).toBe(false);
+    });
+  });
+
   describe('degenerate input → false', () => {
     it('returns false for an empty string', () => {
       expect(isCloudflareChallenge('')).toBe(false);
