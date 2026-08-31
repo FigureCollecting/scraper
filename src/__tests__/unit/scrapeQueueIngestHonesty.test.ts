@@ -156,6 +156,29 @@ describe('ScrapeQueue - ingest honesty (persist-or-fail)', () => {
     expect(reason).toContain('(no server warnings)'); // no-warnings branch of the error message
   });
 
+  it('treats an undefined send() result as an EMPTY record (typed EmptyIngestRecordError + zeroed [INGEST STATS]), never a TypeError', async () => {
+    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+    const send = jest.fn().mockResolvedValue(undefined); // emitter resolved nothing (no WriteStats object)
+    queue = buildQueue(send);
+
+    const result = queue.enqueue('12345', { priority: 'WARM', sessionId: 'session1', maxRetries: 0 });
+    const captured = result.promise.catch((e: Error) => e);
+    await advanceUntil(() => queue.getStats().failed === 1);
+
+    expect(queue.getStats().failed).toBe(1);
+    expect(queue.getStats().completed).toBe(0);
+    const err = (await captured) as Error;
+    // a typed empty-record failure — NOT a TypeError from reading stats.claims on undefined
+    expect(err).not.toBeInstanceOf(TypeError);
+    expect(err.message).toMatch(/Scrape failed: empty_record - EMPTY_INGEST_RECORD/);
+    const reason = mockNotifyItemFailed.mock.calls[0][2] as string;
+    expect(reason).toContain('EMPTY_INGEST_RECORD');
+    // a zeroed [INGEST STATS] line was still emitted (accounting, not skipped by an early throw)
+    const stat = logSpy.mock.calls.map(c => String(c[0])).find(l => l.startsWith('[INGEST STATS] mock-mfc:12345'));
+    expect(stat).toBe('[INGEST STATS] mock-mfc:12345 claims=0/0/0/0 prices=0/0/0/0 identifiers=0/0/0 availability=0/0/0 warnings=0');
+    logSpy.mockRestore();
+  });
+
   it('counts partial per-table stats (missing count fields default to 0) — persists what landed', async () => {
     // claims reports only deduped, identifiers reports only inserted (other count fields undefined):
     // persistedRows must treat the absent fields as 0 and still total 5 + 3 = 8 (a SUCCESS).

@@ -1151,8 +1151,11 @@ export class ScrapeQueue {
     try {
       for (const record of records) {
         // send() resolves the server WriteStats (any OK RPC); the queue's IngestSender narrows it to
-        // unknown, so read it through the structural IngestRecordStats view.
-        const stats = (await this.ingestEmitter!.send(record)) as IngestRecordStats;
+        // unknown, so read it through the structural IngestRecordStats view. A send() that resolves
+        // undefined/null (no WriteStats at all) is normalized to an empty {} so it accounts as a
+        // zeroed, persisted-nothing record (→ EmptyIngestRecordError via the gate below), never a
+        // TypeError from reading stats.claims on undefined.
+        const stats = ((await this.ingestEmitter!.send(record)) ?? {}) as IngestRecordStats;
         const label = `${record.source.site}:${record.source.itemId}`;
         logIngestStats(label, stats);
         const persisted = persistedRows(stats);
