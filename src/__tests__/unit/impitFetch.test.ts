@@ -3,7 +3,7 @@
  * injected fake impit so it never loads the native binary: verifies the default profile, per-store
  * profile + header/UA merge, and one-instance-per-profile caching.
  */
-import { createImpitFetch, type ImpitLike, type CookieJarLike } from '../../services/impitFetch';
+import { createImpitFetch, resolveImpitTimeoutMs, type ImpitLike, type CookieJarLike } from '../../services/impitFetch';
 
 describe('createImpitFetch', () => {
   it('fetches via impit with the default chrome142 profile and returns the body text', async () => {
@@ -48,6 +48,23 @@ describe('createImpitFetch', () => {
     await impitFetch('https://x.test/c', { browser: 'chrome124' }); // new profile → build
 
     expect(builds).toBe(2);
+  });
+
+  it('constructs the impit instance with the resolved per-request timeout (default 30000 ms)', async () => {
+    // The module resolves IMPIT_TIMEOUT_MS once at load; createImpitFetch must hand that value to the
+    // factory it indirects Impit construction through (the seam the fakes above stand in for), so a
+    // slow session-gated store's prime + target GETs share the configured budget rather than the old 15s.
+    let seenTimeout: number | undefined;
+    const spy = (_browser: string, _jar: CookieJarLike, timeoutMs: number): ImpitLike => {
+      seenTimeout = timeoutMs;
+      return { fetch: async () => ({ text: async () => 'ok' }) };
+    };
+
+    const impitFetch = createImpitFetch(spy);
+    await impitFetch('https://x.test/s');
+
+    expect(seenTimeout).toBe(30000);                              // module-load default (no IMPIT_TIMEOUT_MS in env)
+    expect(seenTimeout).toBe(resolveImpitTimeoutMs(process.env)); // …and it is exactly the resolver's value
   });
 });
 
@@ -297,5 +314,40 @@ describe('createImpitFetch — session-prime (jar-carried clearance, prime-once,
     expect(body).toBe(BLOCK);
     expect(g.primes()).toBe(2);     // a block page also triggers exactly one bounded re-prime
     expect(g.targets()).toBe(2);
+  });
+});
+
+/**
+ * resolveImpitTimeoutMs — the pure env→ms resolver for the impit per-request timeout. Absent/invalid
+ * (non-numeric, empty, non-positive) → the 30000 ms default; any numeric value is clamped to
+ * [5000, 120000] so a typo can neither strangle a slow session-gated store's prime+target GETs nor
+ * unbound them. Tested directly (no process.env) so every branch is deterministic.
+ */
+describe('resolveImpitTimeoutMs', () => {
+  const env = (v?: string): NodeJS.ProcessEnv =>
+    (v === undefined ? {} : { IMPIT_TIMEOUT_MS: v }) as NodeJS.ProcessEnv;
+
+  it('defaults to 30000 ms when IMPIT_TIMEOUT_MS is absent', () => {
+    expect(resolveImpitTimeoutMs(env())).toBe(30000);
+  });
+
+  it('accepts an in-range value verbatim', () => {
+    expect(resolveImpitTimeoutMs(env('45000'))).toBe(45000);
+  });
+
+  it('falls back to 30000 ms for a non-numeric value', () => {
+    expect(resolveImpitTimeoutMs(env('abc'))).toBe(30000);
+  });
+
+  it('clamps a below-floor value up to 5000 ms', () => {
+    expect(resolveImpitTimeoutMs(env('1000'))).toBe(5000);
+  });
+
+  it('clamps an above-ceiling value down to 120000 ms', () => {
+    expect(resolveImpitTimeoutMs(env('999999'))).toBe(120000);
+  });
+
+  it('treats an empty value as absent (default 30000 ms)', () => {
+    expect(resolveImpitTimeoutMs(env(''))).toBe(30000);
   });
 });
