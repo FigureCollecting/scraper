@@ -25,7 +25,7 @@ import { getSessionManager, resetSessionManager, SessionManager, SessionPausedEv
 import { notifyItemFailed } from './webhookClient.js';
 import { enrichmentLogger } from '../utils/logger.js';
 import { createScrapingService } from './engineServices/scrapingService.js';
-import { createCapturingFetch, type CapturingFetch, type CapturingFetchTransports } from './engineServices/capturingFetch.js';
+import { createCapturingFetch, ChallengePageError, type CapturingFetch, type CapturingFetchTransports } from './engineServices/capturingFetch.js';
 import { getRawCaptureSink } from './s3ObjectStore.js';
 import { createIngestEmitterFromEnv } from './ingestEmitter.js';
 import { impitFetchBody } from './impitFetch.js';
@@ -51,7 +51,7 @@ import type {
 
 export type QueuePriority = 'HOT' | 'WARM' | 'COLD';
 export type ItemStatus = 'owned' | 'ordered' | 'wished';
-export type ErrorType = 'timeout' | 'not_found' | 'rate_limited' | 'auth_required' | 'network' | 'extraction_unavailable' | 'unknown';
+export type ErrorType = 'timeout' | 'not_found' | 'rate_limited' | 'auth_required' | 'network' | 'extraction_unavailable' | 'empty_record' | 'unknown';
 
 export interface QueueItem {
   /** Unique identifier for this queue entry */
@@ -267,6 +267,18 @@ const RATE_LIMIT = {
 // ============================================================================
 
 function classifyError(error: Error | string): ErrorType {
+  // Class-based classification wins over any substring match: a typed engine error's taxonomy must
+  // never depend on free text (itemId / URL / server warnings) embedded in its message (RS-2). A
+  // ChallengePageError is a CF challenge/block → rate_limited (backoff + CF block tracking); an
+  // EmptyIngestRecordError is a persisted-nothing failure → its own class, retryable-but-bounded,
+  // and never an auth/cookie fault.
+  if (error instanceof ChallengePageError) {
+    return 'rate_limited';
+  }
+  if (error instanceof EmptyIngestRecordError) {
+    return 'empty_record';
+  }
+
   const message = typeof error === 'string' ? error : error.message;
 
   // Config-level shortfall (no emitter / no matching ruleset) — checked first
@@ -316,8 +328,10 @@ function shouldRetry(errorType: ErrorType, retryCount: number, maxRetries: numbe
     return false;
   }
 
-  // Retry transient errors
-  return ['timeout', 'rate_limited', 'network', 'unknown'].includes(errorType);
+  // Retry transient errors. 'empty_record' is bounded-retryable: a re-fetch/re-extract may land rows
+  // (transient upstream), but a permanently-empty store (e.g. a CF block) exhausts maxRetries and
+  // then lands FAILED — never an infinite loop.
+  return ['timeout', 'rate_limited', 'network', 'empty_record', 'unknown'].includes(errorType);
 }
 
 // ============================================================================
