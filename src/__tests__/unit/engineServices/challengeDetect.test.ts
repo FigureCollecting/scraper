@@ -3,7 +3,13 @@
  * interstitial challenge rather than the real page?". It must fire on the CF managed-JS / IUAM
  * challenge markers but NEVER on a real product page that merely mentions Cloudflare.
  */
+import { readFileSync } from 'fs';
+import { join } from 'path';
 import { isCloudflareChallenge } from '../../../services/engineServices/challengeDetect';
+
+/** Load a real captured HTML fixture (verbatim store bytes) from the shared fixtures dir. */
+const fixture = (name: string): string =>
+  readFileSync(join(__dirname, '../../fixtures/challengeDetect', name), 'utf8');
 
 describe('isCloudflareChallenge', () => {
   describe('challenge pages → true', () => {
@@ -74,6 +80,56 @@ describe('isCloudflareChallenge', () => {
         '<p>This site is protected by Cloudflare. Buy the cf-limited edition figure now!</p>' +
         '<div class="challenge">Weekly painting challenge results</div></body></html>';
       expect(isCloudflareChallenge(html)).toBe(false);
+    });
+  });
+
+  describe('real store pages carrying Cloudflare Bot-Management telemetry → false (RS-1/RD-1/F1 regression)', () => {
+    // These fixtures are built from REAL 200-OK product pages captured on disk. Each carries
+    // Cloudflare's Bot-Management telemetry script — /cdn-cgi/challenge-platform/scripts/jsd/main.js
+    // (inline `document.createElement` bootstrap) or /cdn-cgi/challenge-platform/scripts/precursor/main.js
+    // (a plain <script src>) — which Cloudflare injects into ORDINARY pages on bot-managed zones.
+    // The bare token 'challenge-platform' matched all of them, hard-failing every real fnc (http
+    // transport) / bbts / MFC ingest as a phantom challenge. A real page must NEVER match.
+    const REAL_FIXTURES = [
+      'fnc-product.html',
+      'fnc-detail.html',
+      'bbts-product.html',
+      'mfc-item.html',
+      'mfc-shops.html',
+    ];
+
+    it.each(REAL_FIXTURES)('does not flag real product page fixture: %s', (name) => {
+      const html = fixture(name);
+      // sanity: the fixture really does carry the injected telemetry script (the old FP trigger)…
+      expect(html).toContain('challenge-platform');
+      // …and none of the genuine challenge/block markers…
+      expect(html).not.toMatch(/__cf_chl_|_cf_chl_opt|cf-browser-verification|Just a moment|Checking your browser|orchestrate\/chl_page/i);
+      // …so the conservative detector must return false.
+      expect(isCloudflareChallenge(html)).toBe(false);
+    });
+
+    it('does not flag the inline jsd Bot-Management bootstrap in isolation', () => {
+      // Verbatim shape Cloudflare injects into real 200 pages (bbts/MFC form).
+      const html =
+        "<html><head><title>Nendoroid Kanna — Figure Store</title></head><body><h1>Buy now</h1>" +
+        "<script>var a=document.createElement('script');a.nonce='';a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);</script></body></html>";
+      expect(isCloudflareChallenge(html)).toBe(false);
+    });
+
+    it('does not flag the precursor Bot-Management <script src> in isolation (fnc form)', () => {
+      const html =
+        '<html><head><title>Griffith 1/4 — FNC ANIME</title>' +
+        '<script src="/cdn-cgi/challenge-platform/scripts/precursor/main.js"></script></head><body>In stock</body></html>';
+      expect(isCloudflareChallenge(html)).toBe(false);
+    });
+
+    it('STILL flags the genuine challenge loader (orchestrate/chl_page) — the real interstitial (regression pin)', () => {
+      // The one challenge-platform path that IS a challenge: the orchestrate/chl_page loader. Dropping
+      // the bare token must not blind the detector to the real interstitial.
+      const html =
+        '<html><head><title>Just a moment...</title></head><body>' +
+        '<script src="/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1?ray=abc"></script></body></html>';
+      expect(isCloudflareChallenge(html)).toBe(true);
     });
   });
 

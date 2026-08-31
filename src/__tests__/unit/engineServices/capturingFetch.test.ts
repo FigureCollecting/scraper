@@ -4,8 +4,14 @@
  * fetchSearch's dispatcher, but ALWAYS captures the fetched bytes to the sink (today only the
  * browser lane's navigateAndCapture does that) and returns the ingest path's `{ html }` shape.
  */
+import { readFileSync } from 'fs';
+import { join } from 'path';
 import { createCapturingFetch, ChallengePageError, type CapturingFetchTransports } from '../../../services/engineServices/capturingFetch';
 import { CollectingCaptureSink } from '../../../services/captureSink';
+
+/** Load a real captured HTML fixture (verbatim store bytes) from the shared fixtures dir. */
+const fixture = (name: string): string =>
+  readFileSync(join(__dirname, '../../fixtures/challengeDetect', name), 'utf8');
 
 function makeTransports() {
   const calls: any[] = [];
@@ -226,6 +232,41 @@ describe('createCapturingFetch', () => {
       const result = await fetch('https://myfigurecollection.net/item/12345', { transport: 'browser' });
       expect(result).toEqual({ html: CHALLENGE }); // returned, NOT thrown
       expect(sink.captures).toHaveLength(0);        // browser lane captures itself, not here
+    });
+  });
+
+  describe('real Bot-Management page (challenge-platform telemetry) → resolves, never ChallengePageError (RS-1)', () => {
+    it('http lane returns a real fnc product page (precursor telemetry) instead of throwing', async () => {
+      const html = fixture('fnc-product.html');
+      const sink = new CollectingCaptureSink();
+      const t: CapturingFetchTransports = {
+        http: jest.fn(async () => html),
+        impersonate: jest.fn(),
+        browser: { scrapePage: jest.fn(), scrapePageStealth: jest.fn() },
+      };
+      const fetch = createCapturingFetch(t, sink);
+      const url = 'https://www.fanaticanimestore.com/product/griffith';
+
+      // Must resolve with the real bytes — the http-transport fnc ingest depends on this NOT throwing.
+      await expect(fetch(url, { transport: 'http' })).resolves.toEqual({ html });
+      expect(sink.captures).toHaveLength(1);
+      expect(sink.captures[0].bytes.toString('utf8')).toBe(html);
+    });
+
+    it('impersonate lane returns a real MFC page (inline jsd telemetry) instead of throwing', async () => {
+      const html = fixture('mfc-item.html');
+      const sink = new CollectingCaptureSink();
+      const t: CapturingFetchTransports = {
+        http: jest.fn(),
+        impersonate: jest.fn(async () => html),
+        browser: { scrapePage: jest.fn(), scrapePageStealth: jest.fn() },
+      };
+      const fetch = createCapturingFetch(t, sink);
+
+      await expect(
+        fetch('https://myfigurecollection.net/item/107714', { transport: 'impersonate', browser: 'chrome142' }),
+      ).resolves.toEqual({ html });
+      expect(sink.captures).toHaveLength(1);
     });
   });
 });
