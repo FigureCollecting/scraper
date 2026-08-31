@@ -76,6 +76,8 @@ describe('assembleLookup — cross-store buy-decision search, listed + orderable
     const out = await lookup.lookup('tomie');
 
     expect(out.mode).toBe('listed');
+    // discovery: the free-text query is the exact {q} issued, surfaced on each store result.
+    expect(bySite(out, 'goodsmileus')?.storeQuery).toBe('tomie');
     // goodsmileus (listed) returns BOTH — including the sold-out Gyaru Tomie x Hello Kitty.
     expect(bySite(out, 'goodsmileus')?.candidates.map((c) => c.available)).toEqual([true, false]);
     // solaris returned results but is orderable-scope → can't confirm its sold-out items.

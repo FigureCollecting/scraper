@@ -64,6 +64,7 @@ describe('planRetrieval', () => {
     const p = planRetrieval(registry(), { mode: 'lookup', query: '4571245296726' });
     expect(p.plans.map((x) => x.host)).toEqual(['hlj.com']); // only hlj supports search
     expect(p.plans[0].url).toContain('4571245296726');
+    expect(p.plans[0].query).toBe('4571245296726'); // the exact {q} issued → surfaced as storeQuery
     expect(p.unsupported.sort()).toEqual(['amiami', 'nogo']); // no bySearch → coverage gap
   });
 });
