@@ -161,6 +161,16 @@ describe('isCloudflareChallenge', () => {
       expect(isCloudflareChallenge(html)).toBe(true);
     });
 
+    it('flags a CF error body on the cf-error-details container alone (no matching <title>)', () => {
+      // The container marker is independently sufficient — a CF error variant without the exact
+      // "Attention Required!" title still lifts empty and must be rejected.
+      const html =
+        '<html><head><title>error</title></head><body>' +
+        '<div id="cf-error-details" class="cf-error-details-wrapper"><h1>Sorry, you have been blocked</h1></div>' +
+        '</body></html>';
+      expect(isCloudflareChallenge(html)).toBe(true);
+    });
+
     it('does NOT flag a real page merely using the words "attention" or "blocked" in prose (conservative)', () => {
       const html =
         '<html><head><title>Blocked Colors — Nendoroid Store</title></head><body>' +
