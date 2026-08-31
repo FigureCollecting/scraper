@@ -16,7 +16,7 @@ import type {
 } from '@figurecollecting/scraper-plugin-contract';
 
 const result = (over: Partial<ResolveResult> = {}): ResolveResult => ({
-  site: 'amiami', results: [], unsupported: false, failed: [], ...over,
+  site: 'amiami', results: [], unsupported: false, failed: [], cooldown: [], ...over,
 });
 
 const appWith = (resolve: Resolve) => {

@@ -645,6 +645,10 @@ See `.env.example` for complete configuration template.
   - Raise for slow session-gated stores (e.g. Ueeshop) whose prime/search can take 15–30 s
   - Unset/invalid → default; any value is clamped to `[5000, 120000]`
   - Default: `30000`
+- `CHALLENGE_COOLDOWN_MS`: Per-host cooldown window (ms) after a store serves a Cloudflare challenge/block
+  - While a host is cooling, the scrape queue and lookup fan-out skip it without fetching, so repeat challenges don't degrade the egress IP's CF reputation
+  - Unset/invalid → default; any finite value is clamped to `[60000 (1 min), 86400000 (24 h)]`
+  - Default: `1800000` (30 min)
 
 **MFC Cookie Security:**
 - `MFC_ALLOWED_COOKIES`: Whitelist of cookie names allowed during authenticated MFC scraping

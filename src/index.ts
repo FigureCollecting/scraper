@@ -8,6 +8,8 @@ import { createRequire } from 'module';
 import scraperRoutes from './routes/scraper.js';
 import ingestRoutes from './routes/ingest.js';
 import { createLookupRoute } from './routes/lookup.js';
+import { createHealthRoutes } from './routes/health.js';
+import { getChallengeCooldown } from './services/challengeCooldown.js';
 import { createEngineLookup } from './services/engineLookup.js';
 import { createResolveRoute } from './routes/resolve.js';
 import { createEngineResolve } from './services/engineResolve.js';
@@ -36,48 +38,14 @@ const PORT = process.env.PORT || 3080;
 app.use(cors());
 app.use(express.json());
 
-// Health check endpoints
-const healthResponse = () => ({
-  service: 'scraper',
+// Health check endpoints — root/health/version, plus /health/detailed (browser-pool status + the
+// per-host Cloudflare-challenge cooldowns currently open). Extracted to a route factory so the
+// surface is unit-testable without booting the server.
+app.use('/', createHealthRoutes({
   version: packageJson.version,
-  status: 'healthy'
-});
-
-// Root endpoint for health checks (Docker health checks hit this)
-app.get('/', (req, res) => {
-  res.json(healthResponse());
-});
-
-app.get('/health', (req, res) => {
-  res.json(healthResponse());
-});
-
-// Detailed health endpoint with browser pool status (for debugging)
-app.get('/health/detailed', async (req, res) => {
-  try {
-    const browserPoolHealth = await BrowserPool.getHealth();
-    res.json({
-      ...healthResponse(),
-      browserPool: browserPoolHealth,
-      timestamp: new Date().toISOString(),
-    });
-  } catch (error) {
-    res.status(500).json({
-      ...healthResponse(),
-      status: 'degraded',
-      error: error instanceof Error ? error.message : 'Unknown error',
-    });
-  }
-});
-
-// Version endpoint
-app.get('/version', (req, res) => {
-  res.json({
-    name: 'scraper',
-    version: packageJson.version,
-    status: 'ok'
-  });
-});
+  getBrowserPoolHealth: () => BrowserPool.getHealth(),
+  listChallengeCooldowns: () => getChallengeCooldown().list(),
+}));
 
 // Scraper routes (no /api prefix for consistency)
 app.use('/', scraperRoutes);

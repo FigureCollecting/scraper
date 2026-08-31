@@ -22,6 +22,8 @@
 import { resolveByIdUrl } from './retrievalPlanner.js';
 import { extractRecords } from '../services/engineServices/extractRecords.js';
 import { DEFAULT_FETCH_BODY_GAP_MS, safeHostname } from '../services/engineServices/extractContext.js';
+import { isCloudflareChallenge } from '../services/engineServices/challengeDetect.js';
+import { getChallengeCooldown, type ChallengeCooldown } from '../services/challengeCooldown.js';
 import { sanitizeForLog } from '../utils/security.js';
 import type { ProfileRegistry } from './profileRegistry.js';
 import type { ExtractContext, ExtractedData, ExtractionRuleset } from '@figurecollecting/scraper-plugin-contract';
@@ -50,6 +52,14 @@ export interface ResolveServices {
   now?: () => number;
   /** Injectable sleep for the cross-id courtesy gap (default: a real `setTimeout` promise). */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Per-host Cloudflare-challenge cooldown register (shared with the ingest queue, the lookup
+   * fan-out, and /health/detailed). Optional — defaults to the process-wide singleton; tests inject
+   * a clock-controlled instance. An id whose host is cooling is SKIPPED without fetching (→ the
+   * additive `cooldown` list); a detail body that IS a challenge OPENS its host's cooldown so the
+   * other lanes leave it alone. This is the CONFIRM leg's equivalent of the queue's fast-fail gate.
+   */
+  challengeCooldown?: ChallengeCooldown;
 }
 
 export interface ResolveItem {
@@ -79,6 +89,12 @@ export interface ResolveResult {
   unsupported: boolean;
   /** Item ids whose detail fetch or extract errored (transparency, not silent drop). */
   failed: string[];
+  /**
+   * Item ids SKIPPED without fetching because the host is cooling from a recent Cloudflare challenge
+   * (additive — distinct from `failed`: the id is fine, we are deliberately leaving its host alone
+   * until the cooldown expires). Mirrors LookupResult.cooldown for the CONFIRM leg.
+   */
+  cooldown: string[];
 }
 
 export interface Resolve {
@@ -90,11 +106,12 @@ export function assembleResolve(services: ResolveServices): Resolve {
     async resolve(site, ids) {
       const caps = services.profiles.forSite(site);
       if (!caps?.retrieval?.byId) {
-        return { site, results: [], unsupported: true, failed: [] };
+        return { site, results: [], unsupported: true, failed: [], cooldown: [] };
       }
 
       const now = services.now ?? Date.now;
       const sleep = services.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+      const cd = services.challengeCooldown ?? getChallengeCooldown();
       const gapMs = caps.rateLimit?.baseDelayMs ?? DEFAULT_FETCH_BODY_GAP_MS;
       // ONE per-host last-fetch map for the WHOLE call (H1 parity, cross-id): every id in a call
       // targets the same store, so the queue would space them by the store's baseDelayMs — this
@@ -103,6 +120,7 @@ export function assembleResolve(services: ResolveServices): Resolve {
 
       const results: ResolveItem[] = [];
       const failed: string[] = [];
+      const cooldown: string[] = [];
       // SEQUENTIAL by design, not Promise.all: concurrent ids would fire same-host bursts the
       // check-then-sleep gap cannot prevent (all readers see the same stale timestamp). The queue
       // is sequential per host for the same reason; per-id failure isolation is unchanged.
@@ -117,9 +135,20 @@ export function assembleResolve(services: ResolveServices): Resolve {
             failed.push(itemId);
             continue;
           }
+          const host = safeHostname(url);
+          // CHALLENGE COOLDOWN (before any fetch): the host is cooling from a recent CF challenge —
+          // do NOT fetch it (every challenge fetch degrades the egress IP's CF reputation). Skip the
+          // id to the additive `cooldown` list; once the window passes isOpen is false and the fetch
+          // proceeds normally. The CONFIRM leg's equivalent of the queue's fast-fail gate.
+          if (host !== undefined && cd.isOpen(host)) {
+            const minsLeft = Math.max(1, Math.ceil(cd.remaining(host) / 60_000));
+            // eslint-disable-next-line no-console
+            console.warn(`[COOLDOWN] skipped ${sanitizeForLog(url)} (${host} cooling, ${minsLeft} min left)`);
+            cooldown.push(itemId);
+            continue;
+          }
           // Cross-id courtesy floor on the PRIMARY fetch: wait out the store's gap against the
           // call's last fetch to this host (a sibling's primary, or its same-host follow-up).
-          const host = safeHostname(url);
           const last = host === undefined ? undefined : lastFetchedAt.get(host);
           if (last !== undefined) {
             const remaining = last + gapMs - now();
@@ -130,8 +159,16 @@ export function assembleResolve(services: ResolveServices): Resolve {
           const { html, statusCode } = await services.fetchDetail(url).finally(() => {
             if (host !== undefined) lastFetchedAt.set(host, now());
           });
-          // A 4xx/5xx page (CF challenge / gone / error) is NOT a confirm — extract would happily
-          // parse the error body into empty fields WITHOUT throwing, so gate on status explicitly.
+          // A detail body that IS a Cloudflare challenge is NOT a confirm — the browser lane never
+          // sets a `challenge` flag, so detect it on the body here: OPEN the host's cooldown (so the
+          // queue and the lookup fan-out then leave it alone) and fail THIS id. Checked BEFORE the
+          // status gate so a 200 interstitial that rendered opens the cooldown too, not only a 5xx.
+          if (isCloudflareChallenge(html)) {
+            if (host !== undefined) cd.open(host, 'detail challenge page');
+            throw new Error('detail fetch returned a Cloudflare challenge page');
+          }
+          // A 4xx/5xx page (gone / error) is NOT a confirm — extract would happily parse the error
+          // body into empty fields WITHOUT throwing, so gate on status explicitly.
           if (statusCode !== undefined && statusCode >= 400) {
             throw new Error(`detail fetch returned HTTP ${statusCode}`);
           }
@@ -156,7 +193,7 @@ export function assembleResolve(services: ResolveServices): Resolve {
         }
       }
 
-      return { site, results, unsupported: false, failed };
+      return { site, results, unsupported: false, failed, cooldown };
     },
   };
 }

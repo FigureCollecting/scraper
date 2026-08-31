@@ -7,7 +7,7 @@ import { createLookupRoute } from '../../routes/lookup';
 import type { Lookup, LookupResult } from '../../driver/assembleLookup';
 
 const result = (over: Partial<LookupResult> = {}): LookupResult => ({
-  query: 'tomie', mode: 'listed', results: [], unsupported: [], orderableOnly: [], failed: [], resolveTargets: [], ...over,
+  query: 'tomie', mode: 'listed', results: [], unsupported: [], orderableOnly: [], failed: [], cooldown: [], resolveTargets: [], ...over,
 });
 
 const appWith = (lookup: Lookup) => {
