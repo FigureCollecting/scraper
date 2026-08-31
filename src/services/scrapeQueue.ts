@@ -1159,7 +1159,22 @@ export class ScrapeQueue {
         // HONESTY GATE: an OK RPC that persisted nothing (inserted+deduped==0 across all four tables)
         // is a FAILURE, not success. All-deduped (idempotent re-run) has deduped>0 and passes.
         if (persisted === 0) {
+          // A page the transport FLAGGED as a Cloudflare challenge/block that ALSO persisted nothing
+          // is a TRANSPORT failure (rate_limited → backoff + CF tracking), named by its lane — the
+          // branch's class-based classification owns it. A plain persisted-nothing page is an empty
+          // record. The transport is trusted for the flag; the gate is trusted for persist-or-fail.
+          if (page.challenge) {
+            throw new ChallengePageError(item.url, page.transport ?? 'unknown', stats.warnings ?? []);
+          }
           throw new EmptyIngestRecordError(record.source.site, record.source.itemId, stats.warnings ?? []);
+        }
+        if (page.challenge) {
+          // amiami case: the primary page was a challenge/block body, but the ruleset recovered the
+          // real record through its OWN follow-up transport (ctx.scraping.fetchBody -> item API).
+          // Persisted > 0 ⇒ honest success — log it, never fail.
+          console.log(
+            `[INGEST STATS] challenge page received for ${sanitizeForLog(label)} but the ruleset recovered ${persisted} rows via its own transport`
+          );
         }
         totalPersisted += persisted;
         emittedCount++;

@@ -92,6 +92,13 @@ const emptyStats = (warnings: string[] = []) => ({
   claims: zClaim(), identifiers: zTable(), prices: zPrice(), availability: zTable(),
   warnings, registeredNewAttrs: 0, emptyFields: 6,
 });
+/** A healthy first-write: rows actually landed (the ruleset recovered the record). */
+const healthyStats = (warnings: string[] = []) => ({
+  sourceId: 'src-1', productId: 'prod-1',
+  claims: zClaim({ emitted: 3, inserted: 3 }), identifiers: zTable({ emitted: 1, inserted: 1 }),
+  prices: zPrice(), availability: zTable(),
+  warnings, registeredNewAttrs: 0, emptyFields: 0,
+});
 
 describe('ScrapeQueue - ingest failure classification (by class, not message text) [RS-2]', () => {
   let queue: ScrapeQueue;
@@ -137,10 +144,13 @@ describe('ScrapeQueue - ingest failure classification (by class, not message tex
     expect(reason).not.toContain('not_found');
   });
 
-  it('a ChallengePageError whose URL contains "404" classifies as rate_limited (not not_found), with backoff', async () => {
-    // URL ".../figure-4045" embeds "404"; message-based classifyError matched 404 BEFORE Cloudflare.
-    const send = jest.fn();
-    const http = jest.fn().mockResolvedValue(CHALLENGE_HTML); // http lane → ChallengePageError
+  it('a flagged challenge page whose URL contains "404" and persists nothing classifies as rate_limited (not not_found), with backoff', async () => {
+    // URL ".../figure-4045" embeds "404". The http lane FLAGS the challenge (it no longer throws at
+    // fetch); the ruleset lifts a record the spine persists nothing for, so the honesty gate raises a
+    // ChallengePageError — class-based classifyError routes it rate_limited BEFORE the "404" substring
+    // in the URL could book it not_found.
+    const send = jest.fn().mockResolvedValue(emptyStats()); // spine persists nothing from the challenge body
+    const http = jest.fn().mockResolvedValue(CHALLENGE_HTML); // http lane → flagged challenge (challenge:true)
     queue = new ScrapeQueue(false);
     queue.setPluginRegistry(makeRegistry(makeRuleset('x'), 'fnc.example.test', { transport: 'http' }));
     queue.setIngestEmitter({ send });
@@ -152,8 +162,8 @@ describe('ScrapeQueue - ingest failure classification (by class, not message tex
     result.promise.catch(() => {});
     await advanceUntil(() => queue.getStats().failed === 1);
 
-    expect(http).toHaveBeenCalledTimes(3);       // rate_limited is retryable → bounded 3 attempts
-    expect(send).not.toHaveBeenCalled();          // never reached the emitter (transport failed first)
+    expect(http).toHaveBeenCalledTimes(3);           // rate_limited is retryable → bounded 3 attempts
+    expect(send).toHaveBeenCalledTimes(3);           // reached the emitter each attempt (flag, not fetch-throw)
     expect(queue.getStats().rateLimited).toBe(true); // CF block escalated backoff, not booked as 404
     const reason = mockNotifyItemFailed.mock.calls[0][2] as string;
     expect(reason).toContain('rate_limited');
@@ -251,5 +261,86 @@ describe('ScrapeQueue - cookie-authenticated empty record lands FAILED, never an
 
     expect(getSessionManager().isSessionPaused('sess-auth')).toBe(true); // auth failures still pause
     expect(send).not.toHaveBeenCalled();
+  });
+});
+
+describe('ScrapeQueue - challenge page: flag → honesty gate (recover vs fail) [CHANGE 1-2]', () => {
+  let queue: ScrapeQueue;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockNotifyItemFailed.mockResolvedValue(true);
+    jest.useFakeTimers({ advanceTimers: true });
+    resetScrapeQueue();
+    resetSessionManager();
+  });
+
+  afterEach(() => {
+    if (queue) { queue.stop(); queue.clear(); }
+    resetScrapeQueue();
+    resetSessionManager();
+    jest.useRealTimers();
+  });
+
+  async function advanceUntil(pred: () => boolean, stepMs = 250, maxSteps = 400): Promise<void> {
+    for (let i = 0; i < maxSteps && !pred(); i++) {
+      jest.advanceTimersByTime(stepMs);
+      await jest.advanceTimersByTimeAsync(50);
+    }
+  }
+
+  it('a challenge-flagged page the ruleset RECOVERED rows from → SUCCESS + recovered-rows log line (amiami case)', async () => {
+    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+    // The http lane serves a CF challenge body (flagged challenge:true), yet the emitter reports
+    // inserted>0 — the ruleset recovered the real record through its OWN follow-up transport. The
+    // honesty gate's persist-or-fail passes: an honest success, never a ChallengePageError.
+    const send = jest.fn().mockResolvedValue(healthyStats());
+    const http = jest.fn().mockResolvedValue(CHALLENGE_HTML);
+    queue = new ScrapeQueue(false);
+    queue.setPluginRegistry(makeRegistry(makeRuleset('107714'), 'amiami.example.test', { transport: 'http' }));
+    queue.setIngestEmitter({ send });
+    queue.setScrapingService(makeScrapingStub());
+    queue.setIngestTransports({ http });
+
+    const url = 'https://amiami.example.test/product/107714';
+    const result = queue.enqueue(url, { url });
+    await advanceUntil(() => queue.getStats().completed === 1 || queue.getStats().failed === 1);
+    const data = await result.promise;
+
+    expect(queue.getStats().completed).toBe(1);
+    expect(queue.getStats().failed).toBe(0);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(data).toEqual({ name: 'Kitagawa Marin' });
+    // the recovered-rows success line names site:itemId and the row count the ruleset landed
+    const lines = logSpy.mock.calls.map(c => String(c[0]));
+    expect(lines.some(l =>
+      /\[INGEST STATS\] challenge page received for mock-mfc:107714 but the ruleset recovered 4 rows via its own transport/.test(l),
+    )).toBe(true);
+    logSpy.mockRestore();
+  });
+
+  it('a challenge-flagged page that persisted NOTHING → FAILS as ChallengePageError (rate_limited), never EmptyIngestRecordError', async () => {
+    const send = jest.fn().mockResolvedValue(emptyStats());
+    const http = jest.fn().mockResolvedValue(CHALLENGE_HTML);
+    queue = new ScrapeQueue(false);
+    queue.setPluginRegistry(makeRegistry(makeRuleset('12345'), 'fnc.example.test', { transport: 'http' }));
+    queue.setIngestEmitter({ send });
+    queue.setScrapingService(makeScrapingStub());
+    queue.setIngestTransports({ http });
+
+    const url = 'https://fnc.example.test/product/12345';
+    const result = queue.enqueue(url, { url, sessionId: 's1' }); // default maxRetries = 3
+    const captured = result.promise.catch((e: Error) => e);
+    await advanceUntil(() => queue.getStats().failed === 1);
+
+    expect(http).toHaveBeenCalledTimes(3);            // bounded rate_limited retries
+    expect(queue.getStats().rateLimited).toBe(true);  // CF block escalated backoff (not empty_record)
+    const reason = mockNotifyItemFailed.mock.calls[0][2] as string;
+    expect(reason).toContain('rate_limited');
+    expect(reason).toContain('Cloudflare challenge page received');
+    expect(reason).toContain('via http transport');
+    expect(reason).not.toContain('EMPTY_INGEST_RECORD');
+    const err = (await captured) as Error;
+    expect(err.message).toContain('Cloudflare challenge page received');
   });
 });

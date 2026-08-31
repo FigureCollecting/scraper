@@ -6,7 +6,7 @@
  */
 import { readFileSync } from 'fs';
 import { join } from 'path';
-import { createCapturingFetch, ChallengePageError, type CapturingFetchTransports } from '../../../services/engineServices/capturingFetch';
+import { createCapturingFetch, type CapturingFetchTransports } from '../../../services/engineServices/capturingFetch';
 import { CollectingCaptureSink } from '../../../services/captureSink';
 
 /** Load a real captured HTML fixture (verbatim store bytes) from the shared fixtures dir. */
@@ -155,11 +155,12 @@ describe('createCapturingFetch', () => {
     ).resolves.toEqual({ html: '{"json":"BODY"}' });
   });
 
-  describe('Cloudflare challenge → ChallengePageError (transport failure, not empty success)', () => {
+  describe('Cloudflare challenge → flagged challenge:true, NOT thrown (the honesty gate owns it)', () => {
     // Title-form managed-challenge interstitial (same shape impitFetch's re-prime fixture uses).
     const CHALLENGE = '<html><head><title>Just a moment...</title></head><body>cf challenge</body></html>';
 
-    it('throws ChallengePageError on the impersonate lane AFTER capturing the raw body (provenance preserved)', async () => {
+    it('flags challenge:true + transport on the impersonate lane, captures the raw body, warns once, does NOT throw', async () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
       const sink = new CollectingCaptureSink();
       const t: CapturingFetchTransports = {
         http: jest.fn(),
@@ -169,21 +170,24 @@ describe('createCapturingFetch', () => {
       const fetch = createCapturingFetch(t, sink);
       const url = 'https://www.anitoysgk.com/lucy-p29358268.html';
 
-      const err = await fetch(url, { transport: 'impersonate', browser: 'chrome142' }).then(
-        () => { throw new Error('expected ChallengePageError'); },
-        e => e,
-      );
-      expect(err).toBeInstanceOf(ChallengePageError);
-      expect(err.name).toBe('ChallengePageError');
-      expect(err.url).toBe(url);
-      expect(err.transport).toBe('impersonate');
-      // the challenge bytes STILL reached the sink before the throw (raw-capture integrity)
+      const result = await fetch(url, { transport: 'impersonate', browser: 'chrome142' });
+      expect(result).toEqual({ html: CHALLENGE, challenge: true, transport: 'impersonate' });
+      // the challenge bytes STILL reached the sink (raw-capture integrity) — flag does not skip capture
       expect(sink.captures).toHaveLength(1);
       expect(sink.captures[0]).toMatchObject({ url, lane: 'api' });
       expect(sink.captures[0].bytes.toString('utf8')).toBe(CHALLENGE);
+      // exactly one warn line at the lane, naming the sanitized url + transport
+      const warnLines = warnSpy.mock.calls
+        .map(c => String(c[0]))
+        .filter(l => l.includes('[FETCH] Cloudflare challenge/block page received'));
+      expect(warnLines).toHaveLength(1);
+      expect(warnLines[0]).toContain('via impersonate transport');
+      expect(warnLines[0]).toContain(url);
+      warnSpy.mockRestore();
     });
 
-    it('throws ChallengePageError on the http lane AFTER capturing the raw body', async () => {
+    it('flags challenge:true + transport on the http lane and captures the raw body', async () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
       const sink = new CollectingCaptureSink();
       const t: CapturingFetchTransports = {
         http: jest.fn(async () => CHALLENGE),
@@ -193,17 +197,15 @@ describe('createCapturingFetch', () => {
       const fetch = createCapturingFetch(t, sink);
       const url = 'https://json.example.test/item/1';
 
-      const err = await fetch(url, { transport: 'http' }).then(
-        () => { throw new Error('expected ChallengePageError'); },
-        e => e,
-      );
-      expect(err).toBeInstanceOf(ChallengePageError);
-      expect(err.transport).toBe('http');
+      const result = await fetch(url, { transport: 'http' });
+      expect(result).toEqual({ html: CHALLENGE, challenge: true, transport: 'http' });
       expect(sink.captures).toHaveLength(1);
       expect(sink.captures[0].bytes.toString('utf8')).toBe(CHALLENGE);
+      expect(warnSpy.mock.calls.map(c => String(c[0])).some(l => l.includes('via http transport'))).toBe(true);
+      warnSpy.mockRestore();
     });
 
-    it('does NOT throw for a real body on the impersonate lane (only a challenge body throws)', async () => {
+    it('does NOT flag challenge for a real body on the impersonate lane (challenge/transport keys absent)', async () => {
       const sink = new CollectingCaptureSink();
       const t: CapturingFetchTransports = {
         http: jest.fn(),
@@ -211,13 +213,13 @@ describe('createCapturingFetch', () => {
         browser: { scrapePage: jest.fn(), scrapePageStealth: jest.fn() },
       };
       const fetch = createCapturingFetch(t, sink);
-      await expect(
-        fetch('https://api.sentai.example.test/item/1', { transport: 'impersonate' })
-      ).resolves.toEqual({ html: '{"json":"REAL"}' });
+      const result = await fetch('https://api.sentai.example.test/item/1', { transport: 'impersonate' });
+      expect(result).toEqual({ html: '{"json":"REAL"}' }); // no challenge/transport keys on a normal body
+      expect(result).not.toHaveProperty('challenge');
       expect(sink.captures).toHaveLength(1);
     });
 
-    it('does NOT throw on the browser lane even when its body looks like a challenge (browser lane owns its own detection — regression pin)', async () => {
+    it('never flags the browser lane even when its body looks like a challenge (browser lane owns its own detection — regression pin)', async () => {
       const sink = new CollectingCaptureSink();
       const t: CapturingFetchTransports = {
         http: jest.fn(),
@@ -230,7 +232,7 @@ describe('createCapturingFetch', () => {
       const fetch = createCapturingFetch(t, sink);
 
       const result = await fetch('https://myfigurecollection.net/item/12345', { transport: 'browser' });
-      expect(result).toEqual({ html: CHALLENGE }); // returned, NOT thrown
+      expect(result).toEqual({ html: CHALLENGE }); // returned plain, NOT flagged
       expect(sink.captures).toHaveLength(0);        // browser lane captures itself, not here
     });
   });
@@ -270,8 +272,8 @@ describe('createCapturingFetch', () => {
     });
   });
 
-  describe('Cloudflare block / rate-limit error page → ChallengePageError (RD-2)', () => {
-    it('throws on the impersonate lane for a real CF 1020 block body AFTER capturing it', async () => {
+  describe('Cloudflare block / rate-limit error page → flagged challenge:true (RD-2)', () => {
+    it('flags challenge:true on the impersonate lane for a real CF 1020 block body AFTER capturing it', async () => {
       const block = fixture('cf-block-1020-amiami.html');
       const sink = new CollectingCaptureSink();
       const t: CapturingFetchTransports = {
@@ -282,18 +284,14 @@ describe('createCapturingFetch', () => {
       const fetch = createCapturingFetch(t, sink);
       const url = 'https://www.amiami.com/item/1';
 
-      const err = await fetch(url, { transport: 'impersonate', browser: 'chrome142' }).then(
-        () => { throw new Error('expected ChallengePageError'); },
-        e => e,
-      );
-      expect(err).toBeInstanceOf(ChallengePageError);
-      expect(err.transport).toBe('impersonate');
+      const result = await fetch(url, { transport: 'impersonate', browser: 'chrome142' });
+      expect(result).toEqual({ html: block, challenge: true, transport: 'impersonate' });
       // provenance still captured even for a block body
       expect(sink.captures).toHaveLength(1);
       expect(sink.captures[0].bytes.toString('utf8')).toBe(block);
     });
 
-    it('throws on the http lane for a real CF 1020 block body', async () => {
+    it('flags challenge:true on the http lane for a real CF 1020 block body', async () => {
       const block = fixture('cf-block-1020-sugo.html');
       const sink = new CollectingCaptureSink();
       const t: CapturingFetchTransports = {
@@ -303,7 +301,8 @@ describe('createCapturingFetch', () => {
       };
       const fetch = createCapturingFetch(t, sink);
 
-      await expect(fetch('https://sugo.example.test/item/1', { transport: 'http' })).rejects.toBeInstanceOf(ChallengePageError);
+      const result = await fetch('https://sugo.example.test/item/1', { transport: 'http' });
+      expect(result).toMatchObject({ challenge: true, transport: 'http' });
       expect(sink.captures).toHaveLength(1);
     });
   });

@@ -25,23 +25,47 @@ import { isCloudflareChallenge } from './challengeDetect.js';
 
 export interface CapturingFetchResult {
   html: string;
+  /**
+   * Set true ONLY when a non-browser lane (impersonate / http) received a Cloudflare
+   * challenge/block interstitial instead of the real page. Absent (never false) for a normal body
+   * and for the browser lane. The transport does NOT throw on a challenge — a ruleset's own
+   * follow-up call (ctx.scraping.fetchBody) can still recover the real record (the amiami case),
+   * so the queue's honesty gate is the authority: a challenge-flagged page that ALSO persisted
+   * nothing becomes a typed ChallengePageError, while one the ruleset recovered rows from is a
+   * logged success.
+   */
+  challenge?: boolean;
+  /**
+   * The non-browser lane that served this fetch — 'impersonate' | 'http' — carried so the queue
+   * can name the transport in a ChallengePageError. Present alongside `challenge`; absent for a
+   * normal body and for the browser lane.
+   */
+  transport?: string;
 }
 
 /**
- * A non-browser lane (impersonate / http) received a Cloudflare challenge interstitial instead of
- * the real page — a TRANSPORT failure, not an empty success. Thrown AFTER the bytes are handed to
- * the capture sink (provenance is still recorded), so the queue's existing failure handling
- * (attempts / backoff / FAILED) owns it rather than a ruleset silently lifting zero rows. The
- * message names Cloudflare so the queue's classifyError treats it as a rate-limit/block class.
+ * A non-browser lane (impersonate / http) served a Cloudflare challenge/block interstitial AND the
+ * ruleset then persisted nothing from it — a TRANSPORT failure, not an empty success. NO LONGER
+ * thrown by the transport itself (capturingFetch merely FLAGS `challenge` on its result and captures
+ * the bytes for provenance): it is thrown by scrapeQueue's ingest honesty gate, which alone can see
+ * whether the ruleset's own follow-up transport recovered the record (the amiami case, where the
+ * product page is a challenge but a same-pod item-API call still lifts the full record). The message
+ * names Cloudflare so the queue's classifyError treats it as a rate-limit/block class, and carries
+ * any server warnings the gate saw.
  */
 export class ChallengePageError extends Error {
   readonly url: string;
   readonly transport: string;
-  constructor(url: string, transport: string) {
-    super(`Cloudflare challenge page received for ${sanitizeForLog(url)} via ${transport} transport`);
+  readonly warnings: string[];
+  constructor(url: string, transport: string, warnings: string[] = []) {
+    const tail = warnings.length
+      ? ` server warnings: ${warnings.map(sanitizeForLog).join(' | ')}`
+      : '';
+    super(`Cloudflare challenge page received for ${sanitizeForLog(url)} via ${transport} transport.${tail}`);
     this.name = 'ChallengePageError';
     this.url = url;
     this.transport = transport;
+    this.warnings = warnings;
   }
 }
 
@@ -100,16 +124,26 @@ export function createCapturingFetch(transports: CapturingFetchTransports, sink:
           userAgent: searchFetch.userAgent,
           ...(prime ? { prime } : {}),
         });
-        // Capture FIRST (provenance is recorded even for a challenge body), THEN reject a challenge
-        // interstitial as a transport failure — a ruleset would silently lift zero rows from it.
+        // Capture FIRST (provenance is recorded even for a challenge body), THEN FLAG a challenge
+        // interstitial rather than throwing — a ruleset's own follow-up transport may still recover
+        // the record. The queue's honesty gate turns a flagged page that persisted nothing into a
+        // ChallengePageError; one the ruleset recovered rows from stays a success.
         await captureApiBody(sink, url, html);
-        if (isCloudflareChallenge(html)) throw new ChallengePageError(url, 'impersonate');
+        if (isCloudflareChallenge(html)) {
+          // eslint-disable-next-line no-console
+          console.warn(`[FETCH] Cloudflare challenge/block page received for ${sanitizeForLog(url)} via impersonate transport`);
+          return { html, challenge: true, transport: 'impersonate' };
+        }
         return { html };
       }
       case 'http': {
         const html = await transports.http(url);
         await captureApiBody(sink, url, html);
-        if (isCloudflareChallenge(html)) throw new ChallengePageError(url, 'http');
+        if (isCloudflareChallenge(html)) {
+          // eslint-disable-next-line no-console
+          console.warn(`[FETCH] Cloudflare challenge/block page received for ${sanitizeForLog(url)} via http transport`);
+          return { html, challenge: true, transport: 'http' };
+        }
         return { html };
       }
       case 'browser':
