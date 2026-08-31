@@ -1471,9 +1471,15 @@ export class ScrapeQueue {
     // pause/cooldown and fall through to the maxRetries/give-up path below, so a permanently-empty
     // record lands FAILED with a clear reason instead of pausing the user's whole sync session as
     // 'auth_failures' and holding the item indefinitely (RS-3).
+    // A ChallengePageError is likewise NOT a cookie fault: it is raised ONLY by the honesty gate for a
+    // NON-browser lane (http/impersonate) that never sent the cookies, so a cookie'd item must fail
+    // bounded like the cookieless case instead of pausing the session (RT-1). The carve-out keys on the
+    // ChallengePageError CLASS, not errorType==='rate_limited' — a browser-lane CF block still surfaces
+    // as a plain rate_limited Error on a cookie'd lane and keeps its session-pause behavior.
     if (
       errorType !== 'extraction_unavailable' &&
       errorType !== 'empty_record' &&
+      !(error instanceof ChallengePageError) &&
       item.cookies &&
       item.sessionId &&
       item.waitingUserIds.length > 0

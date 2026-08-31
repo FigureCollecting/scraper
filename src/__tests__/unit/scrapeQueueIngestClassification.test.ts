@@ -262,6 +262,60 @@ describe('ScrapeQueue - cookie-authenticated empty record lands FAILED, never an
     expect(getSessionManager().isSessionPaused('sess-auth')).toBe(true); // auth failures still pause
     expect(send).not.toHaveBeenCalled();
   });
+
+  it('a CHALLENGE-flagged empty record on a COOKIE session lands FAILED (rate_limited), never an auth pause [RT-1]', async () => {
+    // A challenge/block page the ruleset persisted nothing from is a TRANSPORT failure (ChallengePageError
+    // → rate_limited), raised by a NON-browser lane that never used the cookies. Booking it as a cookie
+    // failure paused the user's whole sync session ('auth_failures') and held the item forever — no webhook,
+    // promise pending. It must fall through to bounded FAILED like the cookieless case (brief item 2).
+    const send = jest.fn().mockResolvedValue(emptyStats());   // spine persists nothing from the block body
+    const http = jest.fn().mockResolvedValue(CHALLENGE_HTML); // http lane → flagged challenge:true
+    queue = new ScrapeQueue(false);
+    queue.setPluginRegistry(makeRegistry(makeRuleset('777'), 'fnc.example.test', { transport: 'http' }));
+    queue.setIngestEmitter({ send });
+    queue.setScrapingService(makeScrapingStub());
+    queue.setIngestTransports({ http });
+
+    const url = 'https://fnc.example.test/product/777';
+    const result = queue.enqueue(url, {
+      url,
+      cookies: { PHPSESSID: 'abc' },
+      sessionId: 'sess-cf',
+      userId: 'u1',
+    }); // default maxRetries = 3
+    result.promise.catch(() => {});
+    await advanceUntil(() => queue.getStats().failed === 1 || getSessionManager().isSessionPaused('sess-cf'));
+
+    expect(getSessionManager().isSessionPaused('sess-cf')).toBe(false); // challenge is a transport fault, session NOT paused
+    expect(queue.getStats().failed).toBe(1);                            // terminal FAILED, not held for user action
+    expect(http).toHaveBeenCalledTimes(3);                             // bounded rate_limited retries, no infinite hold
+    expect(queue.getStats().rateLimited).toBe(true);                   // class-based rate_limited/backoff preserved
+    expect(mockNotifyItemFailed).toHaveBeenCalledTimes(1);            // permanent-failure webhook fired
+    const reason = mockNotifyItemFailed.mock.calls[0][2] as string;
+    expect(reason).toContain('rate_limited');
+    expect(reason).toContain('via http transport');
+    await expect(result.promise).rejects.toThrow(/Scrape failed: rate_limited - Cloudflare challenge page received/);
+  });
+
+  it('a legacy Cloudflare-message rate_limited failure on a COOKIE session STILL pauses (carve-out is ChallengePageError-only) [RT-1]', async () => {
+    // The carve-out must key on the ChallengePageError CLASS, never on errorType === 'rate_limited': a
+    // browser-lane CF block surfaces as a plain rate_limited Error on a lane that DID use the cookies, and
+    // must keep its session-pause behavior. Carving out rate_limited wholesale would silently change that.
+    const scraping = makeScrapingStub();
+    scraping.scrapePageStealth.mockRejectedValue(new Error('CLOUDFLARE rate limit challenge'));
+    const send = jest.fn();
+    queue = new ScrapeQueue(false);
+    queue.setPluginRegistry(makeRegistry(makeRuleset('888'), 'myfigurecollection.net'));
+    queue.setIngestEmitter({ send });
+    queue.setScrapingService(scraping);
+
+    const result = queue.enqueue('888', { cookies: { PHPSESSID: 'z' }, sessionId: 'sess-cf-legacy', userId: 'u3' });
+    result.promise.catch(() => {});
+    await advanceUntil(() => getSessionManager().isSessionPaused('sess-cf-legacy') || queue.getStats().failed === 1);
+
+    expect(getSessionManager().isSessionPaused('sess-cf-legacy')).toBe(true); // plain rate_limited still pauses
+    expect(send).not.toHaveBeenCalled();
+  });
 });
 
 describe('ScrapeQueue - challenge page: flag → honesty gate (recover vs fail) [CHANGE 1-2]', () => {
