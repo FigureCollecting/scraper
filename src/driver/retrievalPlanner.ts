@@ -13,8 +13,13 @@
 import type { IdentityQuery, RetrievalCapability, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
 import type { ProfileRegistry } from './profileRegistry.js';
 
-/** A store's targeted query, composed from an IdentityQuery per its capabilities. */
-export type ComposedQuery = { kind: 'search'; q: string } | { kind: 'detail'; id: string };
+/**
+ * A store's targeted query, composed from an IdentityQuery per its capabilities. The `search`
+ * variant may carry `filter` tokens (substring-match stores): the store is issued the single most
+ * selective identity term as `q`, and every surviving candidate name must contain EVERY `filter`
+ * token (applied downstream in assembleLookup). Absent `filter` ⇒ no post-filter (today's behavior).
+ */
+export type ComposedQuery = { kind: 'search'; q: string; filter?: string[] } | { kind: 'detail'; id: string };
 
 /**
  * Build a name/ER query string from the identity: prefer the display `name` (most likely to match a
@@ -30,9 +35,36 @@ export function composeNameQuery(identity: IdentityQuery): string | undefined {
 }
 
 /**
+ * Normalize free text for identity matching: lowercase, punctuation → single spaces, trimmed. Shared
+ * by the substring-store filter builder (below) and the candidate post-filter (assembleLookup), so a
+ * studio's tokens match inside a decorated title — "star origin studio" ⊂
+ * "[Pre-Order] Star Origin Studio 1/6 Cyberpunk: Edgerunners Lucyna Kushinada Statue".
+ */
+export function normalizeText(s: string): string {
+  return s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+}
+
+/** Identity tokens for substring post-filtering: normalized words, sub-2-char noise dropped. */
+export function tokenizeIdentity(s: string): string[] {
+  return normalizeText(s).split(' ').filter((t) => t.length >= 2);
+}
+
+/** First value that is non-empty after trimming (empty strings are skipped, not only null/undefined). */
+const firstNonEmpty = (...vals: (string | undefined)[]): string | undefined => {
+  for (const v of vals) {
+    const t = (v ?? '').trim();
+    if (t) return t;
+  }
+  return undefined;
+};
+
+/**
  * Compose ONE store's targeted query from a cross-store IdentityQuery, branching on its capabilities:
  *   - `bySearch.acceptsGtin` + a gtin14  → JAN-exact search (amiami/Woo/PrestaShop).
  *   - `byId.idKind === 'barcode'` + a gtin14 → the JAN resolves straight to a detail page (plazajapan).
+ *   - `bySearch.queryMatch === 'substring'` (Ueeshop/gkloot) → a multi-term phrase matches nothing, so
+ *     issue the single most selective identity term (character|series ?? studio ?? name) as `q` and
+ *     carry the REST (the studio, when a character/series led) as post-filter tokens.
  *   - else a composed name/ER search where the store has bySearch (Shopify title-index, GK statues).
  *   - else undefined → the store can't serve this identity (→ unsupported).
  */
@@ -40,6 +72,18 @@ export function composeStoreQuery(caps: StoreCapabilities, identity: IdentityQue
   const r = caps.retrieval;
   if (identity.gtin14 && r?.bySearch?.acceptsGtin) return { kind: 'search', q: identity.gtin14 };
   if (identity.gtin14 && r?.byId?.idKind === 'barcode') return { kind: 'detail', id: identity.gtin14 };
+  if (r?.bySearch?.queryMatch === 'substring') {
+    const charOrSeries = firstNonEmpty(identity.character, identity.series);
+    const studio = firstNonEmpty(identity.studio);
+    const primary = charOrSeries ?? studio ?? firstNonEmpty(identity.name);
+    if (!primary) return undefined;
+    // Post-filter = tokens of the identity components (studio / character|series) that are NOT the
+    // primary term — never scale, never name. In practice: the studio, when a character/series led.
+    const filter = [charOrSeries, studio]
+      .filter((c): c is string => !!c && c !== primary)
+      .flatMap((c) => tokenizeIdentity(c));
+    return filter.length ? { kind: 'search', q: primary, filter } : { kind: 'search', q: primary };
+  }
   const composed = composeNameQuery(identity);
   if (composed && r?.bySearch) return { kind: 'search', q: composed };
   return undefined;
@@ -69,6 +113,10 @@ export interface FetchPlan {
   url: string;
   kind: 'detail' | 'search';
   itemId?: string;
+  /** The exact `{q}` issued to this store (search plans) — surfaced as StoreLookupResult.storeQuery. */
+  query?: string;
+  /** Substring-store post-filter tokens (record-mode): every kept candidate name must contain them all. */
+  filter?: string[];
 }
 
 export interface RetrievalPlan {
@@ -94,7 +142,7 @@ export function planRetrieval(registry: ProfileRegistry, req: RetrievalRequest):
   if (req.mode === 'search') {
     const caps = registry.forHost(req.host);
     const url = resolveSearchUrl(caps?.retrieval, req.query);
-    if (url) plans.push({ host: req.host, siteId: caps?.siteId ?? '', url, kind: 'search' });
+    if (url) plans.push({ host: req.host, siteId: caps?.siteId ?? '', url, kind: 'search', query: req.query });
     else unsupported.push(caps?.siteId ?? req.host);
     return { plans, unsupported };
   }
@@ -111,7 +159,8 @@ export function planRetrieval(registry: ProfileRegistry, req: RetrievalRequest):
       if (url) {
         plans.push({
           host: caps.domains[0], siteId: caps.siteId, url, kind: composed.kind === 'search' ? 'search' : 'detail',
-          ...(composed.kind === 'detail' ? { itemId: composed.id } : {}),
+          ...(composed.kind === 'detail' ? { itemId: composed.id } : { query: composed.q }),
+          ...(composed.kind === 'search' && composed.filter ? { filter: composed.filter } : {}),
         });
       } else unsupported.push(caps.siteId);
     }
@@ -121,7 +170,7 @@ export function planRetrieval(registry: ProfileRegistry, req: RetrievalRequest):
   // lookup: fan the query out to every store that supports search
   for (const caps of registry.all()) {
     const url = resolveSearchUrl(caps.retrieval, req.query);
-    if (url) plans.push({ host: caps.domains[0], siteId: caps.siteId, url, kind: 'search' });
+    if (url) plans.push({ host: caps.domains[0], siteId: caps.siteId, url, kind: 'search', query: req.query });
     else unsupported.push(caps.siteId);
   }
   return { plans, unsupported };

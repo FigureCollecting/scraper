@@ -5,7 +5,7 @@
  */
 import type { IdentityQuery, RetrievalCapability, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
 import { ProfileRegistry } from '../profileRegistry';
-import { planRetrieval, resolveByIdUrl, resolveSearchUrl, composeStoreQuery, composeNameQuery } from '../retrievalPlanner';
+import { planRetrieval, resolveByIdUrl, resolveSearchUrl, composeStoreQuery, composeNameQuery, normalizeText, tokenizeIdentity } from '../retrievalPlanner';
 
 const caps = (siteId: string, host: string, retrieval?: RetrievalCapability): StoreCapabilities => ({
   siteId, name: siteId, domains: [host], requiresBrowser: false, allowedCookies: [],
@@ -56,7 +56,7 @@ describe('planRetrieval', () => {
 
   it('search: one search plan for a supporting store', () => {
     const p = planRetrieval(registry(), { mode: 'search', host: 'hlj.com', query: 'miku' });
-    expect(p.plans).toEqual([{ host: 'hlj.com', siteId: 'hlj', url: 'https://hlj.com/search?q=miku', kind: 'search' }]);
+    expect(p.plans).toEqual([{ host: 'hlj.com', siteId: 'hlj', url: 'https://hlj.com/search?q=miku', kind: 'search', query: 'miku' }]);
     expect(p.unsupported).toEqual([]);
   });
 
@@ -122,5 +122,55 @@ describe('planRetrieval record mode', () => {
     expect(bySite.plazajapan.kind).toBe('detail');
     expect(bySite.plazajapan.itemId).toBe('4570232591424'); // barcode-byId
     expect(p.unsupported).toEqual(['nogo']);
+  });
+});
+
+describe('normalizeText / tokenizeIdentity (exported identity-matching helpers)', () => {
+  it('normalizeText lowercases, strips punctuation to spaces, and collapses runs', () => {
+    expect(normalizeText('[Pre-Order] Star Origin Studio 1/6 Cyberpunk: Edgerunners'))
+      .toBe('pre order star origin studio 1 6 cyberpunk edgerunners');
+  });
+  it('tokenizeIdentity drops tokens shorter than 2 chars', () => {
+    expect(tokenizeIdentity('J-Pop 2 Go A')).toEqual(['pop', 'go']); // j, 2, a dropped (<2)
+    expect(tokenizeIdentity('   ')).toEqual([]);
+  });
+});
+
+describe('composeStoreQuery — substring-match stores (Ueeshop/gkloot)', () => {
+  const sub = caps('gkloot', 'gkloot.com', { bySearch: { urlTemplate: 'https://www.gkloot.com/search/?Keyword={q}', queryMatch: 'substring' } });
+  const subGtin = caps('subgtin', 'subgtin.com', { bySearch: { urlTemplate: 'https://s/?q={q}', acceptsGtin: true, queryMatch: 'substring' } });
+  const tok = caps('toktore', 'toktore.com', { bySearch: { urlTemplate: 'https://t/?q={q}' } }); // queryMatch absent = tokens
+
+  it('studio + character: issues the most selective term (character) and filters by studio tokens', () => {
+    expect(composeStoreQuery(sub, { studio: 'Star Origin Studio', character: 'Lucy' }))
+      .toEqual({ kind: 'search', q: 'Lucy', filter: ['star', 'origin', 'studio'] });
+  });
+  it('studio + series (no character): primary = series; filter = studio tokens', () => {
+    expect(composeStoreQuery(sub, { studio: 'Crown', series: 'Cyberpunk Edgerunners' }))
+      .toEqual({ kind: 'search', q: 'Cyberpunk Edgerunners', filter: ['crown'] });
+  });
+  it('studio only: q = studio, no filter', () => {
+    expect(composeStoreQuery(sub, { studio: 'Star Origin Studio' }))
+      .toEqual({ kind: 'search', q: 'Star Origin Studio' });
+  });
+  it('name only: q = name, no filter', () => {
+    expect(composeStoreQuery(sub, { name: 'Cyberpunk Lucy Statue' }))
+      .toEqual({ kind: 'search', q: 'Cyberpunk Lucy Statue' });
+  });
+  it('filter tokenizer strips punctuation and drops <2-char tokens', () => {
+    expect(composeStoreQuery(sub, { studio: 'J-Pop 2 Go', character: 'Lucy' }))
+      .toEqual({ kind: 'search', q: 'Lucy', filter: ['pop', 'go'] });
+  });
+  it('gtin path still wins over substring when the store acceptsGtin (no filter)', () => {
+    expect(composeStoreQuery(subGtin, { gtin14: '4570232591424', studio: 'Star Origin Studio', character: 'Lucy' }))
+      .toEqual({ kind: 'search', q: '4570232591424' });
+  });
+  it('empty identity on a substring store is unsupported (undefined)', () => {
+    expect(composeStoreQuery(sub, {})).toBeUndefined();
+  });
+  it('REGRESSION PIN — a tokens store composes the full phrase byte-identically to today', () => {
+    const identity = { studio: 'Star Origin Studio', character: 'Lucy' };
+    expect(composeStoreQuery(tok, identity)).toEqual({ kind: 'search', q: 'Star Origin Studio Lucy' });
+    expect(composeStoreQuery(tok, identity)).toEqual({ kind: 'search', q: composeNameQuery(identity) });
   });
 });
