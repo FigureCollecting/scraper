@@ -1147,6 +1147,7 @@ export class ScrapeQueue {
     // handling — the retry re-fetches, re-extracts, and re-emits ALL records as new honest
     // observations (no partial-batch ambiguity: there is no batch, only a resumable prefix).
     let emittedCount = 0;
+    let sentCount = 0;
     let totalPersisted = 0;
     try {
       for (const record of records) {
@@ -1156,6 +1157,10 @@ export class ScrapeQueue {
         // zeroed, persisted-nothing record (→ EmptyIngestRecordError via the gate below), never a
         // TypeError from reading stats.claims on undefined.
         const stats = ((await this.ingestEmitter!.send(record)) ?? {}) as IngestRecordStats;
+        // This record reached the emitter and returned a response — count it as SENT before the
+        // honesty gate below can reject it, so a partial-emit failure log reports records SENT
+        // (including the one that persisted nothing), distinct from the rows actually PERSISTED.
+        sentCount++;
         const label = `${record.source.site}:${record.source.itemId}`;
         logIngestStats(label, stats);
         const persisted = persistedRows(stats);
@@ -1184,7 +1189,7 @@ export class ScrapeQueue {
       }
     } catch (error: any) {
       console.error(
-        `[SCRAPE QUEUE] Ingest emit failed for ${item.url} after ${emittedCount}/${records.length} records emitted ` +
+        `[SCRAPE QUEUE] Ingest emit failed for ${item.url} after ${sentCount}/${records.length} records emitted (persisted=${totalPersisted}) ` +
           `(ruleset ${ruleset.siteId}@${ruleset.version}): ${sanitizeForLog(error?.message ?? String(error))}`
       );
       throw error instanceof Error ? error : new Error(String(error));
