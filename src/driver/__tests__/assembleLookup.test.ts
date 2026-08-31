@@ -215,3 +215,81 @@ describe('lookupByIdentity — record mode (typed identity → per-store query)'
     expect(out.query).toBe('Tomie');
   });
 });
+
+describe('lookupByIdentity — substring-match store post-filter + observability', () => {
+  // gkloot: Ueeshop storefront, matches {q} as ONE contiguous substring → the engine issues the most
+  // selective identity term and post-filters by the rest.
+  const SUBSTORE = caps('gkloot', 'www.gkloot.com', {
+    bySearch: { urlTemplate: 'https://www.gkloot.com/search/?Keyword={q}', scope: 'listed', queryMatch: 'substring' },
+  });
+  // fnc: a token/keyword store (queryMatch absent = tokens) → composed phrase, no post-filter.
+  const TOKSTORE = caps('fnc', 'www.fnc.com', {
+    bySearch: { urlTemplate: 'https://www.fnc.com/search?q={q}', scope: 'listed' },
+  });
+  // A Keyword=Lucy SERP mixes the target studio with decoys whose names also contain "Lucy".
+  const MIXED: SearchCandidate[] = [
+    { itemId: '17412', name: '[Pre-Order] Star Origin Studio 1/6 Cyberpunk: Edgerunners Lucyna Kushinada Statue', available: true },
+    { itemId: '9001', name: 'Crown Studio Lucy 1/4 Statue', available: true },
+    { itemId: '9002', name: "GIRL'S HOUSE GK Studio Lucy Figure", available: false },
+    { itemId: '9003', name: 'Star Origin Studio Lucy Chibi Ver.', available: true },
+    { itemId: '9004', name: 'Star Origin Studio Lucy Deluxe', available: false },
+  ];
+  const IDENTITY = { studio: 'Star Origin Studio', character: 'Lucy' };
+
+  it('substring store: issues the selective term, keeps only names containing every filter token, reports storeQuery + filtered', async () => {
+    const fetchSearch = jest.fn(async () => JSON.stringify(MIXED));
+    const services: LookupServices = {
+      profiles: buildProfileRegistry([SUBSTORE]),
+      getRulesetForUrl: () => stub('gkloot', () => MIXED),
+      fetchSearch,
+    };
+
+    const out = await assembleLookup(services).lookupByIdentity(IDENTITY);
+
+    // gkloot was issued the single most selective term (not the multi-term phrase Ueeshop can't match).
+    expect(fetchSearch).toHaveBeenCalledWith('https://www.gkloot.com/search/?Keyword=Lucy', expect.anything());
+    const gk = out.results.find((r) => r.siteId === 'gkloot')!;
+    expect(gk.storeQuery).toBe('Lucy');
+    // only the Star Origin candidates survive; Crown + GIRL'S HOUSE are dropped.
+    expect(gk.candidates.map((c) => c.itemId)).toEqual(['17412', '9003', '9004']);
+    expect(gk.filtered).toBe(2);
+  });
+
+  it('tokens store in the SAME fanout is untouched: composed phrase issued, candidates unfiltered, no `filtered`', async () => {
+    const fetchSearch = jest.fn(async () => JSON.stringify(MIXED));
+    const services: LookupServices = {
+      profiles: buildProfileRegistry([SUBSTORE, TOKSTORE]),
+      getRulesetForUrl: (url) => (url.includes('gkloot') ? stub('gkloot', () => MIXED) : stub('fnc', () => MIXED)),
+      fetchSearch,
+    };
+
+    const out = await assembleLookup(services).lookupByIdentity(IDENTITY);
+
+    const fnc = out.results.find((r) => r.siteId === 'fnc')!;
+    expect(fnc.storeQuery).toBe('Star Origin Studio Lucy'); // composed phrase, unchanged from today
+    expect(fnc.candidates.map((c) => c.itemId)).toEqual(['17412', '9001', '9002', '9003', '9004']); // untouched
+    expect(fnc.filtered).toBeUndefined(); // no filter → no `filtered` field
+    // and the substring store is still filtered in the same run
+    const gk = out.results.find((r) => r.siteId === 'gkloot')!;
+    expect(gk.candidates.map((c) => c.itemId)).toEqual(['17412', '9003', '9004']);
+    expect(fetchSearch).toHaveBeenCalledWith('https://www.fnc.com/search?q=Star%20Origin%20Studio%20Lucy', expect.anything());
+    expect(fetchSearch).toHaveBeenCalledWith('https://www.gkloot.com/search/?Keyword=Lucy', expect.anything());
+  });
+
+  it('orderable mode composes with the filter: identity filter runs BEFORE the sold-out cut (filtered counts only identity removals)', async () => {
+    const fetchSearch = jest.fn(async () => JSON.stringify(MIXED));
+    const services: LookupServices = {
+      profiles: buildProfileRegistry([SUBSTORE]),
+      getRulesetForUrl: () => stub('gkloot', () => MIXED),
+      fetchSearch,
+    };
+
+    const out = await assembleLookup(services).lookupByIdentity(IDENTITY, { mode: 'orderable' });
+
+    const gk = out.results.find((r) => r.siteId === 'gkloot')!;
+    // filter keeps the 3 Star Origin hits (filtered = 2); orderable then drops the sold-out 9004.
+    expect(gk.filtered).toBe(2);
+    expect(gk.candidates.map((c) => c.itemId)).toEqual(['17412', '9003']);
+    expect(gk.storeQuery).toBe('Lucy');
+  });
+});
