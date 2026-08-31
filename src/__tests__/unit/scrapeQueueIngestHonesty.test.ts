@@ -31,6 +31,7 @@ jest.mock('../../services/webhookClient', () => ({
 import type { ExtractionRuleset } from '@figurecollecting/scraper-plugin-contract';
 import { ScrapeQueue, resetScrapeQueue } from '../../services/scrapeQueue';
 import { createExtractionRegistry, ExtractionRegistryImpl } from '../../services/extractionRegistry';
+import { enrichmentLogger } from '../../utils/logger';
 
 const FIXTURE_HTML = '<html><body><h1 class="title">Kitagawa Marin</h1></body></html>';
 
@@ -221,6 +222,39 @@ describe('ScrapeQueue - ingest honesty (persist-or-fail)', () => {
     expect(queue.getStats().completed).toBe(1);
     expect(queue.getStats().failed).toBe(0);
     expect(mockNotifyItemFailed).not.toHaveBeenCalled();
+  });
+
+  it('logs plugin-shaped field presence on success (title/price/images/fieldCount), not the legacy all-false ScrapedData shape', async () => {
+    const successSpy = jest.spyOn(enrichmentLogger, 'success').mockImplementation(() => {});
+    // A plugin-shaped record: its fields are `title`/`price`/`images`, NOT the legacy ScrapedData
+    // keys (imageUrl/name/manufacturer/origin/releaseDate) the old summary read (all-false for every
+    // plugin ingest). The success log must derive presence from the emitted record's OWN fields.
+    const richRuleset: ExtractionRuleset & { extract: jest.Mock } = {
+      siteId: 'mock-mfc',
+      version: '1.0.0',
+      extract: jest.fn((html: string, url: string) => ({
+        source: { site: 'mock-mfc', itemId: '12345', url, extractedAt: '2026-07-24T00:00:00.000Z', rulesetVersion: '1.0.0' },
+        fields: { title: 'Kitagawa Marin', price: '¥14,800', images: ['a.jpg', 'b.jpg', 'c.jpg'] },
+        warnings: [],
+      })),
+      validate: () => ({ valid: true, errors: [], warnings: [] }),
+    };
+    const send = jest.fn().mockResolvedValue(HEALTHY_STATS);
+    const q = new ScrapeQueue(false);
+    q.setPluginRegistry(makeRegistry(richRuleset));
+    q.setIngestEmitter({ send });
+    q.setScrapingService(makeScrapingStub());
+    queue = q;
+
+    const result = q.enqueue('12345', { priority: 'WARM', maxRetries: 0 });
+    await advanceUntil(() => q.getStats().completed === 1 || q.getStats().failed === 1);
+    await result.promise;
+
+    expect(successSpy).toHaveBeenCalledTimes(1);
+    // title present (via fields.title), price present, 3 images, 3 fields — derived from the record,
+    // NOT the legacy {imageUrl,name,manufacturer,origin,releaseDate,price} all-false bag.
+    expect(successSpy.mock.calls[0][3]).toEqual({ title: true, price: true, images: 3, fieldCount: 3 });
+    successSpy.mockRestore();
   });
 
   it('logs a per-record [INGEST STATS] line and folds persisted= into the "Ingest complete" line', async () => {

@@ -1390,15 +1390,16 @@ export class ScrapeQueue {
     const itemStatus = item.status || 'wished';
     this.statusCompleted[itemStatus]++;
 
-    // Log enrichment success with field completeness for analysis
+    // Log enrichment success with PLUGIN-shaped field presence derived from the emitted record's own
+    // fields — the legacy {imageUrl,name,manufacturer,origin,releaseDate,price} summary read
+    // ScrapedData keys plugins never set and logged all-false on every plugin ingest.
     const durationMs = Date.now() - item.queuedAt;
+    const recordFields = result as unknown as Record<string, unknown>;
     const fields = {
-      imageUrl: !!result.imageUrl,
-      name: !!result.name,
-      manufacturer: !!result.manufacturer,
-      origin: !!result.origin,
-      releaseDate: !!(result.releases?.[0]?.date),
-      price: !!(result.releases?.[0]?.price),
+      title: !!(recordFields.title ?? recordFields.name),
+      price: recordFields.price != null,
+      images: Array.isArray(recordFields.images) ? recordFields.images.length : 0,
+      fieldCount: Object.keys(recordFields).length,
     };
     enrichmentLogger.success(item.mfcId, item.sessionId, durationMs, fields);
 
