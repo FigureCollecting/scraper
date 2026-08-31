@@ -9,8 +9,13 @@
  * TWO MODES over ONE fetch: `listed` (all, incl. sold-out) vs `orderable` (drop `available === false`).
  * A barcode-byId store yields a single "direct-hit" candidate (itemId = the gtin14) the caller
  * confirms via /resolve — no search/parse. Everything is injected so the fan-out is deterministic.
+ *
+ * SUBSTRING-MATCH stores (Ueeshop/gkloot, `bySearch.queryMatch === 'substring'`) are issued the single
+ * most selective identity term and their candidates are POST-FILTERED by the remaining identity tokens
+ * (a multi-term phrase would match nothing). Each per-store result reports `storeQuery` (the exact `{q}`
+ * issued to that store) and, when that post-filter ran, `filtered` (how many candidates it removed).
  */
-import { planRetrieval, composeNameQuery } from './retrievalPlanner.js';
+import { planRetrieval, composeNameQuery, normalizeText } from './retrievalPlanner.js';
 import { sanitizeForLog } from '../utils/security.js';
 import type { ProfileRegistry } from './profileRegistry.js';
 import type { ExtractionRuleset, IdentityQuery, SearchCandidate, SearchFetch } from '@figurecollecting/scraper-plugin-contract';
@@ -34,7 +39,11 @@ export interface StoreLookupResult {
   siteId: string;
   host: string;
   url: string;
+  /** The exact `{q}` issued to this store: a substring store's selective term, else the composed phrase. */
+  storeQuery: string;
   candidates: SearchCandidate[];
+  /** Candidates the substring-store identity post-filter removed (present ONLY when that filter ran). */
+  filtered?: number;
 }
 
 /**
@@ -111,8 +120,26 @@ export function assembleLookup(services: LookupServices): Lookup {
         try {
           const body = await services.fetchSearch(p.url, services.profiles.searchTransportFor(p.host));
           let candidates = await ruleset.extractCandidates(body, p.url);
+          // Substring-store identity post-filter (record-mode): the store matched only the single
+          // selective term issued as `{q}`, so drop candidates whose normalized name lacks any remaining
+          // identity token. Runs BEFORE the orderable cut so `filtered` counts identity mismatches only.
+          let filtered: number | undefined;
+          if (p.filter?.length) {
+            const kept = candidates.filter((c) => {
+              // Plugin output is untrusted at runtime: a non-string name can't match identity, so
+              // drop it as a non-match — never let it throw and take the WHOLE store into `failed`.
+              const name = typeof c.name === 'string' ? normalizeText(c.name) : '';
+              // Also test the space-collapsed name so an identity token that spans punctuation the
+              // store wrote but the identity didn't ("girls" vs "GIRL'S HOUSE") still matches — the
+              // same cross-store title variance the substring gate exists to see through.
+              const compact = name.replace(/ /g, '');
+              return p.filter!.every((tok) => name.includes(tok) || compact.includes(tok));
+            });
+            filtered = candidates.length - kept.length;
+            candidates = kept;
+          }
           if (mode === 'orderable') candidates = candidates.filter((c) => c.available !== false);
-          return { siteId: p.siteId, host: p.host, url: p.url, candidates };
+          return { siteId: p.siteId, host: p.host, url: p.url, storeQuery: p.query ?? '', candidates, ...(filtered !== undefined ? { filtered } : {}) };
         } catch (err) {
           // Surface WHY a store dropped out (CF block / invalid impersonation profile / parse error).
           // eslint-disable-next-line no-console

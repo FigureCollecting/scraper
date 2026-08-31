@@ -8,6 +8,7 @@ import { assembleLookup, type LookupServices } from '../assembleLookup';
 import { buildProfileRegistry } from '../profileRegistry';
 import type {
   ExtractionRuleset,
+  IdentityQuery,
   SearchCandidate,
   StoreCapabilities,
 } from '@figurecollecting/scraper-plugin-contract';
@@ -75,6 +76,8 @@ describe('assembleLookup — cross-store buy-decision search, listed + orderable
     const out = await lookup.lookup('tomie');
 
     expect(out.mode).toBe('listed');
+    // discovery: the free-text query is the exact {q} issued, surfaced on each store result.
+    expect(bySite(out, 'goodsmileus')?.storeQuery).toBe('tomie');
     // goodsmileus (listed) returns BOTH — including the sold-out Gyaru Tomie x Hello Kitty.
     expect(bySite(out, 'goodsmileus')?.candidates.map((c) => c.available)).toEqual([true, false]);
     // solaris returned results but is orderable-scope → can't confirm its sold-out items.
@@ -213,5 +216,154 @@ describe('lookupByIdentity — record mode (typed identity → per-store query)'
     expect(out.results.map((r) => r.siteId)).toContain('goodsmileus');
     expect(out.unsupported).toContain('plazajapan'); // no name search + no gtin14 for its byId
     expect(out.query).toBe('Tomie');
+  });
+});
+
+describe('lookupByIdentity — substring-match store post-filter + observability', () => {
+  // gkloot: Ueeshop storefront, matches {q} as ONE contiguous substring → the engine issues the most
+  // selective identity term and post-filters by the rest.
+  const SUBSTORE = caps('gkloot', 'www.gkloot.com', {
+    bySearch: { urlTemplate: 'https://www.gkloot.com/search/?Keyword={q}', scope: 'listed', queryMatch: 'substring' },
+  });
+  // fnc: a token/keyword store (queryMatch absent = tokens) → composed phrase, no post-filter.
+  const TOKSTORE = caps('fnc', 'www.fnc.com', {
+    bySearch: { urlTemplate: 'https://www.fnc.com/search?q={q}', scope: 'listed' },
+  });
+  // A Keyword=Lucy SERP mixes the target studio with decoys whose names also contain "Lucy".
+  const MIXED: SearchCandidate[] = [
+    { itemId: '17412', name: '[Pre-Order] Star Origin Studio 1/6 Cyberpunk: Edgerunners Lucyna Kushinada Statue', available: true },
+    { itemId: '9001', name: 'Crown Studio Lucy 1/4 Statue', available: true },
+    { itemId: '9002', name: "GIRL'S HOUSE GK Studio Lucy Figure", available: false },
+    { itemId: '9003', name: 'Star Origin Studio Lucy Chibi Ver.', available: true },
+    { itemId: '9004', name: 'Star Origin Studio Lucy Deluxe', available: false },
+  ];
+  const IDENTITY = { studio: 'Star Origin Studio', character: 'Lucy' };
+
+  it('substring store: issues the selective term, keeps only names containing every filter token, reports storeQuery + filtered', async () => {
+    const fetchSearch = jest.fn(async () => JSON.stringify(MIXED));
+    const services: LookupServices = {
+      profiles: buildProfileRegistry([SUBSTORE]),
+      getRulesetForUrl: () => stub('gkloot', () => MIXED),
+      fetchSearch,
+    };
+
+    const out = await assembleLookup(services).lookupByIdentity(IDENTITY);
+
+    // gkloot was issued the single most selective term (not the multi-term phrase Ueeshop can't match).
+    expect(fetchSearch).toHaveBeenCalledWith('https://www.gkloot.com/search/?Keyword=Lucy', expect.anything());
+    const gk = out.results.find((r) => r.siteId === 'gkloot')!;
+    expect(gk.storeQuery).toBe('Lucy');
+    // only the Star Origin candidates survive; Crown + GIRL'S HOUSE are dropped.
+    expect(gk.candidates.map((c) => c.itemId)).toEqual(['17412', '9003', '9004']);
+    expect(gk.filtered).toBe(2);
+  });
+
+  it('tokens store in the SAME fanout is untouched: composed phrase issued, candidates unfiltered, no `filtered`', async () => {
+    const fetchSearch = jest.fn(async () => JSON.stringify(MIXED));
+    const services: LookupServices = {
+      profiles: buildProfileRegistry([SUBSTORE, TOKSTORE]),
+      getRulesetForUrl: (url) => (url.includes('gkloot') ? stub('gkloot', () => MIXED) : stub('fnc', () => MIXED)),
+      fetchSearch,
+    };
+
+    const out = await assembleLookup(services).lookupByIdentity(IDENTITY);
+
+    const fnc = out.results.find((r) => r.siteId === 'fnc')!;
+    expect(fnc.storeQuery).toBe('Star Origin Studio Lucy'); // composed phrase, unchanged from today
+    expect(fnc.candidates.map((c) => c.itemId)).toEqual(['17412', '9001', '9002', '9003', '9004']); // untouched
+    expect(fnc.filtered).toBeUndefined(); // no filter → no `filtered` field
+    // and the substring store is still filtered in the same run
+    const gk = out.results.find((r) => r.siteId === 'gkloot')!;
+    expect(gk.candidates.map((c) => c.itemId)).toEqual(['17412', '9003', '9004']);
+    expect(fetchSearch).toHaveBeenCalledWith('https://www.fnc.com/search?q=Star%20Origin%20Studio%20Lucy', expect.anything());
+    expect(fetchSearch).toHaveBeenCalledWith('https://www.gkloot.com/search/?Keyword=Lucy', expect.anything());
+  });
+
+  it('orderable mode composes with the filter: identity filter runs BEFORE the sold-out cut (filtered counts only identity removals)', async () => {
+    const fetchSearch = jest.fn(async () => JSON.stringify(MIXED));
+    const services: LookupServices = {
+      profiles: buildProfileRegistry([SUBSTORE]),
+      getRulesetForUrl: () => stub('gkloot', () => MIXED),
+      fetchSearch,
+    };
+
+    const out = await assembleLookup(services).lookupByIdentity(IDENTITY, { mode: 'orderable' });
+
+    const gk = out.results.find((r) => r.siteId === 'gkloot')!;
+    // filter keeps the 3 Star Origin hits (filtered = 2); orderable then drops the sold-out 9004.
+    expect(gk.filtered).toBe(2);
+    expect(gk.candidates.map((c) => c.itemId)).toEqual(['17412', '9003']);
+    expect(gk.storeQuery).toBe('Lucy');
+  });
+
+  it('a candidate with a non-string name is dropped as a non-match, not thrown — the substring store survives (not `failed`)', async () => {
+    // Untrusted plugin output: a substring-store SERP emits a candidate whose name is undefined. The
+    // identity post-filter must treat it as a non-match (drop it) — NOT throw and lose the WHOLE store.
+    const withBadName: SearchCandidate[] = [
+      { itemId: '17412', name: 'Star Origin Studio 1/6 Cyberpunk Lucyna Kushinada Statue', available: true },
+      { itemId: 'nameless', name: undefined as unknown as string, available: true },
+    ];
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const services: LookupServices = {
+      profiles: buildProfileRegistry([SUBSTORE]),
+      getRulesetForUrl: () => stub('gkloot', () => withBadName),
+      fetchSearch: jest.fn(async () => JSON.stringify(withBadName)),
+    };
+
+    const out = await assembleLookup(services).lookupByIdentity(IDENTITY);
+
+    expect(out.failed).toEqual([]); // no crash → store is NOT reported failed
+    const gk = out.results.find((r) => r.siteId === 'gkloot')!;
+    expect(gk.candidates.map((c) => c.itemId)).toEqual(['17412']); // nameless candidate dropped
+    expect(gk.filtered).toBe(1);
+    expect(warn).not.toHaveBeenCalled(); // no false "search failed" log
+    warn.mockRestore();
+  });
+
+  it('matches identity tokens across intra-token punctuation variance (apostrophe/hyphen) — no silent false exclusion', async () => {
+    // The store wrote the apostrophe/hyphen and the identity did not (or vice-versa). normalizeText
+    // spaces punctuation, so a token spanning it ("girls" ⊄ "girl s house") would be falsely excluded.
+    // The post-filter also tests the space-collapsed name, so cross-store title variance keeps the target.
+    const only = async (identity: IdentityQuery, name: string) => {
+      const cand: SearchCandidate[] = [{ itemId: 'x', name, available: true }];
+      const services: LookupServices = {
+        profiles: buildProfileRegistry([SUBSTORE]),
+        getRulesetForUrl: () => stub('gkloot', () => cand),
+        fetchSearch: jest.fn(async () => JSON.stringify(cand)),
+      };
+      return (await assembleLookup(services).lookupByIdentity(identity)).results.find((r) => r.siteId === 'gkloot')!;
+    };
+
+    // apostrophe variance: identity "Girls House" vs store title "GIRL'S HOUSE …" → KEPT (was dropped).
+    const ap = await only({ studio: 'Girls House', character: 'Lucy' }, "GIRL'S HOUSE GK Studio Lucy Figure");
+    expect(ap.candidates.map((c) => c.itemId)).toEqual(['x']);
+    expect(ap.filtered).toBe(0);
+    // hyphen/space variance inside a token: identity "WuKong Studio" vs "Wu-Kong Studio Lucy" → KEPT.
+    const hy = await only({ studio: 'WuKong Studio', character: 'Lucy' }, 'Wu-Kong Studio Lucy');
+    expect(hy.candidates.map((c) => c.itemId)).toEqual(['x']);
+    // a genuine off-identity decoy is STILL dropped — the gate did not become a pass-through.
+    const decoy = await only({ studio: 'Star Origin Studio', character: 'Lucy' }, 'Crown Studio Lucy 1/4');
+    expect(decoy.candidates).toEqual([]);
+    expect(decoy.filtered).toBe(1);
+  });
+
+  it('reports filtered: 0 when the identity filter ran but removed nothing (distinct from no-filter)', async () => {
+    // Every candidate already contains all filter tokens → the filter runs but drops nobody. `filtered`
+    // must still be PRESENT as 0, so "filter ran, all matched" stays distinguishable from "no filter".
+    const allMatch: SearchCandidate[] = [
+      { itemId: '17412', name: 'Star Origin Studio Lucy A', available: true },
+      { itemId: '9003', name: 'Star Origin Studio Lucy B', available: true },
+    ];
+    const services: LookupServices = {
+      profiles: buildProfileRegistry([SUBSTORE]),
+      getRulesetForUrl: () => stub('gkloot', () => allMatch),
+      fetchSearch: jest.fn(async () => JSON.stringify(allMatch)),
+    };
+
+    const gk = (await assembleLookup(services).lookupByIdentity(IDENTITY)).results.find((r) => r.siteId === 'gkloot')!;
+
+    expect(gk.candidates.map((c) => c.itemId)).toEqual(['17412', '9003']); // nobody removed
+    expect(gk.filtered).toBe(0);
+    expect(Object.prototype.hasOwnProperty.call(gk, 'filtered')).toBe(true); // present, not omitted
   });
 });
