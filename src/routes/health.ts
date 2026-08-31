@@ -9,7 +9,8 @@
  *   - GET /version  → { name, version, status:'ok' }
  *   - GET /health/detailed → the above + browserPool health + a timestamp, and ADDITIVELY
  *     `challengeCooldowns: [{host, remainingMs, reason}]` (the per-host CF cooldowns currently open).
- *     A browser-pool-health failure still degrades to 500 { status:'degraded', error } as before.
+ *     A browser-pool-health failure still degrades to 500, now carrying { status:'degraded',
+ *     challengeCooldowns, error } — the cooldown list survives (listChallengeCooldowns cannot throw).
  */
 import { Router, type Request, type Response } from 'express';
 import type { CooldownView } from '../services/challengeCooldown.js';
@@ -51,6 +52,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
       res.status(500).json({
         ...healthResponse(),
         status: 'degraded',
+        challengeCooldowns: deps.listChallengeCooldowns(),
         error: error instanceof Error ? error.message : 'Unknown error',
       });
     }

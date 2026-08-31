@@ -36,7 +36,7 @@ describe('createHealthRoutes', () => {
 
   it('GET /health/detailed carries browserPool AND challengeCooldowns [{host, remainingMs, reason}]', async () => {
     const app = build({
-      listChallengeCooldowns: () => [{ host: 'anitoysgk.com', remainingMs: 1_740_000, reason: 'search challenge page' }],
+      listChallengeCooldowns: () => [{ host: 'coolhost.example.test', remainingMs: 1_740_000, reason: 'search challenge page' }],
     });
 
     const res = await request(app).get('/health/detailed');
@@ -46,7 +46,7 @@ describe('createHealthRoutes', () => {
     expect(res.body.status).toBe('healthy');
     expect(res.body.browserPool).toEqual({ available: 2, capacity: 3, healthy: true });
     expect(res.body.challengeCooldowns).toEqual([
-      { host: 'anitoysgk.com', remainingMs: 1_740_000, reason: 'search challenge page' },
+      { host: 'coolhost.example.test', remainingMs: 1_740_000, reason: 'search challenge page' },
     ]);
     expect(typeof res.body.timestamp).toBe('string');
   });
@@ -71,5 +71,19 @@ describe('createHealthRoutes', () => {
     expect(res.status).toBe(500);
     expect(res.body.status).toBe('degraded');
     expect(res.body.error).toBe('Unknown error');
+  });
+
+  it('GET /health/detailed keeps challengeCooldowns on the degraded (500) branch (listChallengeCooldowns cannot throw)', async () => {
+    const app = build({
+      getBrowserPoolHealth: async () => { throw new Error('pool down'); },
+      listChallengeCooldowns: () => [{ host: 'coolhost.example.test', remainingMs: 1_740_000, reason: 'search challenge page' }],
+    });
+    const res = await request(app).get('/health/detailed');
+    expect(res.status).toBe(500);
+    expect(res.body.status).toBe('degraded');
+    expect(res.body.error).toBe('pool down');
+    expect(res.body.challengeCooldowns).toEqual([
+      { host: 'coolhost.example.test', remainingMs: 1_740_000, reason: 'search challenge page' },
+    ]);
   });
 });
