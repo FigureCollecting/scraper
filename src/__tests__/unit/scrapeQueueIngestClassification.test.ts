@@ -32,7 +32,7 @@ jest.mock('../../services/webhookClient', () => ({
 import type { ExtractionRuleset, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
 import { ScrapeQueue, resetScrapeQueue } from '../../services/scrapeQueue';
 import { createExtractionRegistry, ExtractionRegistryImpl } from '../../services/extractionRegistry';
-import { resetSessionManager } from '../../services/sessionManager';
+import { getSessionManager, resetSessionManager } from '../../services/sessionManager';
 
 const FIXTURE_HTML = '<html><body><h1 class="title">Kitagawa Marin</h1></body></html>';
 /** The CF managed-challenge title interstitial (what capturingFetch's http lane rejects). */
@@ -176,5 +176,80 @@ describe('ScrapeQueue - ingest failure classification (by class, not message tex
     const reason = mockNotifyItemFailed.mock.calls[0][2] as string;
     expect(reason).toContain('empty_record');
     expect(reason).not.toContain('rate_limited');
+  });
+});
+
+describe('ScrapeQueue - cookie-authenticated empty record lands FAILED, never an auth pause [RS-3]', () => {
+  let queue: ScrapeQueue;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockNotifyItemFailed.mockResolvedValue(true);
+    jest.useFakeTimers({ advanceTimers: true });
+    resetScrapeQueue();
+    resetSessionManager();
+  });
+
+  afterEach(() => {
+    if (queue) { queue.stop(); queue.clear(); }
+    resetScrapeQueue();
+    resetSessionManager();
+    jest.useRealTimers();
+  });
+
+  async function advanceUntil(pred: () => boolean, stepMs = 500, maxSteps = 600): Promise<void> {
+    for (let i = 0; i < maxSteps && !pred(); i++) {
+      jest.advanceTimersByTime(stepMs);
+      await jest.advanceTimersByTimeAsync(50);
+    }
+  }
+
+  it('a permanently-empty record on a COOKIE session exhausts retries → FAILED (not held as auth_failures)', async () => {
+    // An empty record is a store/content failure, not a bad-cookie fault. Booking it as a cookie
+    // failure paused the user's whole sync session (reason 'auth_failures') and left the item held
+    // for user action forever — no webhook, promise pending. It must fall through to FAILED instead.
+    const send = jest.fn().mockResolvedValue(emptyStats());
+    queue = new ScrapeQueue(false);
+    queue.setPluginRegistry(makeRegistry(makeRuleset('12345'), 'myfigurecollection.net'));
+    queue.setIngestEmitter({ send });
+    queue.setScrapingService(makeScrapingStub());
+
+    const result = queue.enqueue('12345', {
+      cookies: { PHPSESSID: 'abc' },
+      sessionId: 'sess-1',
+      userId: 'u1',
+    }); // default maxRetries = 3
+    result.promise.catch(() => {});
+
+    // Trip on EITHER terminal outcome so the wait ends promptly in both the buggy and fixed worlds.
+    await advanceUntil(() => queue.getStats().failed === 1 || getSessionManager().isSessionPaused('sess-1'));
+
+    expect(send).toHaveBeenCalledTimes(3);                              // bounded attempts, no infinite hold
+    expect(queue.getStats().failed).toBe(1);                           // terminal FAILED, not held
+    expect(getSessionManager().isSessionPaused('sess-1')).toBe(false); // the user's session is NOT paused
+    expect(mockNotifyItemFailed).toHaveBeenCalledTimes(1);             // permanent-failure webhook fired
+    const reason = mockNotifyItemFailed.mock.calls[0][2] as string;
+    expect(reason).toContain('empty_record');
+    expect(reason).toContain('mock-mfc:12345');
+    await expect(result.promise).rejects.toThrow(/EMPTY_INGEST_RECORD|Scrape failed/);
+  });
+
+  it('a genuine cookie/auth failure STILL pauses the session (regression pin — empty-record carve-out is narrow)', async () => {
+    // The carve-out must be limited to empty records: a real scrape failure on a cookie session keeps
+    // its existing session-pause behavior.
+    const scraping = makeScrapingStub();
+    scraping.scrapePageStealth.mockRejectedValue(new Error('AUTH: session cookie rejected'));
+    const send = jest.fn();
+    queue = new ScrapeQueue(false);
+    queue.setPluginRegistry(makeRegistry(makeRuleset('999'), 'myfigurecollection.net'));
+    queue.setIngestEmitter({ send });
+    queue.setScrapingService(scraping);
+
+    const result = queue.enqueue('999', { cookies: { PHPSESSID: 'z' }, sessionId: 'sess-auth', userId: 'u2' });
+    result.promise.catch(() => {});
+    await advanceUntil(() => getSessionManager().isSessionPaused('sess-auth') || queue.getStats().failed === 1);
+
+    expect(getSessionManager().isSessionPaused('sess-auth')).toBe(true); // auth failures still pause
+    expect(send).not.toHaveBeenCalled();
   });
 });

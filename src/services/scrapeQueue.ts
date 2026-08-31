@@ -1441,9 +1441,19 @@ export class ScrapeQueue {
     this.consecutiveSuccesses = 0;
 
     // For cookie-authenticated requests, track failures in session manager.
-    // Config-level shortfalls (extraction_unavailable) are not cookie
-    // failures — they skip session pause/cooldown and fail directly below.
-    if (errorType !== 'extraction_unavailable' && item.cookies && item.sessionId && item.waitingUserIds.length > 0) {
+    // Config-level shortfalls (extraction_unavailable) and persisted-nothing ingests (empty_record)
+    // are NOT cookie/auth failures — the cookies are fine, the store just returned nothing (layout
+    // change, deleted item, a CF block slipping past the browser lane). They skip session
+    // pause/cooldown and fall through to the maxRetries/give-up path below, so a permanently-empty
+    // record lands FAILED with a clear reason instead of pausing the user's whole sync session as
+    // 'auth_failures' and holding the item indefinitely (RS-3).
+    if (
+      errorType !== 'extraction_unavailable' &&
+      errorType !== 'empty_record' &&
+      item.cookies &&
+      item.sessionId &&
+      item.waitingUserIds.length > 0
+    ) {
       const pendingCount = this.getPendingCountForSession(item.sessionId);
       const userId = item.waitingUserIds[0]; // Primary user for this session
 
