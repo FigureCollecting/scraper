@@ -241,7 +241,7 @@ describe('ScrapeQueue - cookie-authenticated empty record lands FAILED, never an
     const reason = mockNotifyItemFailed.mock.calls[0][2] as string;
     expect(reason).toContain('empty_record');
     expect(reason).toContain('mock-mfc:12345');
-    await expect(result.promise).rejects.toThrow(/EMPTY_INGEST_RECORD|Scrape failed/);
+    await expect(result.promise).rejects.toThrow(/Scrape failed: empty_record - EMPTY_INGEST_RECORD/);
   });
 
   it('a genuine cookie/auth failure STILL pauses the session (regression pin — empty-record carve-out is narrow)', async () => {

@@ -132,7 +132,7 @@ describe('ScrapeQueue - ingest honesty (persist-or-fail)', () => {
     expect(send).toHaveBeenCalledTimes(1);
     expect(queue.getStats().failed).toBe(1);
     expect(queue.getStats().completed).toBe(0); // NEVER counted a success
-    await expect(result.promise).rejects.toThrow(/EMPTY_INGEST_RECORD|Scrape failed/);
+    await expect(result.promise).rejects.toThrow(/Scrape failed: empty_record - EMPTY_INGEST_RECORD/);
     // permanent-failure webhook fired with a clear, specific reason
     expect(mockNotifyItemFailed).toHaveBeenCalledTimes(1);
     const reason = mockNotifyItemFailed.mock.calls[0][2] as string;
