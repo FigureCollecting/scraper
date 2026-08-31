@@ -3,6 +3,23 @@
  * injected fake impit so it never loads the native binary: verifies the default profile, per-store
  * profile + header/UA merge, and one-instance-per-profile caching.
  */
+// Timeout wiring (G-R2): the seam spy below proves createImpitFetch hands TIMEOUT_MS to *a* factory,
+// but only the REAL defaultMakeImpit forwards it into `new Impit({ timeout })`. tsconfig module=commonjs
+// makes that factory's `await import('impit')` a mockable require, so mocking 'impit' here lets the
+// default factory run without the native binary and pins the forwarded timeout (a hard-coded 15000 is
+// caught). The accumulator is `mock`-prefixed so jest's mock-factory hoisting permits the out-of-scope
+// reference; it stays inert for every existing test (they inject a fake factory and never load impit).
+const mockImpitCtorOpts: Array<Record<string, unknown>> = [];
+jest.mock('impit', () => ({
+  Impit: function MockImpit(
+    this: { fetch: () => Promise<{ text(): Promise<string> }> },
+    opts: Record<string, unknown>,
+  ) {
+    mockImpitCtorOpts.push(opts);
+    this.fetch = async () => ({ text: async () => 'ok' });
+  },
+}));
+
 import { createImpitFetch, resolveImpitTimeoutMs, type ImpitLike, type CookieJarLike } from '../../services/impitFetch';
 
 describe('createImpitFetch', () => {
@@ -65,6 +82,50 @@ describe('createImpitFetch', () => {
 
     expect(seenTimeout).toBe(30000);                              // module-load default (no IMPIT_TIMEOUT_MS in env)
     expect(seenTimeout).toBe(resolveImpitTimeoutMs(process.env)); // …and it is exactly the resolver's value
+  });
+});
+
+/**
+ * Timeout wiring end-to-end: IMPIT_TIMEOUT_MS is resolved ONCE at module load and must thread all the
+ * way into `new Impit({ timeout })`. The seam-only construction test above cannot see either end, so
+ * two mutants survive it: (G-R2) the real defaultMakeImpit hard-coding `timeout: 15000`, and (G-R1) the
+ * module-load read ignoring process.env. Each test isolates a fresh module load (TIMEOUT_MS is cached at
+ * first load, so an env override is only visible to an isolated re-require) to kill one of them.
+ */
+describe('createImpitFetch — timeout wiring (IMPIT_TIMEOUT_MS → module load → Impit constructor)', () => {
+  const MODULE_PATH = '../../services/impitFetch';
+  const ORIGINAL = process.env.IMPIT_TIMEOUT_MS;
+  beforeEach(() => { mockImpitCtorOpts.length = 0; });
+  afterEach(() => {
+    if (ORIGINAL === undefined) delete process.env.IMPIT_TIMEOUT_MS;
+    else process.env.IMPIT_TIMEOUT_MS = ORIGINAL;
+  });
+
+  it('the REAL default factory forwards the resolved timeout into new Impit({ timeout }) (default 30000 ms, not a hard-coded 15000)', async () => {
+    // Drive defaultMakeImpit for real (not the injectable seam) with 'impit' mocked out, on an isolated
+    // load with no override, and assert the resolved default is forwarded into the native constructor.
+    delete process.env.IMPIT_TIMEOUT_MS;
+    let mod!: { createImpitFetch: typeof createImpitFetch };
+    jest.isolateModules(() => { mod = require(MODULE_PATH); });
+    await mod.createImpitFetch()('https://x.test/s'); // DEFAULT factory → defaultMakeImpit → mocked Impit
+    expect(mockImpitCtorOpts).toHaveLength(1);
+    expect(mockImpitCtorOpts[0]).toMatchObject({ followRedirects: true });
+    expect(mockImpitCtorOpts[0].timeout).toBe(30000);
+  });
+
+  it('threads an IMPIT_TIMEOUT_MS override through an isolated module load into the factory (env is actually read at L34)', async () => {
+    // Set the env, re-require in isolation so a fresh TIMEOUT_MS is resolved from it, and assert the
+    // value reaches the factory seam — an env-ignoring resolveImpitTimeoutMs({}) yields 30000 and fails.
+    process.env.IMPIT_TIMEOUT_MS = '45000';
+    let seenTimeout: number | undefined;
+    const spy = (_browser: string, _jar: CookieJarLike, timeoutMs: number): ImpitLike => {
+      seenTimeout = timeoutMs;
+      return { fetch: async () => ({ text: async () => 'ok' }) };
+    };
+    let mod!: { createImpitFetch: typeof createImpitFetch };
+    jest.isolateModules(() => { mod = require(MODULE_PATH); });
+    await mod.createImpitFetch(spy)('https://x.test/s');
+    expect(seenTimeout).toBe(45000);
   });
 });
 
