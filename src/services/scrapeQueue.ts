@@ -1056,11 +1056,15 @@ export class ScrapeQueue {
 
     // Acquire item lock - set BEFORE any async operations
     this.processingItem = item;
+    // Remember the last REAL request time: a challenge_cooldown fast-fail (below) never touches the
+    // network, so it must not consume this global pacing slot — we restore this value in that case.
+    const prevLastRequestTime = this.lastRequestTime;
     this.lastRequestTime = now;
 
     const poolAvailable = BrowserPool.getPoolSize();
     console.log(`[SCRAPE QUEUE] Processing ${item.mfcId} (${item.priority}, attempt ${item.retryCount + 1}/${item.maxRetries + 1}, delay=${this.currentDelay}ms, pool=${poolAvailable}/${BrowserPool.getPoolCapacity()})`);
 
+    let fastFailedOnCooldown = false;
     try {
       // Extraction is plugin-only: an ingest emitter must be configured AND
       // a plugin ruleset must match the item's URL. Anything else is a
@@ -1079,13 +1083,23 @@ export class ScrapeQueue {
 
     } catch (error: any) {
       // Handle failure
+      fastFailedOnCooldown = error instanceof ChallengeCooldownError;
       this.handleFailure(item, error);
     }
 
     this.processingItem = null;
 
-    // Schedule next item (unless cooldown timer already handling retry)
-    if (!this.cooldownWaitTimerId) {
+    if (fastFailedOnCooldown) {
+      // A challenge_cooldown fast-fail made NO network request, so it must not burn a global pacing
+      // slot: restore the pre-dispatch lastRequestTime and re-drive immediately. Otherwise N cooling
+      // items ahead of a healthy host's item would delay it by N×currentDelay for no-op failures
+      // (the cooling host's own siblings stay held off by the per-host floor, not the global lane).
+      this.lastRequestTime = prevLastRequestTime;
+      if (!this.cooldownWaitTimerId) {
+        setTimeout(() => this.processNext(), 0);
+      }
+    } else if (!this.cooldownWaitTimerId) {
+      // Schedule next item (unless cooldown timer already handling retry)
       setTimeout(() => this.processNext(), this.currentDelay);
     }
   }
@@ -1165,9 +1179,12 @@ export class ScrapeQueue {
       throw new ChallengeCooldownError(host, cooldown.remaining(host));
     }
     const page = await this.getCapturingFetch()(item.url, searchFetch, { cookies: item.cookies });
-    // A clean (non-challenge) body from this host proves it is serving real pages again — clear any
-    // lingering (expired) cooldown entry so /health/detailed stops listing it and logs the recovery.
-    if (host !== undefined && !page.challenge) cooldown.clear(host);
+    // A clean (non-challenge) body proves this host serves real pages again — clear a lingering,
+    // now-EXPIRED cooldown entry so /health/detailed stops listing it and the recovery is logged.
+    // Guard on !isOpen: a still-LIVE window (one the search fan-out opened on this host WHILE this
+    // fetch was in flight — the fetch passed isOpen before that open) must SURVIVE, or clearing it
+    // here would drop the protection and let the next item fetch the cooling host (F4 race).
+    if (host !== undefined && !page.challenge && !cooldown.isOpen(host)) cooldown.clear(host);
     // Anchor for the courtesy gap (D8): the instant the PRIMARY fetch completed, so a same-store
     // `ctx.scraping.fetchBody` follow-up (extractMany's second call) waits the store's declared
     // gap against THIS fetch, not against whenever the follow-up happens to be invoked.
@@ -1515,8 +1532,13 @@ export class ScrapeQueue {
       }
     }
 
-    // Reset success streak on any failure
-    this.consecutiveSuccesses = 0;
+    // Reset the success streak on any REAL failure. A challenge_cooldown fast-fail never touched the
+    // network (the host was cooling, so nothing was fetched), so it is NEUTRAL to the adaptive lane:
+    // resetting the streak on it would let a trickle of same-host cooling items block the recovery a
+    // real challenge escalated, holding the ×1.4 backoff + rateLimited flag open for the whole window.
+    if (errorType !== 'challenge_cooldown') {
+      this.consecutiveSuccesses = 0;
+    }
 
     // For cookie-authenticated requests, track failures in session manager.
     // Config-level shortfalls (extraction_unavailable) and persisted-nothing ingests (empty_record)
