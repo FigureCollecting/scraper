@@ -33,6 +33,7 @@ import type { ExtractionRuleset, StoreCapabilities } from '@figurecollecting/scr
 import { ScrapeQueue, resetScrapeQueue } from '../../services/scrapeQueue';
 import { createExtractionRegistry, ExtractionRegistryImpl } from '../../services/extractionRegistry';
 import { getSessionManager, resetSessionManager } from '../../services/sessionManager';
+import { resetChallengeCooldown } from '../../services/challengeCooldown';
 
 const FIXTURE_HTML = '<html><body><h1 class="title">Kitagawa Marin</h1></body></html>';
 /** The CF managed-challenge title interstitial (what capturingFetch's http lane rejects). */
@@ -109,6 +110,7 @@ describe('ScrapeQueue - ingest failure classification (by class, not message tex
     jest.useFakeTimers({ advanceTimers: true });
     resetScrapeQueue();
     resetSessionManager();
+    resetChallengeCooldown(); // a raised ChallengePageError now opens the shared cooldown — isolate it per test
   });
 
   afterEach(() => {
@@ -162,8 +164,8 @@ describe('ScrapeQueue - ingest failure classification (by class, not message tex
     result.promise.catch(() => {});
     await advanceUntil(() => queue.getStats().failed === 1);
 
-    expect(http).toHaveBeenCalledTimes(3);           // rate_limited is retryable → bounded 3 attempts
-    expect(send).toHaveBeenCalledTimes(3);           // reached the emitter each attempt (flag, not fetch-throw)
+    expect(http).toHaveBeenCalledTimes(1);           // fail-fast: ONE attempt (no retry storm), class still rate_limited
+    expect(send).toHaveBeenCalledTimes(1);           // reached the emitter once (flag, not fetch-throw)
     expect(queue.getStats().rateLimited).toBe(true); // CF block escalated backoff, not booked as 404
     const reason = mockNotifyItemFailed.mock.calls[0][2] as string;
     expect(reason).toContain('rate_limited');
@@ -198,6 +200,7 @@ describe('ScrapeQueue - cookie-authenticated empty record lands FAILED, never an
     jest.useFakeTimers({ advanceTimers: true });
     resetScrapeQueue();
     resetSessionManager();
+    resetChallengeCooldown(); // a raised ChallengePageError now opens the shared cooldown — isolate it per test
   });
 
   afterEach(() => {
@@ -288,7 +291,7 @@ describe('ScrapeQueue - cookie-authenticated empty record lands FAILED, never an
 
     expect(getSessionManager().isSessionPaused('sess-cf')).toBe(false); // challenge is a transport fault, session NOT paused
     expect(queue.getStats().failed).toBe(1);                            // terminal FAILED, not held for user action
-    expect(http).toHaveBeenCalledTimes(3);                             // bounded rate_limited retries, no infinite hold
+    expect(http).toHaveBeenCalledTimes(1);                             // fail-fast: ONE attempt, no infinite hold
     expect(queue.getStats().rateLimited).toBe(true);                   // class-based rate_limited/backoff preserved
     expect(mockNotifyItemFailed).toHaveBeenCalledTimes(1);            // permanent-failure webhook fired
     const reason = mockNotifyItemFailed.mock.calls[0][2] as string;
@@ -327,6 +330,7 @@ describe('ScrapeQueue - challenge page: flag → honesty gate (recover vs fail) 
     jest.useFakeTimers({ advanceTimers: true });
     resetScrapeQueue();
     resetSessionManager();
+    resetChallengeCooldown(); // a raised ChallengePageError now opens the shared cooldown — isolate it per test
   });
 
   afterEach(() => {
@@ -389,7 +393,7 @@ describe('ScrapeQueue - challenge page: flag → honesty gate (recover vs fail) 
     const captured = result.promise.catch((e: Error) => e);
     await advanceUntil(() => queue.getStats().failed === 1);
 
-    expect(http).toHaveBeenCalledTimes(3);            // bounded rate_limited retries
+    expect(http).toHaveBeenCalledTimes(1);            // fail-fast: ONE attempt (no retry storm)
     expect(queue.getStats().rateLimited).toBe(true);  // CF block escalated backoff (not empty_record)
     const reason = mockNotifyItemFailed.mock.calls[0][2] as string;
     expect(reason).toContain('rate_limited');

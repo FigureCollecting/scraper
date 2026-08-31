@@ -26,6 +26,7 @@ import { notifyItemFailed } from './webhookClient.js';
 import { enrichmentLogger } from '../utils/logger.js';
 import { createScrapingService } from './engineServices/scrapingService.js';
 import { createCapturingFetch, ChallengePageError, type CapturingFetch, type CapturingFetchTransports } from './engineServices/capturingFetch.js';
+import { getChallengeCooldown, ChallengeCooldownError, type ChallengeCooldown } from './challengeCooldown.js';
 import { getRawCaptureSink } from './s3ObjectStore.js';
 import { createIngestEmitterFromEnv } from './ingestEmitter.js';
 import { impitFetchBody } from './impitFetch.js';
@@ -51,7 +52,7 @@ import type {
 
 export type QueuePriority = 'HOT' | 'WARM' | 'COLD';
 export type ItemStatus = 'owned' | 'ordered' | 'wished';
-export type ErrorType = 'timeout' | 'not_found' | 'rate_limited' | 'auth_required' | 'network' | 'extraction_unavailable' | 'empty_record' | 'unknown';
+export type ErrorType = 'timeout' | 'not_found' | 'rate_limited' | 'auth_required' | 'network' | 'extraction_unavailable' | 'empty_record' | 'challenge_cooldown' | 'unknown';
 
 export interface QueueItem {
   /** Unique identifier for this queue entry */
@@ -275,6 +276,11 @@ function classifyError(error: Error | string): ErrorType {
   if (error instanceof ChallengePageError) {
     return 'rate_limited';
   }
+  // A ChallengeCooldownError is a FAST FAIL raised before any fetch because the host is cooling — its
+  // own class, so it is never retried and never mistaken for a cookie/auth or empty-record fault.
+  if (error instanceof ChallengeCooldownError) {
+    return 'challenge_cooldown';
+  }
   if (error instanceof EmptyIngestRecordError) {
     return 'empty_record';
   }
@@ -311,7 +317,7 @@ function classifyError(error: Error | string): ErrorType {
   return 'unknown';
 }
 
-function shouldRetry(errorType: ErrorType, retryCount: number, maxRetries: number): boolean {
+function shouldRetry(error: Error | string, errorType: ErrorType, retryCount: number, maxRetries: number): boolean {
   // Never retry auth errors without new cookies
   if (errorType === 'auth_required') {
     return false;
@@ -320,6 +326,19 @@ function shouldRetry(errorType: ErrorType, retryCount: number, maxRetries: numbe
   // Never retry config-level shortfalls — a missing emitter or ruleset will
   // not appear between attempts
   if (errorType === 'extraction_unavailable') {
+    return false;
+  }
+
+  // Never retry a fast-fail against a cooling host — the host is deliberately being left alone; a
+  // retry would just re-check the same closed window.
+  if (errorType === 'challenge_cooldown') {
+    return false;
+  }
+
+  // A ChallengePageError is ONE SHOT: retrying it re-fetches another challenge page and degrades the
+  // egress IP's CF reputation (the live anitoysgk 3×-in-10s storm). One attempt, then FAILED — even
+  // though its class stays rate_limited so the global backoff/CF-block accounting still fires once.
+  if (error instanceof ChallengePageError) {
     return false;
   }
 
@@ -407,6 +426,10 @@ export class ScrapeQueue {
   // shared engine sink — the same one the browser lane's navigateAndCapture writes to.
   private captureSink: CaptureSink | null = null;
 
+  // Per-host Cloudflare-challenge cooldown register. Defaults to the process-wide singleton (shared
+  // with the lookup fan-out and /health/detailed); a test may inject a clock-controlled instance.
+  private challengeCooldownStore: ChallengeCooldown | null = null;
+
   constructor(testMode?: boolean) {
     // Auto-detect test environment if not explicitly set
     this.testMode = testMode ?? (
@@ -474,6 +497,19 @@ export class ScrapeQueue {
    */
   setCaptureSink(sink: CaptureSink | null): void {
     this.captureSink = sink;
+  }
+
+  /**
+   * Override the per-host challenge-cooldown register (tests / DI). Defaults to the process-wide
+   * singleton so the queue, the lookup fan-out, and /health/detailed all share one register.
+   */
+  setChallengeCooldown(cooldown: ChallengeCooldown | null): void {
+    this.challengeCooldownStore = cooldown;
+  }
+
+  /** The active challenge-cooldown register — the injected instance, else the shared singleton. */
+  private getChallengeCooldownStore(): ChallengeCooldown {
+    return this.challengeCooldownStore ?? getChallengeCooldown();
   }
 
   /**
@@ -1116,7 +1152,22 @@ export class ScrapeQueue {
    */
   private async processViaIngest(item: QueueItem, ruleset: ExtractionRuleset): Promise<ScrapedData> {
     const searchFetch = this.getSearchFetchFor(item.url);
+    const host = this.hostOf(item.url);
+    // CHALLENGE COOLDOWN (fast fail, before any fetch): if this host is cooling from a recent CF
+    // challenge, do NOT fetch it — every challenge fetch degrades the egress IP's CF reputation.
+    // Fail the item immediately with a typed ChallengeCooldownError (→ challenge_cooldown: not
+    // retried, never the cookie-session-pause path). Expiry: once `until` passes, isOpen is false and
+    // the fetch below proceeds normally.
+    const cooldown = this.getChallengeCooldownStore();
+    if (host !== undefined && cooldown.isOpen(host)) {
+      const minsLeft = Math.max(1, Math.ceil(cooldown.remaining(host) / 60_000));
+      console.warn(`[COOLDOWN] skipped ${sanitizeForLog(item.url)} (${host} cooling, ${minsLeft} min left)`);
+      throw new ChallengeCooldownError(host, cooldown.remaining(host));
+    }
     const page = await this.getCapturingFetch()(item.url, searchFetch, { cookies: item.cookies });
+    // A clean (non-challenge) body from this host proves it is serving real pages again — clear any
+    // lingering (expired) cooldown entry so /health/detailed stops listing it and logs the recovery.
+    if (host !== undefined && !page.challenge) cooldown.clear(host);
     // Anchor for the courtesy gap (D8): the instant the PRIMARY fetch completed, so a same-store
     // `ctx.scraping.fetchBody` follow-up (extractMany's second call) waits the store's declared
     // gap against THIS fetch, not against whenever the follow-up happens to be invoked.
@@ -1172,6 +1223,9 @@ export class ScrapeQueue {
           // branch's class-based classification owns it. A plain persisted-nothing page is an empty
           // record. The transport is trusted for the flag; the gate is trusted for persist-or-fail.
           if (page.challenge) {
+            // Genuine challenge that persisted nothing: OPEN the host's cooldown so the next item for
+            // it (and the lookup fan-out's search of it) is left alone until the window expires.
+            if (host !== undefined) cooldown.open(host, `challenge page via ${page.transport ?? 'unknown'} transport`);
             throw new ChallengePageError(item.url, page.transport ?? 'unknown', stats.warnings ?? []);
           }
           throw new EmptyIngestRecordError(record.source.site, record.source.itemId, stats.warnings ?? []);
@@ -1479,6 +1533,7 @@ export class ScrapeQueue {
     if (
       errorType !== 'extraction_unavailable' &&
       errorType !== 'empty_record' &&
+      errorType !== 'challenge_cooldown' &&
       !(error instanceof ChallengePageError) &&
       item.cookies &&
       item.sessionId &&
@@ -1512,7 +1567,7 @@ export class ScrapeQueue {
     }
 
     // Standard retry logic for non-cookie requests or if session manager says don't retry
-    if (shouldRetry(errorType, item.retryCount, item.maxRetries)) {
+    if (shouldRetry(error, errorType, item.retryCount, item.maxRetries)) {
       // Re-queue for retry
       this.addToQueue(item);
       enrichmentLogger.retry(item.mfcId, item.retryCount, item.maxRetries, item.sessionId);
