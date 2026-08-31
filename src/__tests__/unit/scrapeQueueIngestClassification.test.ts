@@ -319,8 +319,10 @@ describe('ScrapeQueue - challenge page: flag → honesty gate (recover vs fail) 
     logSpy.mockRestore();
   });
 
-  it('a challenge-flagged page that persisted NOTHING → FAILS as ChallengePageError (rate_limited), never EmptyIngestRecordError', async () => {
-    const send = jest.fn().mockResolvedValue(emptyStats());
+  it('a challenge-flagged page that persisted NOTHING → FAILS as ChallengePageError (rate_limited, server warnings in message), never EmptyIngestRecordError', async () => {
+    // Empty stats WITH a server warning: the ChallengePageError must name the lane AND carry the
+    // server warnings (CHANGE 2), so an operator sees why the spine stored nothing behind the block.
+    const send = jest.fn().mockResolvedValue(emptyStats(['anchor identifier unstorable; claims unbound']));
     const http = jest.fn().mockResolvedValue(CHALLENGE_HTML);
     queue = new ScrapeQueue(false);
     queue.setPluginRegistry(makeRegistry(makeRuleset('12345'), 'fnc.example.test', { transport: 'http' }));
@@ -339,6 +341,7 @@ describe('ScrapeQueue - challenge page: flag → honesty gate (recover vs fail) 
     expect(reason).toContain('rate_limited');
     expect(reason).toContain('Cloudflare challenge page received');
     expect(reason).toContain('via http transport');
+    expect(reason).toContain('anchor identifier unstorable'); // server warnings threaded into the message
     expect(reason).not.toContain('EMPTY_INGEST_RECORD');
     const err = (await captured) as Error;
     expect(err.message).toContain('Cloudflare challenge page received');
