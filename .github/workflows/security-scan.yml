@@ -2,7 +2,7 @@ name: Security Vulnerability Scan
 
 on:
   push:
-    branches: [develop, main]
+    branches: ['**', '!dependabot/**']  # every branch except Dependabot's; the job-level gate below decides what runs
   pull_request:
     branches: [develop, main]
   schedule:
@@ -10,11 +10,37 @@ on:
     - cron: '0 2 * * *'
   workflow_dispatch:
 
+# ---------------------------------------------------------------------------
+# CI policy: "fork shift-left" (see README, "CI on forks (shift-left)").
+# Developers work on forks and open PRs to FigureCollecting/*. Every push
+# event is gated per entry job by ONE expression (pull_request, schedule and
+# workflow_dispatch behave exactly as before). The four push cases:
+#   owner == FigureCollecting, ref develop|main -> RUN  (upstream integration branches, unchanged)
+#   owner == FigureCollecting, any other ref    -> SKIP (upstream feature branches get CI via their PR)
+#   owner != FigureCollecting, ref develop|main -> SKIP (fork develop/main are mirrors of upstream: run nothing)
+#   owner != FigureCollecting, any other ref    -> RUN  (shift-left: CI on fork feature branches)
+# Jobs that `needs:` a gated entry job skip cleanly (never fail) when it skips.
+# Dependabot branches (dependabot/**) are excluded from the push trigger: they
+# live on upstream and get their CI from the pull_request run; a push twin would
+# only add a same-named `skipped` check run beside the real one.
+# Note: expression `==` is case-insensitive (GitHub has no case-sensitive
+# compare), so a branch named e.g. `Develop` counts as a mirror; nothing here
+# publishes, so at worst a CI run is skipped or runs on an oddly named branch.
+# Install/build steps authenticate with secrets.NODE_AUTH_TOKEN (fork-held PAT,
+# read:packages only) and fall back to GITHUB_TOKEN on the org; publishing
+# (GHCR push, npm publish, releases) is org-only.
+# ---------------------------------------------------------------------------
+
 jobs:
   # Scan dependencies for vulnerabilities
   dependency-scan:
     name: Dependency Vulnerability Scan
     runs-on: ubuntu-latest
+    # Push gate: the single CI-policy expression (four cases documented above).
+    if: >-
+      github.event_name != 'push'
+      || (github.repository_owner == 'FigureCollecting' && (github.ref_name == 'develop' || github.ref_name == 'main'))
+      || (github.repository_owner != 'FigureCollecting' && github.ref_name != 'develop' && github.ref_name != 'main')
     permissions:
       contents: read
       security-events: write
@@ -54,6 +80,11 @@ jobs:
   container-scan:
     name: Container Image Scan
     runs-on: ubuntu-latest
+    # Push gate: the single CI-policy expression (four cases documented above).
+    if: >-
+      github.event_name != 'push'
+      || (github.repository_owner == 'FigureCollecting' && (github.ref_name == 'develop' || github.ref_name == 'main'))
+      || (github.repository_owner != 'FigureCollecting' && github.ref_name != 'develop' && github.ref_name != 'main')
     permissions:
       contents: read
       security-events: write
@@ -74,7 +105,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           secrets: |
-            node_auth_token=${{ secrets.GITHUB_TOKEN }}
+            node_auth_token=${{ secrets.NODE_AUTH_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Run Trivy container scan
         uses: aquasecurity/trivy-action@master
@@ -96,6 +127,11 @@ jobs:
   npm-audit:
     name: NPM Audit
     runs-on: ubuntu-latest
+    # Push gate: the single CI-policy expression (four cases documented above).
+    if: >-
+      github.event_name != 'push'
+      || (github.repository_owner == 'FigureCollecting' && (github.ref_name == 'develop' || github.ref_name == 'main'))
+      || (github.repository_owner != 'FigureCollecting' && github.ref_name != 'develop' && github.ref_name != 'main')
     permissions:
       contents: read
       packages: read
@@ -112,7 +148,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Run npm audit
         run: |
