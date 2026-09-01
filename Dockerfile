@@ -196,6 +196,9 @@ USER pptruser
 # Expose port
 EXPOSE 3050
 
+# Default PORT aligned with EXPOSE and the HEALTHCHECK below (deploys may still override)
+ENV PORT=3050
+
 # Health check with 30s start period for Puppeteer initialization
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD node -e "require('http').get('http://localhost:3050/health', (res) => process.exit(res.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"
