@@ -3,7 +3,7 @@ name: Build, Scan, and Push Docker Image
 on:
   # Automatic triggers
   push:
-    branches: ['**']  # every branch; the job-level gate below decides what runs
+    branches: [develop, main]  # exact-ref filter: on push this workflow publishes, so only integration branches (see policy block)
   pull_request:
     branches: [develop, main]
     types: [opened, synchronize, reopened]
@@ -26,27 +26,31 @@ env:
 
 # ---------------------------------------------------------------------------
 # CI policy: "fork shift-left" (see README, "CI on forks (shift-left)").
-# Developers work on forks and open PRs to FigureCollecting/*. Every push
-# event is gated per entry job by ONE expression (pull_request, schedule and
-# workflow_dispatch behave exactly as before). The four push cases:
-#   owner == FigureCollecting, ref develop|main -> RUN  (upstream integration branches, unchanged)
-#   owner == FigureCollecting, any other ref    -> SKIP (upstream feature branches get CI via their PR)
-#   owner != FigureCollecting, ref develop|main -> SKIP (fork develop/main are mirrors of upstream: run nothing)
-#   owner != FigureCollecting, any other ref    -> RUN  (shift-left: CI on fork feature branches)
-# Jobs that `needs:` a gated entry job skip cleanly (never fail) when it skips.
+# This workflow publishes, so on push events it runs ONLY on the org's
+# integration branches. Fork feature branches get their production-image build
+# and container scan from security-scan.yml (container-scan), not from here, so
+# nothing is built twice and nothing is built that no job consumes. Push cases:
+#   owner == FigureCollecting, ref develop|main -> RUN  (build, push to GHCR, SBOM/attest scan: unchanged)
+#   owner == FigureCollecting, any other ref    -> not triggered (branches: filter above, as before)
+#   owner != FigureCollecting, ref develop|main -> SKIP (fork develop/main are mirrors of upstream: no job runs)
+#   owner != FigureCollecting, any other ref    -> not triggered (branches: filter above)
+# pull_request and workflow_dispatch behave exactly as before; off the org they
+# build with push=false and never log in to GHCR. Keep the exact-ref filter:
+# expression `==` is case-insensitive (a branch named `Main` satisfies the
+# gate), so the filter is what keeps such a branch from publishing on push.
+# Jobs that `needs:` the gated entry job skip cleanly (never fail) when it skips.
 # Install/build steps authenticate with secrets.NODE_AUTH_TOKEN (fork-held PAT,
-# read:packages only) and fall back to GITHUB_TOKEN on the org; publishing
-# (GHCR push, npm publish, releases) is org-only.
+# read:packages only) and fall back to GITHUB_TOKEN on the org; the GHCR login
+# and push keep secrets.GITHUB_TOKEN and are org-only.
 # ---------------------------------------------------------------------------
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
-    # Push gate: the single CI-policy expression (four cases documented above).
+    # Push gate: org integration branches only (cases documented above).
     if: >-
       github.event_name != 'push'
       || (github.repository_owner == 'FigureCollecting' && (github.ref_name == 'develop' || github.ref_name == 'main'))
-      || (github.repository_owner != 'FigureCollecting' && github.ref_name != 'develop' && github.ref_name != 'main')
     permissions:
       contents: read
       packages: write
