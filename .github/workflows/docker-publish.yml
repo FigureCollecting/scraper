@@ -3,7 +3,7 @@ name: Build, Scan, and Push Docker Image
 on:
   # Automatic triggers
   push:
-    branches: [develop, main]
+    branches: ['**']  # every branch; the job-level gate below decides what runs
   pull_request:
     branches: [develop, main]
     types: [opened, synchronize, reopened]
@@ -24,9 +24,29 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
+# ---------------------------------------------------------------------------
+# CI policy: "fork shift-left" (see README, "CI on forks (shift-left)").
+# Developers work on forks and open PRs to FigureCollecting/*. Every push
+# event is gated per entry job by ONE expression (pull_request, schedule and
+# workflow_dispatch behave exactly as before). The four push cases:
+#   owner == FigureCollecting, ref develop|main -> RUN  (upstream integration branches, unchanged)
+#   owner == FigureCollecting, any other ref    -> SKIP (upstream feature branches get CI via their PR)
+#   owner != FigureCollecting, ref develop|main -> SKIP (fork develop/main are mirrors of upstream: run nothing)
+#   owner != FigureCollecting, any other ref    -> RUN  (shift-left: CI on fork feature branches)
+# Jobs that `needs:` a gated entry job skip cleanly (never fail) when it skips.
+# Install/build steps authenticate with secrets.NODE_AUTH_TOKEN (fork-held PAT,
+# read:packages only) and fall back to GITHUB_TOKEN on the org; publishing
+# (GHCR push, npm publish, releases) is org-only.
+# ---------------------------------------------------------------------------
+
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    # Push gate: the single CI-policy expression (four cases documented above).
+    if: >-
+      github.event_name != 'push'
+      || (github.repository_owner == 'FigureCollecting' && (github.ref_name == 'develop' || github.ref_name == 'main'))
+      || (github.repository_owner != 'FigureCollecting' && github.ref_name != 'develop' && github.ref_name != 'main')
     permissions:
       contents: read
       packages: write
@@ -51,6 +71,7 @@ jobs:
           echo "Service version: $SERVICE_VERSION"
 
       - name: Log in to GitHub Container Registry
+        if: github.repository_owner == 'FigureCollecting'  # org-only: forks never push to GHCR
         uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
@@ -84,13 +105,13 @@ jobs:
         with:
           context: .
           target: production
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ github.event_name != 'pull_request' && github.repository_owner == 'FigureCollecting' }}  # org-only push; forks only build
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           secrets: |
-            node_auth_token=${{ secrets.GITHUB_TOKEN }}
+            node_auth_token=${{ secrets.NODE_AUTH_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Debug - Show generated tags
         run: |
@@ -107,7 +128,7 @@ jobs:
           echo "  Is Main Branch: ${{ github.ref == 'refs/heads/main' }}"
 
       - name: Verify image pushed successfully
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && github.repository_owner == 'FigureCollecting'
         run: |
           echo "⏳ Waiting for registry propagation..."
           sleep 15
@@ -141,7 +162,8 @@ jobs:
   # Call the reusable security scanning workflow (only on non-PR events when image is pushed)
   security-scan:
     needs: build-and-push
-    if: github.event_name != 'pull_request'
+    # org-only: the image is only pushed (and therefore scannable/attestable) from the org
+    if: github.event_name != 'pull_request' && github.repository_owner == 'FigureCollecting'
     uses: ./.github/workflows/sbom-security-scan.yml
     with:
       image-tags: ${{ needs.build-and-push.outputs.tags }}
@@ -181,7 +203,7 @@ jobs:
           # No cache-from to ensure fresh build with latest package-lock.json
           no-cache: true
           secrets: |
-            node_auth_token=${{ secrets.GITHUB_TOKEN }}
+            node_auth_token=${{ secrets.NODE_AUTH_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Install security tools
         run: |
