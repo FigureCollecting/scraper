@@ -2,7 +2,7 @@ name: Security Vulnerability Scan
 
 on:
   push:
-    branches: ['**']  # every branch; the job-level gate below decides what runs
+    branches: ['**', '!dependabot/**']  # every branch except Dependabot's; the job-level gate below decides what runs
   pull_request:
     branches: [develop, main]
   schedule:
@@ -20,6 +20,9 @@ on:
 #   owner != FigureCollecting, ref develop|main -> SKIP (fork develop/main are mirrors of upstream: run nothing)
 #   owner != FigureCollecting, any other ref    -> RUN  (shift-left: CI on fork feature branches)
 # Jobs that `needs:` a gated entry job skip cleanly (never fail) when it skips.
+# Dependabot branches (dependabot/**) are excluded from the push trigger: they
+# live on upstream and get their CI from the pull_request run; a push twin would
+# only add a same-named `skipped` check run beside the real one.
 # Install/build steps authenticate with secrets.NODE_AUTH_TOKEN (fork-held PAT,
 # read:packages only) and fall back to GITHUB_TOKEN on the org; publishing
 # (GHCR push, npm publish, releases) is org-only.
