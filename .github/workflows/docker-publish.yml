@@ -37,7 +37,8 @@ env:
 # pull_request and workflow_dispatch behave exactly as before; off the org they
 # build with push=false and never log in to GHCR. Keep the exact-ref filter:
 # expression `==` is case-insensitive (a branch named `Main` satisfies the
-# gate), so the filter is what keeps such a branch from publishing on push.
+# gate), so the filter, not the gate, limits push-triggered publishing to
+# develop/main, exactly as before this policy.
 # Jobs that `needs:` the gated entry job skip cleanly (never fail) when it skips.
 # Install/build steps authenticate with secrets.NODE_AUTH_TOKEN (fork-held PAT,
 # read:packages only) and fall back to GITHUB_TOKEN on the org; the GHCR login

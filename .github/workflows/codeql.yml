@@ -22,6 +22,9 @@ on:
 # Dependabot branches (dependabot/**) are excluded from the push trigger: they
 # live on upstream and get their CI from the pull_request run; a push twin would
 # only add a same-named `skipped` check run beside the real one.
+# Note: expression `==` is case-insensitive (GitHub has no case-sensitive
+# compare), so a branch named e.g. `Develop` counts as a mirror; nothing here
+# publishes, so at worst a CI run is skipped or runs on an oddly named branch.
 # Install/build steps authenticate with secrets.NODE_AUTH_TOKEN (fork-held PAT,
 # read:packages only) and fall back to GITHUB_TOKEN on the org; publishing
 # (GHCR push, npm publish, releases) is org-only.
