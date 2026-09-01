@@ -1,10 +1,10 @@
 # =============================================================================
-# BASE STAGE - Secure Ubuntu 26.04 + Node 24.18.1 LTS + Chrome 151.0.7922.77
+# BASE STAGE - Secure Ubuntu 26.04 + Node 24.20.0 LTS + Chrome 152.0.7977.54
 # =============================================================================
 FROM ubuntu:26.04 AS base
 
 # Cache-bust ARG to invalidate Docker layers when dependencies change
-ARG CACHE_BUST=2026-08-08-node-24.18.1-chrome-151.0.7922.77-cve-fix
+ARG CACHE_BUST=2026-09-01-node-24.20.0-chrome-152.0.7977.54-estate
 
 # Update all packages for latest security patches (openssl, gnupg, glibc)
 # Install Node.js 24 using official binaries (avoids NodeSource CVE false positives)
@@ -12,14 +12,14 @@ RUN apt-get update && apt-get upgrade -y \
     && apt-get install -y \
     curl \
     xz-utils \
-    && NODE_VERSION=v24.18.1 \
+    && NODE_VERSION=v24.20.0 \
     && curl -fsSLO https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-linux-x64.tar.xz \
     && tar -xJf node-${NODE_VERSION}-linux-x64.tar.xz -C /usr/local --strip-components=1 \
     && rm node-${NODE_VERSION}-linux-x64.tar.xz \
     && rm -rf /var/lib/apt/lists/*
 
-# Upgrade npm to latest to fix bundled dependency vulnerabilities (tar, brace-expansion)
-RUN npm install -g npm@latest && npm cache clean --force
+# Pin npm to the 11.x line (estate precedent: fixes bundled tar/brace-expansion CVEs without jumping to npm 12)
+RUN npm install -g npm@11 && npm cache clean --force
 
 WORKDIR /app
 
@@ -63,10 +63,10 @@ RUN apt-get update && apt-get upgrade -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# Download and install Chrome for Testing (151.0.7922.77) - current Stable channel; clears the CVE-2026-176xx batch (13 Critical + 12 High).
-# Verified: puppeteer 25.3.0 drives 151 with no CDP skew and stealth-evasion is unchanged vs 150 (A/B tested).
+# Download and install Chrome for Testing (152.0.7977.54) - the exact build puppeteer 25.9.0 pins in PUPPETEER_REVISIONS.
+# Verified: puppeteer 25.9.0 drives 152 with identical fixture extraction vs 151 (A/B tested).
 RUN apt-get update && apt-get install -y wget unzip \
-    && wget -q https://storage.googleapis.com/chrome-for-testing-public/151.0.7922.77/linux64/chrome-linux64.zip \
+    && wget -q https://storage.googleapis.com/chrome-for-testing-public/152.0.7977.54/linux64/chrome-linux64.zip \
     && unzip chrome-linux64.zip \
     && mv chrome-linux64 /opt/chrome \
     && rm chrome-linux64.zip \
@@ -195,6 +195,9 @@ USER pptruser
 
 # Expose port
 EXPOSE 3050
+
+# Default PORT aligned with EXPOSE and the HEALTHCHECK below (deploys may still override)
+ENV PORT=3050
 
 # Health check with 30s start period for Puppeteer initialization
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
