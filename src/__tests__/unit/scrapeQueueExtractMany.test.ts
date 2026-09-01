@@ -32,6 +32,7 @@ jest.mock('../../services/webhookClient', () => ({
 import type { ExtractContext, ExtractedData, ExtractionRuleset, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
 import { ScrapeQueue, resetScrapeQueue } from '../../services/scrapeQueue';
 import { createExtractionRegistry, ExtractionRegistryImpl } from '../../services/extractionRegistry';
+import { okWriteStats } from '../helpers/ingestWriteStats';
 import { CollectingCaptureSink } from '../../services/captureSink';
 
 function makeRegistry(
@@ -131,7 +132,7 @@ describe('ScrapeQueue — extractRecords/emitAll wiring (B3)', () => {
   it('emits every extractMany record as a sequential unary send(), IN ARRAY ORDER, and resolves the caller with [0].fields', async () => {
     const ruleset = makeMultiRuleset();
     const scraping = makeScrapingStub();
-    const send = jest.fn().mockResolvedValue({ sourceId: 'src-1' });
+    const send = jest.fn().mockResolvedValue(okWriteStats());
 
     queue = new ScrapeQueue(false);
     queue.setPluginRegistry(makeRegistry(ruleset, 'orzgk.example.test'));
@@ -165,7 +166,7 @@ describe('ScrapeQueue — extractRecords/emitAll wiring (B3)', () => {
     const scraping = makeScrapingStub();
     const send = jest
       .fn()
-      .mockResolvedValueOnce({ sourceId: 'p' }) // P succeeds
+      .mockResolvedValueOnce(okWriteStats({ sourceId: 'p' })) // P succeeds
       .mockRejectedValueOnce(new Error('spine unavailable')); // C1 fails — C2 must never be attempted
 
     queue = new ScrapeQueue(false);
@@ -193,7 +194,7 @@ describe('ScrapeQueue — extractRecords/emitAll wiring (B3)', () => {
     const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
     const ruleset = makeMultiRuleset();
     const scraping = makeScrapingStub();
-    const send = jest.fn().mockResolvedValue({ sourceId: 'src-1' });
+    const send = jest.fn().mockResolvedValue(okWriteStats());
 
     queue = new ScrapeQueue(false);
     queue.setPluginRegistry(makeRegistry(ruleset, 'orzgk.example.test'));
@@ -206,7 +207,7 @@ describe('ScrapeQueue — extractRecords/emitAll wiring (B3)', () => {
     await result.promise;
 
     const lines = logSpy.mock.calls.map((call) => String(call[0]));
-    expect(lines.some((line) => /records emitted=3/.test(line))).toBe(true);
+    expect(lines.some((line) => /Ingest complete .*persisted=3 emitted=3\/3/.test(line))).toBe(true);
     logSpy.mockRestore();
   });
 
@@ -216,7 +217,7 @@ describe('ScrapeQueue — extractRecords/emitAll wiring (B3)', () => {
     const scraping = makeScrapingStub();
     const send = jest
       .fn()
-      .mockResolvedValueOnce({ sourceId: 'p' })
+      .mockResolvedValueOnce(okWriteStats({ sourceId: 'p' }))
       .mockRejectedValueOnce(new Error('spine unavailable'));
 
     queue = new ScrapeQueue(false);
@@ -236,6 +237,46 @@ describe('ScrapeQueue — extractRecords/emitAll wiring (B3)', () => {
     logSpy.mockRestore();
   });
 
+  it('reports records SENT (not persisted) and rows persisted when the honesty gate trips mid-batch', async () => {
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    const ruleset = makeMultiRuleset();
+    const scraping = makeScrapingStub();
+    // P persists one row; C1 resolves all-zero (spine persisted nothing) → the honesty gate throws on
+    // C1 AFTER it was sent. The failure log must report 2 SENT (P + C1) but persisted=1 (only P).
+    const zeroStats = {
+      sourceId: 'c1',
+      claims: { emitted: 0, inserted: 0, deduped: 0, quarantined: 0, dropped: 0 },
+      identifiers: { emitted: 0, inserted: 0, deduped: 0, dropped: 0 },
+      prices: { emitted: 0, inserted: 0, deduped: 0, skipped: 0, dropped: 0 },
+      availability: { emitted: 0, inserted: 0, deduped: 0, dropped: 0 },
+      warnings: [] as string[],
+    };
+    const send = jest
+      .fn()
+      .mockResolvedValueOnce(okWriteStats({ sourceId: 'p' })) // P → persisted 1
+      .mockResolvedValueOnce(zeroStats);                      // C1 → persisted 0 → gate throws
+
+    queue = new ScrapeQueue(false);
+    queue.setPluginRegistry(makeRegistry(ruleset, 'orzgk.example.test'));
+    queue.setIngestEmitter({ send });
+    queue.setScrapingService(scraping);
+
+    const url = 'https://orzgk.example.test/item/P';
+    const result = queue.enqueue(url, { url, maxRetries: 0 });
+    const promiseRef = result.promise.catch((e: Error) => e);
+    await advanceAndFlush(500);
+    await advanceAndFlush(5000);
+    await promiseRef;
+
+    const failLine = errSpy.mock.calls.map((call) => String(call[0])).find((l) => l.includes('Ingest emit failed'));
+    expect(failLine).toBeDefined();
+    // 2 records were SENT (P + C1 both reached the emitter), even though only 1 PERSISTED
+    expect(failLine).toMatch(/2\/3 records emitted/);
+    expect(failLine).toMatch(/persisted=1/);
+    expect(send).toHaveBeenCalledTimes(2); // C2 (3rd record) never sent — stopped at first gate failure
+    errSpy.mockRestore();
+  });
+
   it('passes a real ExtractContext to extractMany whose scraping.fetchBody dispatches via the store\'s declared searchFetch transport (captured, api lane)', async () => {
     const followUpUrl = 'https://orzgk.example.test/wc/store/v1/products?type=variation&parent=P';
     const extractMany = jest.fn(async (_html: string, url: string, ctx?: ExtractContext) => {
@@ -246,7 +287,7 @@ describe('ScrapeQueue — extractRecords/emitAll wiring (B3)', () => {
     });
     const ruleset = makeMultiRuleset(extractMany);
     const scraping = makeScrapingStub();
-    const send = jest.fn().mockResolvedValue({ sourceId: 'src-1' });
+    const send = jest.fn().mockResolvedValue(okWriteStats());
     const http = jest.fn().mockResolvedValue('{"variations":[1,2]}');
     const sink = new CollectingCaptureSink();
 

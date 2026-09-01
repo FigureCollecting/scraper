@@ -36,6 +36,7 @@ jest.mock('../../services/webhookClient', () => ({
 
 import { ScrapeQueue, resetScrapeQueue } from '../../services/scrapeQueue';
 import { createExtractionRegistry, ExtractionRegistryImpl } from '../../services/extractionRegistry';
+import { okWriteStats } from '../helpers/ingestWriteStats';
 
 interface SiteSpec {
   siteId: string;
@@ -124,7 +125,7 @@ describe('ScrapeQueue — live queue per-host pacing (H1)', () => {
 
   function makeQueue(sites: SiteSpec[]) {
     const scraping = makeScrapingStub();
-    const send = jest.fn().mockResolvedValue({ sourceId: 'src-1' });
+    const send = jest.fn().mockResolvedValue(okWriteStats());
     queue = new ScrapeQueue(false);
     queue.setPluginRegistry(makeMultiHostRegistry(sites));
     queue.setIngestEmitter({ send });

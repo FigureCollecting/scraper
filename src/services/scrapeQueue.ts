@@ -25,7 +25,8 @@ import { getSessionManager, resetSessionManager, SessionManager, SessionPausedEv
 import { notifyItemFailed } from './webhookClient.js';
 import { enrichmentLogger } from '../utils/logger.js';
 import { createScrapingService } from './engineServices/scrapingService.js';
-import { createCapturingFetch, type CapturingFetch, type CapturingFetchTransports } from './engineServices/capturingFetch.js';
+import { createCapturingFetch, ChallengePageError, type CapturingFetch, type CapturingFetchTransports } from './engineServices/capturingFetch.js';
+import { getChallengeCooldown, ChallengeCooldownError, type ChallengeCooldown } from './challengeCooldown.js';
 import { getRawCaptureSink } from './s3ObjectStore.js';
 import { createIngestEmitterFromEnv } from './ingestEmitter.js';
 import { impitFetchBody } from './impitFetch.js';
@@ -51,7 +52,7 @@ import type {
 
 export type QueuePriority = 'HOT' | 'WARM' | 'COLD';
 export type ItemStatus = 'owned' | 'ordered' | 'wished';
-export type ErrorType = 'timeout' | 'not_found' | 'rate_limited' | 'auth_required' | 'network' | 'extraction_unavailable' | 'unknown';
+export type ErrorType = 'timeout' | 'not_found' | 'rate_limited' | 'auth_required' | 'network' | 'extraction_unavailable' | 'empty_record' | 'challenge_cooldown' | 'unknown';
 
 export interface QueueItem {
   /** Unique identifier for this queue entry */
@@ -157,6 +158,78 @@ export interface IngestSender {
   send(extracted: PluginExtractedData): Promise<unknown>;
 }
 
+/**
+ * Structural view of the ingest server's WriteStats accounting (the emitter resolves the full
+ * @figurecollecting/ingest-contract WriteStats; the narrow IngestSender above types send()'s result
+ * as unknown). Only the per-table fields the honesty gate + [INGEST STATS] log read.
+ */
+interface IngestRecordStats {
+  claims?: { inserted?: number; deduped?: number; dropped?: number; quarantined?: number };
+  identifiers?: { inserted?: number; deduped?: number; dropped?: number };
+  prices?: { inserted?: number; deduped?: number; skipped?: number; dropped?: number };
+  availability?: { inserted?: number; deduped?: number; dropped?: number };
+  warnings?: string[];
+}
+
+/**
+ * The spine accepted the RPC but persisted 0 rows for a record — inserted+deduped == 0 across ALL
+ * four tables. An empty ingest is a FAILURE, never the "[INGEST] SUCCESS" the old emit-count path
+ * reported (a Cloudflare challenge / dead ruleset lifts an empty field bag the server can persist
+ * nothing from). Thrown from processViaIngest so the item flows through the queue's existing
+ * attempts/backoff/FAILED handling. Classifies as 'unknown' (retryable, bounded by maxRetries) so a
+ * permanently-empty store exhausts its attempts and lands FAILED rather than looping.
+ */
+export class EmptyIngestRecordError extends Error {
+  readonly site: string;
+  readonly itemId: string;
+  readonly warnings: string[];
+  constructor(site: string, itemId: string, warnings: string[]) {
+    const tail = warnings.length
+      ? ` server warnings: ${warnings.map(sanitizeForLog).join(' | ')}`
+      : ' (no server warnings)';
+    super(
+      `EMPTY_INGEST_RECORD for ${site}:${itemId}: spine persisted 0 rows ` +
+        `(inserted+deduped=0 across claims/identifiers/prices/availability).${tail}`
+    );
+    this.name = 'EmptyIngestRecordError';
+    this.site = site;
+    this.itemId = itemId;
+    this.warnings = warnings;
+  }
+}
+
+/**
+ * inserted+deduped summed across all four tables — the rows that actually LANDED. An idempotent
+ * re-ingest legitimately lands as all-deduped (inserted=0, deduped>0), so deduped counts as
+ * persisted. An absent table contributes 0.
+ */
+function persistedRows(stats: IngestRecordStats): number {
+  const t = (s?: { inserted?: number; deduped?: number }): number => (s ? (s.inserted ?? 0) + (s.deduped ?? 0) : 0);
+  return t(stats.claims) + t(stats.identifiers) + t(stats.prices) + t(stats.availability);
+}
+
+/**
+ * One [INGEST STATS] line per record surfacing the server WriteStats, then up to the first 3
+ * warnings (each sanitized). Field order: claims=ins/dedup/drop/quar prices=ins/dedup/skip/drop
+ * identifiers=ins/dedup/drop availability=ins/dedup/drop warnings=N.
+ */
+function logIngestStats(label: string, stats: IngestRecordStats): void {
+  const n = (x?: number): number => x ?? 0;
+  const c = stats.claims, id = stats.identifiers, p = stats.prices, av = stats.availability;
+  const warnings = stats.warnings ?? [];
+  console.log(
+    `[INGEST STATS] ${sanitizeForLog(label)} ` +
+      `claims=${n(c?.inserted)}/${n(c?.deduped)}/${n(c?.dropped)}/${n(c?.quarantined)} ` +
+      `prices=${n(p?.inserted)}/${n(p?.deduped)}/${n(p?.skipped)}/${n(p?.dropped)} ` +
+      `identifiers=${n(id?.inserted)}/${n(id?.deduped)}/${n(id?.dropped)} ` +
+      `availability=${n(av?.inserted)}/${n(av?.deduped)}/${n(av?.dropped)} ` +
+      `warnings=${warnings.length}`
+  );
+  for (const w of warnings.slice(0, 3)) {
+    console.log(`[INGEST STATS]   warn: ${sanitizeForLog(w)}`);
+  }
+}
+
 /** Raw page-fetch capability the ingest path uses (extraction is the plugin's job). */
 type RawPageFetcher = Pick<ScrapingService, 'scrapePage' | 'scrapePageStealth'>;
 
@@ -195,6 +268,23 @@ const RATE_LIMIT = {
 // ============================================================================
 
 function classifyError(error: Error | string): ErrorType {
+  // Class-based classification wins over any substring match: a typed engine error's taxonomy must
+  // never depend on free text (itemId / URL / server warnings) embedded in its message (RS-2). A
+  // ChallengePageError is a CF challenge/block → rate_limited (backoff + CF block tracking); an
+  // EmptyIngestRecordError is a persisted-nothing failure → its own class, retryable-but-bounded,
+  // and never an auth/cookie fault.
+  if (error instanceof ChallengePageError) {
+    return 'rate_limited';
+  }
+  // A ChallengeCooldownError is a FAST FAIL raised before any fetch because the host is cooling — its
+  // own class, so it is never retried and never mistaken for a cookie/auth or empty-record fault.
+  if (error instanceof ChallengeCooldownError) {
+    return 'challenge_cooldown';
+  }
+  if (error instanceof EmptyIngestRecordError) {
+    return 'empty_record';
+  }
+
   const message = typeof error === 'string' ? error : error.message;
 
   // Config-level shortfall (no emitter / no matching ruleset) — checked first
@@ -227,7 +317,7 @@ function classifyError(error: Error | string): ErrorType {
   return 'unknown';
 }
 
-function shouldRetry(errorType: ErrorType, retryCount: number, maxRetries: number): boolean {
+function shouldRetry(error: Error | string, errorType: ErrorType, retryCount: number, maxRetries: number): boolean {
   // Never retry auth errors without new cookies
   if (errorType === 'auth_required') {
     return false;
@@ -239,13 +329,28 @@ function shouldRetry(errorType: ErrorType, retryCount: number, maxRetries: numbe
     return false;
   }
 
+  // Never retry a fast-fail against a cooling host — the host is deliberately being left alone; a
+  // retry would just re-check the same closed window.
+  if (errorType === 'challenge_cooldown') {
+    return false;
+  }
+
+  // A ChallengePageError is ONE SHOT: retrying it re-fetches another challenge page and degrades the
+  // egress IP's CF reputation (the live anitoysgk 3×-in-10s storm). One attempt, then FAILED — even
+  // though its class stays rate_limited so the global backoff/CF-block accounting still fires once.
+  if (error instanceof ChallengePageError) {
+    return false;
+  }
+
   // Don't retry if at max
   if (retryCount >= maxRetries) {
     return false;
   }
 
-  // Retry transient errors
-  return ['timeout', 'rate_limited', 'network', 'unknown'].includes(errorType);
+  // Retry transient errors. 'empty_record' is bounded-retryable: a re-fetch/re-extract may land rows
+  // (transient upstream), but a permanently-empty store (e.g. a CF block) exhausts maxRetries and
+  // then lands FAILED — never an infinite loop.
+  return ['timeout', 'rate_limited', 'network', 'empty_record', 'unknown'].includes(errorType);
 }
 
 // ============================================================================
@@ -321,6 +426,10 @@ export class ScrapeQueue {
   // shared engine sink — the same one the browser lane's navigateAndCapture writes to.
   private captureSink: CaptureSink | null = null;
 
+  // Per-host Cloudflare-challenge cooldown register. Defaults to the process-wide singleton (shared
+  // with the lookup fan-out and /health/detailed); a test may inject a clock-controlled instance.
+  private challengeCooldownStore: ChallengeCooldown | null = null;
+
   constructor(testMode?: boolean) {
     // Auto-detect test environment if not explicitly set
     this.testMode = testMode ?? (
@@ -388,6 +497,19 @@ export class ScrapeQueue {
    */
   setCaptureSink(sink: CaptureSink | null): void {
     this.captureSink = sink;
+  }
+
+  /**
+   * Override the per-host challenge-cooldown register (tests / DI). Defaults to the process-wide
+   * singleton so the queue, the lookup fan-out, and /health/detailed all share one register.
+   */
+  setChallengeCooldown(cooldown: ChallengeCooldown | null): void {
+    this.challengeCooldownStore = cooldown;
+  }
+
+  /** The active challenge-cooldown register — the injected instance, else the shared singleton. */
+  private getChallengeCooldownStore(): ChallengeCooldown {
+    return this.challengeCooldownStore ?? getChallengeCooldown();
   }
 
   /**
@@ -934,11 +1056,15 @@ export class ScrapeQueue {
 
     // Acquire item lock - set BEFORE any async operations
     this.processingItem = item;
+    // Remember the last REAL request time: a challenge_cooldown fast-fail (below) never touches the
+    // network, so it must not consume this global pacing slot — we restore this value in that case.
+    const prevLastRequestTime = this.lastRequestTime;
     this.lastRequestTime = now;
 
     const poolAvailable = BrowserPool.getPoolSize();
     console.log(`[SCRAPE QUEUE] Processing ${item.mfcId} (${item.priority}, attempt ${item.retryCount + 1}/${item.maxRetries + 1}, delay=${this.currentDelay}ms, pool=${poolAvailable}/${BrowserPool.getPoolCapacity()})`);
 
+    let fastFailedOnCooldown = false;
     try {
       // Extraction is plugin-only: an ingest emitter must be configured AND
       // a plugin ruleset must match the item's URL. Anything else is a
@@ -957,13 +1083,23 @@ export class ScrapeQueue {
 
     } catch (error: any) {
       // Handle failure
+      fastFailedOnCooldown = error instanceof ChallengeCooldownError;
       this.handleFailure(item, error);
     }
 
     this.processingItem = null;
 
-    // Schedule next item (unless cooldown timer already handling retry)
-    if (!this.cooldownWaitTimerId) {
+    if (fastFailedOnCooldown) {
+      // A challenge_cooldown fast-fail made NO network request, so it must not burn a global pacing
+      // slot: restore the pre-dispatch lastRequestTime and re-drive immediately. Otherwise N cooling
+      // items ahead of a healthy host's item would delay it by N×currentDelay for no-op failures
+      // (the cooling host's own siblings stay held off by the per-host floor, not the global lane).
+      this.lastRequestTime = prevLastRequestTime;
+      if (!this.cooldownWaitTimerId) {
+        setTimeout(() => this.processNext(), 0);
+      }
+    } else if (!this.cooldownWaitTimerId) {
+      // Schedule next item (unless cooldown timer already handling retry)
       setTimeout(() => this.processNext(), this.currentDelay);
     }
   }
@@ -1030,7 +1166,25 @@ export class ScrapeQueue {
    */
   private async processViaIngest(item: QueueItem, ruleset: ExtractionRuleset): Promise<ScrapedData> {
     const searchFetch = this.getSearchFetchFor(item.url);
+    const host = this.hostOf(item.url);
+    // CHALLENGE COOLDOWN (fast fail, before any fetch): if this host is cooling from a recent CF
+    // challenge, do NOT fetch it — every challenge fetch degrades the egress IP's CF reputation.
+    // Fail the item immediately with a typed ChallengeCooldownError (→ challenge_cooldown: not
+    // retried, never the cookie-session-pause path). Expiry: once `until` passes, isOpen is false and
+    // the fetch below proceeds normally.
+    const cooldown = this.getChallengeCooldownStore();
+    if (host !== undefined && cooldown.isOpen(host)) {
+      const minsLeft = Math.max(1, Math.ceil(cooldown.remaining(host) / 60_000));
+      console.warn(`[COOLDOWN] skipped ${sanitizeForLog(item.url)} (${host} cooling, ${minsLeft} min left)`);
+      throw new ChallengeCooldownError(host, cooldown.remaining(host));
+    }
     const page = await this.getCapturingFetch()(item.url, searchFetch, { cookies: item.cookies });
+    // A clean (non-challenge) body proves this host serves real pages again — clear a lingering,
+    // now-EXPIRED cooldown entry so /health/detailed stops listing it and the recovery is logged.
+    // Guard on !isOpen: a still-LIVE window (one the search fan-out opened on this host WHILE this
+    // fetch was in flight — the fetch passed isOpen before that open) must SURVIVE, or clearing it
+    // here would drop the protection and let the next item fetch the cooling host (F4 race).
+    if (host !== undefined && !page.challenge && !cooldown.isOpen(host)) cooldown.clear(host);
     // Anchor for the courtesy gap (D8): the instant the PRIMARY fetch completed, so a same-store
     // `ctx.scraping.fetchBody` follow-up (extractMany's second call) waits the store's declared
     // gap against THIS fetch, not against whenever the follow-up happens to be invoked.
@@ -1061,21 +1215,59 @@ export class ScrapeQueue {
     // handling — the retry re-fetches, re-extracts, and re-emits ALL records as new honest
     // observations (no partial-batch ambiguity: there is no batch, only a resumable prefix).
     let emittedCount = 0;
+    let sentCount = 0;
+    let totalPersisted = 0;
     try {
       for (const record of records) {
-        await this.ingestEmitter!.send(record);
+        // send() resolves the server WriteStats (any OK RPC); the queue's IngestSender narrows it to
+        // unknown, so read it through the structural IngestRecordStats view. A send() that resolves
+        // undefined/null (no WriteStats at all) is normalized to an empty {} so it accounts as a
+        // zeroed, persisted-nothing record (→ EmptyIngestRecordError via the gate below), never a
+        // TypeError from reading stats.claims on undefined.
+        const stats = ((await this.ingestEmitter!.send(record)) ?? {}) as IngestRecordStats;
+        // This record reached the emitter and returned a response — count it as SENT before the
+        // honesty gate below can reject it, so a partial-emit failure log reports records SENT
+        // (including the one that persisted nothing), distinct from the rows actually PERSISTED.
+        sentCount++;
+        const label = `${record.source.site}:${record.source.itemId}`;
+        logIngestStats(label, stats);
+        const persisted = persistedRows(stats);
+        // HONESTY GATE: an OK RPC that persisted nothing (inserted+deduped==0 across all four tables)
+        // is a FAILURE, not success. All-deduped (idempotent re-run) has deduped>0 and passes.
+        if (persisted === 0) {
+          // A page the transport FLAGGED as a Cloudflare challenge/block that ALSO persisted nothing
+          // is a TRANSPORT failure (rate_limited → backoff + CF tracking), named by its lane — the
+          // branch's class-based classification owns it. A plain persisted-nothing page is an empty
+          // record. The transport is trusted for the flag; the gate is trusted for persist-or-fail.
+          if (page.challenge) {
+            // Genuine challenge that persisted nothing: OPEN the host's cooldown so the next item for
+            // it (and the lookup fan-out's search of it) is left alone until the window expires.
+            if (host !== undefined) cooldown.open(host, `challenge page via ${page.transport ?? 'unknown'} transport`);
+            throw new ChallengePageError(item.url, page.transport ?? 'unknown', stats.warnings ?? []);
+          }
+          throw new EmptyIngestRecordError(record.source.site, record.source.itemId, stats.warnings ?? []);
+        }
+        if (page.challenge) {
+          // amiami case: the primary page was a challenge/block body, but the ruleset recovered the
+          // real record through its OWN follow-up transport (ctx.scraping.fetchBody -> item API).
+          // Persisted > 0 ⇒ honest success — log it, never fail.
+          console.log(
+            `[INGEST STATS] challenge page received for ${sanitizeForLog(label)} but the ruleset recovered ${persisted} rows via its own transport`
+          );
+        }
+        totalPersisted += persisted;
         emittedCount++;
       }
     } catch (error: any) {
       console.error(
-        `[SCRAPE QUEUE] Ingest emit failed for ${item.url} after ${emittedCount}/${records.length} records emitted ` +
+        `[SCRAPE QUEUE] Ingest emit failed for ${item.url} after ${sentCount}/${records.length} records emitted (persisted=${totalPersisted}) ` +
           `(ruleset ${ruleset.siteId}@${ruleset.version}): ${sanitizeForLog(error?.message ?? String(error))}`
       );
       throw error instanceof Error ? error : new Error(String(error));
     }
 
     console.log(
-      `[SCRAPE QUEUE] Ingest complete for ${item.url}: records emitted=${emittedCount}/${records.length} (ruleset ${ruleset.siteId}@${ruleset.version})`
+      `[SCRAPE QUEUE] Ingest complete for ${item.url}: persisted=${totalPersisted} emitted=${emittedCount}/${records.length} (ruleset ${ruleset.siteId}@${ruleset.version})`
     );
 
     // [0] is always the page's own record (extractMany's documented contract; the single-record
@@ -1269,15 +1461,16 @@ export class ScrapeQueue {
     const itemStatus = item.status || 'wished';
     this.statusCompleted[itemStatus]++;
 
-    // Log enrichment success with field completeness for analysis
+    // Log enrichment success with PLUGIN-shaped field presence derived from the emitted record's own
+    // fields — the legacy {imageUrl,name,manufacturer,origin,releaseDate,price} summary read
+    // ScrapedData keys plugins never set and logged all-false on every plugin ingest.
     const durationMs = Date.now() - item.queuedAt;
+    const recordFields = result as unknown as Record<string, unknown>;
     const fields = {
-      imageUrl: !!result.imageUrl,
-      name: !!result.name,
-      manufacturer: !!result.manufacturer,
-      origin: !!result.origin,
-      releaseDate: !!(result.releases?.[0]?.date),
-      price: !!(result.releases?.[0]?.price),
+      title: !!(recordFields.title ?? recordFields.name),
+      price: recordFields.price != null,
+      images: Array.isArray(recordFields.images) ? recordFields.images.length : 0,
+      fieldCount: Object.keys(recordFields).length,
     };
     enrichmentLogger.success(item.mfcId, item.sessionId, durationMs, fields);
 
@@ -1339,13 +1532,35 @@ export class ScrapeQueue {
       }
     }
 
-    // Reset success streak on any failure
-    this.consecutiveSuccesses = 0;
+    // Reset the success streak on any REAL failure. A challenge_cooldown fast-fail never touched the
+    // network (the host was cooling, so nothing was fetched), so it is NEUTRAL to the adaptive lane:
+    // resetting the streak on it would let a trickle of same-host cooling items block the recovery a
+    // real challenge escalated, holding the ×1.4 backoff + rateLimited flag open for the whole window.
+    if (errorType !== 'challenge_cooldown') {
+      this.consecutiveSuccesses = 0;
+    }
 
     // For cookie-authenticated requests, track failures in session manager.
-    // Config-level shortfalls (extraction_unavailable) are not cookie
-    // failures — they skip session pause/cooldown and fail directly below.
-    if (errorType !== 'extraction_unavailable' && item.cookies && item.sessionId && item.waitingUserIds.length > 0) {
+    // Config-level shortfalls (extraction_unavailable) and persisted-nothing ingests (empty_record)
+    // are NOT cookie/auth failures — the cookies are fine, the store just returned nothing (layout
+    // change, deleted item, a CF block slipping past the browser lane). They skip session
+    // pause/cooldown and fall through to the maxRetries/give-up path below, so a permanently-empty
+    // record lands FAILED with a clear reason instead of pausing the user's whole sync session as
+    // 'auth_failures' and holding the item indefinitely (RS-3).
+    // A ChallengePageError is likewise NOT a cookie fault: it is raised ONLY by the honesty gate for a
+    // NON-browser lane (http/impersonate) that never sent the cookies, so a cookie'd item must fail
+    // bounded like the cookieless case instead of pausing the session (RT-1). The carve-out keys on the
+    // ChallengePageError CLASS, not errorType==='rate_limited' — a browser-lane CF block still surfaces
+    // as a plain rate_limited Error on a cookie'd lane and keeps its session-pause behavior.
+    if (
+      errorType !== 'extraction_unavailable' &&
+      errorType !== 'empty_record' &&
+      errorType !== 'challenge_cooldown' &&
+      !(error instanceof ChallengePageError) &&
+      item.cookies &&
+      item.sessionId &&
+      item.waitingUserIds.length > 0
+    ) {
       const pendingCount = this.getPendingCountForSession(item.sessionId);
       const userId = item.waitingUserIds[0]; // Primary user for this session
 
@@ -1374,7 +1589,7 @@ export class ScrapeQueue {
     }
 
     // Standard retry logic for non-cookie requests or if session manager says don't retry
-    if (shouldRetry(errorType, item.retryCount, item.maxRetries)) {
+    if (shouldRetry(error, errorType, item.retryCount, item.maxRetries)) {
       // Re-queue for retry
       this.addToQueue(item);
       enrichmentLogger.retry(item.mfcId, item.retryCount, item.maxRetries, item.sessionId);

@@ -507,6 +507,38 @@ NODE_ENV=test npm run test:coverage
 ./test-container-coverage.sh
 ```
 
+### CI on forks (shift-left)
+
+Development happens on personal forks; pull requests go to `FigureCollecting/*`.
+CI on a fork follows one rule. The push gate (its four cases are documented in
+a comment block) sits at the top of `build.yml`, `security-scan.yml` and
+`codeql.yml`; the publishing workflows (`docker-publish.yml`,
+`publish-plugin-contract.yml`, `release.yml`, `sbom-security-scan.yml`,
+`scheduled-security-scan.yml`) carry an org-only gate.
+
+- **Feature branches on your fork run the core CI on every push**: unit tests +
+  build, dependency/container/npm-audit scans (the container scan builds the
+  production image) and CodeQL, so problems surface before the PR is opened.
+  `docker-publish.yml` does not run there (it only publishes), and Dependabot
+  branches (`dependabot/**`) get their CI from their pull request instead.
+- **Set a fork secret `NODE_AUTH_TOKEN`** (repo Settings > Secrets and variables >
+  Actions) to a classic GitHub PAT with **only** the `read:packages` scope, so
+  `npm ci` can read the private `@figurecollecting/*` packages. Without it the
+  install falls back to the fork's `GITHUB_TOKEN` and fails with `npm error 403`.
+  Upstream needs no such secret. The secret reaches your own pushes and PRs from
+  branches of your fork, never a PR opened from someone else's fork.
+- **`develop` and `main` on your fork are mirrors of upstream: pushes to them
+  run no jobs.** The workflows still trigger, so each sync leaves grey
+  `skipped` runs in the Actions tab; that is the gate working, not a failure.
+  Manual `workflow_dispatch` runs (`security-scan.yml`; `docker-publish.yml`, which
+  then builds with `push: false`) are not gated and still run there, and so do
+  scheduled runs if you enable schedules on the fork.
+  The gate compares branch names case-insensitively, so do not name a feature
+  branch `Develop` or `MAIN`.
+- **Publishing (GHCR images, the npm plugin-contract package, GitHub releases,
+  image SBOM/attestations) and Codecov uploads happen only from the org**; those
+  jobs and steps are skipped on forks.
+
 ### Testing Documentation
 
 See `TESTING.md` for comprehensive testing documentation including:
@@ -640,6 +672,15 @@ See `.env.example` for complete configuration template.
   - Unset (default): the new path is disabled and every item uses the legacy scrape+webhook path
 - `INGEST_TIMEOUT_MS`: Per-call deadline in milliseconds for spine ingest RPCs
   - Default: `30000`
+- `IMPIT_TIMEOUT_MS`: Per-request timeout (ms) for the impit browser-TLS transport
+  - Applies to each impit GET independently — a session-gated store's homepage prime and the target fetch each get the full budget
+  - Raise for slow session-gated stores (e.g. Ueeshop) whose prime/search can take 15–30 s
+  - Unset/invalid → default; any value is clamped to `[5000, 120000]`
+  - Default: `30000`
+- `CHALLENGE_COOLDOWN_MS`: Per-host cooldown window (ms) after a store serves a Cloudflare challenge/block
+  - While a host is cooling, the scrape queue and lookup fan-out skip it without fetching, so repeat challenges don't degrade the egress IP's CF reputation
+  - Unset/invalid → default; any finite value is clamped to `[60000 (1 min), 86400000 (24 h)]`
+  - Default: `1800000` (30 min)
 
 **MFC Cookie Security:**
 - `MFC_ALLOWED_COOKIES`: Whitelist of cookie names allowed during authenticated MFC scraping

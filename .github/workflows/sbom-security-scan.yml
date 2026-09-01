@@ -20,9 +20,16 @@ on:
         type: string
         description: 'Full image name'
 
+# CI policy ("fork shift-left"): this reusable workflow pulls, attests and
+# pushes ghcr.io/figurecollecting/* images, so it is org-only. On a fork
+# (repository_owner != FigureCollecting) the job is skipped; the `github`
+# context of a reusable workflow is the caller's, so the check is the caller's
+# owner. Upstream behaviour unchanged.
+
 jobs:
   security-scan:
     runs-on: ubuntu-latest
+    if: github.repository_owner == 'FigureCollecting'
     permissions:
       contents: read
       packages: write

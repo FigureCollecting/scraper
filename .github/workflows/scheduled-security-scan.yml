@@ -26,9 +26,15 @@ env:
   SEVERITY_THRESHOLD: ${{ github.event.inputs.severity_threshold || 'HIGH' }}
   CREATE_ISSUES: ${{ github.event.inputs.create_issues || 'true' }}
 
+# CI policy ("fork shift-left"): this workflow scans ghcr.io/figurecollecting/*
+# images and files issues / Discord alerts, so the WHOLE workflow is org-only.
+# On a fork (repository_owner != FigureCollecting) every job is skipped,
+# including `summary` (its `always()` would otherwise run). Upstream unchanged.
+
 jobs:
   scan-images:
     runs-on: ubuntu-latest
+    if: github.repository_owner == 'FigureCollecting'
     permissions:
       contents: read
       packages: read
@@ -276,7 +282,7 @@ jobs:
   summary:
     needs: scan-images
     runs-on: ubuntu-latest
-    if: always()
+    if: always() && github.repository_owner == 'FigureCollecting'
     permissions:
       issues: write
 

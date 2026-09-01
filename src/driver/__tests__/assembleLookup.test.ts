@@ -6,6 +6,7 @@
  */
 import { assembleLookup, type LookupServices } from '../assembleLookup';
 import { buildProfileRegistry } from '../profileRegistry';
+import { ChallengeCooldown } from '../../services/challengeCooldown';
 import type {
   ExtractionRuleset,
   IdentityQuery,
@@ -365,5 +366,86 @@ describe('lookupByIdentity — substring-match store post-filter + observability
     expect(gk.candidates.map((c) => c.itemId)).toEqual(['17412', '9003']); // nobody removed
     expect(gk.filtered).toBe(0);
     expect(Object.prototype.hasOwnProperty.call(gk, 'filtered')).toBe(true); // present, not omitted
+  });
+});
+
+describe('assembleLookup × challenge cooldown — honest search lane + per-host skip', () => {
+  const CHALLENGE = '<html><head><title>Just a moment...</title></head><body>cf</body></html>';
+
+  it('a Cloudflare-challenge search body → store lands in `failed` (reason "challenge page") and opens its cooldown, never a silent 0-candidates', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const cd = new ChallengeCooldown({ now: () => 1000, windowMs: 60_000 });
+    const fetchSearch = jest.fn(async (url: string) => (url.includes('goodsmileus') ? CHALLENGE : '{}'));
+    const { lookup } = build({ challengeCooldown: cd, fetchSearch });
+
+    const out = await lookup.lookup('tomie');
+
+    // goodsmileus served a challenge → FAILED, not a phantom 0-candidate result
+    expect(out.failed).toContain('goodsmileus');
+    expect(out.results.find((r) => r.siteId === 'goodsmileus')).toBeUndefined();
+    // the reason is logged as "challenge page" (not swallowed as an empty parse)
+    const failLog = warn.mock.calls.map((c) => String(c[0])).find((l) => l.includes('goodsmileus') && l.includes('search failed'));
+    expect(failLog).toContain('challenge page');
+    // and the host's cooldown is now OPEN (so the ingest queue + a later lookup leave it alone)
+    expect(cd.isOpen('goodsmileus.com')).toBe(true);
+    expect(cd.list().map((e) => e.host)).toContain('goodsmileus.com');
+    // solaris (a normal body) is unaffected and still returns results
+    expect(out.results.map((r) => r.siteId)).toContain('solaris');
+    warn.mockRestore();
+  });
+
+  it('a store whose host is cooling is SKIPPED without fetching and listed under `cooldown` (not failed/unsupported)', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const cd = new ChallengeCooldown({ now: () => 1000, windowMs: 60_000 });
+    cd.open('goodsmileus.com', 'search challenge page'); // host already cooling from an earlier hit
+    const fetchSearch = jest.fn(async () => '{}');
+    const { lookup } = build({ challengeCooldown: cd, fetchSearch });
+
+    const out = await lookup.lookup('tomie');
+
+    // goodsmileus is skipped WITHOUT fetching — the whole point of the cooldown
+    expect(fetchSearch).not.toHaveBeenCalledWith(expect.stringContaining('goodsmileus'), expect.anything());
+    expect(out.cooldown).toContain('goodsmileus');
+    expect(out.failed).not.toContain('goodsmileus');
+    expect(out.unsupported).not.toContain('goodsmileus');
+    expect(out.results.find((r) => r.siteId === 'goodsmileus')).toBeUndefined();
+    // the skipped line names the url + host + minutes-left
+    const skipped = warn.mock.calls.map((c) => String(c[0])).find((l) => l.startsWith('[COOLDOWN] skipped'));
+    expect(skipped).toContain('goodsmileus');
+    expect(skipped).toContain('cooling');
+    expect(skipped).toContain('min left');
+    // solaris (not cooling) is still fetched and returned
+    expect(fetchSearch).toHaveBeenCalledWith(expect.stringContaining('solaris'), expect.anything());
+    expect(out.results.map((r) => r.siteId)).toContain('solaris');
+    warn.mockRestore();
+  });
+
+  it('a normal run (no challenge, nothing cooling) leaves `cooldown` empty and does not alter substring/token composition', async () => {
+    const cd = new ChallengeCooldown({ now: () => 1000, windowMs: 60_000 });
+    const SUBSTORE = caps('gkloot', 'www.gkloot.com', {
+      bySearch: { urlTemplate: 'https://www.gkloot.com/search/?Keyword={q}', scope: 'listed', queryMatch: 'substring' },
+    });
+    const TOKSTORE = caps('fnc', 'www.fnc.com', { bySearch: { urlTemplate: 'https://www.fnc.com/search?q={q}', scope: 'listed' } });
+    const CANDS: SearchCandidate[] = [
+      { itemId: '17412', name: 'Star Origin Studio Lucy Deluxe', available: true },
+      { itemId: '9001', name: 'Crown Studio Lucy 1/4', available: true },
+    ];
+    const fetchSearch = jest.fn(async () => JSON.stringify(CANDS));
+    const services: LookupServices = {
+      profiles: buildProfileRegistry([SUBSTORE, TOKSTORE]),
+      getRulesetForUrl: (url) => (url.includes('gkloot') ? stub('gkloot', () => CANDS) : stub('fnc', () => CANDS)),
+      fetchSearch,
+      challengeCooldown: cd,
+    };
+
+    const out = await assembleLookup(services).lookupByIdentity({ studio: 'Star Origin Studio', character: 'Lucy' });
+
+    expect(out.cooldown).toEqual([]); // nothing cooling → empty
+    // substring store still issued the single selective term + post-filtered; token store got the composed phrase
+    expect(fetchSearch).toHaveBeenCalledWith('https://www.gkloot.com/search/?Keyword=Lucy', expect.anything());
+    expect(fetchSearch).toHaveBeenCalledWith('https://www.fnc.com/search?q=Star%20Origin%20Studio%20Lucy', expect.anything());
+    const gk = out.results.find((r) => r.siteId === 'gkloot')!;
+    expect(gk.candidates.map((c) => c.itemId)).toEqual(['17412']); // Crown decoy filtered out — composition intact
+    expect(gk.filtered).toBe(1);
   });
 });

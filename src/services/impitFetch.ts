@@ -7,10 +7,31 @@
  * instance — WITH a per-profile cookie jar — is cached per impersonation profile.
  */
 import { CookieJar } from 'tough-cookie';
+import { isCloudflareChallenge } from './engineServices/challengeDetect.js';
 
 /** Default impersonation profile. A LIVE TUNABLE — chrome110 already went stale to Cloudflare; keep recent. */
 const DEFAULT_PROFILE = 'chrome142';
-const TIMEOUT_MS = 15000;
+
+/** Per-request timeout (ms) used when IMPIT_TIMEOUT_MS is unset/invalid, and the clamp any override rides within. */
+const DEFAULT_TIMEOUT_MS = 30000;
+const MIN_TIMEOUT_MS = 5000;
+const MAX_TIMEOUT_MS = 120000;
+
+/**
+ * Resolve the per-request impit timeout (ms) from the environment. IMPIT_TIMEOUT_MS overrides the
+ * 30s default; a missing, empty, non-numeric, or non-positive value falls back to that default, and
+ * any usable value is clamped to [5000, 120000] so a typo can neither strangle nor unbound a slow
+ * session-gated store's prime + target GETs (the Impit budgets each GET separately). Pure
+ * (env in → number out) so it is unit-testable without touching process.env.
+ */
+export function resolveImpitTimeoutMs(env: NodeJS.ProcessEnv): number {
+  const n = Number(env.IMPIT_TIMEOUT_MS);
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_TIMEOUT_MS;
+  return Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, n));
+}
+
+/** Per-request timeout applied to every impit GET (prime and target alike). Resolved ONCE at module load. */
+const TIMEOUT_MS = resolveImpitTimeoutMs(process.env);
 /**
  * How long a host's prime is trusted before it is re-primed. Cloudflare's cf_clearance is short-lived
  * (~30 min); kept safely under that so a primed host whose clearance has expired is re-primed instead
@@ -56,14 +77,14 @@ export interface ImpitFetchOptions {
  * The per-profile cookie jar is threaded in so cf_clearance from the prime GET persists onto the
  * target fetch (impit is stateless without a jar).
  */
-async function defaultMakeImpit(browser: string, cookieJar: CookieJarLike): Promise<ImpitLike> {
+async function defaultMakeImpit(browser: string, cookieJar: CookieJarLike, timeoutMs: number): Promise<ImpitLike> {
   const { Impit } = await import('impit');
   // `browser` is a runtime-valid profile string; impit types it as a Browser enum. `cookieJar` is a
   // tough-cookie CookieJar — the store impit's JS binding reads/writes for cross-request cookies.
   return new Impit({
     browser: browser as never,
     followRedirects: true,
-    timeout: TIMEOUT_MS,
+    timeout: timeoutMs,
     cookieJar: cookieJar as never,
   }) as unknown as ImpitLike;
 }
@@ -73,7 +94,7 @@ function defaultMakeCookieJar(): CookieJarLike {
   return new CookieJar() as unknown as CookieJarLike;
 }
 
-export type MakeImpit = (browser: string, cookieJar: CookieJarLike) => ImpitLike | Promise<ImpitLike>;
+export type MakeImpit = (browser: string, cookieJar: CookieJarLike, timeoutMs: number) => ImpitLike | Promise<ImpitLike>;
 
 /**
  * One cached Impit plus its session-prime bookkeeping. The Impit is per impersonation profile and
@@ -102,11 +123,11 @@ function hostOf(url: string): string | undefined {
  * misread as a challenge: at worst a false positive costs one wasted re-prime + refetch, never a loop.
  */
 function looksLikeChallenge(body: string): boolean {
-  return (
-    body.includes('Just a moment') ||
-    body.includes('/cdn-cgi/challenge-platform/') ||
-    body.includes('cf-mitigated')
-  );
+  // Delegate to the shared, conservative detector (engineServices/challengeDetect) rather than keep
+  // a second copy of the markers; 'Just a moment' (loose) and 'cf-mitigated' remain impit's own
+  // extra triggers so this stays a strict SUPERSET of the shared detector — never narrower —
+  // preserving the pre-existing re-prime sensitivity.
+  return isCloudflareChallenge(body) || body.includes('Just a moment') || body.includes('cf-mitigated');
 }
 
 /**
@@ -174,7 +195,7 @@ export function createImpitFetch(makeImpit: MakeImpit = defaultMakeImpit, option
     if (!sp) {
       sp = (async (): Promise<ImpitSession> => {
         const jar = defaultMakeCookieJar();
-        const impit = await makeImpit(browser, jar);
+        const impit = await makeImpit(browser, jar, TIMEOUT_MS);
         return { impit, primed: new Map<string, number>(), priming: new Map<string, Promise<void>>() };
       })();
       sessions.set(browser, sp);

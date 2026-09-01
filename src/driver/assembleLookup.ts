@@ -17,6 +17,8 @@
  */
 import { planRetrieval, composeNameQuery, normalizeText } from './retrievalPlanner.js';
 import { sanitizeForLog } from '../utils/security.js';
+import { isCloudflareChallenge } from '../services/engineServices/challengeDetect.js';
+import { getChallengeCooldown, normalizeHost, type ChallengeCooldown } from '../services/challengeCooldown.js';
 import type { ProfileRegistry } from './profileRegistry.js';
 import type { ExtractionRuleset, IdentityQuery, SearchCandidate, SearchFetch } from '@figurecollecting/scraper-plugin-contract';
 
@@ -33,6 +35,13 @@ export interface LookupServices {
    * and injected here, so the fan-out stays deterministic in tests.
    */
   fetchSearch: (url: string, searchFetch: SearchFetch) => Promise<string>;
+  /**
+   * Per-host Cloudflare-challenge cooldown register (shared with the ingest queue and
+   * /health/detailed). Optional — defaults to the process-wide singleton; tests inject a
+   * clock-controlled instance. A cooling store is skipped WITHOUT fetching; a search body that IS a
+   * challenge opens its host's cooldown.
+   */
+  challengeCooldown?: ChallengeCooldown;
 }
 
 export interface StoreLookupResult {
@@ -72,6 +81,12 @@ export interface LookupResult {
   /** Stores whose search fetch or parse errored (transparency, not silent drop). */
   failed: string[];
   /**
+   * Stores SKIPPED without fetching because their host is cooling from a recent Cloudflare challenge
+   * (additive — distinct from `failed`/`unsupported`: the store is fine, we are deliberately leaving
+   * its host alone until the cooldown expires).
+   */
+  cooldown: string[];
+  /**
    * Barcode-byId direct hits (record-mode only): stores where the JAN resolves straight to a byId
    * URL. UNVERIFIED — the caller confirms each via /resolve (which returns the full record incl
    * price/availability). Kept OUT of `results` so an unfetched hit never poses as a real candidate.
@@ -98,7 +113,22 @@ export function assembleLookup(services: LookupServices): Lookup {
     const unsupported = [...plan.unsupported];
     const orderableOnly: string[] = [];
     const failed: string[] = [];
+    const cooldown: string[] = [];
     const resolveTargets: ResolveTarget[] = [];
+    const cd = services.challengeCooldown ?? getChallengeCooldown();
+    // CHALLENGE COOLDOWN gate (shared by detail AND search plans): this host is cooling from a recent
+    // CF challenge — SKIP it WITHOUT fetching (a challenge fetch degrades the egress IP's CF
+    // reputation) and list it under the additive `cooldown` list (the store is fine, we are
+    // deliberately leaving its host alone). A cooling byId host must be gated HERE too, so its detail
+    // target is never handed to the caller as a /resolve confirm that would fetch the cooling host.
+    const skipCooling = (p: { host: string; url: string; siteId: string }): boolean => {
+      if (!cd.isOpen(p.host)) return false;
+      const minsLeft = Math.max(1, Math.ceil(cd.remaining(p.host) / 60_000));
+      // eslint-disable-next-line no-console
+      console.warn(`[COOLDOWN] skipped ${sanitizeForLog(p.url)} (${normalizeHost(p.host)} cooling, ${minsLeft} min left)`);
+      cooldown.push(p.siteId);
+      return true;
+    };
 
     const settled = await Promise.all(
       plan.plans.map(async (p): Promise<StoreLookupResult | null> => {
@@ -106,6 +136,7 @@ export function assembleLookup(services: LookupServices): Lookup {
         // UNVERIFIED (we haven't fetched it), so segregate it into resolveTargets — never surface it
         // as a phantom candidate (no name=barcode into the matcher, no unfetched hit in orderable mode).
         if (p.kind === 'detail') {
+          if (skipCooling(p)) return null; // cooling host → cooldown list, never a resolveTarget
           resolveTargets.push({ siteId: p.siteId, host: p.host, itemId: p.itemId ?? '', url: p.url });
           return null;
         }
@@ -115,10 +146,22 @@ export function assembleLookup(services: LookupServices): Lookup {
           unsupported.push(p.siteId); // has a bySearch URL but no parser yet
           return null;
         }
+        if (skipCooling(p)) return null;
         const scope = services.profiles.retrievalFor(p.host)?.bySearch?.scope ?? 'listed';
         if (mode === 'listed' && scope === 'orderable') orderableOnly.push(p.siteId);
         try {
           const body = await services.fetchSearch(p.url, services.profiles.searchTransportFor(p.host));
+          // HONEST SEARCH LANE: a CF challenge/block body is NOT parseable content — extractCandidates
+          // would silently lift 0 candidates and pose the store as "carries nothing". Detect it BEFORE
+          // parsing: report the store `failed` with a logged reason, and OPEN its host's cooldown so
+          // the ingest queue and a later lookup leave it alone. Raw-capture stays inside fetchSearch.
+          if (isCloudflareChallenge(body)) {
+            // eslint-disable-next-line no-console
+            console.warn(`[lookup] ${sanitizeForLog(p.siteId)} search failed: challenge page`);
+            cd.open(p.host, 'search challenge page');
+            failed.push(p.siteId);
+            return null;
+          }
           let candidates = await ruleset.extractCandidates(body, p.url);
           // Substring-store identity post-filter (record-mode): the store matched only the single
           // selective term issued as `{q}`, so drop candidates whose normalized name lacks any remaining
@@ -157,6 +200,7 @@ export function assembleLookup(services: LookupServices): Lookup {
       unsupported,
       orderableOnly,
       failed,
+      cooldown,
       resolveTargets,
     };
   };
