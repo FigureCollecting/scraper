@@ -263,30 +263,56 @@ const RATE_LIMIT = {
   MAX_QUEUE_SIZE: 10000,
 } as const;
 
-/** Env var name for the D-11 per-host base-delay floor (ms). */
+/** Env var name for the per-host DEFAULT delay (ms) applied to hosts that declare no rate (D-11). */
 const HOST_BASE_DELAY_ENV = 'SCRAPER_HOST_BASE_DELAY_MS';
+/** Env var name for the ABSOLUTE per-host minimum (ms) that clamps EVERY host, declared or not. */
+const HOST_HARD_FLOOR_ENV = 'SCRAPER_HOST_HARD_FLOOR_MS';
 
 /**
- * The D-11 budget-safe per-host floor (ms) applied when `SCRAPER_HOST_BASE_DELAY_MS` is unset. The
- * measured budget is 24,700 req/day/host = 3500 ms at-budget; 4000 ms is the recommended value
- * (12% headroom, D-11's own figure). This is the DEFAULT so budget-safety is NEVER opt-in: a deploy
- * that forgets the env still paces within budget (a forgotten env must not silently run the crawler
- * ~1.75x over budget and burn datacenter-IP reputation). The env LOWERS this toward 3500 ms only on
- * clean evidence (D-11: "scale to 3500 only if clean").
+ * The D-11 budget-safe per-host DEFAULT (ms) applied when a host DECLARES NO rate (no resolved store
+ * profile) and `SCRAPER_HOST_BASE_DELAY_MS` is unset. The measured budget is 24,700 req/day/host =
+ * 3500 ms at-budget; 4000 ms is the recommended value (12% headroom, D-11's own figure). This is the
+ * DEFAULT so budget-safety is NEVER opt-in: a deploy that forgets the env still paces an unknown host
+ * within budget (a forgotten env must not silently run the crawler ~1.75x over budget and burn
+ * datacenter-IP reputation). The env LOWERS this toward 3500 ms only on clean evidence (D-11: "scale
+ * to 3500 only if clean"). A store that DECLARES its own rate is paced by that value instead (clamped
+ * up to HARD_FLOOR) — this default governs only undeclared hosts.
  */
 const DEFAULT_HOST_BASE_FLOOR_MS = 4000;
 
 /**
- * The per-host base-delay FLOOR (ms) from `SCRAPER_HOST_BASE_DELAY_MS` (D-11), or `undefined` when
- * unset. Read fresh each call so an operator can tune it without a restart in tooling. A non-finite
- * or non-positive value (empty string, garbage, 0, negative) reads as "unset" so misconfiguration
- * degrades to the safe default floor (DEFAULT_HOST_BASE_FLOOR_MS), never to zero (no-pacing).
+ * The absolute per-host MINIMUM (ms) applied when `SCRAPER_HOST_HARD_FLOOR_MS` is unset — clamps
+ * EVERY host, INCLUDING a store that deliberately declares a fast rate. This is typo/misconfig
+ * protection: a `baseDelayMs: 40` (or 0) must NOT hammer a host at 25 req/s — it clamps to 1 req/s.
+ * 1000 ms = 1 req/s/host = 86,400 req/day/host: intentionally BELOW the 24,700/day frontier budget
+ * (that budget is enforced by the 4000 ms DEFAULT on undeclared/HTML stores and by each store's own
+ * declared rate), so a deliberately-declared clean JSON-API store can differentiate into the
+ * ~1000-3000 ms band, while a mistake can never exceed 1 req/s. Anything faster than 1 req/s must be
+ * a reviewed, explicit exception (lower this env — same fail-safe parsing applies).
  */
-function resolveHostBaseFloorMs(): number | undefined {
-  const raw = process.env[HOST_BASE_DELAY_ENV];
+const DEFAULT_HOST_HARD_FLOOR_MS = 1000;
+
+/**
+ * Read a positive-ms env knob, fail-safe: `undefined` when unset OR when the value is non-finite or
+ * non-positive (empty string, garbage, 0, negative) — so misconfiguration degrades to the caller's
+ * safe default, NEVER to zero (no-pacing). Read fresh each call so an operator can tune without a
+ * restart in tooling.
+ */
+function resolvePositiveEnvMs(envVar: string): number | undefined {
+  const raw = process.env[envVar];
   if (raw === undefined || raw.trim() === '') return undefined;
   const ms = Number(raw);
   return Number.isFinite(ms) && ms > 0 ? ms : undefined;
+}
+
+/** The per-host DEFAULT delay (ms) for UNDECLARED hosts: the env when valid, else the budget-safe 4000 ms. */
+function resolveHostBaseDefaultMs(): number {
+  return resolvePositiveEnvMs(HOST_BASE_DELAY_ENV) ?? DEFAULT_HOST_BASE_FLOOR_MS;
+}
+
+/** The absolute per-host MINIMUM (ms) clamping every host: the env when valid, else the safe 1000 ms. */
+function resolveHostHardFloorMs(): number {
+  return resolvePositiveEnvMs(HOST_HARD_FLOOR_ENV) ?? DEFAULT_HOST_HARD_FLOOR_MS;
 }
 
 // ============================================================================
@@ -1396,21 +1422,36 @@ export class ScrapeQueue {
   }
 
   /**
-   * The per-host pacing floor. Always at least the D-11 budget floor: `SCRAPER_HOST_BASE_DELAY_MS`
-   * when set to a finite value > 0, else the budget-safe `DEFAULT_HOST_BASE_FLOOR_MS` (4000 ms). The
-   * store's own declared `rateLimit.baseDelayMs` (the SAME store-caps index the ingest path's
-   * transport lookup already reads — buildIngestExtractContext above) still wins where it is LARGER,
-   * so a store that asks to be paced MORE slowly is honored; but no host ever paces FASTER than the
-   * floor, whether it declares a fast delay or resolves no profile at all.
+   * The per-host pacing delay — per-store DIFFERENTIATED (two knobs, fail-safe preserved):
    *
-   * D-11 invariant = per-host, <= budget, scale on evidence. Budget-safety is the DEFAULT, never
-   * opt-in: with the env unset every host paces at >= 4000 ms, so a forgotten env cannot silently
-   * run over budget. The initiator LOWERS the env toward 3500 ms (at-budget) only on clean evidence.
+   *   effective = declared != null ? max(declared, hardFloor) : max(default, hardFloor)
+   *
+   * where `declared` is the store's own `rateLimit.baseDelayMs` (the SAME store-caps index the ingest
+   * path's transport lookup already reads — buildIngestExtractContext above), `default` is
+   * `SCRAPER_HOST_BASE_DELAY_MS` (else 4000 ms), and `hardFloor` is `SCRAPER_HOST_HARD_FLOOR_MS`
+   * (else 1000 ms). So:
+   *   - a host that DECLARES NO rate (no resolved profile) → the budget-safe DEFAULT (4000 ms) —
+   *     UNCHANGED fail-safe; a forgotten env cannot silently run an unknown host over budget.
+   *   - a store that DECLARES a rate → its OWN value, clamped UP to the hard floor. This is the
+   *     differentiation: a clean JSON-API store can now be paced FASTER than 4000 ms (down to the
+   *     hard floor) WITHOUT lowering the global default for every other host — and a mis-declared
+   *     fast value (e.g. 40 ms) still clamps to the hard floor, so a typo can never hammer a host.
+   *
+   * NOTE: a store declaring a rate SLOWER than the default is still honored (max wins), so a store
+   * asking to be paced gently is unaffected. Migrating a store to a fast declared rate is therefore a
+   * DELIBERATE per-store change in its profile (scraper-rulesets), never a silent global acceleration.
    */
   private hostBaseDelayMs(host: string): number {
-    const declared = this.profiles?.forHost(host)?.rateLimit?.baseDelayMs;
-    const floor = resolveHostBaseFloorMs() ?? DEFAULT_HOST_BASE_FLOOR_MS;
-    return Math.max(declared ?? floor, floor);
+    // A declared rate is honored ONLY when finite: `??` catches null/undefined, but a NON-finite
+    // number (NaN/Infinity) slips through — `Math.max(NaN, floor) = NaN` makes the dispatch gate
+    // `NaN > 0` false (fail-OPEN: zero pacing), and `Math.max(Infinity, floor) = Infinity` stalls the
+    // host forever. Both violate "the floor clamps EVERY host". Route a non-finite declared value to
+    // the budget-safe 4000ms default instead — conservative (slower), never faster, never zero,
+    // never a deadlock. Mirrors the Number.isFinite discipline resolvePositiveEnvMs already applies.
+    const raw = this.profiles?.forHost(host)?.rateLimit?.baseDelayMs;
+    const declared = typeof raw === 'number' && Number.isFinite(raw) ? raw : undefined;
+    const base = declared ?? resolveHostBaseDefaultMs();
+    return Math.max(base, resolveHostHardFloorMs());
   }
 
   private getNextProcessableItem(now: number): QueueItem | null {

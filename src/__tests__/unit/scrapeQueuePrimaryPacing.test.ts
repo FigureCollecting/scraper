@@ -182,36 +182,42 @@ describe('ScrapeQueue — primary-dispatch per-host pacing (D-11)', () => {
     expect(hosts).toEqual(['host-a.test', 'host-b.test', 'host-c.test']);
   });
 
-  // ---- (a) the per-host base delay is env-configurable (a floor over the declared delay) ------
-  it('honors SCRAPER_HOST_BASE_DELAY_MS as a per-host floor ABOVE the store-declared delay', async () => {
-    process.env[ENV_KEY] = '4000'; // initiator's D-11 soak knob (declared is only 200 ms)
+  // ---- (a) SCRAPER_HOST_BASE_DELAY_MS is the configurable DEFAULT for an UNDECLARED host --------
+  // Per-store differentiated pacing changed this knob's role: it is the DEFAULT for hosts that
+  // declare no rate, NOT a floor stacked ABOVE a store's own declared delay (that would prevent a
+  // clean-API store from ever running faster than the default). This test pins the surviving,
+  // corrected intent — the env still CONFIGURES the per-host default — on the undeclared path.
+  it('applies SCRAPER_HOST_BASE_DELAY_MS as the configurable per-host default for an UNDECLARED host (no resolved profile)', async () => {
+    // The registered store lives on host-a.test; the items hit a SUBDOMAIN the ruleset resolves via
+    // its `.host-a.test` fallback but ProfileRegistry (exact-domain) does NOT — so the host is
+    // UNDECLARED and takes the env default (6000 ms here), not the sibling's declared 200 ms.
+    process.env[ENV_KEY] = '6000';
     const { scraping } = makeQueue([{ siteId: 'host-a', domain: 'host-a.test', baseDelayMs: 200 }]);
 
-    queue.enqueue('a1', { priority: 'WARM', url: 'https://host-a.test/item/a1' });
-    queue.enqueue('a2', { priority: 'WARM', url: 'https://host-a.test/item/a2' });
+    queue.enqueue('u1', { priority: 'WARM', url: 'https://sub.host-a.test/item/u1' });
+    queue.enqueue('u2', { priority: 'WARM', url: 'https://sub.host-a.test/item/u2' });
 
     await advanceAndFlush(300);
-    expect(scraping.scrapePage).toHaveBeenCalledTimes(1); // a1 dispatches immediately
+    expect(scraping.scrapePage).toHaveBeenCalledTimes(1); // u1 dispatches immediately
 
-    // Past the OLD global blanket (2067 ms) AND the store's declared 200 ms, but under the
-    // configured 4000 ms floor: a global-blanket (or declared-only) impl would already have sent a2.
-    await advanceAndFlush(2600);
-    expect(scraping.scrapePage).toHaveBeenCalledTimes(1); // a2 STILL held by the 4000 ms configured floor
+    // Past the retired 2067 ms global blanket but under the configured 6000 ms default: u2 is held.
+    await advanceAndFlush(3200);
+    expect(scraping.scrapePage).toHaveBeenCalledTimes(1);
 
-    // Once 4000 ms since a1 has elapsed, a2 proceeds.
-    await advanceAndFlush(1800);
+    // Once 6000 ms since u1 has elapsed, u2 proceeds — the env configured the undeclared default.
+    await advanceAndFlush(3200);
     expect(scraping.scrapePage).toHaveBeenCalledTimes(2);
-    expect(scraping.scrapePage.mock.calls[1][0]).toBe('https://host-a.test/item/a2');
+    expect(scraping.scrapePage.mock.calls[1][0]).toBe('https://sub.host-a.test/item/u2');
   });
 
-  // ---- (a2) budget-safety is the DEFAULT, not opt-in — env UNSET still paces at the D-11 floor -
-  it('paces the SAME host at the D-11 budget-safe default (>=3500 ms) when SCRAPER_HOST_BASE_DELAY_MS is UNSET, even for a store declaring a FASTER delay', async () => {
-    // No env set (beforeEach deletes it). The store declares a fast 200 ms courtesy gap. D-11's
-    // invariant is per-host <= budget (24,700/day/host = 3500 ms; 4000 ms recommended). A forgotten
-    // env must NOT silently run the crawler over budget: the default floor holds the 2nd same-host
-    // dispatch back to the safe floor, and the operator LOWERS it toward 3500 ms only on evidence.
+  // ---- (a2) a DECLARED fast store differentiates below the default even with the env UNSET -------
+  // Under the old model a store declaring a FASTER delay was forced up to the default floor; that is
+  // exactly the limitation per-store differentiation removes. Now an env-unset deploy still paces
+  // UNDECLARED hosts at the budget-safe 4000 ms, but a store that DECLARES its own rate is paced by
+  // THAT value (clamped only to the 1000 ms hard floor), not the 4000 ms default.
+  it("lets a store's DECLARED fast delay differentiate it below the 4000ms default when SCRAPER_HOST_BASE_DELAY_MS is UNSET (clamped only to the hard floor)", async () => {
     expect(process.env[ENV_KEY]).toBeUndefined();
-    const { scraping } = makeQueue([{ siteId: 'host-a', domain: 'host-a.test', baseDelayMs: 200 }]);
+    const { scraping } = makeQueue([{ siteId: 'host-a', domain: 'host-a.test', baseDelayMs: 2000 }]);
 
     queue.enqueue('a1', { priority: 'WARM', url: 'https://host-a.test/item/a1' });
     queue.enqueue('a2', { priority: 'WARM', url: 'https://host-a.test/item/a2' });
@@ -219,13 +225,13 @@ describe('ScrapeQueue — primary-dispatch per-host pacing (D-11)', () => {
     await advanceAndFlush(300);
     expect(scraping.scrapePage).toHaveBeenCalledTimes(1); // a1 dispatches immediately
 
-    // Past the store's declared 200 ms AND the retired 2067 ms global blanket, but still under the
-    // 3500 ms budget: a declared-only default (the pre-fix behavior) would have sent a2 by now.
-    await advanceAndFlush(2600);
-    expect(scraping.scrapePage).toHaveBeenCalledTimes(1); // a2 held by the budget-safe default floor
+    // Past the 1000 ms hard floor but under the declared 2000 ms: a2 held (proves NOT clamped down).
+    await advanceAndFlush(800);
+    expect(scraping.scrapePage).toHaveBeenCalledTimes(1);
 
-    // Once the safe default (4000 ms) since a1 has elapsed, a2 proceeds.
-    await advanceAndFlush(1800);
+    // Past the declared 2000 ms but well under the 4000 ms default: a2 dispatches — the OLD
+    // max(declared, default) model would still be holding it here.
+    await advanceAndFlush(1000);
     expect(scraping.scrapePage).toHaveBeenCalledTimes(2);
     expect(scraping.scrapePage.mock.calls[1][0]).toBe('https://host-a.test/item/a2');
   });
