@@ -155,7 +155,7 @@ describe('ScrapeQueue — live queue per-host pacing (H1)', () => {
     expect(scraping.scrapePage.mock.calls[1][0]).toBe('https://host-a.test/item/a2');
   });
 
-  it('does NOT penalize a different, never-touched host by another host\'s floor', async () => {
+  it('does NOT penalize a different, never-touched host by another host\'s floor (independent per-host pacing, no global blanket — D-11)', async () => {
     const { scraping } = makeQueue([
       { siteId: 'host-a', domain: 'host-a.test', baseDelayMs: 5000 },
       { siteId: 'host-b', domain: 'host-b.test', baseDelayMs: 1000 },
@@ -164,14 +164,13 @@ describe('ScrapeQueue — live queue per-host pacing (H1)', () => {
     queue.enqueue('a1', { priority: 'WARM', url: 'https://host-a.test/item/a1' });
     queue.enqueue('b1', { priority: 'WARM', url: 'https://host-b.test/item/b1' });
 
-    await advanceAndFlush(100);
-    expect(scraping.scrapePage).toHaveBeenCalledTimes(1); // host-a's item 1
-
-    // Only the GLOBAL lane delay (2067ms) gates host-b's item — host-a's 5000ms floor must not
-    // leak onto it, since host-b has never been dispatched to.
-    await advanceAndFlush(2200);
+    // D-11: primary dispatch paces PER-HOST with NO global blanket, so host-b (never dispatched to)
+    // is NOT held behind host-a — both dispatch promptly, well inside the retired 2067ms global
+    // lane's window. host-a's 5000ms floor must not leak onto host-b.
+    await advanceAndFlush(600);
     expect(scraping.scrapePage).toHaveBeenCalledTimes(2);
-    expect(scraping.scrapePage.mock.calls[1][0]).toBe('https://host-b.test/item/b1');
+    const urls = scraping.scrapePage.mock.calls.map((c: any[]) => c[0]).sort();
+    expect(urls).toEqual(['https://host-a.test/item/a1', 'https://host-b.test/item/b1']);
   });
 
   it('a HOT item whose host is still paced does not block a WARM item for a different, ready host', async () => {

@@ -263,6 +263,22 @@ const RATE_LIMIT = {
   MAX_QUEUE_SIZE: 10000,
 } as const;
 
+/** Env var name for the D-11 per-host base-delay floor (ms). */
+const HOST_BASE_DELAY_ENV = 'SCRAPER_HOST_BASE_DELAY_MS';
+
+/**
+ * The per-host base-delay FLOOR (ms) from `SCRAPER_HOST_BASE_DELAY_MS` (D-11), or `undefined` when
+ * unset. Read fresh each call so an operator can tune it without a restart in tooling. A non-finite
+ * or non-positive value (empty string, garbage, 0, negative) reads as "unset" so misconfiguration
+ * degrades to the pre-D-11 declared-or-default pacing, never to zero (no-pacing).
+ */
+function resolveHostBaseFloorMs(): number | undefined {
+  const raw = process.env[HOST_BASE_DELAY_ENV];
+  if (raw === undefined || raw.trim() === '') return undefined;
+  const ms = Number(raw);
+  return Number.isFinite(ms) && ms > 0 ? ms : undefined;
+}
+
 // ============================================================================
 // Error Classification
 // ============================================================================
@@ -1022,17 +1038,25 @@ export class ScrapeQueue {
       return; // Processing loop not active - don't start new work
     }
 
-    // Check if we should wait for rate limit
     const now = Date.now();
-    const timeSinceLastRequest = now - this.lastRequestTime;
 
-    if (timeSinceLastRequest < this.currentDelay) {
-      // Schedule next attempt after delay (unless cooldown timer already handling retry)
-      if (!this.cooldownWaitTimerId) {
-        const waitTime = this.currentDelay - timeSinceLastRequest;
-        setTimeout(() => this.processNext(), waitTime);
+    // GLOBAL BACKOFF BRAKE (D-11): the blanket inter-request delay applies ONLY while a rate-limit
+    // backoff is in effect (`isRateLimited`) — a CF-storm safety net that briefly serializes ALL
+    // hosts on the escalated `currentDelay` until SUCCESS_THRESHOLD clean successes recover it.
+    // During NORMAL operation there is NO global blanket: primary-dispatch pacing is PER-HOST
+    // (getNextProcessableItem's per-host floor, keyed on the request's host), so independent hosts
+    // are never serialized behind one another — retiring the 2067 ms global base delay that
+    // DECISIONS-PENDING.md D-11 flags as 1.7x over the per-host budget.
+    if (this.isRateLimited) {
+      const timeSinceLastRequest = now - this.lastRequestTime;
+      if (timeSinceLastRequest < this.currentDelay) {
+        // Schedule next attempt after delay (unless cooldown timer already handling retry)
+        if (!this.cooldownWaitTimerId) {
+          const waitTime = this.currentDelay - timeSinceLastRequest;
+          setTimeout(() => this.processNext(), waitTime);
+        }
+        return;
       }
-      return;
     }
 
     // Get next item, considering paused sessions, cooldowns, and per-host pacing
@@ -1099,8 +1123,12 @@ export class ScrapeQueue {
         setTimeout(() => this.processNext(), 0);
       }
     } else if (!this.cooldownWaitTimerId) {
-      // Schedule next item (unless cooldown timer already handling retry)
-      setTimeout(() => this.processNext(), this.currentDelay);
+      // Schedule the next dispatch (unless cooldown timer already handling retry). Under NORMAL
+      // operation re-drive IMMEDIATELY (0) and let getNextProcessableItem's per-host floor pace the
+      // next item — it schedules a precise re-check when every ready item is host-paced (D-11). Only
+      // while an active rate-limit backoff is in effect do we honor the escalated global brake.
+      const nextIn = this.isRateLimited ? this.currentDelay : 0;
+      setTimeout(() => this.processNext(), nextIn);
     }
   }
 
@@ -1344,14 +1372,22 @@ export class ScrapeQueue {
   }
 
   /**
-   * The per-host pacing floor (H1): the store's own declared `rateLimit.baseDelayMs` (the SAME
-   * store-caps index the ingest path's transport lookup already reads — buildIngestExtractContext
-   * above), falling back to `DEFAULT_FETCH_BODY_GAP_MS` (engineServices/extractContext.ts) for a
-   * host with no resolved store profile — mirroring that seam's own undeclared-store default
-   * rather than inventing a second one.
+   * The per-host pacing floor: the store's own declared `rateLimit.baseDelayMs` (the SAME store-caps
+   * index the ingest path's transport lookup already reads — buildIngestExtractContext above),
+   * falling back to `DEFAULT_FETCH_BODY_GAP_MS` (engineServices/extractContext.ts) for a host with no
+   * resolved store profile.
+   *
+   * D-11 makes this TUNABLE: `SCRAPER_HOST_BASE_DELAY_MS`, when set to a finite value > 0, is a
+   * per-host FLOOR applied over every host — the store's declared delay still wins where it is
+   * LARGER, but no host paces faster than the configured floor. This is the knob the initiator sets
+   * for a conservative first soak (D-11: 4000 ms/host) and then lowers on evidence; unset, the delay
+   * is exactly the pre-D-11 declared-or-default behavior.
    */
   private hostBaseDelayMs(host: string): number {
-    return this.profiles?.forHost(host)?.rateLimit?.baseDelayMs ?? DEFAULT_FETCH_BODY_GAP_MS;
+    const declared = this.profiles?.forHost(host)?.rateLimit?.baseDelayMs;
+    const floor = resolveHostBaseFloorMs();
+    if (floor !== undefined) return Math.max(declared ?? floor, floor);
+    return declared ?? DEFAULT_FETCH_BODY_GAP_MS;
   }
 
   private getNextProcessableItem(now: number): QueueItem | null {
