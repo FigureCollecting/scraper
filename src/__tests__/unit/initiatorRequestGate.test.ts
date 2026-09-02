@@ -108,4 +108,44 @@ describe('createRequestGate', () => {
     await gate.run(async () => 1);
     expect(gate.remaining()).toBe(2);
   });
+
+  it('never exceeds maxConcurrency when a fresh request arrives during the release window', async () => {
+    // Regression: releasing a slot must HAND it to a waiter, not drop the count and
+    // let a woken waiter re-increment later. Otherwise a fresh fast-path acquire that
+    // lands between two woken waiters' continuations steals a slot and breaches the cap.
+    // Reproduced deterministically at max=2: two fns share a barrier so they release
+    // adjacently; two park; a fresh fn is submitted from the first's completion.
+    const gate = createRequestGate({ maxConcurrency: 2, maxRequests: 100, spacingMs: 0 });
+    let inside = 0;
+    let peak = 0;
+    let started = 0;
+    const barrier = deferred();
+    const longFn = () =>
+      gate.run(async () => {
+        started++;
+        inside++;
+        peak = Math.max(peak, inside);
+        await barrier.promise;
+        inside--;
+        return 'ab';
+      });
+    const shortFn = (tag: string) => () =>
+      gate.run(async () => {
+        inside++;
+        peak = Math.max(peak, inside);
+        await new Promise((r) => setTimeout(r, 5));
+        inside--;
+        return tag;
+      });
+    const pA = longFn();
+    const pB = longFn();
+    const pC = shortFn('c')();
+    const pD = shortFn('d')();
+    await waitFor(() => started === 2); // A,B in-flight; C,D parked as waiters
+    const pE = pA.then(() => shortFn('e')()); // fresh submit in the release window
+    barrier.resolve();
+    await Promise.all([pB, pC, pD, pE]);
+    expect(peak).toBeLessThanOrEqual(2);
+    expect(gate.peakInFlight()).toBeLessThanOrEqual(2);
+  });
 });

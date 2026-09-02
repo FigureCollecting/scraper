@@ -61,14 +61,21 @@ export function createRequestGate(opts: RequestGateOptions): RequestGate {
       inFlight++;
       return;
     }
+    // Park until a slot is HANDED to us. releaseSlot does not drop the count when
+    // it wakes a waiter, so the slot is already ours — do NOT re-increment here.
+    // (Re-incrementing after being woken opens a release/reacquire race: a fresh
+    // fast-path acquire landing between two woken waiters would steal a slot and
+    // breach maxConcurrency.)
     await new Promise<void>((resolve) => waiters.push(resolve));
-    inFlight++;
   };
 
   const releaseSlot = (): void => {
-    inFlight--;
     const next = waiters.shift();
-    if (next) next();
+    if (next) {
+      next(); // hand this slot straight to the waiter — inFlight is unchanged
+    } else {
+      inFlight--;
+    }
   };
 
   const applySpacing = async (): Promise<void> => {
