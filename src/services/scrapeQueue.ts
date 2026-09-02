@@ -32,7 +32,7 @@ import { createIngestEmitterFromEnv } from './ingestEmitter.js';
 import { impitFetchBody } from './impitFetch.js';
 import { httpFetchBody } from './engineLookup.js';
 import { buildProfileRegistry, ProfileRegistry } from '../driver/profileRegistry.js';
-import { extractRecords } from './engineServices/extractRecords.js';
+import { extractRecords, EmptyExtractionError } from './engineServices/extractRecords.js';
 import { buildExtractContext, DEFAULT_FETCH_BODY_GAP_MS } from './engineServices/extractContext.js';
 import { createPluginLogger } from './engineServices/pluginLogger.js';
 import type { CaptureSink } from './captureSink.js';
@@ -1229,6 +1229,20 @@ export class ScrapeQueue {
       // failure.
       records = await extractRecords(ruleset, page.html, item.url, ctx);
     } catch (error: any) {
+      // VALID-EMPTY (Ross directive: "differentiate between no data when none expected and no data
+      // as error"). A ruleset that EXPLICITLY opted in via `emptyResultIsValid` AND returned zero
+      // records (EmptyExtractionError) on a NON-challenge page has SUCCESSFULLY determined there is
+      // genuinely nothing to emit — a well-formed empty listing/search result. Record it as a
+      // SUCCESS (empty), never an error: the distinction is the EXTRACTOR'S OWN explicit signal +
+      // its returned-empty, never the row count alone. A challenge page (blocked, not truly empty),
+      // a non-opting ruleset's empty, or any other extraction throw stays a failure below.
+      if (error instanceof EmptyExtractionError && ruleset.emptyResultIsValid === true && !page.challenge) {
+        console.log(
+          `[SCRAPE QUEUE] Ingest complete for ${item.url}: persisted=0 emitted=0 valid-empty ` +
+            `(ruleset ${ruleset.siteId}@${ruleset.version} declared an empty extraction valid)`
+        );
+        return {} as ScrapedData;
+      }
       console.error(
         `[SCRAPE QUEUE] Extraction failed for ${item.url} (ruleset ${ruleset.siteId}@${ruleset.version}): ${sanitizeForLog(error?.message ?? String(error))}`
       );
