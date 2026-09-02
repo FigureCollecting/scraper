@@ -30,6 +30,7 @@ module.exports = {
     'src/**/*.ts',
     '!src/**/*.d.ts',
     '!src/index.ts',
+    '!src/initiator/run.ts',  // process entrypoint (wiring only), like src/index.ts
     '!src/utils/logger.ts',
     '!src/__tests__/**',  // Exclude all test files and mocks
   ],
