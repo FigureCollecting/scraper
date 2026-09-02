@@ -4,6 +4,20 @@ All notable changes to `@figurecollecting/scraper-plugin-contract` will be docum
 file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this
 package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-09-01
+
+Additive, backward-compatible: every existing `ExtractionRuleset` still compiles unchanged — the
+new field is optional and its absence keeps the safe default (a zero-record extraction stays an
+error). Built for the emit honesty gate (valid-empty vs error-empty).
+
+### Added
+- `ExtractionRuleset.emptyResultIsValid?: boolean` — when `true`, the ruleset declares that a
+  ZERO-RECORD extraction is a VALID outcome (a well-formed empty search/listing result, a delisted
+  page with no claimable data): the engine records such an extraction as a SUCCESS (empty) instead
+  of a failure. Applies ONLY to a genuinely empty return from `extractMany` (an `[]`) on a
+  NON-challenge page. Omit (or `false`) to keep the safe default — a zero-record extraction is an
+  error, so a ruleset that has NOT reasoned about empties never has its parse breaks silently pass.
+
 ## [0.4.1] - 2026-08-31
 
 Additive, backward-compatible: every existing `bySearch` capability still compiles unchanged — the

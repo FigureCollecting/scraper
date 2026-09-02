@@ -35,6 +35,23 @@ type RulesetWithExtractAsync = ExtractionRuleset & {
   extractAsync?: (html: string, url: string, ctx?: ExtractContext) => Promise<ExtractedData>;
 };
 
+/**
+ * A ruleset's extraction produced ZERO records (an `extractMany` returning `[]`). Its OWN class so a
+ * consumer can distinguish it from any other extraction throw BY TYPE (never by message text): the
+ * live ingest queue treats it as a VALID-EMPTY success ONLY when the ruleset explicitly opted in via
+ * `emptyResultIsValid` on a non-challenge page, and as a failure otherwise. The default remains a
+ * throw — a ruleset that has not reasoned about empties must still surface its zero-record result
+ * loudly (D11 empty-guard), never silently pass.
+ */
+export class EmptyExtractionError extends Error {
+  readonly ruleset: string;
+  constructor(ruleset: string) {
+    super(`[EXTRACT RECORDS] ${ruleset}: extraction produced no records (empty result)`);
+    this.name = 'EmptyExtractionError';
+    this.ruleset = ruleset;
+  }
+}
+
 /** Which multi-record target field a record carries (mutually exclusive in practice). */
 type TargetRef = { field: 'editionOf' | 'offerOf'; itemId: string };
 
@@ -49,7 +66,7 @@ function validateRecordSet(ruleset: ExtractionRuleset, records: ExtractedData[])
   const label = `${ruleset.siteId}@${ruleset.version}`;
 
   if (!Array.isArray(records) || records.length === 0) {
-    throw new Error(`[EXTRACT RECORDS] ${label}: extraction produced no records (empty result)`);
+    throw new EmptyExtractionError(label);
   }
 
   const seenIds = new Set<string>();

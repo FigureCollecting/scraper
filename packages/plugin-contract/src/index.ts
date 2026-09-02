@@ -374,6 +374,18 @@ export interface ExtractionRuleset {
     url: string,
     ctx?: ExtractContext,
   ): SearchCandidate[] | Promise<SearchCandidate[]>;
+  /**
+   * OPTIONAL: when `true`, this ruleset declares that a ZERO-RECORD extraction is a VALID outcome
+   * — the page was well-formed and the ruleset successfully determined there is genuinely nothing
+   * to emit (an empty search/listing result, a delisted page with no claimable data). This is the
+   * EXTRACTOR'S OWN SIGNAL that "no data" means "none expected", NOT "extraction failed": the
+   * engine records such an extraction as a SUCCESS (empty) instead of a failure. It applies ONLY to
+   * a genuinely empty return from `extractMany` (an `[]`) on a NON-challenge page; a challenge page,
+   * a thrown extraction, or an emitted record the spine persisted nothing for stays a failure. Omit
+   * (or `false`) to keep the default: a zero-record extraction is an error (the safe default — a
+   * ruleset that has NOT reasoned about empties must not have its parse breaks silently pass).
+   */
+  emptyResultIsValid?: boolean;
 }
 
 /**

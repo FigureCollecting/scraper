@@ -32,8 +32,8 @@ import { createIngestEmitterFromEnv } from './ingestEmitter.js';
 import { impitFetchBody } from './impitFetch.js';
 import { httpFetchBody } from './engineLookup.js';
 import { buildProfileRegistry, ProfileRegistry } from '../driver/profileRegistry.js';
-import { extractRecords } from './engineServices/extractRecords.js';
-import { buildExtractContext, DEFAULT_FETCH_BODY_GAP_MS } from './engineServices/extractContext.js';
+import { extractRecords, EmptyExtractionError } from './engineServices/extractRecords.js';
+import { buildExtractContext } from './engineServices/extractContext.js';
 import { createPluginLogger } from './engineServices/pluginLogger.js';
 import type { CaptureSink } from './captureSink.js';
 import type {
@@ -262,6 +262,32 @@ const RATE_LIMIT = {
   /** Maximum items in queue per priority */
   MAX_QUEUE_SIZE: 10000,
 } as const;
+
+/** Env var name for the D-11 per-host base-delay floor (ms). */
+const HOST_BASE_DELAY_ENV = 'SCRAPER_HOST_BASE_DELAY_MS';
+
+/**
+ * The D-11 budget-safe per-host floor (ms) applied when `SCRAPER_HOST_BASE_DELAY_MS` is unset. The
+ * measured budget is 24,700 req/day/host = 3500 ms at-budget; 4000 ms is the recommended value
+ * (12% headroom, D-11's own figure). This is the DEFAULT so budget-safety is NEVER opt-in: a deploy
+ * that forgets the env still paces within budget (a forgotten env must not silently run the crawler
+ * ~1.75x over budget and burn datacenter-IP reputation). The env LOWERS this toward 3500 ms only on
+ * clean evidence (D-11: "scale to 3500 only if clean").
+ */
+const DEFAULT_HOST_BASE_FLOOR_MS = 4000;
+
+/**
+ * The per-host base-delay FLOOR (ms) from `SCRAPER_HOST_BASE_DELAY_MS` (D-11), or `undefined` when
+ * unset. Read fresh each call so an operator can tune it without a restart in tooling. A non-finite
+ * or non-positive value (empty string, garbage, 0, negative) reads as "unset" so misconfiguration
+ * degrades to the safe default floor (DEFAULT_HOST_BASE_FLOOR_MS), never to zero (no-pacing).
+ */
+function resolveHostBaseFloorMs(): number | undefined {
+  const raw = process.env[HOST_BASE_DELAY_ENV];
+  if (raw === undefined || raw.trim() === '') return undefined;
+  const ms = Number(raw);
+  return Number.isFinite(ms) && ms > 0 ? ms : undefined;
+}
 
 // ============================================================================
 // Error Classification
@@ -1022,17 +1048,25 @@ export class ScrapeQueue {
       return; // Processing loop not active - don't start new work
     }
 
-    // Check if we should wait for rate limit
     const now = Date.now();
-    const timeSinceLastRequest = now - this.lastRequestTime;
 
-    if (timeSinceLastRequest < this.currentDelay) {
-      // Schedule next attempt after delay (unless cooldown timer already handling retry)
-      if (!this.cooldownWaitTimerId) {
-        const waitTime = this.currentDelay - timeSinceLastRequest;
-        setTimeout(() => this.processNext(), waitTime);
+    // GLOBAL BACKOFF BRAKE (D-11): the blanket inter-request delay applies ONLY while a rate-limit
+    // backoff is in effect (`isRateLimited`) — a CF-storm safety net that briefly serializes ALL
+    // hosts on the escalated `currentDelay` until SUCCESS_THRESHOLD clean successes recover it.
+    // During NORMAL operation there is NO global blanket: primary-dispatch pacing is PER-HOST
+    // (getNextProcessableItem's per-host floor, keyed on the request's host), so independent hosts
+    // are never serialized behind one another — retiring the 2067 ms global base delay that
+    // DECISIONS-PENDING.md D-11 flags as 1.7x over the per-host budget.
+    if (this.isRateLimited) {
+      const timeSinceLastRequest = now - this.lastRequestTime;
+      if (timeSinceLastRequest < this.currentDelay) {
+        // Schedule next attempt after delay (unless cooldown timer already handling retry)
+        if (!this.cooldownWaitTimerId) {
+          const waitTime = this.currentDelay - timeSinceLastRequest;
+          setTimeout(() => this.processNext(), waitTime);
+        }
+        return;
       }
-      return;
     }
 
     // Get next item, considering paused sessions, cooldowns, and per-host pacing
@@ -1099,8 +1133,12 @@ export class ScrapeQueue {
         setTimeout(() => this.processNext(), 0);
       }
     } else if (!this.cooldownWaitTimerId) {
-      // Schedule next item (unless cooldown timer already handling retry)
-      setTimeout(() => this.processNext(), this.currentDelay);
+      // Schedule the next dispatch (unless cooldown timer already handling retry). Under NORMAL
+      // operation re-drive IMMEDIATELY (0) and let getNextProcessableItem's per-host floor pace the
+      // next item — it schedules a precise re-check when every ready item is host-paced (D-11). Only
+      // while an active rate-limit backoff is in effect do we honor the escalated global brake.
+      const nextIn = this.isRateLimited ? this.currentDelay : 0;
+      setTimeout(() => this.processNext(), nextIn);
     }
   }
 
@@ -1201,6 +1239,20 @@ export class ScrapeQueue {
       // failure.
       records = await extractRecords(ruleset, page.html, item.url, ctx);
     } catch (error: any) {
+      // VALID-EMPTY (Ross directive: "differentiate between no data when none expected and no data
+      // as error"). A ruleset that EXPLICITLY opted in via `emptyResultIsValid` AND returned zero
+      // records (EmptyExtractionError) on a NON-challenge page has SUCCESSFULLY determined there is
+      // genuinely nothing to emit — a well-formed empty listing/search result. Record it as a
+      // SUCCESS (empty), never an error: the distinction is the EXTRACTOR'S OWN explicit signal +
+      // its returned-empty, never the row count alone. A challenge page (blocked, not truly empty),
+      // a non-opting ruleset's empty, or any other extraction throw stays a failure below.
+      if (error instanceof EmptyExtractionError && ruleset.emptyResultIsValid === true && !page.challenge) {
+        console.log(
+          `[SCRAPE QUEUE] Ingest complete for ${item.url}: persisted=0 emitted=0 valid-empty ` +
+            `(ruleset ${ruleset.siteId}@${ruleset.version} declared an empty extraction valid)`
+        );
+        return {} as ScrapedData;
+      }
       console.error(
         `[SCRAPE QUEUE] Extraction failed for ${item.url} (ruleset ${ruleset.siteId}@${ruleset.version}): ${sanitizeForLog(error?.message ?? String(error))}`
       );
@@ -1344,14 +1396,21 @@ export class ScrapeQueue {
   }
 
   /**
-   * The per-host pacing floor (H1): the store's own declared `rateLimit.baseDelayMs` (the SAME
-   * store-caps index the ingest path's transport lookup already reads — buildIngestExtractContext
-   * above), falling back to `DEFAULT_FETCH_BODY_GAP_MS` (engineServices/extractContext.ts) for a
-   * host with no resolved store profile — mirroring that seam's own undeclared-store default
-   * rather than inventing a second one.
+   * The per-host pacing floor. Always at least the D-11 budget floor: `SCRAPER_HOST_BASE_DELAY_MS`
+   * when set to a finite value > 0, else the budget-safe `DEFAULT_HOST_BASE_FLOOR_MS` (4000 ms). The
+   * store's own declared `rateLimit.baseDelayMs` (the SAME store-caps index the ingest path's
+   * transport lookup already reads — buildIngestExtractContext above) still wins where it is LARGER,
+   * so a store that asks to be paced MORE slowly is honored; but no host ever paces FASTER than the
+   * floor, whether it declares a fast delay or resolves no profile at all.
+   *
+   * D-11 invariant = per-host, <= budget, scale on evidence. Budget-safety is the DEFAULT, never
+   * opt-in: with the env unset every host paces at >= 4000 ms, so a forgotten env cannot silently
+   * run over budget. The initiator LOWERS the env toward 3500 ms (at-budget) only on clean evidence.
    */
   private hostBaseDelayMs(host: string): number {
-    return this.profiles?.forHost(host)?.rateLimit?.baseDelayMs ?? DEFAULT_FETCH_BODY_GAP_MS;
+    const declared = this.profiles?.forHost(host)?.rateLimit?.baseDelayMs;
+    const floor = resolveHostBaseFloorMs() ?? DEFAULT_HOST_BASE_FLOOR_MS;
+    return Math.max(declared ?? floor, floor);
   }
 
   private getNextProcessableItem(now: number): QueueItem | null {
