@@ -62,6 +62,18 @@ const posInt = (raw: string | undefined, fallback: number): number => {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 };
 
+/**
+ * Parse a non-negative integer; fall back only on absent / non-numeric / negative
+ * input. Used for the BUDGET knobs (maxRequests, maxUrlsPerStore) so an explicit 0
+ * is honored as a hard clamp — a safety limit must not fail OPEN by reverting to a
+ * generous default at its most-conservative setting.
+ */
+const nonNegInt = (raw: string | undefined, fallback: number): number => {
+  if (raw === undefined) return fallback;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+};
+
 export function loadInitiatorConfig(env: Env = process.env): InitiatorConfig {
   // A csv var is defaulted ONLY when unset. An explicitly-set-but-empty value is
   // honored as an empty list — the operator's kill switch (zero stores → no work).
@@ -76,8 +88,8 @@ export function loadInitiatorConfig(env: Env = process.env): InitiatorConfig {
     terms,
     mode: env.INITIATOR_LOOKUP_MODE === 'orderable' ? 'orderable' : 'listed',
     maxConcurrency: posInt(env.INITIATOR_MAX_CONCURRENCY, DEFAULTS.maxConcurrency),
-    maxRequests: posInt(env.INITIATOR_MAX_REQUESTS, DEFAULTS.maxRequests),
-    maxUrlsPerStore: posInt(env.INITIATOR_MAX_URLS_PER_STORE, DEFAULTS.maxUrlsPerStore),
+    maxRequests: nonNegInt(env.INITIATOR_MAX_REQUESTS, DEFAULTS.maxRequests),
+    maxUrlsPerStore: nonNegInt(env.INITIATOR_MAX_URLS_PER_STORE, DEFAULTS.maxUrlsPerStore),
     requestSpacingMs: posInt(env.INITIATOR_REQUEST_SPACING_MS, DEFAULTS.requestSpacingMs),
     requestTimeoutMs: posInt(env.INITIATOR_REQUEST_TIMEOUT_MS, DEFAULTS.requestTimeoutMs),
   };

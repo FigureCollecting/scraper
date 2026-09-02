@@ -40,16 +40,28 @@ describe('loadInitiatorConfig', () => {
     expect(c.requestTimeoutMs).toBe(9000);
   });
 
-  it('falls back to defaults on non-numeric or non-positive knobs (concurrency floored at 1)', () => {
+  it('falls back to defaults on non-numeric or negative knobs (concurrency floored at 1)', () => {
     const c = loadInitiatorConfig({
       INITIATOR_MAX_CONCURRENCY: 'abc',
-      INITIATOR_MAX_REQUESTS: '0',
+      INITIATOR_MAX_REQUESTS: '-1',
       INITIATOR_MAX_URLS_PER_STORE: '-4',
     });
     expect(c.maxConcurrency).toBe(2);
     expect(c.maxRequests).toBeGreaterThan(0);
     expect(c.maxUrlsPerStore).toBeGreaterThan(0);
     expect(c.maxConcurrency).toBeGreaterThanOrEqual(1);
+  });
+
+  it('honors an explicit zero for the budget knobs as a hard clamp (most-conservative egress setting)', () => {
+    // A safety limit must not fail OPEN: setting the total-request budget to 0 must
+    // clamp egress to zero (the gate honors 0 → dispatch nothing), NOT silently
+    // revert to the 40-request default. Likewise MAX_URLS_PER_STORE=0 = enqueue-nothing
+    // discovery dry run. maxConcurrency=0 stays defaulted (0 concurrency = deadlock).
+    const c = loadInitiatorConfig({ INITIATOR_MAX_REQUESTS: '0', INITIATOR_MAX_URLS_PER_STORE: '0' });
+    expect(c.maxRequests).toBe(0);
+    expect(c.maxUrlsPerStore).toBe(0);
+    const floored = loadInitiatorConfig({ INITIATOR_MAX_CONCURRENCY: '0' });
+    expect(floored.maxConcurrency).toBe(2);
   });
 
   it('honors an explicitly-set empty INITIATOR_STORES as zero stores (operator kill switch)', () => {
