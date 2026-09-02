@@ -203,12 +203,14 @@ describe('ScrapeQueue — live queue per-host pacing (H1)', () => {
     expect(scraping.scrapePage.mock.calls[2][0]).toBe('https://host-a.test/item/a1');
   });
 
-  it("falls back to DEFAULT_FETCH_BODY_GAP_MS (2000ms) — not the store's declared baseDelayMs — when the item's host has no resolved store profile, even though its ruleset matched via the subdomain fallback", async () => {
+  it("falls back to the D-11 budget-safe default floor (4000ms) — not the store's declared baseDelayMs — when the item's host has no resolved store profile, even though its ruleset matched via the subdomain fallback", async () => {
     // The registered store's declared floor is 5000ms, but the items below hit a SUBDOMAIN
     // ('sub.host-a.test') that extractionRegistry's own subdomain fallback resolves to the
     // 'host-a' ruleset, while ProfileRegistry's byHost index (exact-domain only, no subdomain
     // wildcard) does NOT resolve it — so profiles.forHost('sub.host-a.test') is undefined and
-    // hostBaseDelayMs() must take the `?? DEFAULT_FETCH_BODY_GAP_MS` branch, not the 5000ms one.
+    // hostBaseDelayMs() must take the budget-safe DEFAULT_HOST_BASE_FLOOR_MS (4000ms) branch, NOT
+    // the store's 5000ms. A host we have NO profile for gets the conservative default, never a
+    // faster-than-budget gap — SCRAPER_HOST_BASE_DELAY_MS is unset in this suite.
     const { scraping } = makeQueue([{ siteId: 'host-a', domain: 'host-a.test', baseDelayMs: 5000 }]);
 
     queue.enqueue('u1', { priority: 'WARM', url: 'https://sub.host-a.test/item/u1' });
@@ -217,9 +219,14 @@ describe('ScrapeQueue — live queue per-host pacing (H1)', () => {
     await advanceAndFlush(100);
     expect(scraping.scrapePage).toHaveBeenCalledTimes(1); // u1 dispatches (ruleset DID match)
 
-    // Past the DEFAULT gap (2000ms) but well short of the store's declared 5000ms floor: if the
-    // fallback were wrongly reading the store's own baseDelayMs, u2 would still be blocked here.
+    // Past the retired 2067ms global blanket but still UNDER the 4000ms safe default: u2 must NOT
+    // have gone yet (proving the no-profile fallback is the 4000ms floor, not the old 2000ms gap).
     await advanceAndFlush(2200);
+    expect(scraping.scrapePage).toHaveBeenCalledTimes(1);
+
+    // Past 4000ms but well short of the store's declared 5000ms: if the fallback were wrongly
+    // reading the store's own baseDelayMs, u2 would still be blocked here. It dispatches instead.
+    await advanceAndFlush(2100);
     expect(scraping.scrapePage).toHaveBeenCalledTimes(2);
     expect(scraping.scrapePage.mock.calls[1][0]).toBe('https://sub.host-a.test/item/u2');
   });

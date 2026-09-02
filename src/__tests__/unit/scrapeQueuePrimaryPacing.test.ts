@@ -204,6 +204,32 @@ describe('ScrapeQueue — primary-dispatch per-host pacing (D-11)', () => {
     expect(scraping.scrapePage.mock.calls[1][0]).toBe('https://host-a.test/item/a2');
   });
 
+  // ---- (a2) budget-safety is the DEFAULT, not opt-in — env UNSET still paces at the D-11 floor -
+  it('paces the SAME host at the D-11 budget-safe default (>=3500 ms) when SCRAPER_HOST_BASE_DELAY_MS is UNSET, even for a store declaring a FASTER delay', async () => {
+    // No env set (beforeEach deletes it). The store declares a fast 200 ms courtesy gap. D-11's
+    // invariant is per-host <= budget (24,700/day/host = 3500 ms; 4000 ms recommended). A forgotten
+    // env must NOT silently run the crawler over budget: the default floor holds the 2nd same-host
+    // dispatch back to the safe floor, and the operator LOWERS it toward 3500 ms only on evidence.
+    expect(process.env[ENV_KEY]).toBeUndefined();
+    const { scraping } = makeQueue([{ siteId: 'host-a', domain: 'host-a.test', baseDelayMs: 200 }]);
+
+    queue.enqueue('a1', { priority: 'WARM', url: 'https://host-a.test/item/a1' });
+    queue.enqueue('a2', { priority: 'WARM', url: 'https://host-a.test/item/a2' });
+
+    await advanceAndFlush(300);
+    expect(scraping.scrapePage).toHaveBeenCalledTimes(1); // a1 dispatches immediately
+
+    // Past the store's declared 200 ms AND the retired 2067 ms global blanket, but still under the
+    // 3500 ms budget: a declared-only default (the pre-fix behavior) would have sent a2 by now.
+    await advanceAndFlush(2600);
+    expect(scraping.scrapePage).toHaveBeenCalledTimes(1); // a2 held by the budget-safe default floor
+
+    // Once the safe default (4000 ms) since a1 has elapsed, a2 proceeds.
+    await advanceAndFlush(1800);
+    expect(scraping.scrapePage).toHaveBeenCalledTimes(2);
+    expect(scraping.scrapePage.mock.calls[1][0]).toBe('https://host-a.test/item/a2');
+  });
+
   // ---- (c) a cooling host is fast-failed BEFORE any fetch, under the new pacing (preservation) -
   it('fast-fails a cooling host BEFORE any fetch and never lets it delay a ready different host', async () => {
     const COOL = 'cool.test';

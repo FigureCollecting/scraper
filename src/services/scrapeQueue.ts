@@ -33,7 +33,7 @@ import { impitFetchBody } from './impitFetch.js';
 import { httpFetchBody } from './engineLookup.js';
 import { buildProfileRegistry, ProfileRegistry } from '../driver/profileRegistry.js';
 import { extractRecords, EmptyExtractionError } from './engineServices/extractRecords.js';
-import { buildExtractContext, DEFAULT_FETCH_BODY_GAP_MS } from './engineServices/extractContext.js';
+import { buildExtractContext } from './engineServices/extractContext.js';
 import { createPluginLogger } from './engineServices/pluginLogger.js';
 import type { CaptureSink } from './captureSink.js';
 import type {
@@ -267,10 +267,20 @@ const RATE_LIMIT = {
 const HOST_BASE_DELAY_ENV = 'SCRAPER_HOST_BASE_DELAY_MS';
 
 /**
+ * The D-11 budget-safe per-host floor (ms) applied when `SCRAPER_HOST_BASE_DELAY_MS` is unset. The
+ * measured budget is 24,700 req/day/host = 3500 ms at-budget; 4000 ms is the recommended value
+ * (12% headroom, D-11's own figure). This is the DEFAULT so budget-safety is NEVER opt-in: a deploy
+ * that forgets the env still paces within budget (a forgotten env must not silently run the crawler
+ * ~1.75x over budget and burn datacenter-IP reputation). The env LOWERS this toward 3500 ms only on
+ * clean evidence (D-11: "scale to 3500 only if clean").
+ */
+const DEFAULT_HOST_BASE_FLOOR_MS = 4000;
+
+/**
  * The per-host base-delay FLOOR (ms) from `SCRAPER_HOST_BASE_DELAY_MS` (D-11), or `undefined` when
  * unset. Read fresh each call so an operator can tune it without a restart in tooling. A non-finite
  * or non-positive value (empty string, garbage, 0, negative) reads as "unset" so misconfiguration
- * degrades to the pre-D-11 declared-or-default pacing, never to zero (no-pacing).
+ * degrades to the safe default floor (DEFAULT_HOST_BASE_FLOOR_MS), never to zero (no-pacing).
  */
 function resolveHostBaseFloorMs(): number | undefined {
   const raw = process.env[HOST_BASE_DELAY_ENV];
@@ -1386,22 +1396,21 @@ export class ScrapeQueue {
   }
 
   /**
-   * The per-host pacing floor: the store's own declared `rateLimit.baseDelayMs` (the SAME store-caps
-   * index the ingest path's transport lookup already reads — buildIngestExtractContext above),
-   * falling back to `DEFAULT_FETCH_BODY_GAP_MS` (engineServices/extractContext.ts) for a host with no
-   * resolved store profile.
+   * The per-host pacing floor. Always at least the D-11 budget floor: `SCRAPER_HOST_BASE_DELAY_MS`
+   * when set to a finite value > 0, else the budget-safe `DEFAULT_HOST_BASE_FLOOR_MS` (4000 ms). The
+   * store's own declared `rateLimit.baseDelayMs` (the SAME store-caps index the ingest path's
+   * transport lookup already reads — buildIngestExtractContext above) still wins where it is LARGER,
+   * so a store that asks to be paced MORE slowly is honored; but no host ever paces FASTER than the
+   * floor, whether it declares a fast delay or resolves no profile at all.
    *
-   * D-11 makes this TUNABLE: `SCRAPER_HOST_BASE_DELAY_MS`, when set to a finite value > 0, is a
-   * per-host FLOOR applied over every host — the store's declared delay still wins where it is
-   * LARGER, but no host paces faster than the configured floor. This is the knob the initiator sets
-   * for a conservative first soak (D-11: 4000 ms/host) and then lowers on evidence; unset, the delay
-   * is exactly the pre-D-11 declared-or-default behavior.
+   * D-11 invariant = per-host, <= budget, scale on evidence. Budget-safety is the DEFAULT, never
+   * opt-in: with the env unset every host paces at >= 4000 ms, so a forgotten env cannot silently
+   * run over budget. The initiator LOWERS the env toward 3500 ms (at-budget) only on clean evidence.
    */
   private hostBaseDelayMs(host: string): number {
     const declared = this.profiles?.forHost(host)?.rateLimit?.baseDelayMs;
-    const floor = resolveHostBaseFloorMs();
-    if (floor !== undefined) return Math.max(declared ?? floor, floor);
-    return declared ?? DEFAULT_FETCH_BODY_GAP_MS;
+    const floor = resolveHostBaseFloorMs() ?? DEFAULT_HOST_BASE_FLOOR_MS;
+    return Math.max(declared ?? floor, floor);
   }
 
   private getNextProcessableItem(now: number): QueueItem | null {
