@@ -304,4 +304,50 @@ describe('ScrapeQueue — per-store differentiated pacing (hard floor + declared
     expect(scraping.scrapePage).toHaveBeenCalledTimes(2);
     expect(scraping.scrapePage.mock.calls[1][0]).toBe('https://sub.host-a.test/item/u2');
   });
+  // ---- (5) fail-safe: a NON-FINITE declared baseDelayMs must NOT fail OPEN (no-pacing) ----------
+  // NaN ?? default = NaN (nullish coalescing catches only null/undefined), Math.max(NaN,floor) = NaN,
+  // and the dispatch gate `NaN > 0` is false → the host would be paced at ZERO (fail-open, the exact
+  // reputation-burn class the hard floor exists to prevent). A non-finite declared value must route
+  // to the budget-safe 4000ms default, NEVER to no-pacing.
+  it('routes a NON-FINITE (NaN) declared baseDelayMs to the 4000ms default — never fails OPEN to zero pacing', async () => {
+    const { scraping } = makeQueue([{ siteId: 'host-a', domain: 'host-a.test', baseDelayMs: NaN }]);
+
+    queue.enqueue('a1', { priority: 'WARM', url: 'https://host-a.test/item/a1' });
+    queue.enqueue('a2', { priority: 'WARM', url: 'https://host-a.test/item/a2' });
+
+    await advanceAndFlush(300);
+    expect(scraping.scrapePage).toHaveBeenCalledTimes(1); // a1 out; a2 MUST be held (NaN must not fail open)
+
+    // Past the 1000ms floor AND any sane fast band, but under 4000ms: a2 still held (proving the
+    // non-finite value fell back to the budget-safe default, not to zero pacing).
+    await advanceAndFlush(2200); // total ~2500 (>1000, <4000)
+    expect(scraping.scrapePage).toHaveBeenCalledTimes(1);
+
+    await advanceAndFlush(1800); // total ~4300 > 4000
+    expect(scraping.scrapePage).toHaveBeenCalledTimes(2);
+    expect(scraping.scrapePage.mock.calls[1][0]).toBe('https://host-a.test/item/a2');
+  });
+
+  // ---- (5) fail-safe: an INFINITE declared baseDelayMs must NOT deadlock the host ---------------
+  // Math.max(Infinity,floor) = Infinity, and the gate `remaining = last + Infinity - now` stays > 0
+  // forever → the host would NEVER dispatch again (a self-inflicted permanent stall). A non-finite
+  // declared value must route to the 4000ms default so the host keeps making progress.
+  it('routes an INFINITE declared baseDelayMs to the 4000ms default — never deadlocks the host', async () => {
+    const { scraping } = makeQueue([{ siteId: 'host-a', domain: 'host-a.test', baseDelayMs: Infinity }]);
+
+    queue.enqueue('a1', { priority: 'WARM', url: 'https://host-a.test/item/a1' });
+    queue.enqueue('a2', { priority: 'WARM', url: 'https://host-a.test/item/a2' });
+
+    await advanceAndFlush(300);
+    expect(scraping.scrapePage).toHaveBeenCalledTimes(1); // a1 out (first item, no prior dispatch)
+
+    // Under the 4000ms default a2 is held; past it a2 MUST dispatch (Infinity would deadlock forever).
+    await advanceAndFlush(2200); // total ~2500 < 4000 → still held
+    expect(scraping.scrapePage).toHaveBeenCalledTimes(1);
+
+    await advanceAndFlush(1800); // total ~4300 > 4000 → a2 dispatches (no deadlock)
+    expect(scraping.scrapePage).toHaveBeenCalledTimes(2);
+    expect(scraping.scrapePage.mock.calls[1][0]).toBe('https://host-a.test/item/a2');
+  });
+
 });

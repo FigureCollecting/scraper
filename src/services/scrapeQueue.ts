@@ -1442,7 +1442,14 @@ export class ScrapeQueue {
    * DELIBERATE per-store change in its profile (scraper-rulesets), never a silent global acceleration.
    */
   private hostBaseDelayMs(host: string): number {
-    const declared = this.profiles?.forHost(host)?.rateLimit?.baseDelayMs;
+    // A declared rate is honored ONLY when finite: `??` catches null/undefined, but a NON-finite
+    // number (NaN/Infinity) slips through — `Math.max(NaN, floor) = NaN` makes the dispatch gate
+    // `NaN > 0` false (fail-OPEN: zero pacing), and `Math.max(Infinity, floor) = Infinity` stalls the
+    // host forever. Both violate "the floor clamps EVERY host". Route a non-finite declared value to
+    // the budget-safe 4000ms default instead — conservative (slower), never faster, never zero,
+    // never a deadlock. Mirrors the Number.isFinite discipline resolvePositiveEnvMs already applies.
+    const raw = this.profiles?.forHost(host)?.rateLimit?.baseDelayMs;
+    const declared = typeof raw === 'number' && Number.isFinite(raw) ? raw : undefined;
     const base = declared ?? resolveHostBaseDefaultMs();
     return Math.max(base, resolveHostHardFloorMs());
   }
