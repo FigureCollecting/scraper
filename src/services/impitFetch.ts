@@ -8,6 +8,8 @@
  */
 import { CookieJar } from 'tough-cookie';
 import { isCloudflareChallenge } from './engineServices/challengeDetect.js';
+import { getCfCookieStore, type CfCookieSource } from './cookieJar.js';
+import { normalizeHost } from './challengeCooldown.js';
 
 /** Default impersonation profile. A LIVE TUNABLE — chrome110 already went stale to Cloudflare; keep recent. */
 const DEFAULT_PROFILE = 'chrome142';
@@ -104,6 +106,8 @@ export type MakeImpit = (browser: string, cookieJar: CookieJarLike, timeoutMs: n
  */
 interface ImpitSession {
   impit: ImpitLike;
+  /** The per-profile jar impit reads/writes — kept so stored cookies can be SEEDED into it per call. */
+  jar: CookieJarLike;
   primed: Map<string, number>;
   priming: Map<string, Promise<void>>;
 }
@@ -163,6 +167,33 @@ function ensurePrimed(
   return p;
 }
 
+/**
+ * Seed the session jar with a host's STORED cookies (CfCookieStore) before a fetch: one tough-cookie
+ * setCookie per cookie, domain-scoped to the url's www-stripped host (`Domain=.host; Path=/`, plus
+ * `Secure` on https — a Secure cookie set from an http origin is stored but never sent). Runs on EVERY
+ * call: cheap, idempotent, and it deliberately OVERWRITES any server-rotated value with the file's
+ * (CF cannot be re-solved from the pod's IP, so the hand-minted value is the only one that can work).
+ * A cookie the jar rejects is skipped with one warn naming the cookie NAME only — never a value.
+ */
+async function seedJar(jar: CookieJarLike, url: string, cookies: Record<string, string>): Promise<void> {
+  let target: URL;
+  try {
+    target = new URL(url);
+  } catch {
+    return;
+  }
+  const host = normalizeHost(target.hostname);
+  const attrs = `; Domain=.${host}; Path=/${target.protocol === 'https:' ? '; Secure' : ''}`;
+  for (const [name, value] of Object.entries(cookies)) {
+    try {
+      await jar.setCookie(`${name}=${value}${attrs}`, `${target.origin}/`);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(`[CF-COOKIE] could not seed stored cookie ${name} for ${host} into the impit jar: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+}
+
 /** Drop a host's primed marker so the next fetch re-primes it (used when its clearance has gone stale). */
 function invalidatePrime(session: ImpitSession, primeUrl: string): void {
   const host = hostOf(primeUrl);
@@ -175,6 +206,8 @@ export interface CreateImpitFetchOptions {
   now?: () => number;
   /** How long a prime is trusted before re-priming (defaults to {@link PRIME_TTL_MS}). */
   primeTtlMs?: number;
+  /** Stored-cookie source (defaults to the CfCookieStore singleton, resolved per call). */
+  store?: CfCookieSource;
 }
 
 /**
@@ -196,7 +229,7 @@ export function createImpitFetch(makeImpit: MakeImpit = defaultMakeImpit, option
       sp = (async (): Promise<ImpitSession> => {
         const jar = defaultMakeCookieJar();
         const impit = await makeImpit(browser, jar, TIMEOUT_MS);
-        return { impit, primed: new Map<string, number>(), priming: new Map<string, Promise<void>>() };
+        return { impit, jar, primed: new Map<string, number>(), priming: new Map<string, Promise<void>>() };
       })();
       sessions.set(browser, sp);
       sp.catch(() => {
@@ -208,9 +241,18 @@ export function createImpitFetch(makeImpit: MakeImpit = defaultMakeImpit, option
   return async function impitFetchBody(url: string, opts: ImpitFetchOptions = {}): Promise<string> {
     const browser = opts.browser || DEFAULT_PROFILE;
     const session = await getSession(browser);
+    // STORED COOKIES + PINNED UA (CfCookieStore): seed the host's hand-minted cookies into the jar
+    // before the prime/target GETs, and let the mint User-Agent win over the caller's and the
+    // profile's — cf_clearance is bound to IP + UA, so any other UA voids it. Unknown host ⇒ nothing
+    // seeded and no pin: byte-identical to the pre-store path.
+    const store = options.store ?? getCfCookieStore();
+    const stored = store.cookiesFor(url);
+    if (stored) await seedJar(session.jar, url, stored);
+    const pinnedUa = store.userAgentFor(url);
     const headers: Record<string, string> = {
       ...(opts.userAgent ? { 'User-Agent': opts.userAgent } : {}),
       ...(opts.headers ?? {}),
+      ...(pinnedUa ? { 'User-Agent': pinnedUa } : {}),
     };
     if (!opts.prime) {
       const res = await session.impit.fetch(url, { method: 'GET', headers });

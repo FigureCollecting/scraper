@@ -2,7 +2,9 @@
  * createEngineLookup — the entrypoint factory: builds a cross-store Lookup from the engine's
  * registry (allStores → ProfileRegistry) + a fetch, and fans a query to parse candidates.
  */
-import { createEngineLookup, createEngineCatalog, httpFetchBody, type LookupRegistry } from '../../services/engineLookup';
+import { join } from 'path';
+import { createEngineLookup, createEngineCatalog, httpFetchBody, createHttpFetch, resolveHttpFetchTimeoutMs, HTTP_FETCH_TIMEOUT_MS, type LookupRegistry } from '../../services/engineLookup';
+import { getCfCookieStore, resetCfCookieStore } from '../../services/cookieJar';
 import type { ExtractionRuleset, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
 
 const STORE: StoreCapabilities = {
@@ -187,6 +189,125 @@ describe('httpFetchBody', () => {
       expect(init?.signal?.aborted).toBe(false);
     } finally {
       global.fetch = orig;
+    }
+  });
+});
+
+/**
+ * Stored-cookie injection on the plain-http lane (CfCookieStore): a host the store has cookies for
+ * gets a `cookie` header + the pinned mint User-Agent; an unknown host's request is BYTE-IDENTICAL to
+ * the cookieless path. Values are obviously-fake placeholders.
+ */
+describe('httpFetchBody × stored cookies + pinned UA (CfCookieStore)', () => {
+  const DESKTOP_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36';
+  const fakeStore = (hosts: Record<string, { cookies?: Record<string, string>; userAgent?: string }>) => {
+    const key = (url: string) => new URL(url).hostname.toLowerCase().replace(/^www\./, '');
+    return {
+      cookiesFor: (url: string) => (hosts[key(url)]?.cookies ? { ...hosts[key(url)].cookies } : undefined),
+      userAgentFor: (url: string) => hosts[key(url)]?.userAgent,
+    };
+  };
+  let fetchMock: jest.Mock;
+  const orig = global.fetch;
+  beforeEach(() => {
+    fetchMock = jest.fn(async (_url: string, _init?: RequestInit) => ({ text: async () => 'body' }));
+    global.fetch = fetchMock as unknown as typeof fetch;
+  });
+  afterEach(() => { global.fetch = orig; });
+
+  it('cohort host: sends a `cookie` header (name=value; name2=value2) and the pinned UA, keeping the accept header and the abort signal', async () => {
+    const store = fakeStore({ 'sugotoys.com.au': { cookies: { cf_clearance: 'FAKE_cf_1', wp_sess: 'FAKE_sess_1' }, userAgent: 'Mozilla/5.0 FAKE-MINT-UA' } });
+    const fetchBody = createHttpFetch({ store });
+
+    expect(await fetchBody('https://www.sugotoys.com.au/wp-json/wc/store/v1/products?search=lucy')).toBe('body');
+
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(init.headers).toEqual({
+      'user-agent': 'Mozilla/5.0 FAKE-MINT-UA',
+      accept: 'application/json, text/html',
+      cookie: 'cf_clearance=FAKE_cf_1; wp_sess=FAKE_sess_1',
+    });
+    expect(init.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it('unknown host: headers byte-identical to the cookieless path (no cookie key, default desktop UA)', async () => {
+    const store = fakeStore({ 'sugotoys.com.au': { cookies: { cf_clearance: 'FAKE_cf_1' }, userAgent: 'Mozilla/5.0 FAKE-MINT-UA' } });
+    const fetchBody = createHttpFetch({ store });
+
+    await fetchBody('https://www.goodsmileus.com/search/suggest.json?q=tomie');
+
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(init.headers).toEqual({ 'user-agent': DESKTOP_UA, accept: 'application/json, text/html' });
+    expect(init.headers).not.toHaveProperty('cookie');
+  });
+
+  it('a UA pin without cookies pins only the UA; cookies without a pin keep the default UA', async () => {
+    const store = fakeStore({ 'pinonly.test': { userAgent: 'Mozilla/5.0 FAKE-PIN' }, 'cookieonly.test': { cookies: { a: 'FAKE_a' } } });
+    const fetchBody = createHttpFetch({ store });
+    await fetchBody('https://pinonly.test/x');
+    await fetchBody('https://cookieonly.test/x');
+    expect((fetchMock.mock.calls[0][1] as RequestInit).headers).toEqual({ 'user-agent': 'Mozilla/5.0 FAKE-PIN', accept: 'application/json, text/html' });
+    expect((fetchMock.mock.calls[1][1] as RequestInit).headers).toEqual({ 'user-agent': DESKTOP_UA, accept: 'application/json, text/html', cookie: 'a=FAKE_a' });
+  });
+
+  it('the default export consults the CfCookieStore singleton (CF_COOKIE_FILE fixture, FAKE values)', async () => {
+    const ORIGINAL = process.env.CF_COOKIE_FILE;
+    process.env.CF_COOKIE_FILE = join(__dirname, '../fixtures/cfCookies/cf-cookies.json');
+    resetCfCookieStore();
+    try {
+      expect(getCfCookieStore().view()).toHaveLength(2);
+      await httpFetchBody('https://www.myfigurecollection.net/item/1');
+      const headers = (fetchMock.mock.calls[0][1] as RequestInit).headers as Record<string, string>;
+      expect(headers.cookie).toBe('cf_clearance=FAKE_cf_fixture_1; PHPSESSID=FAKE_sess_fixture_1');
+      expect(headers['user-agent']).toBe('Mozilla/5.0 FAKE-FIXTURE-MINT-UA');
+    } finally {
+      resetCfCookieStore();
+      if (ORIGINAL === undefined) delete process.env.CF_COOKIE_FILE; else process.env.CF_COOKIE_FILE = ORIGINAL;
+    }
+  });
+});
+
+/**
+ * HTTP_FETCH_TIMEOUT_MS: the plain-http lane's abort ceiling is env-configurable (the orzgk 100-item
+ * listing takes ~15 s, so ops set 30000). Default 15000, clamped to [5000, 120000]; resolved ONCE at
+ * module load and threaded into AbortSignal.timeout.
+ */
+describe('resolveHttpFetchTimeoutMs — pure env → ms resolver (HTTP_FETCH_TIMEOUT_MS)', () => {
+  const env = (v?: string): NodeJS.ProcessEnv => ({ HTTP_FETCH_TIMEOUT_MS: v } as NodeJS.ProcessEnv);
+
+  it('defaults to 15000 when unset / blank / non-numeric / non-positive', () => {
+    expect(resolveHttpFetchTimeoutMs(env())).toBe(15000);
+    expect(resolveHttpFetchTimeoutMs(env(''))).toBe(15000);
+    expect(resolveHttpFetchTimeoutMs(env('abc'))).toBe(15000);
+    expect(resolveHttpFetchTimeoutMs(env('0'))).toBe(15000);
+    expect(resolveHttpFetchTimeoutMs(env('-5'))).toBe(15000);
+  });
+  it('honors a valid override', () => {
+    expect(resolveHttpFetchTimeoutMs(env('30000'))).toBe(30000);
+  });
+  it('clamps a too-small value up to 5000 and a too-large value down to 120000', () => {
+    expect(resolveHttpFetchTimeoutMs(env('10'))).toBe(5000);
+    expect(resolveHttpFetchTimeoutMs(env('999999'))).toBe(120000);
+  });
+  it('HTTP_FETCH_TIMEOUT_MS is the module-load resolution of process.env (15000 with no override)', () => {
+    expect(HTTP_FETCH_TIMEOUT_MS).toBe(resolveHttpFetchTimeoutMs(process.env));
+    expect(HTTP_FETCH_TIMEOUT_MS).toBe(15000);
+  });
+  it('threads an HTTP_FETCH_TIMEOUT_MS override through an isolated module load into AbortSignal.timeout', async () => {
+    const ORIGINAL = process.env.HTTP_FETCH_TIMEOUT_MS;
+    const orig = global.fetch;
+    const spy = jest.spyOn(AbortSignal, 'timeout');
+    process.env.HTTP_FETCH_TIMEOUT_MS = '30000';
+    global.fetch = jest.fn(async () => ({ text: async () => 'ok' })) as unknown as typeof fetch;
+    try {
+      let mod!: { httpFetchBody: typeof httpFetchBody };
+      jest.isolateModules(() => { mod = require('../../services/engineLookup'); });
+      await mod.httpFetchBody('https://www.orzgk.com/wp-json/wc/store/v1/products?per_page=100');
+      expect(spy).toHaveBeenCalledWith(30000);
+    } finally {
+      spy.mockRestore();
+      global.fetch = orig;
+      if (ORIGINAL === undefined) delete process.env.HTTP_FETCH_TIMEOUT_MS; else process.env.HTTP_FETCH_TIMEOUT_MS = ORIGINAL;
     }
   });
 });

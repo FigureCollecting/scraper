@@ -9,6 +9,7 @@ import { BrowserPool } from '../genericScraper.js';
 import { ScrapingService, ScrapePageOptions, ScrapePageResult, PageOptions, BrowserFetchOptions } from '@figurecollecting/scraper-plugin-contract';
 import { CaptureSink, NoopCaptureSink, buildRawCapture } from '../captureSink.js';
 import { sanitizeForLog } from '../../utils/security.js';
+import { getCfCookieStore, type CfCookieSource } from '../cookieJar.js';
 
 const DEFAULT_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36';
@@ -28,12 +29,44 @@ function capWaitTime(waitTime?: number): number {
 /**
  * Build puppeteer setCookie params for a URL's registrable host from a name→value map, dropping
  * empty values. Shared by navigateAndCapture and browserFetchBody so cookie scoping is identical.
+ * Every cookie is emitted `httpOnly` (cf_clearance and the MFC session cookies are HttpOnly at the
+ * origin — the page's own scripts must not see them) and `secure` iff the url is https (a Secure
+ * cookie is never sent over plain http, so flagging it there would silently drop it).
  */
 function buildCookieParams(url: string, cookies: Record<string, string>): Parameters<Page['setCookie']> {
-  const hostname = new URL(url).hostname;
+  const target = new URL(url);
+  const secure = target.protocol === 'https:';
   return Object.entries(cookies)
     .filter(([, value]) => value != null && value !== '')
-    .map(([name, value]) => ({ name, value, domain: `.${hostname.replace(/^www\./, '')}`, path: '/' })) as Parameters<Page['setCookie']>;
+    .map(([name, value]) => ({
+      name,
+      value,
+      domain: `.${target.hostname.replace(/^www\./, '')}`,
+      path: '/',
+      httpOnly: true,
+      secure,
+    })) as Parameters<Page['setCookie']>;
+}
+
+/**
+ * STORED COOKIES (CfCookieStore) merged UNDER the request's own: a host the store has cookies for
+ * contributes them, and a request/item cookie of the same name WINS (a request-scoped session — the
+ * MFC user-sync path — carries its own coherent set). Neither ⇒ undefined (no setCookie call at all,
+ * byte-identical to the pre-store behavior).
+ */
+function mergeStoredCookies(
+  store: CfCookieSource,
+  url: string,
+  requestCookies: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  const stored = store.cookiesFor(url);
+  if (!stored && !requestCookies) return undefined;
+  return { ...(stored ?? {}), ...(requestCookies ?? {}) };
+}
+
+/** UA precedence on the browser lane: the request's own UA, else the host's pinned mint UA, else the default. */
+function resolveUserAgent(store: CfCookieSource, url: string, requestUa: string | undefined): string {
+  return requestUa || store.userAgentFor(url) || DEFAULT_USER_AGENT;
 }
 
 /**
@@ -45,16 +78,18 @@ function buildCookieParams(url: string, cookies: Record<string, string>): Parame
 export async function browserFetchBody(
   page: Page,
   url: string,
-  options: Omit<BrowserFetchOptions, 'stealth'> = {}
+  options: Omit<BrowserFetchOptions, 'stealth'> = {},
+  store: CfCookieSource = getCfCookieStore(),
 ): Promise<string> {
   await page.setViewport({ width: 1280, height: 720 });
-  await page.setUserAgent(options.userAgent || DEFAULT_USER_AGENT);
+  await page.setUserAgent(resolveUserAgent(store, url, options.userAgent));
 
   if (options.headers && Object.keys(options.headers).length > 0) {
     await page.setExtraHTTPHeaders(options.headers);
   }
-  if (options.cookies) {
-    const cookieArray = buildCookieParams(url, options.cookies);
+  const cookies = mergeStoredCookies(store, url, options.cookies);
+  if (cookies) {
+    const cookieArray = buildCookieParams(url, cookies);
     if (cookieArray.length > 0) {
       await page.setCookie(...cookieArray);
     }
@@ -90,13 +125,15 @@ async function navigateAndCapture(
   page: Page,
   url: string,
   options: ScrapePageOptions = {},
-  sink: CaptureSink = new NoopCaptureSink()
+  sink: CaptureSink = new NoopCaptureSink(),
+  store: CfCookieSource = getCfCookieStore(),
 ): Promise<ScrapePageResult> {
   await page.setViewport({ width: 1280, height: 720 });
-  await page.setUserAgent(options.userAgent || DEFAULT_USER_AGENT);
+  await page.setUserAgent(resolveUserAgent(store, url, options.userAgent));
 
-  if (options.cookies) {
-    const cookieArray = buildCookieParams(url, options.cookies);
+  const cookies = mergeStoredCookies(store, url, options.cookies);
+  if (cookies) {
+    const cookieArray = buildCookieParams(url, cookies);
     if (cookieArray.length > 0) {
       await page.setCookie(...cookieArray);
     }
@@ -171,7 +208,18 @@ async function navigateAndCapture(
   };
 }
 
-export function createScrapingService(captureSink: CaptureSink = new NoopCaptureSink()): ScrapingService {
+/** Optional wiring for {@link createScrapingService}. */
+export interface ScrapingServiceOptions {
+  /** Stored-cookie source (defaults to the CfCookieStore singleton, resolved per navigation). */
+  cookieStore?: CfCookieSource;
+}
+
+export function createScrapingService(
+  captureSink: CaptureSink = new NoopCaptureSink(),
+  options: ScrapingServiceOptions = {},
+): ScrapingService {
+  // Resolved per navigation (not once here) so a hot-reloaded cookie file is always the one consulted.
+  const store = (): CfCookieSource => options.cookieStore ?? getCfCookieStore();
   async function withPage<T>(fn: (page: Page) => Promise<T>, options: PageOptions = {}): Promise<T> {
     const stealth = options.stealth ?? false;
     const browser: Browser = stealth ? await BrowserPool.getStealthBrowser() : await BrowserPool.getBrowser();
@@ -213,14 +261,14 @@ export function createScrapingService(captureSink: CaptureSink = new NoopCapture
 
   return {
     scrapePage: (url: string, options?: ScrapePageOptions) =>
-      withPage(page => navigateAndCapture(page, url, options, captureSink), { stealth: false }),
+      withPage(page => navigateAndCapture(page, url, options, captureSink, store()), { stealth: false }),
 
     scrapePageStealth: (url: string, options?: ScrapePageOptions) =>
-      withPage(page => navigateAndCapture(page, url, options, captureSink), { stealth: true }),
+      withPage(page => navigateAndCapture(page, url, options, captureSink, store()), { stealth: true }),
 
     // browserFetch defaults to the stealth browser — it exists for CF-fronted / SPA hosts.
     browserFetch: (url: string, options?: BrowserFetchOptions) =>
-      withPage(page => browserFetchBody(page, url, options), { stealth: options?.stealth ?? true }),
+      withPage(page => browserFetchBody(page, url, options, store()), { stealth: options?.stealth ?? true }),
 
     withBrowser,
     withPage,

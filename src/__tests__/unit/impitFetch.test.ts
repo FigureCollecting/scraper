@@ -412,3 +412,178 @@ describe('resolveImpitTimeoutMs', () => {
     expect(resolveImpitTimeoutMs(env(''))).toBe(30000);
   });
 });
+
+/**
+ * Stored-cookie jar seeding (CfCookieStore): the impit lane seeds its per-profile tough-cookie jar
+ * with the host's STORED cookies (hand-minted cf_clearance etc.) before the prime/target GETs, on
+ * EVERY call (idempotent overwrite), and pins the mint User-Agent (cf_clearance is IP+UA-bound, so
+ * the mint UA must beat the store profile's UA and any caller UA). An unknown host is byte-identical
+ * to the no-store path. Values below are obviously-fake placeholders.
+ */
+describe('createImpitFetch — stored-cookie jar seeding + pinned UA (CfCookieStore)', () => {
+  const COHORT = 'https://www.anitoysgk.com/Star-Origin-Studio-1-6-Lucy-p29358268.html';
+  const PRIME_URL = 'https://www.anitoysgk.com';
+  const REAL = '<html><body>real product page</body></html>';
+  const CHALLENGE = '<html><head><title>Just a moment...</title></head><body>cf challenge</body></html>';
+
+  /** A fake CfCookieStore keyed by www-stripped host. */
+  const fakeStore = (hosts: Record<string, { cookies?: Record<string, string>; userAgent?: string }>) => {
+    const key = (url: string) => new URL(url).hostname.toLowerCase().replace(/^www\./, '');
+    return {
+      cookiesFor: (url: string) => (hosts[key(url)]?.cookies ? { ...hosts[key(url)].cookies } : undefined),
+      userAgentFor: (url: string) => hosts[key(url)]?.userAgent,
+    };
+  };
+
+  /** A recording impit: for each GET it reports the Cookie string the threaded jar hands back + the headers sent. */
+  function recordingImpit() {
+    const gets: Array<{ url: string; cookie: string; headers: Record<string, string> }> = [];
+    const make = (_browser: string, jar: CookieJarLike): ImpitLike => ({
+      fetch: async (url, init) => {
+        // tough-cookie itself throws on an unparseable url — that is the fake's concern, not the seeder's
+        let cookie: string;
+        try { cookie = String(await jar.getCookieString(url)); } catch { cookie = '<jar-threw>'; }
+        gets.push({ url, cookie, headers: init.headers ?? {} });
+        return { text: async () => 'ok' };
+      },
+    });
+    return { make, gets };
+  }
+
+  it('seeds the session jar with the cohort host\'s stored cookies before the target GET — they are SENT (domain-scoped to the host)', async () => {
+    const r = recordingImpit();
+    const store = fakeStore({ 'anitoysgk.com': { cookies: { cf_clearance: 'FAKE_cf_1', other: 'FAKE_o' } } });
+    const impitFetch = createImpitFetch(r.make, { store });
+
+    await impitFetch(COHORT, { browser: 'chrome142' });
+
+    expect(r.gets).toHaveLength(1);
+    expect(r.gets[0].cookie).toContain('cf_clearance=FAKE_cf_1');
+    expect(r.gets[0].cookie).toContain('other=FAKE_o');
+  });
+
+  it('does NOT seed for a host the store has no entry for — jar empty, headers byte-identical to the no-store path', async () => {
+    const r = recordingImpit();
+    const store = fakeStore({ 'anitoysgk.com': { cookies: { cf_clearance: 'FAKE_cf_1' } } });
+    const impitFetch = createImpitFetch(r.make, { store });
+
+    await impitFetch('https://x.test/s', { browser: 'chrome124', headers: { 'X-User-Key': 'amiami_dev' }, userAgent: 'python-amiami_dev' });
+
+    expect(r.gets[0].cookie).toBe('');
+    expect(r.gets[0].headers).toEqual({ 'User-Agent': 'python-amiami_dev', 'X-User-Key': 'amiami_dev' });
+  });
+
+  it('UA precedence: the pinned mint UA beats opts.userAgent AND a headers User-Agent; no pin → opts.userAgent; neither → no UA header (profile default)', async () => {
+    const r = recordingImpit();
+    const store = fakeStore({
+      'anitoysgk.com': { cookies: { cf_clearance: 'FAKE_cf_1' }, userAgent: 'Mozilla/5.0 FAKE-MINT-UA' },
+      'uaonly.test': { userAgent: 'Mozilla/5.0 FAKE-PIN-ONLY' },
+    });
+    const impitFetch = createImpitFetch(r.make, { store });
+
+    await impitFetch(COHORT, { userAgent: 'caller-ua', headers: { 'User-Agent': 'header-ua', 'X-K': '1' } });
+    await impitFetch('https://uaonly.test/s', { userAgent: 'caller-ua' });
+    await impitFetch('https://x.test/s', { userAgent: 'caller-ua' });
+    await impitFetch('https://x.test/s');
+
+    expect(r.gets[0].headers).toEqual({ 'User-Agent': 'Mozilla/5.0 FAKE-MINT-UA', 'X-K': '1' }); // pin wins over both
+    expect(r.gets[1].headers).toEqual({ 'User-Agent': 'Mozilla/5.0 FAKE-PIN-ONLY' });          // pin without cookies still applies
+    expect(r.gets[1].cookie).toBe('');
+    expect(r.gets[2].headers).toEqual({ 'User-Agent': 'caller-ua' });                            // no pin → caller UA
+    expect(r.gets[3].headers).toEqual({});                                                        // neither → profile default
+  });
+
+  it('with a seeded clearance the session-prime path is a plain 200: prime once, target REAL, NO re-prime (the prime itself cannot mint from the pod IP)', async () => {
+    // A CF gate the prime can NEVER solve (no Set-Cookie on the prime): only a jar that ALREADY carries
+    // the stored clearance gets the real page. Mirrors the live OVH posture.
+    let primes = 0;
+    let targets = 0;
+    const make = (_browser: string, jar: CookieJarLike): ImpitLike => ({
+      fetch: async (url) => {
+        if (url === PRIME_URL || url === `${PRIME_URL}/`) { primes++; return { text: async () => 'homepage' }; }
+        targets++;
+        const cookies = String(await jar.getCookieString(url));
+        return { text: async () => (cookies.includes('cf_clearance=FAKE_cf_1') ? REAL : CHALLENGE) };
+      },
+    });
+    const store = fakeStore({ 'anitoysgk.com': { cookies: { cf_clearance: 'FAKE_cf_1' } } });
+    const impitFetch = createImpitFetch(make, { store });
+
+    const body = await impitFetch(COHORT, { browser: 'chrome142', prime: { url: PRIME_URL } });
+
+    expect(body).toBe(REAL);
+    expect(primes).toBe(1);   // primed once (the existing prime discipline is untouched)
+    expect(targets).toBe(1);  // no challenge → no bounded re-prime/refetch
+  });
+
+  it('re-seeds on EVERY call (idempotent overwrite): a server-rotated jar value is overwritten with the file\'s value on the next fetch', async () => {
+    const sent: string[] = [];
+    const make = (_browser: string, jar: CookieJarLike): ImpitLike => ({
+      fetch: async (url) => {
+        sent.push(String(await jar.getCookieString(url)));
+        // the server rotates the clearance in the response (Set-Cookie) — CF can't be re-solved from OVH, so the FILE value must win next time
+        await jar.setCookie('cf_clearance=ROTATED_BY_SERVER; Domain=.anitoysgk.com; Path=/; Secure', url);
+        return { text: async () => 'ok' };
+      },
+    });
+    const store = fakeStore({ 'anitoysgk.com': { cookies: { cf_clearance: 'FAKE_cf_1' } } });
+    const impitFetch = createImpitFetch(make, { store });
+
+    await impitFetch(COHORT);
+    await impitFetch(COHORT);
+
+    expect(sent).toEqual(['cf_clearance=FAKE_cf_1', 'cf_clearance=FAKE_cf_1']);
+  });
+
+  it('a cookie the jar rejects is skipped with ONE warn naming the cookie NAME only; the other cookies seed and the fetch proceeds', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const r = recordingImpit();
+    // a control character makes tough-cookie throw "Cookie failed to parse" — the real jar is threaded, so this is a real rejection
+    const store = fakeStore({ 'anitoysgk.com': { cookies: { broken: 'va\x01lue', cf_clearance: 'FAKE_cf_1' } } });
+    const impitFetch = createImpitFetch(r.make, { store });
+
+    expect(await impitFetch(COHORT)).toBe('ok');
+    expect(r.gets[0].cookie).toBe('cf_clearance=FAKE_cf_1');
+    const lines = warn.mock.calls.map((c) => String(c[0])).filter((l) => l.startsWith('[CF-COOKIE]'));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('broken');
+    expect(lines[0]).not.toContain('va\x01lue');
+    expect(lines[0]).not.toContain('FAKE_cf_1');
+    warn.mockRestore();
+  });
+
+  it('an unparseable target url is fetched as-is without seeding (no throw from the seeder)', async () => {
+    const r = recordingImpit();
+    const store = { cookiesFor: () => ({ cf_clearance: 'FAKE_cf_1' }), userAgentFor: () => undefined };
+    const impitFetch = createImpitFetch(r.make, { store });
+    await expect(impitFetch('not a url')).resolves.toBe('ok');
+    expect(r.gets[0].url).toBe('not a url');
+  });
+
+  it('seeds over http:// without the Secure attribute so the cookie is actually SENT on a plain-http host', async () => {
+    const r = recordingImpit();
+    const store = fakeStore({ 'plain.test': { cookies: { sess: 'FAKE_sess_1' } } });
+    const impitFetch = createImpitFetch(r.make, { store });
+    await impitFetch('http://plain.test/list');
+    expect(r.gets[0].cookie).toBe('sess=FAKE_sess_1');
+  });
+
+  it('the default factory (no injected store) consults the CfCookieStore singleton — CF_COOKIE_FILE fixture with FAKE values', async () => {
+    const { getCfCookieStore, resetCfCookieStore } = require('../../services/cookieJar') as typeof import('../../services/cookieJar');
+    const ORIGINAL = process.env.CF_COOKIE_FILE;
+    process.env.CF_COOKIE_FILE = require('path').join(__dirname, '../fixtures/cfCookies/cf-cookies.json');
+    resetCfCookieStore();
+    try {
+      expect(getCfCookieStore().cookiesFor('https://anitoysgk.com/')).toBeDefined(); // fixture loaded
+      const r = recordingImpit();
+      const impitFetch = createImpitFetch(r.make); // NO store option → singleton
+      await impitFetch('https://www.myfigurecollection.net/item/1');
+      expect(r.gets[0].cookie).toContain('cf_clearance=FAKE_cf_fixture_1');
+      expect(r.gets[0].cookie).toContain('PHPSESSID=FAKE_sess_fixture_1');
+      expect(r.gets[0].headers).toEqual({ 'User-Agent': 'Mozilla/5.0 FAKE-FIXTURE-MINT-UA' });
+    } finally {
+      resetCfCookieStore();
+      if (ORIGINAL === undefined) delete process.env.CF_COOKIE_FILE; else process.env.CF_COOKIE_FILE = ORIGINAL;
+    }
+  });
+});
