@@ -4,6 +4,8 @@
  *   - POST /lookup {IdentityQuery, mode?} — RECORD-MODE: a typed identity (JAN/name/studio/…) whose
  *     per-store query is composed server-side (JAN-exact where supported, else name/ER).
  * Both return per-store candidates + the coverage envelope (unsupported / orderableOnly / failed).
+ * Each candidate carries the contract's page `url` untouched plus an engine-derived `collectUrl` (the
+ * URL to ingest: byId where declared, else the page link absolutized) — see assembleLookup.
  * `mode` defaults to `listed` (superset, incl. sold-out); `orderable` filters to in-stock. Injected.
  */
 import { Router, type Request, type Response } from 'express';
