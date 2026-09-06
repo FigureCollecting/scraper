@@ -14,15 +14,53 @@
  * most selective identity term and their candidates are POST-FILTERED by the remaining identity tokens
  * (a multi-term phrase would match nothing). Each per-store result reports `storeQuery` (the exact `{q}`
  * issued to that store) and, when that post-filter ran, `filtered` (how many candidates it removed).
+ *
+ * COLLECT URL vs PAGE URL: a candidate's `url` is the store's product PAGE link exactly as the plugin
+ * emitted it (contract semantics, never rewritten). The ENGINE owns retrieval-axis knowledge, so each
+ * candidate is additionally decorated with `collectUrl` — the URL the ingest path should fetch: the
+ * store's `retrieval.byId` URL for its `itemId` where one is declared (orzgk's Store-API JSON collects
+ * where its CF-challenged HTML page does not), else the page link absolutized against the store's
+ * search URL (Shopify hits are RELATIVE `/products/<handle>`), else omitted. Callers that ingest
+ * (the initiator) prefer `collectUrl` and fall back to `url`.
  */
-import { planRetrieval, composeNameQuery, normalizeText } from './retrievalPlanner.js';
+import { planRetrieval, composeNameQuery, normalizeText, resolveByIdUrl } from './retrievalPlanner.js';
 import { sanitizeForLog } from '../utils/security.js';
 import { isCloudflareChallenge } from '../services/engineServices/challengeDetect.js';
 import { getChallengeCooldown, normalizeHost, type ChallengeCooldown } from '../services/challengeCooldown.js';
 import type { ProfileRegistry } from './profileRegistry.js';
-import type { ExtractionRuleset, IdentityQuery, SearchCandidate, SearchFetch } from '@figurecollecting/scraper-plugin-contract';
+import type {
+  ExtractionRuleset,
+  IdentityQuery,
+  RetrievalCapability,
+  SearchCandidate,
+  SearchFetch,
+} from '@figurecollecting/scraper-plugin-contract';
 
 export type LookupMode = 'listed' | 'orderable';
+
+/**
+ * A search hit as /lookup returns it: the contract's SearchCandidate plus the engine-derived
+ * `collectUrl` (see the header). Absent when neither a byId URL nor a usable page link exists.
+ */
+export type LookupCandidate = SearchCandidate & { collectUrl?: string };
+
+/**
+ * Decorate one candidate with `collectUrl`. Plugin output is untrusted at runtime: a non-string /
+ * empty itemId skips the byId rule, a non-string / empty / malformed `url` skips the page rule, and
+ * nothing here ever throws — the candidate is always kept, with every existing field untouched.
+ */
+function withCollectUrl(c: SearchCandidate, retrieval: RetrievalCapability | undefined, searchUrl: string): LookupCandidate {
+  const byId = typeof c.itemId === 'string' && c.itemId ? resolveByIdUrl(retrieval, c.itemId) : undefined;
+  if (byId) return { ...c, collectUrl: byId };
+  if (typeof c.url === 'string' && c.url) {
+    try {
+      return { ...c, collectUrl: new URL(c.url, searchUrl).href };
+    } catch {
+      // malformed page link → no collectUrl, but the candidate itself is still returned
+    }
+  }
+  return c;
+}
 
 /** Per-store search-fetch timeout (ms) used when LOOKUP_STORE_TIMEOUT_MS is unset/invalid, and the clamp any override rides within. */
 const DEFAULT_STORE_TIMEOUT_MS = 15000;
@@ -86,7 +124,7 @@ export interface StoreLookupResult {
   url: string;
   /** The exact `{q}` issued to this store: a substring store's selective term, else the composed phrase. */
   storeQuery: string;
-  candidates: SearchCandidate[];
+  candidates: LookupCandidate[];
   /** Candidates the substring-store identity post-filter removed (present ONLY when that filter ran). */
   filtered?: number;
 }
@@ -193,7 +231,8 @@ export function assembleLookup(services: LookupServices): Lookup {
           return null;
         }
         if (skipCooling(p)) return null;
-        const scope = services.profiles.retrievalFor(p.host)?.bySearch?.scope ?? 'listed';
+        const retrieval = services.profiles.retrievalFor(p.host);
+        const scope = retrieval?.bySearch?.scope ?? 'listed';
         if (mode === 'listed' && scope === 'orderable') orderableOnly.push(p.siteId);
         try {
           // BOUNDED per store: race the fetch against a timeout so one slow / hanging / CF-stalled
@@ -231,7 +270,10 @@ export function assembleLookup(services: LookupServices): Lookup {
             candidates = kept;
           }
           if (mode === 'orderable') candidates = candidates.filter((c) => c.available !== false);
-          return { siteId: p.siteId, host: p.host, url: p.url, storeQuery: p.query ?? '', candidates, ...(filtered !== undefined ? { filtered } : {}) };
+          // Decorate every RETURNED candidate with its collect-ready URL (byId where declared, else the
+          // absolutized page link) — after the filters, so only survivors are touched.
+          const decorated = candidates.map((c) => withCollectUrl(c, retrieval, p.url));
+          return { siteId: p.siteId, host: p.host, url: p.url, storeQuery: p.query ?? '', candidates: decorated, ...(filtered !== undefined ? { filtered } : {}) };
         } catch (err) {
           // Surface WHY a store dropped out (CF block / invalid impersonation profile / parse error).
           // eslint-disable-next-line no-console

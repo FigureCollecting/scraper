@@ -389,3 +389,68 @@ describe('runInitiatorPass', () => {
     expect(gate.issued()).toBe(2);
   });
 });
+
+describe('runInitiatorPass — collectUrl preference (the engine-owned collect-ready URL)', () => {
+  /** A /lookup body for ONE store whose candidates are given raw (so collectUrl can be present, absent, or junk). */
+  const bodyWith = (siteId: string, candidates: Array<Record<string, unknown>>) => ({
+    query: 'lucy',
+    mode: 'listed',
+    results: [{ siteId, host: `${siteId}.test`, url: `https://${siteId}.test/search`, storeQuery: 'lucy', candidates }],
+    unsupported: [],
+    orderableOnly: [],
+    failed: [],
+    cooldown: [],
+    resolveTargets: [],
+  });
+
+  it('(8) prefers collectUrl over url when both are present', async () => {
+    const fake = makeFake({
+      lookup: () => ({
+        status: 200,
+        body: bodyWith('orzgk', [
+          { itemId: '1', name: 'Lucy', url: 'https://orzgk.test/product/lucy/', collectUrl: 'https://orzgk.test/wp-json/wc/store/v1/products/1' },
+        ]),
+      }),
+    });
+    const s = await runInitiatorPass(mkCfg({ stores: ['orzgk'], terms: ['lucy'] }), { fetch: fake.fetch });
+
+    expect(fake.ingestCalls().map((c) => c.body.url)).toEqual(['https://orzgk.test/wp-json/wc/store/v1/products/1']);
+    expect(s.stores[0].discovered).toBe(1);
+    expect(s.stores[0].enqueued).toBe(1);
+  });
+
+  it('(9) falls back to url when collectUrl is absent, empty, or not a string (older engine)', async () => {
+    const fake = makeFake({
+      lookup: () => ({
+        status: 200,
+        body: bodyWith('orzgk', [
+          { itemId: '1', name: 'A', url: 'https://orzgk.test/a' }, // no collectUrl (pre-collectUrl engine)
+          { itemId: '2', name: 'B', url: 'https://orzgk.test/b', collectUrl: '' }, // empty
+          { itemId: '3', name: 'C', url: 'https://orzgk.test/c', collectUrl: 7 }, // junk
+        ]),
+      }),
+    });
+    const s = await runInitiatorPass(mkCfg({ stores: ['orzgk'], terms: ['lucy'] }), { fetch: fake.fetch });
+
+    expect(fake.ingestCalls().map((c) => c.body.url).sort()).toEqual(['https://orzgk.test/a', 'https://orzgk.test/b', 'https://orzgk.test/c']);
+    expect(s.stores[0].discovered).toBe(3);
+  });
+
+  it('(10) two candidates with different url but the same collectUrl dedupe to ONE ingest POST', async () => {
+    const byId = 'https://orzgk.test/wp-json/wc/store/v1/products/1';
+    const fake = makeFake({
+      lookup: () => ({
+        status: 200,
+        body: bodyWith('orzgk', [
+          { itemId: '1', name: 'Lucy', url: 'https://orzgk.test/product/lucy/', collectUrl: byId },
+          { itemId: '1', name: 'Lucy (variant)', url: 'https://orzgk.test/product/lucy/?variant=2', collectUrl: byId },
+        ]),
+      }),
+    });
+    const s = await runInitiatorPass(mkCfg({ stores: ['orzgk'], terms: ['lucy'] }), { fetch: fake.fetch });
+
+    expect(fake.ingestCalls().map((c) => c.body.url)).toEqual([byId]); // exactly one POST
+    expect(s.stores[0].discovered).toBe(1);
+    expect(s.stores[0].enqueued).toBe(1);
+  });
+});

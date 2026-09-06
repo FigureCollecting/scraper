@@ -9,6 +9,12 @@
  *      to maxUrlsPerStore each. Lookups are issued once per TERM (shared across
  *      stores) rather than per store: one fan-out already covers every store, so a
  *      per-store loop would multiply the scraper's upstream search egress needlessly.
+ *      Each candidate carries the store's product PAGE link (`url`) and, from an engine
+ *      that emits it, `collectUrl` — the collect-ready URL the engine derived from its
+ *      retrieval axes (the byId Store-API URL where declared, else the page link
+ *      absolutized). The initiator PREFERS collectUrl and falls back to url, so it
+ *      works against an older engine and never POSTs a relative or CF-fronted page
+ *      link when the engine knows a better one.
  *   2. ENQUEUE — POST each discovered URL to {scraper}/ingest/scrape. The queue does
  *      the real work (per-host pacing, honesty gate, extraction, spine emit) and
  *      dedups by URL, so re-running a pass is idempotent.
@@ -82,7 +88,7 @@ export interface RunSummary {
 }
 
 interface LookupResponseBody {
-  results?: Array<{ siteId?: string; candidates?: Array<{ url?: string }> }>;
+  results?: Array<{ siteId?: string; candidates?: Array<{ url?: string; collectUrl?: string }> }>;
   resolveTargets?: Array<{ siteId?: string; url?: string }>;
   failed?: string[];
   cooldown?: string[];
@@ -217,7 +223,10 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
       for (const sr of body.results ?? []) {
         if (!sr.siteId || !storeSet.has(sr.siteId)) continue;
         for (const c of sr.candidates ?? []) {
-          if (typeof c.url === 'string' && c.url) addUrl(sr.siteId, c.url);
+          // Prefer the engine's collect-ready URL; fall back to the page url (older engine, or no
+          // collectUrl derivable). Dedup (setFor/addUrl) keys on whichever was chosen.
+          const u = typeof c.collectUrl === 'string' && c.collectUrl ? c.collectUrl : c.url;
+          if (typeof u === 'string' && u) addUrl(sr.siteId, u);
         }
       }
       for (const rt of body.resolveTargets ?? []) {

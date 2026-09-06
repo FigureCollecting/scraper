@@ -534,3 +534,117 @@ describe('assembleLookup × challenge cooldown — honest search lane + per-host
     expect(gk.filtered).toBe(1);
   });
 });
+
+describe('assembleLookup — per-candidate collectUrl (the collect-ready URL; `url` stays the page link)', () => {
+  // orzgk: bySearch + byId — the byId Store-API JSON collects where the CF-challenged HTML page does not.
+  const ORZGK = caps('orzgk', 'www.orzgk.com', {
+    bySearch: { urlTemplate: 'https://www.orzgk.com/wp-json/wc/store/v1/products?search={q}', scope: 'listed' },
+    byId: { urlTemplate: 'https://www.orzgk.com/wp-json/wc/store/v1/products/{id}', idKind: 'store-internal' },
+  });
+  // fnc: bySearch only (no byId) — the page url is the only collect path.
+  const FNC = caps('fnc', 'www.fnc.com', { bySearch: { urlTemplate: 'https://www.fnc.com/search?q={q}', scope: 'listed' } });
+
+  const run = async (store: StoreCapabilities, cands: SearchCandidate[], opts?: { mode?: 'listed' | 'orderable' }) => {
+    const services: LookupServices = {
+      profiles: buildProfileRegistry([store]),
+      getRulesetForUrl: () => stub(store.siteId, () => cands),
+      fetchSearch: jest.fn(async () => '{}'),
+    };
+    const out = await assembleLookup(services).lookup('lucy', opts);
+    return { out, r: out.results.find((x) => x.siteId === store.siteId)! };
+  };
+
+  it('(1) byId store + itemId → collectUrl is the byId template with the itemId url-encoded; `url` is untouched', async () => {
+    const { r } = await run(ORZGK, [{ itemId: 'a b/1', name: 'Lucy', url: 'https://www.orzgk.com/product/lucy/', available: true }]);
+
+    expect(r.candidates).toHaveLength(1);
+    expect(r.candidates[0].collectUrl).toBe('https://www.orzgk.com/wp-json/wc/store/v1/products/a%20b%2F1');
+    // the contract's page link is NOT rewritten, and every other field is intact
+    expect(r.candidates[0].url).toBe('https://www.orzgk.com/product/lucy/');
+    expect(r.candidates[0]).toMatchObject({ itemId: 'a b/1', name: 'Lucy', available: true });
+  });
+
+  it('(2) no byId + absolute url → collectUrl === url', async () => {
+    const { r } = await run(FNC, [{ itemId: 'f1', name: 'Lucy', url: 'https://www.fnc.com/item/f1', available: true }]);
+
+    expect(r.candidates[0].collectUrl).toBe('https://www.fnc.com/item/f1');
+    expect(r.candidates[0].url).toBe('https://www.fnc.com/item/f1');
+  });
+
+  it('(3) no byId + RELATIVE url (Shopify /products/<handle>) → absolutized against the search URL origin', async () => {
+    // goodsmileus: bySearch only; its hits carry `/products/nendo` (relative) — the live 400 cause.
+    const { r } = await run(GOODSMILEUS, GSUS_CANDIDATES);
+
+    expect(r.candidates.map((c) => c.collectUrl)).toEqual([
+      'https://www.goodsmileus.com/products/nendo',
+      'https://www.goodsmileus.com/products/gyaru',
+    ]);
+    expect(r.candidates.map((c) => c.url)).toEqual(['/products/nendo', '/products/gyaru']); // page links unchanged
+  });
+
+  it('(4) byId declared but itemId empty → falls back to the url rule', async () => {
+    const { r } = await run(ORZGK, [{ itemId: '', name: 'Lucy', url: '/product/lucy/', available: true }]);
+
+    expect(r.candidates[0].collectUrl).toBe('https://www.orzgk.com/product/lucy/');
+    expect(r.candidates[0].itemId).toBe('');
+  });
+
+  it('(5) neither usable (no itemId, no url) → collectUrl absent, candidate still returned', async () => {
+    // untrusted plugin output: a non-string itemId on a byId store, and no url at all
+    const { r: byIdStore } = await run(ORZGK, [{ itemId: 42 as unknown as string, name: 'Lucy', available: true }]);
+    expect(byIdStore.candidates).toHaveLength(1);
+    expect(Object.prototype.hasOwnProperty.call(byIdStore.candidates[0], 'collectUrl')).toBe(false);
+    expect(byIdStore.candidates[0]).toEqual({ itemId: 42, name: 'Lucy', available: true });
+
+    // a no-byId store whose hit has no url (the solaris suggest shape)
+    const { r: noByIdStore } = await run(FNC, [{ itemId: 'f1', name: 'Lucy', available: true }]);
+    expect(noByIdStore.candidates).toHaveLength(1);
+    expect(Object.prototype.hasOwnProperty.call(noByIdStore.candidates[0], 'collectUrl')).toBe(false);
+  });
+
+  it('(6) collectUrl survives the substring identity post-filter AND the orderable-mode cut', async () => {
+    const GK = caps('gkloot', 'www.gkloot.com', {
+      bySearch: { urlTemplate: 'https://www.gkloot.com/search/?Keyword={q}', scope: 'listed', queryMatch: 'substring' },
+      byId: { urlTemplate: 'https://www.gkloot.com/products/{id}', idKind: 'store-internal' },
+    });
+    const MIXED: SearchCandidate[] = [
+      { itemId: '17412', name: 'Star Origin Studio Lucy Deluxe', url: '/p/17412', available: true },
+      { itemId: '9001', name: 'Crown Studio Lucy 1/4', url: '/p/9001', available: true },
+      { itemId: '9004', name: 'Star Origin Studio Lucy Sold', url: '/p/9004', available: false },
+    ];
+    const build = () => assembleLookup({
+      profiles: buildProfileRegistry([GK]),
+      getRulesetForUrl: () => stub('gkloot', () => MIXED),
+      fetchSearch: jest.fn(async () => '{}'),
+    });
+    const IDENTITY = { studio: 'Star Origin Studio', character: 'Lucy' };
+
+    // listed: the identity post-filter drops Crown; both Star Origin hits keep their byId collectUrl
+    const listed = (await build().lookupByIdentity(IDENTITY)).results.find((r) => r.siteId === 'gkloot')!;
+    expect(listed.filtered).toBe(1);
+    expect(listed.candidates.map((c) => [c.itemId, c.collectUrl])).toEqual([
+      ['17412', 'https://www.gkloot.com/products/17412'],
+      ['9004', 'https://www.gkloot.com/products/9004'],
+    ]);
+
+    // orderable: the sold-out 9004 is cut too; the survivor still carries collectUrl
+    const orderable = (await build().lookupByIdentity(IDENTITY, { mode: 'orderable' })).results.find((r) => r.siteId === 'gkloot')!;
+    expect(orderable.candidates.map((c) => [c.itemId, c.collectUrl])).toEqual([['17412', 'https://www.gkloot.com/products/17412']]);
+  });
+
+  it('(7) a malformed url with no byId → no throw, collectUrl absent, the candidate AND the store survive', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const { out, r } = await run(FNC, [
+      { itemId: 'bad', name: 'Lucy', url: 'http://[bad', available: true },
+      { itemId: 'ok', name: 'Lucy 2', url: 'https://www.fnc.com/item/ok', available: true },
+    ]);
+
+    expect(out.failed).toEqual([]); // the store is NOT taken down by one bad link
+    expect(r.candidates.map((c) => c.itemId)).toEqual(['bad', 'ok']); // the bad candidate is kept
+    expect(Object.prototype.hasOwnProperty.call(r.candidates[0], 'collectUrl')).toBe(false);
+    expect(r.candidates[0].url).toBe('http://[bad');
+    expect(r.candidates[1].collectUrl).toBe('https://www.fnc.com/item/ok');
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+});
