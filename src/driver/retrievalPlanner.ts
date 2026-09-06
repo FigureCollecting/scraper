@@ -95,6 +95,18 @@ export function resolveByIdUrl(retrieval: RetrievalCapability | undefined, itemI
   return template ? template.replace('{id}', encodeURIComponent(itemId)) : undefined;
 }
 
+/**
+ * Build a catalog-listing page URL from the byListing template, EVERY `{page}` occurrence replaced
+ * with the page number (a template may carry it in both path and query). A store without the axis,
+ * or a page that is not a positive integer (0 / negative / fractional / NaN), → undefined — never a
+ * "page=0" or "page=NaN" fetch.
+ */
+export function resolveListingUrl(retrieval: RetrievalCapability | undefined, page: number): string | undefined {
+  const template = retrieval?.byListing?.urlTemplate;
+  if (!template || !Number.isInteger(page) || page < 1) return undefined;
+  return template.replaceAll('{page}', String(page));
+}
+
 /** Build a search URL from the bySearch template, `{q}` url-encoded. */
 export function resolveSearchUrl(retrieval: RetrievalCapability | undefined, query: string): string | undefined {
   const template = retrieval?.bySearch?.urlTemplate;

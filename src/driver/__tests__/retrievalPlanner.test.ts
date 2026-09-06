@@ -5,7 +5,7 @@
  */
 import type { IdentityQuery, RetrievalCapability, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
 import { ProfileRegistry } from '../profileRegistry';
-import { planRetrieval, resolveByIdUrl, resolveSearchUrl, composeStoreQuery, composeNameQuery, normalizeText, tokenizeIdentity } from '../retrievalPlanner';
+import { planRetrieval, resolveByIdUrl, resolveSearchUrl, resolveListingUrl, composeStoreQuery, composeNameQuery, normalizeText, tokenizeIdentity } from '../retrievalPlanner';
 
 const caps = (siteId: string, host: string, retrieval?: RetrievalCapability): StoreCapabilities => ({
   siteId, name: siteId, domains: [host], requiresBrowser: false, allowedCookies: [],
@@ -34,6 +34,36 @@ describe('retrieval URL resolvers', () => {
   it('resolveSearchUrl substitutes {q}, url-encoded; undefined when unsupported', () => {
     expect(resolveSearchUrl({ bySearch: { urlTemplate: 'https://x/s?q={q}' } }, 'nendoroid miku')).toBe('https://x/s?q=nendoroid%20miku');
     expect(resolveSearchUrl({}, 'x')).toBeUndefined();
+  });
+
+  describe('resolveListingUrl — the newest-first catalog page url (byListing)', () => {
+    const LISTING: RetrievalCapability = {
+      byListing: { urlTemplate: 'https://www.orzgk.com/wp-json/wc/store/v1/products?orderby=date&order=desc&per_page=100&page={page}', order: 'newest' },
+    };
+
+    it('substitutes {page} with the page number', () => {
+      expect(resolveListingUrl(LISTING, 1)).toBe('https://www.orzgk.com/wp-json/wc/store/v1/products?orderby=date&order=desc&per_page=100&page=1');
+      expect(resolveListingUrl(LISTING, 409)).toBe('https://www.orzgk.com/wp-json/wc/store/v1/products?orderby=date&order=desc&per_page=100&page=409');
+    });
+
+    it('a page below 1, or a non-integer page, → undefined (never a "page=0"/"page=1.5"/"page=NaN" url)', () => {
+      expect(resolveListingUrl(LISTING, 0)).toBeUndefined();
+      expect(resolveListingUrl(LISTING, -1)).toBeUndefined();
+      expect(resolveListingUrl(LISTING, 1.5)).toBeUndefined();
+      expect(resolveListingUrl(LISTING, Number.NaN)).toBeUndefined();
+      expect(resolveListingUrl(LISTING, Number.POSITIVE_INFINITY)).toBeUndefined();
+    });
+
+    it('no byListing axis (or no retrieval at all) → undefined', () => {
+      expect(resolveListingUrl({ byId: { urlTemplate: 'https://x/d/{id}' } }, 1)).toBeUndefined();
+      expect(resolveListingUrl({}, 1)).toBeUndefined();
+      expect(resolveListingUrl(undefined, 1)).toBeUndefined();
+    });
+
+    it('PIN — a template that repeats {page} has EVERY occurrence replaced consistently', () => {
+      const twice: RetrievalCapability = { byListing: { urlTemplate: 'https://x.test/catalog/page/{page}/?paged={page}', order: 'newest' } };
+      expect(resolveListingUrl(twice, 7)).toBe('https://x.test/catalog/page/7/?paged=7');
+    });
   });
 });
 

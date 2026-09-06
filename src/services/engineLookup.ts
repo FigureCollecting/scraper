@@ -10,7 +10,8 @@
  * `browser` transport is wired at the mount from the ScrapingService; unset here → it degrades to http.
  */
 import { buildProfileRegistry } from '../driver/profileRegistry.js';
-import { assembleLookup, type Lookup } from '../driver/assembleLookup.js';
+import { assembleLookup, type Lookup, type LookupServices } from '../driver/assembleLookup.js';
+import { assembleCatalog, type Catalog } from '../driver/assembleCatalog.js';
 import { makeFetchSearch, type FetchSearchTransports } from './fetchSearch.js';
 import { impitFetchBody } from './impitFetch.js';
 import type { ExtractionRuleset, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
@@ -52,15 +53,32 @@ export function createEngineLookup(
   registry: LookupRegistry,
   transports: Partial<FetchSearchTransports> = {},
 ): Lookup {
+  return assembleLookup(wireServices(registry, transports));
+}
+
+/**
+ * Build the per-store CATALOG listing runtime (GET /catalog — the crawler's enumeration feed) from
+ * the same registry + transports as the Lookup: a store's listing page is fetched through the very
+ * transport its `searchFetch` declares, and parsed by its ruleset's `extractListing`.
+ */
+export function createEngineCatalog(
+  registry: LookupRegistry,
+  transports: Partial<FetchSearchTransports> = {},
+): Catalog {
+  return assembleCatalog(wireServices(registry, transports));
+}
+
+/** The engine wiring both runtimes share: registry → ProfileRegistry, ruleset lookup, 3-way search fetch. */
+function wireServices(registry: LookupRegistry, transports: Partial<FetchSearchTransports>): LookupServices {
   const profiles = buildProfileRegistry(registry.allStores());
   const fetchSearch = makeFetchSearch({
     http: transports.http ?? httpFetchBody,
     impersonate: transports.impersonate ?? impitFetchBody,
     browser: transports.browser,
   });
-  return assembleLookup({
+  return {
     profiles,
     getRulesetForUrl: (url) => registry.getRulesetForUrl(url),
     fetchSearch,
-  });
+  };
 }
