@@ -355,6 +355,78 @@ Cancel all failed items for a session (removes them from queue).
 }
 ```
 
+## Catalog Crawler (ingestion feeder)
+
+`node dist/crawler/run.js` performs ONE bounded catalog-crawl pass and exits — recurrence is
+the CronJob's schedule, stop is the CronJob's `suspend: true`. It is a thin HTTP client of this
+service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
+`POST /ingest/scrape`; it imports nothing from `src/driver/*`.
+
+- **recent** — from page 1 of the listing, up to `CRAWLER_RECENT_MAX_PAGES`: POST every new
+  item's `collectUrl`, and stop at the first page that yields nothing new. A known item counts
+  as new again once its ledger entry is older than `CRAWLER_REOBSERVE_AFTER_MS` (0 = never).
+- **backfill** — resume the store's saved page cursor for up to `CRAWLER_BACKFILL_PAGES_PER_RUN`
+  pages, new ids only. The cursor advances only when the page reported `hasMore: true` AND every
+  new item on it was attempted (`nextPage` is ignored); a page cut short by the per-store cap, the
+  global budget, or a 5xx from `/ingest/scrape` is re-fetched next run.
+- `both` (default) runs recent for every store, THEN backfill. Stores run in parallel under one
+  global request gate (concurrency, total budget over catalog GETs + ingest POSTs, spacing);
+  pages within a store are sequential; the ledger is saved after every page.
+- Per catalog page: `503 cooldown` → the store is skipped for this run (no state change);
+  `422 unsupported` → error, store stopped (a config problem, not exhaustion); any other
+  non-2xx or a malformed body → error, store stopped, cursor untouched.
+- The run ends with a `[CRAWLER] pass complete` JSON summary (per store: pagesFetched,
+  discovered, known, enqueued, deduplicated, reobserved, errors, skipped, backfillCursor,
+  exhaustCandidate, exhausted; plus totals, requestsIssued, budgetExhausted, durationMs).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SCRAPER_SERVICE_URL` | `http://localhost:3050` | The scraper's HTTP surface (the only thing the crawler talks to) |
+| `CRAWLER_MODE` | `both` | `recent`, `backfill`, or `both` (recent then backfill) |
+| `CRAWLER_STORES` | `orzgk` | csv of siteIds; explicitly empty = no work (kill switch) |
+| `CRAWLER_LEDGER_DIR` | `/var/lib/ingest-crawler` | Directory of per-store ledger files |
+| `CRAWLER_RECENT_MAX_PAGES` | `3` | Max listing pages walked from page 1 per store per run |
+| `CRAWLER_BACKFILL_PAGES_PER_RUN` | `5` | Max pages the backfill cursor advances per store per run |
+| `CRAWLER_MAX_REQUESTS` | `100` | Global request budget (catalog GETs + ingest POSTs); `0` = kill switch |
+| `CRAWLER_MAX_ENQUEUE_PER_STORE` | `50` | Max ingest POSTs per store per run; `0` = discovery-only dry run |
+| `CRAWLER_MAX_CONCURRENCY` | `2` | Global max in-flight requests across all stores |
+| `CRAWLER_REQUEST_SPACING_MS` | `1000` | Minimum spacing between consecutive dispatches |
+| `CRAWLER_REQUEST_TIMEOUT_MS` | `45000` | Per-request abort timeout (keep above the engine's `CATALOG_STORE_TIMEOUT_MS`) |
+| `CRAWLER_REOBSERVE_AFTER_MS` | `604800000` (7d) | Recent only: re-POST a known item once its entry is this old; `0` = never |
+| `CRAWLER_EXHAUSTED_RECHECK_MS` | `604800000` (7d) | Re-check an exhausted store's last cursor after this long |
+
+**Ledger** — one file per store, `<CRAWLER_LEDGER_DIR>/<siteId>.json`, written as
+`<siteId>.json.tmp-<pid>` and renamed into place (a crash never leaves a torn file):
+
+```json
+{
+  "version": 1,
+  "siteId": "orzgk",
+  "enqueued": { "<itemId>": { "at": "2026-09-06T12:00:00.000Z", "collectUrl": "https://..." } },
+  "backfill": {
+    "cursor": 12,
+    "exhaustCandidateCursor": 12, "exhaustCandidateAt": "...",
+    "exhaustedAt": "...",
+    "updatedAt": "..."
+  },
+  "recent": { "lastRunAt": "...", "lastNewCount": 3 },
+  "updatedAt": "..."
+}
+```
+
+A missing file is a fresh ledger. Unparseable JSON, a wrong `version`, a wrong `siteId`, or a
+malformed section is **corrupt**: the store is refused for the run (counted as an error) and the
+file is never overwritten — inspect or delete it by hand.
+
+**Exhaustion rule** — end-of-catalog is confirmed, never inferred from one page. The engine's
+upstream fetch is status-blind (a Shopify page-cap `400` or a transient `5xx` parses as an empty
+listing), so a page with `hasMore: false` or zero items only records an exhaustion *candidate*
+at that cursor (`exhaustCandidateCursor`/`exhaustCandidateAt`) and ends the run without
+advancing. Only when the NEXT run sees the SAME cursor empty again is the store marked
+`exhaustedAt` (the cursor is kept); items reappearing clear the candidate. An exhausted store
+makes no backfill requests until `CRAWLER_EXHAUSTED_RECHECK_MS` has elapsed, then re-checks its
+last cursor: still empty re-stamps `exhaustedAt`, items resume the backfill.
+
 ## Testing
 
 The scraper includes comprehensive test coverage with 26 test suites and containerized test execution.
