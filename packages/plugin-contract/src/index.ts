@@ -246,6 +246,15 @@ export interface RetrievalCapability {
    * selective identity term as `{q}` and POST-FILTERS the candidates by the remaining identity terms.
    */
   bySearch?: { urlTemplate: string; scope?: 'listed' | 'orderable'; acceptsGtin?: boolean; queryMatch?: 'tokens' | 'substring' };
+  /**
+   * Newest-first PAGED catalog listing for ENUMERATION — the feed for recent/backfill crawls (a
+   * recent crawl walks the first pages for fresh ids; a backfill resumes a saved page cursor
+   * deeper in). Page N is fetched by substituting `{page}` (which the template MUST contain) with
+   * the page number; `pageStart` is the first page (default 1); `maxPerPage` documents the store's
+   * page-size cap; `order` is `newest` — the ONLY order the feeder reasons about (publish-date
+   * desc, so page 1 is the freshest). Each page body is parsed by `ExtractionRuleset.extractListing`.
+   */
+  byListing?: { urlTemplate: string; pageStart?: number; maxPerPage?: number; order: 'newest' };
 }
 
 export type SearchTransport = 'http' | 'impersonate' | 'browser';
@@ -375,6 +384,15 @@ export interface ExtractionRuleset {
     ctx?: ExtractContext,
   ): SearchCandidate[] | Promise<SearchCandidate[]>;
   /**
+   * OPTIONAL: parse one CATALOG-LISTING page body (fetched from the store's `retrieval.byListing`
+   * endpoint) into the item ids it lists — the enumeration feed for recent/backfill crawls.
+   * Distinct from `extractCandidates()`, which parses the results of ONE search query: this turns
+   * a newest-first catalog page (a WooCommerce Store API product array, a Shopify `products.json`,
+   * or an HTML product grid) into a `ListingPage`. Stores that declare `byListing` implement it;
+   * the rest omit it. Async-capable like `extractCandidates()` — the engine always awaits the result.
+   */
+  extractListing?(body: string, url: string, ctx?: ExtractContext): ListingPage | Promise<ListingPage>;
+  /**
    * OPTIONAL: when `true`, this ruleset declares that a ZERO-RECORD extraction is a VALID outcome
    * — the page was well-formed and the ruleset successfully determined there is genuinely nothing
    * to emit (an empty search/listing result, a delisted page with no claimable data). This is the
@@ -432,6 +450,21 @@ export interface SearchCandidate {
    * history).
    */
   available?: boolean;
+}
+
+/**
+ * One page of a store's newest-first catalog listing (`retrieval.byListing`), as parsed by
+ * `ExtractionRuleset.extractListing`. Each item carries the store's `itemId` — it feeds
+ * `retrieval.byId` exactly like `SearchCandidate.itemId` — and, for stores without a byId axis, the
+ * product page `url` (absolute, or relative to the listing url; the engine absolutizes it) as the
+ * collect target. `hasMore` = the store signalled a further page (absent → the engine infers it from
+ * a non-empty page); `nextPage` = the store's explicit next page number when it reports one (absent
+ * → page + 1 while `hasMore`).
+ */
+export interface ListingPage {
+  items: Array<{ itemId: string; url?: string }>;
+  hasMore?: boolean;
+  nextPage?: number;
 }
 
 /**
