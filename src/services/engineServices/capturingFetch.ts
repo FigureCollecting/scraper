@@ -47,7 +47,7 @@ export interface CapturingFetchResult {
  * A non-browser lane (impersonate / http) served a Cloudflare challenge/block interstitial AND the
  * ruleset then persisted nothing from it — a TRANSPORT failure, not an empty success. NO LONGER
  * thrown by the transport itself (capturingFetch merely FLAGS `challenge` on its result and captures
- * the bytes for provenance): it is thrown by scrapeQueue's ingest honesty gate, which alone can see
+ * the bytes for provenance): it is thrown by scrapeQueue's ingest path (the honesty gate, or the extraction-throw door), which alone can see
  * whether the ruleset's own follow-up transport recovered the record (the amiami case, where the
  * product page is a challenge but a same-pod item-API call still lifts the full record). The message
  * names Cloudflare so the queue's classifyError treats it as a rate-limit/block class, and carries

@@ -1282,6 +1282,24 @@ export class ScrapeQueue {
       console.error(
         `[SCRAPE QUEUE] Extraction failed for ${item.url} (ruleset ${ruleset.siteId}@${ruleset.version}): ${sanitizeForLog(error?.message ?? String(error))}`
       );
+      // CHALLENGE PAGE, EXTRACTION THREW — the SECOND door into the challenge-retry storm (live
+      // 2026-09-06, orzgk). A challenge has two exits: (a) extraction SUCCEEDS on the challenge body
+      // (a JSON-tolerant or follow-up-transport ruleset) and the post-emit honesty gate below decides
+      // persisted-0 → ChallengePageError + cooldown vs persisted>0 → amiami recovery; (b) extraction
+      // THROWS on it (a JSON-only ruleset fed CF's HTML interstitial trips the D11 itemId guard, or a
+      // non-opting ruleset returns empty) — which used to rethrow a PLAIN Error → 'unknown' → retried
+      // up to maxRetries, re-fetching the challenge page every time, and the cooldown (only reachable
+      // via door (a)) never opened. Door (b) now takes the same one-shot exit: open the host cooldown
+      // and raise the typed ChallengePageError (rate_limited, never retried; later same-host items
+      // fast-fail on ChallengeCooldownError before any fetch). The amiami recovery is untouched — it
+      // lives in door (a), where extraction did not throw.
+      if (page.challenge) {
+        if (host !== undefined) cooldown.open(host, `challenge page via ${page.transport ?? 'unknown'} transport (extraction failed)`);
+        console.error(
+          `[SCRAPE QUEUE] Extraction failed on a challenge page for ${sanitizeForLog(item.url)} (ruleset ${ruleset.siteId}@${ruleset.version}) — one-shot fail, host cooldown opened`
+        );
+        throw new ChallengePageError(item.url, page.transport ?? 'unknown', []);
+      }
       throw error instanceof Error ? error : new Error(String(error));
     }
 
@@ -1647,7 +1665,7 @@ export class ScrapeQueue {
     // pause/cooldown and fall through to the maxRetries/give-up path below, so a permanently-empty
     // record lands FAILED with a clear reason instead of pausing the user's whole sync session as
     // 'auth_failures' and holding the item indefinitely (RS-3).
-    // A ChallengePageError is likewise NOT a cookie fault: it is raised ONLY by the honesty gate for a
+    // A ChallengePageError is likewise NOT a cookie fault: it is raised by the ingest queue (the honesty gate, or the extraction-throw door when the flagged page breaks the extractor) for a
     // NON-browser lane (http/impersonate) that never sent the cookies, so a cookie'd item must fail
     // bounded like the cookieless case instead of pausing the session (RT-1). The carve-out keys on the
     // ChallengePageError CLASS, not errorType==='rate_limited' — a browser-lane CF block still surfaces
