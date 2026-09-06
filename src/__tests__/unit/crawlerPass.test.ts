@@ -854,3 +854,38 @@ describe('runCrawlerPass — modes, ledgers, budget, parallelism, summary', () =
     expect(Date.parse(store.files.get('orzgk')!.enqueued.a.at)).toBeGreaterThanOrEqual(before);
   });
 });
+
+describe('runCrawlerPass — backfill exhaustion must not be CONFIRMED on a page that was not fully attempted', () => {
+  const seeded = (cursor: number) => createMemoryLedgerStore({ orzgk: { ...createEmptyLedger('orzgk'), backfill: { cursor } } });
+  const twoRuns = async (store: ReturnType<typeof createMemoryLedgerStore>, catalog: (s: string, p: number) => Reply, ingest?: (u: string) => Reply) => {
+    const c = clock();
+    const runs = [];
+    for (let i = 0; i < 3; i++) {
+      const fake = makeFake({ catalog, ingest });
+      const s = await runCrawlerPass(mkCfg({ mode: 'backfill' }), { fetch: fake.fetch, ledgerStore: store, now: c.now });
+      runs.push({ s, fake });
+      c.advance(60 * 60 * 1000);
+    }
+    return runs;
+  };
+
+  it('last page (hasMore:false) cut short by the per-store cap twice → still a candidate, NOT exhausted; run 3 re-fetches it', async () => {
+    const last = Array.from({ length: 250 }, (_, i) => `L${i}`);
+    const store = seeded(409);
+    const runs = await twoRuns(store, (s, p) => ok(s, p, last, false));
+    expect(runs[0].fake.posted()).toHaveLength(50);
+    expect(runs[1].fake.posted()).toHaveLength(50);
+    expect(Object.keys(store.files.get('orzgk')!.enqueued)).toHaveLength(100); // 150 never attempted
+    expect(store.files.get('orzgk')!.backfill.exhaustedAt).toBeUndefined();
+    expect(runs[2].fake.pages()).toEqual([409]);
+  });
+
+  it('last page (hasMore:false) whose POSTs all 5xx twice (scraper unwell) → NOT exhausted; run 3 re-fetches it', async () => {
+    const store = seeded(409);
+    const sick = (): Reply => ({ status: 503, body: { success: false, message: 'Ingest not configured (INGEST_BASE_URL unset)' } });
+    const runs = await twoRuns(store, (s, p) => ok(s, p, ['z1', 'z2'], false), sick);
+    expect(Object.keys(store.files.get('orzgk')!.enqueued)).toHaveLength(0);
+    expect(store.files.get('orzgk')!.backfill.exhaustedAt).toBeUndefined();
+    expect(runs[2].fake.pages()).toEqual([409]);
+  });
+});
