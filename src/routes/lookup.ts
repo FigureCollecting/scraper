@@ -12,6 +12,23 @@ import type { IdentityQuery } from '@figurecollecting/scraper-plugin-contract';
 
 const parseMode = (m: unknown): LookupMode => (m === 'orderable' ? 'orderable' : 'listed');
 
+// Optional `stores` scope: a CSV of siteIds (e.g. "orzgk,goodsmileus") narrowing the fan-out to just
+// those stores — the interim initiator's scope knob. Trim/drop-empties/dedupe; an absent or all-blank
+// value yields undefined (no scoping → full fan-out, the backward-compat default). A REPEATED param
+// (?stores=a&stores=b) arrives as an array, so flatten each element's CSV rather than silently WIDENING
+// to a full fan-out on the array path — dropping scope open is the least-safe failure direction for a
+// knob whose whole point is to avoid CF-blocked stores.
+const parseStores = (s: unknown): string[] | undefined => {
+  const raw = Array.isArray(s) ? s : typeof s === 'string' ? [s] : undefined;
+  if (!raw) return undefined;
+  const list = [
+    ...new Set(
+      raw.flatMap((x) => (typeof x === 'string' ? x.split(',') : [])).map((x) => x.trim()).filter((x) => x.length > 0),
+    ),
+  ];
+  return list.length > 0 ? list : undefined;
+};
+
 export function createLookupRoute(lookup: Lookup): Router {
   const router = Router();
 
@@ -22,7 +39,7 @@ export function createLookupRoute(lookup: Lookup): Router {
       return;
     }
     try {
-      res.json(await lookup.lookup(q, { mode: parseMode(req.query.mode) }));
+      res.json(await lookup.lookup(q, { mode: parseMode(req.query.mode), stores: parseStores(req.query.stores) }));
     } catch (error) {
       res.status(502).json({ error: 'lookup failed', detail: error instanceof Error ? error.message : String(error) });
     }

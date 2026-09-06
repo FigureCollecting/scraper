@@ -4,7 +4,7 @@
  * `orderable` filters to in-stock. Fakes model the two shapes: a listed store with a sold-out hit,
  * and an orderable-scope store (predictive endpoint that hides sold-out — the solaris case).
  */
-import { assembleLookup, type LookupServices } from '../assembleLookup';
+import { assembleLookup, resolveLookupStoreTimeoutMs, type LookupServices } from '../assembleLookup';
 import { buildProfileRegistry } from '../profileRegistry';
 import { ChallengeCooldown } from '../../services/challengeCooldown';
 import type {
@@ -366,6 +366,91 @@ describe('lookupByIdentity — substring-match store post-filter + observability
     expect(gk.candidates.map((c) => c.itemId)).toEqual(['17412', '9003']); // nobody removed
     expect(gk.filtered).toBe(0);
     expect(Object.prototype.hasOwnProperty.call(gk, 'filtered')).toBe(true); // present, not omitted
+  });
+});
+
+describe('assembleLookup — scoped store fan-out (initiator interim path)', () => {
+  it('stores scope: fetches ONLY the requested stores; the others are never touched', async () => {
+    const { fetchSearch, lookup } = build();
+
+    const out = await lookup.lookup('tomie', { stores: ['solaris'] });
+
+    // only the requested store is fetched — goodsmileus (a supported store) is NOT
+    expect(fetchSearch).toHaveBeenCalledWith(expect.stringContaining('solaris'), expect.anything());
+    expect(fetchSearch).not.toHaveBeenCalledWith(expect.stringContaining('goodsmileus'), expect.anything());
+    expect(out.results.map((r) => r.siteId)).toEqual(['solaris']);
+  });
+
+  it('stores scope: unsupported envelope is filtered to the requested set too', async () => {
+    const { lookup } = build();
+
+    // cdjapan (byId-only → unsupported for search) is OUT of scope → dropped from the coverage envelope
+    const scoped = await lookup.lookup('tomie', { stores: ['solaris'] });
+    expect(scoped.unsupported).not.toContain('cdjapan');
+
+    // …but scoping cdjapan IN keeps it in the envelope (it is a requested, if unsupported, store)
+    const inScope = await lookup.lookup('tomie', { stores: ['solaris', 'cdjapan'] });
+    expect(inScope.unsupported).toContain('cdjapan');
+  });
+
+  it('no stores (omitted OR empty) → full fan-out, UNCHANGED (backward-compat contract)', async () => {
+    const { fetchSearch: fetchOmitted, lookup: lookupOmitted } = build();
+    const omitted = await lookupOmitted.lookup('tomie');
+
+    const { fetchSearch: fetchEmpty, lookup: lookupEmpty } = build();
+    const empty = await lookupEmpty.lookup('tomie', { stores: [] });
+
+    // both fetch every supported store and report the same coverage envelope as the pre-scope behavior
+    for (const fs of [fetchOmitted, fetchEmpty]) {
+      expect(fs).toHaveBeenCalledWith(expect.stringContaining('goodsmileus'), expect.anything());
+      expect(fs).toHaveBeenCalledWith(expect.stringContaining('solaris'), expect.anything());
+    }
+    expect(omitted.results.map((r) => r.siteId).sort()).toEqual(['goodsmileus', 'solaris']);
+    expect(empty.results.map((r) => r.siteId).sort()).toEqual(['goodsmileus', 'solaris']);
+    expect(omitted.unsupported).toContain('cdjapan');
+    expect(empty.unsupported).toContain('cdjapan');
+  });
+
+  it('a store whose search fetch HANGS is timed out → reported `failed`, and never blocks the others', async () => {
+    jest.useFakeTimers();
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    // goodsmileus never resolves; solaris returns normally — the timeout must free the fan-out.
+    const fetchSearch = jest.fn((url: string) =>
+      url.includes('goodsmileus') ? new Promise<string>(() => {}) : Promise.resolve('{}'),
+    );
+    const { lookup } = build({ fetchSearch });
+
+    const pending = lookup.lookup('tomie');
+    // fire the per-store timeout (and drain the microtasks it releases)
+    await jest.advanceTimersByTimeAsync(resolveLookupStoreTimeoutMs(process.env) + 1);
+    const out = await pending;
+
+    expect(out.failed).toContain('goodsmileus'); // the hung store is surfaced, not a silent stall
+    expect(out.results.map((r) => r.siteId)).toContain('solaris'); // the healthy store still returned
+    const failLog = warn.mock.calls.map((c) => String(c[0])).find((l) => l.includes('goodsmileus') && l.includes('search failed'));
+    expect(failLog).toContain('timed out');
+    jest.useRealTimers();
+    warn.mockRestore();
+  });
+});
+
+describe('resolveLookupStoreTimeoutMs — pure env → ms resolver (LOOKUP_STORE_TIMEOUT_MS)', () => {
+  const env = (v?: string): NodeJS.ProcessEnv => ({ LOOKUP_STORE_TIMEOUT_MS: v } as NodeJS.ProcessEnv);
+
+  it('defaults to 15000 when unset', () => {
+    expect(resolveLookupStoreTimeoutMs(env())).toBe(15000);
+  });
+  it('honors a valid override', () => {
+    expect(resolveLookupStoreTimeoutMs(env('20000'))).toBe(20000);
+  });
+  it('falls back to the default on non-numeric input', () => {
+    expect(resolveLookupStoreTimeoutMs(env('abc'))).toBe(15000);
+  });
+  it('clamps a too-small value up to the min', () => {
+    expect(resolveLookupStoreTimeoutMs(env('10'))).toBe(1000);
+  });
+  it('clamps a too-large value down to the max', () => {
+    expect(resolveLookupStoreTimeoutMs(env('999999'))).toBe(60000);
   });
 });
 

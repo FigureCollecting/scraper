@@ -370,6 +370,16 @@ describe('runInitiatorPass', () => {
     expect(si.stores[0].enqueued).toBe(0);
   });
 
+  it('scopes the fan-out to the configured stores via a URL-encoded &stores= csv', async () => {
+    const fake = makeFake({ lookup: () => ({ status: 200, body: lookupWith({}) }) });
+    await runInitiatorPass(mkCfg({ stores: ['orzgk', 'amiami'], terms: ['lucy'] }), { fetch: fake.fetch });
+
+    const url = fake.lookupCalls()[0].url;
+    // the initiator narrows the shared fan-out to exactly its configured store set
+    expect(url).toContain('stores=' + encodeURIComponent('orzgk,amiami'));
+    expect(new URL(url).searchParams.get('stores')).toBe('orzgk,amiami');
+  });
+
   it('uses an injected gate when provided', async () => {
     const { createRequestGate } = await import('../../initiator/requestGate');
     const gate = createRequestGate({ maxConcurrency: 1, maxRequests: 100, spacingMs: 0 });

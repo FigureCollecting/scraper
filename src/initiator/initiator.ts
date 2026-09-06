@@ -193,7 +193,10 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
     return summary;
   }
 
-  const lookupUrl = (term: string): string => `${config.scraperServiceUrl}/lookup?q=${encodeURIComponent(term)}&mode=${config.mode}`;
+  // Scope the shared fan-out to THIS pass's configured stores — the initiator only cares about its
+  // proven-GO set, so narrowing the fan-out spares the scraper the upstream egress of the rest.
+  const lookupUrl = (term: string): string =>
+    `${config.scraperServiceUrl}/lookup?q=${encodeURIComponent(term)}&mode=${config.mode}&stores=${encodeURIComponent(config.stores.join(','))}`;
   const ingestUrl = `${config.scraperServiceUrl}/ingest/scrape`;
 
   // Phase 1 — DISCOVERY (one shared fan-out per term).
