@@ -41,6 +41,37 @@ describe('GET /lookup (discovery)', () => {
     expect(lookup.lookup).toHaveBeenCalledWith('tomie', { mode: 'listed' });
   });
 
+  it('parses a `stores` csv into a deduped, trimmed siteId list', async () => {
+    const lookup = mkLookup();
+    await request(appWith(lookup)).get('/lookup?q=tomie&stores=orzgk,fnc');
+    expect(lookup.lookup).toHaveBeenCalledWith('tomie', { mode: 'listed', stores: ['orzgk', 'fnc'] });
+  });
+
+  it('trims whitespace, drops empties, and dedupes the `stores` csv', async () => {
+    const lookup = mkLookup();
+    await request(appWith(lookup)).get('/lookup?q=tomie&stores=' + encodeURIComponent(' orzgk , , fnc ,orzgk'));
+    expect(lookup.lookup).toHaveBeenCalledWith('tomie', { mode: 'listed', stores: ['orzgk', 'fnc'] });
+  });
+
+  it('a REPEATED stores param (?stores=a&stores=b) still scopes rather than widening to a full fan-out', async () => {
+    const lookup = mkLookup();
+    await request(appWith(lookup)).get('/lookup?q=tomie&stores=orzgk&stores=fnc,orzgk');
+    // express hands req.query.stores an array; flatten each element's CSV → deduped scope (not undefined)
+    expect(lookup.lookup).toHaveBeenCalledWith('tomie', { mode: 'listed', stores: ['orzgk', 'fnc'] });
+  });
+
+  it('omits stores when the param is absent → undefined (full fan-out, backward-compat)', async () => {
+    const lookup = mkLookup();
+    await request(appWith(lookup)).get('/lookup?q=tomie');
+    expect(lookup.lookup).toHaveBeenCalledWith('tomie', { mode: 'listed', stores: undefined });
+  });
+
+  it('treats an all-blank stores param as undefined (no scoping)', async () => {
+    const lookup = mkLookup();
+    await request(appWith(lookup)).get('/lookup?q=tomie&stores=' + encodeURIComponent(' , '));
+    expect(lookup.lookup).toHaveBeenCalledWith('tomie', { mode: 'listed', stores: undefined });
+  });
+
   it('400 when q is missing or blank', async () => {
     const lookup = mkLookup();
     expect((await request(appWith(lookup)).get('/lookup')).status).toBe(400);

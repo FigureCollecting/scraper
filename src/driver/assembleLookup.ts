@@ -24,6 +24,42 @@ import type { ExtractionRuleset, IdentityQuery, SearchCandidate, SearchFetch } f
 
 export type LookupMode = 'listed' | 'orderable';
 
+/** Per-store search-fetch timeout (ms) used when LOOKUP_STORE_TIMEOUT_MS is unset/invalid, and the clamp any override rides within. */
+const DEFAULT_STORE_TIMEOUT_MS = 15000;
+const MIN_STORE_TIMEOUT_MS = 1000;
+const MAX_STORE_TIMEOUT_MS = 60000;
+
+/**
+ * Resolve the per-store search-fetch timeout (ms) from the environment. LOOKUP_STORE_TIMEOUT_MS
+ * overrides the 15s default; a missing, empty, non-numeric, or non-positive value falls back to that
+ * default, and any usable value is clamped to [1000, 60000] so a typo can neither strangle a slow
+ * session-gated store nor let one hung/CF-stalled store pin the whole fan-out open. Pure (env in →
+ * number out) so it is unit-testable without touching process.env — mirrors resolveImpitTimeoutMs.
+ */
+export function resolveLookupStoreTimeoutMs(env: NodeJS.ProcessEnv): number {
+  const n = Number(env.LOOKUP_STORE_TIMEOUT_MS);
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_STORE_TIMEOUT_MS;
+  return Math.min(MAX_STORE_TIMEOUT_MS, Math.max(MIN_STORE_TIMEOUT_MS, n));
+}
+
+/** Per-store search-fetch timeout applied to every fan-out fetch. Resolved ONCE at module load. */
+const STORE_TIMEOUT_MS = resolveLookupStoreTimeoutMs(process.env);
+
+/**
+ * Bound a per-store fetch: resolve with its value if it wins, else REJECT once `ms` elapses so a
+ * single slow / hanging / CF-stalled store can never keep Promise.all pending. The timer is ALWAYS
+ * cleared (whether the fetch or the timeout wins) so a settled fan-out leaves no dangling timer.
+ */
+function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`search timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([work, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
 export interface LookupServices {
   /** The store registry (built from the engine's registered capabilities). */
   profiles: ProfileRegistry;
@@ -95,10 +131,14 @@ export interface LookupResult {
 }
 
 export interface Lookup {
-  /** DISCOVERY: fan a free-text query across every store's bySearch. */
-  lookup(query: string, opts?: { mode?: LookupMode }): Promise<LookupResult>;
+  /**
+   * DISCOVERY: fan a free-text query across every store's bySearch. `stores` (siteIds) narrows the
+   * fan-out to just those stores — the interim initiator's scope knob; absent/empty → every store
+   * (unchanged).
+   */
+  lookup(query: string, opts?: { mode?: LookupMode; stores?: string[] }): Promise<LookupResult>;
   /** RECORD-MODE: fan a typed identity across stores, composing each store's query server-side. */
-  lookupByIdentity(identity: IdentityQuery, opts?: { mode?: LookupMode }): Promise<LookupResult>;
+  lookupByIdentity(identity: IdentityQuery, opts?: { mode?: LookupMode; stores?: string[] }): Promise<LookupResult>;
 }
 
 /** Representative `query` label for a record-mode result: the JAN if present, else the composed name. */
@@ -109,8 +149,14 @@ export function assembleLookup(services: LookupServices): Lookup {
     plan: ReturnType<typeof planRetrieval>,
     mode: LookupMode,
     query: string,
+    stores?: string[],
   ): Promise<LookupResult> => {
-    const unsupported = [...plan.unsupported];
+    // Optional store scope (the interim initiator's knob): narrow the fan-out to just the requested
+    // siteIds — and narrow the coverage envelope to match, so `unsupported` reflects only requested
+    // stores. Absent OR empty → NO filtering (the backward-compat contract: full fan-out, unchanged).
+    const scopeSet = stores && stores.length > 0 ? new Set(stores) : undefined;
+    const plans = scopeSet ? plan.plans.filter((p) => scopeSet.has(p.siteId)) : plan.plans;
+    const unsupported = scopeSet ? plan.unsupported.filter((s) => scopeSet.has(s)) : [...plan.unsupported];
     const orderableOnly: string[] = [];
     const failed: string[] = [];
     const cooldown: string[] = [];
@@ -131,7 +177,7 @@ export function assembleLookup(services: LookupServices): Lookup {
     };
 
     const settled = await Promise.all(
-      plan.plans.map(async (p): Promise<StoreLookupResult | null> => {
+      plans.map(async (p): Promise<StoreLookupResult | null> => {
         // Barcode-byId direct hit (record-mode): a RESOLVE TARGET, not a screen candidate. It is
         // UNVERIFIED (we haven't fetched it), so segregate it into resolveTargets — never surface it
         // as a phantom candidate (no name=barcode into the matcher, no unfetched hit in orderable mode).
@@ -150,7 +196,10 @@ export function assembleLookup(services: LookupServices): Lookup {
         const scope = services.profiles.retrievalFor(p.host)?.bySearch?.scope ?? 'listed';
         if (mode === 'listed' && scope === 'orderable') orderableOnly.push(p.siteId);
         try {
-          const body = await services.fetchSearch(p.url, services.profiles.searchTransportFor(p.host));
+          // BOUNDED per store: race the fetch against a timeout so one slow / hanging / CF-stalled
+          // store can't keep the whole Promise.all pending. A timeout REJECTS → the catch below treats
+          // it exactly like any other fetch failure (siteId → `failed`, reason logged, returns null).
+          const body = await withTimeout(services.fetchSearch(p.url, services.profiles.searchTransportFor(p.host)), STORE_TIMEOUT_MS);
           // HONEST SEARCH LANE: a CF challenge/block body is NOT parseable content — extractCandidates
           // would silently lift 0 candidates and pose the store as "carries nothing". Detect it BEFORE
           // parsing: report the store `failed` with a logged reason, and OPEN its host's cooldown so
@@ -207,10 +256,10 @@ export function assembleLookup(services: LookupServices): Lookup {
 
   return {
     async lookup(query, opts = {}) {
-      return runFanout(planRetrieval(services.profiles, { mode: 'lookup', query }), opts.mode ?? 'listed', query);
+      return runFanout(planRetrieval(services.profiles, { mode: 'lookup', query }), opts.mode ?? 'listed', query, opts.stores);
     },
     async lookupByIdentity(identity, opts = {}) {
-      return runFanout(planRetrieval(services.profiles, { mode: 'record', identity }), opts.mode ?? 'listed', identityLabel(identity));
+      return runFanout(planRetrieval(services.profiles, { mode: 'record', identity }), opts.mode ?? 'listed', identityLabel(identity), opts.stores);
     },
   };
 }
