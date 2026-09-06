@@ -52,9 +52,19 @@ export type LookupCandidate = SearchCandidate & { collectUrl?: string };
 function withCollectUrl(c: SearchCandidate, retrieval: RetrievalCapability | undefined, searchUrl: string): LookupCandidate {
   const byId = typeof c.itemId === 'string' && c.itemId ? resolveByIdUrl(retrieval, c.itemId) : undefined;
   if (byId) return { ...c, collectUrl: byId };
-  if (typeof c.url === 'string' && c.url) {
+  const trimmed = typeof c.url === 'string' ? c.url.trim() : '';
+  // A whitespace-only url, or one that is only a fragment/query (no path to resolve), would otherwise
+  // resolve to the store's own search url — not a real collect target — so skip it. Resolve against
+  // the TRIMMED value; `url` itself is returned untouched below.
+  if (trimmed && !trimmed.startsWith('#') && !trimmed.startsWith('?')) {
     try {
-      return { ...c, collectUrl: new URL(c.url, searchUrl).href };
+      const resolved = new URL(trimmed, searchUrl);
+      // Only a fetchable scheme is a usable collect target — a javascript:/data:/mailto: link (or any
+      // other non-http(s) scheme) is rejected; a protocol-relative "//host/x" resolves to http(s) and
+      // is allowed same as any other relative link (no host special-casing).
+      if (resolved.protocol === 'http:' || resolved.protocol === 'https:') {
+        return { ...c, collectUrl: resolved.href };
+      }
     } catch {
       // malformed page link → no collectUrl, but the candidate itself is still returned
     }
@@ -271,8 +281,13 @@ export function assembleLookup(services: LookupServices): Lookup {
           }
           if (mode === 'orderable') candidates = candidates.filter((c) => c.available !== false);
           // Decorate every RETURNED candidate with its collect-ready URL (byId where declared, else the
-          // absolutized page link) — after the filters, so only survivors are touched.
-          const decorated = candidates.map((c) => withCollectUrl(c, retrieval, p.url));
+          // absolutized page link) — after the filters, so only survivors are touched. Plugin output is
+          // untrusted at runtime: a non-array result passes through UNCHANGED (the pre-existing shape),
+          // and a null/non-object element inside an array passes through UNCHANGED too — neither throws
+          // and takes the whole store into `failed`.
+          const decorated = Array.isArray(candidates)
+            ? candidates.map((c) => (c && typeof c === 'object' ? withCollectUrl(c, retrieval, p.url) : c))
+            : candidates;
           return { siteId: p.siteId, host: p.host, url: p.url, storeQuery: p.query ?? '', candidates: decorated, ...(filtered !== undefined ? { filtered } : {}) };
         } catch (err) {
           // Surface WHY a store dropped out (CF block / invalid impersonation profile / parse error).

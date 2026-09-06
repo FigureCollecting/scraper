@@ -647,4 +647,67 @@ describe('assembleLookup — per-candidate collectUrl (the collect-ready URL; `u
     expect(warn).not.toHaveBeenCalled();
     warn.mockRestore();
   });
+
+  it('(8) a whitespace-only url, or one whose trimmed value is fragment/query-only, → no collectUrl; url untouched', async () => {
+    const { r } = await run(FNC, [
+      { itemId: 'w1', name: 'Lucy A', url: '   ', available: true },
+      { itemId: 'w2', name: 'Lucy B', url: '  #section  ', available: true },
+      { itemId: 'w3', name: 'Lucy C', url: '?foo=bar', available: true },
+    ]);
+
+    expect(r.candidates).toHaveLength(3);
+    for (const c of r.candidates) {
+      expect(Object.prototype.hasOwnProperty.call(c, 'collectUrl')).toBe(false);
+    }
+    // url is untouched (not trimmed, not rewritten) even though the trimmed value drove the decision
+    expect(r.candidates.map((c) => c.url)).toEqual(['   ', '  #section  ', '?foo=bar']);
+  });
+
+  it('(9) a resolved collectUrl whose protocol is not http/https is rejected; a protocol-relative url still resolves (to https)', async () => {
+    const { r } = await run(FNC, [
+      { itemId: 'j1', name: 'Lucy A', url: 'javascript:alert(1)', available: true },
+      { itemId: 'd1', name: 'Lucy B', url: 'data:text/html,hi', available: true },
+      { itemId: 'm1', name: 'Lucy C', url: 'mailto:a@b.com', available: true },
+      { itemId: 'p1', name: 'Lucy D', url: '//cdn.fnc.com/item/p1', available: true },
+    ]);
+    const byId = (id: string) => r.candidates.find((c) => c.itemId === id)!;
+
+    expect(Object.prototype.hasOwnProperty.call(byId('j1'), 'collectUrl')).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(byId('d1'), 'collectUrl')).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(byId('m1'), 'collectUrl')).toBe(false);
+    // protocol-relative is NOT special-cased by host — it resolves against the (https) search URL and is allowed
+    expect(byId('p1').collectUrl).toBe('https://cdn.fnc.com/item/p1');
+  });
+
+  it('(10) a null element inside the candidates array passes through untouched — no throw, store not `failed`', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const cands = [
+      { itemId: 'ok', name: 'Lucy', url: 'https://www.fnc.com/item/ok', available: true },
+      null,
+    ] as unknown as SearchCandidate[];
+
+    const { out, r } = await run(FNC, cands);
+
+    expect(out.failed).toEqual([]);
+    expect(r.candidates).toHaveLength(2);
+    expect(r.candidates[0].collectUrl).toBe('https://www.fnc.com/item/ok');
+    expect(r.candidates[1]).toBeNull();
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it('(11) extractCandidates resolving to a non-array passes through exactly as before collectUrl decoration existed — no throw, store not `failed`', async () => {
+    const services: LookupServices = {
+      profiles: buildProfileRegistry([FNC]),
+      getRulesetForUrl: () => stub('fnc', (() => undefined) as unknown as ExtractionRuleset['extractCandidates']),
+      fetchSearch: jest.fn(async () => '{}'),
+    };
+
+    const out = await assembleLookup(services).lookup('lucy');
+
+    expect(out.failed).toEqual([]);
+    const r = out.results.find((x) => x.siteId === 'fnc')!;
+    expect(r).toBeDefined();
+    expect(r.candidates).toBeUndefined();
+  });
 });
