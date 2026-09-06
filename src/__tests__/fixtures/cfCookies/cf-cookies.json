@@ -1,0 +1,9 @@
+{
+  "www.MyFigureCollection.net": {
+    "cookies": { "cf_clearance": "FAKE_cf_fixture_1", "PHPSESSID": "FAKE_sess_fixture_1" },
+    "userAgent": "Mozilla/5.0 FAKE-FIXTURE-MINT-UA",
+    "mintedAt": "2026-09-06T00:00:00.000Z",
+    "expiresAt": "2026-09-07T00:00:00.000Z"
+  },
+  "anitoysgk.com": { "cookies": { "cf_clearance": "FAKE_cf_fixture_2" } }
+}
