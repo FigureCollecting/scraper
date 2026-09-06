@@ -423,9 +423,14 @@ upstream fetch is status-blind (a Shopify page-cap `400` or a transient `5xx` pa
 listing), so a page with `hasMore: false` or zero items only records an exhaustion *candidate*
 at that cursor (`exhaustCandidateCursor`/`exhaustCandidateAt`) and ends the run without
 advancing. Only when the NEXT run sees the SAME cursor empty again is the store marked
-`exhaustedAt` (the cursor is kept); items reappearing clear the candidate. An exhausted store
-makes no backfill requests until `CRAWLER_EXHAUSTED_RECHECK_MS` has elapsed, then re-checks its
-last cursor: still empty re-stamps `exhaustedAt`, items resume the backfill.
+`exhaustedAt` (the cursor is kept); items reappearing clear the candidate. A last page that was
+CUT SHORT (per-store cap, global budget, or a 5xx from `/ingest/scrape`) is neither a candidate
+nor a confirmation: its unattempted items say nothing about the end of the catalog, so the
+accepted marks are saved, the cursor and any existing candidate/exhausted marks are left as they
+were, and the same page is re-fetched next run. An exhausted store makes no backfill requests
+until `CRAWLER_EXHAUSTED_RECHECK_MS` has elapsed, then re-checks its last cursor: still empty
+re-stamps `exhaustedAt`, items resume the backfill (a re-check cut short keeps the stale
+`exhaustedAt`, so the store stays due and drains a cap's worth per run until fully seen).
 
 ## Testing
 

@@ -874,10 +874,11 @@ describe('runCrawlerPass — backfill exhaustion must not be CONFIRMED on a page
     const store = seeded(409);
     const runs = await twoRuns(store, (s, p) => ok(s, p, last, false));
     expect(runs[0].fake.posted()).toHaveLength(50);
-    expect(runs[1].fake.posted()).toHaveLength(50);
-    expect(Object.keys(store.files.get('orzgk')!.enqueued)).toHaveLength(100); // 150 never attempted
+    expect(runs[1].fake.posted()).toHaveLength(50); // 100 marked after run 2, 150 never attempted
     expect(store.files.get('orzgk')!.backfill.exhaustedAt).toBeUndefined();
     expect(runs[2].fake.pages()).toEqual([409]);
+    expect(runs[2].fake.posted()).toHaveLength(50); // run 3 drains the next 50 instead of parking for 7d
+    expect(Object.keys(store.files.get('orzgk')!.enqueued)).toHaveLength(150);
   });
 
   it('last page (hasMore:false) whose POSTs all 5xx twice (scraper unwell) → NOT exhausted; run 3 re-fetches it', async () => {
@@ -887,5 +888,62 @@ describe('runCrawlerPass — backfill exhaustion must not be CONFIRMED on a page
     expect(Object.keys(store.files.get('orzgk')!.enqueued)).toHaveLength(0);
     expect(store.files.get('orzgk')!.backfill.exhaustedAt).toBeUndefined();
     expect(runs[2].fake.pages()).toEqual([409]);
+  });
+  it('global budget cuts the last page short: accepted marks persisted, cursor initialised and kept, NO candidate recorded', async () => {
+    // 1 GET + 2 POSTs = 3 requests; 'c' is never attempted, so this page says nothing about the end of the catalog.
+    const fake = makeFake({ catalog: (s, p) => ok(s, p, ['a', 'b', 'c'], false) });
+    const store = createMemoryLedgerStore({ orzgk: createEmptyLedger('orzgk') });
+    const s = await runCrawlerPass(mkCfg({ mode: 'backfill', maxRequests: 3 }), { fetch: fake.fetch, ledgerStore: store, now: clock().now });
+    expect(fake.pages('orzgk')).toEqual([2]);
+    expect(Object.keys(store.files.get('orzgk')!.enqueued).sort()).toEqual(['a', 'b']);
+    expect(store.files.get('orzgk')!.backfill).toEqual({ cursor: 2, updatedAt: iso(T0) });
+    expect(s.budgetExhausted).toBe(true);
+    expect(s.stores[0]).toMatchObject({ enqueued: 2, backfillCursor: 2, exhaustCandidate: false, exhausted: false });
+  });
+
+  it('an existing candidate survives a cut-short run at the same cursor (kept, not re-stamped) and is confirmed once the page is fully attempted', async () => {
+    const candidateAt = iso(T0 - 60 * 60 * 1000);
+    const store = createMemoryLedgerStore({
+      orzgk: { ...createEmptyLedger('orzgk'), backfill: { cursor: 409, exhaustCandidateCursor: 409, exhaustCandidateAt: candidateAt } },
+    });
+    const c = clock();
+    // Run 1: three new items on the last page, cap 2 → cut short: candidate untouched, nothing confirmed.
+    const r1 = makeFake({ catalog: (s, p) => ok(s, p, ['x1', 'x2', 'x3'], false) });
+    const s1 = await runCrawlerPass(mkCfg({ mode: 'backfill', maxEnqueuePerStore: 2 }), { fetch: r1.fetch, ledgerStore: store, now: c.now });
+    expect(r1.posted()).toHaveLength(2);
+    expect(store.files.get('orzgk')!.backfill).toEqual({ cursor: 409, exhaustCandidateCursor: 409, exhaustCandidateAt: candidateAt });
+    expect(s1.stores[0]).toMatchObject({ exhausted: false, exhaustCandidate: true, enqueued: 2 });
+    // Run 2: the remaining item is attempted → the page is fully seen at the candidate cursor → confirmed.
+    c.advance(60 * 60 * 1000);
+    const r2 = makeFake({ catalog: (s, p) => ok(s, p, ['x1', 'x2', 'x3'], false) });
+    const s2 = await runCrawlerPass(mkCfg({ mode: 'backfill', maxEnqueuePerStore: 2 }), { fetch: r2.fetch, ledgerStore: store, now: c.now });
+    expect(r2.posted()).toEqual([collectUrl('orzgk', 'x3')]);
+    expect(store.files.get('orzgk')!.backfill).toEqual({ cursor: 409, exhaustedAt: iso(c.now()), updatedAt: iso(c.now()) });
+    expect(s2.stores[0]).toMatchObject({ exhausted: true, exhaustCandidate: false, enqueued: 1 });
+  });
+
+  it('an EXHAUSTED store whose due re-check is cut short keeps the stale exhaustedAt (stays due), drains hourly, and is re-stamped only once fully attempted', async () => {
+    const stale = iso(T0 - WEEK_MS - 24 * 60 * 60 * 1000);
+    const store = createMemoryLedgerStore({ orzgk: { ...createEmptyLedger('orzgk'), backfill: { cursor: 409, exhaustedAt: stale, updatedAt: stale } } });
+    const c = clock();
+    const grown = (s: string, p: number): Reply => ok(s, p, ['y1', 'y2', 'y3'], false);
+    // Run 1 (due): cap 2 cuts the re-check short → exhaustedAt NOT re-stamped, so the store is still due next hour.
+    const r1 = makeFake({ catalog: grown });
+    await runCrawlerPass(mkCfg({ mode: 'backfill', maxEnqueuePerStore: 2 }), { fetch: r1.fetch, ledgerStore: store, now: c.now });
+    expect(r1.pages()).toEqual([409]);
+    expect(r1.posted()).toHaveLength(2);
+    expect(store.files.get('orzgk')!.backfill).toEqual({ cursor: 409, exhaustedAt: stale, updatedAt: stale });
+    // Run 2 (+1h, still due): the last item is attempted → re-stamped now.
+    c.advance(60 * 60 * 1000);
+    const r2 = makeFake({ catalog: grown });
+    await runCrawlerPass(mkCfg({ mode: 'backfill', maxEnqueuePerStore: 2 }), { fetch: r2.fetch, ledgerStore: store, now: c.now });
+    expect(r2.pages()).toEqual([409]);
+    expect(r2.posted()).toEqual([collectUrl('orzgk', 'y3')]);
+    expect(store.files.get('orzgk')!.backfill).toEqual({ cursor: 409, exhaustedAt: iso(c.now()), updatedAt: iso(c.now()) });
+    // Run 3 (+2h): inside the window → parked, zero requests.
+    c.advance(60 * 60 * 1000);
+    const r3 = makeFake({ catalog: grown });
+    await runCrawlerPass(mkCfg({ mode: 'backfill', maxEnqueuePerStore: 2 }), { fetch: r3.fetch, ledgerStore: store, now: c.now });
+    expect(r3.pages()).toEqual([]);
   });
 });

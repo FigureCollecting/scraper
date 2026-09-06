@@ -20,7 +20,9 @@
  * listing), so an empty / hasMore:false page only records an EXHAUSTION CANDIDATE at
  * that cursor and stops the run without advancing. Only when the NEXT run sees the
  * same cursor empty again is the store marked exhausted (cursor kept); items
- * reappearing clear the candidate. An exhausted store is re-checked at its last
+ * reappearing clear the candidate. A last page CUT SHORT (cap / budget / sick
+ * scraper) is neither a candidate nor a confirmation: its marks are kept as they were
+ * and the page is re-fetched next run. An exhausted store is re-checked at its last
  * cursor once exhaustedRecheckMs has elapsed.
  *
  * MODE both (default) runs recent for EVERY store, THEN backfill — recent has budget
@@ -511,6 +513,19 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       const { allAttempted } = await processPage(st, out.items, 'backfill');
 
       const exhaustionSignal = out.items.length === 0 || !out.hasMore;
+      if (exhaustionSignal && !allAttempted) {
+        // The last page was cut short (per-store cap, global budget, sick scraper): its unattempted items
+        // say nothing about the end of the catalog. Persist what was accepted, keep the cursor and any
+        // existing marks untouched, and re-fetch the same page next run. Recording — or confirming —
+        // exhaustion here would park the store for exhaustedRecheckMs with those items stranded.
+        if (b.cursor !== cursor) {
+          b.cursor = cursor; // first initialisation
+          b.updatedAt = iso();
+        }
+        logger.info('[CRAWLER] backfill last page cut short — exhaustion not recorded', { siteId: st.siteId, cursor });
+        await persist(st);
+        return;
+      }
       if (exhaustionSignal) {
         // Never trust one empty page (status-blind upstream fetch). Confirm across runs at the SAME cursor.
         if (b.exhaustedAt !== undefined || b.exhaustCandidateCursor === cursor) {
