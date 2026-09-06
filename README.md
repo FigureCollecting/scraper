@@ -192,6 +192,39 @@ Get service version information for version management.
 ### GET /mfc/cookie-allowlist
 Get the list of allowed MFC cookie names for authenticated scraping.
 
+### GET /catalog
+One page of a store's newest-first catalog listing — the enumeration feed the crawler walks
+(mode *recent*: the first pages for fresh ids; mode *backfill*: a saved page cursor, deeper in).
+A store serves it when its ruleset plugin declares a `retrieval.byListing` axis
+(`{ urlTemplate /* contains {page} */, pageStart?, maxPerPage?, order: 'newest' }`) and an
+`extractListing()` parser (plugin-contract 0.6.0). The page is fetched through the store's declared
+search transport (`http` / `impersonate` / `browser`) under the per-host challenge cooldown.
+
+**Query:** `store=<siteId>` (required), `page=<n>` (positive integer; default = the store's `pageStart`, else 1)
+
+**Response (200):**
+```json
+{
+  "siteId": "orzgk",
+  "page": 1,
+  "url": "https://www.orzgk.com/wp-json/wc/store/v1/products?orderby=date&order=desc&per_page=100&page=1",
+  "items": [{ "itemId": "68064530", "collectUrl": "https://www.orzgk.com/wp-json/wc/store/v1/products/68064530" }],
+  "collectUrls": ["https://www.orzgk.com/wp-json/wc/store/v1/products/68064530"],
+  "hasMore": true,
+  "nextPage": 2,
+  "count": 1
+}
+```
+Each item carries the store's `itemId`, the page `url` when the plugin emitted one (untouched), and
+`collectUrl` — the URL to ingest: the store's `byId` endpoint where declared, else the page link
+absolutized against the listing url (http(s) only). `hasMore`/`nextPage` come from the plugin when
+it reports them, else a non-empty page implies more with `nextPage = page + 1`.
+
+**Errors:** `400` missing/blank `store` or a non-positive-integer `page` · `422 { error: "unsupported", siteId, reason }`
+(unknown store, no `byListing` axis, or no `extractListing` parser) · `503 { error: "cooldown", siteId, host, remainingMs }`
+with `Retry-After` while the listing host cools from a Cloudflare challenge · `502 { error: "catalog failed", siteId, reason }`
+(challenge page — which also opens the host cooldown — fetch error, timeout, or parser throw).
+
 ### POST /reset-pool (Test Environment Only)
 **This endpoint is only available in non-production environments.**
 
@@ -681,6 +714,11 @@ See `.env.example` for complete configuration template.
   - While a host is cooling, the scrape queue and lookup fan-out skip it without fetching, so repeat challenges don't degrade the egress IP's CF reputation
   - Unset/invalid → default; any finite value is clamped to `[60000 (1 min), 86400000 (24 h)]`
   - Default: `1800000` (30 min)
+
+- `CATALOG_STORE_TIMEOUT_MS`: Timeout (ms) for one `GET /catalog` listing-page fetch
+  - A catalog page is far larger than a search hit (orzgk pages run 1.5–2 MB), so it gets its own window
+  - Unset/invalid → default; any value is clamped to `[1000, 120000]`
+  - Default: `30000`
 
 **MFC Cookie Security:**
 - `MFC_ALLOWED_COOKIES`: Whitelist of cookie names allowed during authenticated MFC scraping

@@ -8,9 +8,10 @@ import { createRequire } from 'module';
 import scraperRoutes from './routes/scraper.js';
 import ingestRoutes from './routes/ingest.js';
 import { createLookupRoute } from './routes/lookup.js';
+import { createCatalogRoute } from './routes/catalog.js';
 import { createHealthRoutes } from './routes/health.js';
 import { getChallengeCooldown } from './services/challengeCooldown.js';
-import { createEngineLookup } from './services/engineLookup.js';
+import { createEngineLookup, createEngineCatalog } from './services/engineLookup.js';
 import { createResolveRoute } from './routes/resolve.js';
 import { createEngineResolve } from './services/engineResolve.js';
 import { createCapturingScrapingService } from './services/engineServices/capturingScrapingService.js';
@@ -77,6 +78,12 @@ async function startServer(): Promise<void> {
     // createScrapingService() would default to a Noop sink and silently drop them.
     const lookupScraping = createCapturingScrapingService();
     app.use('/', createLookupRoute(createEngineLookup(registry, {
+      browser: (url, opts) => lookupScraping.browserFetch(url, opts),
+    })));
+    // GET /catalog — one page of a store's newest-first catalog listing (the crawler's enumeration
+    // feed). Same registry and transports as /lookup: the browser lane rides the same pooled,
+    // capture-sink-backed ScrapingService.
+    app.use('/', createCatalogRoute(createEngineCatalog(registry, {
       browser: (url, opts) => lookupScraping.browserFetch(url, opts),
     })));
     // POST /resolve — byId confirm (detail fetch + extractRecords dispatch → full ExtractedData incl

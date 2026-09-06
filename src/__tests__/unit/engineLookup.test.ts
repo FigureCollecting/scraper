@@ -2,7 +2,7 @@
  * createEngineLookup — the entrypoint factory: builds a cross-store Lookup from the engine's
  * registry (allStores → ProfileRegistry) + a fetch, and fans a query to parse candidates.
  */
-import { createEngineLookup, httpFetchBody, type LookupRegistry } from '../../services/engineLookup';
+import { createEngineLookup, createEngineCatalog, httpFetchBody, type LookupRegistry } from '../../services/engineLookup';
 import type { ExtractionRuleset, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
 
 const STORE: StoreCapabilities = {
@@ -78,6 +78,89 @@ describe('createEngineLookup', () => {
     );
     expect(http).not.toHaveBeenCalled();
     expect(out.results[0]?.candidates[0]?.name).toBe('Tomie');
+  });
+});
+
+describe('createEngineCatalog', () => {
+  const LISTING_STORE: StoreCapabilities = {
+    ...STORE,
+    retrieval: {
+      bySearch: STORE.retrieval!.bySearch,
+      byListing: { urlTemplate: 'https://www.goodsmileus.com/products.json?limit=250&page={page}', maxPerPage: 250, order: 'newest' },
+    },
+  };
+  const LISTING_RULESET: ExtractionRuleset = {
+    ...RULESET,
+    extractListing: (body) => ({
+      items: (JSON.parse(body) as { products: Array<{ handle: string }> }).products.map((p) => ({ itemId: p.handle, url: `/products/${p.handle}` })),
+    }),
+  };
+
+  it('builds a Catalog from the registry that fetches the store\'s listing page and parses + decorates its items', async () => {
+    const registry: LookupRegistry = { allStores: () => [LISTING_STORE], getRulesetForUrl: () => LISTING_RULESET };
+    const fetchBody = jest.fn(async () => JSON.stringify({ products: [{ handle: 'noir-black-rabbit-14825' }] }));
+
+    const out = await createEngineCatalog(registry, { http: fetchBody }).catalog('goodsmileus', 2);
+
+    expect(fetchBody).toHaveBeenCalledWith('https://www.goodsmileus.com/products.json?limit=250&page=2');
+    expect(out).toMatchObject({
+      status: 'ok',
+      siteId: 'goodsmileus',
+      page: 2,
+      items: [{ itemId: 'noir-black-rabbit-14825', url: '/products/noir-black-rabbit-14825', collectUrl: 'https://www.goodsmileus.com/products/noir-black-rabbit-14825' }],
+      collectUrls: ['https://www.goodsmileus.com/products/noir-black-rabbit-14825'],
+      hasMore: true,
+      nextPage: 3,
+      count: 1,
+    });
+  });
+
+  it('defaults the http transport to httpFetchBody when no transports are given', async () => {
+    const orig = global.fetch;
+    global.fetch = jest.fn(async () => ({ text: async () => JSON.stringify({ products: [{ handle: 'x' }] }) })) as unknown as typeof fetch;
+    try {
+      const registry: LookupRegistry = { allStores: () => [LISTING_STORE], getRulesetForUrl: () => LISTING_RULESET };
+      const out = await createEngineCatalog(registry).catalog('goodsmileus'); // no transports → http = httpFetchBody
+      expect(global.fetch).toHaveBeenCalledWith('https://www.goodsmileus.com/products.json?limit=250&page=1', expect.anything());
+      expect(out).toMatchObject({ status: 'ok', items: [{ itemId: 'x', collectUrl: 'https://www.goodsmileus.com/products/x' }] });
+    } finally {
+      global.fetch = orig;
+    }
+  });
+
+  it('a store whose ruleset has no extractListing is unsupported (shares the lookup registry wiring)', async () => {
+    const registry: LookupRegistry = { allStores: () => [LISTING_STORE], getRulesetForUrl: () => RULESET };
+    const http = jest.fn(async () => '{}');
+    const out = await createEngineCatalog(registry, { http }).catalog('goodsmileus');
+    expect(out).toMatchObject({ status: 'unsupported', siteId: 'goodsmileus' });
+    expect(http).not.toHaveBeenCalled();
+  });
+
+  it('routes a store that declares the impersonate transport to the impit fetcher (not http), like /lookup', async () => {
+    const AMIAMI_LISTING: StoreCapabilities = {
+      ...STORE,
+      siteId: 'amiami',
+      name: 'AmiAmi',
+      domains: ['www.amiami.com'],
+      requiresBrowser: true,
+      retrieval: { byListing: { urlTemplate: 'https://api.amiami.com/api/v1.0/items?s_st_list_newitem_available=1&pagecnt={page}', order: 'newest' } },
+      searchFetch: { transport: 'impersonate', browser: 'chrome142', headers: { 'X-User-Key': 'amiami_dev' } },
+    };
+    const registry: LookupRegistry = {
+      allStores: () => [AMIAMI_LISTING],
+      getRulesetForUrl: () => ({ ...RULESET, siteId: 'amiami', extractListing: () => ({ items: [{ itemId: 'FIGURE-1' }] }) }),
+    };
+    const http = jest.fn(async () => '{}');
+    const impersonate = jest.fn(async () => '{}');
+
+    const out = await createEngineCatalog(registry, { http, impersonate }).catalog('amiami');
+
+    expect(impersonate).toHaveBeenCalledWith(
+      'https://api.amiami.com/api/v1.0/items?s_st_list_newitem_available=1&pagecnt=1',
+      { browser: 'chrome142', headers: { 'X-User-Key': 'amiami_dev' }, userAgent: undefined },
+    );
+    expect(http).not.toHaveBeenCalled();
+    expect(out).toMatchObject({ status: 'ok', count: 1 });
   });
 });
 

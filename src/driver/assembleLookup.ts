@@ -48,8 +48,14 @@ export type LookupCandidate = SearchCandidate & { collectUrl?: string };
  * Decorate one candidate with `collectUrl`. Plugin output is untrusted at runtime: a non-string /
  * empty itemId skips the byId rule, a non-string / empty / malformed `url` skips the page rule, and
  * nothing here ever throws — the candidate is always kept, with every existing field untouched.
+ * Generic over the candidate shape so the catalog-listing runtime (assembleCatalog) decorates its
+ * `{ itemId, url? }` listing items with the very same rules.
  */
-function withCollectUrl(c: SearchCandidate, retrieval: RetrievalCapability | undefined, searchUrl: string): LookupCandidate {
+export function withCollectUrl<T extends Pick<SearchCandidate, 'itemId' | 'url'>>(
+  c: T,
+  retrieval: RetrievalCapability | undefined,
+  searchUrl: string,
+): T & { collectUrl?: string } {
   const byId = typeof c.itemId === 'string' && c.itemId ? resolveByIdUrl(retrieval, c.itemId) : undefined;
   if (byId) return { ...c, collectUrl: byId };
   const trimmed = typeof c.url === 'string' ? c.url.trim() : '';
@@ -97,11 +103,13 @@ const STORE_TIMEOUT_MS = resolveLookupStoreTimeoutMs(process.env);
  * Bound a per-store fetch: resolve with its value if it wins, else REJECT once `ms` elapses so a
  * single slow / hanging / CF-stalled store can never keep Promise.all pending. The timer is ALWAYS
  * cleared (whether the fetch or the timeout wins) so a settled fan-out leaves no dangling timer.
+ * `what` names the bounded work in the rejection (default `search`; the catalog runtime reuses this
+ * with its own label).
  */
-function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
+export function withTimeout<T>(work: Promise<T>, ms: number, what = 'search'): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`search timed out after ${ms}ms`)), ms);
+    timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms}ms`)), ms);
   });
   return Promise.race([work, timeout]).finally(() => {
     if (timer) clearTimeout(timer);

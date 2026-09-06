@@ -4,6 +4,26 @@ All notable changes to `@figurecollecting/scraper-plugin-contract` will be docum
 file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this
 package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-09-06
+
+Additive, backward-compatible: every existing `RetrievalCapability` and `ExtractionRuleset` still
+compiles unchanged — the new axis and parser are optional. Built for the catalog feeder
+(continuous recent/backfill enumeration crawls over each store's newest-first listing).
+
+### Added
+- `RetrievalCapability.byListing?: { urlTemplate; pageStart?; maxPerPage?; order: 'newest' }` —
+  a newest-first PAGED catalog listing for ENUMERATION (as opposed to targeted retrieval). The
+  engine fetches page N by substituting `{page}` (which the template MUST contain); `pageStart` is
+  the first page (default 1), `maxPerPage` documents the store's page-size cap, and `order` is
+  `newest` — the only order the feeder reasons about (page 1 = freshest).
+- `ListingPage` — one parsed listing page: `items: [{ itemId, url? }]` (`itemId` feeds
+  `retrieval.byId` like `SearchCandidate.itemId`; `url` is the product page link for stores without
+  a byId axis, absolute or relative to the listing url), plus optional paging signals `hasMore` and
+  `nextPage` (absent → the engine infers them: a non-empty page has more, next = page + 1).
+- `ExtractionRuleset.extractListing?(body, url, ctx?)` — OPTIONAL, parses one catalog-listing
+  page body (fetched from `retrieval.byListing`) into a `ListingPage`. Distinct from
+  `extractCandidates` (one search query's results). Async-capable; the engine always awaits it.
+
 ## [0.5.0] - 2026-09-01
 
 Additive, backward-compatible: every existing `ExtractionRuleset` still compiles unchanged — the
