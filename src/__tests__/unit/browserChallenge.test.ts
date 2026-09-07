@@ -48,6 +48,39 @@ describe('browser-lane challenge clearance', () => {
     expect(isChallengeTitle('')).toBe(false);
   });
 
+  /**
+   * The interstitial is not always in English and does not always carry `cf-mitigated`. The proven
+   * probe (cf-probe.cjs) also treats Cloudflare's own challenge containers as the signal, so the
+   * lane does too — otherwise the interstitial is captured as the product page and, worse, the host
+   * is never marked gated, so every later fetch re-challenges on a fresh context.
+   */
+  it('recognises a challenge by Cloudflare\'s DOM containers when the title is not English', async () => {
+    const markers = [true, true, false];
+    const page: any = {
+      title: jest.fn<(...a: any[]) => any>().mockResolvedValue('少々お待ちください'),
+      evaluate: jest.fn<(...a: any[]) => any>().mockImplementation(async () =>
+        (markers.length > 1 ? markers.shift() : markers[0])),
+    };
+
+    const seen = await awaitChallengeClearance(page, makeResponse({ 'content-type': 'text/html' }), 'https://www.anitoysgk.com/lucy.html', { timeoutMs: 500, pollMs: 5 });
+
+    expect(seen).toBe(true);
+    expect(isChallengeGated('www.anitoysgk.com')).toBe(true);
+    expect(jest.mocked(page.evaluate).mock.calls.length).toBeGreaterThan(1); // it WAITED
+  });
+
+  it('does not mistake a page whose evaluate returns something other than true for a challenge', async () => {
+    const page: any = {
+      title: jest.fn<(...a: any[]) => any>().mockResolvedValue('Lucy — anitoys'),
+      evaluate: jest.fn<(...a: any[]) => any>().mockResolvedValue('body text'),
+    };
+
+    const seen = await awaitChallengeClearance(page, makeResponse({ 'content-type': 'text/html' }), 'https://www.anitoysgk.com/lucy.html', { timeoutMs: 50, pollMs: 5 });
+
+    expect(seen).toBe(false);
+    expect(isChallengeGated('www.anitoysgk.com')).toBe(false);
+  });
+
   it('does nothing when the first response is not a challenge', async () => {
     const page = makePage(['Lucy — anitoys']);
 
@@ -112,10 +145,12 @@ describe('browser-lane challenge clearance', () => {
   });
 
   it('does not wait on readyState for a page that was never challenged', async () => {
+    // ONE evaluate — the challenge-marker probe — and then it is done: a page whose readyState is
+    // still 'loading' is not polled, because nothing here was ever a challenge.
     const page = makePage(['Lucy — anitoys'], ['loading']);
 
     await awaitChallengeClearance(page, makeResponse({}), 'https://www.anitoysgk.com/lucy.html', { timeoutMs: 50, pollMs: 5 });
 
-    expect(page.evaluate).not.toHaveBeenCalled();
+    expect(page.evaluate).toHaveBeenCalledTimes(1);
   });
 });

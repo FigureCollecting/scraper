@@ -53,8 +53,8 @@ const gatedHosts = new Set<string>();
 /** The minimal page surface the clearance wait drives (mockable, no puppeteer import needed). */
 export interface ChallengeAwarePage {
   title(): Promise<string>;
-  /** Optional: used only to watch `document.readyState` on the post-challenge document. */
-  evaluate?(pageFunction: () => string): Promise<unknown>;
+  /** Optional: watches `document.readyState`, and looks for the interstitial's own containers. */
+  evaluate?(pageFunction: () => any): Promise<unknown>;
 }
 
 /** The minimal response surface: its headers, whatever the lane got back from `goto`. */
@@ -69,6 +69,24 @@ export function isChallengeResponse(headers: Record<string, string> | undefined)
     if (name.toLowerCase() === CHALLENGE_HEADER) return String(value).toLowerCase() === 'challenge';
   }
   return false;
+}
+
+/**
+ * Cloudflare's own interstitial containers. The title is not enough on its own: the interstitial is
+ * localised (Chrome renders the English one only when it asks for English) and `cf-mitigated` is not
+ * always present, and a MISSED challenge is the expensive case — the interstitial is captured as the
+ * product page AND the host is never marked gated, so every later fetch re-challenges from scratch.
+ * Deliberately NOT the widget/script selectors the probe also accepts (`challenges.cloudflare.com`,
+ * `#cf-chl-widget`): those appear on ordinary pages carrying a Turnstile, which are not interstitials
+ * and must not be waited on.
+ */
+async function hasChallengeMarkers(page: ChallengeAwarePage): Promise<boolean> {
+  if (typeof page.evaluate !== 'function') return false;
+  const found = await page
+    .evaluate(() => document.querySelector('#challenge-running, #challenge-stage') !== null)
+    .catch(() => false);
+  // STRICTLY true: any other value (a page surface that returns something else) is not a challenge.
+  return found === true;
 }
 
 /** Whether a page title is Cloudflare's interstitial rather than the store's own document. */
@@ -118,7 +136,9 @@ export async function awaitChallengeClearance(
 ): Promise<boolean> {
   const headerSaysChallenge = isChallengeResponse(response?.headers?.());
   const title = await page.title().catch(() => '');
-  if (!headerSaysChallenge && !isChallengeTitle(title)) return false;
+  const showsChallenge = async (currentTitle: string): Promise<boolean> =>
+    isChallengeTitle(currentTitle) || await hasChallengeMarkers(page);
+  if (!headerSaysChallenge && !(await showsChallenge(title))) return false;
 
   const host = challengeHost(url);
   if (host) markChallengeGated(host);
@@ -127,7 +147,7 @@ export async function awaitChallengeClearance(
   const pollMs = options.pollMs ?? CHALLENGE_POLL_MS;
   const deadline = Date.now() + timeoutMs;
   let current = title;
-  while (isChallengeTitle(current)) {
+  while (await showsChallenge(current)) {
     if (Date.now() >= deadline) {
       // eslint-disable-next-line no-console
       // lgtm[js/log-injection] — url is caller-influenced; sanitize before logging
