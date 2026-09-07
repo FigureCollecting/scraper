@@ -3,12 +3,15 @@
  * continuous initiator, only manual POSTs" and the full 2b crawl driver.
  *
  * WHAT IT DOES (and deliberately no more):
- *   1. DISCOVER — for each configured term, GET {scraper}/lookup?q= (the scraper's
- *      own cross-store search). The fan-out returns candidates for every store it
- *      knows; the initiator keeps only candidates for the CONFIGURED stores, bounded
- *      to maxUrlsPerStore each. Lookups are issued once per TERM (shared across
- *      stores) rather than per store: one fan-out already covers every store, so a
- *      per-store loop would multiply the scraper's upstream search egress needlessly.
+ *   1. DISCOVER — for each configured term AND each configured store, GET
+ *      {scraper}/lookup?q=&stores=<ONE store> (the scraper's own search, scoped to
+ *      that one store). ONE LOOKUP PER STORE is deliberate: the scraper bounds each
+ *      store's search by LOOKUP_STORE_TIMEOUT_MS, and a shared fan-out made the SLOWEST
+ *      store the whole term's latency — one store hitting that bound tripped the
+ *      initiator's own request timeout and zeroed EVERY store's discovery for the pass
+ *      (2026-09-07 09:00Z, amiami). Scoped per store, a slow or failing store costs only
+ *      its own lookup. Candidates are kept only for the store the call asked for, bounded
+ *      to maxUrlsPerStore per store ACROSS terms.
  *      Each candidate carries the store's product PAGE link (`url`) and, from an engine
  *      that emits it, `collectUrl` — the collect-ready URL the engine derived from its
  *      retrieval axes (the byId Store-API URL where declared, else the page link
@@ -138,7 +141,7 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
       spacingMs: config.requestSpacingMs,
     });
 
-  const storeSet = new Set(config.stores);
+  const uniqueStores = config.stores.filter((s, i) => config.stores.indexOf(s) === i);
   const perStore = new Map<string, StoreSummary>();
   for (const siteId of config.stores) {
     if (!perStore.has(siteId)) perStore.set(siteId, { siteId, discovered: 0, enqueued: 0, deduplicated: 0, errors: 0, skipped: 0 });
@@ -199,16 +202,40 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
     return summary;
   }
 
-  // Scope the shared fan-out to THIS pass's configured stores — the initiator only cares about its
-  // proven-GO set, so narrowing the fan-out spares the scraper the upstream egress of the rest.
-  const lookupUrl = (term: string): string =>
-    `${config.scraperServiceUrl}/lookup?q=${encodeURIComponent(term)}&mode=${config.mode}&stores=${encodeURIComponent(config.stores.join(','))}`;
+  // Each lookup asks for exactly ONE store, so one store's latency or failure is charged to that
+  // store alone (see the header: a shared fan-out let the slowest store zero the whole pass).
+  const lookupUrl = (term: string, siteId: string): string =>
+    `${config.scraperServiceUrl}/lookup?q=${encodeURIComponent(term)}&mode=${config.mode}&stores=${encodeURIComponent(siteId)}`;
   const ingestUrl = `${config.scraperServiceUrl}/ingest/scrape`;
 
-  // Phase 1 — DISCOVERY (one shared fan-out per term).
-  const discoverTerm = async (term: string): Promise<void> => {
+  /** Consume ONE store-scoped lookup body; returns how many candidate URLs it contributed. */
+  const consume = (siteId: string, body: LookupResponseBody): number => {
+    const before = setFor(siteId).size;
+    for (const sr of body.results ?? []) {
+      if (sr.siteId !== siteId) continue; // a body may echo other stores; only the asked-for one counts
+      for (const c of sr.candidates ?? []) {
+        // Prefer the engine's collect-ready URL; fall back to the page url (older engine, or no
+        // collectUrl derivable). Dedup (setFor/addUrl) keys on whichever was chosen.
+        const u = typeof c.collectUrl === 'string' && c.collectUrl ? c.collectUrl : c.url;
+        if (typeof u === 'string' && u) addUrl(siteId, u);
+      }
+    }
+    for (const rt of body.resolveTargets ?? []) {
+      if (rt.siteId === siteId && typeof rt.url === 'string' && rt.url) addUrl(siteId, rt.url);
+    }
+    const ss = perStore.get(siteId);
+    if (ss) {
+      if ((body.failed ?? []).includes(siteId)) ss.errors++;
+      if ((body.cooldown ?? []).includes(siteId) || (body.unsupported ?? []).includes(siteId)) ss.skipped++;
+    }
+    return setFor(siteId).size - before;
+  };
+
+  // Phase 1 — DISCOVERY (one lookup per term x store).
+  const discoverOne = async (term: string, siteId: string): Promise<void> => {
+    const startedMs = Date.now();
     try {
-      const r = await gate.run(() => httpGet(deps.fetch, lookupUrl(term), config.requestTimeoutMs));
+      const r = await gate.run(() => httpGet(deps.fetch, lookupUrl(term, siteId), config.requestTimeoutMs));
       if (r.status === 'budget-exhausted') {
         budgetExhausted = true;
         return;
@@ -216,36 +243,19 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
       const res = r.value;
       if (!res.ok) {
         lookupFailures++;
-        logger.warn('[INITIATOR] lookup failed', { term, status: res.status });
+        logger.info('[INITIATOR] lookup', { term, siteId, status: res.status, ms: Date.now() - startedMs, candidates: 0 });
+        logger.warn('[INITIATOR] lookup failed', { term, siteId, status: res.status });
         return;
       }
-      const body = (await res.json()) as LookupResponseBody;
-      for (const sr of body.results ?? []) {
-        if (!sr.siteId || !storeSet.has(sr.siteId)) continue;
-        for (const c of sr.candidates ?? []) {
-          // Prefer the engine's collect-ready URL; fall back to the page url (older engine, or no
-          // collectUrl derivable). Dedup (setFor/addUrl) keys on whichever was chosen.
-          const u = typeof c.collectUrl === 'string' && c.collectUrl ? c.collectUrl : c.url;
-          if (typeof u === 'string' && u) addUrl(sr.siteId, u);
-        }
-      }
-      for (const rt of body.resolveTargets ?? []) {
-        if (rt.siteId && storeSet.has(rt.siteId) && typeof rt.url === 'string' && rt.url) addUrl(rt.siteId, rt.url);
-      }
-      for (const sid of body.failed ?? []) {
-        const ss = perStore.get(sid);
-        if (ss) ss.errors++;
-      }
-      for (const sid of [...(body.cooldown ?? []), ...(body.unsupported ?? [])]) {
-        const ss = perStore.get(sid);
-        if (ss) ss.skipped++;
-      }
+      const candidates = consume(siteId, (await res.json()) as LookupResponseBody);
+      logger.info('[INITIATOR] lookup', { term, siteId, status: res.status, ms: Date.now() - startedMs, candidates });
     } catch (error) {
       lookupFailures++;
-      logger.warn('[INITIATOR] lookup errored', { term, error: error instanceof Error ? error.message : String(error) });
+      logger.info('[INITIATOR] lookup', { term, siteId, status: 0, ms: Date.now() - startedMs, candidates: 0 });
+      logger.warn('[INITIATOR] lookup errored', { term, siteId, error: error instanceof Error ? error.message : String(error) });
     }
   };
-  await Promise.all(config.terms.map((term) => discoverTerm(term)));
+  await Promise.all(uniqueStores.flatMap((siteId) => config.terms.map((term) => discoverOne(term, siteId))));
 
   // Phase 2 — ENQUEUE (per store, per discovered URL). One bad store/URL is logged
   // and skipped; it never aborts the rest of the pass.
