@@ -247,9 +247,10 @@ const HEADLESS_ARGS = [
  * The PROVEN clean-headful recipe (measured 2026-09-07 against anitoysgk / hobby-genki / sugotoys):
  * real Chrome rendering HEADFUL on the Ozone headless platform (no X server, no Xvfb), the
  * automation switch stripped, and NOTHING else. Every flag the headless profile adds is an extra
- * detection surface, so none of them are carried here — this list is the whole surface, in the
- * order the probe used. `--no-sandbox`/`--disable-setuid-sandbox`/`--disable-dev-shm-usage` stay
- * because the pod runs as an unprivileged uid with a small /dev/shm, not for stealth.
+ * detection surface, so none of them are carried here — this list is the whole surface: the same
+ * SET the probe passed (Chrome does not care in what order). `--no-sandbox` /
+ * `--disable-setuid-sandbox` / `--disable-dev-shm-usage` stay because the pod runs as an
+ * unprivileged uid with a small /dev/shm, not for stealth.
  */
 const CLEAN_HEADFUL_ARGS = [
   '--ozone-platform=headless',

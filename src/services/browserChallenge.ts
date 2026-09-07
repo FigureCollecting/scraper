@@ -40,7 +40,13 @@ export class ChallengeLaneUnavailableError extends Error {
 /** Cloudflare's own header on a mitigated (challenge/block) response. */
 export const CHALLENGE_HEADER = 'cf-mitigated';
 
-/** Default budget for a challenge to clear itself, and the poll interval inside it. */
+/**
+ * Default budget for a challenge to clear itself, and the poll interval inside it. Measured live, a
+ * challenge clears in 3-9 s; the budget is the ceiling for a slow one. The CALLER's own budget can
+ * be shorter and then bounds this first — `/lookup` gives each store LOOKUP_STORE_TIMEOUT_MS (15 s
+ * by default), so a lookup abandons a stalled challenge before this timeout is ever reached, while
+ * the crawl/ingest lane (no per-store deadline) gets the full window.
+ */
 export const CHALLENGE_CLEARANCE_TIMEOUT_MS = 30000;
 export const CHALLENGE_POLL_MS = 750;
 

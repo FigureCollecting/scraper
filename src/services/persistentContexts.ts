@@ -10,7 +10,10 @@
  * It is a CACHE, not a leak, and the bounds are the whole point:
  *   - max age 25 min from creation — inside the ~30 min clearance window, so a reused context never
  *     hands back a page that is about to be re-challenged mid-fetch;
- *   - idle TTL 10 min — a host nobody is fetching does not hold browser memory;
+ *   - idle TTL 10 min — a host nobody is fetching stops being reused and is closed. Expiry is
+ *     TRAFFIC-DRIVEN: the sweep runs inside `acquire`, so an idle entry is reclaimed by the next
+ *     challenge-gated fetch (or by pool shutdown), not by a timer — the LRU cap is what bounds the
+ *     cost in the meantime;
  *   - LRU cap of 6 contexts — the hard ceiling on how much this can ever cost;
  *   - everything closed on pool shutdown.
  * An entry that is IN USE is never evicted out from under its fetch; it becomes evictable as soon
