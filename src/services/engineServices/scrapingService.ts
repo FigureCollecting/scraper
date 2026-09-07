@@ -5,7 +5,7 @@
  * plugin's job via its own ExtractionRuleset.
  */
 import type { Browser, Page, HTTPResponse } from 'puppeteer';
-import { BrowserPool } from '../genericScraper.js';
+import { BrowserPool, isCleanHeadfulMode } from '../genericScraper.js';
 import { ScrapingService, ScrapePageOptions, ScrapePageResult, PageOptions, BrowserFetchOptions, WaitForReadiness } from '@figurecollecting/scraper-plugin-contract';
 import { CaptureSink, NoopCaptureSink, buildRawCapture } from '../captureSink.js';
 import { sanitizeForLog } from '../../utils/security.js';
@@ -179,9 +179,27 @@ function mergeStoredCookies(
   return { ...(stored ?? {}), ...(requestCookies ?? {}) };
 }
 
-/** UA precedence on the browser lane: the request's own UA, else the host's pinned mint UA, else the default. */
-function resolveUserAgent(store: CfCookieSource, url: string, requestUa: string | undefined): string {
-  return requestUa || store.userAgentFor(url) || DEFAULT_USER_AGENT;
+/**
+ * UA precedence on the browser lane: the request's own UA, else the host's pinned mint UA (a stored
+ * `cf_clearance` is only valid for the UA it was minted with), else the engine default — EXCEPT in
+ * clean-headful mode, where "no declaration" means DON'T TOUCH IT. Overriding a real Chrome 152's
+ * UA with the historical `Chrome/127` string contradicts the client hints the same browser sends,
+ * and Cloudflare binds the clearance it issues to the UA that earned it.
+ */
+function resolveUserAgent(store: CfCookieSource, url: string, requestUa: string | undefined): string | undefined {
+  const declared = requestUa || store.userAgentFor(url);
+  if (declared) return declared;
+  return isCleanHeadfulMode() ? undefined : DEFAULT_USER_AGENT;
+}
+
+/**
+ * The default 1280x720 device-metrics override, applied only in the headless profile. Clean-headful
+ * Chrome already opens a 1280x900 window (`--window-size`); overriding its metrics on top of that is
+ * a mismatch the challenge can see, and buys nothing.
+ */
+async function applyDefaultViewport(page: Page): Promise<void> {
+  if (isCleanHeadfulMode()) return;
+  await page.setViewport({ width: 1280, height: 720 });
 }
 
 /**
@@ -196,8 +214,9 @@ export async function browserFetchBody(
   options: Omit<EngineBrowserFetchOptions, 'stealth'> = {},
   store: CfCookieSource = getCfCookieStore(),
 ): Promise<string> {
-  await page.setViewport({ width: 1280, height: 720 });
-  await page.setUserAgent(resolveUserAgent(store, url, options.userAgent));
+  await applyDefaultViewport(page);
+  const userAgent = resolveUserAgent(store, url, options.userAgent);
+  if (userAgent) await page.setUserAgent(userAgent);
 
   if (options.headers && Object.keys(options.headers).length > 0) {
     await page.setExtraHTTPHeaders(options.headers);
@@ -249,8 +268,9 @@ async function navigateAndCapture(
   sink: CaptureSink = new NoopCaptureSink(),
   store: CfCookieSource = getCfCookieStore(),
 ): Promise<ScrapePageResult> {
-  await page.setViewport({ width: 1280, height: 720 });
-  await page.setUserAgent(resolveUserAgent(store, url, options.userAgent));
+  await applyDefaultViewport(page);
+  const userAgent = resolveUserAgent(store, url, options.userAgent);
+  if (userAgent) await page.setUserAgent(userAgent);
 
   const cookies = mergeStoredCookies(store, url, options.cookies);
   if (cookies) {
