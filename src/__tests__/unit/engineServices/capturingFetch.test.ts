@@ -503,3 +503,115 @@ describe('createCapturingFetch — residential egress + waitFor', () => {
     expect(calls).toHaveLength(0);
   });
 });
+
+/**
+ * THE CHALLENGE GATE on the INGEST path. The search dispatcher (fetchSearch), the /resolve detail
+ * fetch and the ExtractContext passthroughs all turn a store's `searchFetch` into browser-lane
+ * wiring through ONE resolver (`resolveBrowserLaneOptions`) — the ingest raw fetch used to build
+ * its own options from `proxyUrl` + `waitFor` alone, so `access: 'cloudflare'` and `sessionPrime`
+ * were DROPPED: `POST /ingest/scrape` for anitoysgk.com took the per-request-context path (measured
+ * in production 2026-09-07, engine 424a270b: "Creating the challenge-lane browser", a challenge body
+ * back, and /health/detailed.browserLane.gatedBrowsers still empty). The ingest path resolves the
+ * same lane options as every other caller now — gate, prime, egress and readiness together.
+ */
+describe('createCapturingFetch — browser lane resolves the SAME options as the dispatchers', () => {
+  const PROXY = 'socks5://egress-proxy.fc.svc.cluster.local:1055';
+  /** No stored cookies for any host: the stealth CHOICE stays out of these assertions. */
+  const bareStore = { cookiesFor: () => undefined, userAgentFor: () => undefined };
+  const gated = (t: CapturingFetchTransports) =>
+    createCapturingFetch(t, new CollectingCaptureSink(), {
+      cookieStore: bareStore,
+      residentialProxyUrl: () => PROXY,
+    });
+  const gatedNoProxy = (t: CapturingFetchTransports) =>
+    createCapturingFetch(t, new CollectingCaptureSink(), {
+      cookieStore: bareStore,
+      residentialProxyUrl: () => undefined,
+    });
+
+  it('a gated RESIDENTIAL store rides the gate, the prime and the proxy (the anitoys ingest case)', async () => {
+    const { t, calls } = makeTransports();
+
+    await gated(t)('https://www.anitoysgk.com/lucy-p29358268.html', {
+      transport: 'browser', egress: 'residential', access: 'cloudflare', sessionPrime: true,
+    });
+
+    expect(calls[0]).toEqual([
+      'scrapePage',
+      'https://www.anitoysgk.com/lucy-p29358268.html',
+      { proxyServer: PROXY, challengeGated: true, primeUrl: 'https://www.anitoysgk.com' },
+    ]);
+  });
+
+  it('honours an explicit primeUrl override, exactly like the search dispatcher', async () => {
+    const { t, calls } = makeTransports();
+
+    await gated(t)('https://sugotoys.com.au/wp-json/wc/store/products/1', {
+      transport: 'browser', access: 'cloudflare', sessionPrime: { primeUrl: 'https://sugotoys.com.au/shop' },
+    });
+
+    expect(calls[0][2]).toEqual({ challengeGated: true, primeUrl: 'https://sugotoys.com.au/shop' });
+  });
+
+  it('a gated DIRECT store (no egress declared) still rides the gated browser, with NO proxyServer', async () => {
+    const { t, calls } = makeTransports();
+
+    await gated(t)('https://hobby-genki.com/item/1', { transport: 'browser', access: 'cloudflare' });
+
+    expect(calls[0][2]).toEqual({ challengeGated: true });
+    expect(calls[0][2]).not.toHaveProperty('proxyServer');
+  });
+
+  it('carries the gate onto the STEALTH lane too when the host has stored cookies', async () => {
+    const { t, calls } = makeTransports();
+    const store = { cookiesFor: () => ({ cf_clearance: 'FAKE_cf_1' }), userAgentFor: () => undefined };
+    const fetch = createCapturingFetch(t, new CollectingCaptureSink(), {
+      cookieStore: store, residentialProxyUrl: () => PROXY,
+    });
+
+    await fetch('https://www.anitoysgk.com/lucy-p29358268.html', {
+      transport: 'browser', egress: 'residential', access: 'cloudflare', sessionPrime: true,
+    });
+
+    expect(calls[0][0]).toBe('scrapePageStealth');
+    expect(calls[0][2]).toEqual({
+      proxyServer: PROXY, challengeGated: true, primeUrl: 'https://www.anitoysgk.com',
+    });
+  });
+
+  it('waitFor still rides alongside the gate', async () => {
+    const { t, calls } = makeTransports();
+
+    await gated(t)('https://www.anitoysgk.com/lucy-p29358268.html', {
+      transport: 'browser', egress: 'residential', access: 'cloudflare', waitFor: { networkIdle: true },
+    });
+
+    expect(calls[0][2]).toEqual({
+      proxyServer: PROXY, waitFor: { networkIdle: true }, challengeGated: true,
+    });
+  });
+
+  it("adds neither key for an UNGATED browser store (access:'open' and undeclared are byte-identical)", async () => {
+    const { t, calls } = makeTransports();
+
+    await gated(t)('https://alpha.example.test/item/1', { transport: 'browser', access: 'open' });
+    await gated(t)('https://alpha.example.test/item/2', { transport: 'browser' });
+    await gated(t)('https://alpha.example.test/item/3', undefined);
+
+    expect(calls).toEqual([
+      ['scrapePage', 'https://alpha.example.test/item/1'],
+      ['scrapePage', 'https://alpha.example.test/item/2'],
+      ['scrapePage', 'https://alpha.example.test/item/3'],
+    ]);
+  });
+
+  it('still REFUSES a residential gated store with no configured proxy — before any fetch, and ONCE', async () => {
+    const { t, calls } = makeTransports();
+
+    await expect(gatedNoProxy(t)('https://www.anitoysgk.com/lucy-p29358268.html', {
+      transport: 'browser', egress: 'residential', access: 'cloudflare', sessionPrime: true,
+    })).rejects.toThrow(ResidentialEgressUnavailableError);
+
+    expect(calls).toHaveLength(0);
+  });
+});
