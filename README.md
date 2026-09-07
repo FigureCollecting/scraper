@@ -175,7 +175,9 @@ Get available pre-built site configurations.
 Health check endpoint for monitoring.
 
 ### GET /health/detailed
-Detailed health check with browser pool and queue status.
+Detailed health check with browser pool status plus two operator views (additive, never cookie values):
+- `challengeCooldowns`: `[{host, remainingMs, reason}]` — the per-host Cloudflare-challenge cooldowns currently open
+- `cfCookies`: `[{host, cookieNames, userAgentPinned, loadedAt, mintedAt?, expiresAt?, stale, staleSince?, staleReason?}]` — the stored-cookie jar (`CF_COOKIE_FILE`) per host. `stale: true` means the host still served a challenge WITH its stored cookies: re-mint (see *Stored Cloudflare cookies* under Environment Variables). `[]` when the jar is disabled.
 
 ### GET /version
 Get service version information for version management.
@@ -787,15 +789,48 @@ See `.env.example` for complete configuration template.
   - Raise for slow session-gated stores (e.g. Ueeshop) whose prime/search can take 15–30 s
   - Unset/invalid → default; any value is clamped to `[5000, 120000]`
   - Default: `30000`
+- `HTTP_FETCH_TIMEOUT_MS`: Abort ceiling (ms) for the plain-HTTP (`http`) transport — one signal bounds headers AND body
+  - Serves the synchronous `/lookup`, `/catalog`, and `/resolve` callers as well as the ingest queue, so it stays tight by default
+  - Raise for large listings (the orzgk 100-item catalog page takes ~15 s; ops set `30000`)
+  - Unset/invalid → default; any value is clamped to `[5000, 120000]`
+  - Default: `15000`
 - `CHALLENGE_COOLDOWN_MS`: Per-host cooldown window (ms) after a store serves a Cloudflare challenge/block
   - While a host is cooling, the scrape queue and lookup fan-out skip it without fetching, so repeat challenges don't degrade the egress IP's CF reputation
   - Unset/invalid → default; any finite value is clamped to `[60000 (1 min), 86400000 (24 h)]`
   - Default: `1800000` (30 min)
+- `CF_COOKIE_FILE`: Path to the stored-cookie file (hand-minted Cloudflare clearance / session cookies, keyed by host) — see **Stored Cloudflare cookies** below
+  - Unset/blank (default): the jar is disabled and every lane behaves exactly as before
+  - Example: `/var/run/fc/cf-cookies/cf-cookies.json` (a Secret mounted as a directory, so a refresh changes the file's mtime)
 
 - `CATALOG_STORE_TIMEOUT_MS`: Timeout (ms) for one `GET /catalog` listing-page fetch
   - A catalog page is far larger than a search hit (orzgk pages run 1.5–2 MB), so it gets its own window
   - Unset/invalid → default; any value is clamped to `[1000, 120000]`
   - Default: `30000`
+
+**Stored Cloudflare cookies (`CF_COOKIE_FILE`):**
+
+`cf_clearance` is bound to the egress IP and the User-Agent it was minted under, and it cannot be minted from the pod. An operator mints it out-of-band, lands the file, and the engine injects it into all three fetch lanes for that host — impit (seeded into the session jar), plain http (`cookie` header), and browser (puppeteer `setCookie`, `httpOnly` + `secure`) — with the mint User-Agent pinned for the host on every lane. Every caller inherits it (ingest queue, `/lookup`, `/catalog`, `/resolve`, ruleset follow-up fetches); no ruleset or contract change is needed.
+
+File format — a JSON object keyed by host; keys are normalized (lower-cased, leading `www.` stripped) and a url matches its exact host first, then a parent domain (`shop.example.com` → `example.com`), so subdomains of a minted apex are covered:
+
+```json
+{
+  "myfigurecollection.net": {
+    "cookies": { "cf_clearance": "<value>", "PHPSESSID": "<value>" },
+    "userAgent": "<the exact User-Agent the cookies were minted under>",
+    "mintedAt": "2026-09-06T00:00:00.000Z",
+    "expiresAt": "2026-09-07T00:00:00.000Z"
+  },
+  "anitoysgk.com": { "cookies": { "cf_clearance": "<value>" } }
+}
+```
+
+- `cookies` (required, non-empty): name → value. A cookie with an empty / non-string / unsendable value is dropped; a host left with no cookies is skipped (named in one warn).
+- `userAgent` (recommended): pinned for the host on every lane — it wins over the store's declared UA and the impit profile's. Without it the lane's default UA is sent, which usually voids `cf_clearance`.
+- `mintedAt` / `expiresAt` (optional, informational): surfaced on `/health/detailed` only.
+- Hot reload: the file's mtime is polled every 30 s (unref'd timer). A rewrite goes live without a restart and RESETS every stale mark. A malformed file keeps the last-good set (one warn); a missing file reads as empty.
+- Stale semantics: the engine never refreshes or retries a cookie. When a host the jar has cookies for STILL serves a challenge — at any of the existing cooldown sites (ingest honesty gate / extraction-throw door, `/lookup` search, `/catalog` listing, on any lane) — the host is marked `stale` once (`[CF-COOKIE] STALE <host> via <lane>: …` naming cookie NAMES only) and `/health/detailed` → `cfCookies[].stale` flips true with `staleSince` / `staleReason`. The existing storm protection is unchanged: one probe fetch per host per cooldown window, then the host cooldown fast-fails everything else. A clean body for that host marks it fresh again. A host the jar knows nothing about is never marked — its challenge is an egress matter, not a cookie one.
+- Logs and the health view carry cookie NAMES only, never a value.
 
 **MFC Cookie Security:**
 - `MFC_ALLOWED_COOKIES`: Whitelist of cookie names allowed during authenticated MFC scraping
