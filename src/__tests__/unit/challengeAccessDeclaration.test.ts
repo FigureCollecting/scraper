@@ -13,7 +13,7 @@ import { warnDroppedBrowserPrime } from '../../services/sessionPrime';
 describe('challenge-gate declaration (SearchFetch.access)', () => {
   /**
    * `sessionPrime` reaches the BROWSER lane only through `access: 'cloudflare'` (contract 0.7.0:
-   * priming a fresh context costs a whole extra navigation, so it rides the declaration that keeps
+   * priming a cold session costs a whole extra navigation, so it rides the declaration that keeps
    * the context). A store declaring the prime WITHOUT the gate therefore gets no priming navigation —
    * which used to happen in complete silence, and looks exactly like a ruleset that suddenly 404s.
    */
@@ -128,7 +128,7 @@ describe('challenge-gate declaration (SearchFetch.access)', () => {
       });
     });
 
-    it('a gated store with no egress declaration still keeps its context', () => {
+    it('a gated store with no egress declaration still rides the gated browser', () => {
       const options = resolveBrowserLaneOptions('https://hobby-genki.com/item/1', { access: 'cloudflare' }, undefined);
 
       expect(options).toEqual({ challengeGated: true });

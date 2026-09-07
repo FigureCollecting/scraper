@@ -65,9 +65,9 @@ export interface EnginePageOptions extends PageOptions {
   proxyServer?: string;
   /** The URL about to be fetched — the per-host key for a persistent (challenge-gated) context. */
   targetUrl?: string;
-  /** The store declares a challenge gate (`access: 'cloudflare'`): keep this host's context alive. */
+  /** The store declares a challenge gate (`access: 'cloudflare'`): fetch it on the gated browser. */
   challengeGated?: boolean;
-  /** Session prime (`SearchFetch.sessionPrime`): navigate here once, on a fresh context, first. */
+  /** Session prime (`SearchFetch.sessionPrime`): navigate here first, once per gated browser. */
   primeUrl?: string;
 }
 
@@ -267,7 +267,7 @@ export async function browserFetchBody(
     const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
     // CHALLENGE: `domcontentloaded` fires on the Cloudflare interstitial too. Wait (bounded) for the
     // clean-headful browser to clear it, so the body below is the store's document and not "Just a
-    // moment" — and so the host is marked gated, keeping this context alive for the clearance window.
+    // moment" — and so the host is marked gated, moving its later fetches onto the gated browser.
     await awaitChallengeClearance(page, response, url);
     // READINESS: a client-rendered storefront has only its app shell at domcontentloaded — wait for
     // the declared selector / network idle before reading the body. Undeclared ⇒ no wait.

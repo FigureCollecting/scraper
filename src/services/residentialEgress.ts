@@ -233,7 +233,7 @@ export interface BrowserLaneEgressOptions {
   proxyServer?: string;
   /** Client-rendered readiness the store declared (`waitFor`), carried alongside the egress. */
   waitFor?: WaitForReadiness;
-  /** The store declares a Cloudflare gate (`access: 'cloudflare'`): keep this host's context alive. */
+  /** The store declares a Cloudflare gate (`access: 'cloudflare'`): fetch it on the gated browser. */
   challengeGated?: boolean;
   /** Session prime (`sessionPrime`) resolved to the URL a FRESH browser context visits first. */
   primeUrl?: string;
@@ -257,8 +257,8 @@ export function resolveBrowserLaneOptions(
   proxyUrl: string | undefined,
 ): BrowserLaneEgressOptions | undefined {
   const proxyServer = requireResidentialProxy(url, searchFetch?.egress, proxyUrl);
-  // A CHALLENGE-GATED store also carries its session prime onto the browser lane: a fresh context
-  // is a cold session, and a cold session at anitoys 404s its own search results.
+  // A CHALLENGE-GATED store also carries its session prime onto the browser lane: a freshly
+  // launched gated browser is a cold session, and a cold session at anitoys 404s its search results.
   const challengeGated = searchFetch?.access === 'cloudflare';
   const prime = challengeGated ? resolvePrime(searchFetch, url) : undefined;
   if (!challengeGated) warnDroppedBrowserPrime(searchFetch, url);
