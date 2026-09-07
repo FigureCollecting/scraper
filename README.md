@@ -229,6 +229,29 @@ it reports them, else a non-empty page implies more with `nextPage = page + 1`.
 with `Retry-After` while the listing host cools from a Cloudflare challenge · `502 { error: "catalog failed", siteId, reason }`
 (challenge page — which also opens the host cooldown — fetch error, timeout, or parser throw).
 
+### Search query encoding (`retrieval.bySearch.queryEncoding`)
+`{q}` is url-encoded into the store's `bySearch.urlTemplate` by `encodeSearchQuery`
+(`src/driver/retrievalPlanner.ts`), which every search caller goes through (`/lookup` fan-out,
+single-store search, record mode). The default is one `encodeURIComponent` — unchanged for every
+store that declares nothing. A plugin that declares `queryEncoding` (plugin-contract 0.8.0) gets
+these steps applied, in this order and no other:
+
+| field | effect |
+|---|---|
+| — | `encodeURIComponent(query)`, always |
+| `reEncodePercentOf: string[]` | re-encode the `%` of each listed percent-escape (`%2f` → `%252f`), one pass, matched case-insensitively and emitted in the DECLARED spelling |
+| `spaces: 'percent' \| 'plus'` | `plus` rewrites every `%20` to `+`; `percent` (the default) leaves it |
+| `lowercase: boolean` | lowercase the finished segment |
+
+The store this was built for is anitoys, whose own search box encodes with `format_keywords`
+(`public_2019.js`) and whose route rejects anything else. Declared as
+`{ reEncodePercentOf: ['%25','%3b','%2f','%40','%3a','%26','%3d','%2b','%24','%2c','%23','%3f'], spaces: 'plus', lowercase: true }`,
+`"star origin 1/6"` leaves as `star+origin+1%252f6` and the store answers HTTP 200 with the item's
+SERP card; a single `encodeURIComponent` sends `star%20origin%201%2F6` and the store answers HTTP
+404 "Page Not Found" — a broken route, not a zero result. That store resolves records by `scale`,
+so a scale-bearing query is its normal shape, and the naive encoding contributes zero candidates
+for items it stocks.
+
 ### POST /reset-pool (Test Environment Only)
 **This endpoint is only available in non-production environments.**
 

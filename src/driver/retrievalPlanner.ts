@@ -10,7 +10,7 @@
  * Search returns candidates, not final items — the two-stage `search → candidate ids → byId`
  * refinement is the caller's next step (a follow-on increment). Pure and synchronous.
  */
-import type { IdentityQuery, RetrievalCapability, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
+import type { IdentityQuery, QueryEncoding, RetrievalCapability, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
 import type { ProfileRegistry } from './profileRegistry.js';
 
 /**
@@ -107,10 +107,36 @@ export function resolveListingUrl(retrieval: RetrievalCapability | undefined, pa
   return template.replaceAll('{page}', String(page));
 }
 
-/** Build a search URL from the bySearch template, `{q}` url-encoded. */
+/** A percent-escape as a store may declare it in `reEncodePercentOf` — anything else is ignored. */
+const PERCENT_ESCAPE = /^%[0-9a-f]{2}$/i;
+
+/**
+ * Encode a free-text query for one store's `{q}`, per its declared {@link QueryEncoding}. The steps
+ * are fixed: `encodeURIComponent`, then re-encode the `%` of each declared percent-escape (ONE pass,
+ * so a rewritten `%25` is never re-matched by its own output), then `%20` → `+` if `spaces: 'plus'`,
+ * then lowercase if declared. No declaration ⇒ `encodeURIComponent` alone — today's behavior for
+ * every store that does not carry the field.
+ *
+ * anitoys is why this exists: its route reads a single-encoded `/` as path structure and answers
+ * HTTP 404, while its own client (`format_keywords`, public_2019.js) sends `%252f` and gets the
+ * item's SERP card — so "star origin 1/6" must leave here as `star+origin+1%252f6`.
+ */
+export function encodeSearchQuery(query: string, encoding?: QueryEncoding): string {
+  let out = encodeURIComponent(query);
+  const escapes = (encoding?.reEncodePercentOf ?? []).filter((e) => PERCENT_ESCAPE.test(e));
+  if (escapes.length) {
+    const declared = new Map(escapes.map((e) => [e.toLowerCase(), e]));
+    const pattern = new RegExp(escapes.map((e) => `%${e.slice(1)}`).join('|'), 'gi');
+    out = out.replace(pattern, (m) => `%25${(declared.get(m.toLowerCase()) ?? m).slice(1)}`);
+  }
+  if (encoding?.spaces === 'plus') out = out.replaceAll('%20', '+');
+  return encoding?.lowercase ? out.toLowerCase() : out;
+}
+
+/** Build a search URL from the bySearch template, `{q}` encoded per the store's declaration. */
 export function resolveSearchUrl(retrieval: RetrievalCapability | undefined, query: string): string | undefined {
-  const template = retrieval?.bySearch?.urlTemplate;
-  return template ? template.replace('{q}', encodeURIComponent(query)) : undefined;
+  const bySearch = retrieval?.bySearch;
+  return bySearch ? bySearch.urlTemplate.replace('{q}', encodeSearchQuery(query, bySearch.queryEncoding)) : undefined;
 }
 
 export type RetrievalRequest =

@@ -3,9 +3,9 @@
  * templates. Covers by-id detail plans, single-store search, the cross-store `lookup` fan-out
  * (the buy-decision seam), and the `unsupported` coverage-gap report.
  */
-import type { IdentityQuery, RetrievalCapability, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
+import type { IdentityQuery, QueryEncoding, RetrievalCapability, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
 import { ProfileRegistry } from '../profileRegistry';
-import { planRetrieval, resolveByIdUrl, resolveSearchUrl, resolveListingUrl, composeStoreQuery, composeNameQuery, normalizeText, tokenizeIdentity } from '../retrievalPlanner';
+import { planRetrieval, resolveByIdUrl, resolveSearchUrl, resolveListingUrl, encodeSearchQuery, composeStoreQuery, composeNameQuery, normalizeText, tokenizeIdentity } from '../retrievalPlanner';
 
 const caps = (siteId: string, host: string, retrieval?: RetrievalCapability): StoreCapabilities => ({
   siteId, name: siteId, domains: [host], requiresBrowser: false, allowedCookies: [],
@@ -34,6 +34,68 @@ describe('retrieval URL resolvers', () => {
   it('resolveSearchUrl substitutes {q}, url-encoded; undefined when unsupported', () => {
     expect(resolveSearchUrl({ bySearch: { urlTemplate: 'https://x/s?q={q}' } }, 'nendoroid miku')).toBe('https://x/s?q=nendoroid%20miku');
     expect(resolveSearchUrl({}, 'x')).toBeUndefined();
+  });
+
+  describe('encodeSearchQuery — the declared {q} encoding (bySearch.queryEncoding)', () => {
+    // anitoys' own client-side `format_keywords` (public_2019.js), declared field by field.
+    const ANITOYS: QueryEncoding = {
+      reEncodePercentOf: ['%25', '%3b', '%2f', '%40', '%3a', '%26', '%3d', '%2b', '%24', '%2c', '%23', '%3f'],
+      spaces: 'plus',
+      lowercase: true,
+    };
+
+    it('no declaration = one encodeURIComponent, byte-identical to today', () => {
+      expect(encodeSearchQuery('star origin 1/6')).toBe('star%20origin%201%2F6');
+      expect(encodeSearchQuery('star origin 1/6', undefined)).toBe('star%20origin%201%2F6');
+      expect(encodeSearchQuery('Honkai: Star Rail Firefly')).toBe('Honkai%3A%20Star%20Rail%20Firefly');
+    });
+
+    // MEASURED 2026-09-07 through the residential browser lane: the naive
+    // `Search-star%20origin%201%2F6/list-r1.html` answers HTTP 404 "Page Not Found" (a broken
+    // route), while this one answers 200 with goods_id 29358268 "Star Origin Studio 1/6 Lucy".
+    it('anitoys: a scale-bearing query reaches the route with the slash double-encoded', () => {
+      expect(encodeSearchQuery('star origin 1/6', ANITOYS)).toBe('star+origin+1%252f6');
+    });
+
+    it('anitoys: a colon is re-encoded and the whole segment lowercased', () => {
+      expect(encodeSearchQuery('Honkai: Star Rail Firefly', ANITOYS)).toBe('honkai%253a+star+rail+firefly');
+    });
+
+    it('anitoys: a plain single-word query is untouched', () => {
+      expect(encodeSearchQuery('lucy', ANITOYS)).toBe('lucy');
+      expect(encodeSearchQuery('Lucy', ANITOYS)).toBe('lucy');
+    });
+
+    it('matches the escape case-insensitively but emits the DECLARED spelling', () => {
+      // encodeURIComponent produces the uppercase %2F; the declaration says %2f, so %252f is emitted.
+      expect(encodeSearchQuery('a/b', { reEncodePercentOf: ['%2f'] })).toBe('a%252fb');
+      expect(encodeSearchQuery('a/b', { reEncodePercentOf: ['%2F'] })).toBe('a%252Fb');
+    });
+
+    it('re-encodes a literal percent without eating its own output', () => {
+      // '%' → '%25' → '%2525'; the pass must not then re-match the %25 it just wrote.
+      expect(encodeSearchQuery('50% off', ANITOYS)).toBe('50%2525+off');
+    });
+
+    it('ignores a declaration entry that is not a percent-escape', () => {
+      expect(encodeSearchQuery('a/b', { reEncodePercentOf: ['/', '', '%2f'] })).toBe('a%252fb');
+    });
+
+    it('applies each declared field independently', () => {
+      expect(encodeSearchQuery('A B', { spaces: 'plus' })).toBe('A+B');
+      expect(encodeSearchQuery('A B', { spaces: 'percent' })).toBe('A%20B');
+      expect(encodeSearchQuery('A B', { lowercase: true })).toBe('a%20b');
+      expect(encodeSearchQuery('A B', {})).toBe('A%20B');
+    });
+
+    it('resolveSearchUrl applies the declaration when the store carries one', () => {
+      expect(
+        resolveSearchUrl(
+          { bySearch: { urlTemplate: 'https://www.anitoysgk.com/Search-{q}/list-r1.html', queryEncoding: ANITOYS } },
+          'star origin 1/6',
+        ),
+      ).toBe('https://www.anitoysgk.com/Search-star+origin+1%252f6/list-r1.html');
+    });
   });
 
   describe('resolveListingUrl — the newest-first catalog page url (byListing)', () => {
