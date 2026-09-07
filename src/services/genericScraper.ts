@@ -492,54 +492,20 @@ export class BrowserPool {
     }
   }
 
-  // Stealth browser for bot-detection-sensitive fetches (e.g. Cloudflare-fronted pages)
+  /**
+   * The singleton browser reserved for challenge-gated hosts. It is a PLAIN puppeteer launch with
+   * the same profile as the pool — no puppeteer-extra, no stealth plugin. Measured 2026-09-07: the
+   * stealth plugin (with the old bundled Chrome) FAILS the Cloudflare JS challenge that a clean,
+   * current Chrome passes, and every property the plugin rewrites is one more chance to disagree
+   * with the real browser it is impersonating. What it buys is not evasion but LIFETIME: one
+   * long-lived browser whose already-passed challenges (and their cookies) survive between fetches.
+   */
   private static stealthBrowser: Browser | null = null;
 
   static async getStealthBrowser(): Promise<Browser> {
     if (!this.stealthBrowser) {
-      console.log('[BROWSER POOL] Creating stealth browser...');
-
-      // In test environment, use regular browser (mocks interfere with puppeteer-extra)
-      if (process.env.NODE_ENV === 'test' || process.env.JEST_WORKER_ID) {
-        console.log('[BROWSER POOL] Test environment detected - using regular browser instead of stealth');
-        this.stealthBrowser = await puppeteer.launch(this.getBrowserConfig());
-        return this.stealthBrowser;
-      }
-
-      // Production: Use puppeteer-extra with stealth plugin.
-      // Dynamic import() (not static) so these CJS-interop modules load lazily
-      // and ONLY in production — the test path above returns before reaching
-      // here, keeping puppeteer-extra out of the mocked test module graph.
-      // Both packages are CJS; under NodeNext their default export is the
-      // instance/factory. The casts pin the types NodeNext leaves as the raw
-      // module namespace (runtime shape verified: .default is the usable value).
-      /* istanbul ignore next - Production-only stealth initialization, conflicts with test mocks */
-      const { default: puppeteerExtra } = (await import('puppeteer-extra')) as unknown as {
-        default: import('puppeteer-extra').PuppeteerExtra;
-      };
-      /* istanbul ignore next */
-      const { default: StealthPlugin } = (await import('puppeteer-extra-plugin-stealth')) as unknown as {
-        default: () => import('puppeteer-extra').PuppeteerExtraPlugin;
-      };
-
-      /* istanbul ignore next */
-      puppeteerExtra.use(StealthPlugin());
-
-      /* istanbul ignore next */
-      const config = this.getBrowserConfig();
-      // Add anti-detection flag
-      /* istanbul ignore next */
-      config.args.push('--disable-blink-features=AutomationControlled');
-
-      /* istanbul ignore next */
-      this.stealthBrowser = await puppeteerExtra.launch(config);
-      /* istanbul ignore next */
-      console.log('[BROWSER POOL] Stealth browser created');
-    }
-
-    // TypeScript doesn't know this is always set by this point
-    if (!this.stealthBrowser) {
-      throw new Error('[BROWSER POOL] Failed to create stealth browser');
+      console.log('[BROWSER POOL] Creating the challenge-lane browser...');
+      this.stealthBrowser = await puppeteer.launch(this.getBrowserConfig());
     }
 
     return this.stealthBrowser;

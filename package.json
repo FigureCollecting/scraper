@@ -48,8 +48,6 @@
     "minio": "^8.0.7",
     "patch-package": "^8.0.1",
     "puppeteer": "^25.9.0",
-    "puppeteer-extra": "^3.3.6",
-    "puppeteer-extra-plugin-stealth": "^2.11.2",
     "tough-cookie": "6.0.2"
   },
   "overrides": {
