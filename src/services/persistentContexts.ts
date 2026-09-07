@@ -101,10 +101,30 @@ export class PersistentContextCache {
     return { entry, evicted };
   }
 
-  /** Register a freshly-opened context. Returns it plus anything the LRU cap pushed out. */
+  /**
+   * Register a freshly-opened context. Returns the entry to fetch on, plus everything the caller must
+   * close (the LRU cap's victims, a displaced idle entry, or — see below — the caller's OWN context).
+   *
+   * LOST RACE: when the key already holds an entry a fetch is still running on, that entry WINS. Two
+   * concurrent fetches to one gated host both miss `acquire` and both open a context; the loser's
+   * context is the disposable duplicate, so it comes back in `evicted` and the caller fetches on the
+   * incumbent instead. Handing back the in-flight entry would have the caller close a context
+   * mid-navigation, killing the other fetch and discarding the clearance it was earning.
+   */
   store(key: string, init: PersistentContextInit): { entry: PersistentContextEntry; evicted: PersistentContextEntry[] } {
     const now = Date.now();
     const existing = this.entries.get(key);
+
+    if (existing && existing.inUse > 0 && this.isAlive(existing)) {
+      const claim = init.inUse ?? 1;
+      existing.inUse += claim;
+      if (claim > 0) existing.lastUsedAt = now;
+      // Re-insert to keep Map order == least-recently-used first (the LRU the cap evicts by).
+      this.entries.delete(key);
+      this.entries.set(key, existing);
+      return { entry: existing, evicted: [this.orphan(key, init, now)] };
+    }
+
     const evicted: PersistentContextEntry[] = existing ? [existing] : [];
     if (existing) this.entries.delete(key);
 
@@ -120,6 +140,23 @@ export class PersistentContextCache {
     this.entries.set(key, entry);
     evicted.push(...this.enforceCap(key));
     return { entry, evicted };
+  }
+
+  /**
+   * An entry for a context that never entered the map — the loser of a store race. It exists only so
+   * the caller closes it through the same `evicted` path (and the same BrowserPool accounting) as a
+   * genuinely evicted one.
+   */
+  private orphan(key: string, init: PersistentContextInit, now: number): PersistentContextEntry {
+    return {
+      key,
+      browser: init.browser,
+      context: init.context,
+      createdAt: now,
+      lastUsedAt: now,
+      inUse: 0,
+      primed: init.primed ?? false,
+    };
   }
 
   /** A fetch finished with this entry: it is idle again (and evictable). */

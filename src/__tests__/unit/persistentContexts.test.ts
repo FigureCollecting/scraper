@@ -152,4 +152,54 @@ describe('PersistentContextCache', () => {
     expect(replacement.evicted).toEqual([first]);
     expect(cache.size()).toBe(1);
   });
+
+  /**
+   * Two concurrent fetches to the same gated host both miss the cache and both open a context. The
+   * SECOND one to finish opening must not displace the first: that entry is mid-navigation, and the
+   * caller closes whatever `store` returns as evicted — closing it would kill the in-flight fetch
+   * ('Target closed') and throw away the clearance it was about to earn.
+   */
+  it('never displaces an IN-USE entry: the late caller joins it and its duplicate is evicted', () => {
+    const cache = new PersistentContextCache();
+    const winner = makeContext('c1');
+    const duplicate = makeContext('c2');
+    const first = cache.store('www.anitoysgk.com|residential', { browser, context: winner, inUse: 1 });
+
+    const second = cache.store('www.anitoysgk.com|residential', { browser, context: duplicate, inUse: 1 });
+
+    expect(second.entry).toBe(first.entry);
+    expect(second.entry.context).toBe(winner);
+    expect(second.evicted.map((e) => e.context)).toEqual([duplicate]);
+    expect(second.entry.inUse).toBe(2);
+    expect(cache.size()).toBe(1);
+
+    cache.release(second.entry);
+    cache.release(first.entry);
+    expect(first.entry.inUse).toBe(0);
+  });
+
+  it('evicts a mid-flight RETAINED context rather than the in-use entry it would replace', () => {
+    const cache = new PersistentContextCache();
+    const inFlight = makeContext('c1');
+    const retained = makeContext('c2');
+    const first = cache.store('a|direct', { browser, context: inFlight, inUse: 1 });
+
+    const retain = cache.store('a|direct', { browser, context: retained, inUse: 0 });
+
+    expect(retain.entry).toBe(first.entry);
+    expect(retain.evicted.map((e) => e.context)).toEqual([retained]);
+    expect(first.entry.inUse).toBe(1); // a retain claims nothing
+  });
+
+  it('still replaces an in-use entry whose browser has died (nothing to close it on)', () => {
+    const dead = { connected: false } as unknown as Browser;
+    const cache = new PersistentContextCache();
+    const stale = makeContext('c1');
+    const first = cache.store('a|direct', { browser: dead, context: stale, inUse: 1 });
+
+    const replacement = cache.store('a|direct', { browser, context: makeContext('c2'), inUse: 1 });
+
+    expect(replacement.entry).not.toBe(first.entry);
+    expect(replacement.evicted).toEqual([first.entry]);
+  });
 });

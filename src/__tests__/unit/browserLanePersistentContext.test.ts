@@ -128,6 +128,27 @@ describe('browser lane persistent contexts', () => {
     expect(getPersistentContexts().size()).toBe(0);
   });
 
+  /**
+   * Two /lookup requests can search one gated host at the same time (assembleLookup fans out with
+   * Promise.all, and nothing serializes the search lane). Both miss the cache and open a context;
+   * the late one must NOT have its store() close the context the other is navigating in.
+   */
+  it('lets two concurrent fetches to one gated host share a context, closing only the duplicate', async () => {
+    const service = createScrapingService();
+
+    const [a, b] = await Promise.all([
+      service.browserFetch('https://www.anitoysgk.com/lucy-p1.html', { challengeGated: true }),
+      service.browserFetch('https://www.anitoysgk.com/lucy-p2.html', { challengeGated: true }),
+    ]);
+
+    expect(a).toContain('lucy');
+    expect(b).toContain('lucy');
+    expect(mockBrowser.createBrowserContext).toHaveBeenCalledTimes(2); // both missed the cold cache
+    expect(contexts[0].close).not.toHaveBeenCalled();                  // the in-flight one survives
+    expect(contexts[1].close).toHaveBeenCalledTimes(1);                // the duplicate is closed
+    expect(getPersistentContexts().size()).toBe(1);
+  });
+
   it('closes every persistent context on pool shutdown', async () => {
     const service = createScrapingService();
     await service.browserFetch('https://www.anitoysgk.com/lucy.html', { challengeGated: true });
