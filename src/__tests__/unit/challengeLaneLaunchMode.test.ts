@@ -4,7 +4,7 @@ import type { Page, Browser } from 'puppeteer';
 import { BrowserPool, isCleanHeadfulMode, warnUnrecognizedLaunchMode } from '../../services/genericScraper';
 import { createScrapingService } from '../../services/engineServices/scrapingService';
 import { ChallengeLaneUnavailableError, clearChallengeGates } from '../../services/browserChallenge';
-import { getPersistentContexts, resetPersistentContexts } from '../../services/persistentContexts';
+import { resetHostConcurrency } from '../../services/gatedBrowsers';
 
 /**
  * The DECLARED challenge gate is a claim about what the fetch needs: only the clean-headful profile
@@ -27,7 +27,7 @@ describe('challenge lane vs BROWSER_LAUNCH_MODE', () => {
     await BrowserPool.reset();
     (BrowserPool as any).stealthBrowser = null;
     clearChallengeGates();
-    resetPersistentContexts();
+    resetHostConcurrency();
 
     mockPage = {
       goto: jest.fn<(...a: any[]) => any>().mockResolvedValue({ status: () => 200, headers: () => ({ 'content-type': 'text/html', 'cf-mitigated': 'challenge' }), url: () => 'https://hobby-genki.com/item/1' }),
@@ -50,6 +50,7 @@ describe('challenge lane vs BROWSER_LAUNCH_MODE', () => {
     }) as unknown as jest.Mock;
     mockBrowser = {
       createBrowserContext: createContext,
+      newPage: jest.fn<(...a: any[]) => any>().mockResolvedValue(mockPage),
       close: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
       connected: true,
     } as unknown as jest.Mocked<Browser>;
@@ -62,7 +63,7 @@ describe('challenge lane vs BROWSER_LAUNCH_MODE', () => {
     else process.env.BROWSER_LAUNCH_MODE = savedMode;
     await BrowserPool.reset();
     clearChallengeGates();
-    resetPersistentContexts();
+    resetHostConcurrency();
   });
 
   it('refuses a DECLARED challenge-gated fetch on the headless profile, before any navigation', async () => {
@@ -76,7 +77,7 @@ describe('challenge lane vs BROWSER_LAUNCH_MODE', () => {
     expect(puppeteer.launch).not.toHaveBeenCalled();
     expect(createContext).not.toHaveBeenCalled();
     expect(mockPage.goto).not.toHaveBeenCalled();
-    expect(getPersistentContexts().size()).toBe(0);
+    expect(BrowserPool.gatedBrowsers()).toEqual([]);
   });
 
   it('names the env var that is wrong, so the refusal is actionable', async () => {
@@ -94,8 +95,10 @@ describe('challenge lane vs BROWSER_LAUNCH_MODE', () => {
 
     await service.browserFetch('https://www.anitoysgk.com/lucy.html', { challengeGated: true });
 
-    expect(createContext).toHaveBeenCalledTimes(1);
-    expect(getPersistentContexts().size()).toBe(1);
+    // The gated lane is a TAB in the per-egress browser's DEFAULT context, never a created one.
+    expect(createContext).not.toHaveBeenCalled();
+    expect(mockBrowser.newPage).toHaveBeenCalledTimes(1);
+    expect(BrowserPool.gatedBrowsers()).toHaveLength(1);
   });
 
   it('does NOT refuse a host whose gate was only LEARNED from a cf-mitigated response', async () => {

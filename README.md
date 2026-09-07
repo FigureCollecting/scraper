@@ -9,7 +9,7 @@ A web scraping microservice with browser automation, browser pooling, priority q
 - **Site Configurations**: Pre-built configs for common sites (MFC, extensible to others)
 - **Cloudflare Bypass**: A real, current Chrome launched clean (`BROWSER_LAUNCH_MODE=clean-headful`) — see **The browser lane** below
 - **MFC NSFW Authentication**: Support for authenticated scraping with user's own session cookies
-- **Challenge-Gated Hosts**: Per-host browser contexts kept alive so an earned Cloudflare clearance is reused, not re-earned
+- **Challenge-Gated Hosts**: One long-lived browser per egress, gated stores fetched in its default context, so an earned Cloudflare clearance is reused, not re-earned
 - **Full Collection Sync**: End-to-end workflow: validate cookies, export CSV, parse items, queue for scraping
 - **3-Tier Priority Queue**: HOT/WARM/COLD priority lanes with deduplication and adaptive rate limiting
 - **Session Management**: Cookie validation caching, automatic pause on failures, cooldown periods
@@ -178,6 +178,7 @@ Health check endpoint for monitoring.
 Detailed health check with browser pool status plus two operator views (additive, never cookie values):
 - `challengeCooldowns`: `[{host, remainingMs, reason}]` — the per-host Cloudflare-challenge cooldowns currently open
 - `cfCookies`: `[{host, cookieNames, userAgentPinned, loadedAt, mintedAt?, expiresAt?, stale, staleSince?, staleReason?}]` — the stored-cookie jar (`CF_COOKIE_FILE`) per host. `stale: true` means the host still served a challenge WITH its stored cookies: re-mint (see *Stored Cloudflare cookies* under Environment Variables). `[]` when the jar is disabled.
+- `browserLane`: `{launchMode, residentialTimezone, directTimezone, processTimezone, gatedBrowsers}` — the lane's live configuration. `processTimezone` is the one that decides a Cloudflare challenge (`null` = a UTC container = gated stores silently never clear); `gatedBrowsers` is `[{egress, launchedAt, pagesOpen, primedHosts}]`, the live per-egress challenge browsers.
 - `residentialEgress`: `{configured, proxy?}` — whether a residential egress proxy (`RESIDENTIAL_PROXY_URL`) is wired. `proxy` (its `scheme://host:port`) appears only under `RESIDENTIAL_EGRESS_HEALTH_DETAIL=true`, since this endpoint is unauthenticated; credentials are stripped at the source either way, so a `user:password@` proxy never appears here. `{configured: false}` ⇒ every store declaring `egress: 'residential'` is refused (see *Residential egress* under Environment Variables).
 
 ### GET /version
@@ -816,9 +817,13 @@ See `.env.example` for complete configuration template.
 - `BROWSER_LAUNCH_MODE`: `clean-headful` selects the proven Cloudflare-passing launch profile (real Chrome, headful on the Ozone headless platform, no automation switch, minimal flags) — see **The browser lane** below
   - Unset or any other value → the historical headless profile (what CI and the tests use)
   - Default: unset
-- `RESIDENTIAL_EGRESS_TIMEZONE` / `DIRECT_EGRESS_TIMEZONE`: IANA timezone each egress emulates on its browser contexts (e.g. `America/Chicago` for the residential exit, `America/New_York` for the OVH node)
-  - A browser left on the container's UTC zone never clears the challenge, with no error at all (any real named zone passes; the egress IP's own zone is the defensible default)
-  - Unset → emulate nothing (the browser keeps its own zone)
+- `TZ`: the CONTAINER's timezone, and the one that decides whether a Cloudflare-gated store clears at all
+  - The challenge's cross-origin frame reads the browser PROCESS's zone, so a UTC container never clears — silently, with no error (measured 2026-09-07; `page.emulateTimezone` cannot substitute for it)
+  - Set it to a real named zone, ideally the egress IP's: the deployment uses `America/Chicago` (the residential exit's)
+  - Default: unset, which in a container means UTC — gated stores will not pass
+- `RESIDENTIAL_EGRESS_TIMEZONE` / `DIRECT_EGRESS_TIMEZONE`: OPTIONAL IANA timezone each egress emulates per page on top of `TZ` (`page.emulateTimezone`), so a page's own reported zone matches the exit it leaves through
+  - These do NOT clear a challenge — only `TZ` does. They are post-challenge cosmetics, and the deployment leaves them EMPTY
+  - Unset → emulate nothing (the page keeps the process zone)
   - Default: unset
 
 - `CATALOG_STORE_TIMEOUT_MS`: Timeout (ms) for one `GET /catalog` listing-page fetch
@@ -835,7 +840,7 @@ Per lane:
 | Lane | Residential egress | How |
 |---|---|---|
 | `impersonate` (impit) | **Supported** | `proxyUrl` on the Impit instance (SOCKS5/HTTP; HTTP/3 stays off — impit cannot proxy with it on). The session cache is keyed by (profile, proxy), so a proxied session never shares its cookie jar with the direct one. |
-| `browser` (puppeteer) | **Supported** | Per-`context` `createBrowserContext({ proxyServer })` — one browser serves proxied and direct stores side by side. The context's emulated timezone follows the egress (see **The browser lane**), and cookie injection is unchanged. |
+| `browser` (puppeteer) | **Supported** | Two paths. An ungated store gets a per-request `createBrowserContext({ proxyServer })`, so one pooled browser serves proxied and direct stores side by side. A CHALLENGE-GATED store gets a tab in the dedicated browser for its egress, which was LAUNCHED with `--proxy-server` — a created context never clears the challenge (see **The browser lane**). Cookie injection is unchanged on both. |
 | `http` (plain GET) | **Refused** | Node's global `fetch` has no proxy support, and undici's `ProxyAgent` speaks only HTTP(S), never the SOCKS proxy this deployment uses. A residential store on this lane raises the same typed refusal — put it on `impersonate`. |
 
 The gate covers every door a STORE's own fetch goes through: both search dispatchers (`fetchSearch`, `capturingFetch`), `POST /resolve`'s primary detail fetch, and the `ExtractContext` seams a ruleset uses — `ctx.scraping.scrapePage` / `scrapePageStealth` / `fetchBody` — all resolve the store's declared egress the same way (proxy or refusal, never a direct fetch of a declared store).
@@ -846,7 +851,7 @@ The proxy is scoped to the DECLARING store's own hosts (its domain and subdomain
 
 The refusal is deliberate and load-bearing: **a residential store is never silently fetched from the node IP.** With `RESIDENTIAL_PROXY_URL` unset (or unusable), the fetch raises `ResidentialEgressUnavailableError`, which the scrape queue classifies as `extraction_unavailable` — one attempt, no retry, no global rate-limit backoff, and never a cookie/auth session pause. Falling back would burn the datacenter path's remaining reputation and tell the store we tried.
 
-**The browser lane (launch profile, timezone, kept contexts):**
+**The browser lane (launch profile, timezone, gated browsers):**
 
 The lane's anti-detection strategy is the launch profile itself. There is **no stealth plugin** — `puppeteer-extra` and `puppeteer-extra-plugin-stealth` were removed on 2026-09-07 because they do not work here: measured against the gated cohort (anitoysgk.com, hobby-genki.com, sugotoys.com.au), the stealth plugin on an older Chrome FAILS the non-interactive JS challenge that a plain, current Chrome passes.
 
@@ -858,18 +863,23 @@ What passes, with no human, no clicking and no solver:
 | `--ozone-platform=headless` | renders headful with no X server and no Xvfb — the pod needs no display |
 | `ignoreDefaultArgs: ['--enable-automation']` + `--disable-blink-features=AutomationControlled` | removes the automation switch the challenge scores on |
 | a minimal flag list, `defaultViewport: null` | every extra flag and every device-metrics override is one more thing that can disagree with a real browser |
-| `RESIDENTIAL_EGRESS_TIMEZONE` / `DIRECT_EGRESS_TIMEZONE` | the browser must not report the container's UTC zone (measured 2026-09-07: UTC and Etc/GMT **never clear — silently**; America/Chicago, America/New_York and even Asia/Tokyo all clear, so the egress IP's own zone is the default, not a requirement). Emulated per context (`page.emulateTimezone`), never as a process TZ, because one browser serves both egresses at once |
+| a non-UTC **process** timezone (the container's `TZ`) | the challenge runs in a CROSS-ORIGIN frame that reads the BROWSER PROCESS's zone, so this cannot be done per page. Measured 2026-09-07: `TZ=UTC` + `page.emulateTimezone('America/Chicago')` stays stuck on the interstitial; `TZ=America/Chicago` with no emulation passes in ~8 s; `TZ=America/Chicago` emulating `America/New_York` also passes. UTC fails **silently** — nothing errors, the page just never leaves "Just a moment". `RESIDENTIAL_EGRESS_TIMEZONE` / `DIRECT_EGRESS_TIMEZONE` remain as optional per-page cosmetics and are left EMPTY by the deployment |
 | no cosmetic UA/viewport overrides | the lane does not rewrite a Chrome 152's UA to the historical `Chrome/127` string (client hints contradict it, and Cloudflare binds the clearance to the UA that earned it), does not override the device metrics of a window that already has the size the flags asked for, and does not CDP-set `Accept-Encoding`/`Connection`. A store that DECLARES a UA still gets it; the cookie jar's pinned MINT UA is not applied in this mode (see below) |
 | no replayed `cf_clearance` | a stored clearance was minted by another client, from another exit, and Cloudflare binds it to (IP, UA). In clean-headful mode the browser lane drops it from the jar and earns its own in-context; the jar's other cookies (sessions) still pass through |
-| a warm pool of 2 (not 3) | the profile is process-wide, so the pooled browsers are headful too, and the challenge-lane browser is a fourth. Three full Chromes is what fits the pod's 3 Gi limit |
+| gated fetches in the browser's DEFAULT context | a `createBrowserContext` page **never clears the challenge**, even with its traffic demonstrably leaving the right residential IP (measured 2026-09-07: stuck past 40 s, while a plain tab in the same browser cleared in 8 s). A DevTools-created context is itself the tell |
+| a warm pool of 2 (not 3) | the profile is process-wide, so the pooled browsers are headful too, and the challenge browsers are additional. Three full Chromes is what fits the pod's 3 Gi limit |
 
 The gated cohort is also an **IP** gate: a clean browser from the datacenter node still fails, so those stores must declare `egress: 'residential'` as well.
 
 A store that DECLARES the gate (`access: 'cloudflare'`) is REFUSED outright when `BROWSER_LAUNCH_MODE` is not `clean-headful` — `ChallengeLaneUnavailableError`, classified `extraction_unavailable` (one attempt, no retry), the same rule the residential lane applies to a missing proxy. The headless profile cannot clear a challenge and fails silently, and every doomed attempt still spends the egress IP's Cloudflare reputation. A set-but-unrecognised `BROWSER_LAUNCH_MODE` (a typo, a stray space) logs one boot warning and falls back to headless. A gate that was only LEARNED from a `cf-mitigated` response is not refused — one such response is a weaker signal than a declaration.
 
-Once a challenge is passed, the clearance is bound to (IP, user agent, browser context) and is good for roughly 30 minutes. So a challenge-gated host **keeps its context**: `searchFetch.access: 'cloudflare'` declares the gate, and the engine also LEARNS it from a `cf-mitigated: challenge` response. The kept contexts are bounded — 25 min max age (inside the clearance window), 10 min idle TTL, 6 contexts LRU, all closed on shutdown — and are keyed per (host, egress), so the same host on two exits is two sessions. A fresh context is session-primed first when the store declares `sessionPrime` (anitoys' search results 404 without a same-session homepage visit). Reuse is the difference between a ~4.5 s first fetch and a ~0.7 s second one (measured live, anitoysgk.com, 2026-09-07).
+Once a challenge is passed, the clearance is bound to (IP, user agent, browser profile) and is good for roughly 30 minutes. So a gated fetch is a **tab in a long-lived browser**, one per egress — `residential` launched with `--proxy-server=$RESIDENTIAL_PROXY_URL`, `direct` launched without one — opened with `browser.newPage()` in that browser's DEFAULT context, exactly like a person with several tabs open. Every gated host on an egress shares that browser and therefore its clearances; the same host on two egresses is two browsers, because the clearance is bound to the exit IP.
 
-A navigation that lands on the interstitial is waited out (bounded, 30 s — the CALLER's own budget can be shorter and then bounds it first: `/lookup` gives each store `LOOKUP_STORE_TIMEOUT_MS`, 15 s by default) and then waited on until the document that REPLACED it has parsed — `domcontentloaded` fires on the challenge page, and the title flips before the real document is readable. The session-priming navigation is waited out the same way — it is the one that MEETS the challenge on a fresh context, and navigating to the target before it clears cancels it. `GET /health/detailed` reports the lane's live configuration as `browserLane: { launchMode, residentialTimezone, directTimezone, persistentContexts }`.
+`searchFetch.access: 'cloudflare'` declares the gate, and the engine also LEARNS it from a `cf-mitigated: challenge` response — a learned host moves onto the gated browser from its next fetch. The bounds: a browser is recycled after 2 h (the replacement is launched first, the old one drains its tabs and then closes), tabs are closed with their fetch, at most 2 concurrent tabs per gated host, a tab that will not close retires the whole browser, and both browsers close on shutdown. A host is session-primed once per browser instance when the store declares `sessionPrime` (anitoys' search results 404 without a same-session homepage visit). Reuse is the difference between a ~8 s first fetch and a sub-second second one (measured live, anitoysgk.com, 2026-09-07).
+
+Ungated stores are untouched by all of this: they keep the per-request `createBrowserContext` on a pooled (or the stealth) browser, closed with the request.
+
+A navigation that lands on the interstitial is waited out (bounded, 30 s — the CALLER's own budget can be shorter and then bounds it first: `/lookup` gives each store `LOOKUP_STORE_TIMEOUT_MS`, 15 s by default) and then waited on until the document that REPLACED it has parsed — `domcontentloaded` fires on the challenge page, and the title flips before the real document is readable. The session-priming navigation is waited out the same way — it is the one that MEETS the challenge on a fresh context, and navigating to the target before it clears cancels it. `GET /health/detailed` reports the lane's live configuration as `browserLane: { launchMode, residentialTimezone, directTimezone, processTimezone, gatedBrowsers }`.
 
 **Client-rendered storefronts (`searchFetch.waitFor`):**
 

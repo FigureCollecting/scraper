@@ -23,10 +23,14 @@ RUN npm install -g npm@11 && npm cache clean --force
 
 WORKDIR /app
 
-# Install dependencies for Puppeteer and ensure latest security updates
+# Install dependencies for Puppeteer and ensure latest security updates.
+# tzdata is LOAD-BEARING, not cosmetic: ubuntu:26.04 ships no /usr/share/zoneinfo, so TZ=America/...
+# would silently resolve to UTC — and a browser process on UTC never clears a Cloudflare JS
+# challenge, with no error at all (measured 2026-09-07; see "The browser lane" in README).
 RUN apt-get update && apt-get upgrade -y \
     && apt-get install -y \
     ca-certificates \
+    tzdata \
     procps \
     libxss1 \
     libx11-6 \
