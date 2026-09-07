@@ -613,8 +613,8 @@ describe('runInitiatorPass — lookup retry (once, on a transient failure only)'
 
     const amiami = s.stores.find((x) => x.siteId === 'amiami')!;
     const gkloot = s.stores.find((x) => x.siteId === 'gkloot')!;
-    expect(amiami.lookupAttempts).toBe(4); // 2 terms x (attempt + retry)
-    expect(amiami.lookupRetries).toBe(2);
+    expect(amiami.lookupAttempts).toBe(3); // t1 + its retry, then t2 with the store's retry spent
+    expect(amiami.lookupRetries).toBe(1); // ONE retry per store per pass, not one per term
     expect(amiami.lookupFailures).toBe(2);
     expect(gkloot.lookupAttempts).toBe(2);
     expect(gkloot.lookupRetries).toBe(0);
@@ -695,5 +695,54 @@ describe('runInitiatorPass — enqueue fairness under a spent budget', () => {
     expect(fake.ingestCalls().map((c) => c.body.url)).toEqual(['https://amiami.test/x']);
     expect(s.totalEnqueued).toBe(1);
     expect(s.totalDiscovered).toBe(1);
+  });
+});
+
+describe('runInitiatorPass — discovery cost control (terms run per store, retries capped per store)', () => {
+  it('stops issuing a store\'s later terms once its URL cap is already full', async () => {
+    const fake = makeFake({
+      lookup: (term, store) => ({ status: 200, body: lookupWith({ [store]: [`https://${store}.test/${term}-1`, `https://${store}.test/${term}-2`] }) }),
+    });
+    const s = await runInitiatorPass(mkCfg({ stores: ['amiami'], terms: ['t1', 't2', 't3'], maxUrlsPerStore: 2 }), { fetch: fake.fetch });
+    expect(fake.lookupCalls().length).toBe(1); // t1 filled the cap; t2/t3 could only be discarded
+    expect(s.stores[0].discovered).toBe(2);
+    expect(s.stores[0].lookupAttempts).toBe(1);
+  });
+
+  it('still issues every term when maxUrlsPerStore is 0 (the discovery-only dry run)', async () => {
+    const fake = makeFake({ lookup: (_t, store) => ({ status: 200, body: lookupWith({ [store]: [`https://${store}.test/x`] }) }) });
+    const s = await runInitiatorPass(mkCfg({ stores: ['amiami'], terms: ['t1', 't2'], maxUrlsPerStore: 0 }), { fetch: fake.fetch });
+    expect(fake.lookupCalls().length).toBe(2);
+    expect(fake.ingestCalls().length).toBe(0);
+    expect(s.stores[0].discovered).toBe(0);
+  });
+
+  it('dispatches term-major so concurrent lookups never target the same store', async () => {
+    const fake = makeFake({ lookup: (_t, store) => ({ status: 200, body: lookupWith({ [store]: [] }) }) });
+    await runInitiatorPass(mkCfg({ stores: ['amiami', 'gkloot', 'orzgk'], terms: ['t1', 't2'], maxConcurrency: 2 }), { fetch: fake.fetch });
+    const issued = fake.lookupCalls().map((c) => {
+      const p = new URL(c.url).searchParams;
+      return `${p.get('q')}|${p.get('stores')}`;
+    });
+    expect(issued.slice(0, 3)).toEqual(['t1|amiami', 't1|gkloot', 't1|orzgk']);
+    expect(issued.every((v, i) => i === 0 || v.split('|')[1] !== issued[i - 1].split('|')[1])).toBe(true);
+  });
+
+  it('gives a store ONE retry for the whole pass, not one per term', async () => {
+    let n = 0;
+    const fake = makeFake({
+      // t1 fails once then its retry succeeds; t2 fails and must NOT be retried (the store's retry is spent).
+      lookup: (term) => {
+        if (term === 't2') return { status: 500, body: { error: 'boom' } };
+        return n++ === 0 ? { status: 500, body: { error: 'boom' } } : { status: 200, body: lookupWith({ amiami: ['https://amiami.test/ok'] }) };
+      },
+    });
+    const s = await runInitiatorPass(mkCfg({ stores: ['amiami'], terms: ['t1', 't2'] }), { fetch: fake.fetch });
+    expect(fake.lookupCalls().length).toBe(3); // t1, t1-retry, t2
+    const amiami = s.stores[0];
+    expect(amiami.lookupAttempts).toBe(3);
+    expect(amiami.lookupRetries).toBe(1);
+    expect(amiami.lookupFailures).toBe(1); // t2 only
+    expect(amiami.discovered).toBe(1);
   });
 });

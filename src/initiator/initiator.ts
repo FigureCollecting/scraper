@@ -291,10 +291,13 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
     }
   };
 
-  // Phase 1 — DISCOVERY (one lookup per term x store, each retried at most once).
-  const discoverOne = async (term: string, siteId: string): Promise<void> => {
-    const ss = perStore.get(siteId);
-    if (!ss) return;
+  // Phase 1 — DISCOVERY. Per store: its terms run SEQUENTIALLY, and the stores run in
+  // parallel under the gate. Store-major submission put every concurrent gate slot on the
+  // SAME store, so one hung store held them all and delayed every other store's first
+  // lookup by a whole request timeout. Running one term at a time per store keeps the
+  // in-flight set on distinct stores, lets a term see what the previous term already
+  // discovered, and caps a store's retries at one for the pass.
+  const discoverOne = async (term: string, siteId: string, ss: StoreSummary, state: { retryUsed: boolean }): Promise<void> => {
     const first = await attemptLookup(term, siteId, ss);
     if (first.kind === 'ok') return;
     if (first.kind === 'budget-exhausted') {
@@ -304,6 +307,13 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
     if (first.kind === 'fatal') {
       ss.lookupFailures++;
       logger.warn('[INITIATOR] lookup failed (not retried)', { term, siteId, reason: first.reason });
+      return;
+    }
+    // Transient — but a store gets ONE retry for the whole pass, not one per term: a store
+    // that is already failing would otherwise double the discovery budget and the wall clock.
+    if (state.retryUsed) {
+      ss.lookupFailures++;
+      logger.warn('[INITIATOR] lookup failed (store retry already spent)', { term, siteId, reason: first.reason });
       return;
     }
 
@@ -316,12 +326,25 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
       logger.warn('[INITIATOR] lookup retry skipped (request budget spent)', { term, siteId });
       return;
     }
+    state.retryUsed = true;
     ss.lookupRetries++;
     if (second.kind === 'ok') return;
     ss.lookupFailures++;
     logger.warn('[INITIATOR] lookup failed after retry', { term, siteId, reason: second.reason });
   };
-  await Promise.all(uniqueStores.flatMap((siteId) => config.terms.map((term) => discoverOne(term, siteId))));
+
+  const discoverStore = async (siteId: string): Promise<void> => {
+    const ss = perStore.get(siteId);
+    if (!ss) return;
+    const state = { retryUsed: false };
+    for (const term of config.terms) {
+      // A full URL cap makes another term's lookup pure waste — everything it returns is
+      // discarded by addUrl. (Cap 0 is the documented discovery-only dry run: still look up.)
+      if (config.maxUrlsPerStore > 0 && setFor(siteId).size >= config.maxUrlsPerStore) break;
+      await discoverOne(term, siteId, ss, state);
+    }
+  };
+  await Promise.all(uniqueStores.map((siteId) => discoverStore(siteId)));
 
   // Phase 2 — ENQUEUE (per store, per discovered URL). One bad store/URL is logged
   // and skipped; it never aborts the rest of the pass.
