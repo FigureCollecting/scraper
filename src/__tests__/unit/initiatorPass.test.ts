@@ -635,3 +635,24 @@ describe('runInitiatorPass — lookup retry (once, on a transient failure only)'
     expect(s.stores[0].lookupFailures).toBe(1);
   });
 });
+
+describe('runInitiatorPass — default retry delay (no injected sleep)', () => {
+  it('waits the configured delay with the real timer when deps.sleep is not provided', async () => {
+    let first = true;
+    const fake = makeFake({
+      lookup: () => {
+        if (first) {
+          first = false;
+          return { status: 502, body: { error: 'bad gateway' } };
+        }
+        return { status: 200, body: lookupWith({ amiami: ['https://amiami.test/ok'] }) };
+      },
+    });
+    const started = Date.now();
+    const s = await runInitiatorPass(mkCfg({ stores: ['amiami'], terms: ['t'], lookupRetryDelayMs: 60 }), { fetch: fake.fetch });
+    expect(Date.now() - started).toBeGreaterThanOrEqual(55);
+    expect(fake.lookupCalls().length).toBe(2);
+    expect(s.stores[0].lookupRetries).toBe(1);
+    expect(s.stores[0].discovered).toBe(1);
+  });
+});
