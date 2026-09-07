@@ -123,7 +123,8 @@ function declaredStrings(value: unknown): string[] {
 
 /**
  * Encode a free-text query for one store's `{q}`, per its declared {@link QueryEncoding}. The steps
- * are fixed: `encodeURIComponent`, then re-encode the `%` of each declared percent-escape (ONE pass,
+ * are fixed: strip the declared substrings, `encodeURIComponent`, then re-encode the `%` of each
+ * declared percent-escape (ONE pass,
  * so a rewritten `%25` is never re-matched by its own output), then `%20` → `+` if `spaces: 'plus'`,
  * then lowercase if declared. No declaration ⇒ `encodeURIComponent` alone — today's behavior for
  * every store that does not carry the field.
@@ -133,7 +134,9 @@ function declaredStrings(value: unknown): string[] {
  * item's SERP card — so "star origin 1/6" must leave here as `star+origin+1%252f6`.
  */
 export function encodeSearchQuery(query: string, encoding?: QueryEncoding): string {
-  let out = encodeURIComponent(query);
+  let raw = query;
+  for (const s of declaredStrings(encoding?.strip)) raw = raw.split(s).join('');
+  let out = encodeURIComponent(raw);
   const escapes = declaredStrings(encoding?.reEncodePercentOf).filter((e) => PERCENT_ESCAPE.test(e));
   if (escapes.length) {
     const declared = new Map(escapes.map((e) => [e.toLowerCase(), e]));

@@ -9,6 +9,7 @@ import type { QueryEncoding, StoreCapabilities } from '../src/index';
 
 // anitoys: the store's own `format_keywords` (public_2019.js), declared field by field.
 const anitoys: QueryEncoding = {
+  strip: ['"'],
   reEncodePercentOf: ['%25', '%3b', '%2f', '%40', '%3a', '%26', '%3d', '%2b', '%24', '%2c', '%23', '%3f'],
   spaces: 'plus',
   lowercase: true,
@@ -53,6 +54,17 @@ const rejectsOtherSpaceModes: NonNullable<StoreCapabilities['retrieval']> = {
   bySearch: { urlTemplate: 'https://x.test/?q={q}', queryEncoding: { spaces: 'underscore' } },
 };
 
+const stripOnly: NonNullable<StoreCapabilities['retrieval']> = {
+  bySearch: { urlTemplate: 'https://x.test/?q={q}', queryEncoding: { strip: ['"'] } },
+};
+
+const rejectsNonListStrip: NonNullable<StoreCapabilities['retrieval']> = {
+  // @ts-expect-error — `strip` is a list of substrings, not a single string
+  bySearch: { urlTemplate: 'https://x.test/?q={q}', queryEncoding: { strip: '"' } },
+};
+
+void stripOnly;
+void rejectsNonListStrip;
 void anitoys;
 void store;
 void spacesOnly;

@@ -268,15 +268,16 @@ export interface RetrievalCapability {
  * How a store wants `{q}` ENCODED into its `bySearch.urlTemplate` — a DECLARATIVE spec, because the
  * one-size `encodeURIComponent` some storefronts accept is a BROKEN ROUTE at others. The engine
  * applies the steps in this fixed order and no other:
- *   1. `encodeURIComponent(query)` — always, declaration or not.
- *   2. `reEncodePercentOf` — for each listed percent-escape, re-encode ITS OWN `%` (`%2f` → `%252f`),
+ *   1. `strip` — delete each declared substring from the RAW query, before any escaping.
+ *   2. `encodeURIComponent(query)` — always, declaration or not.
+ *   3. `reEncodePercentOf` — for each listed percent-escape, re-encode ITS OWN `%` (`%2f` → `%252f`),
  *      so the character survives the store's path/query parser instead of being read as structure.
  *      Matching is case-insensitive on the escape's hex; the output carries the escape exactly as
  *      DECLARED (declare `%2f` and the route gets `%252f`, lowercase f).
- *   3. `spaces` — `percent` leaves the `%20` that step 1 produced (the default); `plus` rewrites
+ *   4. `spaces` — `percent` leaves the `%20` that step 2 produced (the default); `plus` rewrites
  *      every `%20` to `+`.
- *   4. `lowercase` — lowercase the whole encoded segment.
- * Absent ⇒ step 1 alone: byte-identical to today for every store that does not declare it.
+ *   5. `lowercase` — lowercase the whole encoded segment.
+ * Absent ⇒ step 2 alone: byte-identical to today for every store that does not declare it.
  *
  * The worked example is anitoys, whose own client encodes the search box with `format_keywords`
  * (public_2019.js) and whose route 404s on anything else:
@@ -293,6 +294,13 @@ export interface RetrievalCapability {
  * NORMAL shape there and the naive encoding contributes zero candidates for stocked items.
  */
 export interface QueryEncoding {
+  /**
+   * Substrings DELETED from the query before it is encoded — matched LITERALLY, not as a pattern.
+   * For a store whose own client drops a character rather than escaping it: escaping it instead
+   * emits a segment that store's search box could never have produced, and the SERP comes back
+   * empty with no error to see.
+   */
+  strip?: string[];
   /**
    * Percent-escapes whose own `%` must be re-encoded (`'%2f'` ⇒ a literal `/` reaches the store as
    * `%252f`). Declare each escape as the store writes it — the declared spelling is what is emitted.

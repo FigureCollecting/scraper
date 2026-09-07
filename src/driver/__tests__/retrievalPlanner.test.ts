@@ -44,6 +44,7 @@ describe('retrieval URL resolvers', () => {
   describe('encodeSearchQuery — the declared {q} encoding (bySearch.queryEncoding)', () => {
     // anitoys' own client-side `format_keywords` (public_2019.js), declared field by field.
     const ANITOYS: QueryEncoding = {
+      strip: ['"'],
       reEncodePercentOf: ['%25', '%3b', '%2f', '%40', '%3a', '%26', '%3d', '%2b', '%24', '%2c', '%23', '%3f'],
       spaces: 'plus',
       lowercase: true,
@@ -93,8 +94,27 @@ describe('retrieval URL resolvers', () => {
       expect(encodeSearchQuery('A B', {})).toBe('A%20B');
     });
 
+    it('strip removes each declared character BEFORE encodeURIComponent', () => {
+      expect(encodeSearchQuery('a"b', { strip: ['"'] })).toBe('ab');
+      // Undeclared, the character is escaped as usual — a store that wants it kept says nothing.
+      expect(encodeSearchQuery('a"b', {})).toBe('a%22b');
+      // A stripped character never reaches the re-encode pass.
+      expect(encodeSearchQuery('a/b', { strip: ['/'], reEncodePercentOf: ['%2f'] })).toBe('ab');
+      // Literal, not a pattern: '.' removes dots only.
+      expect(encodeSearchQuery('a.b', { strip: ['.'] })).toBe('ab');
+    });
+
+    // format_keywords opens with `keywords.replace(/"/g, '')` — the ONE character it deletes rather
+    // than escapes. Undeclared, a quoted free-text lookup would ship a %22 the store's own search
+    // box can never emit, and the SERP comes back card-free.
+    it('anitoys: a quoted query is stripped of its quotes, as the store client does', () => {
+      expect(encodeSearchQuery('Rem "Re:Zero" 1/7', ANITOYS)).toBe('rem+re%253azero+1%252f7');
+    });
+
     it('a malformed declaration degrades to the plain encoding instead of throwing', () => {
       expect(encodeSearchQuery('a/b', { reEncodePercentOf: '%2f' } as unknown as QueryEncoding)).toBe('a%2Fb');
+      expect(encodeSearchQuery('a"b', { strip: '"' } as unknown as QueryEncoding)).toBe('a%22b');
+      expect(encodeSearchQuery('a"b', { strip: [null] } as unknown as QueryEncoding)).toBe('a%22b');
     });
 
     it('resolveSearchUrl applies the declaration when the store carries one', () => {

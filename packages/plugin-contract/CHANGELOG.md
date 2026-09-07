@@ -13,9 +13,10 @@ search route 404s on the encoding every other store accepts.
 ### Added
 - `RetrievalCapability.bySearch.queryEncoding?: QueryEncoding` (and the `QueryEncoding` export) — a
   DECLARATIVE spec for how `{q}` is encoded into the template, applied by the engine in a fixed
-  order: `encodeURIComponent`, then `reEncodePercentOf` (re-encode the `%` of each listed
-  percent-escape, `%2f` → `%252f`, matched case-insensitively and emitted in the DECLARED spelling),
-  then `spaces` (`plus` rewrites `%20` → `+`; `percent`, the default, leaves it), then `lowercase`.
+  order: `strip` (delete the listed substrings from the raw query), `encodeURIComponent`, then
+  `reEncodePercentOf` (re-encode the `%` of each listed percent-escape, `%2f` → `%252f`, matched
+  case-insensitively and emitted in the DECLARED spelling), then `spaces` (`plus` rewrites `%20` →
+  `+`; `percent`, the default, leaves it), then `lowercase`.
   Absent ⇒ today's single `encodeURIComponent`.
   The worked example is anitoys' own `format_keywords` (public_2019.js): with the declaration
   `"star origin 1/6"` → `star+origin+1%252f6` and the store answers HTTP 200 with the item's card;

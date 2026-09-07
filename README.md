@@ -238,6 +238,7 @@ these steps applied, in this order and no other:
 
 | field | effect |
 |---|---|
+| `strip: string[]` | delete each listed substring from the RAW query, before any escaping (matched literally) |
 | — | `encodeURIComponent(query)`, always |
 | `reEncodePercentOf: string[]` | re-encode the `%` of each listed percent-escape (`%2f` → `%252f`), one pass, matched case-insensitively and emitted in the DECLARED spelling |
 | `spaces: 'percent' \| 'plus'` | `plus` rewrites every `%20` to `+`; `percent` (the default) leaves it |
