@@ -71,7 +71,7 @@ export interface StoreSummary {
   enqueued: number;
   /** Of `enqueued`, how many the queue coalesced onto a pending item (dedup key hit). */
   deduplicated: number;
-  /** Failed ingest POSTs + stores the fan-out reported as `failed`. */
+  /** Failed ingest POSTs, terminal lookup failures, and stores the fan-out reported as `failed`. */
   errors: number;
   /** Stores the fan-out reported as cooling / unsupported (deliberately left alone). */
   skipped: number;
@@ -291,7 +291,10 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
     }
     if (!res.ok) {
       logger.info('[INITIATOR] lookup', { term, siteId, status: res.status, ms: Date.now() - startedMs, candidates: 0 });
-      return { kind: res.status >= 500 ? 'retryable' : 'fatal', reason: `status ${res.status}` };
+      // 5xx is the engine/upstream faulting; 429 and 408 are the two 4xx a second call after a
+      // delay genuinely survives. Every other 4xx is a fault the same request would repeat.
+      const transient = res.status >= 500 || res.status === 429 || res.status === 408;
+      return { kind: transient ? 'retryable' : 'fatal', reason: `status ${res.status}` };
     }
     try {
       const candidates = consume(siteId, (await res.json()) as LookupResponseBody);
@@ -318,6 +321,7 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
     }
     if (first.kind === 'fatal') {
       ss.lookupFailures++;
+      ss.errors++;
       logger.warn('[INITIATOR] lookup failed (not retried)', { term, siteId, reason: first.reason });
       return;
     }
@@ -325,6 +329,7 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
     // that is already failing would otherwise double the discovery budget and the wall clock.
     if (state.retryUsed) {
       ss.lookupFailures++;
+      ss.errors++;
       logger.warn('[INITIATOR] lookup failed (store retry already spent)', { term, siteId, reason: first.reason });
       return;
     }
@@ -335,6 +340,7 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
     if (second.kind === 'budget-exhausted') {
       budgetExhausted = true;
       ss.lookupFailures++;
+      ss.errors++;
       logger.warn('[INITIATOR] lookup retry skipped (request budget spent)', { term, siteId });
       return;
     }
@@ -342,6 +348,7 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
     ss.lookupRetries++;
     if (second.kind === 'ok') return;
     ss.lookupFailures++;
+    ss.errors++;
     logger.warn('[INITIATOR] lookup failed after retry', { term, siteId, reason: second.reason });
   };
 

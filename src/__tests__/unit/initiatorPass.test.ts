@@ -786,3 +786,34 @@ describe('runInitiatorPass — the shipped defaults must survive a fault-free pa
     }
   });
 });
+
+describe('runInitiatorPass — lookup failures are visible as errors, and transient 4xx are retried', () => {
+  it('retries a 429 (rate limited) and a 408 (request timeout) once — they are transient, not config faults', async () => {
+    for (const status of [429, 408]) {
+      let n = 0;
+      const fake = makeFake({
+        lookup: () => (n++ === 0 ? { status, body: { error: 'slow down' } } : { status: 200, body: lookupWith({ amiami: ['https://amiami.test/ok'] }) }),
+      });
+      const s = await runInitiatorPass(mkCfg({ stores: ['amiami'], terms: ['t'] }), { fetch: fake.fetch });
+      expect(fake.lookupCalls().length).toBe(2);
+      expect(s.stores[0].lookupRetries).toBe(1);
+      expect(s.stores[0].lookupFailures).toBe(0);
+      expect(s.stores[0].discovered).toBe(1);
+    }
+  });
+
+  it('charges a terminal lookup failure to the store\'s errors count, not only to lookupFailures', async () => {
+    const fake = makeFake({ lookup: () => ({ status: 422, body: { error: 'unsupported store' } }) });
+    const s = await runInitiatorPass(mkCfg({ stores: ['amiami'], terms: ['t'] }), { fetch: fake.fetch });
+    expect(s.stores[0].lookupFailures).toBe(1);
+    expect(s.stores[0].errors).toBe(1);
+    expect(s.totalErrors).toBe(1);
+  });
+
+  it('charges a failure whose retry also failed exactly once to errors', async () => {
+    const fake = makeFake({ lookup: () => ({ status: 500, body: { error: 'boom' } }) });
+    const s = await runInitiatorPass(mkCfg({ stores: ['amiami'], terms: ['t'] }), { fetch: fake.fetch });
+    expect(s.stores[0].lookupFailures).toBe(1);
+    expect(s.stores[0].errors).toBe(1);
+  });
+});
