@@ -248,6 +248,7 @@ export function buildBrowserConfig(env: NodeJS.ProcessEnv = process.env): {
   args: string[];
   timeout: number;
   ignoreDefaultArgs?: string[];
+  defaultViewport?: null;
   executablePath?: string;
 } {
   const config: {
@@ -255,9 +256,13 @@ export function buildBrowserConfig(env: NodeJS.ProcessEnv = process.env): {
     args: string[];
     timeout: number;
     ignoreDefaultArgs?: string[];
+    defaultViewport?: null;
     executablePath?: string;
   } = isCleanHeadfulMode(env)
-    ? { headless: false, ignoreDefaultArgs: ['--enable-automation'], args: [...CLEAN_HEADFUL_ARGS], timeout: 30000 }
+    // `defaultViewport: null` = NO device-metrics override: the window `--window-size` opened is the
+    // viewport. Puppeteer's 800x600 default would otherwise leave the page reporting an inner size
+    // that contradicts its own window (measured: outer 1280x900, inner 800x600).
+    ? { headless: false, ignoreDefaultArgs: ['--enable-automation'], defaultViewport: null, args: [...CLEAN_HEADFUL_ARGS], timeout: 30000 }
     : { headless: true, args: [...HEADLESS_ARGS], timeout: 30000 };
 
   // GitHub Actions needs this flag; it breaks Docker containers.
@@ -543,6 +548,11 @@ export class BrowserPool {
   }
 
   static async closeAll(): Promise<void> {
+    // The challenge-lane browser is long-lived by design, so shutdown is the ONLY thing that closes
+    // it — miss it and the process hangs on an orphaned Chrome.
+    const challengeLane = this.stealthBrowser;
+    this.stealthBrowser = null;
+
     // Kept (challenge-gated) contexts first: they outlive requests, so nothing else closes them.
     const kept = getPersistentContexts().drain();
     if (kept.length > 0) {
@@ -586,6 +596,15 @@ export class BrowserPool {
         console.warn(`[BROWSER POOL] Browser ${index + 1} close attempt failed:`, result.reason);
       }
     });
+
+    if (challengeLane) {
+      try {
+        if (challengeLane.connected) await challengeLane.close();
+        console.log('[BROWSER POOL] Challenge-lane browser closed');
+      } catch (error) {
+        console.error(`[BROWSER POOL] Error closing the challenge-lane browser: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      }
+    }
 
     this.browsers = [];
     this.isInitialized = false;

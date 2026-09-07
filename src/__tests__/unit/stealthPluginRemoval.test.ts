@@ -71,3 +71,25 @@ describe('stealth plugin removal', () => {
     (BrowserPool as any).stealthBrowser = null;
   });
 });
+
+/**
+ * The challenge-lane browser is long-lived BY DESIGN — which means nothing else ever closes it.
+ * `closeAll` is the shutdown path (SIGTERM/SIGINT), so it must take that browser down too, or the
+ * process hangs on an open Chrome after every deploy.
+ */
+describe('challenge-lane browser shutdown', () => {
+  it('closeAll closes the challenge-lane browser and forgets it', async () => {
+    await BrowserPool.reset();
+    (BrowserPool as any).stealthBrowser = null;
+    const close = jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined);
+    const mockBrowser = { connected: true, close } as unknown as Browser;
+    jest.mocked(puppeteer.launch).mockClear();
+    jest.mocked(puppeteer.launch).mockResolvedValue(mockBrowser);
+    await BrowserPool.getStealthBrowser();
+
+    await BrowserPool.closeAll();
+
+    expect(close).toHaveBeenCalledTimes(1);
+    expect((await BrowserPool.getHealth()).hasStealthBrowser).toBe(false);
+  });
+});

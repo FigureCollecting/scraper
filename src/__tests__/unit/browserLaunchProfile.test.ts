@@ -40,6 +40,7 @@ describe('browser launch profile (BROWSER_LAUNCH_MODE)', () => {
     expect(isCleanHeadfulMode({} as NodeJS.ProcessEnv)).toBe(false);
     expect(config.headless).toBe(true);
     expect(config.ignoreDefaultArgs).toBeUndefined();
+    expect(config.defaultViewport).toBeUndefined(); // headless keeps puppeteer's own default
     expect(config.args).toContain('--disable-web-security');
     expect(config.args).toContain('--no-sandbox');
   });
@@ -57,6 +58,9 @@ describe('browser launch profile (BROWSER_LAUNCH_MODE)', () => {
     expect(config.headless).toBe(false);
     expect(config.ignoreDefaultArgs).toEqual(['--enable-automation']);
     expect(config.args).toEqual(CLEAN_HEADFUL_ARGS);
+    // No device-metrics override at all: puppeteer's 800x600 default would contradict the 1280x900
+    // window the launch flag asks for (measured: outer 1280x900 vs inner 800x600).
+    expect(config.defaultViewport).toBeNull();
   });
 
   it('carries none of the headless profile\'s extra flags in clean-headful mode', () => {
