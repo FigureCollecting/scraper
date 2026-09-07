@@ -463,6 +463,16 @@ export function createScrapingService(
         await awaitChallengeClearance(page, primed, options.primeUrl);
         entry.primedHosts.add(host);
       }
+      // ONE line per gated fetch — the lane is invisible from outside the pod otherwise, and its
+      // failure mode (a fetch quietly taking the per-request context instead) looks identical to a
+      // working one in the logs. Names the egress the tab left through, the host, whether THIS
+      // browser instance already holds a primed session for it, and how many tabs it is carrying.
+      // eslint-disable-next-line no-console
+      // lgtm[js/log-injection] — host is caller-influenced; sanitize before logging
+      console.log(
+        `[GATED] ${egress} tab for ${sanitizeForLog(host)} ` +
+        `(primed=${entry.primedHosts.has(host)}, tabs=${entry.pagesOpen})`,
+      );
       return await fn(page);
     } finally {
       if (entry && page) {

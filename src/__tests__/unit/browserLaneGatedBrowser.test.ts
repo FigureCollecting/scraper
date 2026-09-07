@@ -101,6 +101,53 @@ describe('browser lane gated browsers', () => {
     expect(gatedLaunch().browser.createBrowserContext).not.toHaveBeenCalled();
   });
 
+  /**
+   * OBSERVABILITY: the gated lane is invisible from outside the pod until something fails, and the
+   * defect it was built for (an ingest fetch quietly taking the per-request context) looked exactly
+   * like a working lane in the logs. One line per gated fetch names the egress it left through, the
+   * host, whether that browser already holds a primed session for it, and how many tabs are open on
+   * it — enough to tell "the gate is wired" from "the gate was never reached".
+   */
+  it('logs ONE line per gated fetch: egress, host, prime state, open tabs', async () => {
+    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      const service = createScrapingService();
+
+      await service.browserFetch('https://www.anitoysgk.com/lucy.html', {
+        challengeGated: true, proxyServer: PROXY, primeUrl: 'https://www.anitoysgk.com',
+      });
+      // Second fetch: the prime is not repeated, but the browser still HOLDS the primed session.
+      await service.browserFetch('https://www.anitoysgk.com/rebecca.html', {
+        challengeGated: true, proxyServer: PROXY, primeUrl: 'https://www.anitoysgk.com',
+      });
+
+      const lines = logSpy.mock.calls.map((call) => String(call[0]));
+      expect(lines.filter((line) => line.startsWith('[GATED]'))).toEqual([
+        '[GATED] residential tab for www.anitoysgk.com (primed=true, tabs=1)',
+        '[GATED] residential tab for www.anitoysgk.com (primed=true, tabs=1)',
+      ]);
+      // The pool's own launch line is the other half of the trail.
+      expect(lines.some((line) => line.includes('Launching the residential challenge-lane browser'))).toBe(true);
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it('reports primed=false for a gated store that declares no session prime, and the direct egress', async () => {
+    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      const service = createScrapingService();
+
+      await service.browserFetch('https://hobby-genki.com/item/1', { challengeGated: true });
+
+      expect(logSpy.mock.calls.map((call) => String(call[0])).filter((line) => line.startsWith('[GATED]'))).toEqual([
+        '[GATED] direct tab for hobby-genki.com (primed=false, tabs=1)',
+      ]);
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
   it('reuses ONE browser across fetches, closing only the tab', async () => {
     const service = createScrapingService();
 
