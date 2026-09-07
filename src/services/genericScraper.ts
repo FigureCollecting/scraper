@@ -185,6 +185,92 @@ function detectCloudflareChallenge(title: string, bodyText: string, patterns: { 
   return false;
 }
 
+/** `BROWSER_LAUNCH_MODE` value selecting the proven Cloudflare-passing launch profile. */
+export const CLEAN_HEADFUL_MODE = 'clean-headful';
+
+/** The default profile: pure headless with the historical hardening/perf flag set. What CI launches. */
+const HEADLESS_ARGS = [
+  '--no-sandbox',
+  '--disable-setuid-sandbox',
+  '--disable-dev-shm-usage',
+  '--disable-accelerated-2d-canvas',
+  '--no-first-run',
+  '--no-zygote',
+  '--disable-gpu',
+  '--disable-web-security',
+  '--disable-extensions',
+  '--disable-background-timer-throttling',
+  '--disable-backgrounding-occluded-windows',
+  '--disable-features=TranslateUI',
+  '--disable-ipc-flooding-protection',
+  '--memory-pressure-off',
+];
+
+/**
+ * The PROVEN clean-headful recipe (measured 2026-09-07 against anitoysgk / hobby-genki / sugotoys):
+ * real Chrome rendering HEADFUL on the Ozone headless platform (no X server, no Xvfb), the
+ * automation switch stripped, and NOTHING else. Every flag the headless profile adds is an extra
+ * detection surface, so none of them are carried here — this list is the whole surface, in the
+ * order the probe used. `--no-sandbox`/`--disable-setuid-sandbox`/`--disable-dev-shm-usage` stay
+ * because the pod runs as an unprivileged uid with a small /dev/shm, not for stealth.
+ */
+const CLEAN_HEADFUL_ARGS = [
+  '--ozone-platform=headless',
+  '--disable-blink-features=AutomationControlled',
+  '--lang=en-US',
+  '--window-size=1280,900',
+  '--no-first-run',
+  '--no-default-browser-check',
+  '--no-sandbox',
+  '--disable-setuid-sandbox',
+  '--disable-dev-shm-usage',
+];
+
+/** Whether this process launches Chrome with the clean-headful profile (production), not headless. */
+export function isCleanHeadfulMode(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.BROWSER_LAUNCH_MODE === CLEAN_HEADFUL_MODE;
+}
+
+/**
+ * Build the puppeteer launch options for this process. Pure (env in → options out) so both profiles
+ * are unit-testable without launching anything.
+ *   - default            — the historical headless profile; CI and every existing test keep it.
+ *   - `clean-headful`    — the proven recipe above: `headless:false`, the `--enable-automation`
+ *                          default arg REMOVED (its `navigator.webdriver` + automation banner is
+ *                          exactly what the challenge scores on), and the minimal arg list.
+ * `--single-process` is still appended under GitHub Actions (its runner needs it; it breaks Docker),
+ * and `PUPPETEER_EXECUTABLE_PATH` still selects the image's real Chrome in both profiles.
+ */
+export function buildBrowserConfig(env: NodeJS.ProcessEnv = process.env): {
+  headless: boolean;
+  args: string[];
+  timeout: number;
+  ignoreDefaultArgs?: string[];
+  executablePath?: string;
+} {
+  const config: {
+    headless: boolean;
+    args: string[];
+    timeout: number;
+    ignoreDefaultArgs?: string[];
+    executablePath?: string;
+  } = isCleanHeadfulMode(env)
+    ? { headless: false, ignoreDefaultArgs: ['--enable-automation'], args: [...CLEAN_HEADFUL_ARGS], timeout: 30000 }
+    : { headless: true, args: [...HEADLESS_ARGS], timeout: 30000 };
+
+  // GitHub Actions needs this flag; it breaks Docker containers.
+  if (env.GITHUB_ACTIONS === 'true') {
+    config.args.push('--single-process');
+  }
+
+  // Use the executable path from environment variable if set (for Docker)
+  if (env.PUPPETEER_EXECUTABLE_PATH) {
+    config.executablePath = env.PUPPETEER_EXECUTABLE_PATH;
+  }
+
+  return config;
+}
+
 export class BrowserPool {
   private static browsers: Browser[] = [];
   private static readonly POOL_SIZE = 3; // Keep 3 browsers ready
@@ -224,40 +310,7 @@ export class BrowserPool {
   }
 
   private static getBrowserConfig() {
-    const config: any = {
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
-        '--no-zygote',
-        '--disable-gpu',
-        '--disable-web-security',
-        '--disable-extensions',
-        '--disable-background-timer-throttling',
-        '--disable-backgrounding-occluded-windows',
-        '--disable-features=TranslateUI',
-        '--disable-ipc-flooding-protection',
-        '--memory-pressure-off'
-      ],
-      timeout: 30000
-    };
-
-    // Add single-process flag ONLY for GitHub Actions (not for Docker)
-    // GitHub Actions needs this flag, but it breaks Docker containers
-    /* istanbul ignore next - GitHub Actions specific configuration */
-    if (process.env.GITHUB_ACTIONS === 'true') {
-      config.args.push('--single-process');
-    }
-
-    // Use the executable path from environment variable if set (for Docker)
-    if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-      config.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
-    }
-
-    return config;
+    return buildBrowserConfig(process.env);
   }
 
   static async initialize(): Promise<void> {
