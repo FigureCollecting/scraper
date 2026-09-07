@@ -21,7 +21,14 @@ import { CaptureSink, NoopCaptureSink, buildRawCapture } from '../captureSink.js
 import { sanitizeForLog } from '../../utils/security.js';
 import { getCfCookieStore, type CfCookieSource } from '../cookieJar.js';
 import { applyEgressTimezone } from '../browserTimezone.js';
-import { ChallengeLaneUnavailableError, awaitChallengeClearance, challengeHost, isChallengeGated } from '../browserChallenge.js';
+import {
+  ChallengeLaneUnavailableError,
+  awaitChallengeClearance,
+  challengeHost,
+  isChallengeGated,
+  type ChallengeAwarePage,
+  type ChallengeCookie,
+} from '../browserChallenge.js';
 import {
   gatedHostKey,
   getHostConcurrency,
@@ -268,7 +275,7 @@ export async function browserFetchBody(
     // CHALLENGE: `domcontentloaded` fires on the Cloudflare interstitial too. Wait (bounded) for the
     // clean-headful browser to clear it, so the body below is the store's document and not "Just a
     // moment" — and so the host is marked gated, moving its later fetches onto the gated browser.
-    await awaitChallengeClearance(page, response, url);
+    await awaitChallengeClearance(challengeAwarePage(page), response, url);
     // READINESS: a client-rendered storefront has only its app shell at domcontentloaded — wait for
     // the declared selector / network idle before reading the body. Undeclared ⇒ no wait.
     await applyWaitFor(page, url, options.waitFor);
@@ -276,6 +283,54 @@ export async function browserFetchBody(
   } finally {
     documents.stop();
   }
+}
+
+/**
+ * The cookie read for a page, or `undefined` when this page surface cannot answer one (mocks, and
+ * pages whose browser has already gone). The jar asked for is the one the page RUNS IN: a gated tab
+ * lives in the browser's default context, an ephemeral fetch in its own `createBrowserContext`, and
+ * a Cloudflare clearance lives in whichever of them earned it.
+ */
+function pageCookieJar(page: Page): (() => Promise<ChallengeCookie[]>) | undefined {
+  type Jar = { cookies?: () => Promise<ChallengeCookie[]> };
+  const loose = page as unknown as {
+    browserContext?: () => Jar | undefined;
+    browser?: () => Jar | undefined;
+    cookies?: () => Promise<ChallengeCookie[]>;
+  };
+  const owner = (get: (() => Jar | undefined) | undefined): Jar | undefined => {
+    if (typeof get !== 'function') return undefined;
+    try {
+      return get();
+    } catch {
+      return undefined;
+    }
+  };
+  const context = owner(loose.browserContext);
+  if (context && typeof context.cookies === 'function') return () => context.cookies!();
+  // puppeteer 25 reads the DEFAULT context's jar off the browser; a page in a created context is
+  // covered above, so this is the gated tab's own path when `browserContext` is unavailable.
+  const browser = owner(loose.browser);
+  if (browser && typeof browser.cookies === 'function') return () => browser.cookies!();
+  if (typeof loose.cookies === 'function') return () => loose.cookies!();
+  return undefined;
+}
+
+/**
+ * The puppeteer Page as the challenge wait sees it: `title`/`evaluate` pass straight through, plus
+ * the two signals that separate "the challenge finished" from "the interstitial is mid-round-trip" —
+ * the page's current URL, and its cookie jar. The wait leaves on the `cf_clearance` cookie, so
+ * without this wrapper it has no evidence to leave on (see browserChallenge).
+ */
+function challengeAwarePage(page: Page): ChallengeAwarePage {
+  const wrapper: ChallengeAwarePage = { title: () => page.title() };
+  if (typeof page.evaluate === 'function') {
+    wrapper.evaluate = (pageFunction: () => any) => page.evaluate(pageFunction as any) as Promise<unknown>;
+  }
+  if (typeof page.url === 'function') wrapper.url = () => page.url();
+  const jar = pageCookieJar(page);
+  if (jar) wrapper.cookies = jar;
+  return wrapper;
 }
 
 async function detectChallenge(
@@ -340,7 +395,7 @@ async function navigateAndCapture(
     response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
 
     // CHALLENGE: wait out a Cloudflare interstitial before either lane is read (see browserChallenge).
-    await awaitChallengeClearance(page, response, url);
+    await awaitChallengeClearance(challengeAwarePage(page), response, url);
 
     // READINESS (SearchFetch.waitFor): wait for the client-rendered product before the DOM lane is
     // read, so a PWA storefront captures the product page rather than its 8 KB app shell. This sits
@@ -460,7 +515,7 @@ export function createScrapingService(
         // The PRIME is the navigation that meets the challenge — `domcontentloaded` fires on the
         // interstitial, and navigating to the target without waiting CANCELS the challenge script:
         // the homepage never loads and the cookie the prime exists for is never set.
-        await awaitChallengeClearance(page, primed, options.primeUrl);
+        await awaitChallengeClearance(challengeAwarePage(page), primed, options.primeUrl);
         entry.primedHosts.add(host);
       }
       // ONE line per gated fetch — the lane is invisible from outside the pod otherwise, and its
@@ -527,7 +582,7 @@ export function createScrapingService(
         // Same rule as the gated prime above: wait the interstitial out, or the target navigation
         // cancels it and the priming visit never happened.
         const primed = await page.goto(options.primeUrl, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
-        await awaitChallengeClearance(page, primed, options.primeUrl);
+        await awaitChallengeClearance(challengeAwarePage(page), primed, options.primeUrl);
       }
       return await fn(page);
     } finally {

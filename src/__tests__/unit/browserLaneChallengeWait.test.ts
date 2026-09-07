@@ -82,6 +82,23 @@ describe('browser lane waits out a Cloudflare challenge', () => {
     expect(isChallengeGated('www.anitoysgk.com')).toBe(true);
   });
 
+  /**
+   * WIRING: the wait leaves on a `cf_clearance` cookie, which it can only read if the lane hands it a
+   * page that reports the jar of the context it runs in. On the ephemeral path that is the
+   * per-request `createBrowserContext`.
+   */
+  it('hands the wait the ephemeral context\'s cookie jar as clearance evidence', async () => {
+    build({ titles: ['Just a moment...', 'Lucy — anitoys'], headers: { 'cf-mitigated': 'challenge' } });
+    const cookies = jest.fn<(...a: any[]) => any>().mockResolvedValue([{ name: 'cf_clearance', domain: '.anitoysgk.com' }]);
+    (mockContext as any).cookies = cookies;
+    (mockPage as any).browserContext = jest.fn(() => mockContext);
+    const service = createScrapingService();
+
+    await service.browserFetch('https://www.anitoysgk.com/lucy.html', { stealth: false });
+
+    expect(cookies).toHaveBeenCalled();
+  });
+
   it('an unchallenged store is never marked gated and never polls', async () => {
     build({ titles: ['Alpha item'], headers: { 'content-type': 'text/html' } });
     const service = createScrapingService();
