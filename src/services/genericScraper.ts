@@ -348,9 +348,16 @@ export class BrowserPool {
     }
   }
 
-  /** Open a fresh per-request context on a (long-lived) browser, counting it. */
-  static async openContext(browser: Browser): Promise<BrowserContext> {
-    const context = await browser.createBrowserContext();
+  /**
+   * Open a fresh per-request context on a (long-lived) browser, counting it. `proxyServer` (a store
+   * declaring residential egress) binds THIS CONTEXT to the proxy — per context, so one pooled
+   * browser can serve residential and direct stores side by side without relaunching. Absent ⇒ the
+   * call is byte-identical to the pre-egress one (no options object at all).
+   */
+  static async openContext(browser: Browser, options: { proxyServer?: string } = {}): Promise<BrowserContext> {
+    const context = options.proxyServer
+      ? await browser.createBrowserContext({ proxyServer: options.proxyServer })
+      : await browser.createBrowserContext();
     this.contextsOpened++;
     return context;
   }

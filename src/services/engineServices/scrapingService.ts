@@ -6,7 +6,7 @@
  */
 import type { Browser, Page, HTTPResponse } from 'puppeteer';
 import { BrowserPool } from '../genericScraper.js';
-import { ScrapingService, ScrapePageOptions, ScrapePageResult, PageOptions, BrowserFetchOptions } from '@figurecollecting/scraper-plugin-contract';
+import { ScrapingService, ScrapePageOptions, ScrapePageResult, PageOptions, BrowserFetchOptions, WaitForReadiness } from '@figurecollecting/scraper-plugin-contract';
 import { CaptureSink, NoopCaptureSink, buildRawCapture } from '../captureSink.js';
 import { sanitizeForLog } from '../../utils/security.js';
 import { getCfCookieStore, type CfCookieSource } from '../cookieJar.js';
@@ -16,6 +16,65 @@ const DEFAULT_USER_AGENT =
 const NAV_TIMEOUT_MS = 20000;
 const MAX_WAIT_TIME_MS = 10000;
 const CHALLENGE_RECHECK_DELAY_MS = 1500;
+
+/** Readiness budget (SearchFetch.waitFor.timeoutMs) when the store declares none, and its clamp. */
+const DEFAULT_WAIT_FOR_TIMEOUT_MS = 15000;
+const MIN_WAIT_FOR_TIMEOUT_MS = 1000;
+const MAX_WAIT_FOR_TIMEOUT_MS = 60000;
+
+/**
+ * The engine's own browser-lane options: the contract's per-request shapes plus the two the
+ * dispatchers resolve from the store's `searchFetch` — `proxyServer` (residential egress: bind this
+ * request's context to the proxy) and `waitFor` (client-rendered readiness). Kept engine-side
+ * because they are engine WIRING, not something a plugin passes per call; the returned service is
+ * still a contract `ScrapingService` for every existing caller.
+ */
+export interface EngineScrapePageOptions extends ScrapePageOptions {
+  proxyServer?: string;
+  waitFor?: WaitForReadiness;
+}
+
+export interface EngineBrowserFetchOptions extends BrowserFetchOptions {
+  proxyServer?: string;
+  waitFor?: WaitForReadiness;
+}
+
+export interface EnginePageOptions extends PageOptions {
+  proxyServer?: string;
+}
+
+/** The contract ScrapingService, widened to accept the engine's egress/readiness wiring. */
+export interface EngineScrapingService extends ScrapingService {
+  scrapePage(url: string, options?: EngineScrapePageOptions): Promise<ScrapePageResult>;
+  scrapePageStealth(url: string, options?: EngineScrapePageOptions): Promise<ScrapePageResult>;
+  browserFetch(url: string, options?: EngineBrowserFetchOptions): Promise<string>;
+}
+
+/** Resolve the readiness budget: the store's `timeoutMs` clamped to [1000, 60000], else 15000. */
+function resolveWaitForTimeoutMs(timeoutMs?: number): number {
+  if (!Number.isFinite(timeoutMs) || (timeoutMs as number) <= 0) return DEFAULT_WAIT_FOR_TIMEOUT_MS;
+  return Math.min(MAX_WAIT_FOR_TIMEOUT_MS, Math.max(MIN_WAIT_FOR_TIMEOUT_MS, timeoutMs as number));
+}
+
+/**
+ * Wait for a client-rendered storefront to actually render before the body is read: the declared
+ * selector and/or network idle, both bounded by one budget. A store that declares nothing waits
+ * nothing (the pre-0.7.0 `domcontentloaded` behavior, byte-identical). A wait that TIMES OUT is a
+ * degraded capture, not a failure — whatever rendered is returned and ONE warning is logged, so a
+ * slow store yields a partial page instead of a thrown scrape and a retry storm.
+ */
+async function applyWaitFor(page: Page, url: string, waitFor: WaitForReadiness | undefined): Promise<void> {
+  if (!waitFor || (!waitFor.selector && !waitFor.networkIdle)) return;
+  const timeout = resolveWaitForTimeoutMs(waitFor.timeoutMs);
+  try {
+    if (waitFor.selector) await page.waitForSelector(waitFor.selector, { timeout });
+    if (waitFor.networkIdle) await page.waitForNetworkIdle({ timeout });
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    // lgtm[js/log-injection] — url is caller-influenced; sanitize before logging
+    console.warn(`[WAITFOR] readiness wait timed out for ${sanitizeForLog(url)} after ${timeout}ms — capturing whatever rendered: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
 
 // JSON-ish content types whose body must be read from the response, not page.content():
 // Chrome wraps a navigated JSON document in a viewer DOM, so page.content() would return markup.
@@ -78,7 +137,7 @@ function resolveUserAgent(store: CfCookieSource, url: string, requestUa: string 
 export async function browserFetchBody(
   page: Page,
   url: string,
-  options: Omit<BrowserFetchOptions, 'stealth'> = {},
+  options: Omit<EngineBrowserFetchOptions, 'stealth'> = {},
   store: CfCookieSource = getCfCookieStore(),
 ): Promise<string> {
   await page.setViewport({ width: 1280, height: 720 });
@@ -96,6 +155,9 @@ export async function browserFetchBody(
   }
 
   const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
+  // READINESS: a client-rendered storefront has only its app shell at domcontentloaded — wait for
+  // the declared selector / network idle before reading the body. Undeclared ⇒ no wait.
+  await applyWaitFor(page, url, options.waitFor);
   if (response) {
     const contentType = response.headers?.()?.['content-type'] ?? '';
     if (JSON_CONTENT_TYPE.test(contentType)) {
@@ -124,7 +186,7 @@ async function detectChallenge(
 async function navigateAndCapture(
   page: Page,
   url: string,
-  options: ScrapePageOptions = {},
+  options: EngineScrapePageOptions = {},
   sink: CaptureSink = new NoopCaptureSink(),
   store: CfCookieSource = getCfCookieStore(),
 ): Promise<ScrapePageResult> {
@@ -159,6 +221,11 @@ async function navigateAndCapture(
   let response;
   try {
     response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
+
+    // READINESS (SearchFetch.waitFor): wait for the client-rendered product before the DOM lane is
+    // read, so a PWA storefront captures the product page rather than its 8 KB app shell. This sits
+    // INSIDE the response listener's window, so the wire lane still records the main document.
+    await applyWaitFor(page, url, options.waitFor);
 
     const waitTime = capWaitTime(options.waitTime);
     if (waitTime > 0) {
@@ -217,13 +284,16 @@ export interface ScrapingServiceOptions {
 export function createScrapingService(
   captureSink: CaptureSink = new NoopCaptureSink(),
   options: ScrapingServiceOptions = {},
-): ScrapingService {
+): EngineScrapingService {
   // Resolved per navigation (not once here) so a hot-reloaded cookie file is always the one consulted.
   const store = (): CfCookieSource => options.cookieStore ?? getCfCookieStore();
-  async function withPage<T>(fn: (page: Page) => Promise<T>, options: PageOptions = {}): Promise<T> {
+  async function withPage<T>(fn: (page: Page) => Promise<T>, options: EnginePageOptions = {}): Promise<T> {
     const stealth = options.stealth ?? false;
     const browser: Browser = stealth ? await BrowserPool.getStealthBrowser() : await BrowserPool.getBrowser();
-    const context = await BrowserPool.openContext(browser);
+    // RESIDENTIAL EGRESS: bind the per-request context (not the browser) to the proxy, so only the
+    // declaring store's navigations leave through it. The context is closed in the finally below
+    // exactly like a direct one — a proxied context is never leaked onto the pooled browser.
+    const context = await BrowserPool.openContext(browser, options.proxyServer ? { proxyServer: options.proxyServer } : {});
 
     try {
       const page: Page = await context.newPage();
@@ -260,15 +330,15 @@ export function createScrapingService(
   }
 
   return {
-    scrapePage: (url: string, options?: ScrapePageOptions) =>
-      withPage(page => navigateAndCapture(page, url, options, captureSink, store()), { stealth: false }),
+    scrapePage: (url: string, options?: EngineScrapePageOptions) =>
+      withPage(page => navigateAndCapture(page, url, options, captureSink, store()), { stealth: false, ...(options?.proxyServer ? { proxyServer: options.proxyServer } : {}) }),
 
-    scrapePageStealth: (url: string, options?: ScrapePageOptions) =>
-      withPage(page => navigateAndCapture(page, url, options, captureSink, store()), { stealth: true }),
+    scrapePageStealth: (url: string, options?: EngineScrapePageOptions) =>
+      withPage(page => navigateAndCapture(page, url, options, captureSink, store()), { stealth: true, ...(options?.proxyServer ? { proxyServer: options.proxyServer } : {}) }),
 
     // browserFetch defaults to the stealth browser — it exists for CF-fronted / SPA hosts.
-    browserFetch: (url: string, options?: BrowserFetchOptions) =>
-      withPage(page => browserFetchBody(page, url, options, store()), { stealth: options?.stealth ?? true }),
+    browserFetch: (url: string, options?: EngineBrowserFetchOptions) =>
+      withPage(page => browserFetchBody(page, url, options, store()), { stealth: options?.stealth ?? true, ...(options?.proxyServer ? { proxyServer: options.proxyServer } : {}) }),
 
     withBrowser,
     withPage,

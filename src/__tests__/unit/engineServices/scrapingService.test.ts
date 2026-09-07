@@ -28,6 +28,9 @@ describe('createScrapingService', () => {
       off: jest.fn(),
       mainFrame: jest.fn(() => ({ id: 'main' })),
       close: jest.fn<(...args: any[]) => any>().mockResolvedValue(undefined),
+      // Readiness waits (SearchFetch.waitFor) — only called when a store declares them.
+      waitForSelector: jest.fn<(...args: any[]) => any>().mockResolvedValue({}),
+      waitForNetworkIdle: jest.fn<(...args: any[]) => any>().mockResolvedValue(undefined),
     } as unknown as jest.Mocked<Page>;
 
     mockContext = {
@@ -277,6 +280,134 @@ describe('createScrapingService', () => {
         expect.objectContaining({ name: 'cf_clearance', secure: false, httpOnly: true }),
         expect.objectContaining({ name: 'PHPSESSID', secure: false, httpOnly: true }),
       );
+    });
+  });
+  /**
+   * RESIDENTIAL EGRESS + READINESS on the browser lane (contract 0.7.0).
+   *
+   * Egress: a store declaring `egress: 'residential'` gets a PER-REQUEST incognito context bound to
+   * the proxy (`createBrowserContext({ proxyServer })`) — per context, so only that store's
+   * navigations leave through the residential line while the pooled browser keeps serving everyone
+   * else directly. The context is still closed after the request (no leaked proxied context).
+   *
+   * Readiness: a PWA storefront renders its product client-side, so returning at
+   * `domcontentloaded` captures an empty app shell. `waitFor` makes the lane wait for a selector
+   * and/or network idle first, bounded by `timeoutMs` (default 15000, clamped to [1000, 60000]). A
+   * wait that times out is NOT fatal — the lane returns what rendered and logs exactly one warning.
+   */
+  describe('× residential egress (proxied context) + waitFor readiness', () => {
+    const PROXY = 'socks5://egress-proxy.fc.svc.cluster.local:1055';
+    let warnSpy: jest.SpyInstance;
+
+    beforeEach(() => { warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {}); });
+    afterEach(() => { warnSpy.mockRestore(); });
+
+    it('scrapePage opens the per-request context BOUND TO THE PROXY for a residential store, and still closes it', async () => {
+      const service = createScrapingService();
+
+      const result = await service.scrapePage('https://www.anitoysgk.com/lucy-p29358268.html', { proxyServer: PROXY });
+
+      expect(mockBrowser.createBrowserContext).toHaveBeenCalledWith({ proxyServer: PROXY });
+      expect(mockContext.close).toHaveBeenCalledTimes(1); // proxied context is not leaked
+      expect(result.html).toBe('<html><body>mock</body></html>');
+    });
+
+    it('scrapePageStealth (the CF cohort\'s lane) binds the proxy on the stealth browser too', async () => {
+      const service = createScrapingService();
+      await service.scrapePageStealth('https://www.anitoysgk.com/lucy-p29358268.html', { proxyServer: PROXY });
+      expect(mockBrowser.createBrowserContext).toHaveBeenCalledWith({ proxyServer: PROXY });
+    });
+
+    it('browserFetch (the /lookup + /catalog lane) binds the proxy for a residential store', async () => {
+      const service = createScrapingService();
+      await service.browserFetch('https://www.anitoysgk.com/search?q=lucy', { stealth: false, proxyServer: PROXY });
+      expect(mockBrowser.createBrowserContext).toHaveBeenCalledWith({ proxyServer: PROXY });
+    });
+
+    it('an undeclared store opens the context with NO arguments (byte-identical to the pre-egress path)', async () => {
+      const service = createScrapingService();
+      await service.scrapePage('https://alpha.example.test/item/1');
+      expect(mockBrowser.createBrowserContext).toHaveBeenCalledWith();
+    });
+
+    it('waitFor.selector: waits for the selector after domcontentloaded, with the default 15 s bound', async () => {
+      const service = createScrapingService();
+
+      await service.scrapePage('https://www.crunchyroll-store.test/p/1', {
+        waitFor: { selector: '[data-t="product-title"]' },
+      });
+
+      expect(mockPage.goto).toHaveBeenCalledWith(
+        'https://www.crunchyroll-store.test/p/1',
+        expect.objectContaining({ waitUntil: 'domcontentloaded' }),
+      );
+      expect(mockPage.waitForSelector).toHaveBeenCalledWith('[data-t="product-title"]', { timeout: 15000 });
+      expect(mockPage.waitForNetworkIdle).not.toHaveBeenCalled();
+      expect(warnSpy).not.toHaveBeenCalled();
+    });
+
+    it('waitFor.networkIdle: waits for the hydration XHRs to settle, bounded by the same budget', async () => {
+      const service = createScrapingService();
+      await service.scrapePage('https://www.crunchyroll-store.test/p/1', { waitFor: { networkIdle: true } });
+      expect(mockPage.waitForNetworkIdle).toHaveBeenCalledWith({ timeout: 15000 });
+      expect(mockPage.waitForSelector).not.toHaveBeenCalled();
+    });
+
+    it('honours an explicit timeoutMs and clamps it to [1000, 60000]', async () => {
+      const service = createScrapingService();
+
+      await service.scrapePage('https://a.test/1', { waitFor: { selector: '#a', timeoutMs: 20000 } });
+      await service.scrapePage('https://a.test/2', { waitFor: { selector: '#b', timeoutMs: 10 } });
+      await service.scrapePage('https://a.test/3', { waitFor: { selector: '#c', timeoutMs: 999999 } });
+
+      expect(mockPage.waitForSelector).toHaveBeenNthCalledWith(1, '#a', { timeout: 20000 });
+      expect(mockPage.waitForSelector).toHaveBeenNthCalledWith(2, '#b', { timeout: 1000 });
+      expect(mockPage.waitForSelector).toHaveBeenNthCalledWith(3, '#c', { timeout: 60000 });
+    });
+
+    it('a TIMED-OUT wait returns whatever rendered with exactly one warning — never a thrown scrape', async () => {
+      (mockPage.waitForSelector as unknown as jest.Mock).mockRejectedValue(new Error('Waiting for selector `#never` failed: timeout 15000ms exceeded'));
+      const service = createScrapingService();
+
+      const result = await service.scrapePage('https://www.crunchyroll-store.test/p/1', {
+        waitFor: { selector: '#never', networkIdle: true },
+      });
+
+      expect(result.html).toBe('<html><body>mock</body></html>'); // the partial page, captured anyway
+      expect(result.statusCode).toBe(200);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(String(warnSpy.mock.calls[0][0])).toContain('crunchyroll-store.test');
+    });
+
+    it('browserFetch honours waitFor too (the search/listing body must be the rendered one)', async () => {
+      const service = createScrapingService();
+      const body = await service.browserFetch('https://www.crunchyroll-store.test/search?q=lucy', {
+        stealth: false,
+        waitFor: { selector: '.results', networkIdle: true, timeoutMs: 5000 },
+      });
+      expect(mockPage.waitForSelector).toHaveBeenCalledWith('.results', { timeout: 5000 });
+      expect(mockPage.waitForNetworkIdle).toHaveBeenCalledWith({ timeout: 5000 });
+      expect(body).toBe('<html><body>mock</body></html>');
+    });
+
+    it('a TIMED-OUT wait on browserFetch still returns the rendered body with one warning', async () => {
+      (mockPage.waitForNetworkIdle as unknown as jest.Mock).mockRejectedValue(new Error('timeout'));
+      const service = createScrapingService();
+      const body = await service.browserFetch('https://www.crunchyroll-store.test/search?q=lucy', {
+        stealth: false,
+        waitFor: { networkIdle: true },
+      });
+      expect(body).toBe('<html><body>mock</body></html>');
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('an undeclared store never waits at all (byte-identical: goto → content)', async () => {
+      const service = createScrapingService();
+      await service.scrapePage('https://alpha.example.test/item/1');
+      await service.browserFetch('https://alpha.example.test/search', { stealth: false });
+      expect(mockPage.waitForSelector).not.toHaveBeenCalled();
+      expect(mockPage.waitForNetworkIdle).not.toHaveBeenCalled();
+      expect(warnSpy).not.toHaveBeenCalled();
     });
   });
 });
