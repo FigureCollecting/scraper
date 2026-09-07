@@ -817,3 +817,75 @@ describe('runInitiatorPass — lookup failures are visible as errors, and transi
     expect(s.stores[0].errors).toBe(1);
   });
 });
+
+describe('runInitiatorPass — per-lookup logging carries its identity on the header line', () => {
+  const spy = () => ({
+    info: jest.spyOn(logger, 'info').mockImplementation(() => {}),
+    warn: jest.spyOn(logger, 'warn').mockImplementation(() => {}),
+    error: jest.spyOn(logger, 'error').mockImplementation(() => {}),
+  });
+
+  it('names the store, term, status and both candidate counts in the INFO message itself', async () => {
+    const s = spy();
+    try {
+      const fake = makeFake({
+        lookup: (_t, store) => ({ status: 200, body: lookupWith({ [store]: ['a', 'b', 'c'].map((x) => `https://${store}.test/${x}`) }) }),
+      });
+      await runInitiatorPass(mkCfg({ stores: ['amiami'], terms: ['lucy'], maxUrlsPerStore: 2 }), { fetch: fake.fetch });
+      const line = s.info.mock.calls.map((c) => String(c[0])).find((m) => m.includes('] lookup '));
+      expect(line).toBeDefined();
+      expect(line).toContain('store=amiami');
+      expect(line).toContain('term=lucy');
+      expect(line).toContain('status=200');
+      expect(line).toContain('candidates=3'); // what the store returned
+      expect(line).toContain('kept=2'); // what the per-store cap let through
+      expect(line).toMatch(/ms=\d+/);
+    } finally {
+      Object.values(s).forEach((x) => x.mockRestore());
+    }
+  });
+
+  it('names the store and term in every retry / failure WARN', async () => {
+    const s = spy();
+    try {
+      const fake = makeFake({ lookup: () => ({ status: 503, body: { error: 'boom' } }) });
+      await runInitiatorPass(mkCfg({ stores: ['gkloot'], terms: ['lucy'] }), { fetch: fake.fetch });
+      const warns = s.warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('lookup'));
+      expect(warns.length).toBeGreaterThanOrEqual(2); // retrying once + failed after retry
+      expect(warns.every((m) => m.includes('store=gkloot') && m.includes('term=lucy'))).toBe(true);
+      expect(warns.some((m) => m.includes('503'))).toBe(true);
+    } finally {
+      Object.values(s).forEach((x) => x.mockRestore());
+    }
+  });
+
+  it('names the store in an ingest rejection WARN', async () => {
+    const s = spy();
+    try {
+      const fake = makeFake({
+        lookup: () => ({ status: 200, body: lookupWith({ amiami: ['https://amiami.test/x'] }) }),
+        ingest: () => ({ status: 500, body: { success: false } }),
+      });
+      await runInitiatorPass(mkCfg({ stores: ['amiami'], terms: ['t'] }), { fetch: fake.fetch });
+      const warns = s.warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('ingest rejected'));
+      expect(warns).toHaveLength(1);
+      expect(warns[0]).toContain('store=amiami');
+      expect(warns[0]).toContain('status=500');
+    } finally {
+      Object.values(s).forEach((x) => x.mockRestore());
+    }
+  });
+
+  it('ends a pass that dropped discovered work with an ERROR naming the shortfall', async () => {
+    const s = spy();
+    try {
+      const fake = makeFake({ lookup: () => ({ status: 200, body: lookupWith({ amiami: ['https://amiami.test/1', 'https://amiami.test/2'] }) }) });
+      const summary = await runInitiatorPass(mkCfg({ stores: ['amiami'], terms: ['t'], maxUrlsPerStore: 2, maxRequests: 2 }), { fetch: fake.fetch });
+      expect(summary.totalEnqueued).toBeLessThan(summary.totalDiscovered);
+      const msgs = s.error.mock.calls.map((c) => String(c[0]));
+      expect(msgs.some((m) => m.includes('dropped') && m.includes('1'))).toBe(true);
+    } finally {
+      Object.values(s).forEach((x) => x.mockRestore());
+    }
+  });
+});

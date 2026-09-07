@@ -244,27 +244,38 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
     `${config.scraperServiceUrl}/lookup?q=${encodeURIComponent(term)}&mode=${config.mode}&stores=${encodeURIComponent(siteId)}`;
   const ingestUrl = `${config.scraperServiceUrl}/ingest/scrape`;
 
-  /** Consume ONE store-scoped lookup body; returns how many candidate URLs it contributed. */
-  const consume = (siteId: string, body: LookupResponseBody): number => {
+  /**
+   * Consume ONE store-scoped lookup body. Returns `candidates` (usable URLs the store
+   * actually returned) and `kept` (how many the per-store cap let through) — a capped
+   * store returning results must not look, in the log, like a store returning nothing.
+   */
+  const consume = (siteId: string, body: LookupResponseBody): { candidates: number; kept: number } => {
     const before = setFor(siteId).size;
+    let candidates = 0;
     for (const sr of body.results ?? []) {
       if (sr.siteId !== siteId) continue; // a body may echo other stores; only the asked-for one counts
       for (const c of sr.candidates ?? []) {
         // Prefer the engine's collect-ready URL; fall back to the page url (older engine, or no
         // collectUrl derivable). Dedup (setFor/addUrl) keys on whichever was chosen.
         const u = typeof c.collectUrl === 'string' && c.collectUrl ? c.collectUrl : c.url;
-        if (typeof u === 'string' && u) addUrl(siteId, u);
+        if (typeof u === 'string' && u) {
+          candidates++;
+          addUrl(siteId, u);
+        }
       }
     }
     for (const rt of body.resolveTargets ?? []) {
-      if (rt.siteId === siteId && typeof rt.url === 'string' && rt.url) addUrl(siteId, rt.url);
+      if (rt.siteId === siteId && typeof rt.url === 'string' && rt.url) {
+        candidates++;
+        addUrl(siteId, rt.url);
+      }
     }
     const ss = perStore.get(siteId);
     if (ss) {
       if ((body.failed ?? []).includes(siteId)) ss.errors++;
       if ((body.cooldown ?? []).includes(siteId) || (body.unsupported ?? []).includes(siteId)) ss.skipped++;
     }
-    return setFor(siteId).size - before;
+    return { candidates, kept: setFor(siteId).size - before };
   };
 
   /**
@@ -286,23 +297,24 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
     } catch (error) {
       ss.lookupAttempts++; // dispatched, then aborted / failed in transport
       const reason = error instanceof Error ? error.message : String(error);
-      logger.info('[INITIATOR] lookup', { term, siteId, status: 0, ms: Date.now() - startedMs, candidates: 0 });
+      logger.info(`[INITIATOR] lookup store=${siteId} term=${term} status=0 ms=${Date.now() - startedMs} candidates=0 kept=0 error=${reason}`);
       return { kind: 'retryable', reason };
     }
     if (!res.ok) {
-      logger.info('[INITIATOR] lookup', { term, siteId, status: res.status, ms: Date.now() - startedMs, candidates: 0 });
+      logger.info(`[INITIATOR] lookup store=${siteId} term=${term} status=${res.status} ms=${Date.now() - startedMs} candidates=0 kept=0`);
       // 5xx is the engine/upstream faulting; 429 and 408 are the two 4xx a second call after a
       // delay genuinely survives. Every other 4xx is a fault the same request would repeat.
       const transient = res.status >= 500 || res.status === 429 || res.status === 408;
       return { kind: transient ? 'retryable' : 'fatal', reason: `status ${res.status}` };
     }
     try {
-      const candidates = consume(siteId, (await res.json()) as LookupResponseBody);
-      logger.info('[INITIATOR] lookup', { term, siteId, status: res.status, ms: Date.now() - startedMs, candidates });
+      const { candidates, kept } = consume(siteId, (await res.json()) as LookupResponseBody);
+      logger.info(`[INITIATOR] lookup store=${siteId} term=${term} status=${res.status} ms=${Date.now() - startedMs} candidates=${candidates} kept=${kept}`);
       return { kind: 'ok' };
     } catch (error) {
-      logger.info('[INITIATOR] lookup', { term, siteId, status: res.status, ms: Date.now() - startedMs, candidates: 0 });
-      return { kind: 'fatal', reason: error instanceof Error ? error.message : String(error) };
+      const reason = error instanceof Error ? error.message : String(error);
+      logger.info(`[INITIATOR] lookup store=${siteId} term=${term} status=${res.status} ms=${Date.now() - startedMs} candidates=0 kept=0 error=${reason}`);
+      return { kind: 'fatal', reason };
     }
   };
 
@@ -322,7 +334,7 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
     if (first.kind === 'fatal') {
       ss.lookupFailures++;
       ss.errors++;
-      logger.warn('[INITIATOR] lookup failed (not retried)', { term, siteId, reason: first.reason });
+      logger.warn(`[INITIATOR] lookup store=${siteId} term=${term} failed (not retried): ${first.reason}`);
       return;
     }
     // Transient — but a store gets ONE retry for the whole pass, not one per term: a store
@@ -330,18 +342,18 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
     if (state.retryUsed) {
       ss.lookupFailures++;
       ss.errors++;
-      logger.warn('[INITIATOR] lookup failed (store retry already spent)', { term, siteId, reason: first.reason });
+      logger.warn(`[INITIATOR] lookup store=${siteId} term=${term} failed (store retry already spent): ${first.reason}`);
       return;
     }
 
-    logger.warn('[INITIATOR] lookup failed, retrying once', { term, siteId, reason: first.reason, delayMs: config.lookupRetryDelayMs });
+    logger.warn(`[INITIATOR] lookup store=${siteId} term=${term} failed, retrying once in ${config.lookupRetryDelayMs}ms: ${first.reason}`);
     if (config.lookupRetryDelayMs > 0) await sleep(config.lookupRetryDelayMs);
     const second = await attemptLookup(term, siteId, ss);
     if (second.kind === 'budget-exhausted') {
       budgetExhausted = true;
       ss.lookupFailures++;
       ss.errors++;
-      logger.warn('[INITIATOR] lookup retry skipped (request budget spent)', { term, siteId });
+      logger.warn(`[INITIATOR] lookup store=${siteId} term=${term} retry skipped (request budget spent)`);
       return;
     }
     state.retryUsed = true;
@@ -349,7 +361,7 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
     if (second.kind === 'ok') return;
     ss.lookupFailures++;
     ss.errors++;
-    logger.warn('[INITIATOR] lookup failed after retry', { term, siteId, reason: second.reason });
+    logger.warn(`[INITIATOR] lookup store=${siteId} term=${term} failed after retry: ${second.reason}`);
   };
 
   const discoverStore = async (siteId: string): Promise<void> => {
@@ -395,7 +407,7 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
       const res = r.value;
       if (!res.ok) {
         ss.errors++;
-        logger.warn('[INITIATOR] ingest rejected', { siteId, status: res.status });
+        logger.warn(`[INITIATOR] ingest rejected store=${siteId} status=${res.status} url=${url}`);
         return;
       }
       const body = (await res.json().catch(() => ({}))) as IngestResponseBody;
@@ -403,12 +415,19 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
       if (body.deduplicated === true) ss.deduplicated++;
     } catch (error) {
       ss.errors++;
-      logger.warn('[INITIATOR] ingest errored', { siteId, error: error instanceof Error ? error.message : String(error) });
+      logger.warn(`[INITIATOR] ingest errored store=${siteId} url=${url}: ${error instanceof Error ? error.message : String(error)}`);
     }
   };
   await Promise.all(flat.map((item) => enqueueOne(item)));
 
   const summary = summarize();
+  const dropped = summary.totalDiscovered - summary.totalEnqueued - summary.totalErrors;
+  if (summary.budgetExhausted && dropped > 0) {
+    logger.error(
+      `[INITIATOR] pass dropped ${dropped} discovered URL(s) unenqueued: the request budget ` +
+        `(${summary.requestBudget}) ran out after ${summary.requestsIssued} requests. Raise INITIATOR_MAX_REQUESTS.`,
+    );
+  }
   logger.info('[INITIATOR] pass complete', summary as unknown as Record<string, unknown>);
   for (const s of summary.stores) {
     logger.info('[INITIATOR] store summary', s as unknown as Record<string, unknown>);
