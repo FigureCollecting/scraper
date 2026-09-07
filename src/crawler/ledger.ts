@@ -10,6 +10,8 @@
  *                 exhaustCandidateCursor?, exhaustCandidateAt?, // one empty sighting (unconfirmed)
  *                 exhaustedAt?, updatedAt? },                   // confirmed end-of-catalog
  *     recent:   { lastRunAt?, lastNewCount? },
+ *     range?:   { cursor: number|null,      // next id to walk DOWNWARD; 0 = the id floor was reached
+ *                 frontier?, updatedAt? },  // OPTIONAL: absent on a store that never range-walked
  *     updatedAt
  *   }
  *
@@ -41,6 +43,24 @@ export interface LedgerBackfill {
   updatedAt?: string;
 }
 
+/**
+ * ID-RANGE backfill state for a store whose ids are sequential. `cursor` is the NEXT id to walk
+ * downward (null = never walked, 0 = the walk reached id 1 and is done); `frontier` records the id
+ * the walk started from. OPTIONAL on the document: a ledger written before the axis existed — or by
+ * a store that never walks one — simply has no `range`, and is neither corrupt nor migrated.
+ */
+export interface LedgerRange {
+  cursor: number | null;
+  frontier?: number;
+  /**
+   * The `CRAWLER_RANGE_FRONTIER_<SITEID>` value this walk was seeded (or re-seeded) with. Recorded so
+   * a CHANGE to that env var is detectable: it is the operator's only lever over a walk already under
+   * way — correcting a wrong seed, or re-entering an id space that has grown above the frontier.
+   */
+  seed?: number;
+  updatedAt?: string;
+}
+
 export interface LedgerRecent {
   lastRunAt?: string;
   lastNewCount?: number;
@@ -52,6 +72,7 @@ export interface Ledger {
   enqueued: Record<string, LedgerEntry>;
   backfill: LedgerBackfill;
   recent: LedgerRecent;
+  range?: LedgerRange;
   updatedAt?: string;
 }
 
@@ -78,6 +99,8 @@ const isPlainObject = (v: unknown): v is Record<string, unknown> => typeof v ===
 
 const isPositiveInt = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v > 0;
 
+const isNonNegInt = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v >= 0;
+
 /**
  * Validate a parsed document as a v1 ledger for `siteId`. Missing optional sections
  * are normalised; anything structurally wrong is 'corrupt'.
@@ -93,12 +116,25 @@ function coerceLedger(doc: unknown, siteId: string): Ledger | 'corrupt' {
   if (rawCursor !== null && cursor === null) return 'corrupt';
   const recent = doc.recent ?? {};
   if (!isPlainObject(recent)) return 'corrupt';
+  // The id-range section is OPTIONAL, but a PRESENT one must be well formed: a malformed cursor
+  // would otherwise be silently reset to null and re-walk the whole id space from the frontier, and a
+  // malformed frontier would reach the operator-facing summary typed as a number.
+  let range: LedgerRange | undefined;
+  if (doc.range !== undefined) {
+    if (!isPlainObject(doc.range)) return 'corrupt';
+    const rawRangeCursor: unknown = doc.range.cursor ?? null;
+    if (rawRangeCursor !== null && !isNonNegInt(rawRangeCursor)) return 'corrupt';
+    if (doc.range.frontier !== undefined && !isPositiveInt(doc.range.frontier)) return 'corrupt';
+    if (doc.range.seed !== undefined && !isPositiveInt(doc.range.seed)) return 'corrupt';
+    range = { ...(doc.range as unknown as LedgerRange), cursor: rawRangeCursor as number | null };
+  }
   return {
     version: LEDGER_VERSION,
     siteId,
     enqueued: doc.enqueued as Record<string, LedgerEntry>,
     backfill: { ...(backfill as unknown as LedgerBackfill), cursor },
     recent: recent as LedgerRecent,
+    ...(range !== undefined ? { range } : {}),
     ...(doc.updatedAt !== undefined ? { updatedAt: doc.updatedAt as string } : {}),
   };
 }

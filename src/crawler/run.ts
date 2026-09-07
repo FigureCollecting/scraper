@@ -1,7 +1,7 @@
 /**
  * Entrypoint for the catalog crawler: `node dist/crawler/run.js`.
  *
- * One invocation performs ONE bounded pass (recent THEN backfill by default) and
+ * One invocation performs ONE bounded pass (recent THEN backfill THEN the id-range walk, by default) and
  * exits — recurrence is the K8s CronJob's schedule, and stop = the CronJob's
  * `suspend: true`. This is wiring only; all logic (and its tests) live in
  * ./config, ./ledger and ./crawler. It does NOT touch the server's default CMD
@@ -28,11 +28,15 @@ async function main(): Promise<void> {
     backfillPagesPerRun: config.backfillPagesPerRun,
     maxRequests: config.maxRequests,
     maxEnqueuePerStore: config.maxEnqueuePerStore,
+    storeEnqueueCaps: config.storeEnqueueCaps,
     maxConcurrency: config.maxConcurrency,
     requestSpacingMs: config.requestSpacingMs,
     requestTimeoutMs: config.requestTimeoutMs,
     reobserveAfterMs: config.reobserveAfterMs,
     exhaustedRecheckMs: config.exhaustedRecheckMs,
+    rangeStores: config.rangeStores,
+    rangeIdsPerRun: config.rangeIdsPerRun,
+    rangeFrontiers: config.rangeFrontiers,
   });
   await runCrawlerPass(config, { fetch: httpFetch, ledgerStore: createFileLedgerStore(config.ledgerDir) });
 }

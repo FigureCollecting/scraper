@@ -10,6 +10,7 @@
  */
 import { runCrawlerPass, type CrawlerConfig, type FetchLike, type HttpResponseLike } from '../../crawler/crawler';
 import { createMemoryLedgerStore, createEmptyLedger, type Ledger } from '../../crawler/ledger';
+import { logger } from '../../utils/logger';
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 const T0 = Date.parse('2026-09-06T12:00:00.000Z');
@@ -37,6 +38,10 @@ const mkCfg = (over: Partial<CrawlerConfig> = {}): CrawlerConfig => ({
   requestTimeoutMs: 5000,
   reobserveAfterMs: 0,
   exhaustedRecheckMs: WEEK_MS,
+  storeEnqueueCaps: {},
+  rangeStores: [],
+  rangeIdsPerRun: 50,
+  rangeFrontiers: {},
   ...over,
 });
 
@@ -74,9 +79,29 @@ const badRequest = (): Reply => ({ status: 400, body: { error: "query parameter 
 
 interface FakeOpts {
   catalog: (siteId: string, page: number) => Reply;
+  /** GET /catalog?store=&range=1&from=&count= — the synthesized descending id window. */
+  range?: (siteId: string, from: number, count: number) => Reply;
   ingest?: (url: string) => Reply;
   holdIngest?: boolean;
 }
+
+/** A canned 200 id-range body: `count` ids walking DOWN from `from` (floor 1), as the engine synthesizes them. */
+const rangeBody = (siteId: string, from: number, count: number) => {
+  const lowest = Math.max(1, from - count + 1);
+  const ids: string[] = [];
+  for (let id = from; id >= lowest; id--) ids.push(String(id));
+  return {
+    siteId,
+    from,
+    items: ids.map((id) => ({ itemId: id, collectUrl: collectUrl(siteId, id) })),
+    collectUrls: ids.map((id) => collectUrl(siteId, id)),
+    hasMore: lowest > 1,
+    ...(lowest > 1 ? { nextFrom: lowest - 1 } : {}),
+    count: ids.length,
+  };
+};
+
+const okRange = (siteId: string, from: number, count: number): Reply => ({ status: 200, body: rangeBody(siteId, from, count) });
 
 const makeFake = (opts: FakeOpts) => {
   let active = 0;
@@ -101,7 +126,14 @@ const makeFake = (opts: FakeOpts) => {
         const u = new URL(url);
         const siteId = u.searchParams.get('store') ?? '';
         const page = Number(u.searchParams.get('page'));
-        const r = opts.catalog(siteId, page);
+        const r =
+          u.searchParams.get('range') === '1'
+            ? (opts.range ?? ((s2: string, f: number, c: number) => okRange(s2, f, c)))(
+                siteId,
+                Number(u.searchParams.get('from')),
+                Number(u.searchParams.get('count')),
+              )
+            : opts.catalog(siteId, page);
         if (r.throwErr) throw r.throwValue !== undefined ? r.throwValue : new Error('catalog network error');
         return resp(r.status, r.body ?? {});
       }
@@ -132,7 +164,16 @@ const makeFake = (opts: FakeOpts) => {
           const u = new URL(c.url);
           return [u.searchParams.get('store'), Number(u.searchParams.get('page'))] as [string, number];
         }),
-    pages: (siteId?: string) => calls.filter((c) => c.url.includes('/catalog')).map((c) => new URL(c.url)).filter((u) => !siteId || u.searchParams.get('store') === siteId).map((u) => Number(u.searchParams.get('page'))),
+    /** [siteId, from, count] of every id-range GET in dispatch order. */
+    rangeCalls: () =>
+      calls
+        .filter((c) => c.url.includes('/catalog') && c.url.includes('range=1'))
+        .map((c) => {
+          const u = new URL(c.url);
+          return [u.searchParams.get('store'), Number(u.searchParams.get('from')), Number(u.searchParams.get('count'))] as [string, number, number];
+        }),
+    /** LISTING page numbers only (the id-range axis carries no `page`). */
+    pages: (siteId?: string) => calls.filter((c) => c.url.includes('/catalog') && !c.url.includes('range=1')).map((c) => new URL(c.url)).filter((u) => !siteId || u.searchParams.get('store') === siteId).map((u) => Number(u.searchParams.get('page'))),
     posted: () => calls.filter((c) => c.url.includes('/ingest')).map((c) => c.body.url as string),
   };
 };
@@ -945,5 +986,438 @@ describe('runCrawlerPass — backfill exhaustion must not be CONFIRMED on a page
     const r3 = makeFake({ catalog: grown });
     await runCrawlerPass(mkCfg({ mode: 'backfill', maxEnqueuePerStore: 2 }), { fetch: r3.fetch, ledgerStore: store, now: c.now });
     expect(r3.pages()).toEqual([]);
+  });
+});
+
+describe('runCrawlerPass — per-store enqueue caps', () => {
+  it('applies a per-store cap in place of the global one, leaving unnamed stores on the global cap', async () => {
+    const fake = makeFake({ catalog: (s, p) => ok(s, p, [`${s}-${p}a`, `${s}-${p}b`, `${s}-${p}c`], false) });
+    const store = createMemoryLedgerStore();
+    const s = await runCrawlerPass(
+      mkCfg({ mode: 'recent', stores: ['anitoys', 'orzgk'], maxEnqueuePerStore: 50, storeEnqueueCaps: { anitoys: 2 } }),
+      { fetch: fake.fetch, ledgerStore: store, now: clock().now },
+    );
+
+    expect(fake.posted().filter((u) => u.includes('anitoys'))).toEqual([collectUrl('anitoys', 'anitoys-1a'), collectUrl('anitoys', 'anitoys-1b')]);
+    expect(fake.posted().filter((u) => u.includes('orzgk')).length).toBe(3);
+    expect(s.stores.find((x) => x.siteId === 'anitoys')).toMatchObject({ capApplied: 2, enqueued: 2 });
+    expect(s.stores.find((x) => x.siteId === 'orzgk')).toMatchObject({ capApplied: 50, enqueued: 3 });
+  });
+
+  it('lists the effective per-store cap overrides on the run summary (only the ones that actually applied)', async () => {
+    const fake = makeFake({ catalog: (s, p) => ok(s, p, ['a'], false) });
+    const s = await runCrawlerPass(
+      mkCfg({ mode: 'recent', stores: ['anitoys', 'orzgk'], storeEnqueueCaps: { anitoys: 15, elsewhere: 4 } }),
+      { fetch: fake.fetch, ledgerStore: createMemoryLedgerStore(), now: clock().now },
+    );
+    expect(s.enqueueCapOverrides).toEqual({ anitoys: 15 });
+  });
+
+  it('a per-store cap of 0 skips the store entirely (no requests, no ledger writes) while the others run', async () => {
+    const fake = makeFake({ catalog: (s, p) => ok(s, p, ['a'], false) });
+    const store = createMemoryLedgerStore();
+    const s = await runCrawlerPass(
+      mkCfg({ mode: 'both', stores: ['anitoys', 'orzgk'], storeEnqueueCaps: { anitoys: 0 } }),
+      { fetch: fake.fetch, ledgerStore: store, now: clock().now },
+    );
+
+    expect(fake.catalogCalls().every(([site]) => site === 'orzgk')).toBe(true);
+    expect(fake.pages('anitoys')).toEqual([]);
+    expect(store.saveLog.includes('anitoys')).toBe(false);
+    expect(store.files.has('anitoys')).toBe(false);
+    expect(s.stores.find((x) => x.siteId === 'anitoys')).toMatchObject({ capApplied: 0, pagesFetched: 0, discovered: 0, enqueued: 0, errors: 0 });
+    expect(s.enqueueCapOverrides).toEqual({ anitoys: 0 });
+  });
+
+  it('a global maxEnqueuePerStore of 0 stays a discovery-only dry run (a page IS fetched) for unnamed stores', async () => {
+    const fake = makeFake({ catalog: (s, p) => ok(s, p, ['a'], false) });
+    const s = await runCrawlerPass(
+      mkCfg({ mode: 'recent', stores: ['orzgk'], maxEnqueuePerStore: 0 }),
+      { fetch: fake.fetch, ledgerStore: createMemoryLedgerStore(), now: clock().now },
+    );
+    expect(fake.pages('orzgk')).toEqual([1]);
+    expect(fake.posted()).toEqual([]);
+    expect(s.stores[0]).toMatchObject({ capApplied: 0, discovered: 1, enqueued: 0 });
+  });
+});
+
+/**
+ * ID-RANGE BACKFILL — a store whose ids are sequential (mfc: ~3.6M numeric item ids) needs no
+ * listing to be enumerated: the crawler walks the id space DOWNWARD from a frontier, a bounded
+ * window per run, resuming a durable cursor. The ledger's enqueued map is still the dedup, the
+ * store's enqueue cap is still the ceiling, and ids that do not exist are the ingest's 404s, not
+ * the crawler's problem.
+ */
+describe('runCrawlerPass — id-range backfill', () => {
+  /** A config that does the id-range walk and NOTHING else (no listing pages at all). */
+  const rangeOnly = (over: Partial<CrawlerConfig> = {}): CrawlerConfig =>
+    mkCfg({ mode: 'backfill', backfillPagesPerRun: 0, stores: ['mfc'], rangeStores: ['mfc'], rangeIdsPerRun: 5, ...over });
+
+  it('walks a window DOWN from the env-seeded frontier, POSTs every id and persists the cursor below the window', async () => {
+    const fake = makeFake({ catalog: (s, p) => failed(s) });
+    const store = createMemoryLedgerStore();
+    const s = await runCrawlerPass(rangeOnly({ rangeFrontiers: { mfc: 500 } }), { fetch: fake.fetch, ledgerStore: store, now: clock().now });
+
+    expect(fake.rangeCalls()).toEqual([['mfc', 500, 5]]);
+    expect(fake.posted()).toEqual(['500', '499', '498', '497', '496'].map((id) => collectUrl('mfc', id)));
+    expect(store.files.get('mfc')!.range).toEqual({ cursor: 495, frontier: 500, seed: 500, updatedAt: iso(T0) });
+    expect(s.stores[0]).toMatchObject({ siteId: 'mfc', rangeWalked: 5, rangeCursor: 495, rangeFrontier: 500, discovered: 5, enqueued: 5, errors: 0 });
+    expect(s.totalRangeWalked).toBe(5);
+  });
+
+  it('prefers the highest numeric itemId the ledger has seen over the env seed; ids already enqueued are skipped but still consume the walk', async () => {
+    const fake = makeFake({ catalog: (s, p) => failed(s) });
+    const store = createMemoryLedgerStore({ mfc: ledgerWith('mfc', ['800', '799', 'not-a-number', '12'], T0 - 1000) });
+    const s = await runCrawlerPass(rangeOnly({ rangeIdsPerRun: 3, rangeFrontiers: { mfc: 500 } }), { fetch: fake.fetch, ledgerStore: store, now: clock().now });
+
+    expect(fake.rangeCalls()).toEqual([['mfc', 800, 3]]);
+    expect(fake.posted()).toEqual([collectUrl('mfc', '798')]);
+    // The ledger's own highest id wins the FIRST frontier; the env seed is only recorded, so that a
+    // later change to it is detectable.
+    expect(store.files.get('mfc')!.range).toEqual({ cursor: 797, frontier: 800, seed: 500, updatedAt: iso(T0) });
+    expect(s.stores[0]).toMatchObject({ rangeWalked: 3, rangeCursor: 797, rangeFrontier: 800, discovered: 3, known: 2, enqueued: 1 });
+  });
+
+  it('resumes the persisted cursor on the next run and never re-walks an id', async () => {
+    const store = createMemoryLedgerStore();
+    const cfg = rangeOnly({ rangeIdsPerRun: 4, rangeFrontiers: { mfc: 20 } });
+
+    const first = makeFake({ catalog: (s) => failed(s) });
+    await runCrawlerPass(cfg, { fetch: first.fetch, ledgerStore: store, now: clock().now });
+    expect(first.rangeCalls()).toEqual([['mfc', 20, 4]]);
+
+    const second = makeFake({ catalog: (s) => failed(s) });
+    const s2 = await runCrawlerPass(cfg, { fetch: second.fetch, ledgerStore: store, now: clock().now });
+    expect(second.rangeCalls()).toEqual([['mfc', 16, 4]]);
+    expect(second.posted()).toEqual(['16', '15', '14', '13'].map((id) => collectUrl('mfc', id)));
+    expect(store.files.get('mfc')!.range!.cursor).toBe(12);
+    expect(s2.stores[0]).toMatchObject({ rangeWalked: 4, rangeCursor: 12 });
+  });
+
+  it('shares the store enqueue cap: the cursor advances ONLY over the ids actually handled, the rest are re-walked next run', async () => {
+    const fake = makeFake({ catalog: (s) => failed(s) });
+    const store = createMemoryLedgerStore();
+    const s = await runCrawlerPass(rangeOnly({ rangeIdsPerRun: 5, storeEnqueueCaps: { mfc: 2 }, rangeFrontiers: { mfc: 500 } }), {
+      fetch: fake.fetch,
+      ledgerStore: store,
+      now: clock().now,
+    });
+
+    expect(fake.posted()).toEqual([collectUrl('mfc', '500'), collectUrl('mfc', '499')]);
+    expect(store.files.get('mfc')!.range!.cursor).toBe(498);
+    expect(s.stores[0]).toMatchObject({ capApplied: 2, rangeWalked: 2, rangeCursor: 498, enqueued: 2 });
+  });
+
+  it('skips the walk with a WARN, and no request, when there is no frontier at all (empty ledger, no env seed)', async () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      const fake = makeFake({ catalog: (s) => failed(s) });
+      const store = createMemoryLedgerStore();
+      const s = await runCrawlerPass(rangeOnly(), { fetch: fake.fetch, ledgerStore: store, now: clock().now });
+
+      expect(fake.calls).toEqual([]);
+      expect(store.saveLog).toEqual([]);
+      expect(s.stores[0]).toMatchObject({ rangeWalked: 0, rangeCursor: null, rangeFrontier: null });
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('no frontier'))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('walks only the stores named in rangeStores', async () => {
+    const fake = makeFake({ catalog: (s, p) => ok(s, p, [], false) });
+    const s = await runCrawlerPass(
+      rangeOnly({ stores: ['mfc', 'orzgk'], rangeStores: ['mfc'], rangeFrontiers: { mfc: 9, orzgk: 9 } }),
+      { fetch: fake.fetch, ledgerStore: createMemoryLedgerStore(), now: clock().now },
+    );
+    expect(fake.rangeCalls().map(([site]) => site)).toEqual(['mfc']);
+    expect(s.stores.find((x) => x.siteId === 'orzgk')).toMatchObject({ rangeWalked: 0, rangeCursor: null });
+  });
+
+  it('runs AFTER the recent listing pass, and still runs when the listing axis answers 422 unsupported (mfc has no byListing yet)', async () => {
+    const listing = makeFake({ catalog: (s, p) => ok(s, p, [`${p}a`], p === 1) });
+    await runCrawlerPass(
+      mkCfg({ mode: 'both', recentMaxPages: 2, backfillPagesPerRun: 0, stores: ['mfc'], rangeStores: ['mfc'], rangeIdsPerRun: 2, rangeFrontiers: { mfc: 9 } }),
+      { fetch: listing.fetch, ledgerStore: createMemoryLedgerStore(), now: clock().now },
+    );
+    const order = listing.calls.filter((c) => c.url.includes('/catalog')).map((c) => (c.url.includes('range=1') ? 'range' : 'page'));
+    expect(order).toEqual(['page', 'page', 'range']);
+
+    const unsup = makeFake({ catalog: (s) => unsupported(s) });
+    const s = await runCrawlerPass(
+      mkCfg({ mode: 'both', backfillPagesPerRun: 5, stores: ['mfc'], rangeStores: ['mfc'], rangeIdsPerRun: 2, rangeFrontiers: { mfc: 9 } }),
+      { fetch: unsup.fetch, ledgerStore: createMemoryLedgerStore(), now: clock().now },
+    );
+    expect(unsup.pages('mfc')).toEqual([1]); // the 422 stopped the LISTING walk (backfill made no further page GET)
+    expect(unsup.rangeCalls()).toEqual([['mfc', 9, 2]]);
+    expect(unsup.posted()).toEqual([collectUrl('mfc', '9'), collectUrl('mfc', '8')]);
+    expect(s.stores[0]).toMatchObject({ errors: 1, rangeWalked: 2, rangeCursor: 7 });
+  });
+
+  it('a cooldown / a sick scraper on the listing axis DOES stop the range walk too (same host, same egress)', async () => {
+    const cool = makeFake({ catalog: (s) => cooldown(s) });
+    const s = await runCrawlerPass(
+      mkCfg({ mode: 'both', stores: ['mfc'], rangeStores: ['mfc'], rangeIdsPerRun: 2, rangeFrontiers: { mfc: 9 } }),
+      { fetch: cool.fetch, ledgerStore: createMemoryLedgerStore(), now: clock().now },
+    );
+    expect(cool.rangeCalls()).toEqual([]);
+    expect(s.stores[0]).toMatchObject({ skipped: 1, rangeWalked: 0 });
+  });
+
+  it('stops at the id floor: the window bottoms out at id 1, the cursor lands on 0 and no further run requests anything', async () => {
+    const store = createMemoryLedgerStore();
+    const cfg = rangeOnly({ rangeIdsPerRun: 5, rangeFrontiers: { mfc: 3 } });
+
+    const first = makeFake({ catalog: (s) => failed(s) });
+    const s1 = await runCrawlerPass(cfg, { fetch: first.fetch, ledgerStore: store, now: clock().now });
+    expect(first.posted()).toEqual(['3', '2', '1'].map((id) => collectUrl('mfc', id)));
+    expect(store.files.get('mfc')!.range!.cursor).toBe(0);
+    expect(s1.stores[0]).toMatchObject({ rangeWalked: 3, rangeCursor: 0 });
+
+    const second = makeFake({ catalog: (s) => failed(s) });
+    const s2 = await runCrawlerPass(cfg, { fetch: second.fetch, ledgerStore: store, now: clock().now });
+    expect(second.calls).toEqual([]);
+    expect(s2.stores[0]).toMatchObject({ rangeWalked: 0, rangeCursor: 0 });
+  });
+
+  it('422 on the RANGE axis (the store declares no byRange) → errors++, no cursor written', async () => {
+    const fake = makeFake({ catalog: (s) => failed(s), range: (s) => unsupported(s) });
+    const store = createMemoryLedgerStore();
+    const s = await runCrawlerPass(rangeOnly({ rangeFrontiers: { mfc: 500 } }), { fetch: fake.fetch, ledgerStore: store, now: clock().now });
+
+    expect(fake.posted()).toEqual([]);
+    expect(store.saveLog).toEqual([]);
+    expect(s.stores[0]).toMatchObject({ errors: 1, rangeWalked: 0, rangeCursor: null });
+  });
+
+  it('holds the cursor when /ingest/scrape rejected EVERY id in the window (a ruleset/engine skew burns no id space)', async () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      const store = createMemoryLedgerStore();
+      const cfg = rangeOnly({ rangeFrontiers: { mfc: 500 } });
+      const reject = { status: 422, body: { success: false, message: 'No plugin ruleset matches this URL' } };
+
+      const first = makeFake({ catalog: (s) => failed(s), ingest: () => reject });
+      const s1 = await runCrawlerPass(cfg, { fetch: first.fetch, ledgerStore: store, now: clock().now });
+      expect(first.posted().length).toBe(5);
+      expect(Object.keys(store.files.get('mfc')?.enqueued ?? {})).toEqual([]);
+      expect(store.saveLog).toEqual([]);
+      expect(s1.stores[0]).toMatchObject({ errors: 5, enqueued: 0, rangeCursor: null });
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('rejected'))).toBe(true);
+
+      // Next run re-walks the SAME window — the ids are not below a cursor that nothing collected.
+      const second = makeFake({ catalog: (s) => failed(s) });
+      await runCrawlerPass(cfg, { fetch: second.fetch, ledgerStore: store, now: clock().now });
+      expect(second.rangeCalls()).toEqual([['mfc', 500, 5]]);
+      expect(second.posted().length).toBe(5);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('a window with at least one accepted id still advances over a single rejected one', async () => {
+    const store = createMemoryLedgerStore();
+    const fake = makeFake({
+      catalog: (s) => failed(s),
+      ingest: (u) => (u.endsWith('/499') ? { status: 422, body: { success: false } } : { status: 202, body: { success: true, deduplicated: false } }),
+    });
+    const s = await runCrawlerPass(rangeOnly({ rangeIdsPerRun: 3, rangeFrontiers: { mfc: 500 } }), {
+      fetch: fake.fetch,
+      ledgerStore: store,
+      now: clock().now,
+    });
+    expect(store.files.get('mfc')!.range!.cursor).toBe(497);
+    expect(s.stores[0]).toMatchObject({ enqueued: 2, errors: 1, rangeWalked: 3, rangeCursor: 497 });
+  });
+
+  it('refuses a window that is not the descending run it asked for — no POST, no cursor movement', async () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      const store = createMemoryLedgerStore();
+      // A window whose first item is unusable (dropped by sanitize) would otherwise move the cursor
+      // by an ARRAY INDEX and skip id 500 forever.
+      const skewed = (siteId: string, from: number) => ({
+        status: 200,
+        body: {
+          siteId,
+          from,
+          items: [{ itemId: null }, ...[499, 498, 497, 496].map((id) => ({ itemId: String(id), collectUrl: collectUrl(siteId, String(id)) }))],
+          hasMore: true,
+          count: 5,
+        },
+      });
+      const fake = makeFake({ catalog: (s) => failed(s), range: skewed });
+      const s = await runCrawlerPass(rangeOnly({ rangeFrontiers: { mfc: 500 } }), { fetch: fake.fetch, ledgerStore: store, now: clock().now });
+
+      expect(fake.posted()).toEqual([]);
+      expect(store.saveLog).toEqual([]);
+      expect(s.stores[0]).toMatchObject({ errors: 1, rangeWalked: 0, rangeCursor: null });
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('descending run'))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('accepts a window SHORTER than the one it asked for (the engine clamps at 200) and moves the cursor by the ids returned', async () => {
+    const store = createMemoryLedgerStore();
+    const short = (siteId: string, from: number) => okRange(siteId, from, 3); // asked for 5, served 3
+    const fake = makeFake({ catalog: (s) => failed(s), range: short });
+    const s = await runCrawlerPass(rangeOnly({ rangeFrontiers: { mfc: 500 } }), { fetch: fake.fetch, ledgerStore: store, now: clock().now });
+
+    expect(fake.rangeCalls()).toEqual([['mfc', 500, 5]]);
+    expect(fake.posted()).toEqual(['500', '499', '498'].map((id) => collectUrl('mfc', id)));
+    expect(store.files.get('mfc')!.range!.cursor).toBe(497);
+    expect(s.stores[0]).toMatchObject({ rangeWalked: 3, rangeCursor: 497, errors: 0 });
+  });
+
+  it('reports the cursor the ledger actually holds: a failed save leaves rangeCursor/rangeFrontier where they were', async () => {
+    const mem = createMemoryLedgerStore();
+    const saveFail = { load: mem.load, save: async () => { throw new Error('ENOSPC'); } };
+    const fake = makeFake({ catalog: (s) => failed(s) });
+    const s = await runCrawlerPass(rangeOnly({ rangeFrontiers: { mfc: 500 } }), { fetch: fake.fetch, ledgerStore: saveFail, now: clock().now });
+
+    expect(fake.posted().length).toBe(5);
+    expect(mem.files.has('mfc')).toBe(false);
+    // The walk did happen (5 ids POSTed) but NOTHING is durable — reporting cursor 495 would show
+    // progress an operator's next run will re-do.
+    expect(s.stores[0]).toMatchObject({ errors: 1, rangeWalked: 5, rangeCursor: null, rangeFrontier: null });
+  });
+
+  it('re-seeds the walk when CRAWLER_RANGE_FRONTIER_<SITEID> CHANGES — the only lever over a wrong seed or ids minted above the frontier', async () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      const store = createMemoryLedgerStore();
+      const first = makeFake({ catalog: (s) => failed(s) });
+      await runCrawlerPass(rangeOnly({ rangeIdsPerRun: 2, rangeFrontiers: { mfc: 500 } }), { fetch: first.fetch, ledgerStore: store, now: clock().now });
+      expect(first.rangeCalls()).toEqual([['mfc', 500, 2]]);
+      expect(store.files.get('mfc')!.range).toMatchObject({ cursor: 498, frontier: 500, seed: 500 });
+
+      // The operator raises the seed in the manifest: the walk restarts from the new top.
+      const second = makeFake({ catalog: (s) => failed(s) });
+      const s2 = await runCrawlerPass(rangeOnly({ rangeIdsPerRun: 2, rangeFrontiers: { mfc: 600 } }), { fetch: second.fetch, ledgerStore: store, now: clock().now });
+      expect(second.rangeCalls()).toEqual([['mfc', 600, 2]]);
+      expect(store.files.get('mfc')!.range).toMatchObject({ cursor: 598, frontier: 600, seed: 600 });
+      expect(s2.stores[0]).toMatchObject({ rangeFrontier: 600, rangeCursor: 598 });
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('re-seeded'))).toBe(true);
+
+      // Unchanged from here on: the walk simply resumes its cursor.
+      const third = makeFake({ catalog: (s) => failed(s) });
+      await runCrawlerPass(rangeOnly({ rangeIdsPerRun: 2, rangeFrontiers: { mfc: 600 } }), { fetch: third.fetch, ledgerStore: store, now: clock().now });
+      expect(third.rangeCalls()).toEqual([['mfc', 598, 2]]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('a new seed revives a walk that had reached the id floor', async () => {
+    const store = createMemoryLedgerStore({ mfc: ledgerWith('mfc', [], T0, { range: { cursor: 0, frontier: 3, seed: 3 } }) });
+    const fake = makeFake({ catalog: (s) => failed(s) });
+    await runCrawlerPass(rangeOnly({ rangeIdsPerRun: 2, rangeFrontiers: { mfc: 900 } }), { fetch: fake.fetch, ledgerStore: store, now: clock().now });
+    expect(fake.rangeCalls()).toEqual([['mfc', 900, 2]]);
+    expect(store.files.get('mfc')!.range).toMatchObject({ cursor: 898, frontier: 900, seed: 900 });
+  });
+
+  it('a 503 cooldown on the RANGE axis skips the store for the run: no POSTs, no cursor written', async () => {
+    const fake = makeFake({ catalog: (s) => failed(s), range: (s) => cooldown(s) });
+    const store = createMemoryLedgerStore();
+    const s = await runCrawlerPass(rangeOnly({ rangeFrontiers: { mfc: 500 } }), { fetch: fake.fetch, ledgerStore: store, now: clock().now });
+
+    expect(fake.posted()).toEqual([]);
+    expect(store.saveLog).toEqual([]);
+    expect(s.stores[0]).toMatchObject({ skipped: 1, rangeWalked: 0, rangeCursor: null });
+  });
+
+  it('says WHY the walk did not run: not-configured / cap / budget / no-frontier / floor, and null when it did', async () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      // ran
+      const okRun = makeFake({ catalog: (s) => failed(s) });
+      const ran = await runCrawlerPass(rangeOnly({ rangeFrontiers: { mfc: 9 } }), { fetch: okRun.fetch, ledgerStore: createMemoryLedgerStore(), now: clock().now });
+      expect(ran.stores[0]).toMatchObject({ rangeSkipped: null });
+
+      // not configured for the walk at all
+      const other = makeFake({ catalog: (s, p) => ok(s, p, [], false) });
+      const notCfg = await runCrawlerPass(rangeOnly({ stores: ['mfc', 'orzgk'], rangeStores: ['mfc'], rangeFrontiers: { mfc: 9 } }), {
+        fetch: other.fetch,
+        ledgerStore: createMemoryLedgerStore(),
+        now: clock().now,
+      });
+      expect(notCfg.stores.find((x) => x.siteId === 'orzgk')).toMatchObject({ rangeSkipped: 'not-configured' });
+
+      // the listing phases spent the store's whole enqueue cap
+      const busy = makeFake({ catalog: (s, p) => ok(s, p, [`${p}a`, `${p}b`], false) });
+      const capped = await runCrawlerPass(
+        mkCfg({ mode: 'both', backfillPagesPerRun: 0, stores: ['mfc'], rangeStores: ['mfc'], rangeIdsPerRun: 2, storeEnqueueCaps: { mfc: 1 }, rangeFrontiers: { mfc: 9 } }),
+        { fetch: busy.fetch, ledgerStore: createMemoryLedgerStore(), now: clock().now },
+      );
+      expect(busy.rangeCalls()).toEqual([]);
+      expect(capped.stores[0]).toMatchObject({ rangeSkipped: 'cap', rangeWalked: 0 });
+
+      // the global request budget was gone before the walk's own GET
+      const broke = makeFake({ catalog: (s, p) => ok(s, p, [], false) });
+      const budget = await runCrawlerPass(
+        mkCfg({ mode: 'both', recentMaxPages: 1, backfillPagesPerRun: 0, maxRequests: 1, stores: ['mfc'], rangeStores: ['mfc'], rangeIdsPerRun: 2, rangeFrontiers: { mfc: 9 } }),
+        { fetch: broke.fetch, ledgerStore: createMemoryLedgerStore(), now: clock().now },
+      );
+      expect(broke.rangeCalls()).toEqual([]);
+      expect(budget.stores[0]).toMatchObject({ rangeSkipped: 'budget' });
+
+      // no frontier at all, and a walk that already reached the floor
+      const none = makeFake({ catalog: (s) => failed(s) });
+      const noFrontier = await runCrawlerPass(rangeOnly(), { fetch: none.fetch, ledgerStore: createMemoryLedgerStore(), now: clock().now });
+      expect(noFrontier.stores[0]).toMatchObject({ rangeSkipped: 'no-frontier' });
+
+      const done = makeFake({ catalog: (s) => failed(s) });
+      const floor = await runCrawlerPass(rangeOnly({ rangeFrontiers: { mfc: 3 } }), {
+        fetch: done.fetch,
+        ledgerStore: createMemoryLedgerStore({ mfc: ledgerWith('mfc', [], T0, { range: { cursor: 0, frontier: 3, seed: 3 } }) }),
+        now: clock().now,
+      });
+      expect(floor.stores[0]).toMatchObject({ rangeSkipped: 'floor' });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('a window whose FIRST id the cap blocks moves nothing: no cursor, no ledger write, rangeSkipped cap', async () => {
+    const store = createMemoryLedgerStore();
+    // The listing spends the cap exactly (2 items, cap 2) without ever being cut short, so the walk
+    // still starts — and then cannot get its first id through.
+    const fake = makeFake({ catalog: (s, p) => ok(s, p, [`${p}a`, `${p}b`], false) });
+    const sum = await runCrawlerPass(
+      mkCfg({ mode: 'both', recentMaxPages: 1, backfillPagesPerRun: 0, stores: ['mfc'], rangeStores: ['mfc'], rangeIdsPerRun: 2, storeEnqueueCaps: { mfc: 2 }, rangeFrontiers: { mfc: 9 } }),
+      { fetch: fake.fetch, ledgerStore: store, now: clock().now },
+    );
+
+    expect(fake.rangeCalls()).toEqual([['mfc', 9, 2]]);
+    expect(fake.posted()).toEqual([collectUrl('mfc', '1a'), collectUrl('mfc', '1b')]);
+    expect(store.files.get('mfc')!.range).toBeUndefined();
+    expect(sum.stores[0]).toMatchObject({ rangeWalked: 0, rangeCursor: null, rangeSkipped: 'cap' });
+  });
+
+  it('WARNs when CRAWLER_RANGE_STORES or CRAWLER_STORE_ENQUEUE_CAPS names a store that is not being crawled', async () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      const fake = makeFake({ catalog: (s, p) => ok(s, p, [], false) });
+      await runCrawlerPass(
+        mkCfg({ mode: 'both', stores: ['orzgk'], rangeStores: ['mfc'], storeEnqueueCaps: { anitoys: 15 } }),
+        { fetch: fake.fetch, ledgerStore: createMemoryLedgerStore(), now: clock().now },
+      );
+      const lines = warn.mock.calls.map((c) => `${String(c[0])} ${JSON.stringify(c[1])}`);
+      expect(lines.some((l) => l.includes('CRAWLER_RANGE_STORES') && l.includes('mfc'))).toBe(true);
+      expect(lines.some((l) => l.includes('CRAWLER_STORE_ENQUEUE_CAPS') && l.includes('anitoys'))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("mode 'recent' makes no id-range request at all", async () => {
+    const fake = makeFake({ catalog: (s, p) => ok(s, p, [], false) });
+    await runCrawlerPass(rangeOnly({ mode: 'recent', rangeFrontiers: { mfc: 9 } }), {
+      fetch: fake.fetch,
+      ledgerStore: createMemoryLedgerStore(),
+      now: clock().now,
+    });
+    expect(fake.rangeCalls()).toEqual([]);
   });
 });

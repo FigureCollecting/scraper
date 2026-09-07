@@ -4,6 +4,7 @@
  * conservative default so an unconfigured run is safe on the single egress IP.
  */
 import { loadCrawlerConfig, DEFAULT_CRAWLER_STORES } from '../../crawler/config';
+import { logger } from '../../utils/logger';
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -124,5 +125,64 @@ describe('loadCrawlerConfig', () => {
   it('reads CRAWLER_LEDGER_DIR, falling back to the default when blank', () => {
     expect(loadCrawlerConfig({ CRAWLER_LEDGER_DIR: '/data/ledger' }).ledgerDir).toBe('/data/ledger');
     expect(loadCrawlerConfig({ CRAWLER_LEDGER_DIR: '   ' }).ledgerDir).toBe('/var/lib/ingest-crawler');
+  });
+
+  it('defaults the per-store enqueue caps to none and the id-range knobs to off / 50', () => {
+    const c = loadCrawlerConfig({});
+    expect(c.storeEnqueueCaps).toEqual({});
+    expect(c.rangeStores).toEqual([]);
+    expect(c.rangeIdsPerRun).toBe(50);
+    expect(c.rangeFrontiers).toEqual({});
+  });
+
+  it('parses CRAWLER_STORE_ENQUEUE_CAPS as a csv of siteId:cap, trimming whitespace and honoring 0', () => {
+    const c = loadCrawlerConfig({ CRAWLER_STORE_ENQUEUE_CAPS: ' anitoys:15 , mfc:30 ,sugotoys:0 ' });
+    expect(c.storeEnqueueCaps).toEqual({ anitoys: 15, mfc: 30, sugotoys: 0 });
+  });
+
+  it('ignores a malformed per-store cap entry with a WARN, keeping the well-formed ones', () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      const c = loadCrawlerConfig({ CRAWLER_STORE_ENQUEUE_CAPS: 'anitoys:15,mfc,orzgk:-1,:9,bad site:3,x:1.5,y:abc,mfc:30' });
+      expect(c.storeEnqueueCaps).toEqual({ anitoys: 15, mfc: 30 });
+      const warned = warn.mock.calls.map((call) => String(call[0]));
+      expect(warned.every((m) => m.includes('CRAWLER_STORE_ENQUEUE_CAPS'))).toBe(true);
+      expect(warn).toHaveBeenCalledTimes(6);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('parses CRAWLER_RANGE_STORES, CRAWLER_RANGE_IDS_PER_RUN and the per-store CRAWLER_RANGE_FRONTIER_<SITEID> seeds', () => {
+    const c = loadCrawlerConfig({
+      CRAWLER_STORES: 'mfc,orzgk,good-smile',
+      CRAWLER_RANGE_STORES: ' mfc , good-smile ',
+      CRAWLER_RANGE_IDS_PER_RUN: '25',
+      CRAWLER_RANGE_FRONTIER_MFC: '3630000',
+      CRAWLER_RANGE_FRONTIER_GOOD_SMILE: '42',
+      CRAWLER_RANGE_FRONTIER_ORZGK: 'nope',
+    });
+    expect(c.rangeStores).toEqual(['mfc', 'good-smile']);
+    expect(c.rangeIdsPerRun).toBe(25);
+    expect(c.rangeFrontiers).toEqual({ mfc: 3630000, 'good-smile': 42 });
+  });
+
+  it('falls back to 50 ids per run on a non-positive or non-numeric CRAWLER_RANGE_IDS_PER_RUN', () => {
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_IDS_PER_RUN: '0' }).rangeIdsPerRun).toBe(50);
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_IDS_PER_RUN: 'x' }).rangeIdsPerRun).toBe(50);
+  });
+
+  it('clamps CRAWLER_RANGE_IDS_PER_RUN to the engine window ceiling (200) with a WARN naming the var', () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      expect(loadCrawlerConfig({ CRAWLER_RANGE_IDS_PER_RUN: '1000' }).rangeIdsPerRun).toBe(200);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('CRAWLER_RANGE_IDS_PER_RUN'))).toBe(true);
+      expect(warn).toHaveBeenCalledTimes(1);
+      // At or below the ceiling nothing is clamped and nothing is warned.
+      expect(loadCrawlerConfig({ CRAWLER_RANGE_IDS_PER_RUN: '200' }).rangeIdsPerRun).toBe(200);
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
