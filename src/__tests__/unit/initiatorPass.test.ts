@@ -9,6 +9,7 @@
  * /ingest responses). No real network, no live store, no real scraper.
  */
 import { runInitiatorPass, type FetchLike, type HttpResponseLike, type InitiatorConfig } from '../../initiator/initiator';
+import { logger } from '../../utils/logger';
 
 const waitFor = async (pred: () => boolean, timeoutMs = 3000): Promise<void> => {
   const start = Date.now();
@@ -654,5 +655,45 @@ describe('runInitiatorPass — default retry delay (no injected sleep)', () => {
     expect(fake.lookupCalls().length).toBe(2);
     expect(s.stores[0].lookupRetries).toBe(1);
     expect(s.stores[0].discovered).toBe(1);
+  });
+});
+
+describe('runInitiatorPass — enqueue fairness under a spent budget', () => {
+  it('spends the last of the budget round-robin across stores instead of on the first stores in the list', async () => {
+    const fake = makeFake({
+      lookup: (_term, store) => ({ status: 200, body: lookupWith({ [store]: [`https://${store}.test/1`, `https://${store}.test/2`] }) }),
+    });
+    // 3 lookups + 3 of the 6 discovered URLs fit the budget: every store must get one, not the head of the list two.
+    const s = await runInitiatorPass(
+      mkCfg({ stores: ['amiami', 'gkloot', 'orzgk'], terms: ['t'], maxUrlsPerStore: 2, maxRequests: 6 }),
+      { fetch: fake.fetch },
+    );
+    expect(s.totalDiscovered).toBe(6);
+    expect(s.totalEnqueued).toBe(3);
+    expect(s.budgetExhausted).toBe(true);
+    expect(s.stores.map((x) => x.enqueued)).toEqual([1, 1, 1]);
+  });
+
+  it('WARNs, with store and url in the message, for every URL the spent budget drops', async () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => {});
+    try {
+      const fake = makeFake({ lookup: () => ({ status: 200, body: lookupWith({ amiami: ['https://amiami.test/1', 'https://amiami.test/2'] }) }) });
+      await runInitiatorPass(mkCfg({ stores: ['amiami'], terms: ['t'], maxUrlsPerStore: 2, maxRequests: 2 }), { fetch: fake.fetch });
+      const dropped = warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('ingest skipped'));
+      expect(dropped).toHaveLength(1);
+      expect(dropped[0]).toContain('store=amiami');
+      expect(dropped[0]).toContain('https://amiami.test/2');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('does not double-POST a URL when a siteId appears twice in INITIATOR_STORES', async () => {
+    const fake = makeFake({ lookup: () => ({ status: 200, body: lookupWith({ amiami: ['https://amiami.test/x'] }) }) });
+    const s = await runInitiatorPass(mkCfg({ stores: ['amiami', 'amiami'], terms: ['t'] }), { fetch: fake.fetch });
+    expect(fake.lookupCalls().length).toBe(1);
+    expect(fake.ingestCalls().map((c) => c.body.url)).toEqual(['https://amiami.test/x']);
+    expect(s.totalEnqueued).toBe(1);
+    expect(s.totalDiscovered).toBe(1);
   });
 });

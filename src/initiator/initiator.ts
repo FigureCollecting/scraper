@@ -325,9 +325,19 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
 
   // Phase 2 — ENQUEUE (per store, per discovered URL). One bad store/URL is logged
   // and skipped; it never aborts the rest of the pass.
+  //
+  // ROUND-ROBIN, not store-major: the gate reserves its budget slot in submission
+  // order, so a store-major list makes a spent budget erase the TAIL stores entirely
+  // (deterministically, every pass). Interleaved, an exhausted budget costs each store
+  // its Nth URL instead. The store list is deduped so a siteId repeated in
+  // INITIATOR_STORES cannot POST the same URL twice.
+  const perStoreUrls = uniqueStores.map((siteId) => ({ siteId, urls: [...setFor(siteId)] }));
   const flat: Array<{ siteId: string; url: string }> = [];
-  for (const siteId of config.stores) {
-    for (const url of setFor(siteId)) flat.push({ siteId, url });
+  const deepest = perStoreUrls.reduce((n, s) => Math.max(n, s.urls.length), 0);
+  for (let i = 0; i < deepest; i++) {
+    for (const { siteId, urls } of perStoreUrls) {
+      if (i < urls.length) flat.push({ siteId, url: urls[i] });
+    }
   }
 
   const enqueueOne = async ({ siteId, url }: { siteId: string; url: string }): Promise<void> => {
@@ -337,6 +347,7 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
       const r = await gate.run(() => httpPostJson(deps.fetch, ingestUrl, { url }, config.requestTimeoutMs));
       if (r.status === 'budget-exhausted') {
         budgetExhausted = true;
+        logger.warn(`[INITIATOR] ingest skipped store=${siteId} (request budget spent) url=${url}`);
         return;
       }
       const res = r.value;
