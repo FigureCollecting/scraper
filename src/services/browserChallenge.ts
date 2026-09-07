@@ -9,12 +9,16 @@
  * first response carries `cf-mitigated: challenge` (or the title is the challenge page), poll until
  * the real document replaces it, bounded by a budget.
  *
- * WHAT ENDS THE WAIT is clearance evidence — a `cf_clearance` cookie for the URL's host — and NOT the
- * transient absence of challenge markers. Measured on www.suruga-ya.jp 2026-09-07: the 403 is
- * answered by the interstitial navigating to `…?__cf_chl_rt_tk=…` and back, and through that window
- * the page has no title (localised in any case) and no `#challenge-running` / `#challenge-stage` in
- * the DOM. A wait that leaves on "no markers right now" left on its first poll and the lane captured
- * the interstitial; the stores that seemed to work were passing on timing luck.
+ * WHAT ENDS THE WAIT is the CONJUNCTION of four signals, never any one of them (see clearanceSettled):
+ * no challenge title or markers, no `__cf_chl_rt_tk` round-trip token in the URL, a document parsed
+ * past `loading`, and a `cf_clearance` cookie for the URL's host. Measured against www.suruga-ya.jp
+ * from the production pod on 2026-09-07: the 403 is answered by a navigation to
+ * `…?__cf_chl_rt_tk=…` and straight back (token gone by t+1.40 s with 8 s still to run), the
+ * `#challenge-running` / `#challenge-stage` containers are NEVER rendered on this variant, the
+ * clearance cookie lands at t+9.31 s while the page still reads "Just a moment...", and the store's
+ * own document arrives only after the reload that follows. A wait keyed on markers left on its first
+ * poll and the lane captured the interstitial; the stores that seemed to work were passing on timing
+ * luck. A wait keyed on the cookie alone would leave ~0.3 s early, mid-reload.
  *
  * Seeing a challenge is also the LEARNED signal that a host is gated. That matters beyond this
  * fetch: a gated host is served from then on by the long-lived browser for its egress (see
@@ -187,21 +191,31 @@ async function isDocumentLoading(page: ChallengeAwarePage): Promise<boolean> {
 }
 
 /**
- * Whether the REAL document is up, once a challenge has been seen and its markers are gone.
+ * Whether the REAL document is up, once a challenge has been seen and its title/markers are gone.
  *
- * The markers being gone is not evidence of anything: mid-challenge the interstitial navigates to
- * Cloudflare's round-trip URL and back, and in that window there is no title (it is localised in any
- * case) and no `#challenge-running` / `#challenge-stage` in the DOM. Leaving there captures the
- * interstitial — measured on www.suruga-ya.jp, 2026-09-07. So the wait leaves only on the cookie
- * Cloudflare sets when the challenge passes. A page that cannot report cookies falls back to the
- * older rule plus a grace: Cloudflare's own round-trip token in the URL, or a document still parsing,
- * both mean "not yet".
+ * Every one of these must hold, because each alone is a lie the measured interstitial tells (probe
+ * against www.suruga-ya.jp from the production pod, 2026-09-07 03:06):
+ *
+ *   - NO ROUND-TRIP TOKEN in the URL. The interstitial answers the challenge by navigating to
+ *     `…?__cf_chl_rt_tk=…` and back; the token is present at t+1.09 s and gone by t+1.40 s, while
+ *     the challenge still has 8 s to run.
+ *   - THE DOCUMENT IS PARSED. The clearance is followed by a RELOAD into the store's own page, and
+ *     leaving during that reload captures whatever the previous document left behind.
+ *   - THE CLEARANCE COOKIE IS IN HAND for this host — the only positive evidence Cloudflare emits.
+ *
+ * And the caller's own title/marker check is the fourth: the cookie lands at t+9.31 s while the page
+ * still reads "Just a moment...", ~0.3 s BEFORE the reload, so the cookie alone would capture the
+ * interstitial with a valid clearance in hand. Markers are worth least of all — this variant never
+ * renders `#challenge-running` / `#challenge-stage` at all.
+ *
+ * A page that cannot report cookies (a test double) has no positive evidence to offer, so for it the
+ * first two checks are the whole grace.
  */
 async function clearanceSettled(page: ChallengeAwarePage, host: string | undefined): Promise<boolean> {
-  const cleared = await hasClearanceCookie(page, host);
-  if (cleared !== undefined) return cleared;
   if (typeof page.url === 'function' && CHALLENGE_ROUND_TRIP.test(page.url() ?? '')) return false;
-  return !(await isDocumentLoading(page));
+  if (await isDocumentLoading(page)) return false;
+  const cleared = await hasClearanceCookie(page, host);
+  return cleared ?? true;
 }
 
 /**
