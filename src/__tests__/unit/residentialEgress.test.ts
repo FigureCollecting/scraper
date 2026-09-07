@@ -45,19 +45,52 @@ describe('resolveResidentialProxyUrl', () => {
     expect(warn).not.toHaveBeenCalled();
   });
 
-  it('accepts socks5h (DNS-through-proxy), http and https proxies, trimming surrounding whitespace', () => {
+  it('accepts http and https proxies, trimming surrounding whitespace', () => {
     const warn = jest.fn();
-    expect(resolveResidentialProxyUrl(env('socks5h://127.0.0.1:1055'), warn)).toBe('socks5h://127.0.0.1:1055');
     expect(resolveResidentialProxyUrl(env('http://proxy.test:3128'), warn)).toBe('http://proxy.test:3128');
     expect(resolveResidentialProxyUrl(env(' https://proxy.test:8443 '), warn)).toBe('https://proxy.test:8443');
     expect(warn).not.toHaveBeenCalled();
   });
 
-  it('keeps embedded credentials in the resolved value (the client needs them) — they are only redacted for display', () => {
+  /**
+   * BROWSER-LANE REALITY (probed against this repo's own Chromium, 2026-09-07): Chromium's
+   * `--proxy-server` understands `socks5://host:port` and `http(s)://host:port` and NOTHING else —
+   * `socks5h://` and ANY credentialed proxy URL both die with `net::ERR_NO_SUPPORTED_PROXIES`
+   * before a single byte leaves. impit accepts both, so a value that only impit can use would give
+   * a half-working residential cohort (impit fetches succeed, every browser fetch dies opaquely).
+   * The resolver therefore only ever hands the lanes a shape EVERY lane can use.
+   */
+  it('canonicalizes socks5h:// to socks5:// — the DNS-through-proxy spelling Chromium rejects', () => {
     const warn = jest.fn();
-    expect(resolveResidentialProxyUrl(env('socks5://user:FAKE_PASS@proxy.test:1055'), warn))
-      .toBe('socks5://user:FAKE_PASS@proxy.test:1055');
+    expect(resolveResidentialProxyUrl(env('socks5h://127.0.0.1:1055'), warn)).toBe('socks5://127.0.0.1:1055');
+    expect(resolveResidentialProxyUrl(env('socks5h://egress-proxy.fc.svc.cluster.local:1055'), warn))
+      .toBe('socks5://egress-proxy.fc.svc.cluster.local:1055');
     expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('IGNORES an embedded-credential proxy (Chromium cannot carry them) with one warning that says so and never echoes them', () => {
+    const warn = jest.fn();
+    expect(resolveResidentialProxyUrl(env('socks5://user:FAKE_PASS@proxy.test:1055'), warn)).toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain('RESIDENTIAL_PROXY_URL');
+    expect(warn.mock.calls[0][0]).toContain('credential');
+    expect(warn.mock.calls[0][0]).not.toContain('FAKE_PASS');
+    expect(warn.mock.calls[0][0]).not.toContain('proxy.test');
+  });
+
+  it('ignores a credentialed http(s) proxy for the same reason (one rule for every lane)', () => {
+    const warn = jest.fn();
+    expect(resolveResidentialProxyUrl(env('http://user:FAKE_PASS@proxy.test:3128'), warn)).toBeUndefined();
+    expect(resolveResidentialProxyUrl(env('socks5h://user:FAKE_PASS@proxy.test:1055'), warn)).toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('FAKE_PASS');
+  });
+
+  it('ignores a password-only credential too (no username, still a credential Chromium cannot carry)', () => {
+    const warn = jest.fn();
+    expect(resolveResidentialProxyUrl(env('socks5://:FAKE_PASS@proxy.test:1055'), warn)).toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain('credential');
   });
 
   it('ignores an unparseable value with exactly ONE warning that never echoes it', () => {
@@ -70,15 +103,25 @@ describe('resolveResidentialProxyUrl', () => {
 
   it('ignores a URL whose scheme is not socks5(h)/http(s), with one warning that never echoes credentials', () => {
     const warn = jest.fn();
+    expect(resolveResidentialProxyUrl(env('ftp://proxy.test:21'), warn)).toBeUndefined();
     expect(resolveResidentialProxyUrl(env('ftp://user:FAKE_PASS@proxy.test:21'), warn)).toBeUndefined();
-    expect(warn).toHaveBeenCalledTimes(1);
-    expect(warn.mock.calls[0][0]).not.toContain('FAKE_PASS');
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn.mock.calls[0][0]).toContain('scheme');
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('FAKE_PASS');
   });
 
   it('ignores a socks4 proxy (impit speaks it, but the browser lane cannot — one declared scheme set for every lane)', () => {
     const warn = jest.fn();
     expect(resolveResidentialProxyUrl(env('socks4://proxy.test:1080'), warn)).toBeUndefined();
     expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores a host-less proxy URL — it parses, but it names no proxy for any lane to dial', () => {
+    const warn = jest.fn();
+    expect(resolveResidentialProxyUrl(env('socks5://'), warn)).toBeUndefined();
+    expect(resolveResidentialProxyUrl(env('socks5h:///path'), warn)).toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn.mock.calls[0][0]).toContain('host');
   });
 
   it('is usable without a warn sink (the pure resolver has no side effects of its own)', () => {
@@ -112,7 +155,10 @@ describe('redactProxyUrl', () => {
   });
 
   it('never echoes an unparseable value — it degrades to a fixed placeholder', () => {
+    // Two distinct shapes: one that parses into a host-less `user:` URL (so a naive
+    // `${protocol}//${host}` would echo credential debris), and one that does not parse at all.
     expect(redactProxyUrl('user:FAKE_PASS@whatever')).toBe('<unparseable>');
+    expect(redactProxyUrl('not a url')).toBe('<unparseable>');
   });
 });
 

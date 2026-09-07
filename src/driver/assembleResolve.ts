@@ -26,15 +26,22 @@ import { isCloudflareChallenge } from '../services/engineServices/challengeDetec
 import { getChallengeCooldown, type ChallengeCooldown } from '../services/challengeCooldown.js';
 import { sanitizeForLog } from '../utils/security.js';
 import type { ProfileRegistry } from './profileRegistry.js';
-import type { ExtractContext, ExtractedData, ExtractionRuleset } from '@figurecollecting/scraper-plugin-contract';
+import type { ExtractContext, ExtractedData, ExtractionRuleset, SearchFetch } from '@figurecollecting/scraper-plugin-contract';
 
 export interface ResolveServices {
   /** The store registry (built from the engine's registered capabilities). */
   profiles: ProfileRegistry;
   /** URL → ruleset (engine ExtractionRegistryImpl.getRulesetForUrl); the ruleset's extract() confirms. */
   getRulesetForUrl: (url: string) => ExtractionRuleset | undefined;
-  /** Fetch a detail page's body (the pooled ScrapingService's scrapePage at the mount). */
-  fetchDetail: (url: string) => Promise<{ html: string; statusCode?: number }>;
+  /**
+   * Fetch a detail page's body (the pooled ScrapingService's scrapePage at the mount). The store's
+   * own `searchFetch` rides along so the WIRING layer can resolve the browser-lane options it
+   * declares — residential egress above all: a store gated on `egress: 'residential'` must be
+   * fetched through the proxy or refused, never contacted from the node IP because the confirm leg
+   * happens to be a different door than the search dispatchers. Passed only when the store declares
+   * one, so a store that declares nothing keeps the exact one-argument call shape it always had.
+   */
+  fetchDetail: (url: string, searchFetch?: SearchFetch) => Promise<{ html: string; statusCode?: number }>;
   /**
    * OPTIONAL per-id `ExtractContext` resolver (the crawlWorker `resolveContext` seam): the wiring
    * (engineResolve) builds it via `buildExtractContext`, so an extractAsync/extractMany ruleset's
@@ -156,7 +163,10 @@ export function assembleResolve(services: ResolveServices): Resolve {
           }
           // Record the attempt win or lose (the host was contacted either way — H1 records at
           // dispatch), completion-anchored like D8 so one map carries one consistent semantic.
-          const { html, statusCode } = await services.fetchDetail(url).finally(() => {
+          const { html, statusCode } = await (caps.searchFetch
+            ? services.fetchDetail(url, caps.searchFetch)
+            : services.fetchDetail(url)
+          ).finally(() => {
             if (host !== undefined) lastFetchedAt.set(host, now());
           });
           // A detail body that IS a Cloudflare challenge is NOT a confirm — the browser lane never

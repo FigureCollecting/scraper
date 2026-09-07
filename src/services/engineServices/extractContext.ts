@@ -18,19 +18,26 @@
  *
  * `batchFetch`/`officialApi` are left undefined (optional per contract 0.4.0) — not built this
  * increment. `scrapePage`/`scrapePageStealth` pass through to the real base scraping service the
- * caller supplies; `browserFetch`/`withBrowser`/`withPage` are NOT reachable via `fetchBody`
- * (which is deliberately a non-browser transport-only seam) and are stubbed to throw a clear
- * error if a ruleset ever calls them through `ExtractContext.scraping` — a loud failure, not a
- * silent no-op, if a future ruleset assumes more surface than this context provides.
+ * caller supplies, GATED on the store's declared egress (contract 0.7.0): a ruleset navigating a
+ * residential-gated store's follow-up page rides the configured proxy, or is refused. Those
+ * passthroughs are a door to the network exactly like `fetchBody`, and must not be the one that
+ * leaks a residential store onto the node IP.
+ *
+ * `browserFetch`/`withBrowser`/`withPage` are NOT reachable via `fetchBody` (which is deliberately
+ * a non-browser transport-only seam) and are stubbed to throw a clear error if a ruleset ever calls
+ * them through `ExtractContext.scraping` — a loud failure, not a silent no-op, if a future ruleset
+ * assumes more surface than this context provides.
  */
 import type {
   ExtractContext,
-  ScrapingService,
+  ScrapePageResult,
   SearchFetch,
   SiteConfig,
   PluginLogger,
 } from '@figurecollecting/scraper-plugin-contract';
 import type { CapturingFetch } from './capturingFetch.js';
+import type { EngineScrapePageOptions } from './scrapingService.js';
+import { getResidentialProxyUrl, resolveBrowserLaneOptions } from '../residentialEgress.js';
 
 /**
  * Default courtesy gap (ms) when a store profile declares no `rateLimit.baseDelayMs` — should be
@@ -41,8 +48,15 @@ import type { CapturingFetch } from './capturingFetch.js';
  */
 export const DEFAULT_FETCH_BODY_GAP_MS = 2000;
 
-/** Base page-fetch methods `fetchBody` is layered over; the only ones this context truly needs. */
-type BaseScraping = Pick<ScrapingService, 'scrapePage' | 'scrapePageStealth'>;
+/**
+ * Base page-fetch methods `fetchBody` is layered over; the only ones this context truly needs.
+ * Widened to the ENGINE's page options so the passthroughs can hand the lane the egress/readiness
+ * wiring resolved from the store's `searchFetch` (a contract `ScrapingService` still satisfies it).
+ */
+interface BaseScraping {
+  scrapePage(url: string, options?: EngineScrapePageOptions): Promise<ScrapePageResult>;
+  scrapePageStealth(url: string, options?: EngineScrapePageOptions): Promise<ScrapePageResult>;
+}
 
 export interface BuildExtractContextOptions {
   /** `ExtractContext.config` — the resolved store's SiteConfig (or StoreCapabilities, a superset). */
@@ -75,6 +89,8 @@ export interface BuildExtractContextOptions {
   now?: () => number;
   /** Injectable sleep (default a real `setTimeout` promise). */
   sleep?: (ms: number) => Promise<void>;
+  /** The engine's residential proxy (default: the process's RESIDENTIAL_PROXY_URL, resolved at boot). */
+  residentialProxyUrl?: () => string | undefined;
 }
 
 /** Lowercased, `www.`-stripped hostname; `undefined` on an unparseable URL (never throws). */
@@ -106,6 +122,23 @@ export function buildExtractContext(options: BuildExtractContextOptions): Extrac
   const gapMs = options.baseDelayMs ?? DEFAULT_FETCH_BODY_GAP_MS;
   const primaryHost = safeHostname(options.primaryUrl);
 
+  const resolveProxy = options.residentialProxyUrl ?? getResidentialProxyUrl;
+
+  /**
+   * The store's browser-lane wiring merged UNDER the ruleset's own page options: residential
+   * `proxyServer` + declared `waitFor`, resolved per navigation (the proxy is process config, but
+   * resolving it here keeps a hot-reloaded value honest). A residential store with no configured
+   * proxy THROWS the typed refusal — the ruleset's navigation fails loudly instead of leaving from
+   * the node IP. Nothing declared ⇒ the caller's own options pass through untouched.
+   */
+  const withLaneOptions = (
+    url: string,
+    pageOptions: EngineScrapePageOptions | undefined,
+  ): EngineScrapePageOptions | undefined => {
+    const lane = resolveBrowserLaneOptions(url, options.searchFetch, resolveProxy());
+    return lane ? { ...pageOptions, ...lane } : pageOptions;
+  };
+
   // Last-fetch-per-host (re-gap, spec.md D8 follow-on): a ruleset issuing MULTIPLE fetchBody
   // calls to the SAME host must be courtesy-gapped against its OWN previous call, not just the
   // primary page fetch — otherwise only the FIRST follow-up ever waits, and every call after it
@@ -125,8 +158,10 @@ export function buildExtractContext(options: BuildExtractContextOptions): Extrac
     config: options.config,
     logger: options.logger,
     scraping: {
-      scrapePage: (url, pageOptions) => options.scraping.scrapePage(url, pageOptions),
-      scrapePageStealth: (url, pageOptions) => options.scraping.scrapePageStealth(url, pageOptions),
+      // `async` so an egress REFUSAL rejects the returned promise rather than throwing
+      // synchronously out of a Promise-returning API (a ruleset's `.catch()` must be able to see it).
+      scrapePage: async (url, pageOptions) => options.scraping.scrapePage(url, withLaneOptions(url, pageOptions)),
+      scrapePageStealth: async (url, pageOptions) => options.scraping.scrapePageStealth(url, withLaneOptions(url, pageOptions)),
       browserFetch: notSupported('browserFetch'),
       withBrowser: notSupported('withBrowser'),
       withPage: notSupported('withPage'),

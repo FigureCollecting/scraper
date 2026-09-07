@@ -100,7 +100,11 @@ async function startServer(): Promise<void> {
     // /lookup; that service also backs the ExtractContext (extractAsync/extractMany follow-ups ride
     // the store's declared transport — impit/http default inside createEngineResolve — into the
     // capture sink, courtesy-gapped, exactly like the ingest queue's extraction).
-    app.use('/', createResolveRoute(createEngineResolve(registry, (url) => lookupScraping.scrapePage(url), {
+    // The detail fetch takes the browser-lane options createEngineResolve resolved from the store's
+    // own `searchFetch` — residential `proxyServer` and client-rendered `waitFor`; a store declaring
+    // neither is called with the url alone, and a residential store with no proxy configured never
+    // reaches this lambda at all (the gate refuses it upstream).
+    app.use('/', createResolveRoute(createEngineResolve(registry, (url, options) => lookupScraping.scrapePage(url, options), {
       scraping: lookupScraping,
     })));
     if (plugins.length > 0) {

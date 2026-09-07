@@ -803,9 +803,10 @@ See `.env.example` for complete configuration template.
   - Unset/blank (default): the jar is disabled and every lane behaves exactly as before
   - Example: `/var/run/fc/cf-cookies/cf-cookies.json` (a Secret mounted as a directory, so a refresh changes the file's mtime)
 - `RESIDENTIAL_PROXY_URL`: Proxy for stores that declare `searchFetch.egress: 'residential'` (contract 0.7.0) — see **Residential egress** below
-  - Accepts `socks5://`, `socks5h://`, `http://` or `https://` (credentials may be embedded; they are never logged or surfaced on `/health/detailed`)
+  - Accepts `socks5://host:port` (or `socks5h://`, which is folded to `socks5://` — Chromium's socks5 already resolves DNS at the proxy) and `http(s)://host:port`, with **no embedded credentials**
+  - Credentialed and `socks4://` URLs are REJECTED, not stripped: Chromium's `--proxy-server` cannot carry credentials and rejects `socks5h://` outright (`net::ERR_NO_SUPPORTED_PROXIES`), so a value only impit could use would leave the browser lane dead for the same cohort. One accepted shape, every lane
   - Example: `socks5://egress-proxy.fc.svc.cluster.local:1055` (the in-cluster userspace Tailscale proxy whose exit node is a residential line)
-  - Unset/invalid → no residential egress: the value is ignored with ONE boot warning, and every residential store's fetch is REFUSED rather than sent from the node IP
+  - Unset/invalid → no residential egress: the value is ignored with ONE boot warning naming the reason (never the value — it may carry credentials), and every residential store's fetch is REFUSED rather than sent from the node IP
   - Default: unset (no store is proxied; every other store is unaffected)
 
 - `CATALOG_STORE_TIMEOUT_MS`: Timeout (ms) for one `GET /catalog` listing-page fetch
@@ -824,6 +825,8 @@ Per lane:
 | `impersonate` (impit) | **Supported** | `proxyUrl` on the Impit instance (SOCKS5/HTTP; HTTP/3 stays off — impit cannot proxy with it on). The session cache is keyed by (profile, proxy), so a proxied session never shares its cookie jar with the direct one. |
 | `browser` (puppeteer) | **Supported** | Per-request `createBrowserContext({ proxyServer })` — one pooled browser serves proxied and direct stores side by side. Stealth selection and cookie injection are unchanged. |
 | `http` (plain GET) | **Refused** | Node's global `fetch` has no proxy support, and undici's `ProxyAgent` speaks only HTTP(S), never the SOCKS proxy this deployment uses. A residential store on this lane raises the same typed refusal — put it on `impersonate`. |
+
+The gate is enforced at **every** door to the network, not just the search dispatchers: `POST /resolve`'s primary detail fetch and the `ExtractContext` page passthroughs (`ctx.scraping.scrapePage` / `scrapePageStealth`, the follow-up navigations an `extractAsync`/`extractMany` ruleset makes) resolve the store's declared egress the same way — proxy or refusal, never a direct navigation.
 
 The refusal is deliberate and load-bearing: **a residential store is never silently fetched from the node IP.** With `RESIDENTIAL_PROXY_URL` unset (or unusable), the fetch raises `ResidentialEgressUnavailableError`, which the scrape queue classifies as `extraction_unavailable` — one attempt, no retry, no global rate-limit backoff, and never a cookie/auth session pause. Falling back would burn the datacenter path's remaining reputation and tell the store we tried.
 
