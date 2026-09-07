@@ -10,6 +10,7 @@ import { ScrapingService, ScrapePageOptions, ScrapePageResult, PageOptions, Brow
 import { CaptureSink, NoopCaptureSink, buildRawCapture } from '../captureSink.js';
 import { sanitizeForLog } from '../../utils/security.js';
 import { getCfCookieStore, type CfCookieSource } from '../cookieJar.js';
+import { applyEgressTimezone } from '../browserTimezone.js';
 
 const DEFAULT_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36';
@@ -297,6 +298,11 @@ export function createScrapingService(
 
     try {
       const page: Page = await context.newPage();
+      // TIMEZONE follows the EGRESS, per page: the residential exit's zone for a proxied context,
+      // the node's own for a direct one. Applied BEFORE any navigation — a challenge samples the
+      // environment on its first script, and a zone that disagrees with the exit IP's geolocation
+      // silently never clears. Nothing configured ⇒ no CDP call (CI/tests unchanged).
+      await applyEgressTimezone(page, Boolean(options.proxyServer));
       if (options.viewport) {
         await page.setViewport(options.viewport);
       }

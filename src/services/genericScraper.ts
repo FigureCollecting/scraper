@@ -2,6 +2,7 @@ import puppeteer, { Browser, BrowserContext, Page } from 'puppeteer';
 import zlib from 'zlib';
 import crypto from 'crypto';
 import { sanitizeForLog, sanitizeObjectForLog, capWaitTime, truncateString, MAX_STRING_LENGTH } from '../utils/security.js';
+import { applyEgressTimezone } from './browserTimezone.js';
 
 export interface ScrapedData {
   imageUrl?: string;
@@ -637,6 +638,10 @@ export async function scrapeGeneric(url: string, config: ScrapeConfig): Promise<
     if (!page) {
       throw new Error('[GENERIC SCRAPER] Failed to create page');
     }
+
+    // TIMEZONE: this path always leaves through the node's own egress (it takes no proxy), so it
+    // emulates the DIRECT zone. Unset ⇒ no CDP call at all.
+    await applyEgressTimezone(page, false);
 
     // Set realistic browser configuration
     await page.setViewport({ width: 1280, height: 720 });
