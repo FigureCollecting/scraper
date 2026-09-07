@@ -17,6 +17,7 @@ describe('loadInitiatorConfig', () => {
     expect(c.maxUrlsPerStore).toBeGreaterThan(0);
     expect(c.requestSpacingMs).toBeGreaterThan(0);
     expect(c.requestTimeoutMs).toBeGreaterThan(0);
+    expect(c.lookupRetryDelayMs).toBe(5000);
   });
 
   it('parses csv stores/terms, trimming blanks and whitespace', () => {
@@ -32,12 +33,14 @@ describe('loadInitiatorConfig', () => {
       INITIATOR_MAX_URLS_PER_STORE: '3',
       INITIATOR_REQUEST_SPACING_MS: '750',
       INITIATOR_REQUEST_TIMEOUT_MS: '9000',
+      INITIATOR_LOOKUP_RETRY_DELAY_MS: '2500',
     });
     expect(c.maxConcurrency).toBe(4);
     expect(c.maxRequests).toBe(25);
     expect(c.maxUrlsPerStore).toBe(3);
     expect(c.requestSpacingMs).toBe(750);
     expect(c.requestTimeoutMs).toBe(9000);
+    expect(c.lookupRetryDelayMs).toBe(2500);
   });
 
   it('falls back to defaults on non-numeric or negative knobs (concurrency floored at 1)', () => {
@@ -62,6 +65,12 @@ describe('loadInitiatorConfig', () => {
     expect(c.maxUrlsPerStore).toBe(0);
     const floored = loadInitiatorConfig({ INITIATOR_MAX_CONCURRENCY: '0' });
     expect(floored.maxConcurrency).toBe(2);
+  });
+
+  it('honors an explicit zero lookup-retry delay (retry immediately), defaulting junk', () => {
+    expect(loadInitiatorConfig({ INITIATOR_LOOKUP_RETRY_DELAY_MS: '0' }).lookupRetryDelayMs).toBe(0);
+    expect(loadInitiatorConfig({ INITIATOR_LOOKUP_RETRY_DELAY_MS: 'soon' }).lookupRetryDelayMs).toBe(5000);
+    expect(loadInitiatorConfig({ INITIATOR_LOOKUP_RETRY_DELAY_MS: '-1' }).lookupRetryDelayMs).toBe(5000);
   });
 
   it('honors an explicitly-set empty INITIATOR_STORES as zero stores (operator kill switch)', () => {

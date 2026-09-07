@@ -54,6 +54,8 @@ export interface InitiatorDeps {
   fetch: FetchLike;
   /** Override the gate (tests); defaults to one built from the config. */
   gate?: RequestGate;
+  /** Injectable delay used between a lookup and its retry (tests); defaults to setTimeout. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export interface StoreSummary {
@@ -68,6 +70,12 @@ export interface StoreSummary {
   errors: number;
   /** Stores the fan-out reported as cooling / unsupported (deliberately left alone). */
   skipped: number;
+  /** Lookup calls actually dispatched for this store (retries included). */
+  lookupAttempts: number;
+  /** Of those, second attempts issued after a transient failure. */
+  lookupRetries: number;
+  /** Lookups that ended in failure — a 4xx, or a transient failure whose retry also failed. */
+  lookupFailures: number;
 }
 
 export interface RunSummary {
@@ -79,7 +87,7 @@ export interface RunSummary {
   requestsIssued: number;
   budgetExhausted: boolean;
   peakInFlight: number;
-  /** Term-level /lookup failures (5xx / network / parse). */
+  /** Sum of the per-store lookupFailures (a failure is charged to its own store). */
   lookupFailures: number;
   totalDiscovered: number;
   totalEnqueued: number;
@@ -144,7 +152,18 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
   const uniqueStores = config.stores.filter((s, i) => config.stores.indexOf(s) === i);
   const perStore = new Map<string, StoreSummary>();
   for (const siteId of config.stores) {
-    if (!perStore.has(siteId)) perStore.set(siteId, { siteId, discovered: 0, enqueued: 0, deduplicated: 0, errors: 0, skipped: 0 });
+    if (!perStore.has(siteId))
+      perStore.set(siteId, {
+        siteId,
+        discovered: 0,
+        enqueued: 0,
+        deduplicated: 0,
+        errors: 0,
+        skipped: 0,
+        lookupAttempts: 0,
+        lookupRetries: 0,
+        lookupFailures: 0,
+      });
   }
   // Distinct, capped candidate URLs per store.
   const discovered = new Map<string, Set<string>>();
@@ -162,8 +181,8 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
     s.add(url);
   };
 
-  let lookupFailures = 0;
   let budgetExhausted = false;
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
 
   const summarize = (): RunSummary => {
     for (const [siteId, s] of discovered) {
@@ -184,7 +203,7 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
       requestsIssued: gate.issued(),
       budgetExhausted,
       peakInFlight: gate.peakInFlight(),
-      lookupFailures,
+      lookupFailures: stores.reduce((n, s) => n + s.lookupFailures, 0),
       totalDiscovered: stores.reduce((n, s) => n + s.discovered, 0),
       totalEnqueued: stores.reduce((n, s) => n + s.enqueued, 0),
       totalErrors: stores.reduce((n, s) => n + s.errors, 0),
@@ -231,29 +250,71 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
     return setFor(siteId).size - before;
   };
 
-  // Phase 1 — DISCOVERY (one lookup per term x store).
-  const discoverOne = async (term: string, siteId: string): Promise<void> => {
+  /**
+   * ONE lookup attempt. `retryable` = the fault a second call could survive (abort/timeout,
+   * network error, HTTP 5xx); `fatal` = one it could not (4xx — the same request would be
+   * rejected the same way — or a 2xx body that will not parse); `budget-exhausted` = never
+   * dispatched, so it is neither an attempt nor a failure.
+   */
+  type AttemptOutcome = { kind: 'ok' } | { kind: 'retryable' | 'fatal'; reason: string } | { kind: 'budget-exhausted' };
+
+  const attemptLookup = async (term: string, siteId: string, ss: StoreSummary): Promise<AttemptOutcome> => {
     const startedMs = Date.now();
+    let res: HttpResponseLike;
     try {
       const r = await gate.run(() => httpGet(deps.fetch, lookupUrl(term, siteId), config.requestTimeoutMs));
-      if (r.status === 'budget-exhausted') {
-        budgetExhausted = true;
-        return;
-      }
-      const res = r.value;
-      if (!res.ok) {
-        lookupFailures++;
-        logger.info('[INITIATOR] lookup', { term, siteId, status: res.status, ms: Date.now() - startedMs, candidates: 0 });
-        logger.warn('[INITIATOR] lookup failed', { term, siteId, status: res.status });
-        return;
-      }
+      if (r.status === 'budget-exhausted') return { kind: 'budget-exhausted' };
+      ss.lookupAttempts++;
+      res = r.value;
+    } catch (error) {
+      ss.lookupAttempts++; // dispatched, then aborted / failed in transport
+      const reason = error instanceof Error ? error.message : String(error);
+      logger.info('[INITIATOR] lookup', { term, siteId, status: 0, ms: Date.now() - startedMs, candidates: 0 });
+      return { kind: 'retryable', reason };
+    }
+    if (!res.ok) {
+      logger.info('[INITIATOR] lookup', { term, siteId, status: res.status, ms: Date.now() - startedMs, candidates: 0 });
+      return { kind: res.status >= 500 ? 'retryable' : 'fatal', reason: `status ${res.status}` };
+    }
+    try {
       const candidates = consume(siteId, (await res.json()) as LookupResponseBody);
       logger.info('[INITIATOR] lookup', { term, siteId, status: res.status, ms: Date.now() - startedMs, candidates });
+      return { kind: 'ok' };
     } catch (error) {
-      lookupFailures++;
-      logger.info('[INITIATOR] lookup', { term, siteId, status: 0, ms: Date.now() - startedMs, candidates: 0 });
-      logger.warn('[INITIATOR] lookup errored', { term, siteId, error: error instanceof Error ? error.message : String(error) });
+      logger.info('[INITIATOR] lookup', { term, siteId, status: res.status, ms: Date.now() - startedMs, candidates: 0 });
+      return { kind: 'fatal', reason: error instanceof Error ? error.message : String(error) };
     }
+  };
+
+  // Phase 1 — DISCOVERY (one lookup per term x store, each retried at most once).
+  const discoverOne = async (term: string, siteId: string): Promise<void> => {
+    const ss = perStore.get(siteId);
+    if (!ss) return;
+    const first = await attemptLookup(term, siteId, ss);
+    if (first.kind === 'ok') return;
+    if (first.kind === 'budget-exhausted') {
+      budgetExhausted = true;
+      return;
+    }
+    if (first.kind === 'fatal') {
+      ss.lookupFailures++;
+      logger.warn('[INITIATOR] lookup failed (not retried)', { term, siteId, reason: first.reason });
+      return;
+    }
+
+    logger.warn('[INITIATOR] lookup failed, retrying once', { term, siteId, reason: first.reason, delayMs: config.lookupRetryDelayMs });
+    if (config.lookupRetryDelayMs > 0) await sleep(config.lookupRetryDelayMs);
+    const second = await attemptLookup(term, siteId, ss);
+    if (second.kind === 'budget-exhausted') {
+      budgetExhausted = true;
+      ss.lookupFailures++;
+      logger.warn('[INITIATOR] lookup retry skipped (request budget spent)', { term, siteId });
+      return;
+    }
+    ss.lookupRetries++;
+    if (second.kind === 'ok') return;
+    ss.lookupFailures++;
+    logger.warn('[INITIATOR] lookup failed after retry', { term, siteId, reason: second.reason });
   };
   await Promise.all(uniqueStores.flatMap((siteId) => config.terms.map((term) => discoverOne(term, siteId))));
 

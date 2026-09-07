@@ -28,6 +28,7 @@ const mkCfg = (over: Partial<InitiatorConfig>): InitiatorConfig => ({
   maxUrlsPerStore: 10,
   requestSpacingMs: 0,
   requestTimeoutMs: 5000,
+  lookupRetryDelayMs: 0,
   ...over,
 });
 
@@ -509,5 +510,128 @@ describe('runInitiatorPass — per-store lookups (one slow store must not zero t
     const s = await runInitiatorPass(mkCfg({ stores: ['amiami'], terms: ['t1', 't2'], maxUrlsPerStore: 3 }), { fetch: fake.fetch });
     expect(s.stores[0].discovered).toBe(3);
     expect(fake.ingestCalls().length).toBe(3);
+  });
+});
+
+describe('runInitiatorPass — lookup retry (once, on a transient failure only)', () => {
+  /** A lookup responder that answers by attempt number for a given store. */
+  const byAttempt = (replies: Reply[]) => {
+    let n = 0;
+    return () => replies[Math.min(n++, replies.length - 1)];
+  };
+
+  it('retries a 5xx lookup ONCE after the configured delay and keeps the retry candidates', async () => {
+    const slept: number[] = [];
+    const fake = makeFake({
+      lookup: byAttempt([
+        { status: 503, body: { error: 'upstream' } },
+        { status: 200, body: lookupWith({ amiami: ['https://amiami.test/ok'] }) },
+      ]),
+    });
+    const s = await runInitiatorPass(mkCfg({ stores: ['amiami'], terms: ['t'], lookupRetryDelayMs: 5000 }), {
+      fetch: fake.fetch,
+      sleep: async (ms) => { slept.push(ms); },
+    });
+
+    expect(fake.lookupCalls().length).toBe(2);
+    expect(slept).toEqual([5000]);
+    const amiami = s.stores[0];
+    expect(amiami.lookupAttempts).toBe(2);
+    expect(amiami.lookupRetries).toBe(1);
+    expect(amiami.lookupFailures).toBe(0);
+    expect(amiami.discovered).toBe(1);
+    expect(s.lookupFailures).toBe(0);
+  });
+
+  it('retries an aborted / timed-out lookup ONCE', async () => {
+    const fake = makeFake({
+      lookup: byAttempt([
+        { status: 0, throwErr: true, throwValue: new Error('This operation was aborted') },
+        { status: 200, body: lookupWith({ amiami: ['https://amiami.test/ok'] }) },
+      ]),
+    });
+    const s = await runInitiatorPass(mkCfg({ stores: ['amiami'], terms: ['t'] }), { fetch: fake.fetch });
+    expect(fake.lookupCalls().length).toBe(2);
+    expect(s.stores[0].lookupRetries).toBe(1);
+    expect(s.stores[0].lookupFailures).toBe(0);
+    expect(s.stores[0].discovered).toBe(1);
+  });
+
+  it('does NOT retry a 4xx (a client-side / config fault the same call would repeat)', async () => {
+    const fake = makeFake({ lookup: () => ({ status: 422, body: { error: 'unsupported store' } }) });
+    const s = await runInitiatorPass(mkCfg({ stores: ['amiami'], terms: ['t'] }), { fetch: fake.fetch });
+    expect(fake.lookupCalls().length).toBe(1);
+    expect(s.stores[0].lookupAttempts).toBe(1);
+    expect(s.stores[0].lookupRetries).toBe(0);
+    expect(s.stores[0].lookupFailures).toBe(1);
+    expect(s.lookupFailures).toBe(1);
+  });
+
+  it('counts a failed lookup once when the retry also fails', async () => {
+    const fake = makeFake({ lookup: () => ({ status: 500, body: { error: 'boom' } }) });
+    const s = await runInitiatorPass(mkCfg({ stores: ['amiami'], terms: ['t'] }), { fetch: fake.fetch });
+    expect(fake.lookupCalls().length).toBe(2);
+    expect(s.stores[0].lookupAttempts).toBe(2);
+    expect(s.stores[0].lookupRetries).toBe(1);
+    expect(s.stores[0].lookupFailures).toBe(1);
+    expect(s.stores[0].discovered).toBe(0);
+  });
+
+  it('charges the retry to the global request budget', async () => {
+    const fake = makeFake({
+      lookup: byAttempt([
+        { status: 500, body: { error: 'boom' } },
+        { status: 200, body: lookupWith({ amiami: ['https://amiami.test/ok'] }) },
+      ]),
+    });
+    const s = await runInitiatorPass(mkCfg({ stores: ['amiami'], terms: ['t'], maxRequests: 2 }), { fetch: fake.fetch });
+    expect(fake.lookupCalls().length).toBe(2);
+    expect(s.requestsIssued).toBe(2); // both lookup attempts spent the budget
+    expect(fake.ingestCalls().length).toBe(0); // nothing left for the ingest POST
+    expect(s.budgetExhausted).toBe(true);
+    expect(s.stores[0].discovered).toBe(1);
+    expect(s.stores[0].enqueued).toBe(0);
+  });
+
+  it('does not retry when the budget is spent: no second call, failure recorded, budget flagged', async () => {
+    const fake = makeFake({ lookup: () => ({ status: 500, body: { error: 'boom' } }) });
+    const s = await runInitiatorPass(mkCfg({ stores: ['amiami'], terms: ['t'], maxRequests: 1 }), { fetch: fake.fetch });
+    expect(fake.lookupCalls().length).toBe(1);
+    expect(s.stores[0].lookupAttempts).toBe(1);
+    expect(s.stores[0].lookupRetries).toBe(0);
+    expect(s.stores[0].lookupFailures).toBe(1);
+    expect(s.budgetExhausted).toBe(true);
+  });
+
+  it('the pass-level lookupFailures is the per-store sum, and a failing store leaves the others whole', async () => {
+    const fake = makeFake({
+      lookup: (_term, store) =>
+        store === 'amiami' ? { status: 500, body: { error: 'boom' } } : { status: 200, body: lookupWith({ [store]: [`https://${store}.test/ok`] }) },
+    });
+    const s = await runInitiatorPass(mkCfg({ stores: ['amiami', 'gkloot'], terms: ['t1', 't2'] }), { fetch: fake.fetch });
+
+    const amiami = s.stores.find((x) => x.siteId === 'amiami')!;
+    const gkloot = s.stores.find((x) => x.siteId === 'gkloot')!;
+    expect(amiami.lookupAttempts).toBe(4); // 2 terms x (attempt + retry)
+    expect(amiami.lookupRetries).toBe(2);
+    expect(amiami.lookupFailures).toBe(2);
+    expect(gkloot.lookupAttempts).toBe(2);
+    expect(gkloot.lookupRetries).toBe(0);
+    expect(gkloot.lookupFailures).toBe(0);
+    expect(s.lookupFailures).toBe(2);
+    expect(gkloot.discovered).toBe(1);
+    expect(gkloot.enqueued).toBe(1);
+  });
+
+  it('does not retry a 2xx body it cannot parse (not a transport fault)', async () => {
+    const fake = makeFake({ lookup: () => ({ status: 200, body: undefined }) });
+    const bad: FetchLike = async (url, init) => {
+      const r = await fake.fetch(url, init);
+      return url.includes('/lookup') ? { ...r, json: async () => { throw new Error('bad json'); } } : r;
+    };
+    const s = await runInitiatorPass(mkCfg({ stores: ['amiami'], terms: ['t'] }), { fetch: bad });
+    expect(fake.lookupCalls().length).toBe(1);
+    expect(s.stores[0].lookupRetries).toBe(0);
+    expect(s.stores[0].lookupFailures).toBe(1);
   });
 });

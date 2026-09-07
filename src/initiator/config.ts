@@ -30,6 +30,8 @@ export interface InitiatorConfig {
   requestSpacingMs: number;
   /** Per-request timeout, in ms, before the request is aborted (treated as a failure). */
   requestTimeoutMs: number;
+  /** Delay, in ms, before the ONE retry a transiently-failed lookup gets (0 = retry immediately). */
+  lookupRetryDelayMs: number;
 }
 
 /** The proven-GO route inventory (tonight's run) — the safe default store set. */
@@ -45,6 +47,7 @@ const DEFAULTS = {
   maxUrlsPerStore: 5,
   requestSpacingMs: 1000,
   requestTimeoutMs: 15000,
+  lookupRetryDelayMs: 5000,
 };
 
 type Env = Record<string, string | undefined>;
@@ -92,5 +95,7 @@ export function loadInitiatorConfig(env: Env = process.env): InitiatorConfig {
     maxUrlsPerStore: nonNegInt(env.INITIATOR_MAX_URLS_PER_STORE, DEFAULTS.maxUrlsPerStore),
     requestSpacingMs: posInt(env.INITIATOR_REQUEST_SPACING_MS, DEFAULTS.requestSpacingMs),
     requestTimeoutMs: posInt(env.INITIATOR_REQUEST_TIMEOUT_MS, DEFAULTS.requestTimeoutMs),
+    // nonNeg, not pos: an explicit 0 means "retry at once", a legitimate setting.
+    lookupRetryDelayMs: nonNegInt(env.INITIATOR_LOOKUP_RETRY_DELAY_MS, DEFAULTS.lookupRetryDelayMs),
   };
 }
