@@ -111,12 +111,14 @@ function coerceLedger(doc: unknown, siteId: string): Ledger | 'corrupt' {
   const recent = doc.recent ?? {};
   if (!isPlainObject(recent)) return 'corrupt';
   // The id-range section is OPTIONAL, but a PRESENT one must be well formed: a malformed cursor
-  // would otherwise be silently reset to null and re-walk the whole id space from the frontier.
+  // would otherwise be silently reset to null and re-walk the whole id space from the frontier, and a
+  // malformed frontier would reach the operator-facing summary typed as a number.
   let range: LedgerRange | undefined;
   if (doc.range !== undefined) {
     if (!isPlainObject(doc.range)) return 'corrupt';
     const rawRangeCursor: unknown = doc.range.cursor ?? null;
     if (rawRangeCursor !== null && !isNonNegInt(rawRangeCursor)) return 'corrupt';
+    if (doc.range.frontier !== undefined && !isPositiveInt(doc.range.frontier)) return 'corrupt';
     range = { ...(doc.range as unknown as LedgerRange), cursor: rawRangeCursor as number | null };
   }
   return {

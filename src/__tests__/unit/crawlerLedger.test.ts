@@ -309,4 +309,19 @@ describe('the optional id-range section', () => {
       expect(await createFileLedgerStore(DIR, f.fs).load('orzgk')).toBe('corrupt');
     }
   });
+
+  it("returns 'corrupt' on a malformed frontier — it is reported as a number and must never load as anything else", async () => {
+    for (const range of [
+      { cursor: 500, frontier: 'oops' },
+      { cursor: 500, frontier: 0 },
+      { cursor: 500, frontier: -1 },
+      { cursor: 500, frontier: 1.5 },
+      { cursor: 500, frontier: true },
+      { cursor: 500, frontier: null },
+    ]) {
+      const f = makeFakeFs();
+      f.files.set(path.join(DIR, 'orzgk.json'), JSON.stringify(withRange(range)));
+      expect(await createFileLedgerStore(DIR, f.fs).load('orzgk')).toBe('corrupt');
+    }
+  });
 });

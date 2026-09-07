@@ -556,8 +556,8 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
 
 `range` is OPTIONAL: a ledger written before the axis existed, or for a store that never walks one,
 simply has no `range` and is neither corrupt nor migrated (the file stays `version: 1`). A `range`
-that IS present must be well formed — a malformed cursor is **corrupt**, never a silent reset that
-would re-walk the whole id space.
+that IS present must be well formed — a malformed cursor or frontier is **corrupt**, never a silent
+reset that would re-walk the whole id space nor a non-number reported as one.
 
 A missing file is a fresh ledger. Unparseable JSON, a wrong `version`, a wrong `siteId`, or a
 malformed section is **corrupt**: the store is refused for the run (counted as an error) and the
