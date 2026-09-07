@@ -190,7 +190,7 @@ describe('createHealthRoutes — residentialEgress', () => {
   it('never leaks credentials even when RESIDENTIAL_PROXY_URL carries user:pass (the view redacts at the source)', async () => {
     const { residentialEgressView } = require('../../services/residentialEgress') as typeof import('../../services/residentialEgress');
     const app = build({
-      getResidentialEgress: () => residentialEgressView('socks5://tsuser:FAKE_PASS@egress-proxy.fc.svc.cluster.local:1055'),
+      getResidentialEgress: () => residentialEgressView('socks5://tsuser:FAKE_PASS@egress-proxy.fc.svc.cluster.local:1055', { RESIDENTIAL_EGRESS_HEALTH_DETAIL: 'true' } as NodeJS.ProcessEnv),
     });
 
     const res = await request(app).get('/health/detailed');

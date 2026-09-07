@@ -270,11 +270,22 @@ export function resolveBrowserLaneOptions(
   return Object.keys(options).length > 0 ? options : undefined;
 }
 
-/** The operator view of the residential lane for /health/detailed — credentials always stripped. */
+/**
+ * The operator view of the residential lane for /health/detailed.
+ *
+ * `configured` answers the operator's actual question ("is residential egress wired?"). The proxy's
+ * `scheme://host:port` is NOT published by default: /health/detailed is unauthenticated, and the
+ * exact egress endpoint is topology nobody needs from outside the pod. Set
+ * `RESIDENTIAL_EGRESS_HEALTH_DETAIL=true` to include it (credentials are stripped either way — this
+ * view is the last line of defence for a value that reaches a log or a response).
+ */
 export function residentialEgressView(
   proxyUrl: string | undefined = getResidentialProxyUrl(),
+  env: NodeJS.ProcessEnv = process.env,
 ): { configured: boolean; proxy?: string } {
-  return proxyUrl ? { configured: true, proxy: redactProxyUrl(proxyUrl) } : { configured: false };
+  if (!proxyUrl) return { configured: false };
+  if (env.RESIDENTIAL_EGRESS_HEALTH_DETAIL !== 'true') return { configured: true };
+  return { configured: true, proxy: redactProxyUrl(proxyUrl) };
 }
 
 /**

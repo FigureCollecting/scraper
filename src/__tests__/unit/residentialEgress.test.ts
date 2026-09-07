@@ -238,12 +238,24 @@ describe('refuseHttpLaneResidentialEgress (the plain-HTTP lane rule)', () => {
 });
 
 describe('residentialEgressView (the /health/detailed shape)', () => {
+  const SHOW = { RESIDENTIAL_EGRESS_HEALTH_DETAIL: 'true' } as NodeJS.ProcessEnv;
+
   it('reports configured:false with no proxy string when nothing is configured', () => {
     expect(residentialEgressView(undefined)).toEqual({ configured: false });
   });
 
-  it('reports configured:true with the proxy REDACTED to scheme://host:port (never credentials)', () => {
-    const view = residentialEgressView('socks5://user:FAKE_PASS@egress-proxy.fc.svc.cluster.local:1055');
+  /**
+   * /health/detailed is UNAUTHENTICATED. `configured` is the whole operator question ("is residential
+   * egress wired?"); the endpoint's exact host:port is topology nobody needs from outside the pod, so
+   * it is published only on an explicit opt-in.
+   */
+  it('reports configured:true WITHOUT the proxy endpoint by default', () => {
+    expect(residentialEgressView('socks5://egress-proxy.fc.svc.cluster.local:1055', {} as NodeJS.ProcessEnv))
+      .toEqual({ configured: true });
+  });
+
+  it('reports the proxy REDACTED to scheme://host:port under the opt-in (never credentials)', () => {
+    const view = residentialEgressView('socks5://user:FAKE_PASS@egress-proxy.fc.svc.cluster.local:1055', SHOW);
     expect(view).toEqual({ configured: true, proxy: 'socks5://egress-proxy.fc.svc.cluster.local:1055' });
     expect(JSON.stringify(view)).not.toContain('FAKE_PASS');
     expect(JSON.stringify(view)).not.toContain('user');

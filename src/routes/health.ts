@@ -8,7 +8,8 @@
  *   - GET /health   → same
  *   - GET /version  → { name, version, status:'ok' }
  *   - GET /health/detailed → the above + browserPool health + a timestamp, and ADDITIVELY
- *     `residentialEgress: {configured, proxy?}` (the residential proxy, credentials stripped),
+ *     `residentialEgress: {configured, proxy?}` (the residential proxy; its host:port only under
+ *     RESIDENTIAL_EGRESS_HEALTH_DETAIL, credentials always stripped),
  *     `browserLane: {launchMode, residentialTimezone, directTimezone, persistentContexts}`,
  *     `challengeCooldowns: [{host, remainingMs, reason}]` (the per-host CF cooldowns currently open)
  *     and `cfCookies: [{host, cookieNames, userAgentPinned, loadedAt, mintedAt?, expiresAt?, stale,
@@ -33,8 +34,9 @@ export interface HealthDeps {
   listCfCookies: () => CfCookieHostView[];
   /**
    * The residential-egress view (residentialEgressView()): whether a residential proxy is configured
-   * and, if so, its `scheme://host:port` — credentials are stripped at the source, since this
-   * endpoint is unauthenticated and RESIDENTIAL_PROXY_URL may carry `user:password@`.
+   * and — only under RESIDENTIAL_EGRESS_HEALTH_DETAIL — its `scheme://host:port`. This endpoint is
+   * unauthenticated, so the egress ENDPOINT is opt-in, and credentials are stripped at the source
+   * since RESIDENTIAL_PROXY_URL may carry `user:password@`.
    */
   getResidentialEgress: () => { configured: boolean; proxy?: string };
   /**

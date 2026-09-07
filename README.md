@@ -178,7 +178,7 @@ Health check endpoint for monitoring.
 Detailed health check with browser pool status plus two operator views (additive, never cookie values):
 - `challengeCooldowns`: `[{host, remainingMs, reason}]` — the per-host Cloudflare-challenge cooldowns currently open
 - `cfCookies`: `[{host, cookieNames, userAgentPinned, loadedAt, mintedAt?, expiresAt?, stale, staleSince?, staleReason?}]` — the stored-cookie jar (`CF_COOKIE_FILE`) per host. `stale: true` means the host still served a challenge WITH its stored cookies: re-mint (see *Stored Cloudflare cookies* under Environment Variables). `[]` when the jar is disabled.
-- `residentialEgress`: `{configured, proxy?}` — whether a residential egress proxy (`RESIDENTIAL_PROXY_URL`) is wired, and its `scheme://host:port`. Credentials are stripped at the source, so a `user:password@` proxy never appears here. `{configured: false}` ⇒ every store declaring `egress: 'residential'` is refused (see *Residential egress* under Environment Variables).
+- `residentialEgress`: `{configured, proxy?}` — whether a residential egress proxy (`RESIDENTIAL_PROXY_URL`) is wired. `proxy` (its `scheme://host:port`) appears only under `RESIDENTIAL_EGRESS_HEALTH_DETAIL=true`, since this endpoint is unauthenticated; credentials are stripped at the source either way, so a `user:password@` proxy never appears here. `{configured: false}` ⇒ every store declaring `egress: 'residential'` is refused (see *Residential egress* under Environment Variables).
 
 ### GET /version
 Get service version information for version management.
@@ -808,6 +808,10 @@ See `.env.example` for complete configuration template.
   - Example: `socks5://egress-proxy.fc.svc.cluster.local:1055` (the in-cluster userspace Tailscale proxy whose exit node is a residential line)
   - Unset/invalid → no residential egress: the value is ignored with ONE boot warning naming the reason (never the value — it may carry credentials), and every residential store's fetch is REFUSED rather than sent from the node IP
   - Default: unset (no store is proxied; every other store is unaffected)
+
+- `RESIDENTIAL_EGRESS_HEALTH_DETAIL`: `true` adds the proxy's `scheme://host:port` to `GET /health/detailed`'s `residentialEgress` block
+  - `/health/detailed` is unauthenticated, so the endpoint's address is opt-in; `configured` (always present) is what an operator needs to see
+  - Default: unset (only `{ configured }` is published)
 
 - `BROWSER_LAUNCH_MODE`: `clean-headful` selects the proven Cloudflare-passing launch profile (real Chrome, headful on the Ozone headless platform, no automation switch, minimal flags) — see **The browser lane** below
   - Unset or any other value → the historical headless profile (what CI and the tests use)
