@@ -1379,6 +1379,22 @@ describe('runCrawlerPass — id-range backfill', () => {
     }
   });
 
+  it('a window whose FIRST id the cap blocks moves nothing: no cursor, no ledger write, rangeSkipped cap', async () => {
+    const store = createMemoryLedgerStore();
+    // The listing spends the cap exactly (2 items, cap 2) without ever being cut short, so the walk
+    // still starts — and then cannot get its first id through.
+    const fake = makeFake({ catalog: (s, p) => ok(s, p, [`${p}a`, `${p}b`], false) });
+    const sum = await runCrawlerPass(
+      mkCfg({ mode: 'both', recentMaxPages: 1, backfillPagesPerRun: 0, stores: ['mfc'], rangeStores: ['mfc'], rangeIdsPerRun: 2, storeEnqueueCaps: { mfc: 2 }, rangeFrontiers: { mfc: 9 } }),
+      { fetch: fake.fetch, ledgerStore: store, now: clock().now },
+    );
+
+    expect(fake.rangeCalls()).toEqual([['mfc', 9, 2]]);
+    expect(fake.posted()).toEqual([collectUrl('mfc', '1a'), collectUrl('mfc', '1b')]);
+    expect(store.files.get('mfc')!.range).toBeUndefined();
+    expect(sum.stores[0]).toMatchObject({ rangeWalked: 0, rangeCursor: null, rangeSkipped: 'cap' });
+  });
+
   it('WARNs when CRAWLER_RANGE_STORES or CRAWLER_STORE_ENQUEUE_CAPS names a store that is not being crawled', async () => {
     const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
     try {

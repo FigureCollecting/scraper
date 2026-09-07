@@ -769,8 +769,10 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     const { handled, accepted, rejected } = await processPage(st, out.items, 'range');
     st.summary.rangeWalked += handled;
     if (handled === 0) {
+      // Not one id got through (the cap ran out on the window's very first id, or the budget did):
+      // nothing durable changes, and the reason is worth reporting rather than reading as a walk.
       logger.info('[CRAWLER] id-range window yielded no walkable id — cursor kept', { siteId: st.siteId, from: cursor });
-      return;
+      return skip(st.capReached ? 'cap' : 'budget');
     }
     if (accepted === 0 && rejected > 0) {
       // Every id the window offered was deterministically refused by /ingest/scrape (4xx — typically
