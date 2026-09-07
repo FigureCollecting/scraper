@@ -4,6 +4,25 @@ All notable changes to `@figurecollecting/scraper-plugin-contract` will be docum
 file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this
 package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-09-07
+
+Additive, backward-compatible: every existing `bySearch` still compiles unchanged, and a store that
+declares nothing gets a byte-identical URL (one `encodeURIComponent`). Built for anitoys, whose
+search route 404s on the encoding every other store accepts.
+
+### Added
+- `RetrievalCapability.bySearch.queryEncoding?: QueryEncoding` (and the `QueryEncoding` export) — a
+  DECLARATIVE spec for how `{q}` is encoded into the template, applied by the engine in a fixed
+  order: `encodeURIComponent`, then `reEncodePercentOf` (re-encode the `%` of each listed
+  percent-escape, `%2f` → `%252f`, matched case-insensitively and emitted in the DECLARED spelling),
+  then `spaces` (`plus` rewrites `%20` → `+`; `percent`, the default, leaves it), then `lowercase`.
+  Absent ⇒ today's single `encodeURIComponent`.
+  The worked example is anitoys' own `format_keywords` (public_2019.js): with the declaration
+  `"star origin 1/6"` → `star+origin+1%252f6` and the store answers HTTP 200 with the item's card;
+  without it → `star%20origin%201%2F6` and the store answers HTTP 404 "Page Not Found" — a broken
+  route, not a zero result. That store resolves records by `scale`, so scale-bearing queries are its
+  normal shape and the naive encoding contributes zero candidates for items it stocks.
+
 ## [0.7.0] - 2026-09-07
 
 Additive, backward-compatible: every existing `SearchFetch` still compiles unchanged — the new
