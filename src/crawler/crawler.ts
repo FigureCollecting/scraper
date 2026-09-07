@@ -113,6 +113,11 @@ export interface CrawlerStoreSummary {
   rangeCursor: number | null;
   /** The frontier the id-range walk started from (null until one is known). */
   rangeFrontier: number | null;
+  /**
+   * Why the id-range walk did not request a window this run, `null` when it did. Starvation
+   * (`cap`, `budget`) otherwise looks exactly like a store that was never armed for the axis.
+   */
+  rangeSkipped: RangeSkipReason | null;
   /** The store's backfill cursor after this run (null until backfill first runs). */
   backfillCursor: number | null;
   /** An empty page was seen at the cursor once; awaiting confirmation next run. */
@@ -149,7 +154,13 @@ interface CatalogItem {
   collectUrl?: string;
 }
 
-type PageOutcome = { kind: 'page'; items: CatalogItem[]; hasMore: boolean } | { kind: 'stopped' };
+/** Why a /catalog GET stopped its axis — surfaced on the id-range summary, ignored by the listing phases. */
+type StopReason = 'budget' | 'cooldown' | 'unsupported' | 'failed';
+
+/** Why the id-range walk made no window request this run. */
+export type RangeSkipReason = StopReason | 'not-configured' | 'not-run' | 'store-stopped' | 'cap' | 'no-frontier' | 'floor' | 'window-malformed';
+
+type PageOutcome = { kind: 'page'; items: CatalogItem[]; hasMore: boolean } | { kind: 'stopped'; reason: StopReason };
 
 type PostOutcome = 'accepted' | 'accepted-dedup' | 'rejected' | 'transient' | 'budget';
 
@@ -244,6 +255,15 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
   for (const siteId of stores) {
     if (Object.prototype.hasOwnProperty.call(capOverrides, siteId)) enqueueCapOverrides[siteId] = capOverrides[siteId];
   }
+  // A cap or a range entry naming a store that is NOT being crawled did nothing. Silently dropping it
+  // makes a typo (or a store removed from CRAWLER_STORES) look like a throttle that is in force.
+  for (const siteId of Object.keys(capOverrides)) {
+    if (!stores.includes(siteId)) logger.warn('[CRAWLER] CRAWLER_STORE_ENQUEUE_CAPS names a store that is not being crawled — ignored', { siteId });
+  }
+  for (const siteId of config.rangeStores) {
+    if (!stores.includes(siteId)) logger.warn('[CRAWLER] CRAWLER_RANGE_STORES names a store that is not in CRAWLER_STORES — no id-range walk', { siteId });
+  }
+
   const capFor = (siteId: string): number =>
     Object.prototype.hasOwnProperty.call(capOverrides, siteId) ? capOverrides[siteId] : config.maxEnqueuePerStore;
 
@@ -269,6 +289,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       rangeWalked: 0,
       rangeCursor: null,
       rangeFrontier: null,
+      rangeSkipped: config.rangeStores.includes(siteId) ? 'not-run' : 'not-configured',
       backfillCursor: null,
       exhaustCandidate: false,
       exhausted: false,
@@ -376,9 +397,9 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
    * logs and decides whether a 422 is a listing-axis gap (which leaves the id-range axis alive).
    */
   const fetchCatalog = async (st: StoreState, url: string, where: Record<string, unknown>, axis: 'listing' | 'range'): Promise<PageOutcome> => {
-    const stop = (): PageOutcome => {
+    const stop = (reason: StopReason): PageOutcome => {
       st.stopped = true;
-      return { kind: 'stopped' };
+      return { kind: 'stopped', reason };
     };
     let r: GateResult<HttpResponseLike>;
     try {
@@ -386,11 +407,11 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     } catch (error) {
       st.summary.errors++;
       logger.warn('[CRAWLER] catalog errored', { siteId: st.siteId, ...where, error: errMsg(error) });
-      return stop();
+      return stop('failed');
     }
     if (r.status === 'budget-exhausted') {
       budgetExhausted = true;
-      return stop();
+      return stop('budget');
     }
     const res = r.value;
     if (res.status === 503) {
@@ -398,7 +419,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       const body = await res.json().catch(() => ({}));
       st.summary.skipped++;
       logger.warn('[CRAWLER] catalog cooldown — store skipped this run', { siteId: st.siteId, ...where, remainingMs: body?.remainingMs });
-      return stop();
+      return stop('cooldown');
     }
     if (res.status === 422) {
       // The store does not serve THIS axis (no byListing / no extractListing; or no byRange / byId):
@@ -406,12 +427,12 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       st.summary.errors++;
       if (axis === 'listing') st.listingUnsupported = true;
       logger.warn('[CRAWLER] catalog unsupported — axis stopped', { siteId: st.siteId, ...where, axis });
-      return stop();
+      return stop('unsupported');
     }
     if (!res.ok) {
       st.summary.errors++;
       logger.warn('[CRAWLER] catalog failed', { siteId: st.siteId, ...where, status: res.status });
-      return stop();
+      return stop('failed');
     }
     let body: unknown;
     try {
@@ -419,13 +440,13 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     } catch (error) {
       st.summary.errors++;
       logger.warn('[CRAWLER] catalog body unparseable', { siteId: st.siteId, ...where, error: errMsg(error) });
-      return stop();
+      return stop('failed');
     }
     if (!isPlainObject(body) || !Array.isArray(body.items)) {
       // A 200 that is not a listing is a failure, never an exhaustion signal.
       st.summary.errors++;
       logger.warn('[CRAWLER] catalog body malformed', { siteId: st.siteId, ...where });
-      return stop();
+      return stop('failed');
     }
     return { kind: 'page', items: sanitizeItems(body.items), hasMore: body.hasMore === true };
   };
@@ -675,11 +696,16 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
    */
   const rangePhase = async (st: StoreState): Promise<void> => {
     if (!config.rangeStores.includes(st.siteId)) return;
-    if (!st.ledger) return;
+    const skip = (reason: RangeSkipReason): void => {
+      st.summary.rangeSkipped = reason;
+    };
+    if (!st.ledger) return skip('store-stopped');
     // A 422 on the LISTING axis says nothing about this one — mfc has no byListing yet but a full id
     // space. Any other stop reason (cooldown, budget, a sick scraper, a ledger failure) still holds.
-    if (st.stopped && !st.listingUnsupported) return;
-    if (st.capReached) return;
+    if (st.stopped && !st.listingUnsupported) return skip('store-stopped');
+    // The walk shares the store's enqueue cap and runs LAST, so a listing that spends the whole cap
+    // starves it — reported, because it otherwise reads exactly like a store that never walks.
+    if (st.capReached) return skip('cap');
     st.stopped = false;
 
     const ledger = st.ledger;
@@ -693,7 +719,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       const frontier = highestNumericId(ledger) ?? seed;
       if (frontier === undefined) {
         logger.warn('[CRAWLER] id-range walk skipped — no frontier (empty ledger and no CRAWLER_RANGE_FRONTIER_<SITEID>)', { siteId: st.siteId });
-        return;
+        return skip('no-frontier');
       }
       cursor = frontier;
       range.frontier = frontier;
@@ -715,12 +741,13 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     }
     if (cursor < 1) {
       logger.info('[CRAWLER] id-range walk complete — the id floor was reached', { siteId: st.siteId, frontier: range.frontier });
-      return;
+      return skip('floor');
     }
 
     const count = Math.min(config.rangeIdsPerRun, cursor);
     const out = await fetchCatalog(st, rangeUrl(st.siteId, cursor, count), { from: cursor, count }, 'range');
-    if (out.kind !== 'page') return;
+    if (out.kind !== 'page') return skip(out.reason);
+    st.summary.rangeSkipped = null;
     // The cursor moves by POSITION in this window, so the window must BE the descending run that was
     // asked for: ids `cursor, cursor-1, …`. A shorter one is fine (the engine clamps its window, and
     // the walk bottoms out at id 1); a reordered / gapped / short-of-the-top one is a malformed body,
@@ -735,7 +762,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
         received: out.items.length,
         firstId: out.items[0]?.itemId,
       });
-      return;
+      return skip('window-malformed');
     }
     const { handled, accepted, rejected } = await processPage(st, out.items, 'range');
     st.summary.rangeWalked += handled;

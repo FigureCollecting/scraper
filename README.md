@@ -514,8 +514,11 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
   a discovery-only dry run for every unnamed store (pages fetched, nothing POSTed).
 - The run ends with a `[CRAWLER] pass complete` JSON summary (per store: pagesFetched,
   discovered, known, enqueued, deduplicated, reobserved, errors, skipped, backfillCursor,
-  exhaustCandidate, exhausted, capApplied, rangeWalked, rangeCursor, rangeFrontier; plus totals,
-  requestsIssued, budgetExhausted, enqueueCapOverrides, totalRangeWalked, durationMs).
+  exhaustCandidate, exhausted, capApplied, rangeWalked, rangeCursor, rangeFrontier, rangeSkipped;
+  plus totals, requestsIssued, budgetExhausted, enqueueCapOverrides, totalRangeWalked, durationMs).
+- A `CRAWLER_STORE_ENQUEUE_CAPS` entry or a `CRAWLER_RANGE_STORES` entry naming a store that is not
+  in `CRAWLER_STORES` does nothing, and is WARNed about by siteId at the start of the run — a range
+  store must be named in BOTH.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -618,6 +621,19 @@ because the newest ids always outrank the deep id space for the run's budget.
 - A `422` on the LISTING axis (`no byListing` — mfc today) stops the listing walk only; the id-range
   walk still runs. A cooldown, an exhausted budget, a sick scraper or a ledger failure stops every
   axis, because they are properties of the host or the run, not of one axis.
+- **Budget** — the walk runs LAST and shares both the store's enqueue cap and the global
+  `CRAWLER_MAX_REQUESTS`, so a store whose listing already spent its cap, or a run whose budget is
+  already gone, does not walk at all. Size them for it: `CRAWLER_MAX_REQUESTS` must cover the listing
+  phases plus, per range store, one window GET and up to `CRAWLER_RANGE_IDS_PER_RUN` POSTs, and the
+  store's cap must have that much headroom left. When it does not, `rangeSkipped` on the store
+  summary says which — `cap`, `budget`, `no-frontier`, `floor`, `cooldown`, `unsupported`, `failed`,
+  `window-malformed`, `store-stopped`, `not-run`, `not-configured` — and it is `null` on a run that
+  actually asked for a window. The window GET itself is synthesized (no upstream fetch) but is still
+  charged one slot of the global budget and one spacing interval.
+- **Throughput** — one window per run, at most `CRAWLER_RANGE_IDS_PER_RUN` (ceiling 200) ids. On an
+  hourly CronJob that is at most 4,800 ids/day, so an id space the size of mfc's ~3.6M takes ~756
+  days to walk once at the ceiling — and ~8 years at the `50`/run default. Size the knobs (and the
+  expectations) accordingly: this axis is a slow continuous backfill, not a bulk import.
 
 ## Testing
 

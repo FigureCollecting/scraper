@@ -1327,6 +1327,74 @@ describe('runCrawlerPass — id-range backfill', () => {
     expect(s.stores[0]).toMatchObject({ skipped: 1, rangeWalked: 0, rangeCursor: null });
   });
 
+  it('says WHY the walk did not run: not-configured / cap / budget / no-frontier / floor, and null when it did', async () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      // ran
+      const okRun = makeFake({ catalog: (s) => failed(s) });
+      const ran = await runCrawlerPass(rangeOnly({ rangeFrontiers: { mfc: 9 } }), { fetch: okRun.fetch, ledgerStore: createMemoryLedgerStore(), now: clock().now });
+      expect(ran.stores[0]).toMatchObject({ rangeSkipped: null });
+
+      // not configured for the walk at all
+      const other = makeFake({ catalog: (s, p) => ok(s, p, [], false) });
+      const notCfg = await runCrawlerPass(rangeOnly({ stores: ['mfc', 'orzgk'], rangeStores: ['mfc'], rangeFrontiers: { mfc: 9 } }), {
+        fetch: other.fetch,
+        ledgerStore: createMemoryLedgerStore(),
+        now: clock().now,
+      });
+      expect(notCfg.stores.find((x) => x.siteId === 'orzgk')).toMatchObject({ rangeSkipped: 'not-configured' });
+
+      // the listing phases spent the store's whole enqueue cap
+      const busy = makeFake({ catalog: (s, p) => ok(s, p, [`${p}a`, `${p}b`], false) });
+      const capped = await runCrawlerPass(
+        mkCfg({ mode: 'both', backfillPagesPerRun: 0, stores: ['mfc'], rangeStores: ['mfc'], rangeIdsPerRun: 2, storeEnqueueCaps: { mfc: 1 }, rangeFrontiers: { mfc: 9 } }),
+        { fetch: busy.fetch, ledgerStore: createMemoryLedgerStore(), now: clock().now },
+      );
+      expect(busy.rangeCalls()).toEqual([]);
+      expect(capped.stores[0]).toMatchObject({ rangeSkipped: 'cap', rangeWalked: 0 });
+
+      // the global request budget was gone before the walk's own GET
+      const broke = makeFake({ catalog: (s, p) => ok(s, p, [], false) });
+      const budget = await runCrawlerPass(
+        mkCfg({ mode: 'both', recentMaxPages: 1, backfillPagesPerRun: 0, maxRequests: 1, stores: ['mfc'], rangeStores: ['mfc'], rangeIdsPerRun: 2, rangeFrontiers: { mfc: 9 } }),
+        { fetch: broke.fetch, ledgerStore: createMemoryLedgerStore(), now: clock().now },
+      );
+      expect(broke.rangeCalls()).toEqual([]);
+      expect(budget.stores[0]).toMatchObject({ rangeSkipped: 'budget' });
+
+      // no frontier at all, and a walk that already reached the floor
+      const none = makeFake({ catalog: (s) => failed(s) });
+      const noFrontier = await runCrawlerPass(rangeOnly(), { fetch: none.fetch, ledgerStore: createMemoryLedgerStore(), now: clock().now });
+      expect(noFrontier.stores[0]).toMatchObject({ rangeSkipped: 'no-frontier' });
+
+      const done = makeFake({ catalog: (s) => failed(s) });
+      const floor = await runCrawlerPass(rangeOnly({ rangeFrontiers: { mfc: 3 } }), {
+        fetch: done.fetch,
+        ledgerStore: createMemoryLedgerStore({ mfc: ledgerWith('mfc', [], T0, { range: { cursor: 0, frontier: 3, seed: 3 } }) }),
+        now: clock().now,
+      });
+      expect(floor.stores[0]).toMatchObject({ rangeSkipped: 'floor' });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('WARNs when CRAWLER_RANGE_STORES or CRAWLER_STORE_ENQUEUE_CAPS names a store that is not being crawled', async () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      const fake = makeFake({ catalog: (s, p) => ok(s, p, [], false) });
+      await runCrawlerPass(
+        mkCfg({ mode: 'both', stores: ['orzgk'], rangeStores: ['mfc'], storeEnqueueCaps: { anitoys: 15 } }),
+        { fetch: fake.fetch, ledgerStore: createMemoryLedgerStore(), now: clock().now },
+      );
+      const lines = warn.mock.calls.map((c) => `${String(c[0])} ${JSON.stringify(c[1])}`);
+      expect(lines.some((l) => l.includes('CRAWLER_RANGE_STORES') && l.includes('mfc'))).toBe(true);
+      expect(lines.some((l) => l.includes('CRAWLER_STORE_ENQUEUE_CAPS') && l.includes('anitoys'))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("mode 'recent' makes no id-range request at all", async () => {
     const fake = makeFake({ catalog: (s, p) => ok(s, p, [], false) });
     await runCrawlerPass(rangeOnly({ mode: 'recent', rangeFrontiers: { mfc: 9 } }), {
