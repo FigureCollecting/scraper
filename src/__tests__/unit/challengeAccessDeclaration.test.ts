@@ -1,6 +1,7 @@
 import { jest } from '@jest/globals';
 import { makeFetchSearch } from '../../services/fetchSearch';
 import { resolveBrowserLaneOptions } from '../../services/residentialEgress';
+import { warnDroppedBrowserPrime } from '../../services/sessionPrime';
 
 /**
  * The DECLARED half of the challenge gate (`SearchFetch.access: 'cloudflare'`). Learning a gate from
@@ -10,6 +11,52 @@ import { resolveBrowserLaneOptions } from '../../services/residentialEgress';
  * results 404 without a same-session homepage visit.
  */
 describe('challenge-gate declaration (SearchFetch.access)', () => {
+  /**
+   * `sessionPrime` reaches the BROWSER lane only through `access: 'cloudflare'` (contract 0.7.0:
+   * priming a fresh context costs a whole extra navigation, so it rides the declaration that keeps
+   * the context). A store declaring the prime WITHOUT the gate therefore gets no priming navigation —
+   * which used to happen in complete silence, and looks exactly like a ruleset that suddenly 404s.
+   */
+  const transports = () => ({
+    http: jest.fn<(...a: any[]) => any>().mockResolvedValue('http-body'),
+    impersonate: jest.fn<(...a: any[]) => any>().mockResolvedValue('impit-body'),
+    browser: jest.fn<(...a: any[]) => any>().mockResolvedValue('browser-body'),
+  });
+
+  describe('a browser-lane sessionPrime with no gate declared', () => {
+    it('warns ONCE per host that the prime is not applied', () => {
+      const warn = jest.fn();
+      const searchFetch = { transport: 'browser' as const, sessionPrime: true };
+
+      warnDroppedBrowserPrime(searchFetch, 'https://shop.example.test/search?q=a', warn);
+      warnDroppedBrowserPrime(searchFetch, 'https://shop.example.test/search?q=b', warn);
+
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0][0]).toContain('sessionPrime');
+      expect(warn.mock.calls[0][0]).toContain("access: 'cloudflare'");
+    });
+
+    it('says nothing when the gate IS declared, or when no prime is declared', () => {
+      const warn = jest.fn();
+
+      warnDroppedBrowserPrime({ transport: 'browser', sessionPrime: true, access: 'cloudflare' }, 'https://gated.example.test/x', warn);
+      warnDroppedBrowserPrime({ transport: 'browser' }, 'https://plain.example.test/x', warn);
+
+      expect(warn).not.toHaveBeenCalled();
+    });
+
+    it('is raised by the search dispatcher itself, not only by the helper', async () => {
+      const warn = jest.fn();
+      const t = transports();
+      const fetchSearch = makeFetchSearch(t, { warn });
+
+      await fetchSearch('https://dispatched.example.test/search?q=lucy', { transport: 'browser', sessionPrime: true });
+
+      expect(t.browser).toHaveBeenCalledWith('https://dispatched.example.test/search?q=lucy', expect.not.objectContaining({ primeUrl: expect.anything() }));
+      expect(warn).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe('fetchSearch → browser transport', () => {
     const transports = () => ({
       http: jest.fn<(...a: any[]) => any>().mockResolvedValue('http-body'),

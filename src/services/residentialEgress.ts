@@ -25,7 +25,7 @@
  */
 import type { SearchFetch, WaitForReadiness } from '@figurecollecting/scraper-plugin-contract';
 import { sanitizeForLog } from '../utils/security.js';
-import { resolvePrime } from './sessionPrime.js';
+import { resolvePrime, warnDroppedBrowserPrime } from './sessionPrime.js';
 
 /**
  * Proxy schemes every proxying lane understands. impit also speaks socks4 and takes credentials;
@@ -261,6 +261,7 @@ export function resolveBrowserLaneOptions(
   // is a cold session, and a cold session at anitoys 404s its own search results.
   const challengeGated = searchFetch?.access === 'cloudflare';
   const prime = challengeGated ? resolvePrime(searchFetch, url) : undefined;
+  if (!challengeGated) warnDroppedBrowserPrime(searchFetch, url);
   const options: BrowserLaneEgressOptions = {
     ...(proxyServer ? { proxyServer } : {}),
     ...(searchFetch?.waitFor ? { waitFor: searchFetch.waitFor } : {}),

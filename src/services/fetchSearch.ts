@@ -9,7 +9,7 @@
  * compositions still work. Replaces the earlier boolean browser-vs-http routing.
  */
 import type { SearchFetch, WaitForReadiness } from '@figurecollecting/scraper-plugin-contract';
-import { resolvePrime } from './sessionPrime.js';
+import { resolvePrime, warnDroppedBrowserPrime } from './sessionPrime.js';
 import {
   getResidentialProxyUrl,
   refuseHttpLaneResidentialEgress,
@@ -29,6 +29,8 @@ export interface FetchSearchTransports {
 export interface FetchSearchDeps {
   /** The engine's residential proxy (default: the process's RESIDENTIAL_PROXY_URL, resolved at boot). */
   residentialProxyUrl?: () => string | undefined;
+  /** Warning sink for a dropped browser-lane session prime (default `console.warn`). */
+  warn?: (message: string) => void;
 }
 
 /** Build the per-store search fetcher from the three transports. */
@@ -55,6 +57,8 @@ export function makeFetchSearch(t: FetchSearchTransports, deps: FetchSearchDeps 
         // to it), and primes a fresh one on the origin first — the browser lane's own session prime.
         const challengeGated = searchFetch.access === 'cloudflare';
         const browserPrime = challengeGated ? resolvePrime(searchFetch, url) : undefined;
+        // A prime declared without the gate is dropped here — say so once per host rather than never.
+        if (!challengeGated) warnDroppedBrowserPrime(searchFetch, url, deps.warn);
         return t.browser(url, {
           headers: searchFetch.headers,
           userAgent: searchFetch.userAgent,
