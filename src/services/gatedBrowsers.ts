@@ -158,4 +158,31 @@ export interface GatedBrowserEntry {
   pagesOpen: number;
   /** Hosts already session-primed on THIS browser instance (a relaunch primes them again). */
   primedHosts: Set<string>;
+  /**
+   * Set when the browser is being taken out of service. It ABANDONS a drain that is waiting on
+   * in-flight tabs — shutdown closes the handle immediately rather than waiting out a stuck page.
+   */
+  closing?: boolean;
+  /** Latched by the one close attempt that owns the handle — a retirement and a shutdown can race. */
+  closed?: boolean;
+}
+
+/** The operator view of one gated browser for /health/detailed (counts only, no handles). */
+export interface GatedBrowserView {
+  egress: EgressKind;
+  /** ISO-8601; with the max age it says how much of this browser's life is left. */
+  launchedAt: string;
+  pagesOpen: number;
+  /** How many hosts have already made their session-priming visit on this instance. */
+  primedHosts: number;
+}
+
+/** Project a live entry onto its health view. */
+export function gatedBrowserView(entry: GatedBrowserEntry): GatedBrowserView {
+  return {
+    egress: entry.egress,
+    launchedAt: new Date(entry.launchedAt).toISOString(),
+    pagesOpen: entry.pagesOpen,
+    primedHosts: entry.primedHosts.size,
+  };
 }

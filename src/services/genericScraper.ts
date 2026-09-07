@@ -35,6 +35,13 @@ import crypto from 'crypto';
 import { sanitizeForLog, sanitizeObjectForLog, capWaitTime, truncateString, MAX_STRING_LENGTH } from '../utils/security.js';
 import { applyEgressTimezone, selectEgressTimezone } from './browserTimezone.js';
 import { getPersistentContexts } from './persistentContexts.js';
+import {
+  GATED_BROWSER_MAX_AGE_MS,
+  gatedBrowserView,
+  type EgressKind,
+  type GatedBrowserEntry,
+  type GatedBrowserView,
+} from './gatedBrowsers.js';
 
 export interface ScrapedData {
   imageUrl?: string;
@@ -309,7 +316,10 @@ warnUnrecognizedLaunchMode(process.env, (message) => {
  * `--single-process` is still appended under GitHub Actions (its runner needs it; it breaks Docker),
  * and `PUPPETEER_EXECUTABLE_PATH` still selects the image's real Chrome in both profiles.
  */
-export function buildBrowserConfig(env: NodeJS.ProcessEnv = process.env): {
+export function buildBrowserConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  options: { proxyServer?: string } = {},
+): {
   headless: boolean;
   args: string[];
   timeout: number;
@@ -330,6 +340,14 @@ export function buildBrowserConfig(env: NodeJS.ProcessEnv = process.env): {
     // that contradicts its own window (measured: outer 1280x900, inner 800x600).
     ? { headless: false, ignoreDefaultArgs: ['--enable-automation'], defaultViewport: null, args: [...CLEAN_HEADFUL_ARGS], timeout: 30000 }
     : { headless: true, args: [...HEADLESS_ARGS], timeout: 30000 };
+
+  // A CHALLENGE-LANE browser carries its egress in the LAUNCH, not per context: the challenge only
+  // clears in a browser's default context (see gatedBrowsers), and a default context has no
+  // `proxyServer` of its own. Nothing else in the engine passes this — the pooled browsers and every
+  // non-gated fetch are byte-identical to before.
+  if (options.proxyServer) {
+    config.args.push(`--proxy-server=${options.proxyServer}`);
+  }
 
   // GitHub Actions needs this flag; it breaks Docker containers.
   if (env.GITHUB_ACTIONS === 'true') {
@@ -408,6 +426,9 @@ export class BrowserPool {
     this.contextsOpened = 0;
     this.contextsClosed = 0;
     this.contextsFailed = 0;
+    this.gatedBrowsers_.clear();
+    this.gatedLaunches.clear();
+    this.gatedRetiring.clear();
   }
 
 
@@ -644,12 +665,202 @@ export class BrowserPool {
     return await this.stealthLaunch;
   }
 
+  /**
+   * CHALLENGE-LANE BROWSERS — one long-lived Chrome per EGRESS, and the only browsers gated fetches
+   * ever touch. A gated fetch is a NEW TAB in the browser's DEFAULT context: measured 2026-09-07, a
+   * `browser.createBrowserContext()` page never clears the Cloudflare JS challenge even when its
+   * traffic demonstrably leaves the right IP, while a tab in the default context clears in 8-9 s and
+   * every later tab reuses the clearance. The residential browser therefore takes its proxy as a
+   * LAUNCH argument (a default context has no per-context proxy), which is also why the two egresses
+   * cannot share one browser.
+   */
+  private static gatedBrowsers_ = new Map<EgressKind, GatedBrowserEntry>();
+  /** In-flight launches, cached like the stealth one: concurrent first fetches must not orphan a Chrome. */
+  private static gatedLaunches = new Map<EgressKind, Promise<GatedBrowserEntry>>();
+  /** Replaced browsers still draining their tabs; shutdown closes these too. */
+  private static gatedRetiring = new Set<GatedBrowserEntry>();
+  /** Retirement promises, so shutdown (and tests) can wait for a graceful close to finish. */
+  private static gatedRetirements = new Set<Promise<void>>();
+  private static readonly GATED_DRAIN_POLL_MS = 100;
+  private static readonly GATED_DRAIN_TIMEOUT_MS = 60_000;
+  private static readonly GATED_PAGE_CLOSE_TIMEOUT_MS = 10_000;
+
+  /**
+   * The live browser for an egress, launching it on first use. A browser is replaced when it has
+   * disconnected, when it is past GATED_BROWSER_MAX_AGE_MS, or when the configured proxy no longer
+   * matches the one it was launched with — the replacement is launched FIRST and the old one drains
+   * in the background, so a recycle never interrupts a fetch in flight.
+   */
+  static async getGatedBrowser(egress: EgressKind, proxyServer?: string): Promise<GatedBrowserEntry> {
+    const current = this.gatedBrowsers_.get(egress);
+    if (current && this.isGatedBrowserUsable(current, proxyServer)) return current;
+
+    let launch = this.gatedLaunches.get(egress);
+    if (!launch) {
+      console.log(`[BROWSER POOL] Launching the ${egress} challenge-lane browser...`);
+      launch = puppeteer
+        .launch(buildBrowserConfig(process.env, proxyServer ? { proxyServer } : {}))
+        .then((browser) => {
+          const entry: GatedBrowserEntry = {
+            egress,
+            browser,
+            ...(proxyServer ? { proxyServer } : {}),
+            launchedAt: Date.now(),
+            pagesOpen: 0,
+            primedHosts: new Set<string>(),
+          };
+          this.gatedBrowsers_.set(egress, entry);
+          // The browser this one REPLACES keeps serving its in-flight tabs until they finish.
+          if (current && current.browser !== browser) this.retireGatedBrowserInBackground(current);
+          return entry;
+        })
+        // Cleared either way: a FAILED launch must be retried by the next fetch, never cached as a
+        // permanently rejected promise (the same rule the stealth launch follows).
+        .finally(() => {
+          this.gatedLaunches.delete(egress);
+        });
+      this.gatedLaunches.set(egress, launch);
+    }
+    return await launch;
+  }
+
+  /** Whether a live gated browser can still serve: connected, inside its age bound, right egress. */
+  private static isGatedBrowserUsable(entry: GatedBrowserEntry, proxyServer?: string): boolean {
+    if (entry.closing) return false;
+    if (entry.browser.connected === false) return false;
+    if ((entry.proxyServer ?? undefined) !== (proxyServer ?? undefined)) return false;
+    return Date.now() - entry.launchedAt < GATED_BROWSER_MAX_AGE_MS;
+  }
+
+  /**
+   * Open a gated fetch's tab: `browser.newPage()`, which is the DEFAULT context — never
+   * `createBrowserContext`, whose pages do not clear the challenge. Counted so a retiring browser
+   * knows when it has drained; a tab that fails to open is not booked.
+   */
+  static async openGatedPage(entry: GatedBrowserEntry): Promise<Page> {
+    entry.pagesOpen++;
+    try {
+      return await entry.browser.newPage();
+    } catch (err) {
+      entry.pagesOpen--;
+      throw err;
+    }
+  }
+
+  /**
+   * Close a gated fetch's tab, bounded so a hung challenge page cannot stall the lane. `false` ⇒ the
+   * page LEAKED onto a browser that outlives every request — the caller must retire that browser
+   * rather than keep opening tabs on it.
+   */
+  static async closeGatedPage(entry: GatedBrowserEntry, page: Page): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        page.close(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('page.close() timed out')), this.GATED_PAGE_CLOSE_TIMEOUT_MS);
+        }),
+      ]);
+      return true;
+    } catch (err) {
+      const rssMb = Math.round(process.memoryUsage().rss / 1048576);
+      console.error(
+        `[BROWSER POOL] page.close() FAILED on the ${entry.egress} challenge-lane browser — leaked renderer ` +
+        `(pagesOpen=${entry.pagesOpen} rss=${rssMb}MB): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    } finally {
+      if (timer) clearTimeout(timer);
+      entry.pagesOpen = Math.max(0, entry.pagesOpen - 1);
+    }
+  }
+
+  /**
+   * Take a gated browser out of service now and wait for it to close — the door for a fetch that
+   * found a leaked renderer on it. The next fetch for that egress launches a fresh one (and re-earns
+   * every clearance it held, which is why this is a failure path, not a routine one).
+   */
+  static async retireGatedBrowser(entry: GatedBrowserEntry): Promise<void> {
+    if (this.gatedBrowsers_.get(entry.egress) === entry) this.gatedBrowsers_.delete(entry.egress);
+    await this.drainAndCloseGatedBrowser(entry);
+  }
+
+  /** Same retirement, not awaited by the fetch that triggered it (the age recycle). */
+  private static retireGatedBrowserInBackground(entry: GatedBrowserEntry): void {
+    if (this.gatedBrowsers_.get(entry.egress) === entry) this.gatedBrowsers_.delete(entry.egress);
+    this.gatedRetiring.add(entry);
+    let retirement: Promise<void>;
+    retirement = this.drainAndCloseGatedBrowser(entry).finally(() => {
+      this.gatedRetiring.delete(entry);
+      this.gatedRetirements.delete(retirement);
+    });
+    this.gatedRetirements.add(retirement);
+  }
+
+  /** Wait for every in-flight retirement (shutdown; also what makes the recycle testable). */
+  static async settleGatedRetirements(): Promise<void> {
+    while (this.gatedRetirements.size > 0) {
+      await Promise.allSettled([...this.gatedRetirements]);
+    }
+  }
+
+  /**
+   * Wait for a retired browser's tabs to finish, then close it. Bounded: a tab that never closes
+   * must not keep a whole Chrome alive forever, and `closing` (set by shutdown) abandons the wait
+   * immediately.
+   */
+  private static async drainAndCloseGatedBrowser(entry: GatedBrowserEntry): Promise<void> {
+    const deadline = Date.now() + this.GATED_DRAIN_TIMEOUT_MS;
+    while (entry.pagesOpen > 0 && !entry.closing && entry.browser.connected !== false && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, this.GATED_DRAIN_POLL_MS));
+    }
+    if (entry.pagesOpen > 0) {
+      console.warn(`[BROWSER POOL] Closing the ${entry.egress} challenge-lane browser with ${entry.pagesOpen} tab(s) still open`);
+    }
+    await this.closeGatedBrowserHandle(entry);
+  }
+
+  /** Close one gated browser's handle. Idempotent — a retirement and a shutdown may both reach it. */
+  private static async closeGatedBrowserHandle(entry: GatedBrowserEntry): Promise<void> {
+    entry.closing = true;
+    // A shutdown can reach a browser whose own drain is mid-sleep; whichever arrives first owns the
+    // close, and the other returns. Latched synchronously, so the two can never both get past here.
+    if (entry.closed) return;
+    entry.closed = true;
+    try {
+      if (entry.browser.connected !== false) await entry.browser.close();
+      console.log(`[BROWSER POOL] ${entry.egress} challenge-lane browser closed`);
+    } catch (error) {
+      console.error(`[BROWSER POOL] Error closing the ${entry.egress} challenge-lane browser: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  /** The live gated browsers, for /health/detailed. Handles never leave this class. */
+  static gatedBrowsers(): GatedBrowserView[] {
+    return [...this.gatedBrowsers_.values()].map(gatedBrowserView);
+  }
+
+  /** Close every gated browser (live and retiring) without waiting out their tabs — shutdown only. */
+  private static async closeGatedBrowsers(): Promise<void> {
+    const all = [...this.gatedBrowsers_.values(), ...this.gatedRetiring];
+    this.gatedBrowsers_.clear();
+    this.gatedLaunches.clear();
+    for (const entry of all) await this.closeGatedBrowserHandle(entry);
+    // Every drain now sees `closing` and stops, so this cannot wait out the drain timeout.
+    await this.settleGatedRetirements();
+    this.gatedRetiring.clear();
+  }
+
   static async closeAll(): Promise<void> {
     // The challenge-lane browser is long-lived by design, so shutdown is the ONLY thing that closes
     // it — miss it and the process hangs on an orphaned Chrome.
     const challengeLane = this.stealthBrowser;
     this.stealthBrowser = null;
     this.stealthLaunch = null;
+
+    // The per-egress challenge-lane browsers are long-lived by design too — shutdown is the only
+    // thing that closes them, and their tabs go with them.
+    await this.closeGatedBrowsers();
 
     // Kept (challenge-gated) contexts first: they outlive requests, so nothing else closes them.
     const kept = getPersistentContexts().drain();
