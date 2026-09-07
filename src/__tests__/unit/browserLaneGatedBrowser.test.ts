@@ -209,6 +209,35 @@ describe('browser lane gated browsers', () => {
   });
 
   /**
+   * WIRING: the clearance wait leaves on a `cf_clearance` cookie, and can only see one if the lane
+   * hands it a page reporting the jar of the context it runs in. A gated tab runs in the browser's
+   * DEFAULT context — the one holding the clearance for every gated host on this egress.
+   */
+  it('hands the wait the gated browser default context\'s cookie jar as clearance evidence', async () => {
+    const cookies = jest.fn<(...a: any[]) => any>().mockResolvedValue([{ name: 'cf_clearance', domain: '.anitoysgk.com' }]);
+    const titles = ['Just a moment...', 'Lucy'];
+    jest.mocked(puppeteer.launch).mockImplementationOnce(async () => {
+      const defaultContext = { cookies };
+      return {
+        newPage: jest.fn<(...a: any[]) => any>().mockImplementation(async () => {
+          const page = newMockPage({ 'content-type': 'text/html', 'cf-mitigated': 'challenge' });
+          jest.mocked(page.title).mockImplementation(async () => (titles.length > 1 ? titles.shift()! : titles[0]));
+          (page as any).browserContext = jest.fn(() => defaultContext);
+          return page;
+        }),
+        createBrowserContext: jest.fn<(...a: any[]) => any>(),
+        close: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
+        connected: true,
+      } as unknown as jest.Mocked<Browser>;
+    });
+    const service = createScrapingService();
+
+    await service.browserFetch('https://www.anitoysgk.com/lucy.html', { challengeGated: true, proxyServer: PROXY });
+
+    expect(cookies).toHaveBeenCalled();
+  });
+
+  /**
    * The PRIME is the navigation that meets the challenge on a cold profile; navigating to the target
    * before it clears cancels the challenge script and the priming visit never happened.
    */

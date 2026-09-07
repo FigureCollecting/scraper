@@ -90,6 +90,41 @@ describe('isCloudflareChallenge', () => {
         '<html><head><title>Just A Moment Figure</title></head><body><h1>Buy the Just A Moment figure</h1></body></html>';
       expect(isCloudflareChallenge(html)).toBe(false);
     });
+
+    /**
+     * THE POST-CHALLENGE PAGE (measured live, www.suruga-ya.jp 2026-09-07, 115 KB of genuine product
+     * HTML). Once the browser lane waits for real clearance evidence it lands on the store's own
+     * page — which carries the challenge URL it arrived from as a URL-ENCODED `ref=` parameter, so
+     * `__cf_chl_tk` occurs verbatim in the body. The bare `__cf_chl_` prefix flagged that as an
+     * interstitial, which would fail the ingest of every gated store's first fetch. A challenge
+     * TOKEN in a URL is not a challenge SCRIPT: the genuine interstitial always carries the globals
+     * (`_cf_chl_opt`, `__cf_chl_ctx`, `__cf_chl_managed_tk__`) as well.
+     */
+    it('does NOT flag a real post-challenge page carrying the challenge URL as a referrer', () => {
+      const html =
+        '<html><head><title>駿河屋 -&lt;中古&gt;XRGB-mini FRAME MEISTER</title></head><body>' +
+        '<h1>XRGB-mini FRAME MEISTER</h1>' +
+        '<img src="https://track.example.test/p?url=https%3A%2F%2Fwww.suruga-ya.jp%2Fproduct%2Fdetail%2F100000950' +
+        '&amp;ref=https%3A%2F%2Fwww.suruga-ya.jp%2Fproduct%2Fdetail%2F100000950%3F__cf_chl_tk%3D' +
+        'HrivctppkEeQuI06P7WyM9_xYl81K98uvuUteyRWVzo-1788768831-1.0.1.1-5ekGJoA6jqtXOXWVT4RG7fRsKvi566F8eyCHPjTsf4I">' +
+        '</body></html>';
+      expect(isCloudflareChallenge(html)).toBe(false);
+    });
+
+    it('does NOT flag a real page linking back with the round-trip token unencoded', () => {
+      const html =
+        '<html><head><title>XRGB-mini FRAME MEISTER</title></head><body>' +
+        '<a href="/product/detail/100000950?__cf_chl_rt_tk=abc-123">back</a></body></html>';
+      expect(isCloudflareChallenge(html)).toBe(false);
+    });
+
+    it('STILL flags a genuine interstitial that also carries the round-trip token in its URL', () => {
+      const html =
+        '<html><head><title>Just a moment...</title></head><body>' +
+        '<a href="/product/detail/100000950?__cf_chl_rt_tk=abc-123">x</a>' +
+        '<script>window._cf_chl_opt={cvId:"3"};window.__cf_chl_managed_tk__="x";</script></body></html>';
+      expect(isCloudflareChallenge(html)).toBe(true);
+    });
   });
 
   describe('real store pages carrying Cloudflare Bot-Management telemetry → false (RS-1/RD-1/F1 regression)', () => {
