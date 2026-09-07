@@ -4,7 +4,7 @@ import type { Page, Browser } from 'puppeteer';
 import { BrowserPool, scrapeGeneric } from '../../services/genericScraper';
 import { createScrapingService } from '../../services/engineServices/scrapingService';
 import { clearChallengeGates } from '../../services/browserChallenge';
-import { resetPersistentContexts } from '../../services/persistentContexts';
+import { resetHostConcurrency } from '../../services/gatedBrowsers';
 
 /**
  * In clean-headful mode the browser IS the disguise, so the lane must stop dressing it up. Two
@@ -26,7 +26,7 @@ describe('clean-headful page setup', () => {
     await BrowserPool.reset();
     (BrowserPool as any).stealthBrowser = null;
     clearChallengeGates();
-    resetPersistentContexts();
+    resetHostConcurrency();
 
     mockPage = {
       goto: jest.fn<(...a: any[]) => any>().mockResolvedValue({ status: () => 200, headers: () => ({ 'content-type': 'text/html' }), url: () => 'https://x.test/1' }),
@@ -60,7 +60,7 @@ describe('clean-headful page setup', () => {
     if (savedMode === undefined) delete process.env.BROWSER_LAUNCH_MODE;
     else process.env.BROWSER_LAUNCH_MODE = savedMode;
     await BrowserPool.reset();
-    resetPersistentContexts();
+    resetHostConcurrency();
   });
 
   it('leaves the real browser UA and window size alone when nothing is declared', async () => {

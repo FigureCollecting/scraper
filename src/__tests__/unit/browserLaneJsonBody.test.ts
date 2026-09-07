@@ -4,7 +4,7 @@ import type { Page, Browser } from 'puppeteer';
 import { BrowserPool } from '../../services/genericScraper';
 import { createScrapingService } from '../../services/engineServices/scrapingService';
 import { clearChallengeGates } from '../../services/browserChallenge';
-import { resetPersistentContexts } from '../../services/persistentContexts';
+import { resetHostConcurrency } from '../../services/gatedBrowsers';
 
 /**
  * A JSON API on the browser lane (sugotoys' WooCommerce Store API rides it now that its edge
@@ -70,13 +70,13 @@ describe('browser lane JSON body passthrough', () => {
     await BrowserPool.reset();
     (BrowserPool as any).stealthBrowser = null;
     clearChallengeGates();
-    resetPersistentContexts();
+    resetHostConcurrency();
   });
 
   afterEach(async () => {
     await BrowserPool.reset();
     clearChallengeGates();
-    resetPersistentContexts();
+    resetHostConcurrency();
   });
 
   it('browserFetch returns the raw JSON body, not the viewer DOM', async () => {

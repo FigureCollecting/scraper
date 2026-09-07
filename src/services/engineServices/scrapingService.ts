@@ -1,8 +1,18 @@
 /**
- * ScrapingService adapter — generic page-fetch capability built on top of
- * the existing BrowserPool (pooled + stealth browser lifecycle management).
- * This adapter only navigates and returns raw HTML — extraction is the
- * plugin's job via its own ExtractionRuleset.
+ * ScrapingService adapter — generic page-fetch capability built on top of the existing BrowserPool
+ * (pooled, stealth and per-egress GATED browser lifecycles). This adapter only navigates and returns
+ * raw HTML — extraction is the plugin's job via its own ExtractionRuleset.
+ *
+ * The lane splits on ONE question: is this host challenge-gated? A gated fetch is a tab in the
+ * long-lived browser for its egress, opened in that browser's DEFAULT context — measured 2026-09-07,
+ * a `createBrowserContext` page never clears Cloudflare's JS challenge even with its traffic leaving
+ * the correct residential IP, while a default-context tab clears in 8-9 s and every later tab reuses
+ * the clearance. Everything else keeps the per-request context it has always had.
+ *
+ * The gated browser's other two requirements live outside this file: the residential proxy is a
+ * LAUNCH argument on that browser (genericScraper), and the PROCESS timezone must not be UTC (the
+ * container's TZ) — the challenge's cross-origin frame reads the process zone, so `emulateTimezone`
+ * cannot stand in for it (browserTimezone).
  */
 import type { Browser, Page, HTTPResponse } from 'puppeteer';
 import { BrowserPool, isCleanHeadfulMode } from '../genericScraper.js';
@@ -13,12 +23,11 @@ import { getCfCookieStore, type CfCookieSource } from '../cookieJar.js';
 import { applyEgressTimezone } from '../browserTimezone.js';
 import { ChallengeLaneUnavailableError, awaitChallengeClearance, challengeHost, isChallengeGated } from '../browserChallenge.js';
 import {
-  getPersistentContexts,
-  persistentContextKey,
+  gatedHostKey,
+  getHostConcurrency,
   type EgressKind,
-  type PersistentContextCache,
-  type PersistentContextEntry,
-} from '../persistentContexts.js';
+  type GatedBrowserEntry,
+} from '../gatedBrowsers.js';
 
 const DEFAULT_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36';
@@ -403,26 +412,13 @@ export function createScrapingService(
 ): EngineScrapingService {
   // Resolved per navigation (not once here) so a hot-reloaded cookie file is always the one consulted.
   const store = (): CfCookieSource => options.cookieStore ?? getCfCookieStore();
-  /** Close contexts the cache evicted, keeping the pool's leak counters honest. */
-  async function closeEvicted(evicted: PersistentContextEntry[]): Promise<void> {
-    for (const entry of evicted) {
-      const closedCleanly = await BrowserPool.closeContext(entry.context);
-      if (!closedCleanly) {
-        // The context leaked onto the long-lived challenge-lane browser: retire it, and forget
-        // every other context that lived on it (they died with it — there is nothing to close).
-        getPersistentContexts().dropBrowser(entry.browser);
-        await BrowserPool.retireStealthBrowser(entry.browser);
-      }
-    }
-  }
-
   /** Page setup shared by both lifecycles: egress timezone first, then the caller's overrides. */
   async function preparePage(page: Page, options: EnginePageOptions): Promise<void> {
-    // TIMEZONE follows the EGRESS, per page: the residential exit's zone for a proxied context,
-    // the node's own for a direct one. Applied BEFORE any navigation — a challenge samples the
-    // environment on its first script, and a browser left on the container's UTC zone silently
-    // never clears (any real named zone passes; the egress's zone is the defensible default).
-    // Nothing configured ⇒ no CDP call (CI/tests unchanged).
+    // TIMEZONE, optional and cosmetic: what actually decides a challenge is the PROCESS zone (the
+    // container's TZ), because the challenge's cross-origin frame reads that, not this page's CDP
+    // override — measured 2026-09-07: a UTC process never clears no matter what the page emulates,
+    // and a non-UTC process clears with or without an override. So this only aligns what the page
+    // itself reports with the exit it leaves through. Nothing configured ⇒ no CDP call (the default).
     await applyEgressTimezone(page, Boolean(options.proxyServer));
     if (options.viewport) {
       await page.setViewport(options.viewport);
@@ -433,46 +429,50 @@ export function createScrapingService(
   }
 
   /**
-   * Run one fetch on a KEPT context: a new page inside it, the session prime if this context has
-   * not made one yet, then the fetch. Only the PAGE is closed — the context (and the clearance it
-   * holds) outlives the request, bounded by the cache.
+   * Run one fetch as a TAB in the gated browser for this egress: a new page in its DEFAULT context,
+   * the session prime if this host has not been primed on THIS browser instance, then the fetch.
+   * Only the tab is closed — the browser, and the clearance its profile holds for every gated host,
+   * outlives the request.
+   *
+   * A `createBrowserContext` page is deliberately NOT used here: measured 2026-09-07 through the
+   * residential exit, such a page never clears the challenge (the traffic leaves the right IP; the
+   * interstitial simply stays), while a default-context tab clears in 8-9 s.
    */
-  async function runOnPersistentContext<T>(
-    entry: PersistentContextEntry,
+  async function runOnGatedBrowser<T>(
     fn: (page: Page) => Promise<T>,
     options: EnginePageOptions,
-    contexts: PersistentContextCache,
+    host: string,
+    egress: EgressKind,
   ): Promise<T> {
-    const page: Page = await entry.context.newPage();
+    // Bound the tabs one host may hold BEFORE the browser is touched, so a slow store queues instead
+    // of filling the shared browser with renderers.
+    const slot = await getHostConcurrency().acquire(gatedHostKey(host, egress));
+    let entry: GatedBrowserEntry | undefined;
+    let page: Page | undefined;
     try {
+      entry = await BrowserPool.getGatedBrowser(egress, options.proxyServer);
+      page = await BrowserPool.openGatedPage(entry);
       await preparePage(page, options);
-      // SESSION PRIME on a fresh session: anitoys' search results 404 without a same-session
-      // homepage visit, so the origin root is navigated once per context, before the target.
-      if (options.primeUrl && !entry.primed) {
+      // SESSION PRIME on a cold profile: anitoys' search results 404 without a same-session homepage
+      // visit, so the origin root is navigated once per (browser instance, host), before the target.
+      if (options.primeUrl && !entry.primedHosts.has(host)) {
         const primed = await page.goto(options.primeUrl, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
-        // The PRIME is the navigation that meets the challenge — a fresh context always re-challenges,
-        // and `domcontentloaded` fires on the interstitial. Navigating to the target without waiting
-        // CANCELS the challenge script: the homepage never loads, the same-session cookie the prime
-        // exists for is never set, and `primed` latches for the rest of this context's life.
+        // The PRIME is the navigation that meets the challenge — `domcontentloaded` fires on the
+        // interstitial, and navigating to the target without waiting CANCELS the challenge script:
+        // the homepage never loads and the cookie the prime exists for is never set.
         await awaitChallengeClearance(page, primed, options.primeUrl);
-        entry.primed = true;
+        entry.primedHosts.add(host);
       }
       return await fn(page);
     } finally {
-      let pageClosed = true;
-      await page.close().catch((err: unknown) => {
-        pageClosed = false;
-        // eslint-disable-next-line no-console
-        console.warn(`[BROWSER LANE] failed to close a page on a kept context: ${err instanceof Error ? err.message : String(err)}`);
-      });
-      contexts.release(entry);
-      // A page that will not close is a live renderer on a context that OUTLIVES the request — the
-      // shape of leak that once climbed to ~25 GB. Stop reusing that context: drop it from the cache
-      // and close it, paying one re-challenge on the next fetch rather than accumulating renderers.
-      if (!pageClosed) {
-        const discarded = contexts.discard(entry);
-        if (discarded) await closeEvicted([discarded]);
+      if (entry && page) {
+        const closedCleanly = await BrowserPool.closeGatedPage(entry, page);
+        // A tab that will not close is a live renderer on a browser that outlives every request — the
+        // leak shape that once climbed to ~25 GB. Retire the whole browser and pay one round of
+        // re-challenges rather than keep opening tabs on it.
+        if (!closedCleanly) await BrowserPool.retireGatedBrowser(entry);
       }
+      slot();
     }
   }
 
@@ -480,22 +480,17 @@ export function createScrapingService(
    * Run one fetch on a browser page.
    *
    * Two lifecycles share this door:
-   *   - EPHEMERAL (the default): a fresh context per request, closed with the request. Byte-identical
-   *     to the pre-persistence behavior for every store that is not challenge-gated.
-   *   - PERSISTENT: a challenge-gated host (declared `access: 'cloudflare'`, or LEARNED from a
-   *     `cf-mitigated: challenge` response on an earlier fetch) reuses one context per (host,
-   *     egress) so its Cloudflare clearance is reused instead of re-earned. Those contexts live on
-   *     the long-lived challenge-lane browser — never on a pooled one, which may be retired or
-   *     closed under them — and are bounded by the cache (25 min age, 10 min idle, 6 contexts).
-   * A fetch that DISCOVERS the gate mid-flight keeps its own context on the way out (that context
-   * is the one holding the clearance it just earned), provided it ran on the challenge-lane browser.
+   *   - EPHEMERAL (the default): a fresh `createBrowserContext` per request on a pooled (or the
+   *     stealth) browser, closed with the request. Unchanged for every store that is not gated —
+   *     those pass the challenge-free web perfectly well, and the context is what bounds them.
+   *   - GATED: a challenge-gated host (declared `access: 'cloudflare'`, or LEARNED from a
+   *     `cf-mitigated: challenge` response on an earlier fetch) is fetched as a tab in the
+   *     long-lived browser for its egress, whose default context holds the clearance.
    */
   async function withPage<T>(fn: (page: Page) => Promise<T>, options: EnginePageOptions = {}): Promise<T> {
     const stealth = options.stealth ?? false;
     const egress: EgressKind = options.proxyServer ? 'residential' : 'direct';
     const host = options.targetUrl ? challengeHost(options.targetUrl) : undefined;
-    const key = host ? persistentContextKey(host, egress) : undefined;
-    const contexts = getPersistentContexts();
 
     // A DECLARED gate needs the profile that can actually clear a challenge. Refuse rather than
     // attempt: the headless profile fails silently (it never leaves the interstitial) and every
@@ -504,22 +499,14 @@ export function createScrapingService(
       throw new ChallengeLaneUnavailableError(options.targetUrl ?? '');
     }
 
-    if (key && (options.challengeGated === true || isChallengeGated(host))) {
-      const { entry, evicted } = contexts.acquire(key);
-      await closeEvicted(evicted);
-      if (entry) return await runOnPersistentContext(entry, fn, options, contexts);
-
-      const browser = await BrowserPool.getStealthBrowser();
-      const context = await BrowserPool.openContext(browser, options.proxyServer ? { proxyServer: options.proxyServer } : {});
-      const stored = contexts.store(key, { browser, context, inUse: 1 });
-      await closeEvicted(stored.evicted);
-      return await runOnPersistentContext(stored.entry, fn, options, contexts);
+    if (host && (options.challengeGated === true || isChallengeGated(host))) {
+      return await runOnGatedBrowser(fn, options, host, egress);
     }
 
     const browser: Browser = stealth ? await BrowserPool.getStealthBrowser() : await BrowserPool.getBrowser();
-    // RESIDENTIAL EGRESS: bind the per-request context (not the browser) to the proxy, so only the
-    // declaring store's navigations leave through it. The context is closed in the finally below
-    // exactly like a direct one — a proxied context is never leaked onto the pooled browser.
+    // RESIDENTIAL EGRESS on the ungated path: bind the per-request context (not the browser) to the
+    // proxy, so only the declaring store's navigations leave through it. Gated fetches cannot use
+    // this — their browser carries the proxy at launch instead (see runOnGatedBrowser).
     const context = await BrowserPool.openContext(browser, options.proxyServer ? { proxyServer: options.proxyServer } : {});
 
     let page: Page | undefined;
@@ -527,34 +514,23 @@ export function createScrapingService(
       page = await context.newPage();
       await preparePage(page, options);
       if (options.primeUrl) {
-        // Same rule as the kept-context prime above: wait the interstitial out, or the target
-        // navigation cancels it and the priming visit never happened.
+        // Same rule as the gated prime above: wait the interstitial out, or the target navigation
+        // cancels it and the priming visit never happened.
         const primed = await page.goto(options.primeUrl, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
         await awaitChallengeClearance(page, primed, options.primeUrl);
       }
       return await fn(page);
     } finally {
-      // A gate revealed DURING this fetch (cf-mitigated) means this context now holds a clearance.
-      // Keep it — but only on the challenge-lane browser, which is never returned to the pool.
-      if (key && stealth && isChallengeGated(host)) {
-        if (page) {
-          await page.close().catch(() => { /* the context outlives it; a stuck page is not fatal */ });
-        }
-        const retained = contexts.store(key, { browser, context, inUse: 0, primed: Boolean(options.primeUrl) });
-        await closeEvicted(retained.evicted);
+      // The browser is intentionally long-lived; the context is the per-request unit. If it will not
+      // close cleanly it has leaked onto that browser, so retire the browser rather than reuse it
+      // (paying the relaunch cost only on the rare failure). A clean close returns the pooled browser.
+      const closedCleanly = await BrowserPool.closeContext(context);
+      if (stealth) {
+        if (!closedCleanly) await BrowserPool.retireStealthBrowser(browser);
+      } else if (closedCleanly) {
+        await BrowserPool.returnBrowser(browser);
       } else {
-        // The browser is intentionally long-lived; the context is the per-request
-        // unit. If it will not close cleanly it has leaked onto that browser, so
-        // retire the browser rather than reuse it (paying the relaunch/Cloudflare
-        // cost only on the rare failure). A clean close returns the pooled browser.
-        const closedCleanly = await BrowserPool.closeContext(context);
-        if (stealth) {
-          if (!closedCleanly) await BrowserPool.retireStealthBrowser(browser);
-        } else if (closedCleanly) {
-          await BrowserPool.returnBrowser(browser);
-        } else {
-          await BrowserPool.retirePooledBrowser(browser);
-        }
+        await BrowserPool.retirePooledBrowser(browser);
       }
     }
   }

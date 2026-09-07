@@ -1,6 +1,6 @@
 /**
  * genericScraper — the browser lane's Chrome lifecycle: the pooled browsers, the long-lived
- * challenge-lane browser, per-request contexts, and the selector-driven `scrapeGeneric` fetch.
+ * per-egress CHALLENGE browsers, per-request contexts, and the selector-driven `scrapeGeneric` fetch.
  *
  * THE LAUNCH PROFILE IS THE ANTI-DETECTION STRATEGY. There is no stealth plugin any more (dropped
  * 2026-09-07 with puppeteer-extra). Measured against the Cloudflare-gated cohort (anitoysgk.com,
@@ -17,15 +17,21 @@
  * one far from the exit IP). A UTC browser simply never clears; nothing errors.
  *
  * The rest of the lane follows from that:
- *   - TIMEZONE per context, matched to the EGRESS the context leaves through (browserTimezone.ts):
- *     `RESIDENTIAL_EGRESS_TIMEZONE` for a proxied context, `DIRECT_EGRESS_TIMEZONE` for a direct
- *     one. It is per-context, not a process TZ, because one browser serves both at once.
+ *   - TIMEZONE: the deciding one is the PROCESS zone (the container's `TZ`), NOT a page override.
+ *     Measured 2026-09-07: a UTC process never clears even with `page.emulateTimezone` set to a real
+ *     zone, because the interstitial's cross-origin frame reads the process zone; a non-UTC process
+ *     clears with or without an override. `RESIDENTIAL_EGRESS_TIMEZONE` / `DIRECT_EGRESS_TIMEZONE`
+ *     remain as optional per-page cosmetics (browserTimezone.ts), unset by default and by the deploy.
  *   - NO cosmetic overrides in clean-headful mode: the lane does not rewrite the UA of a Chrome 152
  *     to a stale `Chrome/127` string (client hints would contradict it, and Cloudflare binds the
  *     clearance it issues to the UA), and does not override the device metrics of a window that
  *     already has the size the flags asked for. A store that DECLARES a UA still gets it.
- *   - CONTEXTS ARE KEPT for challenge-gated hosts (persistentContexts.ts): the clearance is bound to
- *     (IP, UA, context), so a fresh context re-earns the challenge every single fetch.
+ *   - CHALLENGE-GATED HOSTS ride a dedicated long-lived browser per EGRESS (gatedBrowsers.ts), and
+ *     are fetched in NEW TABS of its DEFAULT context. A `createBrowserContext` page never clears the
+ *     challenge at all (measured 2026-09-07, with its traffic demonstrably leaving the right IP) —
+ *     the DevTools-created context is itself the tell — while a default-context tab clears in 8-9 s
+ *     and hands its clearance to every later tab. The residential browser carries `--proxy-server`
+ *     as a LAUNCH argument, since a default context has no per-context proxy.
  * The pooled/headless profile is unchanged and remains the default — CI, tests and every non-gated
  * store behave exactly as before.
  */
@@ -34,7 +40,6 @@ import zlib from 'zlib';
 import crypto from 'crypto';
 import { sanitizeForLog, sanitizeObjectForLog, capWaitTime, truncateString, MAX_STRING_LENGTH } from '../utils/security.js';
 import { applyEgressTimezone, selectEgressTimezone } from './browserTimezone.js';
-import { getPersistentContexts } from './persistentContexts.js';
 import {
   GATED_BROWSER_MAX_AGE_MS,
   gatedBrowserView,
@@ -604,8 +609,6 @@ export class BrowserPool {
       this.stealthBrowser = null;
       this.stealthLaunch = null;
     }
-    // Every kept context on this browser dies with it — forget them rather than hand one out.
-    getPersistentContexts().dropBrowser(browser);
     await browser.close().catch((err: any) => console.error('[BROWSER POOL] Error closing retired stealth browser:', err));
   }
 
@@ -868,15 +871,6 @@ export class BrowserPool {
     // The per-egress challenge-lane browsers are long-lived by design too — shutdown is the only
     // thing that closes them, and their tabs go with them.
     await this.closeGatedBrowsers();
-
-    // Kept (challenge-gated) contexts first: they outlive requests, so nothing else closes them.
-    const kept = getPersistentContexts().drain();
-    if (kept.length > 0) {
-      console.log(`[BROWSER POOL] Closing ${kept.length} persistent context(s)...`);
-      for (const entry of kept) {
-        await this.closeContext(entry.context);
-      }
-    }
 
     console.log(`[BROWSER POOL] Closing ${this.browsers.length} browsers...`);
 

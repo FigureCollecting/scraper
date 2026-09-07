@@ -10,9 +10,9 @@
  * the real document replaces it, bounded by a budget.
  *
  * Seeing a challenge is also the LEARNED signal that a host is gated. That matters beyond this
- * fetch: a gated host's browser context is kept alive afterwards (see persistentContexts) so the
- * clearance — which Cloudflare binds to IP + user agent, and which a fresh context always re-earns —
- * is reused for the ~30 min it is good for, instead of being re-earned on every fetch.
+ * fetch: a gated host is served from then on by the long-lived browser for its egress (see
+ * gatedBrowsers), whose default context holds the clearance — which Cloudflare binds to IP + user
+ * agent + profile — so it is reused for the ~30 min it is good for instead of re-earned every fetch.
  */
 import { sanitizeForLog } from '../utils/security.js';
 

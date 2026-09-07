@@ -3,6 +3,8 @@ import puppeteer from 'puppeteer';
 import type { Page, Browser } from 'puppeteer';
 import { BrowserPool } from '../../../services/genericScraper';
 import { createScrapingService } from '../../../services/engineServices/scrapingService';
+import { clearChallengeGates } from '../../../services/browserChallenge';
+import { resetHostConcurrency } from '../../../services/gatedBrowsers';
 
 describe('createScrapingService', () => {
   let mockPage: jest.Mocked<Page>;
@@ -13,6 +15,10 @@ describe('createScrapingService', () => {
     jest.clearAllMocks();
     await BrowserPool.reset();
     (BrowserPool as any).stealthBrowser = null;
+    // Gates are LEARNED per process: the cloudflareDetection test below teaches this suite's host to
+    // the gated lane, which would then route every later fetch to it. Each test starts gate-free.
+    clearChallengeGates();
+    resetHostConcurrency();
 
     mockPage = {
       goto: jest.fn<(...args: any[]) => any>().mockResolvedValue({ status: () => 200 }),
