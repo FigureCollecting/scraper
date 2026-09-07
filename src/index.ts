@@ -20,7 +20,7 @@ import { createCapturingScrapingService } from './services/engineServices/captur
 import { scraperDebug } from './utils/logger.js';
 
 // Import browser pool functionality
-import { initializeBrowserPool, BrowserPool } from './services/genericScraper.js';
+import { browserLaneView, initializeBrowserPool, BrowserPool } from './services/genericScraper.js';
 import { bootstrapPlugins, shutdownPlugins } from './services/pluginBootstrap.js';
 import { getScrapeQueue } from './services/scrapeQueue.js';
 import { ScraperPlugin } from '@figurecollecting/scraper-plugin-contract';
@@ -51,6 +51,7 @@ app.use('/', createHealthRoutes({
   listChallengeCooldowns: () => getChallengeCooldown().list(),
   listCfCookies: () => getCfCookieStore().view(),
   getResidentialEgress: () => residentialEgressView(),
+  getBrowserLane: () => browserLaneView(),
 }));
 
 // Scraper routes (no /api prefix for consistency)

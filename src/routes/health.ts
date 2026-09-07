@@ -9,6 +9,7 @@
  *   - GET /version  → { name, version, status:'ok' }
  *   - GET /health/detailed → the above + browserPool health + a timestamp, and ADDITIVELY
  *     `residentialEgress: {configured, proxy?}` (the residential proxy, credentials stripped),
+ *     `browserLane: {launchMode, residentialTimezone, directTimezone, persistentContexts}`,
  *     `challengeCooldowns: [{host, remainingMs, reason}]` (the per-host CF cooldowns currently open)
  *     and `cfCookies: [{host, cookieNames, userAgentPinned, loadedAt, mintedAt?, expiresAt?, stale,
  *     staleSince?, staleReason?}]` (the stored-cookie jar's per-host view — cookie NAMES only, never a
@@ -19,6 +20,7 @@
 import { Router, type Request, type Response } from 'express';
 import type { CooldownView } from '../services/challengeCooldown.js';
 import type { CfCookieHostView } from '../services/cookieJar.js';
+import type { BrowserLaneView } from '../services/genericScraper.js';
 
 export interface HealthDeps {
   /** The service version (package.json). */
@@ -35,6 +37,12 @@ export interface HealthDeps {
    * endpoint is unauthenticated and RESIDENTIAL_PROXY_URL may carry `user:password@`.
    */
   getResidentialEgress: () => { configured: boolean; proxy?: string };
+  /**
+   * The browser lane's live configuration (browserLaneView()): the launch profile, the timezone each
+   * egress emulates, and how many challenge-gated contexts are being kept alive. Pure config +
+   * counters — nothing here is a secret.
+   */
+  getBrowserLane: () => BrowserLaneView;
 }
 
 export function createHealthRoutes(deps: HealthDeps): Router {
@@ -62,6 +70,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         challengeCooldowns: deps.listChallengeCooldowns(),
         cfCookies: deps.listCfCookies(),
         residentialEgress: deps.getResidentialEgress(),
+        browserLane: deps.getBrowserLane(),
         timestamp: new Date().toISOString(),
       });
     } catch (error) {
@@ -71,6 +80,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         challengeCooldowns: deps.listChallengeCooldowns(),
         cfCookies: deps.listCfCookies(),
         residentialEgress: deps.getResidentialEgress(),
+        browserLane: deps.getBrowserLane(),
         error: error instanceof Error ? error.message : 'Unknown error',
       });
     }

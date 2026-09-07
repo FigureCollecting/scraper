@@ -2,7 +2,7 @@ import puppeteer, { Browser, BrowserContext, Page } from 'puppeteer';
 import zlib from 'zlib';
 import crypto from 'crypto';
 import { sanitizeForLog, sanitizeObjectForLog, capWaitTime, truncateString, MAX_STRING_LENGTH } from '../utils/security.js';
-import { applyEgressTimezone } from './browserTimezone.js';
+import { applyEgressTimezone, selectEgressTimezone } from './browserTimezone.js';
 import { getPersistentContexts } from './persistentContexts.js';
 
 export interface ScrapedData {
@@ -271,6 +271,33 @@ export function buildBrowserConfig(env: NodeJS.ProcessEnv = process.env): {
   }
 
   return config;
+}
+
+/** The operator view of the browser lane for /health/detailed. */
+export interface BrowserLaneView {
+  /** Which launch profile this process uses: 'clean-headful' (production) or 'headless'. */
+  launchMode: string;
+  /** IANA zone emulated on residential-egress contexts (null ⇒ none configured). */
+  residentialTimezone: string | null;
+  /** IANA zone emulated on direct contexts (null ⇒ none configured). */
+  directTimezone: string | null;
+  /** Challenge-gated contexts currently kept alive (bounded at MAX_PERSISTENT_CONTEXTS). */
+  persistentContexts: number;
+}
+
+/**
+ * The browser lane's live configuration, for /health/detailed. All four values decide whether a
+ * Cloudflare-gated store passes or silently never clears, and none of them are observable from
+ * outside the pod otherwise — the wrong launch mode, or a missing timezone, looks exactly like a
+ * store that "stopped working".
+ */
+export function browserLaneView(env: NodeJS.ProcessEnv = process.env): BrowserLaneView {
+  return {
+    launchMode: isCleanHeadfulMode(env) ? CLEAN_HEADFUL_MODE : 'headless',
+    residentialTimezone: selectEgressTimezone(true, env) ?? null,
+    directTimezone: selectEgressTimezone(false, env) ?? null,
+    persistentContexts: getPersistentContexts().size(),
+  };
 }
 
 export class BrowserPool {

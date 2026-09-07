@@ -17,6 +17,7 @@ const build = (over: Partial<HealthDeps> = {}) => {
     listChallengeCooldowns: () => [],
     listCfCookies: () => [],
     getResidentialEgress: () => ({ configured: false }),
+    getBrowserLane: () => ({ launchMode: 'headless', residentialTimezone: null, directTimezone: null, persistentContexts: 0 }),
     ...over,
   }));
   return app;
@@ -210,5 +211,85 @@ describe('createHealthRoutes — residentialEgress', () => {
     const res = await request(app).get('/health/detailed');
     expect(res.status).toBe(500);
     expect(res.body.residentialEgress).toEqual({ configured: true, proxy: 'socks5://p.test:1055' });
+  });
+});
+
+/**
+ * BROWSER LANE view: which launch profile this process actually uses, the timezone each egress
+ * emulates, and how many challenge-gated contexts are being kept alive. All four are the difference
+ * between "Cloudflare passes" and "Cloudflare never clears", and none of them are visible from
+ * outside the pod otherwise.
+ */
+describe('createHealthRoutes — browserLane', () => {
+  it('GET /health/detailed reports the launch mode, both egress timezones and the kept-context count', async () => {
+    const app = build({
+      getBrowserLane: () => ({
+        launchMode: 'clean-headful',
+        residentialTimezone: 'America/Chicago',
+        directTimezone: 'America/New_York',
+        persistentContexts: 2,
+      }),
+    });
+
+    const res = await request(app).get('/health/detailed');
+
+    expect(res.status).toBe(200);
+    expect(res.body.browserLane).toEqual({
+      launchMode: 'clean-headful',
+      residentialTimezone: 'America/Chicago',
+      directTimezone: 'America/New_York',
+      persistentContexts: 2,
+    });
+  });
+
+  it('reports nulls for timezones nobody configured', async () => {
+    const res = await request(build()).get('/health/detailed');
+
+    expect(res.body.browserLane).toEqual({
+      launchMode: 'headless',
+      residentialTimezone: null,
+      directTimezone: null,
+      persistentContexts: 0,
+    });
+  });
+
+  it('keeps the browserLane view on the degraded (500) response too', async () => {
+    const app = build({
+      getBrowserPoolHealth: async () => { throw new Error('pool down'); },
+      getBrowserLane: () => ({ launchMode: 'clean-headful', residentialTimezone: 'America/Chicago', directTimezone: null, persistentContexts: 1 }),
+    });
+
+    const res = await request(app).get('/health/detailed');
+
+    expect(res.status).toBe(500);
+    expect(res.body.browserLane.launchMode).toBe('clean-headful');
+    expect(res.body.browserLane.persistentContexts).toBe(1);
+  });
+});
+
+/** The view builder itself: it reads the same env the launch profile and the lane read. */
+describe('browserLaneView', () => {
+  const { browserLaneView } = require('../../services/genericScraper') as typeof import('../../services/genericScraper');
+
+  it('reports the clean-headful profile and both configured zones', () => {
+    expect(browserLaneView({
+      BROWSER_LAUNCH_MODE: 'clean-headful',
+      RESIDENTIAL_EGRESS_TIMEZONE: 'America/Chicago',
+      DIRECT_EGRESS_TIMEZONE: 'America/New_York',
+    } as NodeJS.ProcessEnv)).toEqual({
+      launchMode: 'clean-headful',
+      residentialTimezone: 'America/Chicago',
+      directTimezone: 'America/New_York',
+      persistentContexts: 0,
+    });
+  });
+
+  it('reports the headless default with no zones configured', () => {
+    expect(browserLaneView({} as NodeJS.ProcessEnv)).toEqual({
+      launchMode: 'headless',
+      residentialTimezone: null,
+      directTimezone: null,
+      persistentContexts: 0,
+    });
   });
 });
