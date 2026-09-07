@@ -6,8 +6,8 @@ package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.7.0] - 2026-09-07
 
-Additive, backward-compatible: every existing `SearchFetch` still compiles unchanged — both new
-fields are optional and an undeclared store's fetches are byte-identical. Built for the residential
+Additive, backward-compatible: every existing `SearchFetch` still compiles unchanged — the new
+fields are all optional and an undeclared store's fetches are byte-identical. Built for the residential
 egress lane (Cloudflare-cohort stores whose gate is IP/ASN reputation) and for client-rendered
 (PWA) storefronts the browser lane used to capture as an empty app shell.
 
@@ -18,6 +18,12 @@ egress lane (Cloudflare-cohort stores whose gate is IP/ASN reputation) and for c
   `direct`) keeps today's node-IP path. The declaration is a REQUIREMENT, not a hint: with no proxy
   configured the engine REFUSES the fetch (a typed, non-retried config failure) rather than silently
   falling back to the node IP.
+- `SearchFetch.access?: 'open' | 'cloudflare'` (and the `StoreAccess` export) — the store's edge
+  gate. `cloudflare` tells the engine's browser lane to KEEP this host's browser context alive
+  between fetches (Cloudflare binds a clearance to IP + user agent + context, so a fresh context
+  re-runs the challenge every time) and makes `sessionPrime` apply to the browser lane as well as to
+  impit. Undeclared (or `open`) ⇒ a fresh context per request, exactly as before; the engine still
+  LEARNS the gate from a `cf-mitigated: challenge` response for stores that do not declare it.
 - `SearchFetch.waitFor?: { selector?; networkIdle?; timeoutMs? }` (and the `WaitForReadiness`
   export) — browser-lane readiness for a client-rendered storefront: after `domcontentloaded`, wait
   for the selector and/or network idle, bounded by `timeoutMs` (engine default 15000, clamped to

@@ -25,6 +25,7 @@
  */
 import type { SearchFetch, WaitForReadiness } from '@figurecollecting/scraper-plugin-contract';
 import { sanitizeForLog } from '../utils/security.js';
+import { resolvePrime } from './sessionPrime.js';
 
 /**
  * Proxy schemes every proxying lane understands. impit also speaks socks4 and takes credentials;
@@ -197,6 +198,10 @@ export interface BrowserLaneEgressOptions {
   proxyServer?: string;
   /** Client-rendered readiness the store declared (`waitFor`), carried alongside the egress. */
   waitFor?: WaitForReadiness;
+  /** The store declares a Cloudflare gate (`access: 'cloudflare'`): keep this host's context alive. */
+  challengeGated?: boolean;
+  /** Session prime (`sessionPrime`) resolved to the URL a FRESH browser context visits first. */
+  primeUrl?: string;
 }
 
 /**
@@ -217,9 +222,15 @@ export function resolveBrowserLaneOptions(
   proxyUrl: string | undefined,
 ): BrowserLaneEgressOptions | undefined {
   const proxyServer = requireResidentialProxy(url, searchFetch?.egress, proxyUrl);
+  // A CHALLENGE-GATED store also carries its session prime onto the browser lane: a fresh context
+  // is a cold session, and a cold session at anitoys 404s its own search results.
+  const challengeGated = searchFetch?.access === 'cloudflare';
+  const prime = challengeGated ? resolvePrime(searchFetch, url) : undefined;
   const options: BrowserLaneEgressOptions = {
     ...(proxyServer ? { proxyServer } : {}),
     ...(searchFetch?.waitFor ? { waitFor: searchFetch.waitFor } : {}),
+    ...(challengeGated ? { challengeGated: true } : {}),
+    ...(prime ? { primeUrl: prime.url } : {}),
   };
   return Object.keys(options).length > 0 ? options : undefined;
 }

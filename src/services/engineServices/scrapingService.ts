@@ -11,7 +11,14 @@ import { CaptureSink, NoopCaptureSink, buildRawCapture } from '../captureSink.js
 import { sanitizeForLog } from '../../utils/security.js';
 import { getCfCookieStore, type CfCookieSource } from '../cookieJar.js';
 import { applyEgressTimezone } from '../browserTimezone.js';
-import { awaitChallengeClearance } from '../browserChallenge.js';
+import { awaitChallengeClearance, challengeHost, isChallengeGated } from '../browserChallenge.js';
+import {
+  getPersistentContexts,
+  persistentContextKey,
+  type EgressKind,
+  type PersistentContextCache,
+  type PersistentContextEntry,
+} from '../persistentContexts.js';
 
 const DEFAULT_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36';
@@ -34,15 +41,25 @@ const MAX_WAIT_FOR_TIMEOUT_MS = 60000;
 export interface EngineScrapePageOptions extends ScrapePageOptions {
   proxyServer?: string;
   waitFor?: WaitForReadiness;
+  challengeGated?: boolean;
+  primeUrl?: string;
 }
 
 export interface EngineBrowserFetchOptions extends BrowserFetchOptions {
   proxyServer?: string;
   waitFor?: WaitForReadiness;
+  challengeGated?: boolean;
+  primeUrl?: string;
 }
 
 export interface EnginePageOptions extends PageOptions {
   proxyServer?: string;
+  /** The URL about to be fetched — the per-host key for a persistent (challenge-gated) context. */
+  targetUrl?: string;
+  /** The store declares a challenge gate (`access: 'cloudflare'`): keep this host's context alive. */
+  challengeGated?: boolean;
+  /** Session prime (`SearchFetch.sessionPrime`): navigate here once, on a fresh context, first. */
+  primeUrl?: string;
 }
 
 /** The contract ScrapingService, widened to accept the engine's egress/readiness wiring. */
@@ -296,40 +313,133 @@ export function createScrapingService(
 ): EngineScrapingService {
   // Resolved per navigation (not once here) so a hot-reloaded cookie file is always the one consulted.
   const store = (): CfCookieSource => options.cookieStore ?? getCfCookieStore();
+  /** Close contexts the cache evicted, keeping the pool's leak counters honest. */
+  async function closeEvicted(evicted: PersistentContextEntry[]): Promise<void> {
+    for (const entry of evicted) {
+      const closedCleanly = await BrowserPool.closeContext(entry.context);
+      if (!closedCleanly) {
+        // The context leaked onto the long-lived challenge-lane browser: retire it, and forget
+        // every other context that lived on it (they died with it — there is nothing to close).
+        getPersistentContexts().dropBrowser(entry.browser);
+        await BrowserPool.retireStealthBrowser(entry.browser);
+      }
+    }
+  }
+
+  /** Page setup shared by both lifecycles: egress timezone first, then the caller's overrides. */
+  async function preparePage(page: Page, options: EnginePageOptions): Promise<void> {
+    // TIMEZONE follows the EGRESS, per page: the residential exit's zone for a proxied context,
+    // the node's own for a direct one. Applied BEFORE any navigation — a challenge samples the
+    // environment on its first script, and a zone that disagrees with the exit IP's geolocation
+    // silently never clears. Nothing configured ⇒ no CDP call (CI/tests unchanged).
+    await applyEgressTimezone(page, Boolean(options.proxyServer));
+    if (options.viewport) {
+      await page.setViewport(options.viewport);
+    }
+    if (options.userAgent) {
+      await page.setUserAgent(options.userAgent);
+    }
+  }
+
+  /**
+   * Run one fetch on a KEPT context: a new page inside it, the session prime if this context has
+   * not made one yet, then the fetch. Only the PAGE is closed — the context (and the clearance it
+   * holds) outlives the request, bounded by the cache.
+   */
+  async function runOnPersistentContext<T>(
+    entry: PersistentContextEntry,
+    fn: (page: Page) => Promise<T>,
+    options: EnginePageOptions,
+    contexts: PersistentContextCache,
+  ): Promise<T> {
+    const page: Page = await entry.context.newPage();
+    try {
+      await preparePage(page, options);
+      // SESSION PRIME on a fresh session: anitoys' search results 404 without a same-session
+      // homepage visit, so the origin root is navigated once per context, before the target.
+      if (options.primeUrl && !entry.primed) {
+        await page.goto(options.primeUrl, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
+        entry.primed = true;
+      }
+      return await fn(page);
+    } finally {
+      await page.close().catch((err: unknown) => {
+        // eslint-disable-next-line no-console
+        console.warn(`[BROWSER LANE] failed to close a page on a kept context: ${err instanceof Error ? err.message : String(err)}`);
+      });
+      contexts.release(entry);
+    }
+  }
+
+  /**
+   * Run one fetch on a browser page.
+   *
+   * Two lifecycles share this door:
+   *   - EPHEMERAL (the default): a fresh context per request, closed with the request. Byte-identical
+   *     to the pre-persistence behavior for every store that is not challenge-gated.
+   *   - PERSISTENT: a challenge-gated host (declared `access: 'cloudflare'`, or LEARNED from a
+   *     `cf-mitigated: challenge` response on an earlier fetch) reuses one context per (host,
+   *     egress) so its Cloudflare clearance is reused instead of re-earned. Those contexts live on
+   *     the long-lived challenge-lane browser — never on a pooled one, which may be retired or
+   *     closed under them — and are bounded by the cache (25 min age, 10 min idle, 6 contexts).
+   * A fetch that DISCOVERS the gate mid-flight keeps its own context on the way out (that context
+   * is the one holding the clearance it just earned), provided it ran on the challenge-lane browser.
+   */
   async function withPage<T>(fn: (page: Page) => Promise<T>, options: EnginePageOptions = {}): Promise<T> {
     const stealth = options.stealth ?? false;
+    const egress: EgressKind = options.proxyServer ? 'residential' : 'direct';
+    const host = options.targetUrl ? challengeHost(options.targetUrl) : undefined;
+    const key = host ? persistentContextKey(host, egress) : undefined;
+    const contexts = getPersistentContexts();
+
+    if (key && (options.challengeGated === true || isChallengeGated(host))) {
+      const { entry, evicted } = contexts.acquire(key);
+      await closeEvicted(evicted);
+      if (entry) return await runOnPersistentContext(entry, fn, options, contexts);
+
+      const browser = await BrowserPool.getStealthBrowser();
+      const context = await BrowserPool.openContext(browser, options.proxyServer ? { proxyServer: options.proxyServer } : {});
+      const stored = contexts.store(key, { browser, context, inUse: 1 });
+      await closeEvicted(stored.evicted);
+      return await runOnPersistentContext(stored.entry, fn, options, contexts);
+    }
+
     const browser: Browser = stealth ? await BrowserPool.getStealthBrowser() : await BrowserPool.getBrowser();
     // RESIDENTIAL EGRESS: bind the per-request context (not the browser) to the proxy, so only the
     // declaring store's navigations leave through it. The context is closed in the finally below
     // exactly like a direct one — a proxied context is never leaked onto the pooled browser.
     const context = await BrowserPool.openContext(browser, options.proxyServer ? { proxyServer: options.proxyServer } : {});
 
+    let page: Page | undefined;
     try {
-      const page: Page = await context.newPage();
-      // TIMEZONE follows the EGRESS, per page: the residential exit's zone for a proxied context,
-      // the node's own for a direct one. Applied BEFORE any navigation — a challenge samples the
-      // environment on its first script, and a zone that disagrees with the exit IP's geolocation
-      // silently never clears. Nothing configured ⇒ no CDP call (CI/tests unchanged).
-      await applyEgressTimezone(page, Boolean(options.proxyServer));
-      if (options.viewport) {
-        await page.setViewport(options.viewport);
-      }
-      if (options.userAgent) {
-        await page.setUserAgent(options.userAgent);
+      page = await context.newPage();
+      await preparePage(page, options);
+      if (options.primeUrl) {
+        await page.goto(options.primeUrl, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
       }
       return await fn(page);
     } finally {
-      // The browser is intentionally long-lived; the context is the per-request
-      // unit. If it will not close cleanly it has leaked onto that browser, so
-      // retire the browser rather than reuse it (paying the relaunch/Cloudflare
-      // cost only on the rare failure). A clean close returns the pooled browser.
-      const closedCleanly = await BrowserPool.closeContext(context);
-      if (stealth) {
-        if (!closedCleanly) await BrowserPool.retireStealthBrowser(browser);
-      } else if (closedCleanly) {
-        await BrowserPool.returnBrowser(browser);
+      // A gate revealed DURING this fetch (cf-mitigated) means this context now holds a clearance.
+      // Keep it — but only on the challenge-lane browser, which is never returned to the pool.
+      if (key && stealth && isChallengeGated(host)) {
+        if (page) {
+          await page.close().catch(() => { /* the context outlives it; a stuck page is not fatal */ });
+        }
+        const retained = contexts.store(key, { browser, context, inUse: 0, primed: Boolean(options.primeUrl) });
+        await closeEvicted(retained.evicted);
       } else {
-        await BrowserPool.retirePooledBrowser(browser);
+        // The browser is intentionally long-lived; the context is the per-request
+        // unit. If it will not close cleanly it has leaked onto that browser, so
+        // retire the browser rather than reuse it (paying the relaunch/Cloudflare
+        // cost only on the rare failure). A clean close returns the pooled browser.
+        const closedCleanly = await BrowserPool.closeContext(context);
+        if (stealth) {
+          if (!closedCleanly) await BrowserPool.retireStealthBrowser(browser);
+        } else if (closedCleanly) {
+          await BrowserPool.returnBrowser(browser);
+        } else {
+          await BrowserPool.retirePooledBrowser(browser);
+        }
       }
     }
   }
@@ -343,16 +453,27 @@ export function createScrapingService(
     }
   }
 
+  /** The per-request page options every entry point derives from the caller's fetch options. */
+  const laneOptions = (
+    url: string,
+    fetchOptions: { proxyServer?: string; challengeGated?: boolean; primeUrl?: string } | undefined,
+  ): Omit<EnginePageOptions, 'stealth'> => ({
+    targetUrl: url,
+    ...(fetchOptions?.proxyServer ? { proxyServer: fetchOptions.proxyServer } : {}),
+    ...(fetchOptions?.challengeGated ? { challengeGated: true } : {}),
+    ...(fetchOptions?.primeUrl ? { primeUrl: fetchOptions.primeUrl } : {}),
+  });
+
   return {
     scrapePage: (url: string, options?: EngineScrapePageOptions) =>
-      withPage(page => navigateAndCapture(page, url, options, captureSink, store()), { stealth: false, ...(options?.proxyServer ? { proxyServer: options.proxyServer } : {}) }),
+      withPage(page => navigateAndCapture(page, url, options, captureSink, store()), { stealth: false, ...laneOptions(url, options) }),
 
     scrapePageStealth: (url: string, options?: EngineScrapePageOptions) =>
-      withPage(page => navigateAndCapture(page, url, options, captureSink, store()), { stealth: true, ...(options?.proxyServer ? { proxyServer: options.proxyServer } : {}) }),
+      withPage(page => navigateAndCapture(page, url, options, captureSink, store()), { stealth: true, ...laneOptions(url, options) }),
 
     // browserFetch defaults to the stealth browser — it exists for CF-fronted / SPA hosts.
     browserFetch: (url: string, options?: EngineBrowserFetchOptions) =>
-      withPage(page => browserFetchBody(page, url, options, store()), { stealth: options?.stealth ?? true, ...(options?.proxyServer ? { proxyServer: options.proxyServer } : {}) }),
+      withPage(page => browserFetchBody(page, url, options, store()), { stealth: options?.stealth ?? true, ...laneOptions(url, options) }),
 
     withBrowser,
     withPage,

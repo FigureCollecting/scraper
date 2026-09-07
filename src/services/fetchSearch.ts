@@ -22,7 +22,7 @@ export interface FetchSearchTransports {
   /** impit TLS-impersonating GET (Cloudflare-fronted JSON APIs). `prime` primes a session-gated host; `proxyUrl` is residential egress. */
   impersonate: (url: string, opts: { browser?: string; headers?: Record<string, string>; userAgent?: string; prime?: { url: string }; proxyUrl?: string }) => Promise<string>;
   /** Pooled browser navigation (rendered-DOM / JS-challenge). Optional — degrades to http if absent. */
-  browser?: (url: string, opts?: { headers?: Record<string, string>; userAgent?: string; cookies?: Record<string, string>; proxyServer?: string; waitFor?: WaitForReadiness }) => Promise<string>;
+  browser?: (url: string, opts?: { headers?: Record<string, string>; userAgent?: string; cookies?: Record<string, string>; proxyServer?: string; waitFor?: WaitForReadiness; challengeGated?: boolean; primeUrl?: string }) => Promise<string>;
 }
 
 /** Injectable wiring for {@link makeFetchSearch} (tests drive the egress config deterministically). */
@@ -46,18 +46,25 @@ export function makeFetchSearch(t: FetchSearchTransports, deps: FetchSearchDeps 
         const prime = resolvePrime(searchFetch, url);
         return t.impersonate(url, { browser: searchFetch.browser, headers: searchFetch.headers, userAgent: searchFetch.userAgent, ...(prime ? { prime } : {}), ...(proxyUrl ? { proxyUrl } : {}) });
       }
-      case 'browser':
+      case 'browser': {
         // A store that explicitly needs a browser must NOT silently fall back to a plain GET — that
         // returns a Cloudflare challenge PAGE the parser would treat as empty. Fail loud (→ the
         // lookup's failed[]) instead of returning garbage.
         if (!t.browser) throw new Error('search transport "browser" requested but no browser fetcher is wired');
+        // A CHALLENGE-GATED store keeps its browser context between fetches (its clearance is bound
+        // to it), and primes a fresh one on the origin first — the browser lane's own session prime.
+        const challengeGated = searchFetch.access === 'cloudflare';
+        const browserPrime = challengeGated ? resolvePrime(searchFetch, url) : undefined;
         return t.browser(url, {
           headers: searchFetch.headers,
           userAgent: searchFetch.userAgent,
           cookies: searchFetch.cookies,
           ...(proxyUrl ? { proxyServer: proxyUrl } : {}),
           ...(searchFetch.waitFor ? { waitFor: searchFetch.waitFor } : {}),
+          ...(challengeGated ? { challengeGated: true } : {}),
+          ...(browserPrime ? { primeUrl: browserPrime.url } : {}),
         });
+      }
       case 'http':
       default:
         // The plain-HTTP lane cannot proxy (see refuseHttpLaneResidentialEgress) — a residential

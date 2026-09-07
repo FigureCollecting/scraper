@@ -287,6 +287,21 @@ export type SessionPrime = boolean | { primeUrl?: string };
 export type EgressMode = 'direct' | 'residential';
 
 /**
+ * How a store's pages are GATED at the edge — what the fetching engine must expect at the door.
+ *   - `open`        — no edge gate (the implicit default).
+ *   - `cloudflare`  — the store sits behind a Cloudflare JS challenge. The engine's browser lane
+ *                     KEEPS this host's browser context alive between fetches instead of opening a
+ *                     fresh one per request: Cloudflare binds the clearance it issues to (IP, user
+ *                     agent, browser context), so a fresh context re-runs the challenge on every
+ *                     single fetch — slow, and one more challenge on the record each time — while a
+ *                     kept context is served clean for the rest of the clearance window. Declaring
+ *                     it is an optimisation, not a requirement: the engine also LEARNS the gate
+ *                     from a `cf-mitigated: challenge` response, at the cost of one challenge per
+ *                     cold host per process.
+ */
+export type StoreAccess = 'open' | 'cloudflare';
+
+/**
  * Browser-lane READINESS for a client-rendered (PWA/SPA) storefront: what the lane must observe
  * AFTER `domcontentloaded` before it captures the page. Without it the lane captures the app SHELL
  * — the store's HTML skeleton with no product in it. All fields optional:
@@ -343,6 +358,13 @@ export interface SearchFetch {
    * `browser` transport. Undeclared ⇒ today's `domcontentloaded` behavior.
    */
   waitFor?: WaitForReadiness;
+  /**
+   * The store's edge gate (see {@link StoreAccess}). `cloudflare` tells the browser lane to keep
+   * this host's context — and the Cloudflare clearance in it — alive between fetches, and makes
+   * `sessionPrime` apply to the browser lane as well as impit. Undeclared (or `open`) ⇒ a fresh
+   * context per request, exactly as before.
+   */
+  access?: StoreAccess;
 }
 
 /**

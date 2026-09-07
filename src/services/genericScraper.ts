@@ -3,6 +3,7 @@ import zlib from 'zlib';
 import crypto from 'crypto';
 import { sanitizeForLog, sanitizeObjectForLog, capWaitTime, truncateString, MAX_STRING_LENGTH } from '../utils/security.js';
 import { applyEgressTimezone } from './browserTimezone.js';
+import { getPersistentContexts } from './persistentContexts.js';
 
 export interface ScrapedData {
   imageUrl?: string;
@@ -462,6 +463,8 @@ export class BrowserPool {
   static async retireStealthBrowser(browser: Browser): Promise<void> {
     console.warn('[BROWSER POOL] Retiring the stealth browser after a context-close failure');
     if (this.stealthBrowser === browser) this.stealthBrowser = null;
+    // Every kept context on this browser dies with it — forget them rather than hand one out.
+    getPersistentContexts().dropBrowser(browser);
     await browser.close().catch((err: any) => console.error('[BROWSER POOL] Error closing retired stealth browser:', err));
   }
 
@@ -513,6 +516,15 @@ export class BrowserPool {
   }
 
   static async closeAll(): Promise<void> {
+    // Kept (challenge-gated) contexts first: they outlive requests, so nothing else closes them.
+    const kept = getPersistentContexts().drain();
+    if (kept.length > 0) {
+      console.log(`[BROWSER POOL] Closing ${kept.length} persistent context(s)...`);
+      for (const entry of kept) {
+        await this.closeContext(entry.context);
+      }
+    }
+
     console.log(`[BROWSER POOL] Closing ${this.browsers.length} browsers...`);
 
     const closePromises = this.browsers.map(async (browser, index) => {
