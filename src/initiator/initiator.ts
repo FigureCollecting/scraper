@@ -11,7 +11,12 @@
  *      initiator's own request timeout and zeroed EVERY store's discovery for the pass
  *      (2026-09-07 09:00Z, amiami). Scoped per store, a slow or failing store costs only
  *      its own lookup. Candidates are kept only for the store the call asked for, bounded
- *      to maxUrlsPerStore per store ACROSS terms.
+ *      to maxUrlsPerStore per store ACROSS terms. A lookup that fails TRANSIENTLY —
+ *      abort/timeout, network error, or HTTP 5xx — is retried ONCE after
+ *      INITIATOR_LOOKUP_RETRY_DELAY_MS; a 4xx is NOT retried (the same request would be
+ *      refused the same way: an unsupported store or a bad query is a config fault), and
+ *      neither is a 2xx body that will not parse. The retry is an ordinary request — same
+ *      gate, same budget.
  *      Each candidate carries the store's product PAGE link (`url`) and, from an engine
  *      that emits it, `collectUrl` — the collect-ready URL the engine derived from its
  *      retrieval axes (the byId Store-API URL where declared, else the page link
