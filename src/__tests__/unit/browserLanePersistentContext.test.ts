@@ -149,6 +149,59 @@ describe('browser lane persistent contexts', () => {
     expect(getPersistentContexts().size()).toBe(1);
   });
 
+  /**
+   * The prime navigation is the one that MEETS the challenge: a fresh context always re-challenges,
+   * and `goto(..., 'domcontentloaded')` returns on the interstitial. Navigating to the target right
+   * then cancels the challenge script, so the homepage never loads, the same-session cookie the
+   * prime exists for is never set — and `primed` latches for the life of the context.
+   */
+  const challengeScript = (target: string, primeUrl: string) => {
+    const events: string[] = [];
+    const titles = ['Just a moment...', 'Just a moment...', 'Lucy'];
+    jest.mocked(mockPage.title).mockImplementation(async () => {
+      const title = titles.length > 1 ? titles.shift()! : titles[0];
+      events.push(`title:${title}`);
+      return title;
+    });
+    jest.mocked(mockPage.goto).mockImplementation(async (url: any) => {
+      events.push(`goto:${url}`);
+      return {
+        status: () => 200,
+        url: () => url,
+        headers: () => (url === primeUrl
+          ? { 'content-type': 'text/html', 'cf-mitigated': 'challenge' }
+          : { 'content-type': 'text/html' }),
+      } as any;
+    });
+    return { events, target };
+  };
+
+  it('waits out a challenge on the PRIME navigation before navigating to the target (kept context)', async () => {
+    const target = 'https://www.anitoysgk.com/search?q=lucy';
+    const primeUrl = 'https://www.anitoysgk.com';
+    const { events } = challengeScript(target, primeUrl);
+    const service = createScrapingService();
+
+    await service.browserFetch(target, { challengeGated: true, primeUrl });
+
+    const lastInterstitial = events.lastIndexOf('title:Just a moment...');
+    expect(lastInterstitial).toBeGreaterThan(-1);
+    expect(events.indexOf(`goto:${target}`)).toBeGreaterThan(lastInterstitial);
+  });
+
+  it('waits out a challenge on the PRIME navigation before the target on an ephemeral context too', async () => {
+    const target = 'https://hobby-genki.com/search?q=lucy';
+    const primeUrl = 'https://hobby-genki.com';
+    const { events } = challengeScript(target, primeUrl);
+    const service = createScrapingService();
+
+    await service.browserFetch(target, { primeUrl, stealth: false });
+
+    const lastInterstitial = events.lastIndexOf('title:Just a moment...');
+    expect(lastInterstitial).toBeGreaterThan(-1);
+    expect(events.indexOf(`goto:${target}`)).toBeGreaterThan(lastInterstitial);
+  });
+
   it('closes every persistent context on pool shutdown', async () => {
     const service = createScrapingService();
     await service.browserFetch('https://www.anitoysgk.com/lucy.html', { challengeGated: true });

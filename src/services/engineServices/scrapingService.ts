@@ -448,7 +448,12 @@ export function createScrapingService(
       // SESSION PRIME on a fresh session: anitoys' search results 404 without a same-session
       // homepage visit, so the origin root is navigated once per context, before the target.
       if (options.primeUrl && !entry.primed) {
-        await page.goto(options.primeUrl, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
+        const primed = await page.goto(options.primeUrl, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
+        // The PRIME is the navigation that meets the challenge — a fresh context always re-challenges,
+        // and `domcontentloaded` fires on the interstitial. Navigating to the target without waiting
+        // CANCELS the challenge script: the homepage never loads, the same-session cookie the prime
+        // exists for is never set, and `primed` latches for the rest of this context's life.
+        await awaitChallengeClearance(page, primed, options.primeUrl);
         entry.primed = true;
       }
       return await fn(page);
@@ -505,7 +510,10 @@ export function createScrapingService(
       page = await context.newPage();
       await preparePage(page, options);
       if (options.primeUrl) {
-        await page.goto(options.primeUrl, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
+        // Same rule as the kept-context prime above: wait the interstitial out, or the target
+        // navigation cancels it and the priming visit never happened.
+        const primed = await page.goto(options.primeUrl, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
+        await awaitChallengeClearance(page, primed, options.primeUrl);
       }
       return await fn(page);
     } finally {
