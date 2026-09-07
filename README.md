@@ -615,6 +615,10 @@ because the newest ids always outrank the deep id space for the run's budget.
   ENTIRELY (4xx for every id — typically no ruleset matches the store's `byId` url, an engine/ruleset
   skew) leaves the cursor exactly where it was, with a WARN: that band would otherwise be spent
   collecting nothing and is never walked again.
+- **Durability** — the listing phases save the ledger after every page; the id-range walk saves once
+  per WINDOW (its ids are one bounded batch). A pod killed mid-window (`activeDeadlineSeconds`, OOM,
+  eviction) therefore re-walks that window on the next run: the POSTs it already made are coalesced
+  by the ingest queue's own dedup, and no id is lost or skipped.
 - **Misses** — an id in the window that does not exist at the store is EXPECTED and is not an error
   here: `/catalog?range=1` never probes it, so the gap surfaces downstream as the ingest fetch's own
   404, recorded in the ingest lane. The crawler counts `rangeWalked` (ids walked), not hits.

@@ -45,8 +45,10 @@
  * priority. Stores run in parallel under ONE global RequestGate (concurrency, total
  * budget over catalog GETs + ingest POSTs, spacing); pages within a store are
  * sequential. The ledger is saved after EVERY page (tmp file + rename), so a crash
- * or a budget stop loses nothing. A corrupt ledger refuses the store and is NEVER
- * overwritten. Imports nothing from src/driver/* — this is a thin HTTP client.
+ * or a budget stop loses nothing; the ID-RANGE axis saves once per WINDOW instead (its
+ * ids are one bounded batch, not a page each), so a pod killed mid-window re-walks that
+ * window next run — duplicate POSTs the queue coalesces, never a lost or skipped id.
+ * A corrupt ledger refuses the store and is NEVER overwritten. Imports nothing from src/driver/* — this is a thin HTTP client.
  */
 import { createRequestGate, type GateResult, type RequestGate } from '../initiator/requestGate.js';
 import { logger } from '../utils/logger.js';
