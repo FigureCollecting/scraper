@@ -1268,6 +1268,19 @@ describe('runCrawlerPass — id-range backfill', () => {
     expect(s.stores[0]).toMatchObject({ rangeWalked: 3, rangeCursor: 497, errors: 0 });
   });
 
+  it('reports the cursor the ledger actually holds: a failed save leaves rangeCursor/rangeFrontier where they were', async () => {
+    const mem = createMemoryLedgerStore();
+    const saveFail = { load: mem.load, save: async () => { throw new Error('ENOSPC'); } };
+    const fake = makeFake({ catalog: (s) => failed(s) });
+    const s = await runCrawlerPass(rangeOnly({ rangeFrontiers: { mfc: 500 } }), { fetch: fake.fetch, ledgerStore: saveFail, now: clock().now });
+
+    expect(fake.posted().length).toBe(5);
+    expect(mem.files.has('mfc')).toBe(false);
+    // The walk did happen (5 ids POSTed) but NOTHING is durable — reporting cursor 495 would show
+    // progress an operator's next run will re-do.
+    expect(s.stores[0]).toMatchObject({ errors: 1, rangeWalked: 5, rangeCursor: null, rangeFrontier: null });
+  });
+
   it('a 503 cooldown on the RANGE axis skips the store for the run: no POSTs, no cursor written', async () => {
     const fake = makeFake({ catalog: (s) => failed(s), range: (s) => cooldown(s) });
     const store = createMemoryLedgerStore();

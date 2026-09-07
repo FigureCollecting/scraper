@@ -51,7 +51,7 @@
 import { createRequestGate, type GateResult, type RequestGate } from '../initiator/requestGate.js';
 import { logger } from '../utils/logger.js';
 import type { CrawlerConfig, CrawlerMode } from './config.js';
-import type { Ledger, LedgerStore } from './ledger.js';
+import type { Ledger, LedgerRange, LedgerStore } from './ledger.js';
 
 export type { CrawlerConfig, CrawlerMode } from './config.js';
 
@@ -684,6 +684,9 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
 
     const ledger = st.ledger;
     const range = (ledger.range ??= { cursor: null });
+    // The state as the LEDGER holds it. A save that fails is restored onto it, so the run summary
+    // never reports a cursor the next run will not resume from.
+    const durable: LedgerRange = { ...range };
     let cursor = range.cursor;
     if (cursor === null) {
       const frontier = highestNumericId(ledger) ?? config.rangeFrontiers[st.siteId];
@@ -734,7 +737,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     }
     range.cursor = Math.max(0, cursor - handled);
     range.updatedAt = iso();
-    await persist(st);
+    if (!(await persist(st))) ledger.range = durable;
   };
 
   // --- run --------------------------------------------------------------------------------------
