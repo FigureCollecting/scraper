@@ -1,0 +1,3 @@
+# Kept so the image build's `COPY patches ./patches` (Dockerfile, all three stages) has a source
+# directory to copy: git does not track empty directories, and the last patch file was removed with
+# puppeteer-extra. patch-package globs *.patch here, so this file is inert.

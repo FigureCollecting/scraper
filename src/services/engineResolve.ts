@@ -23,6 +23,7 @@ import { createPluginLogger } from './engineServices/pluginLogger.js';
 import { getRawCaptureSink } from './s3ObjectStore.js';
 import { impitFetchBody } from './impitFetch.js';
 import { httpFetchBody, type LookupRegistry } from './engineLookup.js';
+import { getResidentialProxyUrl, resolveBrowserLaneOptions, type BrowserLaneEgressOptions } from './residentialEgress.js';
 import type { CaptureSink } from './captureSink.js';
 import type { SiteConfig } from '@figurecollecting/scraper-plugin-contract';
 
@@ -37,15 +38,18 @@ export interface ResolveExtractDeps {
   /** Injectable clock + sleep for the courtesy gap (default: real time). */
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
+  /** The engine's residential proxy (default: the process's RESIDENTIAL_PROXY_URL, resolved at boot). */
+  residentialProxyUrl?: () => string | undefined;
 }
 
 /** Build the byId-confirm Resolve from the engine's registered stores + a detail fetch. */
 export function createEngineResolve(
   registry: LookupRegistry,
-  fetchDetail: (url: string) => Promise<{ html: string; statusCode?: number }>,
+  fetchDetail: (url: string, options?: BrowserLaneEgressOptions) => Promise<{ html: string; statusCode?: number }>,
   extract: ResolveExtractDeps,
 ): Resolve {
   const profiles = buildProfileRegistry(registry.allStores());
+  const resolveProxy = extract.residentialProxyUrl ?? getResidentialProxyUrl;
   const capturingFetch = createCapturingFetch(
     {
       http: extract.transports?.http ?? httpFetchBody,
@@ -53,12 +57,25 @@ export function createEngineResolve(
       browser: extract.scraping,
     },
     extract.sink ?? getRawCaptureSink(),
+    extract.residentialProxyUrl ? { residentialProxyUrl: extract.residentialProxyUrl } : {},
   );
 
   return assembleResolve({
     profiles,
     getRulesetForUrl: (url) => registry.getRulesetForUrl(url),
-    fetchDetail,
+    // EGRESS GATE on the PRIMARY detail fetch. /resolve is the confirm leg's own door to the
+    // network — a different one from the search dispatchers — so it enforces the same rule here:
+    // a store declaring `egress: 'residential'` is fetched through the configured proxy, or
+    // REFUSED — never sent from the node IP. The refusal throws SYNCHRONOUSLY (assembleResolve
+    // calls this inside its per-id try, so it fails just this id like any other detail-fetch
+    // failure) and deliberately so: it lands before the pacer's `.finally` can record a fetch that
+    // never happened, so a batch of refused ids fails fast instead of courtesy-waiting between
+    // each one. A store declaring neither egress nor readiness is called with the url alone,
+    // exactly as before 0.7.0.
+    fetchDetail: (url, searchFetch) => {
+      const laneOptions = resolveBrowserLaneOptions(url, searchFetch, resolveProxy());
+      return laneOptions ? fetchDetail(url, laneOptions) : fetchDetail(url);
+    },
     ...(extract.now ? { now: extract.now } : {}),
     ...(extract.sleep ? { sleep: extract.sleep } : {}),
     resolveContext: (ruleset, url, primaryFetchedAt, lastFetchedAt) => {
@@ -97,6 +114,7 @@ export function createEngineResolve(
         scraping: extract.scraping,
         capturingFetch,
         searchFetch: caps?.searchFetch,
+        ...(extract.residentialProxyUrl ? { residentialProxyUrl: extract.residentialProxyUrl } : {}),
         primaryUrl: url,
         primaryFetchedAt,
         // The call-wide shared map (assembleResolve's pacer): follow-ups re-gap against SIBLING

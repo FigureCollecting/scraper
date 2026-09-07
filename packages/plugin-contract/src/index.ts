@@ -273,6 +273,52 @@ export type SearchTransport = 'http' | 'impersonate' | 'browser';
 export type SessionPrime = boolean | { primeUrl?: string };
 
 /**
+ * Which EGRESS a store's fetches leave the engine through.
+ *   - `direct`       — the engine's own network path (the node/pod IP). The implicit default.
+ *   - `residential`  — route this store's fetches through the engine's configured RESIDENTIAL
+ *                      proxy. For stores whose gate is IP/ASN REPUTATION rather than browser
+ *                      fingerprint: they serve a challenge to any datacenter IP but real content to
+ *                      a residential one, and their challenge-passage window is far shorter than a
+ *                      hand-minted cookie can survive. Declaring it is a REQUIREMENT, never a hint:
+ *                      with no residential proxy configured the engine REFUSES the fetch rather
+ *                      than silently falling back to the node IP (which would both burn that IP's
+ *                      reputation and reveal the attempt).
+ */
+export type EgressMode = 'direct' | 'residential';
+
+/**
+ * How a store's pages are GATED at the edge — what the fetching engine must expect at the door.
+ *   - `open`        — no edge gate (the implicit default).
+ *   - `cloudflare`  — the store sits behind a Cloudflare JS challenge. The engine's browser lane
+ *                     KEEPS this host's browser context alive between fetches instead of opening a
+ *                     fresh one per request: Cloudflare binds the clearance it issues to (IP, user
+ *                     agent, browser context), so a fresh context re-runs the challenge on every
+ *                     single fetch — slow, and one more challenge on the record each time — while a
+ *                     kept context is served clean for the rest of the clearance window. Declaring
+ *                     it is an optimisation, not a requirement: the engine also LEARNS the gate
+ *                     from a `cf-mitigated: challenge` response, at the cost of one challenge per
+ *                     cold host per process.
+ */
+export type StoreAccess = 'open' | 'cloudflare';
+
+/**
+ * Browser-lane READINESS for a client-rendered (PWA/SPA) storefront: what the lane must observe
+ * AFTER `domcontentloaded` before it captures the page. Without it the lane captures the app SHELL
+ * — the store's HTML skeleton with no product in it. All fields optional:
+ *   - `selector`    — wait until this CSS selector is present in the DOM.
+ *   - `networkIdle` — wait until the page's network goes quiet (the XHR/fetch hydration settles).
+ *   - `timeoutMs`   — upper bound for the wait (engine default 15000, clamped to [1000, 60000]).
+ * A wait that TIMES OUT is not fatal: the lane captures whatever rendered and logs one warning, so
+ * a slow store degrades to today's behavior instead of failing the fetch. Undeclared ⇒ the lane
+ * returns at `domcontentloaded` exactly as before.
+ */
+export interface WaitForReadiness {
+  selector?: string;
+  networkIdle?: boolean;
+  timeoutMs?: number;
+}
+
+/**
  * Per-store fetch decoration for the cross-store SEARCH (`bySearch`) request: how the engine should
  * FETCH this store's search endpoint, and with what request headers/UA/cookies. Opaque to the engine
  * and filled by the plugin from the private profile (same pattern as `allowedCookies`/`rateLimit`).
@@ -299,6 +345,26 @@ export interface SearchFetch {
    * (behavior byte-identical for undeclared stores). Applies to the `impersonate` transport.
    */
   sessionPrime?: SessionPrime;
+  /**
+   * Which egress this store's fetches leave through (see {@link EgressMode}). `residential` routes
+   * them through the engine's configured residential proxy (`RESIDENTIAL_PROXY_URL`) on the impit
+   * and browser lanes; with no proxy configured the fetch is REFUSED, never quietly sent from the
+   * node IP. Undeclared (or `direct`) ⇒ today's behavior, byte-identical.
+   */
+  egress?: EgressMode;
+  /**
+   * Browser-lane readiness for a client-rendered storefront (see {@link WaitForReadiness}): wait for
+   * the selector and/or network idle, bounded by `timeoutMs`, before capturing. Applies to the
+   * `browser` transport. Undeclared ⇒ today's `domcontentloaded` behavior.
+   */
+  waitFor?: WaitForReadiness;
+  /**
+   * The store's edge gate (see {@link StoreAccess}). `cloudflare` tells the browser lane to keep
+   * this host's context — and the Cloudflare clearance in it — alive between fetches, and makes
+   * `sessionPrime` apply to the browser lane as well as impit. Undeclared (or `open`) ⇒ a fresh
+   * context per request, exactly as before.
+   */
+  access?: StoreAccess;
 }
 
 /**

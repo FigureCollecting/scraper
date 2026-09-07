@@ -12,6 +12,7 @@ import { createCatalogRoute } from './routes/catalog.js';
 import { createHealthRoutes } from './routes/health.js';
 import { getChallengeCooldown } from './services/challengeCooldown.js';
 import { getCfCookieStore } from './services/cookieJar.js';
+import { residentialEgressView } from './services/residentialEgress.js';
 import { createEngineLookup, createEngineCatalog } from './services/engineLookup.js';
 import { createResolveRoute } from './routes/resolve.js';
 import { createEngineResolve } from './services/engineResolve.js';
@@ -19,7 +20,7 @@ import { createCapturingScrapingService } from './services/engineServices/captur
 import { scraperDebug } from './utils/logger.js';
 
 // Import browser pool functionality
-import { initializeBrowserPool, BrowserPool } from './services/genericScraper.js';
+import { browserLaneView, initializeBrowserPool, BrowserPool } from './services/genericScraper.js';
 import { bootstrapPlugins, shutdownPlugins } from './services/pluginBootstrap.js';
 import { getScrapeQueue } from './services/scrapeQueue.js';
 import { ScraperPlugin } from '@figurecollecting/scraper-plugin-contract';
@@ -49,6 +50,8 @@ app.use('/', createHealthRoutes({
   getBrowserPoolHealth: () => BrowserPool.getHealth(),
   listChallengeCooldowns: () => getChallengeCooldown().list(),
   listCfCookies: () => getCfCookieStore().view(),
+  getResidentialEgress: () => residentialEgressView(),
+  getBrowserLane: () => browserLaneView(),
 }));
 
 // Scraper routes (no /api prefix for consistency)
@@ -98,7 +101,11 @@ async function startServer(): Promise<void> {
     // /lookup; that service also backs the ExtractContext (extractAsync/extractMany follow-ups ride
     // the store's declared transport — impit/http default inside createEngineResolve — into the
     // capture sink, courtesy-gapped, exactly like the ingest queue's extraction).
-    app.use('/', createResolveRoute(createEngineResolve(registry, (url) => lookupScraping.scrapePage(url), {
+    // The detail fetch takes the browser-lane options createEngineResolve resolved from the store's
+    // own `searchFetch` — residential `proxyServer` and client-rendered `waitFor`; a store declaring
+    // neither is called with the url alone, and a residential store with no proxy configured never
+    // reaches this lambda at all (the gate refuses it upstream).
+    app.use('/', createResolveRoute(createEngineResolve(registry, (url, options) => lookupScraping.scrapePage(url, options), {
       scraping: lookupScraping,
     })));
     if (plugins.length > 0) {

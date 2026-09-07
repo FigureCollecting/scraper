@@ -33,3 +33,35 @@ export function resolvePrime(searchFetch: SearchFetch | undefined, targetUrl: st
     return undefined;
   }
 }
+
+/** Hosts already warned about a dropped browser-lane prime (one line per host, not per fetch). */
+const warnedPrimeDrops = new Set<string>();
+
+/**
+ * ONE warning per host when a store declares `sessionPrime` for the BROWSER lane without the gate
+ * that carries it there. `sessionPrime` reaches that lane only through `access: 'cloudflare'`
+ * (contract 0.7.0): a priming navigation costs a whole extra page load, so it rides the declaration
+ * that also keeps the context. That coupling is deliberate — but silently dropping a declaration the
+ * author wrote looks exactly like a ruleset that suddenly stopped finding its results.
+ */
+export function warnDroppedBrowserPrime(
+  searchFetch: SearchFetch | undefined,
+  targetUrl: string,
+  // eslint-disable-next-line no-console
+  warn: (message: string) => void = console.warn,
+): void {
+  if (!searchFetch?.sessionPrime || searchFetch.access === 'cloudflare') return;
+  let host: string;
+  try {
+    host = new URL(targetUrl).hostname.toLowerCase();
+  } catch {
+    return;
+  }
+  if (warnedPrimeDrops.has(host)) return;
+  warnedPrimeDrops.add(host);
+  warn(
+    `[PRIME] ${host} declares sessionPrime on the browser transport but not access: 'cloudflare' — ` +
+    'the browser lane primes only challenge-gated stores, so NO priming navigation is made for it ' +
+    '(the impersonate lane is unaffected). Declare the gate if this store needs a primed session.',
+  );
+}

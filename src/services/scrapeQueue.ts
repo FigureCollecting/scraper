@@ -27,6 +27,8 @@ import { enrichmentLogger } from '../utils/logger.js';
 import { createScrapingService } from './engineServices/scrapingService.js';
 import { createCapturingFetch, ChallengePageError, type CapturingFetch, type CapturingFetchTransports } from './engineServices/capturingFetch.js';
 import { getChallengeCooldown, ChallengeCooldownError, type ChallengeCooldown } from './challengeCooldown.js';
+import { ResidentialEgressUnavailableError } from './residentialEgress.js';
+import { ChallengeLaneUnavailableError } from './browserChallenge.js';
 import { getCfCookieStore, markStaleIfStored, markFreshIfStored, type CfCookieStoreLike } from './cookieJar.js';
 import { getRawCaptureSink } from './s3ObjectStore.js';
 import { createIngestEmitterFromEnv } from './ingestEmitter.js';
@@ -336,6 +338,19 @@ function classifyError(error: Error | string): ErrorType {
   }
   if (error instanceof EmptyIngestRecordError) {
     return 'empty_record';
+  }
+  // A ResidentialEgressUnavailableError is a CONFIG shortfall raised before any fetch: the store
+  // declares residential egress and no usable proxy is wired (or its lane cannot proxy). Booked
+  // like the other config shortfalls — extraction_unavailable, so it is never retried (a missing
+  // env var will not appear between attempts) and never mistaken for a cookie/auth fault.
+  if (error instanceof ResidentialEgressUnavailableError) {
+    return 'extraction_unavailable';
+  }
+  // A ChallengeLaneUnavailableError is the same shape of CONFIG shortfall on the browser lane: the
+  // store declares a Cloudflare gate and this process launches the headless profile, which cannot
+  // clear one. Never retried — BROWSER_LAUNCH_MODE will not change between attempts.
+  if (error instanceof ChallengeLaneUnavailableError) {
+    return 'extraction_unavailable';
   }
 
   const message = typeof error === 'string' ? error : error.message;

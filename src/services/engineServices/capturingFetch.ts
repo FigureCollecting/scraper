@@ -16,7 +16,13 @@
  * to `requiresBrowser`): the ingest path wants "declared transport, else browser", not "declared
  * transport, else infer from requiresBrowser".
  */
-import type { SearchFetch, ScrapePageOptions, ScrapePageResult } from '@figurecollecting/scraper-plugin-contract';
+import type { SearchFetch, ScrapePageResult } from '@figurecollecting/scraper-plugin-contract';
+import type { EngineScrapePageOptions } from './scrapingService.js';
+import {
+  getResidentialProxyUrl,
+  refuseHttpLaneResidentialEgress,
+  requireResidentialProxy,
+} from '../residentialEgress.js';
 import type { CaptureSink } from '../captureSink.js';
 import { buildRawCapture } from '../captureSink.js';
 import { sanitizeForLog } from '../../utils/security.js';
@@ -73,15 +79,15 @@ export class ChallengePageError extends Error {
 
 /** The browser lane's raw-fetch surface — it already captures internally via navigateAndCapture. */
 export interface BrowserLaneFetcher {
-  scrapePage(url: string, options?: ScrapePageOptions): Promise<ScrapePageResult>;
-  scrapePageStealth(url: string, options?: ScrapePageOptions): Promise<ScrapePageResult>;
+  scrapePage(url: string, options?: EngineScrapePageOptions): Promise<ScrapePageResult>;
+  scrapePageStealth(url: string, options?: EngineScrapePageOptions): Promise<ScrapePageResult>;
 }
 
 export interface CapturingFetchTransports {
   /** Plain HTTP GET (Tier-1 cookieless JSON/HTML). */
   http: (url: string) => Promise<string>;
-  /** impit TLS-impersonating GET (Cloudflare-fronted JSON APIs). `prime` primes a session-gated host. */
-  impersonate: (url: string, opts: { browser?: string; headers?: Record<string, string>; userAgent?: string; prime?: { url: string } }) => Promise<string>;
+  /** impit TLS-impersonating GET (Cloudflare-fronted JSON APIs). `prime` primes a session-gated host; `proxyUrl` is residential egress. */
+  impersonate: (url: string, opts: { browser?: string; headers?: Record<string, string>; userAgent?: string; prime?: { url: string }; proxyUrl?: string }) => Promise<string>;
   /** Pooled browser navigation — the fallback for `browser`/undeclared transports. */
   browser: BrowserLaneFetcher;
 }
@@ -111,6 +117,8 @@ async function captureApiBody(sink: CaptureSink, url: string, body: string): Pro
 export interface CapturingFetchDeps {
   /** Stored-cookie source (defaults to the CfCookieStore singleton, resolved per call). */
   cookieStore?: CfCookieSource;
+  /** The engine's residential proxy (default: the process's RESIDENTIAL_PROXY_URL, resolved at boot). */
+  residentialProxyUrl?: () => string | undefined;
 }
 
 /**
@@ -122,7 +130,12 @@ export function createCapturingFetch(
   sink: CaptureSink,
   deps: CapturingFetchDeps = {},
 ): CapturingFetch {
+  const resolveProxy = deps.residentialProxyUrl ?? getResidentialProxyUrl;
   return async function capturingFetch(url, searchFetch, options = {}) {
+    // EGRESS (once per call, before any fetch or capture): a store declaring `residential` rides the
+    // configured proxy; with none configured this THROWS a typed config failure rather than letting
+    // the request leave from the node IP. Undeclared/direct ⇒ undefined and the pre-0.7.0 path.
+    const proxyUrl = requireResidentialProxy(url, searchFetch?.egress, resolveProxy());
     switch (searchFetch?.transport) {
       case 'impersonate': {
         // Session-gated stores (403-cold) declare `sessionPrime`; the impit transport primes the
@@ -135,6 +148,7 @@ export function createCapturingFetch(
           headers: searchFetch.headers,
           userAgent: searchFetch.userAgent,
           ...(prime ? { prime } : {}),
+          ...(proxyUrl ? { proxyUrl } : {}),
         });
         // Capture FIRST (provenance is recorded even for a challenge body), THEN FLAG a challenge
         // interstitial rather than throwing — a ruleset's own follow-up transport may still recover
@@ -149,6 +163,9 @@ export function createCapturingFetch(
         return { html };
       }
       case 'http': {
+        // The plain-HTTP lane cannot proxy (see refuseHttpLaneResidentialEgress) — a residential
+        // store on it is refused, never quietly fetched from the node IP.
+        if (proxyUrl) refuseHttpLaneResidentialEgress(url, proxyUrl);
         const html = await transports.http(url);
         await captureApiBody(sink, url, html);
         if (isCloudflareChallenge(html)) {
@@ -166,9 +183,19 @@ export function createCapturingFetch(
         // forwards nothing; item cookies keep their exact pre-existing call shape.
         const store = deps.cookieStore ?? getCfCookieStore();
         const stealth = options.cookies !== undefined || store.cookiesFor(url) !== undefined;
+        // EGRESS + READINESS ride ALONGSIDE that choice, never changing it: `proxyServer` binds the
+        // per-request context to the residential proxy, `waitFor` makes a client-rendered store
+        // render before capture. A store declaring neither passes NO options (byte-identical).
+        const laneOptions: EngineScrapePageOptions = {
+          ...(proxyUrl ? { proxyServer: proxyUrl } : {}),
+          ...(searchFetch?.waitFor ? { waitFor: searchFetch.waitFor } : {}),
+        };
+        const hasLaneOptions = Object.keys(laneOptions).length > 0;
         const page = stealth
-          ? await transports.browser.scrapePageStealth(url, options.cookies ? { cookies: options.cookies } : {})
-          : await transports.browser.scrapePage(url);
+          ? await transports.browser.scrapePageStealth(url, { ...(options.cookies ? { cookies: options.cookies } : {}), ...laneOptions })
+          : hasLaneOptions
+            ? await transports.browser.scrapePage(url, laneOptions)
+            : await transports.browser.scrapePage(url);
         // FLAG a browser-lane interstitial like the other lanes (capture already happened inside
         // navigateAndCapture): the queue's honesty gate / extraction-throw door then give it the
         // same one-shot ChallengePageError + host cooldown instead of a retried empty_record.

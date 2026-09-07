@@ -1,7 +1,40 @@
+/**
+ * genericScraper — the browser lane's Chrome lifecycle: the pooled browsers, the long-lived
+ * challenge-lane browser, per-request contexts, and the selector-driven `scrapeGeneric` fetch.
+ *
+ * THE LAUNCH PROFILE IS THE ANTI-DETECTION STRATEGY. There is no stealth plugin any more (dropped
+ * 2026-09-07 with puppeteer-extra). Measured against the Cloudflare-gated cohort (anitoysgk.com,
+ * hobby-genki.com, sugotoys.com.au), the ONLY configuration that clears their NON-interactive JS
+ * challenge with no human and no solver is a real, current Chrome launched CLEAN:
+ *
+ *   BROWSER_LAUNCH_MODE=clean-headful  →  headless: false, rendering on `--ozone-platform=headless`
+ *   (no X server, no Xvfb), `--enable-automation` removed from the default args, `defaultViewport:
+ *   null`, and the minimal flag list in CLEAN_HEADFUL_ARGS — nothing else.
+ *
+ * What FAILS, all measured the same day: `headless: true` with any user agent; puppeteer-extra's
+ * stealth plugin on an older Chrome; and — silently, which is the dangerous one — the correct setup
+ * with the browser's timezone left on UTC (the container default; any real named zone passes, even
+ * one far from the exit IP). A UTC browser simply never clears; nothing errors.
+ *
+ * The rest of the lane follows from that:
+ *   - TIMEZONE per context, matched to the EGRESS the context leaves through (browserTimezone.ts):
+ *     `RESIDENTIAL_EGRESS_TIMEZONE` for a proxied context, `DIRECT_EGRESS_TIMEZONE` for a direct
+ *     one. It is per-context, not a process TZ, because one browser serves both at once.
+ *   - NO cosmetic overrides in clean-headful mode: the lane does not rewrite the UA of a Chrome 152
+ *     to a stale `Chrome/127` string (client hints would contradict it, and Cloudflare binds the
+ *     clearance it issues to the UA), and does not override the device metrics of a window that
+ *     already has the size the flags asked for. A store that DECLARES a UA still gets it.
+ *   - CONTEXTS ARE KEPT for challenge-gated hosts (persistentContexts.ts): the clearance is bound to
+ *     (IP, UA, context), so a fresh context re-earns the challenge every single fetch.
+ * The pooled/headless profile is unchanged and remains the default — CI, tests and every non-gated
+ * store behave exactly as before.
+ */
 import puppeteer, { Browser, BrowserContext, Page } from 'puppeteer';
 import zlib from 'zlib';
 import crypto from 'crypto';
 import { sanitizeForLog, sanitizeObjectForLog, capWaitTime, truncateString, MAX_STRING_LENGTH } from '../utils/security.js';
+import { applyEgressTimezone, selectEgressTimezone } from './browserTimezone.js';
+import { getPersistentContexts } from './persistentContexts.js';
 
 export interface ScrapedData {
   imageUrl?: string;
@@ -185,9 +218,174 @@ function detectCloudflareChallenge(title: string, bodyText: string, patterns: { 
   return false;
 }
 
+/** The headless profile's stand-in UA for `scrapeGeneric` when the caller declares none. */
+const DEFAULT_SCRAPE_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36';
+
+/** `BROWSER_LAUNCH_MODE` value selecting the proven Cloudflare-passing launch profile. */
+export const CLEAN_HEADFUL_MODE = 'clean-headful';
+
+/** The default profile: pure headless with the historical hardening/perf flag set. What CI launches. */
+const HEADLESS_ARGS = [
+  '--no-sandbox',
+  '--disable-setuid-sandbox',
+  '--disable-dev-shm-usage',
+  '--disable-accelerated-2d-canvas',
+  '--no-first-run',
+  '--no-zygote',
+  '--disable-gpu',
+  '--disable-web-security',
+  '--disable-extensions',
+  '--disable-background-timer-throttling',
+  '--disable-backgrounding-occluded-windows',
+  '--disable-features=TranslateUI',
+  '--disable-ipc-flooding-protection',
+  '--memory-pressure-off',
+];
+
+/**
+ * The PROVEN clean-headful recipe (measured 2026-09-07 against anitoysgk / hobby-genki / sugotoys):
+ * real Chrome rendering HEADFUL on the Ozone headless platform (no X server, no Xvfb), the
+ * automation switch stripped, and NOTHING else. Every flag the headless profile adds is an extra
+ * detection surface, so none of them are carried here — this list is the whole surface: the same
+ * SET the probe passed (Chrome does not care in what order). `--no-sandbox` /
+ * `--disable-setuid-sandbox` / `--disable-dev-shm-usage` stay because the pod runs as an
+ * unprivileged uid with a small /dev/shm, not for stealth.
+ */
+const CLEAN_HEADFUL_ARGS = [
+  '--ozone-platform=headless',
+  '--disable-blink-features=AutomationControlled',
+  '--lang=en-US',
+  '--window-size=1280,900',
+  '--no-first-run',
+  '--no-default-browser-check',
+  '--no-sandbox',
+  '--disable-setuid-sandbox',
+  '--disable-dev-shm-usage',
+];
+
+/** `BROWSER_LAUNCH_MODE`, trimmed and lowercased; `undefined` when unset or blank. */
+function normalizeLaunchMode(raw: string | undefined): string | undefined {
+  const value = (raw ?? '').trim().toLowerCase();
+  return value === '' ? undefined : value;
+}
+
+/**
+ * Whether this process launches Chrome with the clean-headful profile (production), not headless.
+ * Read TOLERANTLY (case, surrounding whitespace) because the cost of a near-miss is invisible: the
+ * headless profile never clears a Cloudflare challenge and nothing errors when it doesn't.
+ */
+export function isCleanHeadfulMode(env: NodeJS.ProcessEnv = process.env): boolean {
+  return normalizeLaunchMode(env.BROWSER_LAUNCH_MODE) === CLEAN_HEADFUL_MODE;
+}
+
+/**
+ * ONE boot warning when `BROWSER_LAUNCH_MODE` is SET to something this process does not recognise —
+ * the mirror of resolveResidentialProxyUrl's warning for an unusable proxy. Unset is silent (the
+ * headless default is a legitimate configuration: CI, tests, every non-gated store). Pure (env +
+ * sink in) so it is testable; the module-level call below supplies console.warn.
+ */
+export function warnUnrecognizedLaunchMode(env: NodeJS.ProcessEnv, warn: (message: string) => void): void {
+  const value = normalizeLaunchMode(env.BROWSER_LAUNCH_MODE);
+  if (value === undefined || value === CLEAN_HEADFUL_MODE) return;
+  warn(
+    `[BROWSER LANE] BROWSER_LAUNCH_MODE is set to an unrecognised value (${sanitizeForLog(value)}) — falling back to the ` +
+    `HEADLESS profile, which does NOT clear a Cloudflare JS challenge. Set it to '${CLEAN_HEADFUL_MODE}' or leave it unset.`,
+  );
+}
+
+warnUnrecognizedLaunchMode(process.env, (message) => {
+  // eslint-disable-next-line no-console
+  console.warn(message);
+});
+
+/**
+ * Build the puppeteer launch options for this process. Pure (env in → options out) so both profiles
+ * are unit-testable without launching anything.
+ *   - default            — the historical headless profile; CI and every existing test keep it.
+ *   - `clean-headful`    — the proven recipe above: `headless:false`, the `--enable-automation`
+ *                          default arg REMOVED (its `navigator.webdriver` + automation banner is
+ *                          exactly what the challenge scores on), and the minimal arg list.
+ * `--single-process` is still appended under GitHub Actions (its runner needs it; it breaks Docker),
+ * and `PUPPETEER_EXECUTABLE_PATH` still selects the image's real Chrome in both profiles.
+ */
+export function buildBrowserConfig(env: NodeJS.ProcessEnv = process.env): {
+  headless: boolean;
+  args: string[];
+  timeout: number;
+  ignoreDefaultArgs?: string[];
+  defaultViewport?: null;
+  executablePath?: string;
+} {
+  const config: {
+    headless: boolean;
+    args: string[];
+    timeout: number;
+    ignoreDefaultArgs?: string[];
+    defaultViewport?: null;
+    executablePath?: string;
+  } = isCleanHeadfulMode(env)
+    // `defaultViewport: null` = NO device-metrics override: the window `--window-size` opened is the
+    // viewport. Puppeteer's 800x600 default would otherwise leave the page reporting an inner size
+    // that contradicts its own window (measured: outer 1280x900, inner 800x600).
+    ? { headless: false, ignoreDefaultArgs: ['--enable-automation'], defaultViewport: null, args: [...CLEAN_HEADFUL_ARGS], timeout: 30000 }
+    : { headless: true, args: [...HEADLESS_ARGS], timeout: 30000 };
+
+  // GitHub Actions needs this flag; it breaks Docker containers.
+  if (env.GITHUB_ACTIONS === 'true') {
+    config.args.push('--single-process');
+  }
+
+  // Use the executable path from environment variable if set (for Docker)
+  if (env.PUPPETEER_EXECUTABLE_PATH) {
+    config.executablePath = env.PUPPETEER_EXECUTABLE_PATH;
+  }
+
+  return config;
+}
+
+/** The operator view of the browser lane for /health/detailed. */
+export interface BrowserLaneView {
+  /** Which launch profile this process uses: 'clean-headful' (production) or 'headless'. */
+  launchMode: string;
+  /** IANA zone emulated on residential-egress contexts (null ⇒ none configured). */
+  residentialTimezone: string | null;
+  /** IANA zone emulated on direct contexts (null ⇒ none configured). */
+  directTimezone: string | null;
+  /** Challenge-gated contexts currently kept alive (bounded at MAX_PERSISTENT_CONTEXTS). */
+  persistentContexts: number;
+}
+
+/**
+ * The browser lane's live configuration, for /health/detailed. All four values decide whether a
+ * Cloudflare-gated store passes or silently never clears, and none of them are observable from
+ * outside the pod otherwise — the wrong launch mode, or a missing timezone, looks exactly like a
+ * store that "stopped working".
+ */
+export function browserLaneView(env: NodeJS.ProcessEnv = process.env): BrowserLaneView {
+  return {
+    launchMode: isCleanHeadfulMode(env) ? CLEAN_HEADFUL_MODE : 'headless',
+    residentialTimezone: selectEgressTimezone(true, env) ?? null,
+    directTimezone: selectEgressTimezone(false, env) ?? null,
+    persistentContexts: getPersistentContexts().size(),
+  };
+}
+
 export class BrowserPool {
   private static browsers: Browser[] = [];
-  private static readonly POOL_SIZE = 3; // Keep 3 browsers ready
+  /**
+   * Warm pooled browsers. The launch profile is process-wide, so in clean-headful mode these are
+   * FULL headful Chromes (their own GPU/viz process, a 1280x900 surface, and none of the headless
+   * profile's memory-relevant flags) — and the challenge-lane browser is an additional always-on
+   * one. The 3-browser HEADLESS warm pool already measured ~2.5 GB against this pod's 3 Gi limit, so
+   * clean-headful gives one pool slot back to keep the total at three browsers. The headless default
+   * (CI, tests, every non-gated store) is unchanged at 3.
+   */
+  private static readonly HEADLESS_POOL_SIZE = 3;
+  private static readonly CLEAN_HEADFUL_POOL_SIZE = 2;
+  private static get POOL_SIZE(): number {
+    return isCleanHeadfulMode() ? this.CLEAN_HEADFUL_POOL_SIZE : this.HEADLESS_POOL_SIZE;
+  }
   private static isInitialized = false;
 
   // Per-context lifecycle counters. Browsers are intentionally long-lived (a
@@ -224,40 +422,7 @@ export class BrowserPool {
   }
 
   private static getBrowserConfig() {
-    const config: any = {
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
-        '--no-zygote',
-        '--disable-gpu',
-        '--disable-web-security',
-        '--disable-extensions',
-        '--disable-background-timer-throttling',
-        '--disable-backgrounding-occluded-windows',
-        '--disable-features=TranslateUI',
-        '--disable-ipc-flooding-protection',
-        '--memory-pressure-off'
-      ],
-      timeout: 30000
-    };
-
-    // Add single-process flag ONLY for GitHub Actions (not for Docker)
-    // GitHub Actions needs this flag, but it breaks Docker containers
-    /* istanbul ignore next - GitHub Actions specific configuration */
-    if (process.env.GITHUB_ACTIONS === 'true') {
-      config.args.push('--single-process');
-    }
-
-    // Use the executable path from environment variable if set (for Docker)
-    if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-      config.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
-    }
-
-    return config;
+    return buildBrowserConfig(process.env);
   }
 
   static async initialize(): Promise<void> {
@@ -348,9 +513,16 @@ export class BrowserPool {
     }
   }
 
-  /** Open a fresh per-request context on a (long-lived) browser, counting it. */
-  static async openContext(browser: Browser): Promise<BrowserContext> {
-    const context = await browser.createBrowserContext();
+  /**
+   * Open a fresh per-request context on a (long-lived) browser, counting it. `proxyServer` (a store
+   * declaring residential egress) binds THIS CONTEXT to the proxy — per context, so one pooled
+   * browser can serve residential and direct stores side by side without relaunching. Absent ⇒ the
+   * call is byte-identical to the pre-egress one (no options object at all).
+   */
+  static async openContext(browser: Browser, options: { proxyServer?: string } = {}): Promise<BrowserContext> {
+    const context = options.proxyServer
+      ? await browser.createBrowserContext({ proxyServer: options.proxyServer })
+      : await browser.createBrowserContext();
     this.contextsOpened++;
     return context;
   }
@@ -400,7 +572,12 @@ export class BrowserPool {
    *  re-passing Cloudflare once, acceptable ONLY on a failure, never per-call. */
   static async retireStealthBrowser(browser: Browser): Promise<void> {
     console.warn('[BROWSER POOL] Retiring the stealth browser after a context-close failure');
-    if (this.stealthBrowser === browser) this.stealthBrowser = null;
+    if (this.stealthBrowser === browser) {
+      this.stealthBrowser = null;
+      this.stealthLaunch = null;
+    }
+    // Every kept context on this browser dies with it — forget them rather than hand one out.
+    getPersistentContexts().dropBrowser(browser);
     await browser.close().catch((err: any) => console.error('[BROWSER POOL] Error closing retired stealth browser:', err));
   }
 
@@ -432,60 +609,57 @@ export class BrowserPool {
     }
   }
 
-  // Stealth browser for bot-detection-sensitive fetches (e.g. Cloudflare-fronted pages)
+  /**
+   * The singleton browser reserved for challenge-gated hosts. It is a PLAIN puppeteer launch with
+   * the same profile as the pool — no puppeteer-extra, no stealth plugin. Measured 2026-09-07: the
+   * stealth plugin (with the old bundled Chrome) FAILS the Cloudflare JS challenge that a clean,
+   * current Chrome passes, and every property the plugin rewrites is one more chance to disagree
+   * with the real browser it is impersonating. What it buys is not evasion but LIFETIME: one
+   * long-lived browser whose already-passed challenges (and their cookies) survive between fetches.
+   */
   private static stealthBrowser: Browser | null = null;
+  /**
+   * The IN-FLIGHT launch. Caching only the resolved browser let two concurrent first fetches each
+   * start a Chrome; the second assignment orphaned the first, and closeAll only ever closes the
+   * survivor — so the orphan outlived SIGTERM and held the process open.
+   */
+  private static stealthLaunch: Promise<Browser> | null = null;
 
   static async getStealthBrowser(): Promise<Browser> {
-    if (!this.stealthBrowser) {
-      console.log('[BROWSER POOL] Creating stealth browser...');
-
-      // In test environment, use regular browser (mocks interfere with puppeteer-extra)
-      if (process.env.NODE_ENV === 'test' || process.env.JEST_WORKER_ID) {
-        console.log('[BROWSER POOL] Test environment detected - using regular browser instead of stealth');
-        this.stealthBrowser = await puppeteer.launch(this.getBrowserConfig());
-        return this.stealthBrowser;
-      }
-
-      // Production: Use puppeteer-extra with stealth plugin.
-      // Dynamic import() (not static) so these CJS-interop modules load lazily
-      // and ONLY in production — the test path above returns before reaching
-      // here, keeping puppeteer-extra out of the mocked test module graph.
-      // Both packages are CJS; under NodeNext their default export is the
-      // instance/factory. The casts pin the types NodeNext leaves as the raw
-      // module namespace (runtime shape verified: .default is the usable value).
-      /* istanbul ignore next - Production-only stealth initialization, conflicts with test mocks */
-      const { default: puppeteerExtra } = (await import('puppeteer-extra')) as unknown as {
-        default: import('puppeteer-extra').PuppeteerExtra;
-      };
-      /* istanbul ignore next */
-      const { default: StealthPlugin } = (await import('puppeteer-extra-plugin-stealth')) as unknown as {
-        default: () => import('puppeteer-extra').PuppeteerExtraPlugin;
-      };
-
-      /* istanbul ignore next */
-      puppeteerExtra.use(StealthPlugin());
-
-      /* istanbul ignore next */
-      const config = this.getBrowserConfig();
-      // Add anti-detection flag
-      /* istanbul ignore next */
-      config.args.push('--disable-blink-features=AutomationControlled');
-
-      /* istanbul ignore next */
-      this.stealthBrowser = await puppeteerExtra.launch(config);
-      /* istanbul ignore next */
-      console.log('[BROWSER POOL] Stealth browser created');
+    if (this.stealthBrowser) return this.stealthBrowser;
+    if (!this.stealthLaunch) {
+      console.log('[BROWSER POOL] Creating the challenge-lane browser...');
+      this.stealthLaunch = puppeteer.launch(this.getBrowserConfig())
+        .then((browser) => {
+          this.stealthBrowser = browser;
+          return browser;
+        })
+        // Cleared either way: a FAILED launch must be retried by the next fetch, not cached as a
+        // permanently rejected promise.
+        .finally(() => {
+          this.stealthLaunch = null;
+        });
     }
 
-    // TypeScript doesn't know this is always set by this point
-    if (!this.stealthBrowser) {
-      throw new Error('[BROWSER POOL] Failed to create stealth browser');
-    }
-
-    return this.stealthBrowser;
+    return await this.stealthLaunch;
   }
 
   static async closeAll(): Promise<void> {
+    // The challenge-lane browser is long-lived by design, so shutdown is the ONLY thing that closes
+    // it — miss it and the process hangs on an orphaned Chrome.
+    const challengeLane = this.stealthBrowser;
+    this.stealthBrowser = null;
+    this.stealthLaunch = null;
+
+    // Kept (challenge-gated) contexts first: they outlive requests, so nothing else closes them.
+    const kept = getPersistentContexts().drain();
+    if (kept.length > 0) {
+      console.log(`[BROWSER POOL] Closing ${kept.length} persistent context(s)...`);
+      for (const entry of kept) {
+        await this.closeContext(entry.context);
+      }
+    }
+
     console.log(`[BROWSER POOL] Closing ${this.browsers.length} browsers...`);
 
     const closePromises = this.browsers.map(async (browser, index) => {
@@ -520,6 +694,15 @@ export class BrowserPool {
         console.warn(`[BROWSER POOL] Browser ${index + 1} close attempt failed:`, result.reason);
       }
     });
+
+    if (challengeLane) {
+      try {
+        if (challengeLane.connected) await challengeLane.close();
+        console.log('[BROWSER POOL] Challenge-lane browser closed');
+      } catch (error) {
+        console.error(`[BROWSER POOL] Error closing the challenge-lane browser: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      }
+    }
 
     this.browsers = [];
     this.isInitialized = false;
@@ -612,20 +795,29 @@ export async function scrapeGeneric(url: string, config: ScrapeConfig): Promise<
       throw new Error('[GENERIC SCRAPER] Failed to create page');
     }
 
-    // Set realistic browser configuration
-    await page.setViewport({ width: 1280, height: 720 });
-    const userAgent = config.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36';
-    await page.setUserAgent(userAgent);
+    // TIMEZONE: this path always leaves through the node's own egress (it takes no proxy), so it
+    // emulates the DIRECT zone. Unset ⇒ no CDP call at all.
+    await applyEgressTimezone(page, false);
 
-    // Set extra headers to appear more like a real browser
-    await page.setExtraHTTPHeaders({
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Accept-Encoding': 'gzip, deflate, br',
-      'DNT': '1',
-      'Connection': 'keep-alive',
-      'Upgrade-Insecure-Requests': '1',
-    });
+    // COSMETICS, headless profile only. In clean-headful mode the browser IS a current, real Chrome,
+    // so every one of these makes it look LESS real: a Chrome/127 UA under Chrome 152 client hints, a
+    // 1280x720 device-metrics override against the 1280x900 window the flags opened, and CDP-set
+    // Accept-Encoding/Connection that disagree with what this Chrome actually negotiates. A UA the
+    // CALLER declares is still honoured in both profiles.
+    if (!isCleanHeadfulMode()) {
+      await page.setViewport({ width: 1280, height: 720 });
+      await page.setUserAgent(config.userAgent || DEFAULT_SCRAPE_USER_AGENT);
+      await page.setExtraHTTPHeaders({
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'DNT': '1',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+      });
+    } else if (config.userAgent) {
+      await page.setUserAgent(config.userAgent);
+    }
 
     console.log('[GENERIC SCRAPER] Navigating to page...');
 

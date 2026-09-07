@@ -72,6 +72,14 @@ export interface ImpitFetchOptions {
    * Absent ⇒ no prime (byte-identical to the pre-prime behavior).
    */
   prime?: { url: string };
+  /**
+   * RESIDENTIAL EGRESS: route this fetch through the given proxy (`socks5://` / `http(s)://`) —
+   * threaded into the Impit itself, since impit takes the proxy per SESSION, not per request. The
+   * session cache is therefore keyed by (profile, proxy) so a proxied session never shares its
+   * cookie jar with the direct one (a clearance minted from the residential IP must not be replayed
+   * from the node IP, nor the reverse). Absent ⇒ the direct session (byte-identical).
+   */
+  proxyUrl?: string;
 }
 
 /**
@@ -79,15 +87,23 @@ export interface ImpitFetchOptions {
  * The per-profile cookie jar is threaded in so cf_clearance from the prime GET persists onto the
  * target fetch (impit is stateless without a jar).
  */
-async function defaultMakeImpit(browser: string, cookieJar: CookieJarLike, timeoutMs: number): Promise<ImpitLike> {
+async function defaultMakeImpit(
+  browser: string,
+  cookieJar: CookieJarLike,
+  timeoutMs: number,
+  proxyUrl?: string,
+): Promise<ImpitLike> {
   const { Impit } = await import('impit');
   // `browser` is a runtime-valid profile string; impit types it as a Browser enum. `cookieJar` is a
   // tough-cookie CookieJar — the store impit's JS binding reads/writes for cross-request cookies.
+  // `proxyUrl` (residential egress) is a SESSION property in impit, so it is set here and the
+  // session cache is keyed by it. HTTP/3 is never enabled: impit cannot use a proxy with it on.
   return new Impit({
     browser: browser as never,
     followRedirects: true,
     timeout: timeoutMs,
     cookieJar: cookieJar as never,
+    ...(proxyUrl ? { proxyUrl } : {}),
   }) as unknown as ImpitLike;
 }
 
@@ -96,7 +112,7 @@ function defaultMakeCookieJar(): CookieJarLike {
   return new CookieJar() as unknown as CookieJarLike;
 }
 
-export type MakeImpit = (browser: string, cookieJar: CookieJarLike, timeoutMs: number) => ImpitLike | Promise<ImpitLike>;
+export type MakeImpit = (browser: string, cookieJar: CookieJarLike, timeoutMs: number, proxyUrl?: string) => ImpitLike | Promise<ImpitLike>;
 
 /**
  * One cached Impit plus its session-prime bookkeeping. The Impit is per impersonation profile and
@@ -223,24 +239,28 @@ export function createImpitFetch(makeImpit: MakeImpit = defaultMakeImpit, option
   // Cache the SESSION promise (not the resolved session) so the get-then-set is synchronous and two
   // concurrent first-calls for a profile can never build two Impits. A failed build evicts itself.
   const sessions = new Map<string, Promise<ImpitSession>>();
-  function getSession(browser: string): Promise<ImpitSession> {
-    let sp = sessions.get(browser);
+  function getSession(browser: string, proxyUrl?: string): Promise<ImpitSession> {
+    // The cache key pairs the impersonation profile with the EGRESS: a proxied and a direct session
+    // must be distinct Impits (hence distinct cookie jars and prime bookkeeping), because a
+    // Cloudflare clearance is bound to the IP it was minted from.
+    const key = `${browser}\u0000${proxyUrl ?? 'direct'}`;
+    let sp = sessions.get(key);
     if (!sp) {
       sp = (async (): Promise<ImpitSession> => {
         const jar = defaultMakeCookieJar();
-        const impit = await makeImpit(browser, jar, TIMEOUT_MS);
+        const impit = await makeImpit(browser, jar, TIMEOUT_MS, proxyUrl);
         return { impit, jar, primed: new Map<string, number>(), priming: new Map<string, Promise<void>>() };
       })();
-      sessions.set(browser, sp);
+      sessions.set(key, sp);
       sp.catch(() => {
-        if (sessions.get(browser) === sp) sessions.delete(browser);
+        if (sessions.get(key) === sp) sessions.delete(key);
       });
     }
     return sp;
   }
   return async function impitFetchBody(url: string, opts: ImpitFetchOptions = {}): Promise<string> {
     const browser = opts.browser || DEFAULT_PROFILE;
-    const session = await getSession(browser);
+    const session = await getSession(browser, opts.proxyUrl);
     // STORED COOKIES + PINNED UA (CfCookieStore): seed the host's hand-minted cookies into the jar
     // before the prime/target GETs, and let the mint User-Agent win over the caller's and the
     // profile's — cf_clearance is bound to IP + UA, so any other UA voids it. Unknown host ⇒ nothing
