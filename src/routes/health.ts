@@ -10,7 +10,7 @@
  *   - GET /health/detailed → the above + browserPool health + a timestamp, and ADDITIVELY
  *     `residentialEgress: {configured, proxy?}` (the residential proxy; its host:port only under
  *     RESIDENTIAL_EGRESS_HEALTH_DETAIL, credentials always stripped),
- *     `browserLane: {launchMode, residentialTimezone, directTimezone, persistentContexts}`,
+ *     `browserLane: {launchMode, residentialTimezone, directTimezone, processTimezone, gatedBrowsers}`,
  *     `challengeCooldowns: [{host, remainingMs, reason}]` (the per-host CF cooldowns currently open)
  *     and `cfCookies: [{host, cookieNames, userAgentPinned, loadedAt, mintedAt?, expiresAt?, stale,
  *     staleSince?, staleReason?}]` (the stored-cookie jar's per-host view — cookie NAMES only, never a
@@ -40,9 +40,9 @@ export interface HealthDeps {
    */
   getResidentialEgress: () => { configured: boolean; proxy?: string };
   /**
-   * The browser lane's live configuration (browserLaneView()): the launch profile, the timezone each
-   * egress emulates, and how many challenge-gated contexts are being kept alive. Pure config +
-   * counters — nothing here is a secret.
+   * The browser lane's live configuration (browserLaneView()): the launch profile, the PROCESS
+   * timezone (the one a Cloudflare challenge actually reads), the zone each egress emulates on top
+   * of it, and the live per-egress challenge browsers. Pure config + counters — nothing secret.
    */
   getBrowserLane: () => BrowserLaneView;
 }

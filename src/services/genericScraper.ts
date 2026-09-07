@@ -366,26 +366,33 @@ export function buildBrowserConfig(
 export interface BrowserLaneView {
   /** Which launch profile this process uses: 'clean-headful' (production) or 'headless'. */
   launchMode: string;
-  /** IANA zone emulated on residential-egress contexts (null ⇒ none configured). */
+  /** IANA zone emulated on residential-egress pages (null ⇒ none; the deploy leaves this empty). */
   residentialTimezone: string | null;
-  /** IANA zone emulated on direct contexts (null ⇒ none configured). */
+  /** IANA zone emulated on direct pages (null ⇒ none; the deploy leaves this empty). */
   directTimezone: string | null;
-  /** Challenge-gated contexts currently kept alive (bounded at MAX_PERSISTENT_CONTEXTS). */
-  persistentContexts: number;
+  /**
+   * The PROCESS zone (`TZ`) — the one that actually decides a challenge, because the interstitial's
+   * cross-origin frame reads it rather than any page-level override. `null` here (a UTC container)
+   * is the silent failure: gated stores simply never clear and nothing errors.
+   */
+  processTimezone: string | null;
+  /** The live per-egress challenge browsers, each holding its own clearances. */
+  gatedBrowsers: GatedBrowserView[];
 }
 
 /**
- * The browser lane's live configuration, for /health/detailed. All four values decide whether a
+ * The browser lane's live configuration, for /health/detailed. Every value here decides whether a
  * Cloudflare-gated store passes or silently never clears, and none of them are observable from
- * outside the pod otherwise — the wrong launch mode, or a missing timezone, looks exactly like a
- * store that "stopped working".
+ * outside the pod otherwise — the wrong launch mode, or a UTC process, looks exactly like a store
+ * that "stopped working".
  */
 export function browserLaneView(env: NodeJS.ProcessEnv = process.env): BrowserLaneView {
   return {
     launchMode: isCleanHeadfulMode(env) ? CLEAN_HEADFUL_MODE : 'headless',
     residentialTimezone: selectEgressTimezone(true, env) ?? null,
     directTimezone: selectEgressTimezone(false, env) ?? null,
-    persistentContexts: getPersistentContexts().size(),
+    processTimezone: env.TZ ?? null,
+    gatedBrowsers: BrowserPool.gatedBrowsers(),
   };
 }
 
