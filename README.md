@@ -229,6 +229,37 @@ it reports them, else a non-empty page implies more with `nextPage = page + 1`.
 with `Retry-After` while the listing host cools from a Cloudflare challenge · `502 { error: "catalog failed", siteId, reason }`
 (challenge page — which also opens the host cooldown — fetch error, timeout, or parser throw).
 
+#### GET /catalog?range=1 — the id-range axis
+
+A store whose ids are SEQUENTIAL (`retrieval.byRange: true` plus a `byId.urlTemplate` — mfc's ~3.6M
+numeric item ids) needs no listing to be enumerated: its id space *is* the listing. This axis
+SYNTHESIZES a descending window of that space and never fetches, parses or cools anything.
+
+**Query:** `store=<siteId>` (required), `range=1` (required, exactly `1`), `from=<id>` (required,
+positive integer — the highest id in the window), `count=<n>` (optional, default `50`, clamped to
+`[1, 200]`). `range` and `page` are mutually exclusive; a `from` without `range` is ignored.
+
+**Response (200):**
+```json
+{
+  "siteId": "mfc",
+  "from": 3630000,
+  "items": [{ "itemId": "3630000", "collectUrl": "https://myfigurecollection.net/item/3630000" }],
+  "collectUrls": ["https://myfigurecollection.net/item/3630000"],
+  "hasMore": true,
+  "nextFrom": 3629999,
+  "count": 1
+}
+```
+The window walks DOWN from `from` and stops at id `1` (`hasMore: false`, no `nextFrom`). Ids in the
+window that do not exist at the store are EXPECTED: this surface never probes them, so a gap surfaces
+later as the ingest fetch's own 404 — a miss in the ingest lane, not an error here.
+
+**Errors:** `400` bad input (blank `store`, `range` other than `1`, `range` with `page`, missing or
+non-positive-integer `from`, non-positive-integer `count`) · `422 { error: "unsupported", siteId, reason }`
+(unknown store, no `byRange` axis, or no `byId` template to build item urls from) ·
+`502 { error: "catalog failed", siteId, reason }`.
+
 ### Search query encoding (`retrieval.bySearch.queryEncoding`)
 `{q}` is url-encoded into the store's `bySearch.urlTemplate` by `encodeSearchQuery`
 (`src/driver/retrievalPlanner.ts`), which every search caller goes through (`/lookup` fan-out,
@@ -461,15 +492,27 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
   pages, new ids only. The cursor advances only when the page reported `hasMore: true` AND every
   new item on it was attempted (`nextPage` is ignored); a page cut short by the per-store cap, the
   global budget, or a 5xx from `/ingest/scrape` is re-fetched next run.
-- `both` (default) runs recent for every store, THEN backfill. Stores run in parallel under one
+- **id-range backfill** — for the stores named in `CRAWLER_RANGE_STORES` only: walk the store's
+  SEQUENTIAL id space downward through `GET /catalog?store=&range=1&from=&count=`, up to
+  `CRAWLER_RANGE_IDS_PER_RUN` ids per run. See *Id-range backfill* below.
+- `both` (default) runs recent for every store, THEN backfill, THEN the id-range walk. Stores run in parallel under one
   global request gate (concurrency, total budget over catalog GETs + ingest POSTs, spacing);
   pages within a store are sequential; the ledger is saved after every page.
 - Per catalog page: `503 cooldown` → the store is skipped for this run (no state change);
-  `422 unsupported` → error, store stopped (a config problem, not exhaustion); any other
-  non-2xx or a malformed body → error, store stopped, cursor untouched.
+  `422 unsupported` → error, that AXIS stopped (a config or coverage gap, not exhaustion — a
+  `422` on the listing axis still leaves the id-range walk to run); any other non-2xx or a
+  malformed body → error, store stopped, cursor untouched.
+- Every store runs under an enqueue ceiling: its `CRAWLER_STORE_ENQUEUE_CAPS` entry when it has
+  one, else the global `CRAWLER_MAX_ENQUEUE_PER_STORE`. The ceiling is reported per store as
+  `capApplied`, and the overrides that actually applied are listed on the run summary as
+  `enqueueCapOverrides`. An explicit per-store cap of `0` pulls that store OUT of the run (no
+  requests, its ledger is not even opened) — the lever for a store that has to rest, such as a
+  Cloudflare-gated one that stalls above ~15 items/hour. A GLOBAL `0` keeps its other meaning:
+  a discovery-only dry run for every unnamed store (pages fetched, nothing POSTed).
 - The run ends with a `[CRAWLER] pass complete` JSON summary (per store: pagesFetched,
   discovered, known, enqueued, deduplicated, reobserved, errors, skipped, backfillCursor,
-  exhaustCandidate, exhausted; plus totals, requestsIssued, budgetExhausted, durationMs).
+  exhaustCandidate, exhausted, capApplied, rangeWalked, rangeCursor, rangeFrontier; plus totals,
+  requestsIssued, budgetExhausted, enqueueCapOverrides, totalRangeWalked, durationMs).
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -481,11 +524,15 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
 | `CRAWLER_BACKFILL_PAGES_PER_RUN` | `5` | Max pages the backfill cursor advances per store per run |
 | `CRAWLER_MAX_REQUESTS` | `100` | Global request budget (catalog GETs + ingest POSTs); `0` = kill switch |
 | `CRAWLER_MAX_ENQUEUE_PER_STORE` | `50` | Max ingest POSTs per store per run; `0` = discovery-only dry run |
+| `CRAWLER_STORE_ENQUEUE_CAPS` | *(none)* | csv of `siteId:cap` overriding the global cap for those stores (`anitoys:15,mfc:30`); an explicit `0` pulls the store out of the run. A malformed entry is ignored with a WARN naming it; the rest still apply |
 | `CRAWLER_MAX_CONCURRENCY` | `2` | Global max in-flight requests across all stores |
 | `CRAWLER_REQUEST_SPACING_MS` | `1000` | Minimum spacing between consecutive dispatches |
 | `CRAWLER_REQUEST_TIMEOUT_MS` | `45000` | Per-request abort timeout (keep above the engine's `CATALOG_STORE_TIMEOUT_MS`) |
 | `CRAWLER_REOBSERVE_AFTER_MS` | `604800000` (7d) | Recent only: re-POST a known item once its entry is this old; `0` = never |
 | `CRAWLER_EXHAUSTED_RECHECK_MS` | `604800000` (7d) | Re-check an exhausted store's last cursor after this long |
+| `CRAWLER_RANGE_STORES` | *(none)* | csv of siteIds that walk their sequential id space; empty = no id-range walking at all |
+| `CRAWLER_RANGE_IDS_PER_RUN` | `50` | Max ids walked per store per run (the window asked of `/catalog?range=1`) |
+| `CRAWLER_RANGE_FRONTIER_<SITEID>` | *(none)* | Seed frontier for a store whose ledger has no numeric itemId yet; `<SITEID>` = the siteId uppercased with every non-alphanumeric character replaced by `_` |
 
 **Ledger** — one file per store, `<CRAWLER_LEDGER_DIR>/<siteId>.json`, written as
 `<siteId>.json.tmp-<pid>` and renamed into place (a crash never leaves a torn file):
@@ -502,9 +549,15 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
     "updatedAt": "..."
   },
   "recent": { "lastRunAt": "...", "lastNewCount": 3 },
+  "range": { "cursor": 3629950, "frontier": 3630000, "updatedAt": "..." },
   "updatedAt": "..."
 }
 ```
+
+`range` is OPTIONAL: a ledger written before the axis existed, or for a store that never walks one,
+simply has no `range` and is neither corrupt nor migrated (the file stays `version: 1`). A `range`
+that IS present must be well formed — a malformed cursor is **corrupt**, never a silent reset that
+would re-walk the whole id space.
 
 A missing file is a fresh ledger. Unparseable JSON, a wrong `version`, a wrong `siteId`, or a
 malformed section is **corrupt**: the store is refused for the run (counted as an error) and the
@@ -523,6 +576,33 @@ were, and the same page is re-fetched next run. An exhausted store makes no back
 until `CRAWLER_EXHAUSTED_RECHECK_MS` has elapsed, then re-checks its last cursor: still empty
 re-stamps `exhaustedAt`, items resume the backfill (a re-check cut short keeps the stale
 `exhaustedAt`, so the store stays due and drains a cap's worth per run until fully seen).
+
+**Id-range backfill** — a store whose ids are sequential (`retrieval.byRange` + `byId`) can be
+collected continuously without any listing at all: the id space *is* the listing. Only the stores
+named in `CRAWLER_RANGE_STORES` walk it, so the crawler never spends a request discovering that a
+store has no such axis; the walk runs LAST (after every store's recent and listing-backfill passes),
+because the newest ids always outrank the deep id space for the run's budget.
+
+- **Frontier** — the highest itemId in the store's ledger that reads as a positive integer, else the
+  operator's `CRAWLER_RANGE_FRONTIER_<SITEID>` seed. With neither, the walk is skipped with a WARN
+  (it is never started from a guess).
+- **Window** — one `GET /catalog?store=&range=1&from=<cursor>&count=<CRAWLER_RANGE_IDS_PER_RUN>` per
+  store per run. The engine synthesizes the `{ itemId, collectUrl }` pairs from the store's `byId`
+  template, so every id flows through exactly the same ledger dedup, enqueue cap and global request
+  budget as a listing item — the ledger semantics are untouched, only the source of the ids differs.
+  Ids already in the ledger are skipped without a POST but still consume the walk, so they are never
+  looked at twice.
+- **Cursor** — `range.cursor` in the ledger is the next id to walk, and it moves DOWN only by the
+  number of ids actually HANDLED (POSTed, skipped as known, or deterministically 4xx-rejected). An id
+  the per-store cap, the global budget or a 5xx from `/ingest/scrape` cut off is left above the
+  cursor and picked up next run: nothing is stranded, and nothing is ever re-walked. The walk ends at
+  id 1, leaving `cursor: 0`; further runs make no request.
+- **Misses** — an id in the window that does not exist at the store is EXPECTED and is not an error
+  here: `/catalog?range=1` never probes it, so the gap surfaces downstream as the ingest fetch's own
+  404, recorded in the ingest lane. The crawler counts `rangeWalked` (ids walked), not hits.
+- A `422` on the LISTING axis (`no byListing` — mfc today) stops the listing walk only; the id-range
+  walk still runs. A cooldown, an exhausted budget, a sick scraper or a ledger failure stops every
+  axis, because they are properties of the host or the run, not of one axis.
 
 ## Testing
 
