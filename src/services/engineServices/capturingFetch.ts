@@ -10,6 +10,15 @@
  *     stay populated no matter which transport served the fetch.
  *   - it returns `{ html }` (the shape ruleset.extract() consumes), not a bare string.
  *
+ * On the BROWSER lane it resolves its per-request wiring through the SAME `resolveBrowserLaneOptions`
+ * the other doors use (the search dispatcher, the /resolve detail fetch, the ExtractContext
+ * passthroughs), so one store is wired identically whichever path reaches it: the challenge GATE
+ * (`access: 'cloudflare'`), the session PRIME, residential EGRESS and `waitFor` READINESS together.
+ * Deriving those options here from egress + waitFor alone is exactly what left the ingest path
+ * fetching Cloudflare-gated stores on a per-request context — which never clears the challenge —
+ * while every other door had already moved to the per-egress gated browser (measured in production
+ * 2026-09-07: anitoysgk.com ingest logged a challenge body with `gatedBrowsers` still empty).
+ *
  * An UNDECLARED transport (no `SearchFetch` at all) resolves to the browser lane — this preserves
  * existing behavior for HTML-rendered rulesets that predate per-store transport declarations, and
  * is a deliberate divergence from ProfileRegistry.searchTransportFor()'s default (which falls back
@@ -22,6 +31,7 @@ import {
   getResidentialProxyUrl,
   refuseHttpLaneResidentialEgress,
   requireResidentialProxy,
+  resolveBrowserLaneOptions,
 } from '../residentialEgress.js';
 import type { CaptureSink } from '../captureSink.js';
 import { buildRawCapture } from '../captureSink.js';
@@ -183,17 +193,24 @@ export function createCapturingFetch(
         // forwards nothing; item cookies keep their exact pre-existing call shape.
         const store = deps.cookieStore ?? getCfCookieStore();
         const stealth = options.cookies !== undefined || store.cookiesFor(url) !== undefined;
-        // EGRESS + READINESS ride ALONGSIDE that choice, never changing it: `proxyServer` binds the
-        // per-request context to the residential proxy, `waitFor` makes a client-rendered store
-        // render before capture. A store declaring neither passes NO options (byte-identical).
-        const laneOptions: EngineScrapePageOptions = {
-          ...(proxyUrl ? { proxyServer: proxyUrl } : {}),
-          ...(searchFetch?.waitFor ? { waitFor: searchFetch.waitFor } : {}),
-        };
-        const hasLaneOptions = Object.keys(laneOptions).length > 0;
+        // LANE WIRING rides ALONGSIDE that choice, never changing it — and it is resolved by the
+        // SAME function every other browser-lane caller uses (the search dispatcher, /resolve, the
+        // ExtractContext passthroughs), so a store is wired identically whichever door reaches it:
+        // `challengeGated` puts the fetch on the per-egress gated browser's default context (without
+        // it a Cloudflare store takes the per-request context, which never clears the challenge —
+        // the ingest defect measured in production 2026-09-07), `primeUrl` gives that cold profile
+        // its session-priming visit, `proxyServer` binds the request to the residential exit and
+        // `waitFor` makes a client-rendered store render before capture. A store declaring none of
+        // them resolves to `undefined` and is called with the URL alone (byte-identical).
+        //
+        // The ALREADY-RESOLVED `proxyUrl` is handed back in rather than `resolveProxy()`: for a
+        // residential store it is that same value (the refusal above has already fired if there was
+        // none), and for every other store both are ignored — so the typed refusal is raised exactly
+        // once per fetch, at the top of this function, before any transport is touched.
+        const laneOptions = resolveBrowserLaneOptions(url, searchFetch, proxyUrl);
         const page = stealth
           ? await transports.browser.scrapePageStealth(url, { ...(options.cookies ? { cookies: options.cookies } : {}), ...laneOptions })
-          : hasLaneOptions
+          : laneOptions
             ? await transports.browser.scrapePage(url, laneOptions)
             : await transports.browser.scrapePage(url);
         // FLAG a browser-lane interstitial like the other lanes (capture already happened inside
