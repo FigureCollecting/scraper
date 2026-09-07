@@ -16,6 +16,27 @@
  */
 import { sanitizeForLog } from '../utils/security.js';
 
+/**
+ * A store DECLARED a Cloudflare gate (`SearchFetch.access: 'cloudflare'`) but this process launches
+ * Chrome with the headless profile, which does not clear a Cloudflare JS challenge — with any user
+ * agent, and silently: the page simply never leaves the interstitial. The fetch is refused rather
+ * than attempted, for the same reason an unconfigured residential proxy is refused: a doomed attempt
+ * still spends the egress IP's Cloudflare reputation, and a config gap must fail loudly instead of
+ * looking like a store that "stopped working". A LEARNED gate is not refused (see isChallengeGated):
+ * one `cf-mitigated` response is a weaker signal than a declaration.
+ */
+export class ChallengeLaneUnavailableError extends Error {
+  readonly url: string;
+  constructor(url: string) {
+    super(
+      `A Cloudflare challenge gate is declared for ${sanitizeForLog(url)} but BROWSER_LAUNCH_MODE is not 'clean-headful' — ` +
+      'the headless launch profile never clears the challenge, so the fetch is refused instead of spending the egress IP on an attempt that cannot pass.',
+    );
+    this.name = 'ChallengeLaneUnavailableError';
+    this.url = url;
+  }
+}
+
 /** Cloudflare's own header on a mitigated (challenge/block) response. */
 export const CHALLENGE_HEADER = 'cf-mitigated';
 

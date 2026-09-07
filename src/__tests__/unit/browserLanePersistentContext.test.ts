@@ -50,16 +50,23 @@ describe('browser lane persistent contexts', () => {
     jest.mocked(puppeteer.launch).mockResolvedValue(mockBrowser);
   };
 
+  const savedMode = process.env.BROWSER_LAUNCH_MODE;
+
   beforeEach(async () => {
     jest.clearAllMocks();
     await BrowserPool.reset();
     (BrowserPool as any).stealthBrowser = null;
     clearChallengeGates();
     resetPersistentContexts();
+    // A DECLARED gate is only served on the clean-headful profile (see challengeLaneLaunchMode) —
+    // that is the mode these lifecycle tests describe.
+    process.env.BROWSER_LAUNCH_MODE = 'clean-headful';
     wire();
   });
 
   afterEach(async () => {
+    if (savedMode === undefined) delete process.env.BROWSER_LAUNCH_MODE;
+    else process.env.BROWSER_LAUNCH_MODE = savedMode;
     await BrowserPool.reset();
     clearChallengeGates();
     resetPersistentContexts();

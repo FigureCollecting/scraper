@@ -11,7 +11,7 @@ import { CaptureSink, NoopCaptureSink, buildRawCapture } from '../captureSink.js
 import { sanitizeForLog } from '../../utils/security.js';
 import { getCfCookieStore, type CfCookieSource } from '../cookieJar.js';
 import { applyEgressTimezone } from '../browserTimezone.js';
-import { awaitChallengeClearance, challengeHost, isChallengeGated } from '../browserChallenge.js';
+import { ChallengeLaneUnavailableError, awaitChallengeClearance, challengeHost, isChallengeGated } from '../browserChallenge.js';
 import {
   getPersistentContexts,
   persistentContextKey,
@@ -486,6 +486,13 @@ export function createScrapingService(
     const host = options.targetUrl ? challengeHost(options.targetUrl) : undefined;
     const key = host ? persistentContextKey(host, egress) : undefined;
     const contexts = getPersistentContexts();
+
+    // A DECLARED gate needs the profile that can actually clear a challenge. Refuse rather than
+    // attempt: the headless profile fails silently (it never leaves the interstitial) and every
+    // attempt still costs the egress IP Cloudflare reputation. Learned gates are not refused.
+    if (options.challengeGated === true && !isCleanHeadfulMode()) {
+      throw new ChallengeLaneUnavailableError(options.targetUrl ?? '');
+    }
 
     if (key && (options.challengeGated === true || isChallengeGated(host))) {
       const { entry, evicted } = contexts.acquire(key);

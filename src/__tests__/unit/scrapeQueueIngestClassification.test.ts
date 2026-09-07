@@ -34,6 +34,7 @@ import { ScrapeQueue, resetScrapeQueue } from '../../services/scrapeQueue';
 import { createExtractionRegistry, ExtractionRegistryImpl } from '../../services/extractionRegistry';
 import { getSessionManager, resetSessionManager } from '../../services/sessionManager';
 import { resetChallengeCooldown } from '../../services/challengeCooldown';
+import { ChallengeLaneUnavailableError } from '../../services/browserChallenge';
 
 const FIXTURE_HTML = '<html><body><h1 class="title">Kitagawa Marin</h1></body></html>';
 /** The CF managed-challenge title interstitial (what capturingFetch's http lane rejects). */
@@ -486,5 +487,58 @@ describe('ScrapeQueue - residential egress with no proxy configured [RE-1]', () 
     expect(getSessionManager().isSessionPaused('sess-res')).toBe(false);
     expect(queue.getStats().failed).toBe(1);
     expect(mockNotifyItemFailed).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * A DECLARED Cloudflare gate on the WRONG launch profile is the same shape of config shortfall as an
+ * unconfigured residential proxy [CL-1]: the browser lane refuses before navigating, and the queue
+ * must book that refusal as `extraction_unavailable` — ONE attempt (BROWSER_LAUNCH_MODE will not
+ * change between retries), no rate-limit backoff, no session pause.
+ */
+describe('ScrapeQueue - declared challenge gate on the headless profile [CL-1]', () => {
+  let queue: ScrapeQueue;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockNotifyItemFailed.mockResolvedValue(true);
+    jest.useFakeTimers({ advanceTimers: true });
+    resetScrapeQueue();
+    resetSessionManager();
+    resetChallengeCooldown();
+  });
+
+  afterEach(() => {
+    if (queue) { queue.stop(); queue.clear(); }
+    resetScrapeQueue();
+    resetSessionManager();
+    jest.useRealTimers();
+  });
+
+  it('fails ONE attempt as extraction_unavailable and never rate-limits the queue', async () => {
+    const send = jest.fn().mockResolvedValue(emptyStats());
+    const refuse = jest.fn().mockRejectedValue(new ChallengeLaneUnavailableError('https://anitoysgk.example.test/lucy-p1.html'));
+    queue = new ScrapeQueue(false);
+    queue.setPluginRegistry(makeRegistry(makeRuleset('lucy-cl1'), 'anitoysgk.example.test', {
+      transport: 'browser', access: 'cloudflare',
+    }));
+    queue.setIngestEmitter({ send });
+    queue.setScrapingService({ scrapePage: refuse, scrapePageStealth: refuse });
+
+    const url = 'https://anitoysgk.example.test/lucy-p1.html';
+    const result = queue.enqueue(url, { url, sessionId: 's1' }); // default maxRetries = 3
+    result.promise.catch(() => {});
+    for (let i = 0; i < 400 && queue.getStats().failed !== 1; i++) {
+      jest.advanceTimersByTime(250);
+      await jest.advanceTimersByTimeAsync(50);
+    }
+
+    expect(send).not.toHaveBeenCalled();
+    expect(queue.getStats().failed).toBe(1);
+    expect(queue.getStats().rateLimited).toBe(false);
+    expect(refuse).toHaveBeenCalledTimes(1);
+    const reason = mockNotifyItemFailed.mock.calls[0][2] as string;
+    expect(reason).toContain('extraction_unavailable');
+    expect(reason).toContain('BROWSER_LAUNCH_MODE');
   });
 });

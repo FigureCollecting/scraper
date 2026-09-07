@@ -263,10 +263,40 @@ const CLEAN_HEADFUL_ARGS = [
   '--disable-dev-shm-usage',
 ];
 
-/** Whether this process launches Chrome with the clean-headful profile (production), not headless. */
-export function isCleanHeadfulMode(env: NodeJS.ProcessEnv = process.env): boolean {
-  return env.BROWSER_LAUNCH_MODE === CLEAN_HEADFUL_MODE;
+/** `BROWSER_LAUNCH_MODE`, trimmed and lowercased; `undefined` when unset or blank. */
+function normalizeLaunchMode(raw: string | undefined): string | undefined {
+  const value = (raw ?? '').trim().toLowerCase();
+  return value === '' ? undefined : value;
 }
+
+/**
+ * Whether this process launches Chrome with the clean-headful profile (production), not headless.
+ * Read TOLERANTLY (case, surrounding whitespace) because the cost of a near-miss is invisible: the
+ * headless profile never clears a Cloudflare challenge and nothing errors when it doesn't.
+ */
+export function isCleanHeadfulMode(env: NodeJS.ProcessEnv = process.env): boolean {
+  return normalizeLaunchMode(env.BROWSER_LAUNCH_MODE) === CLEAN_HEADFUL_MODE;
+}
+
+/**
+ * ONE boot warning when `BROWSER_LAUNCH_MODE` is SET to something this process does not recognise —
+ * the mirror of resolveResidentialProxyUrl's warning for an unusable proxy. Unset is silent (the
+ * headless default is a legitimate configuration: CI, tests, every non-gated store). Pure (env +
+ * sink in) so it is testable; the module-level call below supplies console.warn.
+ */
+export function warnUnrecognizedLaunchMode(env: NodeJS.ProcessEnv, warn: (message: string) => void): void {
+  const value = normalizeLaunchMode(env.BROWSER_LAUNCH_MODE);
+  if (value === undefined || value === CLEAN_HEADFUL_MODE) return;
+  warn(
+    `[BROWSER LANE] BROWSER_LAUNCH_MODE is set to an unrecognised value (${sanitizeForLog(value)}) — falling back to the ` +
+    `HEADLESS profile, which does NOT clear a Cloudflare JS challenge. Set it to '${CLEAN_HEADFUL_MODE}' or leave it unset.`,
+  );
+}
+
+warnUnrecognizedLaunchMode(process.env, (message) => {
+  // eslint-disable-next-line no-console
+  console.warn(message);
+});
 
 /**
  * Build the puppeteer launch options for this process. Pure (env in → options out) so both profiles
