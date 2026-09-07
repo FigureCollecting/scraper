@@ -52,6 +52,12 @@ export interface LedgerBackfill {
 export interface LedgerRange {
   cursor: number | null;
   frontier?: number;
+  /**
+   * The `CRAWLER_RANGE_FRONTIER_<SITEID>` value this walk was seeded (or re-seeded) with. Recorded so
+   * a CHANGE to that env var is detectable: it is the operator's only lever over a walk already under
+   * way — correcting a wrong seed, or re-entering an id space that has grown above the frontier.
+   */
+  seed?: number;
   updatedAt?: string;
 }
 
@@ -119,6 +125,7 @@ function coerceLedger(doc: unknown, siteId: string): Ledger | 'corrupt' {
     const rawRangeCursor: unknown = doc.range.cursor ?? null;
     if (rawRangeCursor !== null && !isNonNegInt(rawRangeCursor)) return 'corrupt';
     if (doc.range.frontier !== undefined && !isPositiveInt(doc.range.frontier)) return 'corrupt';
+    if (doc.range.seed !== undefined && !isPositiveInt(doc.range.seed)) return 'corrupt';
     range = { ...(doc.range as unknown as LedgerRange), cursor: rawRangeCursor as number | null };
   }
   return {

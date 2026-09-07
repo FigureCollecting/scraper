@@ -310,6 +310,14 @@ describe('the optional id-range section', () => {
     }
   });
 
+  it("returns 'corrupt' on a malformed seed — a bad one would silently re-seed the walk every run", async () => {
+    for (const range of [{ cursor: 500, seed: 'x' }, { cursor: 500, seed: 0 }, { cursor: 500, seed: -3 }, { cursor: 500, seed: 1.5 }]) {
+      const f = makeFakeFs();
+      f.files.set(path.join(DIR, 'orzgk.json'), JSON.stringify(withRange(range)));
+      expect(await createFileLedgerStore(DIR, f.fs).load('orzgk')).toBe('corrupt');
+    }
+  });
+
   it("returns 'corrupt' on a malformed frontier — it is reported as a number and must never load as anything else", async () => {
     for (const range of [
       { cursor: 500, frontier: 'oops' },

@@ -535,7 +535,7 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
 | `CRAWLER_EXHAUSTED_RECHECK_MS` | `604800000` (7d) | Re-check an exhausted store's last cursor after this long |
 | `CRAWLER_RANGE_STORES` | *(none)* | csv of siteIds that walk their sequential id space; empty = no id-range walking at all |
 | `CRAWLER_RANGE_IDS_PER_RUN` | `50` | Max ids walked per store per run (the window asked of `/catalog?range=1`); clamped to the engine's `200`-id ceiling with a WARN |
-| `CRAWLER_RANGE_FRONTIER_<SITEID>` | *(none)* | Seed frontier for a store whose ledger has no numeric itemId yet; `<SITEID>` = the siteId uppercased with every non-alphanumeric character replaced by `_` |
+| `CRAWLER_RANGE_FRONTIER_<SITEID>` | *(none)* | Seed frontier for a store whose ledger has no numeric itemId yet; CHANGING it later re-seeds the walk from the new top. `<SITEID>` = the siteId uppercased with every non-alphanumeric character replaced by `_` |
 
 **Ledger** — one file per store, `<CRAWLER_LEDGER_DIR>/<siteId>.json`, written as
 `<siteId>.json.tmp-<pid>` and renamed into place (a crash never leaves a torn file):
@@ -552,7 +552,7 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
     "updatedAt": "..."
   },
   "recent": { "lastRunAt": "...", "lastNewCount": 3 },
-  "range": { "cursor": 3629950, "frontier": 3630000, "updatedAt": "..." },
+  "range": { "cursor": 3629950, "frontier": 3630000, "seed": 3630000, "updatedAt": "..." },
   "updatedAt": "..."
 }
 ```
@@ -588,7 +588,13 @@ because the newest ids always outrank the deep id space for the run's budget.
 
 - **Frontier** — the highest itemId in the store's ledger that reads as a positive integer, else the
   operator's `CRAWLER_RANGE_FRONTIER_<SITEID>` seed. With neither, the walk is skipped with a WARN
-  (it is never started from a guess).
+  (it is never started from a guess). The seed in force is recorded in the ledger as `range.seed`.
+- **Re-seeding** — the walk only ever descends, so ids minted ABOVE the frontier (and a seed set too
+  high or too low) are not something the walk corrects on its own. CHANGING
+  `CRAWLER_RANGE_FRONTIER_<SITEID>` restarts the walk from the new top, with a WARN: it is the
+  operator's lever, and it needs no PVC surgery. Ids already in the ledger are skipped without a POST,
+  so re-entering a band already walked costs windows, not fetches. On a store that HAS a listing axis,
+  new ids arrive through the recent phase and the frontier need never move.
 - **Window** — one `GET /catalog?store=&range=1&from=<cursor>&count=<CRAWLER_RANGE_IDS_PER_RUN>` per
   store per run. The engine synthesizes the `{ itemId, collectUrl }` pairs from the store's `byId`
   template, so every id flows through exactly the same ledger dedup, enqueue cap and global request

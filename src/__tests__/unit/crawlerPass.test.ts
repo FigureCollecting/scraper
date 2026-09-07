@@ -1060,7 +1060,7 @@ describe('runCrawlerPass — id-range backfill', () => {
 
     expect(fake.rangeCalls()).toEqual([['mfc', 500, 5]]);
     expect(fake.posted()).toEqual(['500', '499', '498', '497', '496'].map((id) => collectUrl('mfc', id)));
-    expect(store.files.get('mfc')!.range).toEqual({ cursor: 495, frontier: 500, updatedAt: iso(T0) });
+    expect(store.files.get('mfc')!.range).toEqual({ cursor: 495, frontier: 500, seed: 500, updatedAt: iso(T0) });
     expect(s.stores[0]).toMatchObject({ siteId: 'mfc', rangeWalked: 5, rangeCursor: 495, rangeFrontier: 500, discovered: 5, enqueued: 5, errors: 0 });
     expect(s.totalRangeWalked).toBe(5);
   });
@@ -1072,7 +1072,9 @@ describe('runCrawlerPass — id-range backfill', () => {
 
     expect(fake.rangeCalls()).toEqual([['mfc', 800, 3]]);
     expect(fake.posted()).toEqual([collectUrl('mfc', '798')]);
-    expect(store.files.get('mfc')!.range).toEqual({ cursor: 797, frontier: 800, updatedAt: iso(T0) });
+    // The ledger's own highest id wins the FIRST frontier; the env seed is only recorded, so that a
+    // later change to it is detectable.
+    expect(store.files.get('mfc')!.range).toEqual({ cursor: 797, frontier: 800, seed: 500, updatedAt: iso(T0) });
     expect(s.stores[0]).toMatchObject({ rangeWalked: 3, rangeCursor: 797, rangeFrontier: 800, discovered: 3, known: 2, enqueued: 1 });
   });
 
@@ -1279,6 +1281,40 @@ describe('runCrawlerPass — id-range backfill', () => {
     // The walk did happen (5 ids POSTed) but NOTHING is durable — reporting cursor 495 would show
     // progress an operator's next run will re-do.
     expect(s.stores[0]).toMatchObject({ errors: 1, rangeWalked: 5, rangeCursor: null, rangeFrontier: null });
+  });
+
+  it('re-seeds the walk when CRAWLER_RANGE_FRONTIER_<SITEID> CHANGES — the only lever over a wrong seed or ids minted above the frontier', async () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      const store = createMemoryLedgerStore();
+      const first = makeFake({ catalog: (s) => failed(s) });
+      await runCrawlerPass(rangeOnly({ rangeIdsPerRun: 2, rangeFrontiers: { mfc: 500 } }), { fetch: first.fetch, ledgerStore: store, now: clock().now });
+      expect(first.rangeCalls()).toEqual([['mfc', 500, 2]]);
+      expect(store.files.get('mfc')!.range).toMatchObject({ cursor: 498, frontier: 500, seed: 500 });
+
+      // The operator raises the seed in the manifest: the walk restarts from the new top.
+      const second = makeFake({ catalog: (s) => failed(s) });
+      const s2 = await runCrawlerPass(rangeOnly({ rangeIdsPerRun: 2, rangeFrontiers: { mfc: 600 } }), { fetch: second.fetch, ledgerStore: store, now: clock().now });
+      expect(second.rangeCalls()).toEqual([['mfc', 600, 2]]);
+      expect(store.files.get('mfc')!.range).toMatchObject({ cursor: 598, frontier: 600, seed: 600 });
+      expect(s2.stores[0]).toMatchObject({ rangeFrontier: 600, rangeCursor: 598 });
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('re-seeded'))).toBe(true);
+
+      // Unchanged from here on: the walk simply resumes its cursor.
+      const third = makeFake({ catalog: (s) => failed(s) });
+      await runCrawlerPass(rangeOnly({ rangeIdsPerRun: 2, rangeFrontiers: { mfc: 600 } }), { fetch: third.fetch, ledgerStore: store, now: clock().now });
+      expect(third.rangeCalls()).toEqual([['mfc', 598, 2]]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('a new seed revives a walk that had reached the id floor', async () => {
+    const store = createMemoryLedgerStore({ mfc: ledgerWith('mfc', [], T0, { range: { cursor: 0, frontier: 3, seed: 3 } }) });
+    const fake = makeFake({ catalog: (s) => failed(s) });
+    await runCrawlerPass(rangeOnly({ rangeIdsPerRun: 2, rangeFrontiers: { mfc: 900 } }), { fetch: fake.fetch, ledgerStore: store, now: clock().now });
+    expect(fake.rangeCalls()).toEqual([['mfc', 900, 2]]);
+    expect(store.files.get('mfc')!.range).toMatchObject({ cursor: 898, frontier: 900, seed: 900 });
   });
 
   it('a 503 cooldown on the RANGE axis skips the store for the run: no POSTs, no cursor written', async () => {

@@ -687,15 +687,31 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     // The state as the LEDGER holds it. A save that fails is restored onto it, so the run summary
     // never reports a cursor the next run will not resume from.
     const durable: LedgerRange = { ...range };
+    const seed = config.rangeFrontiers[st.siteId];
     let cursor = range.cursor;
     if (cursor === null) {
-      const frontier = highestNumericId(ledger) ?? config.rangeFrontiers[st.siteId];
+      const frontier = highestNumericId(ledger) ?? seed;
       if (frontier === undefined) {
         logger.warn('[CRAWLER] id-range walk skipped — no frontier (empty ledger and no CRAWLER_RANGE_FRONTIER_<SITEID>)', { siteId: st.siteId });
         return;
       }
       cursor = frontier;
       range.frontier = frontier;
+      if (seed !== undefined) range.seed = seed;
+    } else if (seed !== undefined && range.seed !== seed) {
+      // The operator CHANGED the seed. Once a cursor exists the env var is otherwise dead config, so
+      // a wrong seed could only be corrected by editing the ledger on the PVC by hand — and a walk
+      // that has reached the floor could never re-enter an id space that has since grown. A changed
+      // seed therefore restarts the walk at the new top; ids already in the ledger cost no POST.
+      logger.warn('[CRAWLER] id-range walk re-seeded — CRAWLER_RANGE_FRONTIER_<SITEID> changed', {
+        siteId: st.siteId,
+        previousSeed: range.seed,
+        seed,
+        previousCursor: cursor,
+      });
+      cursor = seed;
+      range.frontier = seed;
+      range.seed = seed;
     }
     if (cursor < 1) {
       logger.info('[CRAWLER] id-range walk complete — the id floor was reached', { siteId: st.siteId, frontier: range.frontier });
