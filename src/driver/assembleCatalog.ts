@@ -6,6 +6,12 @@
  * via the ruleset's `extractListing`, and decorates every listed id with its collect-ready URL
  * (`withCollectUrl` — the same byId-else-page-link rule /lookup applies to candidates).
  *
+ * The same runtime also serves the ID-RANGE axis (`idRange`, GET /catalog?store=&range=1&from=&count=):
+ * for a store whose `retrieval.byRange` declares its ids sequential, a descending window of the id
+ * space IS the listing, so the window is SYNTHESIZED from `byId.urlTemplate` with no fetch at all.
+ * The capability resolution lives here (where the profile registry is); the frontier, the cursor and
+ * the dedup stay with the crawler.
+ *
  * The result is a DISCRIMINATED UNION, never a throw: `ok` (items + paging signals), `unsupported`
  * (unknown store / no byListing axis / no extractListing parser — a coverage gap, not a failure),
  * `cooldown` (the listing host is cooling from a recent CF challenge — skipped WITHOUT fetching), or
@@ -15,7 +21,7 @@
  * Plugin output is UNTRUSTED at runtime and guarded field by field. Everything is injected
  * (LookupServices shape) so the flow is deterministic in tests.
  */
-import { resolveListingUrl } from './retrievalPlanner.js';
+import { resolveByIdUrl, resolveListingUrl } from './retrievalPlanner.js';
 import { withCollectUrl, withTimeout, type LookupServices } from './assembleLookup.js';
 import { sanitizeForLog } from '../utils/security.js';
 import { isCloudflareChallenge } from '../services/engineServices/challengeDetect.js';
@@ -46,9 +52,41 @@ export type CatalogResult =
   | { status: 'cooldown'; siteId: string; host: string; remainingMs: number }
   | { status: 'failed'; siteId: string; reason: string };
 
+/**
+ * One SYNTHESIZED window of a `byRange` store's id space, walking DOWN from `from`. Shaped like the
+ * listing result (`items` + `collectUrls` + a paging signal) so the crawler consumes both axes with
+ * one parser; `nextFrom` is the next id below the window (absent once the walk reaches id 1).
+ */
+export type IdRangeResult =
+  | {
+      status: 'ok';
+      siteId: string;
+      from: number;
+      items: CatalogItem[];
+      collectUrls: string[];
+      hasMore: boolean;
+      nextFrom?: number;
+      count: number;
+    }
+  | { status: 'unsupported'; siteId: string; reason: string }
+  | { status: 'failed'; siteId: string; reason: string };
+
+/** Default and clamp for an id-range window's size (ids per call). */
+const DEFAULT_ID_RANGE_COUNT = 50;
+const MAX_ID_RANGE_COUNT = 200;
+
 export interface Catalog {
   /** One page of `siteId`'s newest-first listing; `page` defaults to the store's `byListing.pageStart` (else 1). */
   catalog(siteId: string, page?: number): Promise<CatalogResult>;
+  /**
+   * One descending window of `siteId`'s SEQUENTIAL id space — `count` ids from `from` down, each
+   * decorated with the collect URL its `byId.urlTemplate` builds. PURE: it fetches nothing, parses
+   * nothing and consults no cooldown, because a store that declares `retrieval.byRange` has already
+   * told us its ids are enumerable — the id space IS the listing. Ids in the window that do not
+   * exist at the store are EXPECTED and surface downstream as the ingest fetch's own 404; this
+   * surface never probes them. `count` defaults to 50 and is clamped to [1, 200].
+   */
+  idRange(siteId: string, from: number, count?: number): IdRangeResult;
 }
 
 /** Listing-fetch timeout (ms) used when CATALOG_STORE_TIMEOUT_MS is unset/invalid, and the clamp any override rides within. */
@@ -83,6 +121,37 @@ export function assembleCatalog(services: CatalogServices): Catalog {
   const cfStore = services.cfCookieStore ?? getCfCookieStore();
 
   return {
+    idRange(siteId, from, count) {
+      const caps = services.profiles.forSite(siteId);
+      if (!caps) return { status: 'unsupported', siteId, reason: 'unknown store' };
+      // byRange is the store's DECLARATION that its ids are sequential/enumerable; byId is what turns
+      // one of those ids into a fetchable URL. Neither alone makes a walk valid.
+      if (caps.retrieval?.byRange !== true) return { status: 'unsupported', siteId, reason: 'store declares no byRange axis' };
+      if (!caps.retrieval?.byId?.urlTemplate) return { status: 'unsupported', siteId, reason: 'store declares no byId axis to build item urls from' };
+      if (!Number.isSafeInteger(from) || from < 1) {
+        return { status: 'failed', siteId, reason: `invalid from ${from} (must be a positive integer)` };
+      }
+      const size = Math.min(MAX_ID_RANGE_COUNT, Math.max(1, Number.isSafeInteger(count) ? (count as number) : DEFAULT_ID_RANGE_COUNT));
+      const lowest = Math.max(1, from - size + 1);
+      const items: CatalogItem[] = [];
+      for (let id = from; id >= lowest; id--) {
+        const collectUrl = resolveByIdUrl(caps.retrieval, String(id));
+        items.push(collectUrl ? { itemId: String(id), collectUrl } : { itemId: String(id) });
+      }
+      const collectUrls = items.map((it) => it.collectUrl).filter((u): u is string => typeof u === 'string' && u.length > 0);
+      const hasMore = lowest > 1;
+      return {
+        status: 'ok',
+        siteId,
+        from,
+        items,
+        collectUrls,
+        hasMore,
+        ...(hasMore ? { nextFrom: lowest - 1 } : {}),
+        count: items.length,
+      };
+    },
+
     async catalog(siteId, page) {
       const caps = services.profiles.forSite(siteId);
       if (!caps) return { status: 'unsupported', siteId, reason: 'unknown store' };

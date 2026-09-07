@@ -6,7 +6,7 @@
 import express from 'express';
 import request from 'supertest';
 import { createCatalogRoute } from '../../routes/catalog';
-import type { Catalog, CatalogResult } from '../../driver/assembleCatalog';
+import type { Catalog, CatalogResult, IdRangeResult } from '../../driver/assembleCatalog';
 
 const OK: CatalogResult = {
   status: 'ok',
@@ -26,8 +26,20 @@ const appWith = (catalog: Catalog) => {
   return app;
 };
 
-const mk = (result: CatalogResult | (() => Promise<CatalogResult>) = OK): Catalog => ({
+const RANGE_OK: IdRangeResult = {
+  status: 'ok',
+  siteId: 'mfc',
+  from: 3630000,
+  items: [{ itemId: '3630000', collectUrl: 'https://myfigurecollection.net/item/3630000' }],
+  collectUrls: ['https://myfigurecollection.net/item/3630000'],
+  hasMore: true,
+  nextFrom: 3629999,
+  count: 1,
+};
+
+const mk = (result: CatalogResult | (() => Promise<CatalogResult>) = OK, range: IdRangeResult | (() => IdRangeResult) = RANGE_OK): Catalog => ({
   catalog: jest.fn(typeof result === 'function' ? result : async () => result),
+  idRange: jest.fn(typeof range === 'function' ? range : () => range),
 });
 
 describe('GET /catalog', () => {
@@ -108,5 +120,82 @@ describe('GET /catalog', () => {
     const res = await request(appWith(mk(weird))).get('/catalog?store=orzgk');
     expect(res.status).toBe(502);
     expect(res.body.error).toBe('catalog failed');
+  });
+});
+
+describe('GET /catalog?range=1 (id-range window)', () => {
+  it('200: passes store, from and count to idRange and returns its ok result minus `status`', async () => {
+    const catalog = mk();
+    const res = await request(appWith(catalog)).get('/catalog?store=mfc&range=1&from=3630000&count=25');
+
+    expect(res.status).toBe(200);
+    const { status: _s, ...body } = RANGE_OK;
+    expect(res.body).toEqual(body);
+    expect(catalog.idRange).toHaveBeenCalledWith('mfc', 3630000, 25);
+    expect(catalog.catalog).not.toHaveBeenCalled();
+  });
+
+  it('count absent → undefined (the runtime applies its default)', async () => {
+    const catalog = mk();
+    await request(appWith(catalog)).get('/catalog?store=mfc&range=1&from=42');
+    expect(catalog.idRange).toHaveBeenCalledWith('mfc', 42, undefined);
+  });
+
+  it('400 when range is present but not `1`', async () => {
+    const catalog = mk();
+    for (const r of ['0', 'true', 'yes', '']) {
+      const res = await request(appWith(catalog)).get(`/catalog?store=mfc&range=${r}&from=1`);
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain('range');
+    }
+    expect(catalog.idRange).not.toHaveBeenCalled();
+  });
+
+  it('400 when `from` is missing, or present but not a positive integer', async () => {
+    const catalog = mk();
+    const res = await request(appWith(catalog)).get('/catalog?store=mfc&range=1');
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain('from');
+    for (const f of ['0', '-1', '1.5', 'abc', '', '1e3']) {
+      const bad = await request(appWith(catalog)).get(`/catalog?store=mfc&range=1&from=${f}`);
+      expect(bad.status).toBe(400);
+      expect(bad.body.error).toContain('from');
+    }
+    expect(catalog.idRange).not.toHaveBeenCalled();
+  });
+
+  it('400 when `count` is present but not a positive integer, and when `page` is combined with `range`', async () => {
+    const catalog = mk();
+    const badCount = await request(appWith(catalog)).get('/catalog?store=mfc&range=1&from=10&count=0');
+    expect(badCount.status).toBe(400);
+    expect(badCount.body.error).toContain('count');
+
+    const both = await request(appWith(catalog)).get('/catalog?store=mfc&range=1&from=10&page=2');
+    expect(both.status).toBe(400);
+    expect(both.body.error).toContain('range');
+    expect(catalog.idRange).not.toHaveBeenCalled();
+  });
+
+  it('`from` without `range` is ignored — the listing path still runs', async () => {
+    const catalog = mk();
+    const res = await request(appWith(catalog)).get('/catalog?store=orzgk&page=1&from=99');
+    expect(res.status).toBe(200);
+    expect(catalog.catalog).toHaveBeenCalledWith('orzgk', 1);
+    expect(catalog.idRange).not.toHaveBeenCalled();
+  });
+
+  it('422 unsupported / 502 failed / 502 (never 500) when idRange throws', async () => {
+    const unsup = await request(appWith(mk(OK, { status: 'unsupported', siteId: 'orzgk', reason: 'store declares no byRange axis' })))
+      .get('/catalog?store=orzgk&range=1&from=5');
+    expect(unsup.status).toBe(422);
+    expect(unsup.body).toEqual({ error: 'unsupported', siteId: 'orzgk', reason: 'store declares no byRange axis' });
+
+    const fail = await request(appWith(mk(OK, { status: 'failed', siteId: 'mfc', reason: 'invalid from' }))).get('/catalog?store=mfc&range=1&from=5');
+    expect(fail.status).toBe(502);
+    expect(fail.body).toEqual({ error: 'catalog failed', siteId: 'mfc', reason: 'invalid from' });
+
+    const threw = await request(appWith(mk(OK, () => { throw new Error('boom'); }))).get('/catalog?store=mfc&range=1&from=5');
+    expect(threw.status).toBe(502);
+    expect(threw.body).toEqual({ error: 'catalog failed', siteId: 'mfc', reason: 'boom' });
   });
 });
