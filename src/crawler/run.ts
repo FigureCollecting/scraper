@@ -28,6 +28,7 @@ async function main(): Promise<void> {
     backfillPagesPerRun: config.backfillPagesPerRun,
     maxRequests: config.maxRequests,
     maxEnqueuePerStore: config.maxEnqueuePerStore,
+    storeEnqueueCaps: config.storeEnqueueCaps,
     maxConcurrency: config.maxConcurrency,
     requestSpacingMs: config.requestSpacingMs,
     requestTimeoutMs: config.requestTimeoutMs,

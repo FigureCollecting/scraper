@@ -37,6 +37,7 @@ const mkCfg = (over: Partial<CrawlerConfig> = {}): CrawlerConfig => ({
   requestTimeoutMs: 5000,
   reobserveAfterMs: 0,
   exhaustedRecheckMs: WEEK_MS,
+  storeEnqueueCaps: {},
   ...over,
 });
 
@@ -945,5 +946,57 @@ describe('runCrawlerPass — backfill exhaustion must not be CONFIRMED on a page
     const r3 = makeFake({ catalog: grown });
     await runCrawlerPass(mkCfg({ mode: 'backfill', maxEnqueuePerStore: 2 }), { fetch: r3.fetch, ledgerStore: store, now: c.now });
     expect(r3.pages()).toEqual([]);
+  });
+});
+
+describe('runCrawlerPass — per-store enqueue caps', () => {
+  it('applies a per-store cap in place of the global one, leaving unnamed stores on the global cap', async () => {
+    const fake = makeFake({ catalog: (s, p) => ok(s, p, [`${s}-${p}a`, `${s}-${p}b`, `${s}-${p}c`], false) });
+    const store = createMemoryLedgerStore();
+    const s = await runCrawlerPass(
+      mkCfg({ mode: 'recent', stores: ['anitoys', 'orzgk'], maxEnqueuePerStore: 50, storeEnqueueCaps: { anitoys: 2 } }),
+      { fetch: fake.fetch, ledgerStore: store, now: clock().now },
+    );
+
+    expect(fake.posted().filter((u) => u.includes('anitoys'))).toEqual([collectUrl('anitoys', 'anitoys-1a'), collectUrl('anitoys', 'anitoys-1b')]);
+    expect(fake.posted().filter((u) => u.includes('orzgk')).length).toBe(3);
+    expect(s.stores.find((x) => x.siteId === 'anitoys')).toMatchObject({ capApplied: 2, enqueued: 2 });
+    expect(s.stores.find((x) => x.siteId === 'orzgk')).toMatchObject({ capApplied: 50, enqueued: 3 });
+  });
+
+  it('lists the effective per-store cap overrides on the run summary (only the ones that actually applied)', async () => {
+    const fake = makeFake({ catalog: (s, p) => ok(s, p, ['a'], false) });
+    const s = await runCrawlerPass(
+      mkCfg({ mode: 'recent', stores: ['anitoys', 'orzgk'], storeEnqueueCaps: { anitoys: 15, elsewhere: 4 } }),
+      { fetch: fake.fetch, ledgerStore: createMemoryLedgerStore(), now: clock().now },
+    );
+    expect(s.enqueueCapOverrides).toEqual({ anitoys: 15 });
+  });
+
+  it('a per-store cap of 0 skips the store entirely (no requests, no ledger writes) while the others run', async () => {
+    const fake = makeFake({ catalog: (s, p) => ok(s, p, ['a'], false) });
+    const store = createMemoryLedgerStore();
+    const s = await runCrawlerPass(
+      mkCfg({ mode: 'both', stores: ['anitoys', 'orzgk'], storeEnqueueCaps: { anitoys: 0 } }),
+      { fetch: fake.fetch, ledgerStore: store, now: clock().now },
+    );
+
+    expect(fake.catalogCalls().every(([site]) => site === 'orzgk')).toBe(true);
+    expect(fake.pages('anitoys')).toEqual([]);
+    expect(store.saveLog.includes('anitoys')).toBe(false);
+    expect(store.files.has('anitoys')).toBe(false);
+    expect(s.stores.find((x) => x.siteId === 'anitoys')).toMatchObject({ capApplied: 0, pagesFetched: 0, discovered: 0, enqueued: 0, errors: 0 });
+    expect(s.enqueueCapOverrides).toEqual({ anitoys: 0 });
+  });
+
+  it('a global maxEnqueuePerStore of 0 stays a discovery-only dry run (a page IS fetched) for unnamed stores', async () => {
+    const fake = makeFake({ catalog: (s, p) => ok(s, p, ['a'], false) });
+    const s = await runCrawlerPass(
+      mkCfg({ mode: 'recent', stores: ['orzgk'], maxEnqueuePerStore: 0 }),
+      { fetch: fake.fetch, ledgerStore: createMemoryLedgerStore(), now: clock().now },
+    );
+    expect(fake.pages('orzgk')).toEqual([1]);
+    expect(fake.posted()).toEqual([]);
+    expect(s.stores[0]).toMatchObject({ capApplied: 0, discovered: 1, enqueued: 0 });
   });
 });

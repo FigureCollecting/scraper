@@ -4,6 +4,7 @@
  * conservative default so an unconfigured run is safe on the single egress IP.
  */
 import { loadCrawlerConfig, DEFAULT_CRAWLER_STORES } from '../../crawler/config';
+import { logger } from '../../utils/logger';
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -125,4 +126,27 @@ describe('loadCrawlerConfig', () => {
     expect(loadCrawlerConfig({ CRAWLER_LEDGER_DIR: '/data/ledger' }).ledgerDir).toBe('/data/ledger');
     expect(loadCrawlerConfig({ CRAWLER_LEDGER_DIR: '   ' }).ledgerDir).toBe('/var/lib/ingest-crawler');
   });
+
+  it('defaults the per-store enqueue caps to none', () => {
+    expect(loadCrawlerConfig({}).storeEnqueueCaps).toEqual({});
+  });
+
+  it('parses CRAWLER_STORE_ENQUEUE_CAPS as a csv of siteId:cap, trimming whitespace and honoring 0', () => {
+    const c = loadCrawlerConfig({ CRAWLER_STORE_ENQUEUE_CAPS: ' anitoys:15 , mfc:30 ,sugotoys:0 ' });
+    expect(c.storeEnqueueCaps).toEqual({ anitoys: 15, mfc: 30, sugotoys: 0 });
+  });
+
+  it('ignores a malformed per-store cap entry with a WARN, keeping the well-formed ones', () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      const c = loadCrawlerConfig({ CRAWLER_STORE_ENQUEUE_CAPS: 'anitoys:15,mfc,orzgk:-1,:9,bad site:3,x:1.5,y:abc,mfc:30' });
+      expect(c.storeEnqueueCaps).toEqual({ anitoys: 15, mfc: 30 });
+      const warned = warn.mock.calls.map((call) => String(call[0]));
+      expect(warned.every((m) => m.includes('CRAWLER_STORE_ENQUEUE_CAPS'))).toBe(true);
+      expect(warn).toHaveBeenCalledTimes(6);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
 });

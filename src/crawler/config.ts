@@ -12,6 +12,8 @@
  * unconfigured invocation stays bounded and gentle on the single egress IP.
  */
 
+import { logger } from '../utils/logger.js';
+
 export type CrawlerMode = 'recent' | 'backfill' | 'both';
 
 export interface CrawlerConfig {
@@ -31,6 +33,13 @@ export interface CrawlerConfig {
   maxRequests: number;
   /** Upper bound on ingest POSTs per store per run (recent + backfill). 0 = discovery-only dry run. */
   maxEnqueuePerStore: number;
+  /**
+   * Per-store overrides of `maxEnqueuePerStore`, keyed by siteId. A store the operator has to hold
+   * back (anitoys stalls above ~15/h behind its Cloudflare gate) gets its own ceiling without
+   * throttling every other store; an explicit 0 pulls that store OUT of the run entirely (no
+   * requests at all) — as opposed to a GLOBAL 0, which stays a discovery-only dry run.
+   */
+  storeEnqueueCaps: Record<string, number>;
   /** GLOBAL max concurrent in-flight requests across ALL stores. */
   maxConcurrency: number;
   /** Minimum spacing, in ms, between consecutive request dispatches (global). */
@@ -90,6 +99,31 @@ const nonNegInt = (raw: string | undefined, fallback: number): number => {
   return Number.isFinite(n) && n >= 0 ? n : fallback;
 };
 
+/** A siteId is a plain token (it doubles as a ledger file stem) — anything else is refused. */
+const SAFE_SITE_ID = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * Parse `CRAWLER_STORE_ENQUEUE_CAPS` — a csv of `siteId:cap` pairs. Every entry is validated on its
+ * own: a malformed one is DROPPED with a WARN naming it, and the well-formed entries still apply, so
+ * one typo can never silently unthrottle a store nor void the whole declaration. A repeated siteId
+ * takes its LAST value.
+ */
+const parseStoreCaps = (raw: string | undefined): Record<string, number> => {
+  const out: Record<string, number> = {};
+  for (const entry of csv(raw ?? '')) {
+    const at = entry.indexOf(':');
+    const siteId = at === -1 ? '' : entry.slice(0, at).trim();
+    const capRaw = at === -1 ? '' : entry.slice(at + 1).trim();
+    const cap = Number(capRaw);
+    if (!SAFE_SITE_ID.test(siteId) || !/^\d+$/.test(capRaw) || !Number.isSafeInteger(cap)) {
+      logger.warn('[CRAWLER] CRAWLER_STORE_ENQUEUE_CAPS entry ignored (expected siteId:nonNegativeInteger)', { entry });
+      continue;
+    }
+    out[siteId] = cap;
+  }
+  return out;
+};
+
 const parseMode = (raw: string | undefined): CrawlerMode => (raw === 'recent' || raw === 'backfill' ? raw : 'both');
 
 export function loadCrawlerConfig(env: Env = process.env): CrawlerConfig {
@@ -109,6 +143,7 @@ export function loadCrawlerConfig(env: Env = process.env): CrawlerConfig {
     backfillPagesPerRun: posInt(env.CRAWLER_BACKFILL_PAGES_PER_RUN, DEFAULTS.backfillPagesPerRun),
     maxRequests: nonNegInt(env.CRAWLER_MAX_REQUESTS, DEFAULTS.maxRequests),
     maxEnqueuePerStore: nonNegInt(env.CRAWLER_MAX_ENQUEUE_PER_STORE, DEFAULTS.maxEnqueuePerStore),
+    storeEnqueueCaps: parseStoreCaps(env.CRAWLER_STORE_ENQUEUE_CAPS),
     maxConcurrency: posInt(env.CRAWLER_MAX_CONCURRENCY, DEFAULTS.maxConcurrency),
     requestSpacingMs: posInt(env.CRAWLER_REQUEST_SPACING_MS, DEFAULTS.requestSpacingMs),
     requestTimeoutMs: posInt(env.CRAWLER_REQUEST_TIMEOUT_MS, DEFAULTS.requestTimeoutMs),

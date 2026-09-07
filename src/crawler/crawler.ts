@@ -25,6 +25,11 @@
  * and the page is re-fetched next run. An exhausted store is re-checked at its last
  * cursor once exhaustedRecheckMs has elapsed.
  *
+ * PER-STORE ENQUEUE CAPS: a store may carry its own ceiling (config.storeEnqueueCaps) instead of the
+ * global maxEnqueuePerStore — one Cloudflare-gated store that stalls above ~15 items/hour is held
+ * back without throttling the rest. An explicit per-store 0 pulls that store OUT of the run (no
+ * requests, no ledger access); the GLOBAL 0 keeps its discovery-only-dry-run meaning.
+ *
  * MODE both (default) runs recent for EVERY store, THEN backfill — recent has budget
  * priority. Stores run in parallel under ONE global RequestGate (concurrency, total
  * budget over catalog GETs + ingest POSTs, spacing); pages within a store are
@@ -84,6 +89,8 @@ export interface CrawlerStoreSummary {
   deduplicated: number;
   /** Of `enqueued`, how many were re-observations of known items (recent only). */
   reobserved: number;
+  /** The enqueue ceiling this store ran under: its CRAWLER_STORE_ENQUEUE_CAPS override, else the global cap. */
+  capApplied: number;
   /** Failed catalog GETs, rejected/failed ingest POSTs, ledger failures. */
   errors: number;
   /** Catalog GETs answered 503 cooldown (the store was left alone this run). */
@@ -111,6 +118,8 @@ export interface CrawlerSummary {
   totalEnqueued: number;
   totalErrors: number;
   totalSkipped: number;
+  /** The per-store enqueue caps that actually applied this run, keyed by siteId (a cap for a store not crawled is not listed). */
+  enqueueCapOverrides: Record<string, number>;
   stores: CrawlerStoreSummary[];
   startedAt: string;
   finishedAt: string;
@@ -131,6 +140,8 @@ type Phase = 'recent' | 'backfill';
 interface StoreState {
   siteId: string;
   summary: CrawlerStoreSummary;
+  /** This store's enqueue ceiling for the run (override or global) — the only cap processPage consults. */
+  enqueueCap: number;
   /** null when the ledger could not be loaded (corrupt / fs error) — the store does no work. */
   ledger: Ledger | null;
   /** itemIds POSTed this run (dedupe within a run, across pages and phases). */
@@ -202,8 +213,19 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     });
 
   const stores = config.stores.filter((s, i) => config.stores.indexOf(s) === i);
+  const capOverrides = config.storeEnqueueCaps ?? {};
+  // Only the overrides for stores actually crawled this run are reported — a cap naming a store that
+  // is not in CRAWLER_STORES did nothing and must not read as if it had.
+  const enqueueCapOverrides: Record<string, number> = {};
+  for (const siteId of stores) {
+    if (Object.prototype.hasOwnProperty.call(capOverrides, siteId)) enqueueCapOverrides[siteId] = capOverrides[siteId];
+  }
+  const capFor = (siteId: string): number =>
+    Object.prototype.hasOwnProperty.call(capOverrides, siteId) ? capOverrides[siteId] : config.maxEnqueuePerStore;
+
   const states: StoreState[] = stores.map((siteId) => ({
     siteId,
+    enqueueCap: capFor(siteId),
     summary: {
       siteId,
       pagesFetched: 0,
@@ -216,6 +238,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       enqueued: 0,
       deduplicated: 0,
       reobserved: 0,
+      capApplied: capFor(siteId),
       errors: 0,
       skipped: 0,
       ledgerCorrupt: false,
@@ -226,7 +249,10 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     ledger: null,
     attempted: new Set<string>(),
     posts: 0,
-    stopped: false,
+    // An EXPLICIT per-store cap of 0 pulls the store out of the run before any request: the operator
+    // is holding it back (anitoys mid-stall), not asking for a dry run. A GLOBAL 0 keeps its
+    // existing discovery-only meaning — pages are fetched, nothing is POSTed.
+    stopped: Object.prototype.hasOwnProperty.call(capOverrides, siteId) && capOverrides[siteId] === 0,
     capReached: false,
     deepestRecentPage: 0,
   }));
@@ -260,6 +286,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       totalEnqueued: perStore.reduce((n, s) => n + s.enqueued, 0),
       totalErrors: perStore.reduce((n, s) => n + s.errors, 0),
       totalSkipped: perStore.reduce((n, s) => n + s.skipped, 0),
+      enqueueCapOverrides,
       stores: perStore,
       startedAt: new Date(startedAtMs).toISOString(),
       finishedAt: new Date(finishedAtMs).toISOString(),
@@ -277,6 +304,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
   // --- ledger -----------------------------------------------------------------------------------
 
   const loadLedger = async (st: StoreState): Promise<void> => {
+    if (st.stopped) return; // pulled out by an explicit per-store cap of 0 — its ledger is not even opened
     try {
       const l = await deps.ledgerStore.load(st.siteId);
       if (l === 'corrupt') {
@@ -422,7 +450,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
         allAttempted = false;
         continue;
       }
-      if (st.posts >= config.maxEnqueuePerStore) {
+      if (st.posts >= st.enqueueCap) {
         st.capReached = true;
         allAttempted = false;
         continue;
