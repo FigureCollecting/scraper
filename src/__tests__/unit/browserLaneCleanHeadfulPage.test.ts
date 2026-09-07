@@ -82,14 +82,52 @@ describe('clean-headful page setup', () => {
     expect(mockPage.setUserAgent).toHaveBeenCalledWith('Declared/1.0');
   });
 
-  it('still applies the UA pinned to a host\'s stored cookies (the clearance is bound to it)', async () => {
+  it('ignores the jar\'s pinned MINT user agent in clean-headful mode', async () => {
     process.env.BROWSER_LAUNCH_MODE = 'clean-headful';
-    const cookieStore = { cookiesFor: () => undefined, userAgentFor: () => 'Pinned/152.0' };
+    const cookieStore = { cookiesFor: () => undefined, userAgentFor: () => 'MintClient/1.0' };
     const service = createScrapingService(undefined, { cookieStore });
 
     await service.browserFetch('https://www.anitoysgk.com/lucy.html', { stealth: false });
 
-    expect(mockPage.setUserAgent).toHaveBeenCalledWith('Pinned/152.0');
+    expect(mockPage.setUserAgent).not.toHaveBeenCalled();
+  });
+
+  it('drops the jar\'s stored cf_clearance in clean-headful mode, keeping its other cookies', async () => {
+    process.env.BROWSER_LAUNCH_MODE = 'clean-headful';
+    const cookieStore = {
+      cookiesFor: () => ({ cf_clearance: 'minted-elsewhere', session: 's1' }),
+      userAgentFor: () => undefined,
+    };
+    const service = createScrapingService(undefined, { cookieStore });
+
+    await service.browserFetch('https://www.anitoysgk.com/lucy.html', { stealth: false });
+
+    const names = jest.mocked(mockPage.setCookie).mock.calls[0].map((c: any) => c.name);
+    expect(names).toEqual(['session']);
+  });
+
+  it('makes NO setCookie call when cf_clearance is the only stored cookie (clean-headful)', async () => {
+    process.env.BROWSER_LAUNCH_MODE = 'clean-headful';
+    const cookieStore = { cookiesFor: () => ({ cf_clearance: 'minted-elsewhere' }), userAgentFor: () => undefined };
+    const service = createScrapingService(undefined, { cookieStore });
+
+    await service.browserFetch('https://www.anitoysgk.com/lucy.html', { stealth: false });
+
+    expect(mockPage.setCookie).not.toHaveBeenCalled();
+  });
+
+  it('still replays the jar\'s pinned UA and cf_clearance in the default headless profile', async () => {
+    delete process.env.BROWSER_LAUNCH_MODE;
+    const cookieStore = {
+      cookiesFor: () => ({ cf_clearance: 'minted-elsewhere' }),
+      userAgentFor: () => 'MintClient/1.0',
+    };
+    const service = createScrapingService(undefined, { cookieStore });
+
+    await service.browserFetch('https://www.anitoysgk.com/lucy.html', { stealth: false });
+
+    expect(mockPage.setUserAgent).toHaveBeenCalledWith('MintClient/1.0');
+    expect(jest.mocked(mockPage.setCookie).mock.calls[0].map((c: any) => c.name)).toEqual(['cf_clearance']);
   });
 
   it('keeps the historical UA and viewport in the default headless profile', async () => {

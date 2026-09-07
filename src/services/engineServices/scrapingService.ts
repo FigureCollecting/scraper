@@ -164,6 +164,26 @@ function buildCookieParams(url: string, cookies: Record<string, string>): Parame
 }
 
 /**
+ * The jar cookie a clean-headful Chrome must never replay. Cloudflare binds a `cf_clearance` to the
+ * (IP, user agent) that EARNED it; every stored one was minted out-of-band by another client, from
+ * another exit. Presenting it from this browser is a contradiction the challenge can see, and it
+ * buys nothing — this browser earns its own clearance in-context.
+ */
+const IP_BOUND_STORED_COOKIE = /^cf_clearance$/i;
+
+/**
+ * The jar's cookies MINUS the ones this launch profile must not replay: in clean-headful mode a
+ * stored `cf_clearance` is dropped (see IP_BOUND_STORED_COOKIE); session cookies (the MFC set) still
+ * pass through, and the headless profile is unchanged. Everything dropped ⇒ undefined, so a host
+ * whose only stored cookie was the clearance makes no `setCookie` call at all.
+ */
+function usableStoredCookies(stored: Record<string, string> | undefined): Record<string, string> | undefined {
+  if (!stored || !isCleanHeadfulMode()) return stored;
+  const usable = Object.fromEntries(Object.entries(stored).filter(([name]) => !IP_BOUND_STORED_COOKIE.test(name)));
+  return Object.keys(usable).length > 0 ? usable : undefined;
+}
+
+/**
  * STORED COOKIES (CfCookieStore) merged UNDER the request's own: a host the store has cookies for
  * contributes them, and a request/item cookie of the same name WINS (a request-scoped session — the
  * MFC user-sync path — carries its own coherent set). Neither ⇒ undefined (no setCookie call at all,
@@ -174,22 +194,26 @@ function mergeStoredCookies(
   url: string,
   requestCookies: Record<string, string> | undefined,
 ): Record<string, string> | undefined {
-  const stored = store.cookiesFor(url);
+  const stored = usableStoredCookies(store.cookiesFor(url));
   if (!stored && !requestCookies) return undefined;
   return { ...(stored ?? {}), ...(requestCookies ?? {}) };
 }
 
 /**
- * UA precedence on the browser lane: the request's own UA, else the host's pinned mint UA (a stored
- * `cf_clearance` is only valid for the UA it was minted with), else the engine default — EXCEPT in
- * clean-headful mode, where "no declaration" means DON'T TOUCH IT. Overriding a real Chrome 152's
- * UA with the historical `Chrome/127` string contradicts the client hints the same browser sends,
- * and Cloudflare binds the clearance it issues to the UA that earned it.
+ * UA precedence on the browser lane: the REQUEST's own UA always wins (a store declaring one means
+ * it). Below that the two profiles diverge:
+ *   - headless (default)    — the host's pinned mint UA (a stored `cf_clearance` is only valid for
+ *                             the UA it was minted with), else the engine default. Unchanged.
+ *   - clean-headful         — NOTHING. Don't touch the real Chrome's UA: the jar's pinned UA is the
+ *                             MINT client's, sent from another exit, and this browser no longer
+ *                             replays that clearance (see usableStoredCookies). Rewriting a Chrome
+ *                             152's UA contradicts the client hints the same browser sends, and
+ *                             Cloudflare binds the clearance it issues to the UA that earned it.
  */
 function resolveUserAgent(store: CfCookieSource, url: string, requestUa: string | undefined): string | undefined {
-  const declared = requestUa || store.userAgentFor(url);
-  if (declared) return declared;
-  return isCleanHeadfulMode() ? undefined : DEFAULT_USER_AGENT;
+  if (requestUa) return requestUa;
+  if (isCleanHeadfulMode()) return undefined;
+  return store.userAgentFor(url) || DEFAULT_USER_AGENT;
 }
 
 /**
