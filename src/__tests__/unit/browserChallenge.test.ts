@@ -21,11 +21,16 @@ describe('browser-lane challenge clearance', () => {
 
   const makeResponse = (headers: Record<string, string>) => ({ headers: () => headers }) as any;
 
-  const makePage = (titles: string[]) => {
+  const makePage = (titles: string[], readyStates: string[] = []) => {
     const queue = [...titles];
-    return {
+    const ready = [...readyStates];
+    const page: any = {
       title: jest.fn<(...a: any[]) => any>().mockImplementation(async () => queue.length > 1 ? queue.shift() : queue[0]),
-    } as any;
+    };
+    if (readyStates.length > 0) {
+      page.evaluate = jest.fn<(...a: any[]) => any>().mockImplementation(async () => (ready.length > 1 ? ready.shift() : ready[0]));
+    }
+    return page;
   };
 
   it('recognises the challenge signal on a response', () => {
@@ -93,5 +98,24 @@ describe('browser-lane challenge clearance', () => {
 
     clearChallengeGates();
     expect(isChallengeGated('www.anitoysgk.com')).toBe(false);
+  });
+
+  it('waits for the document that REPLACED the interstitial to finish parsing', async () => {
+    // The title flips as soon as the real document starts loading — reading the DOM then yields a
+    // 2 KB fragment of a 290 KB page (measured live against anitoysgk.com 2026-09-07).
+    const page = makePage(['Just a moment...', 'Lucy — anitoys'], ['loading', 'loading', 'interactive']);
+
+    const seen = await awaitChallengeClearance(page, makeResponse({ 'cf-mitigated': 'challenge' }), 'https://www.anitoysgk.com/lucy.html', { timeoutMs: 5000, pollMs: 1 });
+
+    expect(seen).toBe(true);
+    expect(page.evaluate).toHaveBeenCalled();
+  });
+
+  it('does not wait on readyState for a page that was never challenged', async () => {
+    const page = makePage(['Lucy — anitoys'], ['loading']);
+
+    await awaitChallengeClearance(page, makeResponse({}), 'https://www.anitoysgk.com/lucy.html', { timeoutMs: 50, pollMs: 5 });
+
+    expect(page.evaluate).not.toHaveBeenCalled();
   });
 });

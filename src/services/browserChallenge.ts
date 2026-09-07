@@ -32,6 +32,8 @@ const gatedHosts = new Set<string>();
 /** The minimal page surface the clearance wait drives (mockable, no puppeteer import needed). */
 export interface ChallengeAwarePage {
   title(): Promise<string>;
+  /** Optional: used only to watch `document.readyState` on the post-challenge document. */
+  evaluate?(pageFunction: () => string): Promise<unknown>;
 }
 
 /** The minimal response surface: its headers, whatever the lane got back from `goto`. */
@@ -114,5 +116,22 @@ export async function awaitChallengeClearance(
     await sleep(pollMs);
     current = await page.title().catch(() => current);
   }
+
+  // The title flips the moment the REAL document starts loading, which is not the moment it is
+  // readable: measured live, reading right then yielded a 2 KB fragment of a 290 KB page. The
+  // post-challenge document is a navigation the caller's `goto` never waited on, so wait for it
+  // here — until the HTML is parsed (`readyState` past `loading`), bounded by the same deadline.
+  await awaitDocumentParsed(page, deadline, pollMs);
   return true;
+}
+
+/** Poll `document.readyState` until the document is past `loading`, or the deadline passes. */
+async function awaitDocumentParsed(page: ChallengeAwarePage, deadline: number, pollMs: number): Promise<void> {
+  if (typeof page.evaluate !== 'function') return;
+  const readyState = async (): Promise<unknown> =>
+    await page.evaluate!(() => document.readyState).catch(() => 'complete');
+  while ((await readyState()) === 'loading') {
+    if (Date.now() >= deadline) return;
+    await sleep(pollMs);
+  }
 }
