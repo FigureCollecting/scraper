@@ -166,6 +166,57 @@ describe('ExtractContext page passthroughs — residential egress gate', () => {
     expect(scraping.scrapePageStealth).not.toHaveBeenCalled();
   });
 
+  /**
+   * The proxy is chosen by the DECLARING store, but a ruleset chooses the URL. A follow-up to some
+   * third-party host must not inherit the residential exit: that hands the home IP to a host that
+   * never declared it, and spends the residential line's reputation on someone else's traffic.
+   */
+  it('does NOT send an OFF-STORE follow-up through the residential exit', async () => {
+    const { ctx, scraping } = build(PROXY);
+    await ctx.scraping.scrapePage('https://cdn.thirdparty.example/img/1.jpg');
+    expect(scraping.scrapePage).toHaveBeenCalledWith('https://cdn.thirdparty.example/img/1.jpg', undefined);
+  });
+
+  it('does not REFUSE an off-store follow-up either — it is simply not the declaring store\'s fetch', async () => {
+    const { ctx, scraping } = build(undefined);
+    await ctx.scraping.scrapePage('https://cdn.thirdparty.example/img/1.jpg');
+    expect(scraping.scrapePage).toHaveBeenCalledWith('https://cdn.thirdparty.example/img/1.jpg', undefined);
+  });
+
+  it('still covers the store\'s OWN subdomains (an asset host under the declaring domain)', async () => {
+    const { ctx, scraping } = build(PROXY);
+    await ctx.scraping.scrapePage('https://cdn.anitoysgk.com/product/ABC');
+    expect(scraping.scrapePage).toHaveBeenCalledWith('https://cdn.anitoysgk.com/product/ABC', expect.objectContaining({ proxyServer: PROXY }));
+  });
+
+  it('does not let a look-alike suffix host ride the exit', async () => {
+    const { ctx, scraping } = build(PROXY);
+    await ctx.scraping.scrapePage('https://evil-anitoysgk.com/product/ABC');
+    expect(scraping.scrapePage).toHaveBeenCalledWith('https://evil-anitoysgk.com/product/ABC', undefined);
+  });
+
+  it('keeps an OFF-STORE fetchBody off the residential exit as well', async () => {
+    const capturingFetch = jest.fn(async () => ({ html: '{}' }));
+    const ctx = buildExtractContext({
+      config: CONFIG,
+      logger: LOGGER,
+      scraping: fakeScraping(),
+      capturingFetch,
+      searchFetch: { transport: 'impersonate', egress: 'residential', browser: 'chrome142' },
+      primaryUrl: 'https://anitoysgk.com/product/ABC',
+      primaryFetchedAt: 0,
+      residentialProxyUrl: () => PROXY,
+      now: () => 10_000_000,
+      sleep: jest.fn(async () => {}),
+    });
+
+    await ctx.scraping.fetchBody!('https://api.thirdparty.example/v1/item');
+    await ctx.scraping.fetchBody!('https://anitoysgk.com/api/variations');
+
+    expect(capturingFetch.mock.calls[0][1]).toEqual({ transport: 'impersonate', browser: 'chrome142' });
+    expect(capturingFetch.mock.calls[1][1]).toEqual({ transport: 'impersonate', egress: 'residential', browser: 'chrome142' });
+  });
+
   it('forwards an undeclared store\'s pageOptions untouched (undefined stays undefined)', async () => {
     const scraping = fakeScraping();
     const ctx = buildExtractContext({

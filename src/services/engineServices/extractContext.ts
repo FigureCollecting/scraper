@@ -37,7 +37,12 @@ import type {
 } from '@figurecollecting/scraper-plugin-contract';
 import type { CapturingFetch } from './capturingFetch.js';
 import type { EngineScrapePageOptions } from './scrapingService.js';
-import { getResidentialProxyUrl, resolveBrowserLaneOptions } from '../residentialEgress.js';
+import {
+  getResidentialProxyUrl,
+  isDeclaringStoreUrl,
+  resolveBrowserLaneOptions,
+  withoutDeclaredEgress,
+} from '../residentialEgress.js';
 
 /**
  * Default courtesy gap (ms) when a store profile declares no `rateLimit.baseDelayMs` — should be
@@ -131,10 +136,19 @@ export function buildExtractContext(options: BuildExtractContextOptions): Extrac
    * proxy THROWS the typed refusal — the ruleset's navigation fails loudly instead of leaving from
    * the node IP. Nothing declared ⇒ the caller's own options pass through untouched.
    */
+  /**
+   * HOST SCOPE: the declaration belongs to the STORE, and the ruleset chooses the URL. A follow-up
+   * to a host that is not the declaring store's (an image CDN, a third-party API) is dispatched
+   * DIRECTLY — it neither rides the residential exit (which would hand the home IP to a host that
+   * never declared it) nor is refused for lacking one (it never needed one).
+   */
+  const onDeclaringStore = (url: string): boolean => isDeclaringStoreUrl(url, options.primaryUrl);
+
   const withLaneOptions = (
     url: string,
     pageOptions: EngineScrapePageOptions | undefined,
   ): EngineScrapePageOptions | undefined => {
+    if (!onDeclaringStore(url)) return pageOptions;
     const lane = resolveBrowserLaneOptions(url, options.searchFetch, resolveProxy());
     return lane ? { ...pageOptions, ...lane } : pageOptions;
   };
@@ -177,7 +191,10 @@ export function buildExtractContext(options: BuildExtractContextOptions): Extrac
           }
         }
         const cookies = fetchOpts?.cookies ?? options.cookies;
-        const result = await options.capturingFetch(url, options.searchFetch, cookies ? { cookies } : {});
+        // Same host scope as the page passthroughs: an off-store follow-up keeps the store's
+        // transport/headers but never its residential exit.
+        const searchFetch = onDeclaringStore(url) ? options.searchFetch : withoutDeclaredEgress(options.searchFetch);
+        const result = await options.capturingFetch(url, searchFetch, cookies ? { cookies } : {});
         if (targetHost !== undefined) {
           lastFetchedAt.set(targetHost, now());
         }

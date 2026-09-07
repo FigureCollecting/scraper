@@ -192,6 +192,41 @@ export function requireResidentialProxy(
   return proxyUrl;
 }
 
+/** A URL's hostname, lowercased and `www.`-stripped; `undefined` when it does not parse. */
+function egressHost(url: string): string | undefined {
+  try {
+    return new URL(url).hostname.toLowerCase().replace(/^www\./, '');
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Whether `url` belongs to the store that DECLARED the egress (`declaringUrl` = the store URL the
+ * declaration was resolved for). The residential exit is the HOME line: a store declaring it opts
+ * ITSELF in, not every host a ruleset happens to name in a follow-up. Without this, a ruleset
+ * fetching an image CDN or a third-party API through `ctx.scraping` would hand the home IP to a host
+ * that never declared it and spend that line's reputation on unrelated traffic.
+ *
+ * The store's own subdomains count (an asset host under the declaring domain); a look-alike that
+ * merely ENDS with the same string does not (the dot in the suffix test is load-bearing). Compared
+ * against the declaring host rather than an eTLD+1, so no public-suffix list is needed — which also
+ * avoids the `.com.au` trap that a naive "last two labels" rule falls into (sugotoys.com.au).
+ */
+export function isDeclaringStoreUrl(url: string, declaringUrl: string): boolean {
+  const target = egressHost(url);
+  const declaring = egressHost(declaringUrl);
+  if (target === undefined || declaring === undefined) return false;
+  return target === declaring || target.endsWith(`.${declaring}`);
+}
+
+/** The same declaration with its egress dropped — what an OFF-STORE follow-up is dispatched with. */
+export function withoutDeclaredEgress(searchFetch: SearchFetch | undefined): SearchFetch | undefined {
+  if (!searchFetch?.egress) return searchFetch;
+  const { egress: _declared, ...rest } = searchFetch;
+  return rest;
+}
+
 /** The browser lane's per-request wiring resolved from a store's declared `searchFetch`. */
 export interface BrowserLaneEgressOptions {
   /** Residential proxy to bind this request's incognito context to. */
