@@ -1188,6 +1188,46 @@ describe('runCrawlerPass — id-range backfill', () => {
     expect(s.stores[0]).toMatchObject({ errors: 1, rangeWalked: 0, rangeCursor: null });
   });
 
+  it('holds the cursor when /ingest/scrape rejected EVERY id in the window (a ruleset/engine skew burns no id space)', async () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      const store = createMemoryLedgerStore();
+      const cfg = rangeOnly({ rangeFrontiers: { mfc: 500 } });
+      const reject = { status: 422, body: { success: false, message: 'No plugin ruleset matches this URL' } };
+
+      const first = makeFake({ catalog: (s) => failed(s), ingest: () => reject });
+      const s1 = await runCrawlerPass(cfg, { fetch: first.fetch, ledgerStore: store, now: clock().now });
+      expect(first.posted().length).toBe(5);
+      expect(Object.keys(store.files.get('mfc')?.enqueued ?? {})).toEqual([]);
+      expect(store.saveLog).toEqual([]);
+      expect(s1.stores[0]).toMatchObject({ errors: 5, enqueued: 0, rangeCursor: null });
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('rejected'))).toBe(true);
+
+      // Next run re-walks the SAME window — the ids are not below a cursor that nothing collected.
+      const second = makeFake({ catalog: (s) => failed(s) });
+      await runCrawlerPass(cfg, { fetch: second.fetch, ledgerStore: store, now: clock().now });
+      expect(second.rangeCalls()).toEqual([['mfc', 500, 5]]);
+      expect(second.posted().length).toBe(5);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('a window with at least one accepted id still advances over a single rejected one', async () => {
+    const store = createMemoryLedgerStore();
+    const fake = makeFake({
+      catalog: (s) => failed(s),
+      ingest: (u) => (u.endsWith('/499') ? { status: 422, body: { success: false } } : { status: 202, body: { success: true, deduplicated: false } }),
+    });
+    const s = await runCrawlerPass(rangeOnly({ rangeIdsPerRun: 3, rangeFrontiers: { mfc: 500 } }), {
+      fetch: fake.fetch,
+      ledgerStore: store,
+      now: clock().now,
+    });
+    expect(store.files.get('mfc')!.range!.cursor).toBe(497);
+    expect(s.stores[0]).toMatchObject({ enqueued: 2, errors: 1, rangeWalked: 3, rangeCursor: 497 });
+  });
+
   it('a 503 cooldown on the RANGE axis skips the store for the run: no POSTs, no cursor written', async () => {
     const fake = makeFake({ catalog: (s) => failed(s), range: (s) => cooldown(s) });
     const store = createMemoryLedgerStore();

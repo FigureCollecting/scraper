@@ -468,10 +468,12 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     st: StoreState,
     items: CatalogItem[],
     phase: Phase,
-  ): Promise<{ newCount: number; allAttempted: boolean; handled: number }> => {
+  ): Promise<{ newCount: number; allAttempted: boolean; handled: number; accepted: number; rejected: number }> => {
     const ledger = st.ledger!;
     let newCount = 0;
     let allAttempted = true;
+    let accepted = 0;
+    let rejected = 0;
     // Index of the FIRST item this run did not get through (cap / budget / a sick scraper). Everything
     // before it was dealt with — POSTed, deliberately skipped, or deterministically rejected — which is
     // exactly how far a durable cursor may move. Undefined ⇒ the whole page was handled.
@@ -515,11 +517,13 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
         case 'accepted':
         case 'accepted-dedup':
           ledger.enqueued[item.itemId] = { at: iso(), collectUrl: item.collectUrl };
+          accepted++;
           st.summary.enqueued++;
           if (outcome === 'accepted-dedup') st.summary.deduplicated++;
           if (reobserve) st.summary.reobserved++;
           break;
         case 'rejected':
+          rejected++;
           st.summary.errors++;
           break;
         case 'transient':
@@ -539,7 +543,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
           break;
       }
     }
-    return { newCount, allAttempted, handled: firstUnhandled ?? items.length };
+    return { newCount, allAttempted, handled: firstUnhandled ?? items.length, accepted, rejected };
   };
 
   // --- phases -----------------------------------------------------------------------------------
@@ -663,7 +667,9 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
    *
    * The cursor moves down by the number of ids HANDLED (POSTed, skipped as known, or deterministically
    * rejected), never by the window size: an id the cap or the budget cut off is left above the cursor
-   * and picked up next run, so nothing is stranded and nothing is ever re-walked. Ids in the window
+   * and picked up next run, so nothing is stranded and nothing is ever re-walked. A window that
+   * /ingest/scrape rejected ENTIRELY moves the cursor not at all — that is the store's ruleset
+   * missing, not this id band's fault, and the band would otherwise be spent collecting nothing. Ids in the window
    * that do not exist at the store are EXPECTED — the ingest fetch answers 404 and the miss is
    * recorded there; the crawler cannot see it and does not pretend to.
    */
@@ -696,10 +702,18 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     const count = Math.min(config.rangeIdsPerRun, cursor);
     const out = await fetchCatalog(st, rangeUrl(st.siteId, cursor, count), { from: cursor, count }, 'range');
     if (out.kind !== 'page') return;
-    const { handled } = await processPage(st, out.items, 'range');
+    const { handled, accepted, rejected } = await processPage(st, out.items, 'range');
     st.summary.rangeWalked += handled;
     if (handled === 0) {
       logger.info('[CRAWLER] id-range window yielded no walkable id — cursor kept', { siteId: st.siteId, from: cursor });
+      return;
+    }
+    if (accepted === 0 && rejected > 0) {
+      // Every id the window offered was deterministically refused by /ingest/scrape (4xx — typically
+      // no ruleset matches the store's byId url, i.e. an engine/ruleset skew). That is a property of
+      // the STORE, not of these ids: walking past them would spend the id space collecting nothing
+      // and they are never re-walked. Keep the cursor and let the error count say so.
+      logger.warn('[CRAWLER] id-range window entirely rejected by ingest — cursor kept', { siteId: st.siteId, from: cursor, rejected });
       return;
     }
     range.cursor = Math.max(0, cursor - handled);

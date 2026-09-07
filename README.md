@@ -599,7 +599,10 @@ because the newest ids always outrank the deep id space for the run's budget.
   number of ids actually HANDLED (POSTed, skipped as known, or deterministically 4xx-rejected). An id
   the per-store cap, the global budget or a 5xx from `/ingest/scrape` cut off is left above the
   cursor and picked up next run: nothing is stranded, and nothing is ever re-walked. The walk ends at
-  id 1, leaving `cursor: 0`; further runs make no request.
+  id 1, leaving `cursor: 0`; further runs make no request. A window `/ingest/scrape` rejected
+  ENTIRELY (4xx for every id — typically no ruleset matches the store's `byId` url, an engine/ruleset
+  skew) leaves the cursor exactly where it was, with a WARN: that band would otherwise be spent
+  collecting nothing and is never walked again.
 - **Misses** — an id in the window that does not exist at the store is EXPECTED and is not an error
   here: `/catalog?range=1` never probes it, so the gap surfaces downstream as the ingest fetch's own
   404, recorded in the ingest lane. The crawler counts `rangeWalked` (ids walked), not hits.
