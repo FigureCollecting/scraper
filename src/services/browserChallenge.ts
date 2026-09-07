@@ -9,6 +9,13 @@
  * first response carries `cf-mitigated: challenge` (or the title is the challenge page), poll until
  * the real document replaces it, bounded by a budget.
  *
+ * WHAT ENDS THE WAIT is clearance evidence — a `cf_clearance` cookie for the URL's host — and NOT the
+ * transient absence of challenge markers. Measured on www.suruga-ya.jp 2026-09-07: the 403 is
+ * answered by the interstitial navigating to `…?__cf_chl_rt_tk=…` and back, and through that window
+ * the page has no title (localised in any case) and no `#challenge-running` / `#challenge-stage` in
+ * the DOM. A wait that leaves on "no markers right now" left on its first poll and the lane captured
+ * the interstitial; the stores that seemed to work were passing on timing luck.
+ *
  * Seeing a challenge is also the LEARNED signal that a host is gated. That matters beyond this
  * fetch: a gated host is served from then on by the long-lived browser for its egress (see
  * gatedBrowsers), whose default context holds the clearance — which Cloudflare binds to IP + user
@@ -53,14 +60,37 @@ export const CHALLENGE_POLL_MS = 750;
 /** Titles the interstitial serves while the challenge runs (Chrome renders the English one). */
 const CHALLENGE_TITLE = /^\s*just a moment/i;
 
+/** The cookie Cloudflare sets once a challenge is passed — the wait's positive evidence. */
+export const CLEARANCE_COOKIE = 'cf_clearance';
+
+/**
+ * Cloudflare's own round-trip parameters. The interstitial answers the challenge by navigating to
+ * `…?__cf_chl_rt_tk=…` (older builds: `__cf_chl_tk`) and back; a URL carrying either is proof the
+ * challenge is still running, whatever the DOM looks like at that instant.
+ */
+const CHALLENGE_ROUND_TRIP = /[?&]__cf_chl_(rt_)?tk=/;
+
 /** Hosts observed serving a challenge in this process (learned, never configured). */
 const gatedHosts = new Set<string>();
+
+/** One browser cookie, as much of it as the clearance wait reads. */
+export interface ChallengeCookie {
+  name: string;
+  domain: string;
+}
 
 /** The minimal page surface the clearance wait drives (mockable, no puppeteer import needed). */
 export interface ChallengeAwarePage {
   title(): Promise<string>;
   /** Optional: watches `document.readyState`, and looks for the interstitial's own containers. */
   evaluate?(pageFunction: () => any): Promise<unknown>;
+  /** Optional: the page's current URL, which carries Cloudflare's round-trip token mid-challenge. */
+  url?(): string;
+  /**
+   * Optional: the cookies of the context this page runs in — where `cf_clearance` lands. Absent on a
+   * mock or an unusual page surface, and that absence is "no evidence available", NOT "no clearance".
+   */
+  cookies?(): Promise<ChallengeCookie[]>;
 }
 
 /** The minimal response surface: its headers, whatever the lane got back from `goto`. */
@@ -127,6 +157,54 @@ export function clearChallengeGates(): void {
 const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 
 /**
+ * Whether a cookie's domain covers this host. Cookie domains arrive either bare (`www.example.com`)
+ * or with the leading dot that means "and every subdomain" (`.example.com`); both must match the
+ * host the URL names, and NEITHER must match a different host — a clearance is bound to the site
+ * that issued it, so another store's cookie is not evidence this one cleared.
+ */
+function cookieCoversHost(domain: string, host: string): boolean {
+  const scope = domain.replace(/^\./, '').toLowerCase();
+  if (!scope) return false;
+  return host === scope || host.endsWith(`.${scope}`);
+}
+
+/**
+ * The clearance evidence, read from the context the page runs in. `undefined` ⇒ this page surface
+ * cannot answer (no cookies accessor, or the read threw), which is NOT the same as "no clearance"
+ * and sends the wait down its fallback.
+ */
+async function hasClearanceCookie(page: ChallengeAwarePage, host: string | undefined): Promise<boolean | undefined> {
+  if (typeof page.cookies !== 'function' || !host) return undefined;
+  const cookies = await page.cookies().catch(() => undefined);
+  if (!Array.isArray(cookies)) return undefined;
+  return cookies.some(cookie => cookie?.name === CLEARANCE_COOKIE && cookieCoversHost(String(cookie?.domain ?? ''), host));
+}
+
+/** Whether the document is still parsing (`readyState === 'loading'`). Unknowable ⇒ false. */
+async function isDocumentLoading(page: ChallengeAwarePage): Promise<boolean> {
+  if (typeof page.evaluate !== 'function') return false;
+  return (await page.evaluate(() => document.readyState).catch(() => 'complete')) === 'loading';
+}
+
+/**
+ * Whether the REAL document is up, once a challenge has been seen and its markers are gone.
+ *
+ * The markers being gone is not evidence of anything: mid-challenge the interstitial navigates to
+ * Cloudflare's round-trip URL and back, and in that window there is no title (it is localised in any
+ * case) and no `#challenge-running` / `#challenge-stage` in the DOM. Leaving there captures the
+ * interstitial — measured on www.suruga-ya.jp, 2026-09-07. So the wait leaves only on the cookie
+ * Cloudflare sets when the challenge passes. A page that cannot report cookies falls back to the
+ * older rule plus a grace: Cloudflare's own round-trip token in the URL, or a document still parsing,
+ * both mean "not yet".
+ */
+async function clearanceSettled(page: ChallengeAwarePage, host: string | undefined): Promise<boolean> {
+  const cleared = await hasClearanceCookie(page, host);
+  if (cleared !== undefined) return cleared;
+  if (typeof page.url === 'function' && CHALLENGE_ROUND_TRIP.test(page.url() ?? '')) return false;
+  return !(await isDocumentLoading(page));
+}
+
+/**
  * Wait out a Cloudflare challenge on a freshly-navigated page.
  *
  * @returns whether a challenge was seen at all (true ⇒ the host is now marked gated, whether or not
@@ -153,7 +231,9 @@ export async function awaitChallengeClearance(
   const pollMs = options.pollMs ?? CHALLENGE_POLL_MS;
   const deadline = Date.now() + timeoutMs;
   let current = title;
-  while (await showsChallenge(current)) {
+  // A challenge has been SEEN, so the wait now leaves only on POSITIVE evidence that the store's own
+  // document is up: no interstitial markers AND the clearance in hand (see clearanceSettled).
+  while (await showsChallenge(current) || !(await clearanceSettled(page, host))) {
     if (Date.now() >= deadline) {
       // eslint-disable-next-line no-console
       // lgtm[js/log-injection] — url is caller-influenced; sanitize before logging
@@ -175,9 +255,7 @@ export async function awaitChallengeClearance(
 /** Poll `document.readyState` until the document is past `loading`, or the deadline passes. */
 async function awaitDocumentParsed(page: ChallengeAwarePage, deadline: number, pollMs: number): Promise<void> {
   if (typeof page.evaluate !== 'function') return;
-  const readyState = async (): Promise<unknown> =>
-    await page.evaluate!(() => document.readyState).catch(() => 'complete');
-  while ((await readyState()) === 'loading') {
+  while (await isDocumentLoading(page)) {
     if (Date.now() >= deadline) return;
     await sleep(pollMs);
   }

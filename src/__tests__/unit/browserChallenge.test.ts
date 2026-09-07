@@ -144,6 +144,117 @@ describe('browser-lane challenge clearance', () => {
     expect(page.evaluate).toHaveBeenCalled();
   });
 
+  /**
+   * THE DEFECT (production 2026-09-07, www.suruga-ya.jp through the residential gated browser): the
+   * 403 carrying `cf-mitigated: challenge` is answered by the interstitial navigating to
+   * `…?__cf_chl_rt_tk=…` and back. During that round trip the page has NO title (and the interstitial
+   * is localised anyway) and Cloudflare's containers are gone from the DOM — so a wait that leaves on
+   * "no markers right now" left immediately and the lane captured the interstitial. The absence of a
+   * challenge marker is not evidence the challenge finished; a `cf_clearance` cookie is.
+   */
+  it('keeps waiting through the interstitial round trip and leaves only once the clearance cookie lands', async () => {
+    const jar: Array<{ name: string; domain: string }> = [];
+    let reads = 0;
+    const page: any = {
+      title: jest.fn<(...a: any[]) => any>().mockResolvedValue(''),
+      evaluate: jest.fn<(...a: any[]) => any>().mockResolvedValue(false),
+      url: jest.fn(() => 'https://www.suruga-ya.jp/product/detail/100000950'),
+      cookies: jest.fn<(...a: any[]) => any>().mockImplementation(async () => {
+        if (++reads >= 3) jar.push({ name: 'cf_clearance', domain: '.suruga-ya.jp' });
+        return [...jar];
+      }),
+    };
+
+    const seen = await awaitChallengeClearance(page, makeResponse({ 'cf-mitigated': 'challenge' }), 'https://www.suruga-ya.jp/product/detail/100000950', { timeoutMs: 5000, pollMs: 1 });
+
+    expect(seen).toBe(true);
+    expect(reads).toBeGreaterThan(1); // it WAITED rather than leaving on the first empty title
+    expect(isChallengeGated('www.suruga-ya.jp')).toBe(true);
+  });
+
+  it('leaves at once when the session already holds the clearance for this host', async () => {
+    const page: any = {
+      title: jest.fn<(...a: any[]) => any>().mockResolvedValue('駿河屋 - XRGB'),
+      evaluate: jest.fn<(...a: any[]) => any>().mockResolvedValue(false),
+      url: jest.fn(() => 'https://www.suruga-ya.jp/product/detail/100000950'),
+      cookies: jest.fn<(...a: any[]) => any>().mockResolvedValue([{ name: 'cf_clearance', domain: 'www.suruga-ya.jp' }]),
+    };
+
+    const seen = await awaitChallengeClearance(page, makeResponse({ 'cf-mitigated': 'challenge' }), 'https://www.suruga-ya.jp/product/detail/100000950', { timeoutMs: 5000, pollMs: 50 });
+
+    expect(seen).toBe(true);
+    expect(jest.mocked(page.cookies).mock.calls.length).toBe(1); // no needless poll
+  });
+
+  it('never reads cookies for a page that was never challenged', async () => {
+    const page: any = {
+      title: jest.fn<(...a: any[]) => any>().mockResolvedValue('Lucy — anitoys'),
+      evaluate: jest.fn<(...a: any[]) => any>().mockResolvedValue(false),
+      cookies: jest.fn<(...a: any[]) => any>().mockResolvedValue([]),
+    };
+
+    const seen = await awaitChallengeClearance(page, makeResponse({ 'content-type': 'text/html' }), 'https://alpha.example.test/item/1', { timeoutMs: 50, pollMs: 5 });
+
+    expect(seen).toBe(false);
+    expect(page.cookies).not.toHaveBeenCalled();
+  });
+
+  it('does not accept a clearance cookie issued for a DIFFERENT host', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const page: any = {
+      title: jest.fn<(...a: any[]) => any>().mockResolvedValue(''),
+      evaluate: jest.fn<(...a: any[]) => any>().mockResolvedValue(false),
+      url: jest.fn(() => 'https://www.suruga-ya.jp/product/detail/100000950'),
+      cookies: jest.fn<(...a: any[]) => any>().mockResolvedValue([{ name: 'cf_clearance', domain: '.anitoysgk.com' }]),
+    };
+
+    const seen = await awaitChallengeClearance(page, makeResponse({ 'cf-mitigated': 'challenge' }), 'https://www.suruga-ya.jp/product/detail/100000950', { timeoutMs: 20, pollMs: 5 });
+
+    expect(seen).toBe(true);
+    expect(warn).toHaveBeenCalledTimes(1); // it waited out the budget, then captured
+    warn.mockRestore();
+  });
+
+  it('runs out the budget when the clearance never lands, warns once, and still captures', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const page: any = {
+      title: jest.fn<(...a: any[]) => any>().mockResolvedValue(''),
+      evaluate: jest.fn<(...a: any[]) => any>().mockResolvedValue(false),
+      url: jest.fn(() => 'https://www.suruga-ya.jp/product/detail/100000950'),
+      cookies: jest.fn<(...a: any[]) => any>().mockResolvedValue([]),
+    };
+
+    const seen = await awaitChallengeClearance(page, makeResponse({ 'cf-mitigated': 'challenge' }), 'https://www.suruga-ya.jp/product/detail/100000950', { timeoutMs: 20, pollMs: 5 });
+
+    expect(seen).toBe(true);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(isChallengeGated('www.suruga-ya.jp')).toBe(true);
+    warn.mockRestore();
+  });
+
+  /**
+   * A page with no cookie surface (a mock, or an unusual page object) cannot supply positive
+   * evidence, so the wait falls back to the old marker rule PLUS a grace: while the URL still
+   * carries Cloudflare's own round-trip token the challenge is demonstrably still running.
+   */
+  it('without a cookie surface, keeps polling while the URL carries the challenge round-trip token', async () => {
+    const urls = [
+      'https://www.suruga-ya.jp/product/detail/100000950?__cf_chl_rt_tk=abc',
+      'https://www.suruga-ya.jp/product/detail/100000950?__cf_chl_tk=abc',
+      'https://www.suruga-ya.jp/product/detail/100000950',
+    ];
+    const page: any = {
+      title: jest.fn<(...a: any[]) => any>().mockResolvedValue(''),
+      evaluate: jest.fn<(...a: any[]) => any>().mockResolvedValue('complete'),
+      url: jest.fn(() => (urls.length > 1 ? urls.shift()! : urls[0])),
+    };
+
+    const seen = await awaitChallengeClearance(page, makeResponse({ 'cf-mitigated': 'challenge' }), 'https://www.suruga-ya.jp/product/detail/100000950', { timeoutMs: 5000, pollMs: 1 });
+
+    expect(seen).toBe(true);
+    expect(jest.mocked(page.url).mock.calls.length).toBeGreaterThan(1);
+  });
+
   it('does not wait on readyState for a page that was never challenged', async () => {
     // ONE evaluate — the challenge-marker probe — and then it is done: a page whose readyState is
     // still 'loading' is not polled, because nothing here was ever a challenge.
