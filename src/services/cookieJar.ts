@@ -11,9 +11,10 @@
  *   { "<host>": { "cookies": { "<name>": "<value>", … }, "userAgent"?: "…", "mintedAt"?: iso, "expiresAt"?: iso } }
  *
  * LIFECYCLE: `load()` reads + validates; a malformed file keeps the LAST-GOOD set (one warn); a
- * missing file reads as empty. `start()` polls the file's mtime (default 30 s, unref'd) — a kubelet
- * Secret refresh changes the mtime, so a re-mint goes live WITHOUT a restart. A reload resets stale
- * marks. `markStale`/`markFresh` are the engine's signal that a host WITH stored cookies still got
+ * missing file reads as empty. Both open the file ONCE and take its mtime and its bytes from that
+ * one descriptor. `start()` polls the mtime (default 30 s, unref'd) — a kubelet Secret refresh
+ * changes it, so a re-mint goes live WITHOUT a restart. A reload resets stale marks.
+ * `markStale`/`markFresh` are the engine's signal that a host WITH stored cookies still got
  * challenged (→ /health/detailed `cfCookies[].stale`), so an operator knows to re-mint.
  *
  * Everything is injectable (path / fs / clock / interval) so the behavior is deterministic in tests.
@@ -89,10 +90,16 @@ export function markFreshIfStored(store: CfCookieStoreLike, url: string, host: s
   return store.cookiesFor(url) !== undefined && store.markFresh(host);
 }
 
-/** The fs slice the store depends on (Node's `fs` satisfies it; tests inject an in-memory fake). */
+/**
+ * The fs slice the store depends on (Node's `fs` satisfies it; tests inject an in-memory fake).
+ * DESCRIPTOR-based on purpose: an mtime and the bytes it stamps must come from ONE open file, so
+ * there is no path `stat` here to pair with a separate path read (see `readOnce`).
+ */
 export interface CfCookieFs {
-  readFileSync(path: string, encoding: 'utf8'): string;
-  statSync(path: string): { mtimeMs: number };
+  openSync(path: string, flags: 'r'): number;
+  fstatSync(fd: number): { mtimeMs: number };
+  readFileSync(fd: number, encoding: 'utf8'): string;
+  closeSync(fd: number): void;
 }
 
 export interface CfCookieStoreOptions {
@@ -200,26 +207,74 @@ export class CfCookieStore implements CfCookieSource, CfCookieStaleSignals {
    * replaced, stale marks reset, and one `loaded` line naming hosts + cookie NAMES.
    */
   load(): void {
-    if (!this.path) return;
-    this.attempted = true;
-    let raw: string;
-    let mtimeMs: number;
+    this.readOnce(false);
+  }
+
+  /**
+   * Reload iff the file's mtime changed since the last load (or it appeared/disappeared). True when
+   * a load ran. The mtime comes from `fstat` on the descriptor the bytes would be read from, so an
+   * unchanged file costs one open/fstat/close and never a read.
+   */
+  poll(): boolean {
+    return this.readOnce(true);
+  }
+
+  /**
+   * ONE descriptor per attempt: open the file once, take its mtime by `fstat` on THAT fd, read its
+   * bytes from the SAME fd, and release it in a `finally`. Never a path `stat` paired with a
+   * separate path read — that is a check-then-use race (CodeQL js/file-system-race): the two calls
+   * can land on different versions of the file, and the store would then remember one version's
+   * mtime for another version's bytes. When the remembered mtime is the fresher of the two, the
+   * poller sees "unchanged" forever and a re-minted cookie file never goes live.
+   *
+   * @param onlyIfChanged poll semantics — bail (no read, no load) while the mtime, or the file's
+   *   continued absence, matches the last attempt. `false` always (re)loads.
+   * @returns whether a load actually ran.
+   */
+  private readOnce(onlyIfChanged: boolean): boolean {
+    if (!this.path) return false;
+    let fd: number | undefined;
     try {
-      mtimeMs = this.fs.statSync(this.path).mtimeMs;
-      raw = this.fs.readFileSync(this.path, 'utf8');
-    } catch (err) {
-      const code = err instanceof Error ? ((err as { code?: string }).code ?? err.message) : String(err);
-      if (!this.missingLogged) {
-        // eslint-disable-next-line no-console
-        console.warn(`[CF-COOKIE] cookie file ${this.path} not readable (${code}) — no stored cookies in use`);
+      let raw: string;
+      let mtimeMs: number;
+      try {
+        fd = this.fs.openSync(this.path, 'r');
+        mtimeMs = this.fs.fstatSync(fd).mtimeMs;
+        if (onlyIfChanged && this.attempted && mtimeMs === this.lastMtimeMs) return false;
+        raw = this.fs.readFileSync(fd, 'utf8');
+      } catch (err) {
+        if (onlyIfChanged && this.attempted && this.lastMtimeMs === undefined) return false;
+        this.attempted = true;
+        this.forget(err);
+        return true;
       }
-      this.missingLogged = true;
-      this.lastMtimeMs = undefined;
-      this.entries = new Map();
-      this.stale = new Map();
-      this.loadedAt = this.now();
-      return;
+      this.attempted = true;
+      this.install(raw, mtimeMs);
+      return true;
+    } finally {
+      // release the descriptor on every path; a close that fails must not lose a good load
+      if (fd !== undefined) {
+        try { this.fs.closeSync(fd); } catch { /* nothing to do: the read already happened or failed */ }
+      }
     }
+  }
+
+  /** Missing / unreadable: drop to empty and warn ONCE, until the file reads again. */
+  private forget(err: unknown): void {
+    const code = err instanceof Error ? ((err as { code?: string }).code ?? err.message) : String(err);
+    if (!this.missingLogged) {
+      // eslint-disable-next-line no-console
+      console.warn(`[CF-COOKIE] cookie file ${this.path} not readable (${code}) — no stored cookies in use`);
+    }
+    this.missingLogged = true;
+    this.lastMtimeMs = undefined;
+    this.entries = new Map();
+    this.stale = new Map();
+    this.loadedAt = this.now();
+  }
+
+  /** Validate and install one descriptor's bytes under the mtime that same descriptor reported. */
+  private install(raw: string, mtimeMs: number): void {
     this.lastMtimeMs = mtimeMs;
     this.missingLogged = false;
     const parsed = parseCookieFile(raw);
@@ -240,20 +295,6 @@ export class CfCookieStore implements CfCookieSource, CfCookieStaleSignals {
       .join(' ');
     // eslint-disable-next-line no-console
     console.log(`[CF-COOKIE] loaded ${this.entries.size} host(s): ${summary}`);
-  }
-
-  /** Reload iff the file's mtime changed since the last load (or it appeared/disappeared). True when a load ran. */
-  poll(): boolean {
-    if (!this.path) return false;
-    let mtimeMs: number | undefined;
-    try {
-      mtimeMs = this.fs.statSync(this.path).mtimeMs;
-    } catch {
-      mtimeMs = undefined;
-    }
-    if (this.attempted && mtimeMs === this.lastMtimeMs) return false;
-    this.load();
-    return true;
   }
 
   /** Load now (if not yet) and start the unref'd mtime poller. Idempotent; a no-op when disabled. */

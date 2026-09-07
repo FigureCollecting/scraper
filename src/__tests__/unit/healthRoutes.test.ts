@@ -107,7 +107,7 @@ describe('createHealthRoutes', () => {
     const realStore = () => {
       const store = new CfCookieStore({
         path: '/x/cf-cookies.json',
-        fs: { readFileSync: () => FILE, statSync: () => ({ mtimeMs: 1 }) },
+        fs: { openSync: () => 7, fstatSync: () => ({ mtimeMs: 1 }), readFileSync: () => FILE, closeSync: () => {} },
         now: () => 1_700_000_000_000,
       });
       store.load();

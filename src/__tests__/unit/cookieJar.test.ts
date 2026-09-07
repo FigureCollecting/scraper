@@ -38,30 +38,68 @@ const FILE_V2 = JSON.stringify({
   'myfigurecollection.net': { cookies: { cf_clearance: 'FAKE_cf_ROTATED', tfaTrust: 'FAKE_tfa_1' } },
 });
 
-/** An in-memory fs: mutable content + mtime; reads/stats throw ENOENT while the file is "missing". */
+/**
+ * An in-memory fs with real DESCRIPTOR semantics: `openSync` binds the file's content AND mtime as
+ * they stand at that instant, and `fstatSync` / `readFileSync(fd)` serve THAT one snapshot. The
+ * legacy path surface (`statSync` / `readFileSync(path)`) is kept beside it and serves whatever the
+ * file holds at the moment of the call, so a check-then-use pair — a path stat, then a separate path
+ * read — is observably different from one descriptor when `raceOnMtime` replaces the file between
+ * the two. Reads/stats/opens throw ENOENT while the file is "missing".
+ */
 function fakeFs(initial?: string) {
   let content: string | undefined = initial;
   let mtimeMs = 1_000;
   let reads = 0;
+  let nextFd = 3;
+  const calls: string[] = [];
+  const open = new Map<number, { content: string; mtimeMs: number }>();
+  let race: (() => void) | undefined;
   const enoent = () => Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' });
+  const ebadf = () => Object.assign(new Error('EBADF: bad file descriptor'), { code: 'EBADF' });
+  /** The snapshot a descriptor is bound to — a closed/unknown fd is EBADF, as the real fs would be. */
+  const held = (fd: number) => { const h = open.get(fd); if (!h) throw ebadf(); return h; };
+  /** Fire the armed one-shot replacement (once) — always right after an mtime is observed. */
+  const fireRace = () => { const r = race; race = undefined; r?.(); };
   return {
     fs: {
-      readFileSync: (_p: string, _enc: 'utf8'): string => {
+      openSync: (_p: string, _flags: 'r'): number => {
+        calls.push('open');
+        if (content === undefined) throw enoent();
+        const fd = nextFd++;
+        open.set(fd, { content, mtimeMs });
+        return fd;
+      },
+      fstatSync: (fd: number): { mtimeMs: number } => {
+        calls.push('fstat');
+        const h = held(fd);
+        fireRace();
+        return { mtimeMs: h.mtimeMs };
+      },
+      readFileSync: (target: number | string, _enc: 'utf8'): string => {
         reads++;
+        if (typeof target === 'number') { calls.push('read'); return held(target).content; }
+        calls.push('read:path');
         if (content === undefined) throw enoent();
         return content;
       },
+      closeSync: (fd: number): void => { calls.push('close'); open.delete(fd); },
+      /** The legacy check-then-use surface — present ONLY so the tests below can prove it is unused. */
       statSync: (_p: string): { mtimeMs: number } => {
+        calls.push('stat:path');
         if (content === undefined) throw enoent();
-        return { mtimeMs };
+        const observed = mtimeMs;
+        fireRace();
+        return { mtimeMs: observed };
       },
     },
     /** Replace the file's content and bump its mtime (what a kubelet Secret refresh looks like). */
     write: (next: string) => { content = next; mtimeMs += 1; },
-    /** Rewrite the SAME content without touching mtime (a no-op sync). */
-    touchless: (next: string) => { content = next; },
     remove: () => { content = undefined; },
+    /** Arm a ONE-SHOT replacement that lands the instant the file's mtime is first observed. */
+    raceOnMtime: (next: string) => { race = () => { content = next; mtimeMs += 1; }; },
     reads: () => reads,
+    calls: () => [...calls],
+    openFds: () => open.size,
   };
 }
 
@@ -192,18 +230,97 @@ describe('CfCookieStore — disabled / missing / malformed', () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
     const plain = new CfCookieStore({
       path: '/x/cf.json',
-      fs: { readFileSync: () => { throw new Error('permission denied'); }, statSync: () => ({ mtimeMs: 1 }) },
+      fs: { openSync: () => 7, fstatSync: () => ({ mtimeMs: 1 }), readFileSync: () => { throw new Error('permission denied'); }, closeSync: () => {} },
     });
     plain.load();
     expect(warnLines(warn).at(-1)).toContain('(permission denied)');
     const weird = new CfCookieStore({
       path: '/x/cf.json',
-      fs: { readFileSync: () => 'unreached', statSync: () => { throw 'disk on fire'; } },
+      fs: { openSync: () => { throw 'disk on fire'; }, fstatSync: () => ({ mtimeMs: 1 }), readFileSync: () => 'unreached', closeSync: () => {} },
     });
     weird.load();
     expect(warnLines(warn).at(-1)).toContain('(disk on fire)');
     expect(weird.view()).toEqual([]);
     warn.mockRestore();
+  });
+});
+
+/**
+ * The load is ONE descriptor: open once, take the mtime by fstat on that fd and the bytes from the
+ * same fd, close it. A path stat followed by a separate path read is a check-then-use race (CodeQL
+ * js/file-system-race): the two calls can land on different versions of the file, so the store would
+ * remember one version's mtime for another version's bytes — and when the mtime is the FRESHER of
+ * the two, the poller never reloads and the re-minted cookies never go live.
+ */
+describe('CfCookieStore — one descriptor: the mtime and the bytes come from the SAME open file', () => {
+  it('load() opens once and takes both the mtime and the body from that fd: open → fstat → read → close, never a path stat/read', () => {
+    const log = jest.spyOn(console, 'log').mockImplementation(() => {});
+    const { f, store } = build(FILE_V1);
+    store.load();
+    expect(f.calls()).toEqual(['open', 'fstat', 'read', 'close']);
+    expect(f.openFds()).toBe(0); // the descriptor is released, always
+    log.mockRestore();
+  });
+
+  it('a poll on an unchanged file costs one open/fstat/close and never a read', () => {
+    const log = jest.spyOn(console, 'log').mockImplementation(() => {});
+    const { f, store } = build(FILE_V1);
+    store.load();
+    expect(store.poll()).toBe(false);
+    expect(f.calls().slice(4)).toEqual(['open', 'fstat', 'close']);
+    expect(f.reads()).toBe(1); // the body was read once, by load()
+    expect(f.openFds()).toBe(0);
+    log.mockRestore();
+  });
+
+  it('a file REPLACED the instant its mtime is observed cannot splice the new bytes onto the old mtime: this load is that descriptor\'s own snapshot, and the next poll picks the replacement up', () => {
+    const log = jest.spyOn(console, 'log').mockImplementation(() => {});
+    const { f, store } = build(FILE_V1);
+    f.raceOnMtime(FILE_V2); // a re-mint lands between the mtime observation and the read
+    store.load();
+    // the bytes belong to the descriptor that reported the mtime — NOT to the version that replaced
+    // the file after it was opened (a path stat + a separate path read would have spliced V2's bytes
+    // under V1's mtime, and the mirror-image race stamps STALE bytes with the FRESH mtime forever)
+    expect(store.cookiesFor('https://myfigurecollection.net/x')).toEqual({ cf_clearance: 'FAKE_cf_1', PHPSESSID: 'FAKE_sess_1' });
+    // nothing is lost: the replacement carries a different mtime, so the very next poll loads it
+    expect(store.poll()).toBe(true);
+    expect(store.cookiesFor('https://myfigurecollection.net/x')).toEqual({ cf_clearance: 'FAKE_cf_ROTATED', tfaTrust: 'FAKE_tfa_1' });
+    log.mockRestore();
+  });
+
+  it('the descriptor is released even when the read throws — never a leaked fd on an unreadable file', () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const closed: number[] = [];
+    const store = new CfCookieStore({
+      path: '/x/cf.json',
+      fs: {
+        openSync: () => 7,
+        fstatSync: () => ({ mtimeMs: 1 }),
+        readFileSync: () => { throw Object.assign(new Error('io error'), { code: 'EIO' }); },
+        closeSync: (fd: number) => { closed.push(fd); },
+      },
+    });
+    store.load();
+    expect(closed).toEqual([7]);
+    expect(store.view()).toEqual([]);
+    expect(warnLines(warn).at(-1)).toContain('(EIO)');
+    warn.mockRestore();
+  });
+
+  it('a close that itself fails does not lose the load it completed', () => {
+    const log = jest.spyOn(console, 'log').mockImplementation(() => {});
+    const store = new CfCookieStore({
+      path: '/x/cf.json',
+      fs: {
+        openSync: () => 7,
+        fstatSync: () => ({ mtimeMs: 1 }),
+        readFileSync: () => FILE_V1,
+        closeSync: () => { throw Object.assign(new Error('bad fd'), { code: 'EBADF' }); },
+      },
+    });
+    expect(() => store.load()).not.toThrow();
+    expect(store.cookiesFor('https://anitoysgk.com/x')).toEqual({ cf_clearance: 'FAKE_cf_2' });
+    log.mockRestore();
   });
 });
 
