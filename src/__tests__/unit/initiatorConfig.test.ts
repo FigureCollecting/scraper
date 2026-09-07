@@ -4,6 +4,7 @@
  * a conservative default so an unconfigured run is safe.
  */
 import { loadInitiatorConfig } from '../../initiator/config';
+import { resolveLookupStoreTimeoutMs } from '../../driver/assembleLookup';
 
 describe('loadInitiatorConfig', () => {
   it('applies safe defaults when env is empty', () => {
@@ -85,6 +86,22 @@ describe('loadInitiatorConfig', () => {
   it('accepts orderable mode, defaulting anything else to listed', () => {
     expect(loadInitiatorConfig({ INITIATOR_LOOKUP_MODE: 'orderable' }).mode).toBe('orderable');
     expect(loadInitiatorConfig({ INITIATOR_LOOKUP_MODE: 'whatever' }).mode).toBe('listed');
+  });
+
+  it('defaults the request budget large enough for the default fan-out AND its ingests', () => {
+    // Discovery now costs stores x terms (+ up to one retry per store); the ingest phase
+    // needs stores x maxUrlsPerStore on top. An under-sized default silently DROPS
+    // discovered URLs on a fault-free pass, so the default must cover the whole shape.
+    const c = loadInitiatorConfig({});
+    const worstCase = c.stores.length * c.terms.length + c.stores.length + c.stores.length * c.maxUrlsPerStore;
+    expect(c.maxRequests).toBeGreaterThanOrEqual(worstCase);
+  });
+
+  it('defaults the per-request timeout ABOVE the engine per-store search bound', () => {
+    // The engine bounds each store's search by LOOKUP_STORE_TIMEOUT_MS (15000 default) and
+    // then still has to assemble and serialize; an equal client abort always fires first,
+    // which is the 2026-09-07 09:00Z failure shape reduced to one store.
+    expect(loadInitiatorConfig({}).requestTimeoutMs).toBeGreaterThan(resolveLookupStoreTimeoutMs({}));
   });
 
   it('trims a trailing slash from SCRAPER_SERVICE_URL', () => {

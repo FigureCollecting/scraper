@@ -226,6 +226,18 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
     return summary;
   }
 
+  // Lookups and ingests share ONE budget and discovery spends it FIRST, so an under-sized
+  // budget silently drops discovered URLs instead of failing loudly. Say so, loudly.
+  const budgetNeeded =
+    uniqueStores.length * config.terms.length + uniqueStores.length + uniqueStores.length * config.maxUrlsPerStore;
+  if (config.maxRequests > 0 && config.maxRequests < budgetNeeded) {
+    logger.error(
+      `[INITIATOR] request budget ${config.maxRequests} is below the configured fan-out: ` +
+        `${budgetNeeded} needed (stores x terms lookups + one retry per store + stores x maxUrlsPerStore ingests). ` +
+        'Discovered URLs will be dropped unenqueued — raise INITIATOR_MAX_REQUESTS.',
+    );
+  }
+
   // Each lookup asks for exactly ONE store, so one store's latency or failure is charged to that
   // store alone (see the header: a shared fan-out let the slowest store zero the whole pass).
   const lookupUrl = (term: string, siteId: string): string =>

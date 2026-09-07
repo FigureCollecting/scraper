@@ -10,6 +10,7 @@
  */
 import { runInitiatorPass, type FetchLike, type HttpResponseLike, type InitiatorConfig } from '../../initiator/initiator';
 import { logger } from '../../utils/logger';
+import { loadInitiatorConfig } from '../../initiator/config';
 
 const waitFor = async (pred: () => boolean, timeoutMs = 3000): Promise<void> => {
   const start = Date.now();
@@ -744,5 +745,44 @@ describe('runInitiatorPass — discovery cost control (terms run per store, retr
     expect(amiami.lookupRetries).toBe(1);
     expect(amiami.lookupFailures).toBe(1); // t2 only
     expect(amiami.discovered).toBe(1);
+  });
+});
+
+describe('runInitiatorPass — the shipped defaults must survive a fault-free pass', () => {
+  it('enqueues everything it discovered on the stock config (no silent budget drop)', async () => {
+    const cfg: InitiatorConfig = { ...loadInitiatorConfig({}), scraperServiceUrl: 'http://scraper.test', requestSpacingMs: 0 };
+    const fake = makeFake({
+      lookup: (_t, store) => ({
+        status: 200,
+        body: lookupWith({ [store]: Array.from({ length: cfg.maxUrlsPerStore }, (_v, i) => `https://${store}.test/${i}`) }),
+      }),
+    });
+    const s = await runInitiatorPass(cfg, { fetch: fake.fetch });
+    expect(s.totalDiscovered).toBe(cfg.stores.length * cfg.maxUrlsPerStore);
+    expect(s.totalEnqueued).toBe(s.totalDiscovered);
+    expect(s.budgetExhausted).toBe(false);
+  });
+
+  it('logs an ERROR when the request budget cannot cover the configured fan-out', async () => {
+    const err = jest.spyOn(logger, 'error').mockImplementation(() => {});
+    try {
+      const fake = makeFake({ lookup: (_t, store) => ({ status: 200, body: lookupWith({ [store]: [`https://${store}.test/1`] }) }) });
+      await runInitiatorPass(mkCfg({ stores: ['a', 'b', 'c'], terms: ['t1', 't2'], maxUrlsPerStore: 5, maxRequests: 10 }), { fetch: fake.fetch });
+      const msgs = err.mock.calls.map((c) => String(c[0]));
+      expect(msgs.some((m) => m.includes('request budget') && m.includes('24'))).toBe(true);
+    } finally {
+      err.mockRestore();
+    }
+  });
+
+  it('does not log a budget ERROR when the budget covers the fan-out', async () => {
+    const err = jest.spyOn(logger, 'error').mockImplementation(() => {});
+    try {
+      const fake = makeFake({ lookup: (_t, store) => ({ status: 200, body: lookupWith({ [store]: [`https://${store}.test/1`] }) }) });
+      await runInitiatorPass(mkCfg({ stores: ['a', 'b'], terms: ['t'], maxUrlsPerStore: 2, maxRequests: 50 }), { fetch: fake.fetch });
+      expect(err.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('request budget'))).toEqual([]);
+    } finally {
+      err.mockRestore();
+    }
   });
 });

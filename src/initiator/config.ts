@@ -43,10 +43,16 @@ export const DEFAULT_TERMS = ['nendoroid'];
 const DEFAULTS = {
   scraperServiceUrl: 'http://localhost:3050',
   maxConcurrency: 2,
-  maxRequests: 40,
+  // Sized for the DEFAULT shape: stores x terms lookups (7) + one retry per store (7)
+  // + stores x maxUrlsPerStore ingests (35) = 49. An under-sized budget does not fail
+  // loudly — discovery wins it FIFO and the tail ingests are dropped in silence.
+  maxRequests: 60,
   maxUrlsPerStore: 5,
   requestSpacingMs: 1000,
-  requestTimeoutMs: 15000,
+  // ABOVE the engine's own per-store search bound (LOOKUP_STORE_TIMEOUT_MS, 15000 default)
+  // plus its assembly/serialization: an equal timeout means the client abort always wins
+  // and the operator never sees the engine's bounded partial answer.
+  requestTimeoutMs: 20000,
   lookupRetryDelayMs: 5000,
 };
 
