@@ -4,7 +4,9 @@
  * The crawler is a bounded, CronJob-driven pass over each configured store's
  * newest-first catalog listing (the scraper's own GET /catalog feed): a RECENT
  * sweep from page 1 that stops at the first page with nothing new, THEN a
- * BACKFILL that resumes a durable per-store page cursor. Every discovered item's
+ * BACKFILL that resumes a durable per-store page cursor, THEN — for the stores
+ * named in CRAWLER_RANGE_STORES — an ID-RANGE backfill that walks the store's
+ * sequential id space downward from a frontier. Every discovered item's
  * collectUrl goes to POST /ingest/scrape. Like the initiator, it is a thin HTTP
  * client of the scraper — NOT the full 2b crawl driver (src/driver/*).
  *
@@ -50,6 +52,20 @@ export interface CrawlerConfig {
   reobserveAfterMs: number;
   /** BACKFILL: re-check an exhausted store's last cursor once this long has elapsed since exhaustion. */
   exhaustedRecheckMs: number;
+  /**
+   * siteIds whose SEQUENTIAL id space is walked downward after the listing phases (the id-range
+   * backfill). Empty by default: no store walks its id space unless the operator names it, so the
+   * crawler never spends a request discovering that a store has no `byRange` axis.
+   */
+  rangeStores: string[];
+  /** ID-RANGE: max ids walked per store per run (the window size asked of GET /catalog?range=1). */
+  rangeIdsPerRun: number;
+  /**
+   * Seed frontiers per siteId, from `CRAWLER_RANGE_FRONTIER_<SITEID>`, used ONLY when the store's
+   * ledger has no numeric itemId of its own to start from. `<SITEID>` is the siteId uppercased with
+   * every non-alphanumeric character replaced by `_` (`good-smile` → `CRAWLER_RANGE_FRONTIER_GOOD_SMILE`).
+   */
+  rangeFrontiers: Record<string, number>;
 }
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
@@ -69,6 +85,7 @@ const DEFAULTS = {
   requestTimeoutMs: 45000,
   reobserveAfterMs: WEEK_MS,
   exhaustedRecheckMs: WEEK_MS,
+  rangeIdsPerRun: 50,
 };
 
 type Env = Record<string, string | undefined>;
@@ -124,6 +141,22 @@ const parseStoreCaps = (raw: string | undefined): Record<string, number> => {
   return out;
 };
 
+/** The env-var suffix for a store's range frontier seed: uppercased, every non-alphanumeric → `_`. */
+export const rangeFrontierEnvName = (siteId: string): string =>
+  `CRAWLER_RANGE_FRONTIER_${siteId.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
+
+/** Read one `CRAWLER_RANGE_FRONTIER_<SITEID>` seed per configured store; a non-positive / non-numeric value is simply absent. */
+const parseFrontiers = (env: Env, stores: string[]): Record<string, number> => {
+  const out: Record<string, number> = {};
+  for (const siteId of stores) {
+    const raw = env[rangeFrontierEnvName(siteId)];
+    if (raw === undefined) continue;
+    const n = Number.parseInt(raw.trim(), 10);
+    if (Number.isSafeInteger(n) && n > 0) out[siteId] = n;
+  }
+  return out;
+};
+
 const parseMode = (raw: string | undefined): CrawlerMode => (raw === 'recent' || raw === 'backfill' ? raw : 'both');
 
 export function loadCrawlerConfig(env: Env = process.env): CrawlerConfig {
@@ -149,5 +182,8 @@ export function loadCrawlerConfig(env: Env = process.env): CrawlerConfig {
     requestTimeoutMs: posInt(env.CRAWLER_REQUEST_TIMEOUT_MS, DEFAULTS.requestTimeoutMs),
     reobserveAfterMs: nonNegInt(env.CRAWLER_REOBSERVE_AFTER_MS, DEFAULTS.reobserveAfterMs),
     exhaustedRecheckMs: posInt(env.CRAWLER_EXHAUSTED_RECHECK_MS, DEFAULTS.exhaustedRecheckMs),
+    rangeStores: csv(env.CRAWLER_RANGE_STORES ?? ''),
+    rangeIdsPerRun: posInt(env.CRAWLER_RANGE_IDS_PER_RUN, DEFAULTS.rangeIdsPerRun),
+    rangeFrontiers: parseFrontiers(env, stores),
   };
 }

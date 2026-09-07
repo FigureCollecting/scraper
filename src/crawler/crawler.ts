@@ -8,6 +8,17 @@
  *             to {scraper}/ingest/scrape, and stop at the first page that yields
  *             nothing new. An item is "new" when it is not in the store's ledger, or
  *             (reobserveAfterMs > 0) its ledger entry is at least that old.
+ *   ID-RANGE — for a store whose ids are SEQUENTIAL (retrieval.byRange, e.g. mfc's ~3.6M numeric
+ *             item ids), the id space itself is the listing: after the listing phases, walk DOWN
+ *             from a frontier through GET /catalog?store=&range=1&from=&count=, which SYNTHESIZES
+ *             the window's {itemId, collectUrl} pairs from the store's byId template without
+ *             fetching anything upstream. Only stores named in config.rangeStores walk. The
+ *             frontier is the highest numeric itemId the ledger has seen, else the operator's
+ *             CRAWLER_RANGE_FRONTIER_<SITEID> seed; with neither, the walk is skipped with a WARN.
+ *             The window's cursor is durable (ledger.range.cursor) and moves DOWN only over ids
+ *             actually handled, so nothing is ever re-walked and nothing is stranded; it shares the
+ *             store's enqueue cap and the global budget. Ids in the window that do not exist at the
+ *             store are EXPECTED — the ingest fetch 404s and the failure is recorded there, not here.
  *   BACKFILL — resume the store's durable page cursor and walk forward up to
  *             backfillPagesPerRun pages, enqueuing NEW ids only (never re-observing).
  *             The cursor advances ONLY when the page reported `hasMore: true` AND every
@@ -96,6 +107,12 @@ export interface CrawlerStoreSummary {
   /** Catalog GETs answered 503 cooldown (the store was left alone this run). */
   skipped: number;
   ledgerCorrupt: boolean;
+  /** Ids the id-range backfill walked this run (POSTed + skipped as known). */
+  rangeWalked: number;
+  /** The store's id-range cursor after this run: the next id to walk (null = never walked, 0 = floor reached). */
+  rangeCursor: number | null;
+  /** The frontier the id-range walk started from (null until one is known). */
+  rangeFrontier: number | null;
   /** The store's backfill cursor after this run (null until backfill first runs). */
   backfillCursor: number | null;
   /** An empty page was seen at the cursor once; awaiting confirmation next run. */
@@ -116,6 +133,7 @@ export interface CrawlerSummary {
   totalPagesFetched: number;
   totalDiscovered: number;
   totalEnqueued: number;
+  totalRangeWalked: number;
   totalErrors: number;
   totalSkipped: number;
   /** The per-store enqueue caps that actually applied this run, keyed by siteId (a cap for a store not crawled is not listed). */
@@ -135,7 +153,7 @@ type PageOutcome = { kind: 'page'; items: CatalogItem[]; hasMore: boolean } | { 
 
 type PostOutcome = 'accepted' | 'accepted-dedup' | 'rejected' | 'transient' | 'budget';
 
-type Phase = 'recent' | 'backfill';
+type Phase = 'recent' | 'backfill' | 'range';
 
 interface StoreState {
   siteId: string;
@@ -152,6 +170,12 @@ interface StoreState {
   stopped: boolean;
   /** The per-store enqueue cap blocked a POST this run. */
   capReached: boolean;
+  /**
+   * The store's LISTING axis answered 422 (no byListing / no extractListing). That stops the listing
+   * phases only — the id-range axis is a different axis on the same store and still runs. Every
+   * OTHER stop reason (cooldown, budget, a sick scraper, a ledger failure) applies to all axes.
+   */
+  listingUnsupported: boolean;
   /** Deepest listing page the recent phase fetched this run (backfill starts after it). */
   deepestRecentPage: number;
 }
@@ -242,6 +266,9 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       errors: 0,
       skipped: 0,
       ledgerCorrupt: false,
+      rangeWalked: 0,
+      rangeCursor: null,
+      rangeFrontier: null,
       backfillCursor: null,
       exhaustCandidate: false,
       exhausted: false,
@@ -254,6 +281,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     // existing discovery-only meaning — pages are fetched, nothing is POSTed.
     stopped: Object.prototype.hasOwnProperty.call(capOverrides, siteId) && capOverrides[siteId] === 0,
     capReached: false,
+    listingUnsupported: false,
     deepestRecentPage: 0,
   }));
 
@@ -261,12 +289,16 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
 
   const catalogUrl = (siteId: string, page: number): string =>
     `${config.scraperServiceUrl}/catalog?store=${encodeURIComponent(siteId)}&page=${page}`;
+  const rangeUrl = (siteId: string, from: number, count: number): string =>
+    `${config.scraperServiceUrl}/catalog?store=${encodeURIComponent(siteId)}&range=1&from=${from}&count=${count}`;
   const ingestUrl = `${config.scraperServiceUrl}/ingest/scrape`;
 
   const summarize = (): CrawlerSummary => {
     for (const st of states) {
       if (!st.ledger) continue;
       st.summary.backfillCursor = st.ledger.backfill.cursor;
+      st.summary.rangeCursor = st.ledger.range?.cursor ?? null;
+      st.summary.rangeFrontier = st.ledger.range?.frontier ?? null;
       st.summary.exhaustCandidate = st.ledger.backfill.exhaustCandidateCursor !== undefined;
       st.summary.exhausted = st.ledger.backfill.exhaustedAt !== undefined;
     }
@@ -284,6 +316,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       totalPagesFetched: perStore.reduce((n, s) => n + s.pagesFetched, 0),
       totalDiscovered: perStore.reduce((n, s) => n + s.discovered, 0),
       totalEnqueued: perStore.reduce((n, s) => n + s.enqueued, 0),
+      totalRangeWalked: perStore.reduce((n, s) => n + s.rangeWalked, 0),
       totalErrors: perStore.reduce((n, s) => n + s.errors, 0),
       totalSkipped: perStore.reduce((n, s) => n + s.skipped, 0),
       enqueueCapOverrides,
@@ -337,17 +370,22 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
 
   // --- http -------------------------------------------------------------------------------------
 
-  const fetchPage = async (st: StoreState, page: number): Promise<PageOutcome> => {
+  /**
+   * One /catalog GET — the LISTING axis (`&page=`) or the ID-RANGE axis (`&range=1&from=&count=`).
+   * Both answer the same `{ items: [...] }` shape, so one parser serves both; `where` only labels the
+   * logs and decides whether a 422 is a listing-axis gap (which leaves the id-range axis alive).
+   */
+  const fetchCatalog = async (st: StoreState, url: string, where: Record<string, unknown>, axis: 'listing' | 'range'): Promise<PageOutcome> => {
     const stop = (): PageOutcome => {
       st.stopped = true;
       return { kind: 'stopped' };
     };
     let r: GateResult<HttpResponseLike>;
     try {
-      r = await gate.run(() => httpGet(deps.fetch, catalogUrl(st.siteId, page), config.requestTimeoutMs));
+      r = await gate.run(() => httpGet(deps.fetch, url, config.requestTimeoutMs));
     } catch (error) {
       st.summary.errors++;
-      logger.warn('[CRAWLER] catalog errored', { siteId: st.siteId, page, error: errMsg(error) });
+      logger.warn('[CRAWLER] catalog errored', { siteId: st.siteId, ...where, error: errMsg(error) });
       return stop();
     }
     if (r.status === 'budget-exhausted') {
@@ -359,18 +397,20 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       // The host is cooling from a challenge: leave the store alone this run, change nothing.
       const body = await res.json().catch(() => ({}));
       st.summary.skipped++;
-      logger.warn('[CRAWLER] catalog cooldown — store skipped this run', { siteId: st.siteId, page, remainingMs: body?.remainingMs });
+      logger.warn('[CRAWLER] catalog cooldown — store skipped this run', { siteId: st.siteId, ...where, remainingMs: body?.remainingMs });
       return stop();
     }
     if (res.status === 422) {
-      // No listing axis / parser for this store: a configuration problem, NOT exhaustion.
+      // The store does not serve THIS axis (no byListing / no extractListing; or no byRange / byId):
+      // a configuration or coverage gap, NOT exhaustion. A listing gap leaves the id-range axis alive.
       st.summary.errors++;
-      logger.warn('[CRAWLER] catalog unsupported — store stopped', { siteId: st.siteId, page });
+      if (axis === 'listing') st.listingUnsupported = true;
+      logger.warn('[CRAWLER] catalog unsupported — axis stopped', { siteId: st.siteId, ...where, axis });
       return stop();
     }
     if (!res.ok) {
       st.summary.errors++;
-      logger.warn('[CRAWLER] catalog failed', { siteId: st.siteId, page, status: res.status });
+      logger.warn('[CRAWLER] catalog failed', { siteId: st.siteId, ...where, status: res.status });
       return stop();
     }
     let body: unknown;
@@ -378,17 +418,20 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       body = await res.json();
     } catch (error) {
       st.summary.errors++;
-      logger.warn('[CRAWLER] catalog body unparseable', { siteId: st.siteId, page, error: errMsg(error) });
+      logger.warn('[CRAWLER] catalog body unparseable', { siteId: st.siteId, ...where, error: errMsg(error) });
       return stop();
     }
     if (!isPlainObject(body) || !Array.isArray(body.items)) {
       // A 200 that is not a listing is a failure, never an exhaustion signal.
       st.summary.errors++;
-      logger.warn('[CRAWLER] catalog body malformed', { siteId: st.siteId, page });
+      logger.warn('[CRAWLER] catalog body malformed', { siteId: st.siteId, ...where });
       return stop();
     }
     return { kind: 'page', items: sanitizeItems(body.items), hasMore: body.hasMore === true };
   };
+
+  const fetchPage = (st: StoreState, page: number): Promise<PageOutcome> =>
+    fetchCatalog(st, catalogUrl(st.siteId, page), { page }, 'listing');
 
   const postOne = async (st: StoreState, collectUrl: string): Promise<PostOutcome> => {
     let r: GateResult<HttpResponseLike>;
@@ -421,11 +464,19 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
    * Enqueue the page's new items sequentially. Returns how many were NEW (for recent's
    * stop rule) and whether every new item was actually attempted (for backfill's advance rule).
    */
-  const processPage = async (st: StoreState, items: CatalogItem[], phase: Phase): Promise<{ newCount: number; allAttempted: boolean }> => {
+  const processPage = async (
+    st: StoreState,
+    items: CatalogItem[],
+    phase: Phase,
+  ): Promise<{ newCount: number; allAttempted: boolean; handled: number }> => {
     const ledger = st.ledger!;
     let newCount = 0;
     let allAttempted = true;
-    for (const item of items) {
+    // Index of the FIRST item this run did not get through (cap / budget / a sick scraper). Everything
+    // before it was dealt with — POSTed, deliberately skipped, or deterministically rejected — which is
+    // exactly how far a durable cursor may move. Undefined ⇒ the whole page was handled.
+    let firstUnhandled: number | undefined;
+    for (const [index, item] of items.entries()) {
       st.summary.discovered++;
       if (!item.collectUrl) {
         st.summary.uncollectable++;
@@ -448,11 +499,13 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       newCount++;
       if (st.stopped) {
         allAttempted = false;
+        firstUnhandled ??= index;
         continue;
       }
       if (st.posts >= st.enqueueCap) {
         st.capReached = true;
         allAttempted = false;
+        firstUnhandled ??= index;
         continue;
       }
       st.posts++;
@@ -473,6 +526,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
           st.summary.errors++;
           st.stopped = true;
           allAttempted = false;
+          firstUnhandled ??= index; // the POST failed transiently: this id must be retried, not walked past
           break;
         case 'budget':
           // Not dispatched: undo the attempt bookkeeping; the run is over for this store.
@@ -481,10 +535,11 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
           budgetExhausted = true;
           st.stopped = true;
           allAttempted = false;
+          firstUnhandled ??= index;
           break;
       }
     }
-    return { newCount, allAttempted };
+    return { newCount, allAttempted, handled: firstUnhandled ?? items.length };
   };
 
   // --- phases -----------------------------------------------------------------------------------
@@ -586,6 +641,72 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     }
   };
 
+  /** The highest itemId the ledger has seen for this store that reads as a positive integer. */
+  const highestNumericId = (ledger: Ledger): number | undefined => {
+    let best: number | undefined;
+    for (const id of Object.keys(ledger.enqueued)) {
+      if (!/^\d+$/.test(id)) continue;
+      const n = Number(id);
+      if (!Number.isSafeInteger(n) || n < 1) continue;
+      if (best === undefined || n > best) best = n;
+    }
+    return best;
+  };
+
+  /**
+   * ID-RANGE BACKFILL — walk the store's sequential id space DOWNWARD, one bounded window per run.
+   *
+   * The window comes from GET /catalog?range=1&from=&count=, which SYNTHESIZES {itemId, collectUrl}
+   * from the store's byId template (no upstream fetch), so every id flows through exactly the same
+   * ledger dedup, enqueue cap and global budget as a listing item — the crawler's semantics are
+   * untouched, only the source of the ids differs.
+   *
+   * The cursor moves down by the number of ids HANDLED (POSTed, skipped as known, or deterministically
+   * rejected), never by the window size: an id the cap or the budget cut off is left above the cursor
+   * and picked up next run, so nothing is stranded and nothing is ever re-walked. Ids in the window
+   * that do not exist at the store are EXPECTED — the ingest fetch answers 404 and the miss is
+   * recorded there; the crawler cannot see it and does not pretend to.
+   */
+  const rangePhase = async (st: StoreState): Promise<void> => {
+    if (!config.rangeStores.includes(st.siteId)) return;
+    if (!st.ledger) return;
+    // A 422 on the LISTING axis says nothing about this one — mfc has no byListing yet but a full id
+    // space. Any other stop reason (cooldown, budget, a sick scraper, a ledger failure) still holds.
+    if (st.stopped && !st.listingUnsupported) return;
+    if (st.capReached) return;
+    st.stopped = false;
+
+    const ledger = st.ledger;
+    const range = (ledger.range ??= { cursor: null });
+    let cursor = range.cursor;
+    if (cursor === null) {
+      const frontier = highestNumericId(ledger) ?? config.rangeFrontiers[st.siteId];
+      if (frontier === undefined) {
+        logger.warn('[CRAWLER] id-range walk skipped — no frontier (empty ledger and no CRAWLER_RANGE_FRONTIER_<SITEID>)', { siteId: st.siteId });
+        return;
+      }
+      cursor = frontier;
+      range.frontier = frontier;
+    }
+    if (cursor < 1) {
+      logger.info('[CRAWLER] id-range walk complete — the id floor was reached', { siteId: st.siteId, frontier: range.frontier });
+      return;
+    }
+
+    const count = Math.min(config.rangeIdsPerRun, cursor);
+    const out = await fetchCatalog(st, rangeUrl(st.siteId, cursor, count), { from: cursor, count }, 'range');
+    if (out.kind !== 'page') return;
+    const { handled } = await processPage(st, out.items, 'range');
+    st.summary.rangeWalked += handled;
+    if (handled === 0) {
+      logger.info('[CRAWLER] id-range window yielded no walkable id — cursor kept', { siteId: st.siteId, from: cursor });
+      return;
+    }
+    range.cursor = Math.max(0, cursor - handled);
+    range.updatedAt = iso();
+    await persist(st);
+  };
+
   // --- run --------------------------------------------------------------------------------------
 
   await Promise.all(states.map((st) => loadLedger(st)));
@@ -595,6 +716,9 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
   }
   if (config.mode !== 'recent') {
     await Promise.all(states.map((st) => backfillPhase(st)));
+    // The id-range walk goes LAST: the newest ids (listing) always outrank the deep id space for the
+    // run's budget, and a store may serve this axis while serving no listing at all.
+    await Promise.all(states.map((st) => rangePhase(st)));
   }
 
   const summary = summarize();

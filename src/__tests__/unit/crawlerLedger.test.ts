@@ -272,3 +272,41 @@ describe('createMemoryLedgerStore', () => {
     expect(await store.load('fnc')).toEqual(createEmptyLedger('fnc'));
   });
 });
+
+describe('the optional id-range section', () => {
+  const DIR = '/var/lib/ingest-crawler';
+  const withRange = (range: unknown): Record<string, unknown> => ({ ...sample(), range });
+
+  it('is absent on a fresh ledger and on a file that never had one (an older ledger stays valid)', async () => {
+    expect(createEmptyLedger('mfc').range).toBeUndefined();
+    const f = makeFakeFs();
+    f.files.set(path.join(DIR, 'orzgk.json'), JSON.stringify(sample()));
+    const loaded = await createFileLedgerStore(DIR, f.fs).load('orzgk');
+    expect((loaded as Ledger).range).toBeUndefined();
+  });
+
+  it('round-trips a range cursor, its frontier and its updatedAt', async () => {
+    const f = makeFakeFs();
+    const doc = withRange({ cursor: 3629950, frontier: 3630000, updatedAt: '2026-09-07T00:00:00.000Z' });
+    f.files.set(path.join(DIR, 'orzgk.json'), JSON.stringify(doc));
+    expect(await createFileLedgerStore(DIR, f.fs).load('orzgk')).toEqual(doc);
+  });
+
+  it('accepts a null cursor (never walked) and a 0 cursor (the id floor was reached)', async () => {
+    for (const cursor of [null, 0]) {
+      const f = makeFakeFs();
+      f.files.set(path.join(DIR, 'orzgk.json'), JSON.stringify(withRange({ cursor })));
+      const loaded = await createFileLedgerStore(DIR, f.fs).load('orzgk');
+      expect((loaded as Ledger).range).toEqual({ cursor });
+    }
+  });
+
+  it("returns 'corrupt' on a malformed range section — the store is refused, never silently re-walked from the top", async () => {
+    // (NaN is not in the list: JSON.stringify writes it as null, which is a VALID "never walked" cursor.)
+    for (const range of ['x', 3, [], { cursor: '7' }, { cursor: -1 }, { cursor: 1.5 }, { cursor: true }]) {
+      const f = makeFakeFs();
+      f.files.set(path.join(DIR, 'orzgk.json'), JSON.stringify(withRange(range)));
+      expect(await createFileLedgerStore(DIR, f.fs).load('orzgk')).toBe('corrupt');
+    }
+  });
+});

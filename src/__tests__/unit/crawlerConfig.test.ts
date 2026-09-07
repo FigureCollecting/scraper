@@ -127,8 +127,12 @@ describe('loadCrawlerConfig', () => {
     expect(loadCrawlerConfig({ CRAWLER_LEDGER_DIR: '   ' }).ledgerDir).toBe('/var/lib/ingest-crawler');
   });
 
-  it('defaults the per-store enqueue caps to none', () => {
-    expect(loadCrawlerConfig({}).storeEnqueueCaps).toEqual({});
+  it('defaults the per-store enqueue caps to none and the id-range knobs to off / 50', () => {
+    const c = loadCrawlerConfig({});
+    expect(c.storeEnqueueCaps).toEqual({});
+    expect(c.rangeStores).toEqual([]);
+    expect(c.rangeIdsPerRun).toBe(50);
+    expect(c.rangeFrontiers).toEqual({});
   });
 
   it('parses CRAWLER_STORE_ENQUEUE_CAPS as a csv of siteId:cap, trimming whitespace and honoring 0', () => {
@@ -149,4 +153,22 @@ describe('loadCrawlerConfig', () => {
     }
   });
 
+  it('parses CRAWLER_RANGE_STORES, CRAWLER_RANGE_IDS_PER_RUN and the per-store CRAWLER_RANGE_FRONTIER_<SITEID> seeds', () => {
+    const c = loadCrawlerConfig({
+      CRAWLER_STORES: 'mfc,orzgk,good-smile',
+      CRAWLER_RANGE_STORES: ' mfc , good-smile ',
+      CRAWLER_RANGE_IDS_PER_RUN: '25',
+      CRAWLER_RANGE_FRONTIER_MFC: '3630000',
+      CRAWLER_RANGE_FRONTIER_GOOD_SMILE: '42',
+      CRAWLER_RANGE_FRONTIER_ORZGK: 'nope',
+    });
+    expect(c.rangeStores).toEqual(['mfc', 'good-smile']);
+    expect(c.rangeIdsPerRun).toBe(25);
+    expect(c.rangeFrontiers).toEqual({ mfc: 3630000, 'good-smile': 42 });
+  });
+
+  it('falls back to 50 ids per run on a non-positive or non-numeric CRAWLER_RANGE_IDS_PER_RUN', () => {
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_IDS_PER_RUN: '0' }).rangeIdsPerRun).toBe(50);
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_IDS_PER_RUN: 'x' }).rangeIdsPerRun).toBe(50);
+  });
 });
