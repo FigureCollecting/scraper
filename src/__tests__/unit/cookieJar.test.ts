@@ -111,6 +111,20 @@ describe('CfCookieStore — disabled / missing / malformed', () => {
     warn.mockRestore();
   });
 
+  it('malformed JSON with an UNQUOTED cookie value → the warn must NOT carry the V8 parse snippet (it embeds ~10 chars of the source around the bad token)', () => {
+    // A hand-edited file where an operator dropped the quotes around a value: V8's JSON.parse message is
+    // `Unexpected token 'F', ..."arance": FAKE_cf_le"... is not valid JSON` — a value PREFIX in the log.
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const { store } = build('{"anitoysgk.com":{"cookies":{"cf_clearance": FAKE_cf_leak_value_1}}}');
+    store.load();
+    expect(store.view()).toEqual([]);
+    const lines = warnLines(warn).filter((l) => l.startsWith('[CF-COOKIE]'));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('malformed');
+    expect(lines[0]).not.toContain('FAKE_cf_l');
+    warn.mockRestore();
+  });
+
   it('malformed file AFTER a good load → the last-good set is KEPT and exactly one warn is logged', () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
     const { f, store } = build(FILE_V1);
