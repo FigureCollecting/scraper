@@ -99,6 +99,43 @@ async function applyWaitFor(page: Page, url: string, waitFor: WaitForReadiness |
 // Chrome wraps a navigated JSON document in a viewer DOM, so page.content() would return markup.
 const JSON_CONTENT_TYPE = /\bjson\b/i;
 
+/**
+ * Watch for the LAST main-frame document response of a navigation. The response `goto` resolves
+ * with is the FIRST one — after a Cloudflare interstitial (or any redirect chain) that is the 403
+ * challenge, not the document that was actually served, so its status and content type describe the
+ * wrong page. Every lane reads its body off the final one instead.
+ */
+function trackFinalDocumentResponse(page: Page): { get(): HTTPResponse | undefined; stop(): void } {
+  let last: HTTPResponse | undefined;
+  const onResponse = (response: HTTPResponse): void => {
+    try {
+      if (response.request().resourceType() === 'document' && response.frame() === page.mainFrame()) {
+        last = response;
+      }
+    } catch {
+      /* a response that can no longer describe itself is not the one we want anyway */
+    }
+  };
+  page.on('response', onResponse);
+  return { get: () => last, stop: () => page.off('response', onResponse) };
+}
+
+/**
+ * The body a fetch RETURNS: the raw response bytes for a JSON document (Chrome would otherwise hand
+ * back its JSON-viewer markup), else the rendered DOM. A JSON body the browser has already discarded
+ * falls back to the viewer's own text — which is the same JSON — before giving up on `page.content()`.
+ */
+async function readMainBody(page: Page, response: HTTPResponse | null | undefined): Promise<string> {
+  const contentType = response?.headers?.()?.['content-type'] ?? '';
+  if (response && JSON_CONTENT_TYPE.test(contentType)) {
+    const text = await response.text().catch(() => '');
+    if (text.trim() !== '') return text;
+    const innerText = await page.evaluate(() => document.body?.innerText ?? '').catch(() => '');
+    if (typeof innerText === 'string' && innerText.trim() !== '') return innerText;
+  }
+  return await page.content();
+}
+
 function capWaitTime(waitTime?: number): number {
   if (!waitTime || waitTime < 0) return 0;
   return Math.min(waitTime, MAX_WAIT_TIME_MS);
@@ -173,21 +210,20 @@ export async function browserFetchBody(
     }
   }
 
-  const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
-  // CHALLENGE: `domcontentloaded` fires on the Cloudflare interstitial too. Wait (bounded) for the
-  // clean-headful browser to clear it, so the body below is the store's document and not "Just a
-  // moment" — and so the host is marked gated, keeping this context alive for the clearance window.
-  await awaitChallengeClearance(page, response, url);
-  // READINESS: a client-rendered storefront has only its app shell at domcontentloaded — wait for
-  // the declared selector / network idle before reading the body. Undeclared ⇒ no wait.
-  await applyWaitFor(page, url, options.waitFor);
-  if (response) {
-    const contentType = response.headers?.()?.['content-type'] ?? '';
-    if (JSON_CONTENT_TYPE.test(contentType)) {
-      return await response.text();
-    }
+  const documents = trackFinalDocumentResponse(page);
+  try {
+    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
+    // CHALLENGE: `domcontentloaded` fires on the Cloudflare interstitial too. Wait (bounded) for the
+    // clean-headful browser to clear it, so the body below is the store's document and not "Just a
+    // moment" — and so the host is marked gated, keeping this context alive for the clearance window.
+    await awaitChallengeClearance(page, response, url);
+    // READINESS: a client-rendered storefront has only its app shell at domcontentloaded — wait for
+    // the declared selector / network idle before reading the body. Undeclared ⇒ no wait.
+    await applyWaitFor(page, url, options.waitFor);
+    return await readMainBody(page, documents.get() ?? response);
+  } finally {
+    documents.stop();
   }
-  return await page.content();
 }
 
 async function detectChallenge(
@@ -229,9 +265,14 @@ async function navigateAndCapture(
   // browser consumes it for rendering it may no longer be retrievable. A body
   // that is genuinely unavailable (e.g. a 3xx with no body) is skipped, not fatal.
   let wire: { bytes: Buffer; statusCode?: number; contentType?: string } | undefined;
+  let finalResponse: HTTPResponse | undefined;
   const onResponse = async (resp: HTTPResponse): Promise<void> => {
     try {
       if (resp.request().resourceType() === 'document' && resp.frame() === page.mainFrame()) {
+        // The LAST main-frame document is the one that was actually served (a challenge or redirect
+        // makes goto's response describe a page nobody wanted). Recorded before the body read, so a
+        // response whose bytes are gone still supplies the status and content type.
+        finalResponse = resp;
         const bytes = await resp.buffer();
         wire = { bytes, statusCode: resp.status(), contentType: resp.headers()['content-type'] };
       }
@@ -270,12 +311,17 @@ async function navigateAndCapture(
     page.off('response', onResponse);
   }
 
-  const html = await page.content();
+  const served = finalResponse ?? response;
+  const servedContentType = served?.headers?.()?.['content-type'] ?? '';
+  const domContentType = JSON_CONTENT_TYPE.test(servedContentType) ? servedContentType : 'text/html';
+  // JSON PASSTHROUGH: a JSON API on this lane (sugotoys' Store API) returns its raw bytes — Chrome's
+  // JSON viewer DOM is not a body any ruleset can parse.
+  const html = await readMainBody(page, served);
   const title = await page.title();
 
   // Hand both lanes to the sink. Capturing must never break a scrape.
   const fetchedAt = new Date().toISOString();
-  const finalUrl = response?.url?.() ?? url;
+  const finalUrl = served?.url?.() ?? url;
   try {
     if (wire) {
       await sink.capture(buildRawCapture({
@@ -285,7 +331,7 @@ async function navigateAndCapture(
     }
     await sink.capture(buildRawCapture({
       url, finalUrl, lane: 'dom', bytes: Buffer.from(html, 'utf8'),
-      statusCode: response?.status(), contentType: 'text/html', fetchedAt,
+      statusCode: served?.status(), contentType: domContentType, fetchedAt,
     }));
   } catch (err) {
     // eslint-disable-next-line no-console
@@ -297,7 +343,7 @@ async function navigateAndCapture(
     html,
     url,
     title,
-    statusCode: response?.status(),
+    statusCode: served?.status(),
   };
 }
 
