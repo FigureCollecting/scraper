@@ -4,6 +4,26 @@ All notable changes to `@figurecollecting/scraper-plugin-contract` will be docum
 file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this
 package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-09-07
+
+Additive, backward-compatible: every existing `SearchFetch` still compiles unchanged — both new
+fields are optional and an undeclared store's fetches are byte-identical. Built for the residential
+egress lane (Cloudflare-cohort stores whose gate is IP/ASN reputation) and for client-rendered
+(PWA) storefronts the browser lane used to capture as an empty app shell.
+
+### Added
+- `SearchFetch.egress?: 'direct' | 'residential'` (and the `EgressMode` export) — which egress this
+  store's fetches leave through. `residential` routes them through the engine's configured
+  residential proxy (`RESIDENTIAL_PROXY_URL`) on the impit and browser lanes; undeclared (or
+  `direct`) keeps today's node-IP path. The declaration is a REQUIREMENT, not a hint: with no proxy
+  configured the engine REFUSES the fetch (a typed, non-retried config failure) rather than silently
+  falling back to the node IP.
+- `SearchFetch.waitFor?: { selector?; networkIdle?; timeoutMs? }` (and the `WaitForReadiness`
+  export) — browser-lane readiness for a client-rendered storefront: after `domcontentloaded`, wait
+  for the selector and/or network idle, bounded by `timeoutMs` (engine default 15000, clamped to
+  [1000, 60000]), before capturing. A timed-out wait captures whatever rendered and logs one
+  warning — never an error. Undeclared ⇒ today's `domcontentloaded` behavior.
+
 ## [0.6.0] - 2026-09-06
 
 Additive, backward-compatible: every existing `RetrievalCapability` and `ExtractionRuleset` still
