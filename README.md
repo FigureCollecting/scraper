@@ -229,6 +229,34 @@ it reports them, else a non-empty page implies more with `nextPage = page + 1`.
 with `Retry-After` while the listing host cools from a Cloudflare challenge · `502 { error: "catalog failed", siteId, reason }`
 (challenge page — which also opens the host cooldown — fetch error, timeout, or parser throw).
 
+### Search query encoding (`retrieval.bySearch.queryEncoding`)
+`{q}` is url-encoded into the store's `bySearch.urlTemplate` by `encodeSearchQuery`
+(`src/driver/retrievalPlanner.ts`), which every search caller goes through (`/lookup` fan-out,
+single-store search, record mode). The default is one `encodeURIComponent` — unchanged for every
+store that declares nothing. A plugin that declares `queryEncoding` (plugin-contract 0.8.0) gets
+these steps applied, in this order and no other:
+
+| field | effect |
+|---|---|
+| `strip: string[]` | delete each listed substring from the RAW query, before any escaping (matched literally) |
+| — | `encodeURIComponent(query)`, always |
+| `reEncodePercentOf: string[]` | re-encode the `%` of each listed percent-escape (`%2f` → `%252f`), one pass, matched case-insensitively and emitted in the DECLARED spelling |
+| `spaces: 'percent' \| 'plus'` | `plus` rewrites every `%20` to `+`; `percent` (the default) leaves it |
+| `lowercase: boolean` | lowercase the finished segment |
+
+This exists for storefronts that carry `{q}` in a PATH SEGMENT: there a singly-escaped `/` is read
+as path structure, so the route does not match and the store answers HTTP 404 rather than a
+zero-result page — indistinguishable, from the caller's side, from "this store has nothing". A
+store on `https://example.test/Search-{q}/list-r1.html` declaring
+`{ reEncodePercentOf: ['%2f'], spaces: 'plus', lowercase: true }` gets `"star origin 1/6"` as
+`star+origin+1%252f6` instead of `star%20origin%201%2F6`. It matters wherever records resolve by a
+scale-bearing identity, which makes a query carrying "1/6" that store's normal shape.
+
+Which escapes a store re-encodes, which substrings it strips and whether it folds case are the
+store's own business: they are declared in that store's (private) plugin profile. The engine holds
+no store's rules — it replays the declaration it is handed, and applies one `encodeURIComponent`
+when there is none.
+
 ### POST /reset-pool (Test Environment Only)
 **This endpoint is only available in non-production environments.**
 

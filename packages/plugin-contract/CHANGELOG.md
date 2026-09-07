@@ -4,6 +4,27 @@ All notable changes to `@figurecollecting/scraper-plugin-contract` will be docum
 file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this
 package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-09-07
+
+Additive, backward-compatible: every existing `bySearch` still compiles unchanged, and a store that
+declares nothing gets a byte-identical URL (one `encodeURIComponent`). Built for path-segment search
+routes, which 404 on the encoding every query-parameter store accepts.
+
+### Added
+- `RetrievalCapability.bySearch.queryEncoding?: QueryEncoding` (and the `QueryEncoding` export) — a
+  DECLARATIVE spec for how `{q}` is encoded into the template, applied by the engine in a fixed
+  order: `strip` (delete the listed substrings from the raw query), `encodeURIComponent`, then
+  `reEncodePercentOf` (re-encode the `%` of each listed percent-escape, `%2f` → `%252f`, matched
+  case-insensitively and emitted in the DECLARED spelling), then `spaces` (`plus` rewrites `%20` →
+  `+`; `percent`, the default, leaves it), then `lowercase`.
+  Absent ⇒ today's single `encodeURIComponent`.
+  A store on `https://example.test/Search-{q}/list-r1.html` declaring
+  `{ reEncodePercentOf: ['%2f'], spaces: 'plus', lowercase: true }` sends `"star origin 1/6"` as
+  `star+origin+1%252f6` and gets the item's card; without the declaration it sends
+  `star%20origin%201%2F6` and gets HTTP 404 "Page Not Found" — a broken route, not a zero result.
+  Which escapes, strips and case-folding a given store needs stay in that store's own plugin
+  profile; the contract carries only the vocabulary.
+
 ## [0.7.0] - 2026-09-07
 
 Additive, backward-compatible: every existing `SearchFetch` still compiles unchanged — the new

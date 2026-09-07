@@ -245,7 +245,14 @@ export interface RetrievalCapability {
    * identity PHRASE matches nothing. For a `substring` store the engine issues the single most
    * selective identity term as `{q}` and POST-FILTERS the candidates by the remaining identity terms.
    */
-  bySearch?: { urlTemplate: string; scope?: 'listed' | 'orderable'; acceptsGtin?: boolean; queryMatch?: 'tokens' | 'substring' };
+  bySearch?: {
+    urlTemplate: string;
+    scope?: 'listed' | 'orderable';
+    acceptsGtin?: boolean;
+    queryMatch?: 'tokens' | 'substring';
+    /** How `{q}` must be ENCODED into the template (see {@link QueryEncoding}). Absent ⇒ one `encodeURIComponent`. */
+    queryEncoding?: QueryEncoding;
+  };
   /**
    * Newest-first PAGED catalog listing for ENUMERATION — the feed for recent/backfill crawls (a
    * recent crawl walks the first pages for fresh ids; a backfill resumes a saved page cursor
@@ -255,6 +262,59 @@ export interface RetrievalCapability {
    * desc, so page 1 is the freshest). Each page body is parsed by `ExtractionRuleset.extractListing`.
    */
   byListing?: { urlTemplate: string; pageStart?: number; maxPerPage?: number; order: 'newest' };
+}
+
+/**
+ * How a store wants `{q}` ENCODED into its `bySearch.urlTemplate` — a DECLARATIVE spec, because the
+ * one-size `encodeURIComponent` some storefronts accept is a BROKEN ROUTE at others. The engine
+ * applies the steps in this fixed order and no other:
+ *   1. `strip` — delete each declared substring from the RAW query, before any escaping.
+ *   2. `encodeURIComponent(query)` — always, declaration or not.
+ *   3. `reEncodePercentOf` — for each listed percent-escape, re-encode ITS OWN `%` (`%2f` → `%252f`),
+ *      so the character survives the store's path/query parser instead of being read as structure.
+ *      Matching is case-insensitive on the escape's hex; the output carries the escape exactly as
+ *      DECLARED (declare `%2f` and the route gets `%252f`, lowercase f).
+ *   4. `spaces` — `percent` leaves the `%20` that step 2 produced (the default); `plus` rewrites
+ *      every `%20` to `+`.
+ *   5. `lowercase` — lowercase the whole encoded segment.
+ * Absent ⇒ step 2 alone: byte-identical to today for every store that does not declare it.
+ *
+ * The shape this exists for: a storefront that carries `{q}` in a PATH SEGMENT rather than a query
+ * parameter. There a singly-escaped `/` is read as path STRUCTURE — the route does not match, the
+ * store answers 404, and the caller cannot tell that from "no results". The character has to arrive
+ * as data, which is what re-encoding its escape's own `%` achieves:
+ * ```ts
+ * bySearch: {
+ *   urlTemplate: 'https://example.test/Search-{q}/list-r1.html',
+ *   queryEncoding: { reEncodePercentOf: ['%2f'], spaces: 'plus', lowercase: true },
+ * }
+ * // "star origin 1/6" → "star+origin+1%252f6"  (a plain encodeURIComponent → "star%20origin%201%2F6")
+ * ```
+ * This is not cosmetic for a store whose records resolve by a scale-bearing identity: a query
+ * carrying "1/6" is that store's NORMAL shape, and the naive encoding contributes zero candidates
+ * for items it stocks.
+ *
+ * WHICH escapes a store re-encodes, WHICH substrings it strips and WHETHER it folds case are that
+ * store's business and live in its own (private) plugin profile — the engine only replays what a
+ * plugin hands it and never carries a store's rules itself.
+ */
+export interface QueryEncoding {
+  /**
+   * Substrings DELETED from the query before it is encoded — matched LITERALLY, not as a pattern.
+   * For a store whose own client drops a character rather than escaping it: escaping it instead
+   * emits a segment that store's search box could never have produced, and the SERP comes back
+   * empty with no error to see.
+   */
+  strip?: string[];
+  /**
+   * Percent-escapes whose own `%` must be re-encoded (`'%2f'` ⇒ a literal `/` reaches the store as
+   * `%252f`). Declare each escape as the store writes it — the declared spelling is what is emitted.
+   */
+  reEncodePercentOf?: string[];
+  /** How a SPACE leaves the encoder: `percent` keeps `%20` (default), `plus` rewrites it to `+`. */
+  spaces?: 'percent' | 'plus';
+  /** Lowercase the finished segment (stores whose search index and route are both case-folded). */
+  lowercase?: boolean;
 }
 
 export type SearchTransport = 'http' | 'impersonate' | 'browser';

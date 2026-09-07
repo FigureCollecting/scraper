@@ -10,7 +10,7 @@
  * Search returns candidates, not final items — the two-stage `search → candidate ids → byId`
  * refinement is the caller's next step (a follow-on increment). Pure and synchronous.
  */
-import type { IdentityQuery, RetrievalCapability, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
+import type { IdentityQuery, QueryEncoding, RetrievalCapability, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
 import type { ProfileRegistry } from './profileRegistry.js';
 
 /**
@@ -107,10 +107,52 @@ export function resolveListingUrl(retrieval: RetrievalCapability | undefined, pa
   return template.replaceAll('{page}', String(page));
 }
 
-/** Build a search URL from the bySearch template, `{q}` url-encoded. */
+/** A percent-escape as a store may declare it in `reEncodePercentOf` — anything else is ignored. */
+const PERCENT_ESCAPE = /^%[0-9a-f]{2}$/i;
+
+/**
+ * The strings in a declared `string[]` field, as a plugin may ACTUALLY hand it over. A plugin is
+ * discovered by package.json keyword and need not be TypeScript, so a field typed `string[]` can
+ * arrive as a bare string, a null, anything — and this runs inside planRetrieval's unguarded loop
+ * over every registered store. A malformed declaration degrades that store to the plain encoding;
+ * it never throws the whole fan-out.
+ */
+function declaredStrings(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [];
+}
+
+/**
+ * Encode a free-text query for one store's `{q}`, per its declared {@link QueryEncoding}. The steps
+ * are fixed: strip the declared substrings, `encodeURIComponent`, then re-encode the `%` of each
+ * declared percent-escape (ONE pass,
+ * so a rewritten `%25` is never re-matched by its own output), then `%20` → `+` if `spaces: 'plus'`,
+ * then lowercase if declared. No declaration ⇒ `encodeURIComponent` alone — today's behavior for
+ * every store that does not carry the field.
+ *
+ * Path-segment search routes are why this exists: they read a single-encoded `/` as path structure
+ * and answer HTTP 404 instead of a zero-result page, so a scale-bearing query such as
+ * "star origin 1/6" must leave here as `star+origin+1%252f6` for the store that declares it.
+ */
+export function encodeSearchQuery(query: string, encoding?: QueryEncoding): string {
+  let raw = query;
+  for (const s of declaredStrings(encoding?.strip)) raw = raw.split(s).join('');
+  let out = encodeURIComponent(raw);
+  const escapes = declaredStrings(encoding?.reEncodePercentOf).filter((e) => PERCENT_ESCAPE.test(e));
+  if (escapes.length) {
+    const declared = new Map(escapes.map((e) => [e.toLowerCase(), e]));
+    const pattern = new RegExp(escapes.map((e) => `%${e.slice(1)}`).join('|'), 'gi');
+    out = out.replace(pattern, (m) => `%25${(declared.get(m.toLowerCase()) ?? m).slice(1)}`);
+  }
+  if (encoding?.spaces === 'plus') out = out.replaceAll('%20', '+');
+  return encoding?.lowercase ? out.toLowerCase() : out;
+}
+
+/** Build a search URL from the bySearch template, `{q}` encoded per the store's declaration. */
 export function resolveSearchUrl(retrieval: RetrievalCapability | undefined, query: string): string | undefined {
-  const template = retrieval?.bySearch?.urlTemplate;
-  return template ? template.replace('{q}', encodeURIComponent(query)) : undefined;
+  const bySearch = retrieval?.bySearch;
+  const template = bySearch?.urlTemplate;
+  if (!template) return undefined;
+  return template.replace('{q}', encodeSearchQuery(query, bySearch?.queryEncoding));
 }
 
 export type RetrievalRequest =

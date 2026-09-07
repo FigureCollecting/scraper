@@ -3,9 +3,9 @@
  * templates. Covers by-id detail plans, single-store search, the cross-store `lookup` fan-out
  * (the buy-decision seam), and the `unsupported` coverage-gap report.
  */
-import type { IdentityQuery, RetrievalCapability, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
+import type { IdentityQuery, QueryEncoding, RetrievalCapability, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
 import { ProfileRegistry } from '../profileRegistry';
-import { planRetrieval, resolveByIdUrl, resolveSearchUrl, resolveListingUrl, composeStoreQuery, composeNameQuery, normalizeText, tokenizeIdentity } from '../retrievalPlanner';
+import { planRetrieval, resolveByIdUrl, resolveSearchUrl, resolveListingUrl, encodeSearchQuery, composeStoreQuery, composeNameQuery, normalizeText, tokenizeIdentity } from '../retrievalPlanner';
 
 const caps = (siteId: string, host: string, retrieval?: RetrievalCapability): StoreCapabilities => ({
   siteId, name: siteId, domains: [host], requiresBrowser: false, allowedCookies: [],
@@ -34,6 +34,100 @@ describe('retrieval URL resolvers', () => {
   it('resolveSearchUrl substitutes {q}, url-encoded; undefined when unsupported', () => {
     expect(resolveSearchUrl({ bySearch: { urlTemplate: 'https://x/s?q={q}' } }, 'nendoroid miku')).toBe('https://x/s?q=nendoroid%20miku');
     expect(resolveSearchUrl({}, 'x')).toBeUndefined();
+    // A bySearch object without a usable template is `unsupported`, not a throw: planRetrieval has
+    // no try/catch and calls this for EVERY registered store, so one malformed plugin profile must
+    // not 500 the whole /lookup fan-out.
+    expect(resolveSearchUrl({ bySearch: {} } as RetrievalCapability, 'x')).toBeUndefined();
+    expect(resolveSearchUrl({ bySearch: { urlTemplate: '' } }, 'x')).toBeUndefined();
+  });
+
+  describe('encodeSearchQuery — the declared {q} encoding (bySearch.queryEncoding)', () => {
+    // A path-segment search route (`/Search-{q}/list-r1.html`): '/' must arrive as data, spaces as
+    // '+', the segment case-folded, and the declaring store's own client deletes double quotes
+    // rather than escaping them. Synthetic on purpose — a real store's escape list lives in its own
+    // private profile, not in the engine. The VECTORS below are the live-measured ones.
+    const PATH_SEGMENT_ROUTE: QueryEncoding = {
+      strip: ['"'],
+      reEncodePercentOf: ['%25', '%2f', '%3a'],
+      spaces: 'plus',
+      lowercase: true,
+    };
+
+    it('no declaration = one encodeURIComponent, byte-identical to today', () => {
+      expect(encodeSearchQuery('star origin 1/6')).toBe('star%20origin%201%2F6');
+      expect(encodeSearchQuery('star origin 1/6', undefined)).toBe('star%20origin%201%2F6');
+      expect(encodeSearchQuery('Honkai: Star Rail Firefly')).toBe('Honkai%3A%20Star%20Rail%20Firefly');
+    });
+
+    // MEASURED 2026-09-07 through the residential browser lane against the declaring store: the
+    // naive `Search-star%20origin%201%2F6/list-r1.html` answers HTTP 404 "Page Not Found" (a broken
+    // route), while the form below answers 200 with the queried item's own SERP card.
+    it('a scale-bearing query reaches the route with the slash double-encoded', () => {
+      expect(encodeSearchQuery('star origin 1/6', PATH_SEGMENT_ROUTE)).toBe('star+origin+1%252f6');
+    });
+
+    it('a colon is re-encoded and the whole segment lowercased', () => {
+      expect(encodeSearchQuery('Honkai: Star Rail Firefly', PATH_SEGMENT_ROUTE)).toBe('honkai%253a+star+rail+firefly');
+    });
+
+    it('a plain single-word query is untouched', () => {
+      expect(encodeSearchQuery('lucy', PATH_SEGMENT_ROUTE)).toBe('lucy');
+      expect(encodeSearchQuery('Lucy', PATH_SEGMENT_ROUTE)).toBe('lucy');
+    });
+
+    it('matches the escape case-insensitively but emits the DECLARED spelling', () => {
+      // encodeURIComponent produces the uppercase %2F; the declaration says %2f, so %252f is emitted.
+      expect(encodeSearchQuery('a/b', { reEncodePercentOf: ['%2f'] })).toBe('a%252fb');
+      expect(encodeSearchQuery('a/b', { reEncodePercentOf: ['%2F'] })).toBe('a%252Fb');
+    });
+
+    it('re-encodes a literal percent without eating its own output', () => {
+      // '%' → '%25' → '%2525'; the pass must not then re-match the %25 it just wrote.
+      expect(encodeSearchQuery('50% off', PATH_SEGMENT_ROUTE)).toBe('50%2525+off');
+    });
+
+    it('ignores a declaration entry that is not a percent-escape', () => {
+      expect(encodeSearchQuery('a/b', { reEncodePercentOf: ['/', '', '%2f'] })).toBe('a%252fb');
+    });
+
+    it('applies each declared field independently', () => {
+      expect(encodeSearchQuery('A B', { spaces: 'plus' })).toBe('A+B');
+      expect(encodeSearchQuery('A B', { spaces: 'percent' })).toBe('A%20B');
+      expect(encodeSearchQuery('A B', { lowercase: true })).toBe('a%20b');
+      expect(encodeSearchQuery('A B', {})).toBe('A%20B');
+    });
+
+    it('strip removes each declared character BEFORE encodeURIComponent', () => {
+      expect(encodeSearchQuery('a"b', { strip: ['"'] })).toBe('ab');
+      // Undeclared, the character is escaped as usual — a store that wants it kept says nothing.
+      expect(encodeSearchQuery('a"b', {})).toBe('a%22b');
+      // A stripped character never reaches the re-encode pass.
+      expect(encodeSearchQuery('a/b', { strip: ['/'], reEncodePercentOf: ['%2f'] })).toBe('ab');
+      // Literal, not a pattern: '.' removes dots only.
+      expect(encodeSearchQuery('a.b', { strip: ['.'] })).toBe('ab');
+    });
+
+    // The declaring store's client deletes double quotes before encoding — the ONE character it
+    // drops rather than escapes. Undeclared, a quoted free-text lookup ships a %22 that store's own
+    // search box can never emit, and the SERP comes back card-free with no error to see.
+    it('a quoted query is stripped of its quotes, as the declaring store client does', () => {
+      expect(encodeSearchQuery('Rem "Re:Zero" 1/7', PATH_SEGMENT_ROUTE)).toBe('rem+re%253azero+1%252f7');
+    });
+
+    it('a malformed declaration degrades to the plain encoding instead of throwing', () => {
+      expect(encodeSearchQuery('a/b', { reEncodePercentOf: '%2f' } as unknown as QueryEncoding)).toBe('a%2Fb');
+      expect(encodeSearchQuery('a"b', { strip: '"' } as unknown as QueryEncoding)).toBe('a%22b');
+      expect(encodeSearchQuery('a"b', { strip: [null] } as unknown as QueryEncoding)).toBe('a%22b');
+    });
+
+    it('resolveSearchUrl applies the declaration when the store carries one', () => {
+      expect(
+        resolveSearchUrl(
+          { bySearch: { urlTemplate: 'https://example.test/Search-{q}/list-r1.html', queryEncoding: PATH_SEGMENT_ROUTE } },
+          'star origin 1/6',
+        ),
+      ).toBe('https://example.test/Search-star+origin+1%252f6/list-r1.html');
+    });
   });
 
   describe('resolveListingUrl — the newest-first catalog page url (byListing)', () => {
