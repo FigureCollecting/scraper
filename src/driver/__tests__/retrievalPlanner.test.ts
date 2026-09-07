@@ -34,6 +34,11 @@ describe('retrieval URL resolvers', () => {
   it('resolveSearchUrl substitutes {q}, url-encoded; undefined when unsupported', () => {
     expect(resolveSearchUrl({ bySearch: { urlTemplate: 'https://x/s?q={q}' } }, 'nendoroid miku')).toBe('https://x/s?q=nendoroid%20miku');
     expect(resolveSearchUrl({}, 'x')).toBeUndefined();
+    // A bySearch object without a usable template is `unsupported`, not a throw: planRetrieval has
+    // no try/catch and calls this for EVERY registered store, so one malformed plugin profile must
+    // not 500 the whole /lookup fan-out.
+    expect(resolveSearchUrl({ bySearch: {} } as RetrievalCapability, 'x')).toBeUndefined();
+    expect(resolveSearchUrl({ bySearch: { urlTemplate: '' } }, 'x')).toBeUndefined();
   });
 
   describe('encodeSearchQuery — the declared {q} encoding (bySearch.queryEncoding)', () => {
@@ -86,6 +91,10 @@ describe('retrieval URL resolvers', () => {
       expect(encodeSearchQuery('A B', { spaces: 'percent' })).toBe('A%20B');
       expect(encodeSearchQuery('A B', { lowercase: true })).toBe('a%20b');
       expect(encodeSearchQuery('A B', {})).toBe('A%20B');
+    });
+
+    it('a malformed declaration degrades to the plain encoding instead of throwing', () => {
+      expect(encodeSearchQuery('a/b', { reEncodePercentOf: '%2f' } as unknown as QueryEncoding)).toBe('a%2Fb');
     });
 
     it('resolveSearchUrl applies the declaration when the store carries one', () => {

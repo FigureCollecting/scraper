@@ -111,6 +111,17 @@ export function resolveListingUrl(retrieval: RetrievalCapability | undefined, pa
 const PERCENT_ESCAPE = /^%[0-9a-f]{2}$/i;
 
 /**
+ * The strings in a declared `string[]` field, as a plugin may ACTUALLY hand it over. A plugin is
+ * discovered by package.json keyword and need not be TypeScript, so a field typed `string[]` can
+ * arrive as a bare string, a null, anything — and this runs inside planRetrieval's unguarded loop
+ * over every registered store. A malformed declaration degrades that store to the plain encoding;
+ * it never throws the whole fan-out.
+ */
+function declaredStrings(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [];
+}
+
+/**
  * Encode a free-text query for one store's `{q}`, per its declared {@link QueryEncoding}. The steps
  * are fixed: `encodeURIComponent`, then re-encode the `%` of each declared percent-escape (ONE pass,
  * so a rewritten `%25` is never re-matched by its own output), then `%20` → `+` if `spaces: 'plus'`,
@@ -123,7 +134,7 @@ const PERCENT_ESCAPE = /^%[0-9a-f]{2}$/i;
  */
 export function encodeSearchQuery(query: string, encoding?: QueryEncoding): string {
   let out = encodeURIComponent(query);
-  const escapes = (encoding?.reEncodePercentOf ?? []).filter((e) => PERCENT_ESCAPE.test(e));
+  const escapes = declaredStrings(encoding?.reEncodePercentOf).filter((e) => PERCENT_ESCAPE.test(e));
   if (escapes.length) {
     const declared = new Map(escapes.map((e) => [e.toLowerCase(), e]));
     const pattern = new RegExp(escapes.map((e) => `%${e.slice(1)}`).join('|'), 'gi');
@@ -136,7 +147,9 @@ export function encodeSearchQuery(query: string, encoding?: QueryEncoding): stri
 /** Build a search URL from the bySearch template, `{q}` encoded per the store's declaration. */
 export function resolveSearchUrl(retrieval: RetrievalCapability | undefined, query: string): string | undefined {
   const bySearch = retrieval?.bySearch;
-  return bySearch ? bySearch.urlTemplate.replace('{q}', encodeSearchQuery(query, bySearch.queryEncoding)) : undefined;
+  const template = bySearch?.urlTemplate;
+  if (!template) return undefined;
+  return template.replace('{q}', encodeSearchQuery(query, bySearch?.queryEncoding));
 }
 
 export type RetrievalRequest =
