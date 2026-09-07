@@ -201,6 +201,8 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
 
   let budgetExhausted = false;
   let deadlineExceeded = false;
+  /** Discovered URLs never POSTed because the budget or the deadline ran out (silent data loss). */
+  let droppedUrls = 0;
   const now = deps.now ?? Date.now;
   const passStartedMs = now();
   /**
@@ -430,11 +432,15 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
   const enqueueOne = async ({ siteId, url }: { siteId: string; url: string }): Promise<void> => {
     const ss = perStore.get(siteId);
     if (!ss) return;
-    if (pastDeadline()) return;
+    if (pastDeadline()) {
+      droppedUrls++;
+      return;
+    }
     try {
       const r = await gate.run(() => httpPostJson(deps.fetch, ingestUrl, { url }, config.requestTimeoutMs));
       if (r.status === 'budget-exhausted') {
         budgetExhausted = true;
+        droppedUrls++;
         logger.warn(`[INITIATOR] ingest skipped store=${siteId} (request budget spent) url=${url}`);
         return;
       }
@@ -455,11 +461,13 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
   await Promise.all(flat.map((item) => enqueueOne(item)));
 
   const summary = summarize();
-  const dropped = summary.totalDiscovered - summary.totalEnqueued - summary.totalErrors;
-  if (summary.budgetExhausted && dropped > 0) {
+  if (droppedUrls > 0) {
     logger.error(
-      `[INITIATOR] pass dropped ${dropped} discovered URL(s) unenqueued: the request budget ` +
-        `(${summary.requestBudget}) ran out after ${summary.requestsIssued} requests. Raise INITIATOR_MAX_REQUESTS.`,
+      `[INITIATOR] pass dropped ${droppedUrls} discovered URL(s) unenqueued: ` +
+        `${summary.budgetExhausted ? `the request budget (${summary.requestBudget}) ran out after ${summary.requestsIssued} requests` : ''}` +
+        `${summary.budgetExhausted && summary.deadlineExceeded ? ' and ' : ''}` +
+        `${summary.deadlineExceeded ? `the pass deadline (${config.passDeadlineMs}ms) was reached` : ''}. ` +
+        'Raise INITIATOR_MAX_REQUESTS or narrow the store/term set.',
     );
   }
   logger.info('[INITIATOR] pass complete', summary as unknown as Record<string, unknown>);

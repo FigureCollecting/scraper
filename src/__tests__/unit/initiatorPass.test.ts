@@ -937,3 +937,29 @@ describe('runInitiatorPass — pass wall-clock deadline', () => {
     expect(s.deadlineExceeded).toBe(false);
   });
 });
+
+describe('runInitiatorPass — dropped-work ERROR counts the URLs actually dropped', () => {
+  it('counts dropped ingests, not discovered-minus-enqueued (a lookup failure is not a dropped URL)', async () => {
+    const err = jest.spyOn(logger, 'error').mockImplementation(() => {});
+    try {
+      const fake = makeFake({
+        lookup: (_t, store) =>
+          store === 'amiami'
+            ? { status: 422, body: { error: 'unsupported' } } // an error, but no URL was dropped by it
+            : { status: 200, body: lookupWith({ gkloot: ['https://gkloot.test/1', 'https://gkloot.test/2'] }) },
+      });
+      const s = await runInitiatorPass(mkCfg({ stores: ['amiami', 'gkloot'], terms: ['t'], maxUrlsPerStore: 2, maxRequests: 3 }), {
+        fetch: fake.fetch,
+      });
+      expect(s.totalDiscovered).toBe(2);
+      expect(s.totalEnqueued).toBe(1);
+      expect(s.totalErrors).toBe(1);
+      expect(s.budgetExhausted).toBe(true);
+      const msgs = err.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('pass dropped'));
+      expect(msgs).toHaveLength(1);
+      expect(msgs[0]).toContain('pass dropped 1 discovered URL');
+    } finally {
+      err.mockRestore();
+    }
+  });
+});
