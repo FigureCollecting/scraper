@@ -3,19 +3,22 @@
  * continuous initiator, only manual POSTs" and the full 2b crawl driver.
  *
  * WHAT IT DOES (and deliberately no more):
- *   1. DISCOVER — for each configured term AND each configured store, GET
- *      {scraper}/lookup?q=&stores=<ONE store> (the scraper's own search, scoped to
- *      that one store). ONE LOOKUP PER STORE is deliberate: the scraper bounds each
- *      store's search by LOOKUP_STORE_TIMEOUT_MS, and a shared fan-out made the SLOWEST
- *      store the whole term's latency — one store hitting that bound tripped the
- *      initiator's own request timeout and zeroed EVERY store's discovery for the pass
- *      (2026-09-07 09:00Z, amiami). Scoped per store, a slow or failing store costs only
- *      its own lookup. Candidates are kept only for the store the call asked for, bounded
- *      to maxUrlsPerStore per store ACROSS terms. A lookup that fails TRANSIENTLY —
- *      abort/timeout, network error, or HTTP 5xx — is retried ONCE after
- *      INITIATOR_LOOKUP_RETRY_DELAY_MS; a 4xx is NOT retried (the same request would be
- *      refused the same way: an unsupported store or a bad query is a config fault), and
- *      neither is a 2xx body that will not parse. The retry is an ordinary request — same
+ *   1. DISCOVER — for each configured store, and within a store for each term IN SEQUENCE,
+ *      GET {scraper}/lookup?q=&stores=<ONE store> (the scraper's own search, scoped to that
+ *      one store). ONE LOOKUP PER STORE is deliberate: the scraper bounds each store's search
+ *      by LOOKUP_STORE_TIMEOUT_MS, and a shared fan-out made the SLOWEST store the whole
+ *      term's latency — one store hitting that bound tripped the initiator's own request
+ *      timeout and zeroed EVERY store's discovery for the pass (2026-09-07 09:00Z, amiami).
+ *      Scoped per store, a slow or failing store costs only its own lookup. The stores run in
+ *      parallel while a store's terms run one at a time, so the concurrent gate slots hold
+ *      DISTINCT stores (store-major submission let one hung store hold them all) and a term
+ *      whose store has already filled maxUrlsPerStore is skipped — its results could only be
+ *      discarded. Candidates are kept only for the store the call asked for, bounded to
+ *      maxUrlsPerStore per store ACROSS terms. A lookup that fails TRANSIENTLY — abort/timeout,
+ *      network error, HTTP 5xx, 429 or 408 — is retried ONCE after
+ *      INITIATOR_LOOKUP_RETRY_DELAY_MS; any other 4xx is NOT retried (the same request would be
+ *      refused the same way), and neither is a 2xx body that will not parse. A store gets ONE
+ *      retry for the whole pass, not one per term. The retry is an ordinary request — same
  *      gate, same budget.
  *      Each candidate carries the store's product PAGE link (`url`) and, from an engine
  *      that emits it, `collectUrl` — the collect-ready URL the engine derived from its
@@ -23,13 +26,19 @@
  *      absolutized). The initiator PREFERS collectUrl and falls back to url, so it
  *      works against an older engine and never POSTs a relative or CF-fronted page
  *      link when the engine knows a better one.
- *   2. ENQUEUE — POST each discovered URL to {scraper}/ingest/scrape. The queue does
- *      the real work (per-host pacing, honesty gate, extraction, spine emit) and
- *      dedups by URL, so re-running a pass is idempotent.
+ *   2. ENQUEUE — POST each discovered URL to {scraper}/ingest/scrape, ROUND-ROBIN across
+ *      stores so a spent budget costs every store its Nth URL rather than erasing the tail
+ *      of the store list. The queue does the real work (per-host pacing, honesty gate,
+ *      extraction, spine emit) and dedups by URL, so re-running a pass is idempotent.
  *
  * GLOBAL EGRESS CEILING: every request — lookups AND ingests — passes through ONE
  * shared RequestGate, so the per-host pacing the queue already does is capped by a
  * cross-host concurrency limit and a total-request budget over the single egress IP.
+ * Discovery spends that shared budget FIRST, so an under-sized budget drops discovered
+ * URLs: size it as stores x terms + stores (retries) + stores x maxUrlsPerStore — the pass
+ * logs an ERROR when it is below that, and again when a spent budget actually dropped work.
+ * The pass is bounded in wall clock too (INITIATOR_PASS_DEADLINE_MS), so an over-running
+ * pass cannot overlap the next CronJob tick and double the egress the gate caps.
  *
  * NOT the full driver: this imports nothing from src/driver/* (no coverage ledger,
  * scheduler, or crawl loop) and holds no internal recurrence — recurrence is the
