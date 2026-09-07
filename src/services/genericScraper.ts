@@ -1,3 +1,34 @@
+/**
+ * genericScraper — the browser lane's Chrome lifecycle: the pooled browsers, the long-lived
+ * challenge-lane browser, per-request contexts, and the selector-driven `scrapeGeneric` fetch.
+ *
+ * THE LAUNCH PROFILE IS THE ANTI-DETECTION STRATEGY. There is no stealth plugin any more (dropped
+ * 2026-09-07 with puppeteer-extra). Measured against the Cloudflare-gated cohort (anitoysgk.com,
+ * hobby-genki.com, sugotoys.com.au), the ONLY configuration that clears their NON-interactive JS
+ * challenge with no human and no solver is a real, current Chrome launched CLEAN:
+ *
+ *   BROWSER_LAUNCH_MODE=clean-headful  →  headless: false, rendering on `--ozone-platform=headless`
+ *   (no X server, no Xvfb), `--enable-automation` removed from the default args, `defaultViewport:
+ *   null`, and the minimal flag list in CLEAN_HEADFUL_ARGS — nothing else.
+ *
+ * What FAILS, all measured the same day: `headless: true` with any user agent; puppeteer-extra's
+ * stealth plugin on an older Chrome; and — silently, which is the dangerous one — the correct setup
+ * with the browser's timezone left on UTC while the egress IP geolocates to the US. A challenge that
+ * disagrees with its environment simply never clears; nothing errors.
+ *
+ * The rest of the lane follows from that:
+ *   - TIMEZONE per context, matched to the EGRESS the context leaves through (browserTimezone.ts):
+ *     `RESIDENTIAL_EGRESS_TIMEZONE` for a proxied context, `DIRECT_EGRESS_TIMEZONE` for a direct
+ *     one. It is per-context, not a process TZ, because one browser serves both at once.
+ *   - NO cosmetic overrides in clean-headful mode: the lane does not rewrite the UA of a Chrome 152
+ *     to a stale `Chrome/127` string (client hints would contradict it, and Cloudflare binds the
+ *     clearance it issues to the UA), and does not override the device metrics of a window that
+ *     already has the size the flags asked for. A store that DECLARES a UA still gets it.
+ *   - CONTEXTS ARE KEPT for challenge-gated hosts (persistentContexts.ts): the clearance is bound to
+ *     (IP, UA, context), so a fresh context re-earns the challenge every single fetch.
+ * The pooled/headless profile is unchanged and remains the default — CI, tests and every non-gated
+ * store behave exactly as before.
+ */
 import puppeteer, { Browser, BrowserContext, Page } from 'puppeteer';
 import zlib from 'zlib';
 import crypto from 'crypto';

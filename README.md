@@ -7,9 +7,9 @@ A web scraping microservice with browser automation, browser pooling, priority q
 - **Generic Scraping**: Configurable selectors for any website
 - **Browser Pool**: Pre-launched browsers for instant responses (3-5 second scraping vs 15+ seconds)
 - **Site Configurations**: Pre-built configs for common sites (MFC, extensible to others)
-- **Cloudflare Bypass**: Real Chromium browsers with fresh sessions per request
+- **Cloudflare Bypass**: A real, current Chrome launched clean (`BROWSER_LAUNCH_MODE=clean-headful`) — see **The browser lane** below
 - **MFC NSFW Authentication**: Support for authenticated scraping with user's own session cookies
-- **Stealth Mode**: Anti-detection for authenticated requests (bypasses Cloudflare bot protection)
+- **Challenge-Gated Hosts**: Per-host browser contexts kept alive so an earned Cloudflare clearance is reused, not re-earned
 - **Full Collection Sync**: End-to-end workflow: validate cookies, export CSV, parse items, queue for scraping
 - **3-Tier Priority Queue**: HOT/WARM/COLD priority lanes with deduplication and adaptive rate limiting
 - **Session Management**: Cookie validation caching, automatic pause on failures, cooldown periods
@@ -43,7 +43,7 @@ This scraper is designed for **personal data management** and **legitimate colle
 
 ### MFC NSFW Authentication
 
-The NSFW authentication feature uses **stealth browser technology** to bypass Cloudflare's bot detection. This functionality is provided **exclusively for users to access their own authenticated content**:
+The NSFW authentication feature uses a **real browser session** (see **The browser lane**) to get past Cloudflare's bot check. This functionality is provided **exclusively for users to access their own authenticated content**:
 
 - **User's Own Data**: Only scrape figures visible to the authenticated user
 - **Personal Use**: For organizing and managing the user's own collection
@@ -138,7 +138,7 @@ Convenience endpoint for MyFigureCollection (uses pre-built config).
 4. Copy the four required cookie values
 5. ⚠️ **Security**: Cookies expire (typically monthly), treat like passwords
 
-**Note**: NSFW scraping uses stealth browser mode to bypass Cloudflare protection and requires valid authentication cookies from your own MFC account.
+**Note**: NSFW scraping runs through the browser lane (a real Chrome session) and requires valid authentication cookies from your own MFC account.
 
 **Response (both endpoints):**
 ```json
@@ -809,6 +809,14 @@ See `.env.example` for complete configuration template.
   - Unset/invalid → no residential egress: the value is ignored with ONE boot warning naming the reason (never the value — it may carry credentials), and every residential store's fetch is REFUSED rather than sent from the node IP
   - Default: unset (no store is proxied; every other store is unaffected)
 
+- `BROWSER_LAUNCH_MODE`: `clean-headful` selects the proven Cloudflare-passing launch profile (real Chrome, headful on the Ozone headless platform, no automation switch, minimal flags) — see **The browser lane** below
+  - Unset or any other value → the historical headless profile (what CI and the tests use)
+  - Default: unset
+- `RESIDENTIAL_EGRESS_TIMEZONE` / `DIRECT_EGRESS_TIMEZONE`: IANA timezone each egress emulates on its browser contexts (e.g. `America/Chicago` for the residential exit, `America/New_York` for the OVH node)
+  - A timezone that disagrees with the exit IP's geolocation makes the challenge never clear, with no error at all
+  - Unset → emulate nothing (the browser keeps its own zone)
+  - Default: unset
+
 - `CATALOG_STORE_TIMEOUT_MS`: Timeout (ms) for one `GET /catalog` listing-page fetch
   - A catalog page is far larger than a search hit (orzgk pages run 1.5–2 MB), so it gets its own window
   - Unset/invalid → default; any value is clamped to `[1000, 120000]`
@@ -823,12 +831,33 @@ Per lane:
 | Lane | Residential egress | How |
 |---|---|---|
 | `impersonate` (impit) | **Supported** | `proxyUrl` on the Impit instance (SOCKS5/HTTP; HTTP/3 stays off — impit cannot proxy with it on). The session cache is keyed by (profile, proxy), so a proxied session never shares its cookie jar with the direct one. |
-| `browser` (puppeteer) | **Supported** | Per-request `createBrowserContext({ proxyServer })` — one pooled browser serves proxied and direct stores side by side. Stealth selection and cookie injection are unchanged. |
+| `browser` (puppeteer) | **Supported** | Per-`context` `createBrowserContext({ proxyServer })` — one browser serves proxied and direct stores side by side. The context's emulated timezone follows the egress (see **The browser lane**), and cookie injection is unchanged. |
 | `http` (plain GET) | **Refused** | Node's global `fetch` has no proxy support, and undici's `ProxyAgent` speaks only HTTP(S), never the SOCKS proxy this deployment uses. A residential store on this lane raises the same typed refusal — put it on `impersonate`. |
 
 The gate is enforced at **every** door to the network, not just the search dispatchers: `POST /resolve`'s primary detail fetch and the `ExtractContext` page passthroughs (`ctx.scraping.scrapePage` / `scrapePageStealth`, the follow-up navigations an `extractAsync`/`extractMany` ruleset makes) resolve the store's declared egress the same way — proxy or refusal, never a direct navigation.
 
 The refusal is deliberate and load-bearing: **a residential store is never silently fetched from the node IP.** With `RESIDENTIAL_PROXY_URL` unset (or unusable), the fetch raises `ResidentialEgressUnavailableError`, which the scrape queue classifies as `extraction_unavailable` — one attempt, no retry, no global rate-limit backoff, and never a cookie/auth session pause. Falling back would burn the datacenter path's remaining reputation and tell the store we tried.
+
+**The browser lane (launch profile, timezone, kept contexts):**
+
+The lane's anti-detection strategy is the launch profile itself. There is **no stealth plugin** — `puppeteer-extra` and `puppeteer-extra-plugin-stealth` were removed on 2026-09-07 because they do not work here: measured against the gated cohort (anitoysgk.com, hobby-genki.com, sugotoys.com.au), the stealth plugin on an older Chrome FAILS the non-interactive JS challenge that a plain, current Chrome passes.
+
+What passes, with no human, no clicking and no solver:
+
+| Ingredient | Why |
+|---|---|
+| `BROWSER_LAUNCH_MODE=clean-headful` → `headless: false` | `headless: true` fails with any user agent |
+| `--ozone-platform=headless` | renders headful with no X server and no Xvfb — the pod needs no display |
+| `ignoreDefaultArgs: ['--enable-automation']` + `--disable-blink-features=AutomationControlled` | removes the automation switch the challenge scores on |
+| a minimal flag list, `defaultViewport: null` | every extra flag and every device-metrics override is one more thing that can disagree with a real browser |
+| `RESIDENTIAL_EGRESS_TIMEZONE` / `DIRECT_EGRESS_TIMEZONE` | the browser's timezone must match the exit IP's geolocation. With the residential exit in the US and the browser on the container's UTC, the identical setup **never clears — silently**. Emulated per context (`page.emulateTimezone`), never as a process TZ, because one browser serves both egresses at once |
+| no cosmetic UA/viewport overrides | the lane does not rewrite a Chrome 152's UA to the historical `Chrome/127` string (client hints contradict it, and Cloudflare binds the clearance to the UA that earned it). A store that DECLARES a UA — or has a pinned mint UA in the cookie jar — still gets it |
+
+The gated cohort is also an **IP** gate: a clean browser from the datacenter node still fails, so those stores must declare `egress: 'residential'` as well.
+
+Once a challenge is passed, the clearance is bound to (IP, user agent, browser context) and is good for roughly 30 minutes. So a challenge-gated host **keeps its context**: `searchFetch.access: 'cloudflare'` declares the gate, and the engine also LEARNS it from a `cf-mitigated: challenge` response. The kept contexts are bounded — 25 min max age (inside the clearance window), 10 min idle TTL, 6 contexts LRU, all closed on shutdown — and are keyed per (host, egress), so the same host on two exits is two sessions. A fresh context is session-primed first when the store declares `sessionPrime` (anitoys' search results 404 without a same-session homepage visit). Reuse is the difference between a ~4.5 s first fetch and a ~0.7 s second one (measured live, anitoysgk.com, 2026-09-07).
+
+A navigation that lands on the interstitial is waited out (bounded, 30 s) and then waited on until the document that REPLACED it has parsed — `domcontentloaded` fires on the challenge page, and the title flips before the real document is readable. `GET /health/detailed` reports the lane's live configuration as `browserLane: { launchMode, residentialTimezone, directTimezone, persistentContexts }`.
 
 **Client-rendered storefronts (`searchFetch.waitFor`):**
 
