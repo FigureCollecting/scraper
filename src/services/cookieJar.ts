@@ -139,7 +139,10 @@ function parseCookieFile(raw: string): ParsedFile {
   try {
     data = JSON.parse(raw);
   } catch (err) {
-    return { ok: false, reason: `invalid JSON (${(err as Error).message})` };
+    // NEVER err.message: V8 embeds ~10 chars of the source around the bad token (a value prefix on a
+    // hand-edited file). Keep only the digits-only `at position N` tail when V8 supplies one.
+    const position = /at position \d+/.exec(String(err))?.[0];
+    return { ok: false, reason: position ? `invalid JSON ${position}` : 'invalid JSON' };
   }
   if (!data || typeof data !== 'object' || Array.isArray(data)) {
     return { ok: false, reason: 'top-level value is not an object keyed by host' };

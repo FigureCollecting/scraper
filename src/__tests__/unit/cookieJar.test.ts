@@ -122,6 +122,8 @@ describe('CfCookieStore — disabled / missing / malformed', () => {
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain('malformed');
     expect(lines[0]).not.toContain('FAKE_cf_l');
+    // the reason is a FIXED string, optionally followed by V8's digits-only position — never free text
+    expect(lines[0]).toMatch(/: invalid JSON( at position \d+)? — keeping the last-good set \(0 host\(s\)\)$/);
     warn.mockRestore();
   });
 
