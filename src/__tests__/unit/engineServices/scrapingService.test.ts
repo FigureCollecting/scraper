@@ -140,7 +140,10 @@ describe('createScrapingService', () => {
   });
 
   it('waits an extra beat when a Cloudflare-style challenge is detected in title/body', async () => {
-    mockPage.title.mockResolvedValue('Just a moment...');
+    // The interstitial clears on the second look (the lane's own bounded challenge wait), and the
+    // plugin-declared body pattern still trips the extra-beat re-check.
+    const titles = ['Just a moment...', 'Cleared Page'];
+    mockPage.title.mockImplementation(async () => (titles.length > 1 ? titles.shift() : titles[0]) as string);
     mockPage.evaluate.mockResolvedValue('checking your browser before accessing');
 
     const service = createScrapingService();
@@ -148,7 +151,7 @@ describe('createScrapingService', () => {
       cloudflareDetection: { titleIncludes: ['Just a moment'], bodyIncludes: ['checking your browser'] },
     });
 
-    expect(result.title).toBe('Just a moment...');
+    expect(result.title).toBe('Cleared Page');
   });
 
   it('does not wait extra when cloudflareDetection is configured but no challenge matches', async () => {

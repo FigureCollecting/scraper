@@ -11,6 +11,7 @@ import { CaptureSink, NoopCaptureSink, buildRawCapture } from '../captureSink.js
 import { sanitizeForLog } from '../../utils/security.js';
 import { getCfCookieStore, type CfCookieSource } from '../cookieJar.js';
 import { applyEgressTimezone } from '../browserTimezone.js';
+import { awaitChallengeClearance } from '../browserChallenge.js';
 
 const DEFAULT_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36';
@@ -156,6 +157,10 @@ export async function browserFetchBody(
   }
 
   const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
+  // CHALLENGE: `domcontentloaded` fires on the Cloudflare interstitial too. Wait (bounded) for the
+  // clean-headful browser to clear it, so the body below is the store's document and not "Just a
+  // moment" — and so the host is marked gated, keeping this context alive for the clearance window.
+  await awaitChallengeClearance(page, response, url);
   // READINESS: a client-rendered storefront has only its app shell at domcontentloaded — wait for
   // the declared selector / network idle before reading the body. Undeclared ⇒ no wait.
   await applyWaitFor(page, url, options.waitFor);
@@ -222,6 +227,9 @@ async function navigateAndCapture(
   let response;
   try {
     response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
+
+    // CHALLENGE: wait out a Cloudflare interstitial before either lane is read (see browserChallenge).
+    await awaitChallengeClearance(page, response, url);
 
     // READINESS (SearchFetch.waitFor): wait for the client-rendered product before the DOM lane is
     // read, so a PWA storefront captures the product page rather than its 8 KB app shell. This sits
