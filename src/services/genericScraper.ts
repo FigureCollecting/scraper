@@ -218,6 +218,10 @@ function detectCloudflareChallenge(title: string, bodyText: string, patterns: { 
   return false;
 }
 
+/** The headless profile's stand-in UA for `scrapeGeneric` when the caller declares none. */
+const DEFAULT_SCRAPE_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36';
+
 /** `BROWSER_LAUNCH_MODE` value selecting the proven Cloudflare-passing launch profile. */
 export const CLEAN_HEADFUL_MODE = 'clean-headful';
 
@@ -732,20 +736,25 @@ export async function scrapeGeneric(url: string, config: ScrapeConfig): Promise<
     // emulates the DIRECT zone. Unset ⇒ no CDP call at all.
     await applyEgressTimezone(page, false);
 
-    // Set realistic browser configuration
-    await page.setViewport({ width: 1280, height: 720 });
-    const userAgent = config.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36';
-    await page.setUserAgent(userAgent);
-
-    // Set extra headers to appear more like a real browser
-    await page.setExtraHTTPHeaders({
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Accept-Encoding': 'gzip, deflate, br',
-      'DNT': '1',
-      'Connection': 'keep-alive',
-      'Upgrade-Insecure-Requests': '1',
-    });
+    // COSMETICS, headless profile only. In clean-headful mode the browser IS a current, real Chrome,
+    // so every one of these makes it look LESS real: a Chrome/127 UA under Chrome 152 client hints, a
+    // 1280x720 device-metrics override against the 1280x900 window the flags opened, and CDP-set
+    // Accept-Encoding/Connection that disagree with what this Chrome actually negotiates. A UA the
+    // CALLER declares is still honoured in both profiles.
+    if (!isCleanHeadfulMode()) {
+      await page.setViewport({ width: 1280, height: 720 });
+      await page.setUserAgent(config.userAgent || DEFAULT_SCRAPE_USER_AGENT);
+      await page.setExtraHTTPHeaders({
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'DNT': '1',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+      });
+    } else if (config.userAgent) {
+      await page.setUserAgent(config.userAgent);
+    }
 
     console.log('[GENERIC SCRAPER] Navigating to page...');
 

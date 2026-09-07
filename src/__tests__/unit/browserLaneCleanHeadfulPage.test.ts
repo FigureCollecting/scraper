@@ -1,7 +1,7 @@
 import { jest } from '@jest/globals';
 import puppeteer from 'puppeteer';
 import type { Page, Browser } from 'puppeteer';
-import { BrowserPool } from '../../services/genericScraper';
+import { BrowserPool, scrapeGeneric } from '../../services/genericScraper';
 import { createScrapingService } from '../../services/engineServices/scrapingService';
 import { clearChallengeGates } from '../../services/browserChallenge';
 import { resetPersistentContexts } from '../../services/persistentContexts';
@@ -128,6 +128,43 @@ describe('clean-headful page setup', () => {
 
     expect(mockPage.setUserAgent).toHaveBeenCalledWith('MintClient/1.0');
     expect(jest.mocked(mockPage.setCookie).mock.calls[0].map((c: any) => c.name)).toEqual(['cf_clearance']);
+  });
+
+  /**
+   * The legacy `POST /scrape` route rides the SAME pooled browsers. In clean-headful mode those are
+   * a real Chrome 152, so its own header block ("appear more like a real browser") is now the thing
+   * that makes it look automated: a Chrome/127 UA under Chrome 152 client hints, a device-metrics
+   * override contradicting `--window-size`, and CDP-set Accept-Encoding/Connection.
+   */
+  it('leaves scrapeGeneric\'s UA, viewport and cosmetic headers alone in clean-headful mode', async () => {
+    process.env.BROWSER_LAUNCH_MODE = 'clean-headful';
+    jest.mocked(mockPage.evaluate).mockResolvedValue({} as any);
+
+    await scrapeGeneric('https://www.anitoysgk.com/lucy.html', {});
+
+    expect(mockPage.setViewport).not.toHaveBeenCalled();
+    expect(mockPage.setUserAgent).not.toHaveBeenCalled();
+    expect(mockPage.setExtraHTTPHeaders).not.toHaveBeenCalled();
+  });
+
+  it('still applies a DECLARED UA in scrapeGeneric under clean-headful', async () => {
+    process.env.BROWSER_LAUNCH_MODE = 'clean-headful';
+    jest.mocked(mockPage.evaluate).mockResolvedValue({} as any);
+
+    await scrapeGeneric('https://www.anitoysgk.com/lucy.html', { userAgent: 'Declared/1.0' });
+
+    expect(mockPage.setUserAgent).toHaveBeenCalledWith('Declared/1.0');
+  });
+
+  it('keeps scrapeGeneric\'s historical UA, viewport and headers in the default headless profile', async () => {
+    delete process.env.BROWSER_LAUNCH_MODE;
+    jest.mocked(mockPage.evaluate).mockResolvedValue({} as any);
+
+    await scrapeGeneric('https://alpha.example.test/item/1', {});
+
+    expect(mockPage.setViewport).toHaveBeenCalledWith({ width: 1280, height: 720 });
+    expect(mockPage.setUserAgent).toHaveBeenCalledWith(expect.stringContaining('Chrome/127'));
+    expect(mockPage.setExtraHTTPHeaders).toHaveBeenCalled();
   });
 
   it('keeps the historical UA and viewport in the default headless profile', async () => {
