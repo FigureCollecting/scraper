@@ -36,11 +36,11 @@ export type ResidentialEgressRefusal = 'unconfigured' | 'unsupported-lane';
 export class ResidentialEgressUnavailableError extends Error {
   readonly url: string;
   readonly reason: ResidentialEgressRefusal;
-  constructor(url: string, reason: ResidentialEgressRefusal = 'unconfigured') {
+  constructor(url: string, reason: ResidentialEgressRefusal = 'unconfigured', detail?: string) {
     super(
       reason === 'unconfigured'
         ? `Residential egress is declared for ${sanitizeForLog(url)} but RESIDENTIAL_PROXY_URL is not configured — refusing the fetch instead of falling back to the node IP.`
-        : `Residential egress is declared for ${sanitizeForLog(url)} but the plain-HTTP lane cannot use a proxy — declare transport 'impersonate' or 'browser' for this store.`,
+        : `Residential egress is declared for ${sanitizeForLog(url)} but the plain-HTTP lane cannot use a proxy${detail ? ` (${detail})` : ''} — declare transport 'impersonate' or 'browser' for this store.`,
     );
     this.name = 'ResidentialEgressUnavailableError';
     this.url = url;
@@ -135,4 +135,25 @@ export function residentialEgressView(
   proxyUrl: string | undefined = getResidentialProxyUrl(),
 ): { configured: boolean; proxy?: string } {
   return proxyUrl ? { configured: true, proxy: redactProxyUrl(proxyUrl) } : { configured: false };
+}
+
+/**
+ * The PLAIN-HTTP lane's residential rule: it cannot honour residential egress, so it REFUSES.
+ *
+ * Node's global `fetch` has no proxy support of its own — proxying it needs an undici dispatcher —
+ * and undici's `ProxyAgent` speaks only HTTP(S) proxies, never SOCKS, which is exactly what the
+ * cluster's userspace Tailscale egress proxy is. Rather than half-support one scheme, the lane
+ * refuses both and says so: a store that needs residential egress belongs on `impersonate` (impit
+ * takes `proxyUrl` natively, SOCKS5 included) or on `browser` (Chromium's per-context
+ * `proxyServer`). The refusal is the same typed class as an unconfigured proxy, so it is booked as
+ * a non-retried config failure — never a silent fetch from the node IP.
+ */
+export function refuseHttpLaneResidentialEgress(url: string, proxyUrl: string): never {
+  throw new ResidentialEgressUnavailableError(
+    url,
+    'unsupported-lane',
+    isSocksProxy(proxyUrl)
+      ? 'the configured proxy is SOCKS, which an undici ProxyAgent cannot speak'
+      : "Node's global fetch has no proxy support on this lane",
+  );
 }

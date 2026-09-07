@@ -8,6 +8,7 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import { createCapturingFetch, type CapturingFetchTransports } from '../../../services/engineServices/capturingFetch';
 import { CollectingCaptureSink } from '../../../services/captureSink';
+import { ResidentialEgressUnavailableError } from '../../../services/residentialEgress';
 
 /** Load a real captured HTML fixture (verbatim store bytes) from the shared fixtures dir. */
 const fixture = (name: string): string =>
@@ -25,8 +26,10 @@ function makeTransports() {
       return '{"json":"BODY"}';
     }),
     browser: {
-      scrapePage: jest.fn(async (url: string) => {
-        calls.push(['scrapePage', url]);
+      scrapePage: jest.fn(async (url: string, opts?: any) => {
+        // Record the options only when the dispatcher passes any, so the byte-identical
+        // `scrapePage(url)` call shape stays visible as a 2-element entry.
+        calls.push(opts === undefined ? ['scrapePage', url] : ['scrapePage', url, opts]);
         return { html: '<html>BROWSER</html>', url, title: 'T', statusCode: 200 };
       }),
       scrapePageStealth: jest.fn(async (url: string, opts: any) => {
@@ -391,5 +394,112 @@ describe('createCapturingFetch', () => {
       const result = await fetch('https://myfigurecollection.net/item/1', undefined);
       expect(result).toMatchObject({ challenge: true, transport: 'browser' });
     });
+  });
+});
+
+/**
+ * RESIDENTIAL EGRESS on the INGEST path (contract 0.7.0) — same rules as the search dispatcher:
+ * the declared store's fetch is routed through the configured residential proxy (impit `proxyUrl`,
+ * browser per-context `proxyServer`), an unconfigured proxy is a typed REFUSAL before any fetch or
+ * capture, and the plain-HTTP lane (which cannot proxy) refuses a residential store outright.
+ * `waitFor` rides to the browser lane so a PWA storefront is captured rendered, not as its shell.
+ */
+describe('createCapturingFetch — residential egress + waitFor', () => {
+  const PROXY = 'socks5://egress-proxy.fc.svc.cluster.local:1055';
+  const withProxy = (t: CapturingFetchTransports, sink: CollectingCaptureSink) =>
+    createCapturingFetch(t, sink, { residentialProxyUrl: () => PROXY });
+  const noProxy = (t: CapturingFetchTransports, sink: CollectingCaptureSink) =>
+    createCapturingFetch(t, sink, { residentialProxyUrl: () => undefined });
+
+  it('threads the proxy into impit for a residential impersonate store, and still captures the body', async () => {
+    const { t, calls } = makeTransports();
+    const sink = new CollectingCaptureSink();
+
+    const result = await withProxy(t, sink)('https://www.anitoysgk.com/lucy-p29358268.html', {
+      transport: 'impersonate', browser: 'chrome142', egress: 'residential',
+    });
+
+    expect(result).toEqual({ html: '{"json":"BODY"}' });
+    expect(calls[0][2]).toMatchObject({ browser: 'chrome142', proxyUrl: PROXY });
+    expect(sink.captures).toHaveLength(1);
+  });
+
+  it('adds NO proxyUrl key for an undeclared store even when a proxy IS configured (byte-identical)', async () => {
+    const { t, calls } = makeTransports();
+    await withProxy(t, new CollectingCaptureSink())('https://api.sentai.example.test/item/1', {
+      transport: 'impersonate', browser: 'chrome142',
+    });
+    expect(calls[0][2]).not.toHaveProperty('proxyUrl');
+  });
+
+  it('REFUSES a residential store when no proxy is configured — no fetch, no capture', async () => {
+    const { t, calls } = makeTransports();
+    const sink = new CollectingCaptureSink();
+
+    await expect(noProxy(t, sink)('https://www.anitoysgk.com/lucy-p29358268.html', {
+      transport: 'impersonate', egress: 'residential',
+    })).rejects.toThrow(ResidentialEgressUnavailableError);
+
+    expect(calls).toHaveLength(0);
+    expect(sink.captures).toHaveLength(0);
+  });
+
+  it('REFUSES a residential store on the plain-HTTP lane (it cannot proxy)', async () => {
+    const { t, calls } = makeTransports();
+    await expect(withProxy(t, new CollectingCaptureSink())('https://www.anitoysgk.com/api/item/1', {
+      transport: 'http', egress: 'residential',
+    })).rejects.toThrow(/impersonate/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('threads proxyServer + waitFor into the browser lane WITHOUT changing the stealth choice (cookies still decide it)', async () => {
+    const { t, calls } = makeTransports();
+    await withProxy(t, new CollectingCaptureSink())('https://www.crunchyroll-store.test/p/1', {
+      transport: 'browser', egress: 'residential', waitFor: { selector: '[data-t="price"]', timeoutMs: 20000 },
+    });
+    // Egress is orthogonal to stealth: with no request/stored cookies this stays the plain lane.
+    expect(calls[0][0]).toBe('scrapePage');
+    expect(calls[0][2]).toEqual({
+      proxyServer: PROXY,
+      waitFor: { selector: '[data-t="price"]', timeoutMs: 20000 },
+    });
+  });
+
+  it('carries proxyServer + waitFor on the STEALTH lane too when the item brings cookies', async () => {
+    const { t, calls } = makeTransports();
+    await withProxy(t, new CollectingCaptureSink())(
+      'https://www.anitoysgk.com/lucy-p29358268.html',
+      { transport: 'browser', egress: 'residential', waitFor: { networkIdle: true } },
+      { cookies: { PHPSESSID: 'abc' } },
+    );
+    expect(calls[0][0]).toBe('scrapePageStealth');
+    expect(calls[0][2]).toEqual({
+      cookies: { PHPSESSID: 'abc' },
+      proxyServer: PROXY,
+      waitFor: { networkIdle: true },
+    });
+  });
+
+  it('threads waitFor alone into the non-stealth browser lane for a DIRECT PWA store', async () => {
+    const { t, calls } = makeTransports();
+    await withProxy(t, new CollectingCaptureSink())('https://www.crunchyroll-store.test/p/1', {
+      transport: 'browser', waitFor: { networkIdle: true },
+    });
+    expect(calls[0][0]).toBe('scrapePage');
+    expect(calls[0][2]).toEqual({ waitFor: { networkIdle: true } });
+  });
+
+  it('an UNDECLARED store still takes the plain browser lane with no options at all (byte-identical)', async () => {
+    const { t, calls } = makeTransports();
+    await withProxy(t, new CollectingCaptureSink())('https://legacy.example.test/item/1', undefined);
+    expect(calls[0]).toEqual(['scrapePage', 'https://legacy.example.test/item/1']);
+  });
+
+  it('defaults to the engine\'s configured proxy when no resolver is injected (unset env ⇒ residential refused)', async () => {
+    const { t, calls } = makeTransports();
+    await expect(createCapturingFetch(t, new CollectingCaptureSink())('https://www.anitoysgk.com/x', {
+      transport: 'impersonate', egress: 'residential',
+    })).rejects.toThrow(ResidentialEgressUnavailableError);
+    expect(calls).toHaveLength(0);
   });
 });

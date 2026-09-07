@@ -15,6 +15,7 @@ import {
   ResidentialEgressUnavailableError,
   isSocksProxy,
   redactProxyUrl,
+  refuseHttpLaneResidentialEgress,
   requireResidentialProxy,
   residentialEgressView,
   resolveResidentialProxyUrl,
@@ -158,6 +159,35 @@ describe('requireResidentialProxy', () => {
     expect(e.reason).toBe('unsupported-lane');
     expect(e.message).toContain('impersonate');
     expect(e.message).not.toContain('RESIDENTIAL_PROXY_URL is not configured');
+  });
+});
+
+describe('refuseHttpLaneResidentialEgress (the plain-HTTP lane rule)', () => {
+  const URL_ = 'https://www.anitoysgk.com/api/item/1';
+
+  it('refuses a SOCKS proxy, naming why an undici ProxyAgent cannot serve this lane', () => {
+    try {
+      refuseHttpLaneResidentialEgress(URL_, 'socks5://p.test:1055');
+      throw new Error('expected a refusal');
+    } catch (err) {
+      const e = err as ResidentialEgressUnavailableError;
+      expect(e).toBeInstanceOf(ResidentialEgressUnavailableError);
+      expect(e.reason).toBe('unsupported-lane');
+      expect(e.message).toContain('SOCKS');
+      expect(e.message).toContain('impersonate');
+    }
+  });
+
+  it('refuses an HTTP(S) proxy too — this lane has no proxy support at all, so it never falls back', () => {
+    try {
+      refuseHttpLaneResidentialEgress(URL_, 'http://proxy.test:3128');
+      throw new Error('expected a refusal');
+    } catch (err) {
+      const e = err as ResidentialEgressUnavailableError;
+      expect(e.reason).toBe('unsupported-lane');
+      expect(e.message).toContain('no proxy support');
+      expect(e.message).not.toContain('SOCKS');
+    }
   });
 });
 

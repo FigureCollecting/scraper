@@ -405,3 +405,86 @@ describe('ScrapeQueue - challenge page: flag → honesty gate (recover vs fail) 
     expect(err.message).toContain('Cloudflare challenge page received');
   });
 });
+
+/**
+ * RESIDENTIAL EGRESS misconfiguration is a CONFIG shortfall, not a transient fault [RE-1].
+ *
+ * A store declaring `egress: 'residential'` (contract 0.7.0) can only be fetched through the
+ * engine's residential proxy. With `RESIDENTIAL_PROXY_URL` unset the dispatcher REFUSES before any
+ * fetch — the one thing it must never do is quietly send the request from the node IP, which would
+ * both burn that IP's Cloudflare reputation and reveal the attempt. The queue must therefore book a
+ * ResidentialEgressUnavailableError like its other config shortfalls: classified
+ * `extraction_unavailable`, ONE attempt (a missing env var will not appear between retries), no
+ * global rate-limit backoff, and never a cookie/auth session pause.
+ */
+describe('ScrapeQueue - residential egress with no proxy configured [RE-1]', () => {
+  let queue: ScrapeQueue;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockNotifyItemFailed.mockResolvedValue(true);
+    jest.useFakeTimers({ advanceTimers: true });
+    resetScrapeQueue();
+    resetSessionManager();
+    resetChallengeCooldown();
+  });
+
+  afterEach(() => {
+    if (queue) { queue.stop(); queue.clear(); }
+    resetScrapeQueue();
+    resetSessionManager();
+    jest.useRealTimers();
+  });
+
+  async function advanceUntil(pred: () => boolean, stepMs = 250, maxSteps = 400): Promise<void> {
+    for (let i = 0; i < maxSteps && !pred(); i++) {
+      jest.advanceTimersByTime(stepMs);
+      await jest.advanceTimersByTimeAsync(50);
+    }
+  }
+
+  it('fails ONE attempt as extraction_unavailable and never touches the transport (no node-IP fallback)', async () => {
+    const send = jest.fn().mockResolvedValue(emptyStats());
+    const impersonate = jest.fn().mockResolvedValue('<html>should never be fetched</html>');
+    queue = new ScrapeQueue(false);
+    queue.setPluginRegistry(makeRegistry(makeRuleset('lucy-1'), 'anitoysgk.example.test', {
+      transport: 'impersonate', browser: 'chrome142', egress: 'residential',
+    }));
+    queue.setIngestEmitter({ send });
+    queue.setScrapingService(makeScrapingStub());
+    queue.setIngestTransports({ impersonate });
+
+    const url = 'https://anitoysgk.example.test/lucy-p29358268.html';
+    const result = queue.enqueue(url, { url, sessionId: 's1' }); // default maxRetries = 3
+    result.promise.catch(() => {});
+    await advanceUntil(() => queue.getStats().failed === 1);
+
+    expect(impersonate).not.toHaveBeenCalled();          // refused BEFORE the fetch
+    expect(send).not.toHaveBeenCalled();                 // nothing reached the spine
+    expect(queue.getStats().failed).toBe(1);             // terminal after ONE attempt
+    expect(queue.getStats().rateLimited).toBe(false);    // a config gap is not a rate limit
+    const reason = mockNotifyItemFailed.mock.calls[0][2] as string;
+    expect(reason).toContain('extraction_unavailable');
+    expect(reason).toContain('RESIDENTIAL_PROXY_URL');
+    await expect(result.promise).rejects.toThrow(/Residential egress is declared/);
+  });
+
+  it('does NOT pause a cookie session on the refusal (it is a config gap, not a bad cookie)', async () => {
+    const send = jest.fn().mockResolvedValue(emptyStats());
+    queue = new ScrapeQueue(false);
+    queue.setPluginRegistry(makeRegistry(makeRuleset('lucy-2'), 'anitoysgk.example.test', {
+      transport: 'impersonate', egress: 'residential',
+    }));
+    queue.setIngestEmitter({ send });
+    queue.setScrapingService(makeScrapingStub());
+
+    const url = 'https://anitoysgk.example.test/lucy-p2.html';
+    const result = queue.enqueue(url, { url, cookies: { PHPSESSID: 'abc' }, sessionId: 'sess-res', userId: 'u1' });
+    result.promise.catch(() => {});
+    await advanceUntil(() => queue.getStats().failed === 1 || getSessionManager().isSessionPaused('sess-res'));
+
+    expect(getSessionManager().isSessionPaused('sess-res')).toBe(false);
+    expect(queue.getStats().failed).toBe(1);
+    expect(mockNotifyItemFailed).toHaveBeenCalledTimes(1);
+  });
+});

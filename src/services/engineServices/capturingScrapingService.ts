@@ -6,10 +6,15 @@
  * (the resolve leg's primary detail fetches and browser-lane follow-ups all ride this surface, and
  * their raw-store provenance would just never appear).
  */
-import { createScrapingService } from './scrapingService.js';
+import { createScrapingService, type EngineScrapingService } from './scrapingService.js';
 import { getRawCaptureSink } from '../s3ObjectStore.js';
-import type { ScrapingService } from '@figurecollecting/scraper-plugin-contract';
 
-export function createCapturingScrapingService(): ScrapingService {
+/**
+ * Returned as the ENGINE-widened service (not the bare contract `ScrapingService`) so the /lookup +
+ * /catalog browser transport can hand it the dispatcher's egress/readiness wiring — `proxyServer`
+ * (residential egress) and `waitFor` (client-rendered readiness) — under the type system rather
+ * than as untyped extra properties.
+ */
+export function createCapturingScrapingService(): EngineScrapingService {
   return createScrapingService(getRawCaptureSink());
 }

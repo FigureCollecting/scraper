@@ -178,6 +178,7 @@ Health check endpoint for monitoring.
 Detailed health check with browser pool status plus two operator views (additive, never cookie values):
 - `challengeCooldowns`: `[{host, remainingMs, reason}]` — the per-host Cloudflare-challenge cooldowns currently open
 - `cfCookies`: `[{host, cookieNames, userAgentPinned, loadedAt, mintedAt?, expiresAt?, stale, staleSince?, staleReason?}]` — the stored-cookie jar (`CF_COOKIE_FILE`) per host. `stale: true` means the host still served a challenge WITH its stored cookies: re-mint (see *Stored Cloudflare cookies* under Environment Variables). `[]` when the jar is disabled.
+- `residentialEgress`: `{configured, proxy?}` — whether a residential egress proxy (`RESIDENTIAL_PROXY_URL`) is wired, and its `scheme://host:port`. Credentials are stripped at the source, so a `user:password@` proxy never appears here. `{configured: false}` ⇒ every store declaring `egress: 'residential'` is refused (see *Residential egress* under Environment Variables).
 
 ### GET /version
 Get service version information for version management.
@@ -801,11 +802,34 @@ See `.env.example` for complete configuration template.
 - `CF_COOKIE_FILE`: Path to the stored-cookie file (hand-minted Cloudflare clearance / session cookies, keyed by host) — see **Stored Cloudflare cookies** below
   - Unset/blank (default): the jar is disabled and every lane behaves exactly as before
   - Example: `/var/run/fc/cf-cookies/cf-cookies.json` (a Secret mounted as a directory, so a refresh changes the file's mtime)
+- `RESIDENTIAL_PROXY_URL`: Proxy for stores that declare `searchFetch.egress: 'residential'` (contract 0.7.0) — see **Residential egress** below
+  - Accepts `socks5://`, `socks5h://`, `http://` or `https://` (credentials may be embedded; they are never logged or surfaced on `/health/detailed`)
+  - Example: `socks5://egress-proxy.fc.svc.cluster.local:1055` (the in-cluster userspace Tailscale proxy whose exit node is a residential line)
+  - Unset/invalid → no residential egress: the value is ignored with ONE boot warning, and every residential store's fetch is REFUSED rather than sent from the node IP
+  - Default: unset (no store is proxied; every other store is unaffected)
 
 - `CATALOG_STORE_TIMEOUT_MS`: Timeout (ms) for one `GET /catalog` listing-page fetch
   - A catalog page is far larger than a search hit (orzgk pages run 1.5–2 MB), so it gets its own window
   - Unset/invalid → default; any value is clamped to `[1000, 120000]`
   - Default: `30000`
+
+**Residential egress (`RESIDENTIAL_PROXY_URL`):**
+
+A few Cloudflare-fronted stores gate on IP/ASN REPUTATION, not on browser fingerprint: the very same impit `chrome142` client that is challenged from the datacenter node gets a plain 200 from a residential IP, and their challenge-passage windows are far shorter than a hand-minted `cf_clearance` can survive. Those stores declare `searchFetch.egress: 'residential'` in their profile and the engine routes ONLY their fetches through the configured proxy; every other store keeps leaving through the node as before.
+
+Per lane:
+
+| Lane | Residential egress | How |
+|---|---|---|
+| `impersonate` (impit) | **Supported** | `proxyUrl` on the Impit instance (SOCKS5/HTTP; HTTP/3 stays off — impit cannot proxy with it on). The session cache is keyed by (profile, proxy), so a proxied session never shares its cookie jar with the direct one. |
+| `browser` (puppeteer) | **Supported** | Per-request `createBrowserContext({ proxyServer })` — one pooled browser serves proxied and direct stores side by side. Stealth selection and cookie injection are unchanged. |
+| `http` (plain GET) | **Refused** | Node's global `fetch` has no proxy support, and undici's `ProxyAgent` speaks only HTTP(S), never the SOCKS proxy this deployment uses. A residential store on this lane raises the same typed refusal — put it on `impersonate`. |
+
+The refusal is deliberate and load-bearing: **a residential store is never silently fetched from the node IP.** With `RESIDENTIAL_PROXY_URL` unset (or unusable), the fetch raises `ResidentialEgressUnavailableError`, which the scrape queue classifies as `extraction_unavailable` — one attempt, no retry, no global rate-limit backoff, and never a cookie/auth session pause. Falling back would burn the datacenter path's remaining reputation and tell the store we tried.
+
+**Client-rendered storefronts (`searchFetch.waitFor`):**
+
+A PWA storefront renders its product client-side, so a browser-lane fetch that returns at `domcontentloaded` captures an empty app shell. Such a store declares `waitFor: { selector?, networkIdle?, timeoutMs? }` and the browser lane waits for the selector and/or network idle before reading the body. `timeoutMs` defaults to `15000` and is clamped to `[1000, 60000]`; a wait that times out is NOT an error — the lane captures whatever rendered and logs one `[WAITFOR]` warning, so a slow store degrades to today's behavior instead of failing the fetch. Undeclared stores never wait.
 
 **Stored Cloudflare cookies (`CF_COOKIE_FILE`):**
 

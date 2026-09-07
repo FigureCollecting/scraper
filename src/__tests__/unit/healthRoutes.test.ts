@@ -16,6 +16,7 @@ const build = (over: Partial<HealthDeps> = {}) => {
     getBrowserPoolHealth: async () => ({ available: 2, capacity: 3, healthy: true }),
     listChallengeCooldowns: () => [],
     listCfCookies: () => [],
+    getResidentialEgress: () => ({ configured: false }),
     ...over,
   }));
   return app;
@@ -157,5 +158,57 @@ describe('createHealthRoutes', () => {
       expect(res.body.cfCookies).toEqual([expect.objectContaining({ host: 'myfigurecollection.net', cookieNames: ['cf_clearance', 'PHPSESSID'], stale: false })]);
       for (const v of VALUES) expect(JSON.stringify(res.body)).not.toContain(v);
     });
+  });
+});
+
+/**
+ * RESIDENTIAL EGRESS view (contract 0.7.0): /health/detailed additively reports whether the engine
+ * has a residential proxy configured, so an operator can tell "the cohort store is refused" from
+ * "the proxy is down" without shelling into the pod. The proxy string is REDACTED to
+ * scheme://host:port — RESIDENTIAL_PROXY_URL may legitimately carry `user:password@`, and this
+ * endpoint is not an authenticated surface.
+ */
+describe('createHealthRoutes — residentialEgress', () => {
+  it('GET /health/detailed reports configured:false when no residential proxy is set', async () => {
+    const res = await request(build()).get('/health/detailed');
+    expect(res.status).toBe(200);
+    expect(res.body.residentialEgress).toEqual({ configured: false });
+  });
+
+  it('GET /health/detailed reports the configured proxy as scheme://host:port', async () => {
+    const app = build({
+      getResidentialEgress: () => ({ configured: true, proxy: 'socks5://egress-proxy.fc.svc.cluster.local:1055' }),
+    });
+    const res = await request(app).get('/health/detailed');
+    expect(res.body.residentialEgress).toEqual({
+      configured: true,
+      proxy: 'socks5://egress-proxy.fc.svc.cluster.local:1055',
+    });
+  });
+
+  it('never leaks credentials even when RESIDENTIAL_PROXY_URL carries user:pass (the view redacts at the source)', async () => {
+    const { residentialEgressView } = require('../../services/residentialEgress') as typeof import('../../services/residentialEgress');
+    const app = build({
+      getResidentialEgress: () => residentialEgressView('socks5://tsuser:FAKE_PASS@egress-proxy.fc.svc.cluster.local:1055'),
+    });
+
+    const res = await request(app).get('/health/detailed');
+
+    expect(res.body.residentialEgress).toEqual({
+      configured: true,
+      proxy: 'socks5://egress-proxy.fc.svc.cluster.local:1055',
+    });
+    expect(JSON.stringify(res.body)).not.toContain('FAKE_PASS');
+    expect(JSON.stringify(res.body)).not.toContain('tsuser');
+  });
+
+  it('keeps the residentialEgress view on the degraded (500) response too', async () => {
+    const app = build({
+      getBrowserPoolHealth: async () => { throw new Error('pool down'); },
+      getResidentialEgress: () => ({ configured: true, proxy: 'socks5://p.test:1055' }),
+    });
+    const res = await request(app).get('/health/detailed');
+    expect(res.status).toBe(500);
+    expect(res.body.residentialEgress).toEqual({ configured: true, proxy: 'socks5://p.test:1055' });
   });
 });

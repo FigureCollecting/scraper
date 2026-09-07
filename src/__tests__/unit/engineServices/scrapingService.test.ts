@@ -297,7 +297,7 @@ describe('createScrapingService', () => {
    */
   describe('× residential egress (proxied context) + waitFor readiness', () => {
     const PROXY = 'socks5://egress-proxy.fc.svc.cluster.local:1055';
-    let warnSpy: jest.SpyInstance;
+    let warnSpy: jest.Spied<typeof console.warn>;
 
     beforeEach(() => { warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {}); });
     afterEach(() => { warnSpy.mockRestore(); });
@@ -366,7 +366,7 @@ describe('createScrapingService', () => {
     });
 
     it('a TIMED-OUT wait returns whatever rendered with exactly one warning — never a thrown scrape', async () => {
-      (mockPage.waitForSelector as unknown as jest.Mock).mockRejectedValue(new Error('Waiting for selector `#never` failed: timeout 15000ms exceeded'));
+      (mockPage.waitForSelector as unknown as jest.Mock<(...args: any[]) => any>).mockRejectedValue(new Error('Waiting for selector `#never` failed: timeout 15000ms exceeded'));
       const service = createScrapingService();
 
       const result = await service.scrapePage('https://www.crunchyroll-store.test/p/1', {
@@ -391,7 +391,7 @@ describe('createScrapingService', () => {
     });
 
     it('a TIMED-OUT wait on browserFetch still returns the rendered body with one warning', async () => {
-      (mockPage.waitForNetworkIdle as unknown as jest.Mock).mockRejectedValue(new Error('timeout'));
+      (mockPage.waitForNetworkIdle as unknown as jest.Mock<(...args: any[]) => any>).mockRejectedValue(new Error('timeout'));
       const service = createScrapingService();
       const body = await service.browserFetch('https://www.crunchyroll-store.test/search?q=lucy', {
         stealth: false,

@@ -8,6 +8,7 @@
  *   - GET /health   → same
  *   - GET /version  → { name, version, status:'ok' }
  *   - GET /health/detailed → the above + browserPool health + a timestamp, and ADDITIVELY
+ *     `residentialEgress: {configured, proxy?}` (the residential proxy, credentials stripped),
  *     `challengeCooldowns: [{host, remainingMs, reason}]` (the per-host CF cooldowns currently open)
  *     and `cfCookies: [{host, cookieNames, userAgentPinned, loadedAt, mintedAt?, expiresAt?, stale,
  *     staleSince?, staleReason?}]` (the stored-cookie jar's per-host view — cookie NAMES only, never a
@@ -28,6 +29,12 @@ export interface HealthDeps {
   listChallengeCooldowns: () => CooldownView[];
   /** The stored-cookie jar's per-host view (getCfCookieStore().view()) — names and flags, never values. */
   listCfCookies: () => CfCookieHostView[];
+  /**
+   * The residential-egress view (residentialEgressView()): whether a residential proxy is configured
+   * and, if so, its `scheme://host:port` — credentials are stripped at the source, since this
+   * endpoint is unauthenticated and RESIDENTIAL_PROXY_URL may carry `user:password@`.
+   */
+  getResidentialEgress: () => { configured: boolean; proxy?: string };
 }
 
 export function createHealthRoutes(deps: HealthDeps): Router {
@@ -54,6 +61,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         browserPool,
         challengeCooldowns: deps.listChallengeCooldowns(),
         cfCookies: deps.listCfCookies(),
+        residentialEgress: deps.getResidentialEgress(),
         timestamp: new Date().toISOString(),
       });
     } catch (error) {
@@ -62,6 +70,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         status: 'degraded',
         challengeCooldowns: deps.listChallengeCooldowns(),
         cfCookies: deps.listCfCookies(),
+        residentialEgress: deps.getResidentialEgress(),
         error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
