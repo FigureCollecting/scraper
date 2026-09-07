@@ -26,6 +26,9 @@ async function main(): Promise<void> {
     maxRequests: config.maxRequests,
     maxUrlsPerStore: config.maxUrlsPerStore,
     requestSpacingMs: config.requestSpacingMs,
+    requestTimeoutMs: config.requestTimeoutMs,
+    passDeadlineMs: config.passDeadlineMs,
+    lookupRetryDelayMs: config.lookupRetryDelayMs,
   });
   await runInitiatorPass(config, { fetch: httpFetch });
 }

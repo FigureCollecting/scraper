@@ -359,6 +359,66 @@ Cancel all failed items for a session (removes them from queue).
 }
 ```
 
+## Ingestion Initiator (interim discovery feeder)
+
+`node dist/initiator/run.js` performs ONE bounded discovery pass and exits — recurrence is the
+CronJob's schedule, stop is the CronJob's `suspend: true`. It is a thin HTTP client of this
+service's own `GET /lookup?q=&mode=&stores=` (search) and `POST /ingest/scrape`; it imports
+nothing from `src/driver/*`.
+
+- **One lookup per term x store.** Each call carries a SINGLE siteId in `&stores=`. The engine
+  bounds each store's search by `LOOKUP_STORE_TIMEOUT_MS` (15 s default), so a shared fan-out
+  made the slowest store the whole term's latency: on 2026-09-07 09:00Z amiami hit that bound,
+  the initiator's own `INITIATOR_REQUEST_TIMEOUT_MS` abort fired, and EVERY store reported
+  `discovered=0` for the hour. Scoped per store, a slow or failing store costs only its own
+  lookup. Only candidates for the store the call asked for are consumed.
+- **Stores run in parallel, a store's terms run in sequence.** Store-major submission put every
+  concurrent gate slot on the SAME store, so one hung store delayed every other store's first
+  lookup by a whole request timeout. One term at a time per store keeps the in-flight set on
+  distinct stores, and a term whose store has already filled `INITIATOR_MAX_URLS_PER_STORE` is
+  skipped entirely — its results could only be discarded. (`0` = the discovery-only dry run:
+  every term is still looked up.)
+- **Retry once, on transient faults only.** An abort/timeout, a network error, an HTTP 5xx, a
+  `429` or a `408` is retried ONE more time after `INITIATOR_LOOKUP_RETRY_DELAY_MS`. Any other
+  **4xx is never retried** (the same request would be refused the same way), and neither is a 2xx
+  body that will not parse. A store gets **one retry for the whole pass**, not one per term: a
+  store already failing would otherwise double both the discovery budget and the wall clock. The
+  retry is a normal request: same gate, same budget.
+- Discovered URLs are deduped per store ACROSS terms and capped at `INITIATOR_MAX_URLS_PER_STORE`;
+  each is POSTed to `/ingest/scrape`, which dedups by URL (re-running a pass is idempotent). The
+  initiator prefers a candidate's engine-derived `collectUrl` over its page `url`. The POSTs are
+  interleaved **round-robin across stores**, so a budget that runs out costs every store its Nth
+  URL instead of erasing the tail of `INITIATOR_STORES` on every pass.
+- Every request — lookups (retries included) and ingest POSTs — passes through ONE global gate
+  (concurrency, total budget, spacing) over the single egress IP, and the whole pass is bounded by
+  `INITIATOR_PASS_DEADLINE_MS` so an over-running pass cannot overlap the next CronJob tick.
+- **Size the budget**: `stores x terms` lookups `+ stores` retries `+ stores x maxUrlsPerStore`
+  ingests. Discovery spends the shared budget FIRST, so an under-sized budget silently drops
+  discovered URLs; the pass logs an `[ERROR]` at start when `INITIATOR_MAX_REQUESTS` is below that
+  figure, and another at the end naming how many URLs a spent budget dropped.
+- Each lookup call logs one INFO line whose HEADER carries its identity —
+  `[INITIATOR] lookup store=amiami term=lucy status=200 ms=812 candidates=12 kept=5` (`candidates`
+  = what the store returned, `kept` = what the per-store cap let through) — and every retry,
+  failure, or dropped ingest logs a WARN naming `store=` and `term=`. A terminal lookup failure
+  also counts toward that store's `errors`, so a store whose lookups all failed is not reported as
+  a healthy store with no matches. The run ends with an `[INITIATOR] pass complete` JSON summary
+  plus a per-store line: discovered, enqueued, deduplicated, errors, skipped, lookupAttempts,
+  lookupRetries, lookupFailures. The pass-level `lookupFailures` is the per-store sum.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SCRAPER_SERVICE_URL` | `http://localhost:3050` | The scraper's HTTP surface (the only thing the initiator talks to) |
+| `INITIATOR_STORES` | 7 proven-GO siteIds | csv of siteIds; explicitly empty = no work (kill switch) |
+| `INITIATOR_TERMS` | `nendoroid` | csv of discovery terms; explicitly empty = no work |
+| `INITIATOR_LOOKUP_MODE` | `listed` | `listed` (all, incl. sold-out) or `orderable` (in-stock only) |
+| `INITIATOR_MAX_CONCURRENCY` | `2` | Global max in-flight requests across all stores |
+| `INITIATOR_MAX_REQUESTS` | `60` | Global request budget (lookups + retries + ingest POSTs); size it as `stores x terms + stores + stores x maxUrlsPerStore`; `0` = kill switch |
+| `INITIATOR_MAX_URLS_PER_STORE` | `5` | Max distinct URLs enqueued per store per run, across terms; `0` = discovery-only dry run |
+| `INITIATOR_REQUEST_SPACING_MS` | `1000` | Minimum spacing between consecutive dispatches |
+| `INITIATOR_REQUEST_TIMEOUT_MS` | `20000` | Per-request abort timeout — keep it ABOVE the engine's `LOOKUP_STORE_TIMEOUT_MS` (15 s) plus assembly, or the client abort always wins and the engine's bounded answer is never seen |
+| `INITIATOR_LOOKUP_RETRY_DELAY_MS` | `5000` | Delay before the ONE retry a transiently-failed lookup gets; `0` = retry immediately |
+| `INITIATOR_PASS_DEADLINE_MS` | `2700000` | Wall-clock ceiling on one pass (45 min); past it nothing further is dispatched; `0` = no deadline |
+
 ## Catalog Crawler (ingestion feeder)
 
 `node dist/crawler/run.js` performs ONE bounded catalog-crawl pass and exits — recurrence is

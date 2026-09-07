@@ -30,6 +30,10 @@ export interface InitiatorConfig {
   requestSpacingMs: number;
   /** Per-request timeout, in ms, before the request is aborted (treated as a failure). */
   requestTimeoutMs: number;
+  /** Delay, in ms, before the ONE retry a transiently-failed lookup gets (0 = retry immediately). */
+  lookupRetryDelayMs: number;
+  /** Wall-clock ceiling, in ms, on one pass: past it nothing more is dispatched (0 = no deadline). */
+  passDeadlineMs: number;
 }
 
 /** The proven-GO route inventory (tonight's run) — the safe default store set. */
@@ -41,10 +45,21 @@ export const DEFAULT_TERMS = ['nendoroid'];
 const DEFAULTS = {
   scraperServiceUrl: 'http://localhost:3050',
   maxConcurrency: 2,
-  maxRequests: 40,
+  // Sized for the DEFAULT shape: stores x terms lookups (7) + one retry per store (7)
+  // + stores x maxUrlsPerStore ingests (35) = 49. An under-sized budget does not fail
+  // loudly — discovery wins it FIFO and the tail ingests are dropped in silence.
+  maxRequests: 60,
   maxUrlsPerStore: 5,
   requestSpacingMs: 1000,
-  requestTimeoutMs: 15000,
+  // ABOVE the engine's own per-store search bound (LOOKUP_STORE_TIMEOUT_MS, 15000 default)
+  // plus its assembly/serialization: an equal timeout means the client abort always wins
+  // and the operator never sees the engine's bounded partial answer.
+  requestTimeoutMs: 20000,
+  lookupRetryDelayMs: 5000,
+  // 45 min — comfortably inside an hourly CronJob schedule. Without a deadline the worst
+  // case is maxRequests x requestTimeoutMs / maxConcurrency, which can outrun the schedule
+  // and put two passes (two independent gates) on the single egress IP at once.
+  passDeadlineMs: 45 * 60 * 1000,
 };
 
 type Env = Record<string, string | undefined>;
@@ -92,5 +107,9 @@ export function loadInitiatorConfig(env: Env = process.env): InitiatorConfig {
     maxUrlsPerStore: nonNegInt(env.INITIATOR_MAX_URLS_PER_STORE, DEFAULTS.maxUrlsPerStore),
     requestSpacingMs: posInt(env.INITIATOR_REQUEST_SPACING_MS, DEFAULTS.requestSpacingMs),
     requestTimeoutMs: posInt(env.INITIATOR_REQUEST_TIMEOUT_MS, DEFAULTS.requestTimeoutMs),
+    // nonNeg, not pos: an explicit 0 means "retry at once", a legitimate setting.
+    lookupRetryDelayMs: nonNegInt(env.INITIATOR_LOOKUP_RETRY_DELAY_MS, DEFAULTS.lookupRetryDelayMs),
+    // nonNeg, not pos: an explicit 0 disables the deadline (unbounded pass), a legitimate setting.
+    passDeadlineMs: nonNegInt(env.INITIATOR_PASS_DEADLINE_MS, DEFAULTS.passDeadlineMs),
   };
 }

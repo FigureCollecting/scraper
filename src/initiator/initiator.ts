@@ -3,25 +3,42 @@
  * continuous initiator, only manual POSTs" and the full 2b crawl driver.
  *
  * WHAT IT DOES (and deliberately no more):
- *   1. DISCOVER — for each configured term, GET {scraper}/lookup?q= (the scraper's
- *      own cross-store search). The fan-out returns candidates for every store it
- *      knows; the initiator keeps only candidates for the CONFIGURED stores, bounded
- *      to maxUrlsPerStore each. Lookups are issued once per TERM (shared across
- *      stores) rather than per store: one fan-out already covers every store, so a
- *      per-store loop would multiply the scraper's upstream search egress needlessly.
+ *   1. DISCOVER — for each configured store, and within a store for each term IN SEQUENCE,
+ *      GET {scraper}/lookup?q=&stores=<ONE store> (the scraper's own search, scoped to that
+ *      one store). ONE LOOKUP PER STORE is deliberate: the scraper bounds each store's search
+ *      by LOOKUP_STORE_TIMEOUT_MS, and a shared fan-out made the SLOWEST store the whole
+ *      term's latency — one store hitting that bound tripped the initiator's own request
+ *      timeout and zeroed EVERY store's discovery for the pass (2026-09-07 09:00Z, amiami).
+ *      Scoped per store, a slow or failing store costs only its own lookup. The stores run in
+ *      parallel while a store's terms run one at a time, so the concurrent gate slots hold
+ *      DISTINCT stores (store-major submission let one hung store hold them all) and a term
+ *      whose store has already filled maxUrlsPerStore is skipped — its results could only be
+ *      discarded. Candidates are kept only for the store the call asked for, bounded to
+ *      maxUrlsPerStore per store ACROSS terms. A lookup that fails TRANSIENTLY — abort/timeout,
+ *      network error, HTTP 5xx, 429 or 408 — is retried ONCE after
+ *      INITIATOR_LOOKUP_RETRY_DELAY_MS; any other 4xx is NOT retried (the same request would be
+ *      refused the same way), and neither is a 2xx body that will not parse. A store gets ONE
+ *      retry for the whole pass, not one per term. The retry is an ordinary request — same
+ *      gate, same budget.
  *      Each candidate carries the store's product PAGE link (`url`) and, from an engine
  *      that emits it, `collectUrl` — the collect-ready URL the engine derived from its
  *      retrieval axes (the byId Store-API URL where declared, else the page link
  *      absolutized). The initiator PREFERS collectUrl and falls back to url, so it
  *      works against an older engine and never POSTs a relative or CF-fronted page
  *      link when the engine knows a better one.
- *   2. ENQUEUE — POST each discovered URL to {scraper}/ingest/scrape. The queue does
- *      the real work (per-host pacing, honesty gate, extraction, spine emit) and
- *      dedups by URL, so re-running a pass is idempotent.
+ *   2. ENQUEUE — POST each discovered URL to {scraper}/ingest/scrape, ROUND-ROBIN across
+ *      stores so a spent budget costs every store its Nth URL rather than erasing the tail
+ *      of the store list. The queue does the real work (per-host pacing, honesty gate,
+ *      extraction, spine emit) and dedups by URL, so re-running a pass is idempotent.
  *
  * GLOBAL EGRESS CEILING: every request — lookups AND ingests — passes through ONE
  * shared RequestGate, so the per-host pacing the queue already does is capped by a
  * cross-host concurrency limit and a total-request budget over the single egress IP.
+ * Discovery spends that shared budget FIRST, so an under-sized budget drops discovered
+ * URLs: size it as stores x terms + stores (retries) + stores x maxUrlsPerStore — the pass
+ * logs an ERROR when it is below that, and again when a spent budget actually dropped work.
+ * The pass is bounded in wall clock too (INITIATOR_PASS_DEADLINE_MS), so an over-running
+ * pass cannot overlap the next CronJob tick and double the egress the gate caps.
  *
  * NOT the full driver: this imports nothing from src/driver/* (no coverage ledger,
  * scheduler, or crawl loop) and holds no internal recurrence — recurrence is the
@@ -51,6 +68,10 @@ export interface InitiatorDeps {
   fetch: FetchLike;
   /** Override the gate (tests); defaults to one built from the config. */
   gate?: RequestGate;
+  /** Injectable delay used between a lookup and its retry (tests); defaults to setTimeout. */
+  sleep?: (ms: number) => Promise<void>;
+  /** Injectable clock for the pass deadline (tests); defaults to Date.now. */
+  now?: () => number;
 }
 
 export interface StoreSummary {
@@ -61,10 +82,16 @@ export interface StoreSummary {
   enqueued: number;
   /** Of `enqueued`, how many the queue coalesced onto a pending item (dedup key hit). */
   deduplicated: number;
-  /** Failed ingest POSTs + stores the fan-out reported as `failed`. */
+  /** Failed ingest POSTs, terminal lookup failures, and stores the fan-out reported as `failed`. */
   errors: number;
   /** Stores the fan-out reported as cooling / unsupported (deliberately left alone). */
   skipped: number;
+  /** Lookup calls actually dispatched for this store (retries included). */
+  lookupAttempts: number;
+  /** Of those, second attempts issued after a transient failure. */
+  lookupRetries: number;
+  /** Lookups that ended in failure — a 4xx, or a transient failure whose retry also failed. */
+  lookupFailures: number;
 }
 
 export interface RunSummary {
@@ -75,8 +102,10 @@ export interface RunSummary {
   requestBudget: number;
   requestsIssued: number;
   budgetExhausted: boolean;
+  /** True when the pass stopped dispatching because INITIATOR_PASS_DEADLINE_MS was reached. */
+  deadlineExceeded: boolean;
   peakInFlight: number;
-  /** Term-level /lookup failures (5xx / network / parse). */
+  /** Sum of the per-store lookupFailures (a failure is charged to its own store). */
   lookupFailures: number;
   totalDiscovered: number;
   totalEnqueued: number;
@@ -138,10 +167,21 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
       spacingMs: config.requestSpacingMs,
     });
 
-  const storeSet = new Set(config.stores);
+  const uniqueStores = config.stores.filter((s, i) => config.stores.indexOf(s) === i);
   const perStore = new Map<string, StoreSummary>();
   for (const siteId of config.stores) {
-    if (!perStore.has(siteId)) perStore.set(siteId, { siteId, discovered: 0, enqueued: 0, deduplicated: 0, errors: 0, skipped: 0 });
+    if (!perStore.has(siteId))
+      perStore.set(siteId, {
+        siteId,
+        discovered: 0,
+        enqueued: 0,
+        deduplicated: 0,
+        errors: 0,
+        skipped: 0,
+        lookupAttempts: 0,
+        lookupRetries: 0,
+        lookupFailures: 0,
+      });
   }
   // Distinct, capped candidate URLs per store.
   const discovered = new Map<string, Set<string>>();
@@ -159,8 +199,28 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
     s.add(url);
   };
 
-  let lookupFailures = 0;
   let budgetExhausted = false;
+  let deadlineExceeded = false;
+  /** Discovered URLs never POSTed because the budget or the deadline ran out (silent data loss). */
+  let droppedUrls = 0;
+  const now = deps.now ?? Date.now;
+  const passStartedMs = now();
+  /**
+   * The pass has a wall clock, not just a request budget: an hourly CronJob whose pass
+   * outruns its schedule puts two passes — two independent gates — on the single egress
+   * IP at once, which is exactly what the gate exists to prevent. Past the deadline
+   * nothing further is dispatched; what already ran is still summarized.
+   */
+  const pastDeadline = (): boolean => {
+    if (config.passDeadlineMs <= 0) return false;
+    if (now() - passStartedMs < config.passDeadlineMs) return false;
+    if (!deadlineExceeded) {
+      deadlineExceeded = true;
+      logger.warn(`[INITIATOR] pass deadline ${config.passDeadlineMs}ms reached — dispatching nothing further`);
+    }
+    return true;
+  };
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
 
   const summarize = (): RunSummary => {
     for (const [siteId, s] of discovered) {
@@ -180,8 +240,9 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
       requestBudget: config.maxRequests,
       requestsIssued: gate.issued(),
       budgetExhausted,
+      deadlineExceeded,
       peakInFlight: gate.peakInFlight(),
-      lookupFailures,
+      lookupFailures: stores.reduce((n, s) => n + s.lookupFailures, 0),
       totalDiscovered: stores.reduce((n, s) => n + s.discovered, 0),
       totalEnqueued: stores.reduce((n, s) => n + s.enqueued, 0),
       totalErrors: stores.reduce((n, s) => n + s.errors, 0),
@@ -199,74 +260,194 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
     return summary;
   }
 
-  // Scope the shared fan-out to THIS pass's configured stores — the initiator only cares about its
-  // proven-GO set, so narrowing the fan-out spares the scraper the upstream egress of the rest.
-  const lookupUrl = (term: string): string =>
-    `${config.scraperServiceUrl}/lookup?q=${encodeURIComponent(term)}&mode=${config.mode}&stores=${encodeURIComponent(config.stores.join(','))}`;
+  // Lookups and ingests share ONE budget and discovery spends it FIRST, so an under-sized
+  // budget silently drops discovered URLs instead of failing loudly. Say so, loudly.
+  const budgetNeeded =
+    uniqueStores.length * config.terms.length + uniqueStores.length + uniqueStores.length * config.maxUrlsPerStore;
+  if (config.maxRequests > 0 && config.maxRequests < budgetNeeded) {
+    logger.error(
+      `[INITIATOR] request budget ${config.maxRequests} is below the configured fan-out: ` +
+        `${budgetNeeded} needed (stores x terms lookups + one retry per store + stores x maxUrlsPerStore ingests). ` +
+        'Discovered URLs will be dropped unenqueued — raise INITIATOR_MAX_REQUESTS.',
+    );
+  }
+
+  // Each lookup asks for exactly ONE store, so one store's latency or failure is charged to that
+  // store alone (see the header: a shared fan-out let the slowest store zero the whole pass).
+  const lookupUrl = (term: string, siteId: string): string =>
+    `${config.scraperServiceUrl}/lookup?q=${encodeURIComponent(term)}&mode=${config.mode}&stores=${encodeURIComponent(siteId)}`;
   const ingestUrl = `${config.scraperServiceUrl}/ingest/scrape`;
 
-  // Phase 1 — DISCOVERY (one shared fan-out per term).
-  const discoverTerm = async (term: string): Promise<void> => {
-    try {
-      const r = await gate.run(() => httpGet(deps.fetch, lookupUrl(term), config.requestTimeoutMs));
-      if (r.status === 'budget-exhausted') {
-        budgetExhausted = true;
-        return;
-      }
-      const res = r.value;
-      if (!res.ok) {
-        lookupFailures++;
-        logger.warn('[INITIATOR] lookup failed', { term, status: res.status });
-        return;
-      }
-      const body = (await res.json()) as LookupResponseBody;
-      for (const sr of body.results ?? []) {
-        if (!sr.siteId || !storeSet.has(sr.siteId)) continue;
-        for (const c of sr.candidates ?? []) {
-          // Prefer the engine's collect-ready URL; fall back to the page url (older engine, or no
-          // collectUrl derivable). Dedup (setFor/addUrl) keys on whichever was chosen.
-          const u = typeof c.collectUrl === 'string' && c.collectUrl ? c.collectUrl : c.url;
-          if (typeof u === 'string' && u) addUrl(sr.siteId, u);
+  /**
+   * Consume ONE store-scoped lookup body. Returns `candidates` (usable URLs the store
+   * actually returned) and `kept` (how many the per-store cap let through) — a capped
+   * store returning results must not look, in the log, like a store returning nothing.
+   */
+  const consume = (siteId: string, body: LookupResponseBody): { candidates: number; kept: number } => {
+    const before = setFor(siteId).size;
+    let candidates = 0;
+    for (const sr of body.results ?? []) {
+      if (sr.siteId !== siteId) continue; // a body may echo other stores; only the asked-for one counts
+      for (const c of sr.candidates ?? []) {
+        // Prefer the engine's collect-ready URL; fall back to the page url (older engine, or no
+        // collectUrl derivable). Dedup (setFor/addUrl) keys on whichever was chosen.
+        const u = typeof c.collectUrl === 'string' && c.collectUrl ? c.collectUrl : c.url;
+        if (typeof u === 'string' && u) {
+          candidates++;
+          addUrl(siteId, u);
         }
       }
-      for (const rt of body.resolveTargets ?? []) {
-        if (rt.siteId && storeSet.has(rt.siteId) && typeof rt.url === 'string' && rt.url) addUrl(rt.siteId, rt.url);
+    }
+    for (const rt of body.resolveTargets ?? []) {
+      if (rt.siteId === siteId && typeof rt.url === 'string' && rt.url) {
+        candidates++;
+        addUrl(siteId, rt.url);
       }
-      for (const sid of body.failed ?? []) {
-        const ss = perStore.get(sid);
-        if (ss) ss.errors++;
-      }
-      for (const sid of [...(body.cooldown ?? []), ...(body.unsupported ?? [])]) {
-        const ss = perStore.get(sid);
-        if (ss) ss.skipped++;
-      }
+    }
+    const ss = perStore.get(siteId);
+    if (ss) {
+      if ((body.failed ?? []).includes(siteId)) ss.errors++;
+      if ((body.cooldown ?? []).includes(siteId) || (body.unsupported ?? []).includes(siteId)) ss.skipped++;
+    }
+    return { candidates, kept: setFor(siteId).size - before };
+  };
+
+  /**
+   * ONE lookup attempt. `retryable` = the fault a second call could survive (abort/timeout,
+   * network error, HTTP 5xx); `fatal` = one it could not (4xx — the same request would be
+   * rejected the same way — or a 2xx body that will not parse); `budget-exhausted` = never
+   * dispatched, so it is neither an attempt nor a failure.
+   */
+  type AttemptOutcome = { kind: 'ok' } | { kind: 'retryable' | 'fatal'; reason: string } | { kind: 'budget-exhausted' };
+
+  const attemptLookup = async (term: string, siteId: string, ss: StoreSummary): Promise<AttemptOutcome> => {
+    const startedMs = Date.now();
+    let res: HttpResponseLike;
+    try {
+      const r = await gate.run(() => httpGet(deps.fetch, lookupUrl(term, siteId), config.requestTimeoutMs));
+      if (r.status === 'budget-exhausted') return { kind: 'budget-exhausted' };
+      ss.lookupAttempts++;
+      res = r.value;
     } catch (error) {
-      lookupFailures++;
-      logger.warn('[INITIATOR] lookup errored', { term, error: error instanceof Error ? error.message : String(error) });
+      ss.lookupAttempts++; // dispatched, then aborted / failed in transport
+      const reason = error instanceof Error ? error.message : String(error);
+      logger.info(`[INITIATOR] lookup store=${siteId} term=${term} status=0 ms=${Date.now() - startedMs} candidates=0 kept=0 error=${reason}`);
+      return { kind: 'retryable', reason };
+    }
+    if (!res.ok) {
+      logger.info(`[INITIATOR] lookup store=${siteId} term=${term} status=${res.status} ms=${Date.now() - startedMs} candidates=0 kept=0`);
+      // 5xx is the engine/upstream faulting; 429 and 408 are the two 4xx a second call after a
+      // delay genuinely survives. Every other 4xx is a fault the same request would repeat.
+      const transient = res.status >= 500 || res.status === 429 || res.status === 408;
+      return { kind: transient ? 'retryable' : 'fatal', reason: `status ${res.status}` };
+    }
+    try {
+      const { candidates, kept } = consume(siteId, (await res.json()) as LookupResponseBody);
+      logger.info(`[INITIATOR] lookup store=${siteId} term=${term} status=${res.status} ms=${Date.now() - startedMs} candidates=${candidates} kept=${kept}`);
+      return { kind: 'ok' };
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      logger.info(`[INITIATOR] lookup store=${siteId} term=${term} status=${res.status} ms=${Date.now() - startedMs} candidates=0 kept=0 error=${reason}`);
+      return { kind: 'fatal', reason };
     }
   };
-  await Promise.all(config.terms.map((term) => discoverTerm(term)));
+
+  // Phase 1 — DISCOVERY. Per store: its terms run SEQUENTIALLY, and the stores run in
+  // parallel under the gate. Store-major submission put every concurrent gate slot on the
+  // SAME store, so one hung store held them all and delayed every other store's first
+  // lookup by a whole request timeout. Running one term at a time per store keeps the
+  // in-flight set on distinct stores, lets a term see what the previous term already
+  // discovered, and caps a store's retries at one for the pass.
+  const discoverOne = async (term: string, siteId: string, ss: StoreSummary, state: { retryUsed: boolean }): Promise<void> => {
+    const first = await attemptLookup(term, siteId, ss);
+    if (first.kind === 'ok') return;
+    if (first.kind === 'budget-exhausted') {
+      budgetExhausted = true;
+      return;
+    }
+    if (first.kind === 'fatal') {
+      ss.lookupFailures++;
+      ss.errors++;
+      logger.warn(`[INITIATOR] lookup store=${siteId} term=${term} failed (not retried): ${first.reason}`);
+      return;
+    }
+    // Transient — but a store gets ONE retry for the whole pass, not one per term: a store
+    // that is already failing would otherwise double the discovery budget and the wall clock.
+    if (state.retryUsed) {
+      ss.lookupFailures++;
+      ss.errors++;
+      logger.warn(`[INITIATOR] lookup store=${siteId} term=${term} failed (store retry already spent): ${first.reason}`);
+      return;
+    }
+
+    logger.warn(`[INITIATOR] lookup store=${siteId} term=${term} failed, retrying once in ${config.lookupRetryDelayMs}ms: ${first.reason}`);
+    if (config.lookupRetryDelayMs > 0) await sleep(config.lookupRetryDelayMs);
+    const second = await attemptLookup(term, siteId, ss);
+    if (second.kind === 'budget-exhausted') {
+      budgetExhausted = true;
+      ss.lookupFailures++;
+      ss.errors++;
+      logger.warn(`[INITIATOR] lookup store=${siteId} term=${term} retry skipped (request budget spent)`);
+      return;
+    }
+    state.retryUsed = true;
+    ss.lookupRetries++;
+    if (second.kind === 'ok') return;
+    ss.lookupFailures++;
+    ss.errors++;
+    logger.warn(`[INITIATOR] lookup store=${siteId} term=${term} failed after retry: ${second.reason}`);
+  };
+
+  const discoverStore = async (siteId: string): Promise<void> => {
+    const ss = perStore.get(siteId);
+    if (!ss) return;
+    const state = { retryUsed: false };
+    for (const term of config.terms) {
+      // A full URL cap makes another term's lookup pure waste — everything it returns is
+      // discarded by addUrl. (Cap 0 is the documented discovery-only dry run: still look up.)
+      if (config.maxUrlsPerStore > 0 && setFor(siteId).size >= config.maxUrlsPerStore) break;
+      if (pastDeadline()) break;
+      await discoverOne(term, siteId, ss, state);
+    }
+  };
+  await Promise.all(uniqueStores.map((siteId) => discoverStore(siteId)));
 
   // Phase 2 — ENQUEUE (per store, per discovered URL). One bad store/URL is logged
   // and skipped; it never aborts the rest of the pass.
+  //
+  // ROUND-ROBIN, not store-major: the gate reserves its budget slot in submission
+  // order, so a store-major list makes a spent budget erase the TAIL stores entirely
+  // (deterministically, every pass). Interleaved, an exhausted budget costs each store
+  // its Nth URL instead. The store list is deduped so a siteId repeated in
+  // INITIATOR_STORES cannot POST the same URL twice.
+  const perStoreUrls = uniqueStores.map((siteId) => ({ siteId, urls: [...setFor(siteId)] }));
   const flat: Array<{ siteId: string; url: string }> = [];
-  for (const siteId of config.stores) {
-    for (const url of setFor(siteId)) flat.push({ siteId, url });
+  const deepest = perStoreUrls.reduce((n, s) => Math.max(n, s.urls.length), 0);
+  for (let i = 0; i < deepest; i++) {
+    for (const { siteId, urls } of perStoreUrls) {
+      if (i < urls.length) flat.push({ siteId, url: urls[i] });
+    }
   }
 
   const enqueueOne = async ({ siteId, url }: { siteId: string; url: string }): Promise<void> => {
     const ss = perStore.get(siteId);
     if (!ss) return;
+    if (pastDeadline()) {
+      droppedUrls++;
+      return;
+    }
     try {
       const r = await gate.run(() => httpPostJson(deps.fetch, ingestUrl, { url }, config.requestTimeoutMs));
       if (r.status === 'budget-exhausted') {
         budgetExhausted = true;
+        droppedUrls++;
+        logger.warn(`[INITIATOR] ingest skipped store=${siteId} (request budget spent) url=${url}`);
         return;
       }
       const res = r.value;
       if (!res.ok) {
         ss.errors++;
-        logger.warn('[INITIATOR] ingest rejected', { siteId, status: res.status });
+        logger.warn(`[INITIATOR] ingest rejected store=${siteId} status=${res.status} url=${url}`);
         return;
       }
       const body = (await res.json().catch(() => ({}))) as IngestResponseBody;
@@ -274,12 +455,21 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
       if (body.deduplicated === true) ss.deduplicated++;
     } catch (error) {
       ss.errors++;
-      logger.warn('[INITIATOR] ingest errored', { siteId, error: error instanceof Error ? error.message : String(error) });
+      logger.warn(`[INITIATOR] ingest errored store=${siteId} url=${url}: ${error instanceof Error ? error.message : String(error)}`);
     }
   };
   await Promise.all(flat.map((item) => enqueueOne(item)));
 
   const summary = summarize();
+  if (droppedUrls > 0) {
+    logger.error(
+      `[INITIATOR] pass dropped ${droppedUrls} discovered URL(s) unenqueued: ` +
+        `${summary.budgetExhausted ? `the request budget (${summary.requestBudget}) ran out after ${summary.requestsIssued} requests` : ''}` +
+        `${summary.budgetExhausted && summary.deadlineExceeded ? ' and ' : ''}` +
+        `${summary.deadlineExceeded ? `the pass deadline (${config.passDeadlineMs}ms) was reached` : ''}. ` +
+        'Raise INITIATOR_MAX_REQUESTS or narrow the store/term set.',
+    );
+  }
   logger.info('[INITIATOR] pass complete', summary as unknown as Record<string, unknown>);
   for (const s of summary.stores) {
     logger.info('[INITIATOR] store summary', s as unknown as Record<string, unknown>);
