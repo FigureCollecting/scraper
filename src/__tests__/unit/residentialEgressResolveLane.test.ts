@@ -20,6 +20,7 @@ import { ResidentialEgressUnavailableError } from '../../services/residentialEgr
 import type { LookupRegistry } from '../../services/engineLookup';
 import type {
   ExtractContext,
+  SearchFetch,
   ExtractedData,
   ExtractionRuleset,
   SiteConfig,
@@ -196,7 +197,7 @@ describe('ExtractContext page passthroughs — residential egress gate', () => {
   });
 
   it('keeps an OFF-STORE fetchBody off the residential exit as well', async () => {
-    const capturingFetch = jest.fn(async () => ({ html: '{}' }));
+    const capturingFetch = jest.fn<Promise<{ html: string }>, [string, SearchFetch | undefined, unknown?]>(async () => ({ html: '{}' }));
     const ctx = buildExtractContext({
       config: CONFIG,
       logger: LOGGER,
