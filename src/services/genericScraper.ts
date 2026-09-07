@@ -571,7 +571,10 @@ export class BrowserPool {
    *  re-passing Cloudflare once, acceptable ONLY on a failure, never per-call. */
   static async retireStealthBrowser(browser: Browser): Promise<void> {
     console.warn('[BROWSER POOL] Retiring the stealth browser after a context-close failure');
-    if (this.stealthBrowser === browser) this.stealthBrowser = null;
+    if (this.stealthBrowser === browser) {
+      this.stealthBrowser = null;
+      this.stealthLaunch = null;
+    }
     // Every kept context on this browser dies with it — forget them rather than hand one out.
     getPersistentContexts().dropBrowser(browser);
     await browser.close().catch((err: any) => console.error('[BROWSER POOL] Error closing retired stealth browser:', err));
@@ -614,14 +617,30 @@ export class BrowserPool {
    * long-lived browser whose already-passed challenges (and their cookies) survive between fetches.
    */
   private static stealthBrowser: Browser | null = null;
+  /**
+   * The IN-FLIGHT launch. Caching only the resolved browser let two concurrent first fetches each
+   * start a Chrome; the second assignment orphaned the first, and closeAll only ever closes the
+   * survivor — so the orphan outlived SIGTERM and held the process open.
+   */
+  private static stealthLaunch: Promise<Browser> | null = null;
 
   static async getStealthBrowser(): Promise<Browser> {
-    if (!this.stealthBrowser) {
+    if (this.stealthBrowser) return this.stealthBrowser;
+    if (!this.stealthLaunch) {
       console.log('[BROWSER POOL] Creating the challenge-lane browser...');
-      this.stealthBrowser = await puppeteer.launch(this.getBrowserConfig());
+      this.stealthLaunch = puppeteer.launch(this.getBrowserConfig())
+        .then((browser) => {
+          this.stealthBrowser = browser;
+          return browser;
+        })
+        // Cleared either way: a FAILED launch must be retried by the next fetch, not cached as a
+        // permanently rejected promise.
+        .finally(() => {
+          this.stealthLaunch = null;
+        });
     }
 
-    return this.stealthBrowser;
+    return await this.stealthLaunch;
   }
 
   static async closeAll(): Promise<void> {
@@ -629,6 +648,7 @@ export class BrowserPool {
     // it — miss it and the process hangs on an orphaned Chrome.
     const challengeLane = this.stealthBrowser;
     this.stealthBrowser = null;
+    this.stealthLaunch = null;
 
     // Kept (challenge-gated) contexts first: they outlive requests, so nothing else closes them.
     const kept = getPersistentContexts().drain();

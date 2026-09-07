@@ -127,6 +127,49 @@ describe('browser launch profile (BROWSER_LAUNCH_MODE)', () => {
     });
   });
 
+  /**
+   * The challenge-lane browser is a singleton because its passed challenges are the asset. Caching
+   * the RESOLVED browser (not the launch) let two concurrent first fetches launch two Chromes and
+   * orphan one: closeAll only ever closes the survivor, so the orphan outlives SIGTERM and holds the
+   * process open — the hang the shutdown close was written to fix, reachable again under load.
+   */
+  describe('challenge-lane singleton', () => {
+    afterEach(async () => {
+      await BrowserPool.reset();
+      (BrowserPool as any).stealthBrowser = null;
+      (BrowserPool as any).stealthLaunch = null;
+    });
+
+    it('launches ONE browser under concurrent first calls', async () => {
+      (BrowserPool as any).stealthBrowser = null;
+      (BrowserPool as any).stealthLaunch = null;
+      jest.mocked(puppeteer.launch).mockClear();
+      jest.mocked(puppeteer.launch).mockImplementation(async () => ({
+        close: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
+        connected: true,
+      } as unknown as Browser));
+
+      const [first, second] = await Promise.all([
+        BrowserPool.getStealthBrowser(),
+        BrowserPool.getStealthBrowser(),
+      ]);
+
+      expect(puppeteer.launch).toHaveBeenCalledTimes(1);
+      expect(first).toBe(second);
+    });
+
+    it('relaunches after a failed launch instead of caching the rejection', async () => {
+      (BrowserPool as any).stealthBrowser = null;
+      (BrowserPool as any).stealthLaunch = null;
+      jest.mocked(puppeteer.launch)
+        .mockRejectedValueOnce(new Error('no display'))
+        .mockResolvedValueOnce({ close: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined), connected: true } as unknown as Browser);
+
+      await expect(BrowserPool.getStealthBrowser()).rejects.toThrow('no display');
+      await expect(BrowserPool.getStealthBrowser()).resolves.toBeDefined();
+    });
+  });
+
   it('returns a fresh args array per call (no shared mutable module state)', () => {
     const first = buildBrowserConfig({ BROWSER_LAUNCH_MODE: 'clean-headful' } as NodeJS.ProcessEnv);
     first.args.push('--mutated');
