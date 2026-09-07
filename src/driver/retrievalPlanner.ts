@@ -129,9 +129,9 @@ function declaredStrings(value: unknown): string[] {
  * then lowercase if declared. No declaration ⇒ `encodeURIComponent` alone — today's behavior for
  * every store that does not carry the field.
  *
- * anitoys is why this exists: its route reads a single-encoded `/` as path structure and answers
- * HTTP 404, while its own client (`format_keywords`, public_2019.js) sends `%252f` and gets the
- * item's SERP card — so "star origin 1/6" must leave here as `star+origin+1%252f6`.
+ * Path-segment search routes are why this exists: they read a single-encoded `/` as path structure
+ * and answer HTTP 404 instead of a zero-result page, so a scale-bearing query such as
+ * "star origin 1/6" must leave here as `star+origin+1%252f6` for the store that declares it.
  */
 export function encodeSearchQuery(query: string, encoding?: QueryEncoding): string {
   let raw = query;

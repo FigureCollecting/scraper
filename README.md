@@ -244,14 +244,18 @@ these steps applied, in this order and no other:
 | `spaces: 'percent' \| 'plus'` | `plus` rewrites every `%20` to `+`; `percent` (the default) leaves it |
 | `lowercase: boolean` | lowercase the finished segment |
 
-The store this was built for is anitoys, whose own search box encodes with `format_keywords`
-(`public_2019.js`) and whose route rejects anything else. Declared as
-`{ reEncodePercentOf: ['%25','%3b','%2f','%40','%3a','%26','%3d','%2b','%24','%2c','%23','%3f'], spaces: 'plus', lowercase: true }`,
-`"star origin 1/6"` leaves as `star+origin+1%252f6` and the store answers HTTP 200 with the item's
-SERP card; a single `encodeURIComponent` sends `star%20origin%201%2F6` and the store answers HTTP
-404 "Page Not Found" — a broken route, not a zero result. That store resolves records by `scale`,
-so a scale-bearing query is its normal shape, and the naive encoding contributes zero candidates
-for items it stocks.
+This exists for storefronts that carry `{q}` in a PATH SEGMENT: there a singly-escaped `/` is read
+as path structure, so the route does not match and the store answers HTTP 404 rather than a
+zero-result page — indistinguishable, from the caller's side, from "this store has nothing". A
+store on `https://example.test/Search-{q}/list-r1.html` declaring
+`{ reEncodePercentOf: ['%2f'], spaces: 'plus', lowercase: true }` gets `"star origin 1/6"` as
+`star+origin+1%252f6` instead of `star%20origin%201%2F6`. It matters wherever records resolve by a
+scale-bearing identity, which makes a query carrying "1/6" that store's normal shape.
+
+Which escapes a store re-encodes, which substrings it strips and whether it folds case are the
+store's own business: they are declared in that store's (private) plugin profile. The engine holds
+no store's rules — it replays the declaration it is handed, and applies one `encodeURIComponent`
+when there is none.
 
 ### POST /reset-pool (Test Environment Only)
 **This endpoint is only available in non-production environments.**

@@ -42,10 +42,13 @@ describe('retrieval URL resolvers', () => {
   });
 
   describe('encodeSearchQuery — the declared {q} encoding (bySearch.queryEncoding)', () => {
-    // anitoys' own client-side `format_keywords` (public_2019.js), declared field by field.
-    const ANITOYS: QueryEncoding = {
+    // A path-segment search route (`/Search-{q}/list-r1.html`): '/' must arrive as data, spaces as
+    // '+', the segment case-folded, and the declaring store's own client deletes double quotes
+    // rather than escaping them. Synthetic on purpose — a real store's escape list lives in its own
+    // private profile, not in the engine. The VECTORS below are the live-measured ones.
+    const PATH_SEGMENT_ROUTE: QueryEncoding = {
       strip: ['"'],
-      reEncodePercentOf: ['%25', '%3b', '%2f', '%40', '%3a', '%26', '%3d', '%2b', '%24', '%2c', '%23', '%3f'],
+      reEncodePercentOf: ['%25', '%2f', '%3a'],
       spaces: 'plus',
       lowercase: true,
     };
@@ -56,20 +59,20 @@ describe('retrieval URL resolvers', () => {
       expect(encodeSearchQuery('Honkai: Star Rail Firefly')).toBe('Honkai%3A%20Star%20Rail%20Firefly');
     });
 
-    // MEASURED 2026-09-07 through the residential browser lane: the naive
-    // `Search-star%20origin%201%2F6/list-r1.html` answers HTTP 404 "Page Not Found" (a broken
-    // route), while this one answers 200 with goods_id 29358268 "Star Origin Studio 1/6 Lucy".
-    it('anitoys: a scale-bearing query reaches the route with the slash double-encoded', () => {
-      expect(encodeSearchQuery('star origin 1/6', ANITOYS)).toBe('star+origin+1%252f6');
+    // MEASURED 2026-09-07 through the residential browser lane against the declaring store: the
+    // naive `Search-star%20origin%201%2F6/list-r1.html` answers HTTP 404 "Page Not Found" (a broken
+    // route), while the form below answers 200 with the queried item's own SERP card.
+    it('a scale-bearing query reaches the route with the slash double-encoded', () => {
+      expect(encodeSearchQuery('star origin 1/6', PATH_SEGMENT_ROUTE)).toBe('star+origin+1%252f6');
     });
 
-    it('anitoys: a colon is re-encoded and the whole segment lowercased', () => {
-      expect(encodeSearchQuery('Honkai: Star Rail Firefly', ANITOYS)).toBe('honkai%253a+star+rail+firefly');
+    it('a colon is re-encoded and the whole segment lowercased', () => {
+      expect(encodeSearchQuery('Honkai: Star Rail Firefly', PATH_SEGMENT_ROUTE)).toBe('honkai%253a+star+rail+firefly');
     });
 
-    it('anitoys: a plain single-word query is untouched', () => {
-      expect(encodeSearchQuery('lucy', ANITOYS)).toBe('lucy');
-      expect(encodeSearchQuery('Lucy', ANITOYS)).toBe('lucy');
+    it('a plain single-word query is untouched', () => {
+      expect(encodeSearchQuery('lucy', PATH_SEGMENT_ROUTE)).toBe('lucy');
+      expect(encodeSearchQuery('Lucy', PATH_SEGMENT_ROUTE)).toBe('lucy');
     });
 
     it('matches the escape case-insensitively but emits the DECLARED spelling', () => {
@@ -80,7 +83,7 @@ describe('retrieval URL resolvers', () => {
 
     it('re-encodes a literal percent without eating its own output', () => {
       // '%' → '%25' → '%2525'; the pass must not then re-match the %25 it just wrote.
-      expect(encodeSearchQuery('50% off', ANITOYS)).toBe('50%2525+off');
+      expect(encodeSearchQuery('50% off', PATH_SEGMENT_ROUTE)).toBe('50%2525+off');
     });
 
     it('ignores a declaration entry that is not a percent-escape', () => {
@@ -104,11 +107,11 @@ describe('retrieval URL resolvers', () => {
       expect(encodeSearchQuery('a.b', { strip: ['.'] })).toBe('ab');
     });
 
-    // format_keywords opens with `keywords.replace(/"/g, '')` — the ONE character it deletes rather
-    // than escapes. Undeclared, a quoted free-text lookup would ship a %22 the store's own search
-    // box can never emit, and the SERP comes back card-free.
-    it('anitoys: a quoted query is stripped of its quotes, as the store client does', () => {
-      expect(encodeSearchQuery('Rem "Re:Zero" 1/7', ANITOYS)).toBe('rem+re%253azero+1%252f7');
+    // The declaring store's client deletes double quotes before encoding — the ONE character it
+    // drops rather than escapes. Undeclared, a quoted free-text lookup ships a %22 that store's own
+    // search box can never emit, and the SERP comes back card-free with no error to see.
+    it('a quoted query is stripped of its quotes, as the declaring store client does', () => {
+      expect(encodeSearchQuery('Rem "Re:Zero" 1/7', PATH_SEGMENT_ROUTE)).toBe('rem+re%253azero+1%252f7');
     });
 
     it('a malformed declaration degrades to the plain encoding instead of throwing', () => {
@@ -120,10 +123,10 @@ describe('retrieval URL resolvers', () => {
     it('resolveSearchUrl applies the declaration when the store carries one', () => {
       expect(
         resolveSearchUrl(
-          { bySearch: { urlTemplate: 'https://www.anitoysgk.com/Search-{q}/list-r1.html', queryEncoding: ANITOYS } },
+          { bySearch: { urlTemplate: 'https://example.test/Search-{q}/list-r1.html', queryEncoding: PATH_SEGMENT_ROUTE } },
           'star origin 1/6',
         ),
-      ).toBe('https://www.anitoysgk.com/Search-star+origin+1%252f6/list-r1.html');
+      ).toBe('https://example.test/Search-star+origin+1%252f6/list-r1.html');
     });
   });
 

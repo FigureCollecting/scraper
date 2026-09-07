@@ -279,19 +279,24 @@ export interface RetrievalCapability {
  *   5. `lowercase` — lowercase the whole encoded segment.
  * Absent ⇒ step 2 alone: byte-identical to today for every store that does not declare it.
  *
- * The worked example is anitoys, whose own client encodes the search box with `format_keywords`
- * (public_2019.js) and whose route 404s on anything else:
+ * The shape this exists for: a storefront that carries `{q}` in a PATH SEGMENT rather than a query
+ * parameter. There a singly-escaped `/` is read as path STRUCTURE — the route does not match, the
+ * store answers 404, and the caller cannot tell that from "no results". The character has to arrive
+ * as data, which is what re-encoding its escape's own `%` achieves:
  * ```ts
- * queryEncoding: {
- *   reEncodePercentOf: ['%25', '%3b', '%2f', '%40', '%3a', '%26', '%3d', '%2b', '%24', '%2c', '%23', '%3f'],
- *   spaces: 'plus',
- *   lowercase: true,
+ * bySearch: {
+ *   urlTemplate: 'https://example.test/Search-{q}/list-r1.html',
+ *   queryEncoding: { reEncodePercentOf: ['%2f'], spaces: 'plus', lowercase: true },
  * }
+ * // "star origin 1/6" → "star+origin+1%252f6"  (a plain encodeURIComponent → "star%20origin%201%2F6")
  * ```
- * `"star origin 1/6"` → `star+origin+1%252f6` (HTTP 200, the item's own SERP card), where a single
- * `encodeURIComponent` → `star%20origin%201%2F6` → HTTP 404 "Page Not Found". This is not cosmetic:
- * that store's `identity.resolveBy` includes `scale`, so a record-mode query carrying "1/6" is the
- * NORMAL shape there and the naive encoding contributes zero candidates for stocked items.
+ * This is not cosmetic for a store whose records resolve by a scale-bearing identity: a query
+ * carrying "1/6" is that store's NORMAL shape, and the naive encoding contributes zero candidates
+ * for items it stocks.
+ *
+ * WHICH escapes a store re-encodes, WHICH substrings it strips and WHETHER it folds case are that
+ * store's business and live in its own (private) plugin profile — the engine only replays what a
+ * plugin hands it and never carries a store's rules itself.
  */
 export interface QueryEncoding {
   /**

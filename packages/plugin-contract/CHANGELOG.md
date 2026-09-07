@@ -7,8 +7,8 @@ package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [0.8.0] - 2026-09-07
 
 Additive, backward-compatible: every existing `bySearch` still compiles unchanged, and a store that
-declares nothing gets a byte-identical URL (one `encodeURIComponent`). Built for anitoys, whose
-search route 404s on the encoding every other store accepts.
+declares nothing gets a byte-identical URL (one `encodeURIComponent`). Built for path-segment search
+routes, which 404 on the encoding every query-parameter store accepts.
 
 ### Added
 - `RetrievalCapability.bySearch.queryEncoding?: QueryEncoding` (and the `QueryEncoding` export) — a
@@ -18,11 +18,12 @@ search route 404s on the encoding every other store accepts.
   case-insensitively and emitted in the DECLARED spelling), then `spaces` (`plus` rewrites `%20` →
   `+`; `percent`, the default, leaves it), then `lowercase`.
   Absent ⇒ today's single `encodeURIComponent`.
-  The worked example is anitoys' own `format_keywords` (public_2019.js): with the declaration
-  `"star origin 1/6"` → `star+origin+1%252f6` and the store answers HTTP 200 with the item's card;
-  without it → `star%20origin%201%2F6` and the store answers HTTP 404 "Page Not Found" — a broken
-  route, not a zero result. That store resolves records by `scale`, so scale-bearing queries are its
-  normal shape and the naive encoding contributes zero candidates for items it stocks.
+  A store on `https://example.test/Search-{q}/list-r1.html` declaring
+  `{ reEncodePercentOf: ['%2f'], spaces: 'plus', lowercase: true }` sends `"star origin 1/6"` as
+  `star+origin+1%252f6` and gets the item's card; without the declaration it sends
+  `star%20origin%201%2F6` and gets HTTP 404 "Page Not Found" — a broken route, not a zero result.
+  Which escapes, strips and case-folding a given store needs stay in that store's own plugin
+  profile; the contract carries only the vocabulary.
 
 ## [0.7.0] - 2026-09-07
 

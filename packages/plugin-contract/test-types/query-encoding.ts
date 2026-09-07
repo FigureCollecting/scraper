@@ -4,23 +4,26 @@
  * 0.8.0 bump (queryEncoding does not exist ⇒ an excess-property error, QueryEncoding has no
  * export); GREEN after. A `bySearch` WITHOUT the field must keep compiling (the default = today's
  * single `encodeURIComponent`).
+ *
+ * The store here is synthetic on purpose: which escapes, strips and case-folding a real store needs
+ * belong to that store's own plugin profile, never to the contract.
  */
 import type { QueryEncoding, StoreCapabilities } from '../src/index';
 
-// anitoys: the store's own `format_keywords` (public_2019.js), declared field by field.
-const anitoys: QueryEncoding = {
+// A path-segment search route: '/' must reach it as data ('%252f'), spaces as '+', segment folded.
+const pathSegmentRoute: QueryEncoding = {
   strip: ['"'],
-  reEncodePercentOf: ['%25', '%3b', '%2f', '%40', '%3a', '%26', '%3d', '%2b', '%24', '%2c', '%23', '%3f'],
+  reEncodePercentOf: ['%2f', '%3a'],
   spaces: 'plus',
   lowercase: true,
 };
 
 const store: StoreCapabilities = {
-  siteId: 'anitoys',
-  name: 'Anitoysgk',
-  domains: ['anitoysgk.com'],
+  siteId: 'example',
+  name: 'Example Store',
+  domains: ['example.test'],
   rateLimit: {
-    domain: 'anitoysgk.com',
+    domain: 'example.test',
     baseDelayMs: 3000,
     minDelayMs: 1500,
     maxDelayMs: 30000,
@@ -32,9 +35,9 @@ const store: StoreCapabilities = {
   allowedCookies: [],
   retrieval: {
     bySearch: {
-      urlTemplate: 'https://www.anitoysgk.com/Search-{q}/list-r1.html',
+      urlTemplate: 'https://example.test/Search-{q}/list-r1.html',
       scope: 'listed',
-      queryEncoding: anitoys,
+      queryEncoding: pathSegmentRoute,
     },
   },
 };
@@ -65,7 +68,7 @@ const rejectsNonListStrip: NonNullable<StoreCapabilities['retrieval']> = {
 
 void stripOnly;
 void rejectsNonListStrip;
-void anitoys;
+void pathSegmentRoute;
 void store;
 void spacesOnly;
 void undeclared;
