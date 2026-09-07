@@ -191,6 +191,24 @@ describe('PersistentContextCache', () => {
     expect(first.entry.inUse).toBe(1); // a retain claims nothing
   });
 
+  it('discards an idle entry the lane no longer trusts, and hands it back to close', () => {
+    const cache = new PersistentContextCache();
+    const { entry } = cache.store('a|direct', { browser, context: makeContext('c1'), inUse: 0 });
+
+    expect(cache.discard(entry)).toBe(entry);
+    expect(cache.size()).toBe(0);
+    expect(cache.discard(entry)).toBeUndefined(); // already gone: nothing to close twice
+  });
+
+  it('refuses to discard an entry another fetch is still running on', () => {
+    const cache = new PersistentContextCache();
+    const { entry } = cache.store('a|direct', { browser, context: makeContext('c1'), inUse: 2 });
+    cache.release(entry);
+
+    expect(cache.discard(entry)).toBeUndefined();
+    expect(cache.size()).toBe(1);
+  });
+
   it('still replaces an in-use entry whose browser has died (nothing to close it on)', () => {
     const dead = { connected: false } as unknown as Browser;
     const cache = new PersistentContextCache();

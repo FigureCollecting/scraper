@@ -209,6 +209,21 @@ describe('browser lane persistent contexts', () => {
     expect(events.indexOf(`goto:${target}`)).toBeGreaterThan(lastInterstitial);
   });
 
+  /**
+   * A page that will not close is a live renderer on a context that OUTLIVES the request — the exact
+   * shape of the swallowed `close()` failure that once climbed to ~25 GB. The ephemeral path already
+   * fails loud (count it, retire the browser); the kept path must at least stop reusing that context.
+   */
+  it('retires a kept context whose page will not close, instead of reusing it', async () => {
+    const service = createScrapingService();
+    jest.mocked(mockPage.close).mockRejectedValue(new Error('page.close() timed out'));
+
+    await service.browserFetch('https://www.anitoysgk.com/lucy.html', { challengeGated: true });
+
+    expect(contexts[0].close).toHaveBeenCalledTimes(1);
+    expect(getPersistentContexts().size()).toBe(0);
+  });
+
   it('closes every persistent context on pool shutdown', async () => {
     const service = createScrapingService();
     await service.browserFetch('https://www.anitoysgk.com/lucy.html', { challengeGated: true });

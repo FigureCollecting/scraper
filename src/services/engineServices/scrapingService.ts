@@ -458,11 +458,20 @@ export function createScrapingService(
       }
       return await fn(page);
     } finally {
+      let pageClosed = true;
       await page.close().catch((err: unknown) => {
+        pageClosed = false;
         // eslint-disable-next-line no-console
         console.warn(`[BROWSER LANE] failed to close a page on a kept context: ${err instanceof Error ? err.message : String(err)}`);
       });
       contexts.release(entry);
+      // A page that will not close is a live renderer on a context that OUTLIVES the request — the
+      // shape of leak that once climbed to ~25 GB. Stop reusing that context: drop it from the cache
+      // and close it, paying one re-challenge on the next fetch rather than accumulating renderers.
+      if (!pageClosed) {
+        const discarded = contexts.discard(entry);
+        if (discarded) await closeEvicted([discarded]);
+      }
     }
   }
 

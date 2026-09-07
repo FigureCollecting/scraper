@@ -165,6 +165,19 @@ export class PersistentContextCache {
     entry.lastUsedAt = Date.now();
   }
 
+  /**
+   * Drop an entry the caller no longer trusts (a page on it would not close) and hand it back to be
+   * closed. `undefined` — a no-op — when another fetch is still running on it (closing a context out
+   * from under a live fetch is the one thing this cache never does; that context dies with its
+   * browser at shutdown instead) or when the key has already moved on to a different entry.
+   */
+  discard(entry: PersistentContextEntry): PersistentContextEntry | undefined {
+    if (entry.inUse > 0) return undefined;
+    if (this.entries.get(entry.key) !== entry) return undefined;
+    this.entries.delete(entry.key);
+    return entry;
+  }
+
   /** Forget every entry on a browser that is gone (its contexts died with it — nothing to close). */
   dropBrowser(browser: Browser): void {
     for (const [key, entry] of this.entries) {
