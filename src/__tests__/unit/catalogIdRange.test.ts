@@ -110,6 +110,18 @@ describe('assembleCatalog — idRange', () => {
     expect(assembleCatalog(svc).idRange('mfc', 10, 2).status).toBe('ok');
   });
 
+  it('unsupported for a byId template with no `{id}` placeholder — every id in the window would share one url', () => {
+    const noPlaceholder: StoreCapabilities = {
+      ...MFC,
+      siteId: 'flat',
+      domains: ['flat.test'],
+      retrieval: { byId: { urlTemplate: 'https://flat.test/item' }, byRange: true },
+    };
+    const out = assembleCatalog(services(noPlaceholder)).idRange('flat', 100, 3);
+    expect(out).toMatchObject({ status: 'unsupported', siteId: 'flat' });
+    expect((out as { reason: string }).reason).toContain('{id}');
+  });
+
   it('failed for a `from` that is not a positive safe integer', () => {
     const cat = assembleCatalog(services(MFC));
     for (const from of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 2]) {

@@ -259,8 +259,8 @@ later as the ingest fetch's own 404 — a miss in the ingest lane, not an error 
 
 **Errors:** `400` bad input (blank `store`, `range` other than `1`, `range` with `page`, missing or
 non-positive-integer `from`, non-positive-integer `count`) · `422 { error: "unsupported", siteId, reason }`
-(unknown store, no `byRange` axis, or no `byId` template to build item urls from) ·
-`503 { error: "cooldown", siteId, host, remainingMs }` with `Retry-After` while the item host cools
+(unknown store, no `byRange` axis, or no `byId` template — or one without an `{id}` placeholder — to
+build item urls from) · `503 { error: "cooldown", siteId, host, remainingMs }` with `Retry-After` while the item host cools
 from a Cloudflare challenge · `502 { error: "catalog failed", siteId, reason }`.
 
 ### Search query encoding (`retrieval.bySearch.queryEncoding`)

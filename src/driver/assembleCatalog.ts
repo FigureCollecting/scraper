@@ -131,7 +131,11 @@ export function assembleCatalog(services: CatalogServices): Catalog {
       // byRange is the store's DECLARATION that its ids are sequential/enumerable; byId is what turns
       // one of those ids into a fetchable URL. Neither alone makes a walk valid.
       if (caps.retrieval?.byRange !== true) return { status: 'unsupported', siteId, reason: 'store declares no byRange axis' };
-      if (!caps.retrieval?.byId?.urlTemplate) return { status: 'unsupported', siteId, reason: 'store declares no byId axis to build item urls from' };
+      const byIdTemplate = caps.retrieval?.byId?.urlTemplate;
+      if (!byIdTemplate) return { status: 'unsupported', siteId, reason: 'store declares no byId axis to build item urls from' };
+      // Without the placeholder every id in the window resolves to the SAME url: the queue would
+      // coalesce them onto one fetch while the crawler ledgered each id as done and walked past it.
+      if (!byIdTemplate.includes('{id}')) return { status: 'unsupported', siteId, reason: 'byId urlTemplate has no {id} placeholder to walk' };
       if (!Number.isSafeInteger(from) || from < 1) {
         return { status: 'failed', siteId, reason: `invalid from ${from} (must be a positive integer)` };
       }
