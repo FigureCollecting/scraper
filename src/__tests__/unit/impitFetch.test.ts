@@ -587,3 +587,108 @@ describe('createImpitFetch — stored-cookie jar seeding + pinned UA (CfCookieSt
     }
   });
 });
+
+/**
+ * RESIDENTIAL EGRESS (contract 0.7.0): a store declaring `egress: 'residential'` has its impit
+ * fetches routed through the engine's residential proxy. impit 0.14.x takes a `proxyUrl` on the
+ * Impit constructor (SOCKS5/HTTP; unsupported when HTTP/3 is on — so the engine never enables it),
+ * which means the proxy is a property of the SESSION, not of a request. Two rules follow:
+ *   - the session cache must be keyed by (profile, proxy) — a proxied and a direct session for the
+ *     same profile must never share one Impit, or they would share its cookie jar and a clearance
+ *     minted from the residential IP would be replayed from the node IP (and vice versa);
+ *   - an undeclared store must be byte-identical: no `proxyUrl` key reaches the constructor at all.
+ */
+describe('createImpitFetch — residential egress (proxyUrl threading + per-proxy session isolation)', () => {
+  beforeEach(() => { mockImpitCtorOpts.length = 0; });
+
+  const PROXY = 'socks5://egress-proxy.fc.svc.cluster.local:1055';
+  const OTHER_PROXY = 'socks5://127.0.0.1:1055';
+
+  /** A factory spy that records the (browser, proxyUrl) pair it was built for, per build. */
+  function recordingFactory() {
+    const builds: Array<{ browser: string; proxyUrl?: string }> = [];
+    const make = (browser: string, _jar: CookieJarLike, _timeoutMs: number, proxyUrl?: string): ImpitLike => {
+      builds.push({ browser, ...(proxyUrl ? { proxyUrl } : {}) });
+      return { fetch: async () => ({ text: async () => 'ok' }) };
+    };
+    return { make, builds };
+  }
+
+  it('passes the declared proxy through to the Impit factory for a residential store', async () => {
+    const f = recordingFactory();
+    const impitFetch = createImpitFetch(f.make);
+    await impitFetch('https://www.anitoysgk.com/lucy-p29358268.html', { browser: 'chrome142', proxyUrl: PROXY });
+    expect(f.builds).toEqual([{ browser: 'chrome142', proxyUrl: PROXY }]);
+  });
+
+  it('builds NO proxy for an undeclared store (byte-identical to the pre-egress path)', async () => {
+    const f = recordingFactory();
+    const impitFetch = createImpitFetch(f.make);
+    await impitFetch('https://api.amiami.com/items?s_keywords=tomie', { browser: 'chrome142' });
+    expect(f.builds).toEqual([{ browser: 'chrome142' }]);
+  });
+
+  it('keys the session cache by (profile, proxy): direct and proxied sessions for ONE profile are SEPARATE Impits', async () => {
+    const f = recordingFactory();
+    const impitFetch = createImpitFetch(f.make);
+    await impitFetch('https://x.test/a', { browser: 'chrome142' });                      // direct
+    await impitFetch('https://x.test/b', { browser: 'chrome142', proxyUrl: PROXY });     // proxied → new session
+    await impitFetch('https://x.test/c', { browser: 'chrome142', proxyUrl: PROXY });     // same pair → reuse
+    await impitFetch('https://x.test/d', { browser: 'chrome142' });                      // direct again → reuse
+    expect(f.builds).toEqual([{ browser: 'chrome142' }, { browser: 'chrome142', proxyUrl: PROXY }]);
+  });
+
+  it('separates sessions per PROXY as well as per profile (two proxies never share a cookie jar)', async () => {
+    const f = recordingFactory();
+    const impitFetch = createImpitFetch(f.make);
+    await impitFetch('https://x.test/a', { browser: 'chrome142', proxyUrl: PROXY });
+    await impitFetch('https://x.test/b', { browser: 'chrome142', proxyUrl: OTHER_PROXY });
+    await impitFetch('https://x.test/c', { browser: 'chrome124', proxyUrl: PROXY });
+    expect(f.builds).toEqual([
+      { browser: 'chrome142', proxyUrl: PROXY },
+      { browser: 'chrome142', proxyUrl: OTHER_PROXY },
+      { browser: 'chrome124', proxyUrl: PROXY },
+    ]);
+  });
+
+  it('gives each proxied session its OWN jar: stored cookies are seeded into it, and a prime lands there only', async () => {
+    // The proxied session must be self-contained — stored cookies seeded, prime-once discipline intact —
+    // and its clearance must not appear in the direct session's jar (separate Impits ⇒ separate jars).
+    const seen: Array<{ proxied: boolean; cookie: string }> = [];
+    const make = (_browser: string, jar: CookieJarLike, _timeoutMs: number, proxyUrl?: string): ImpitLike => ({
+      fetch: async (url) => {
+        if (url === 'https://www.anitoysgk.com') { await jar.setCookie('primed=1; Path=/', url); return { text: async () => 'homepage' }; }
+        seen.push({ proxied: proxyUrl !== undefined, cookie: String(await jar.getCookieString(url)) });
+        return { text: async () => 'ok' };
+      },
+    });
+    const store = {
+      cookiesFor: (url: string) => (url.includes('anitoysgk') ? { cf_clearance: 'FAKE_cf_1' } : undefined),
+      userAgentFor: () => undefined,
+    };
+    const impitFetch = createImpitFetch(make, { store });
+
+    const target = 'https://www.anitoysgk.com/lucy-p29358268.html';
+    await impitFetch(target, { browser: 'chrome142', proxyUrl: PROXY, prime: { url: 'https://www.anitoysgk.com' } });
+    await impitFetch(target, { browser: 'chrome142' }); // the DIRECT session for the same profile
+
+    expect(seen[0]).toEqual({ proxied: true, cookie: expect.stringContaining('cf_clearance=FAKE_cf_1') });
+    expect(seen[0].cookie).toContain('primed=1');   // the proxied session's own prime landed in its jar
+    expect(seen[1].proxied).toBe(false);
+    expect(seen[1].cookie).toContain('cf_clearance=FAKE_cf_1'); // stored cookies seeded into the direct jar too
+    expect(seen[1].cookie).not.toContain('primed=1');           // …but NOT the proxied session's prime
+  });
+
+  it('the REAL default factory forwards proxyUrl into new Impit({ proxyUrl }) and never enables HTTP/3 (proxies are unsupported with it)', async () => {
+    await createImpitFetch()('https://x.test/s', { browser: 'chrome142', proxyUrl: PROXY }); // DEFAULT factory → mocked Impit
+    expect(mockImpitCtorOpts).toHaveLength(1);
+    expect(mockImpitCtorOpts[0]).toMatchObject({ proxyUrl: PROXY, followRedirects: true });
+    expect(mockImpitCtorOpts[0].http3).toBeUndefined();
+  });
+
+  it('the REAL default factory omits the proxyUrl key entirely for a direct fetch', async () => {
+    await createImpitFetch()('https://x.test/s', { browser: 'chrome142' });
+    expect(mockImpitCtorOpts).toHaveLength(1);
+    expect(mockImpitCtorOpts[0]).not.toHaveProperty('proxyUrl');
+  });
+});
