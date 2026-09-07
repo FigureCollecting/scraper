@@ -702,6 +702,22 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     const count = Math.min(config.rangeIdsPerRun, cursor);
     const out = await fetchCatalog(st, rangeUrl(st.siteId, cursor, count), { from: cursor, count }, 'range');
     if (out.kind !== 'page') return;
+    // The cursor moves by POSITION in this window, so the window must BE the descending run that was
+    // asked for: ids `cursor, cursor-1, …`. A shorter one is fine (the engine clamps its window, and
+    // the walk bottoms out at id 1); a reordered / gapped / short-of-the-top one is a malformed body,
+    // and walking it would silently strand whichever ids it left out. Refuse it before POSTing.
+    const contiguous = out.items.length > 0 && out.items.every((it, i) => it.itemId === String(cursor - i));
+    if (!contiguous) {
+      st.summary.errors++;
+      logger.warn('[CRAWLER] id-range window is not the requested descending run — cursor kept', {
+        siteId: st.siteId,
+        from: cursor,
+        count,
+        received: out.items.length,
+        firstId: out.items[0]?.itemId,
+      });
+      return;
+    }
     const { handled, accepted, rejected } = await processPage(st, out.items, 'range');
     st.summary.rangeWalked += handled;
     if (handled === 0) {

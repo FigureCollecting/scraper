@@ -1228,6 +1228,46 @@ describe('runCrawlerPass — id-range backfill', () => {
     expect(s.stores[0]).toMatchObject({ enqueued: 2, errors: 1, rangeWalked: 3, rangeCursor: 497 });
   });
 
+  it('refuses a window that is not the descending run it asked for — no POST, no cursor movement', async () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      const store = createMemoryLedgerStore();
+      // A window whose first item is unusable (dropped by sanitize) would otherwise move the cursor
+      // by an ARRAY INDEX and skip id 500 forever.
+      const skewed = (siteId: string, from: number) => ({
+        status: 200,
+        body: {
+          siteId,
+          from,
+          items: [{ itemId: null }, ...[499, 498, 497, 496].map((id) => ({ itemId: String(id), collectUrl: collectUrl(siteId, String(id)) }))],
+          hasMore: true,
+          count: 5,
+        },
+      });
+      const fake = makeFake({ catalog: (s) => failed(s), range: skewed });
+      const s = await runCrawlerPass(rangeOnly({ rangeFrontiers: { mfc: 500 } }), { fetch: fake.fetch, ledgerStore: store, now: clock().now });
+
+      expect(fake.posted()).toEqual([]);
+      expect(store.saveLog).toEqual([]);
+      expect(s.stores[0]).toMatchObject({ errors: 1, rangeWalked: 0, rangeCursor: null });
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('descending run'))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('accepts a window SHORTER than the one it asked for (the engine clamps at 200) and moves the cursor by the ids returned', async () => {
+    const store = createMemoryLedgerStore();
+    const short = (siteId: string, from: number) => okRange(siteId, from, 3); // asked for 5, served 3
+    const fake = makeFake({ catalog: (s) => failed(s), range: short });
+    const s = await runCrawlerPass(rangeOnly({ rangeFrontiers: { mfc: 500 } }), { fetch: fake.fetch, ledgerStore: store, now: clock().now });
+
+    expect(fake.rangeCalls()).toEqual([['mfc', 500, 5]]);
+    expect(fake.posted()).toEqual(['500', '499', '498'].map((id) => collectUrl('mfc', id)));
+    expect(store.files.get('mfc')!.range!.cursor).toBe(497);
+    expect(s.stores[0]).toMatchObject({ rangeWalked: 3, rangeCursor: 497, errors: 0 });
+  });
+
   it('a 503 cooldown on the RANGE axis skips the store for the run: no POSTs, no cursor written', async () => {
     const fake = makeFake({ catalog: (s) => failed(s), range: (s) => cooldown(s) });
     const store = createMemoryLedgerStore();

@@ -594,7 +594,10 @@ because the newest ids always outrank the deep id space for the run's budget.
   template, so every id flows through exactly the same ledger dedup, enqueue cap and global request
   budget as a listing item — the ledger semantics are untouched, only the source of the ids differs.
   Ids already in the ledger are skipped without a POST but still consume the walk, so they are never
-  looked at twice.
+  looked at twice. The window must BE the descending run that was asked for (`from`, `from-1`, …); a
+  SHORTER one is fine (the engine clamps at 200 ids, and the walk bottoms out at id 1), but a
+  reordered, gapped or short-of-the-top one is refused as a malformed body — counted as an error,
+  nothing POSTed, cursor untouched — because the cursor moves by position within the window.
 - **Cursor** — `range.cursor` in the ledger is the next id to walk, and it moves DOWN only by the
   number of ids actually HANDLED (POSTed, skipped as known, or deterministically 4xx-rejected). An id
   the per-store cap, the global budget or a 5xx from `/ingest/scrape` cut off is left above the
