@@ -372,7 +372,19 @@ export function browserLaneView(env: NodeJS.ProcessEnv = process.env): BrowserLa
 
 export class BrowserPool {
   private static browsers: Browser[] = [];
-  private static readonly POOL_SIZE = 3; // Keep 3 browsers ready
+  /**
+   * Warm pooled browsers. The launch profile is process-wide, so in clean-headful mode these are
+   * FULL headful Chromes (their own GPU/viz process, a 1280x900 surface, and none of the headless
+   * profile's memory-relevant flags) — and the challenge-lane browser is an additional always-on
+   * one. The 3-browser HEADLESS warm pool already measured ~2.5 GB against this pod's 3 Gi limit, so
+   * clean-headful gives one pool slot back to keep the total at three browsers. The headless default
+   * (CI, tests, every non-gated store) is unchanged at 3.
+   */
+  private static readonly HEADLESS_POOL_SIZE = 3;
+  private static readonly CLEAN_HEADFUL_POOL_SIZE = 2;
+  private static get POOL_SIZE(): number {
+    return isCleanHeadfulMode() ? this.CLEAN_HEADFUL_POOL_SIZE : this.HEADLESS_POOL_SIZE;
+  }
   private static isInitialized = false;
 
   // Per-context lifecycle counters. Browsers are intentionally long-lived (a

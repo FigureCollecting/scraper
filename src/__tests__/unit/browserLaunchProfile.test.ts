@@ -1,4 +1,7 @@
-import { buildBrowserConfig, isCleanHeadfulMode } from '../../services/genericScraper';
+import { jest } from '@jest/globals';
+import puppeteer from 'puppeteer';
+import type { Browser } from 'puppeteer';
+import { BrowserPool, buildBrowserConfig, isCleanHeadfulMode } from '../../services/genericScraper';
 
 /**
  * The launch profile is the difference between passing a Cloudflare JS challenge and staring at
@@ -86,6 +89,42 @@ describe('browser launch profile (BROWSER_LAUNCH_MODE)', () => {
 
     expect(headless.executablePath).toBe('/opt/chrome/chrome');
     expect(clean.executablePath).toBe('/opt/chrome/chrome');
+  });
+
+  /**
+   * The profile is process-wide: in clean-headful mode the warm POOL is full headful Chromes too,
+   * each with its own GPU/viz process and a 1280x900 surface, and the challenge-lane browser is an
+   * additional always-on one. The 3-browser HEADLESS warm pool already measured ~2.5 GB against a
+   * 3 Gi limit, so the pool gives a slot back to keep the total at three browsers.
+   */
+  describe('warm pool size', () => {
+    const savedMode = process.env.BROWSER_LAUNCH_MODE;
+
+    afterEach(async () => {
+      if (savedMode === undefined) delete process.env.BROWSER_LAUNCH_MODE;
+      else process.env.BROWSER_LAUNCH_MODE = savedMode;
+      await BrowserPool.reset();
+    });
+
+    it('keeps three warm browsers on the headless profile', () => {
+      delete process.env.BROWSER_LAUNCH_MODE;
+      expect(BrowserPool.getPoolCapacity()).toBe(3);
+    });
+
+    it('warms one fewer in clean-headful mode, and launches only that many', async () => {
+      process.env.BROWSER_LAUNCH_MODE = 'clean-headful';
+      expect(BrowserPool.getPoolCapacity()).toBe(2);
+
+      jest.mocked(puppeteer.launch).mockClear();
+      jest.mocked(puppeteer.launch).mockResolvedValue({
+        close: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
+        connected: true,
+      } as unknown as Browser);
+      await BrowserPool.initialize();
+
+      expect(puppeteer.launch).toHaveBeenCalledTimes(2);
+      expect(BrowserPool.getPoolSize()).toBe(2);
+    });
   });
 
   it('returns a fresh args array per call (no shared mutable module state)', () => {
