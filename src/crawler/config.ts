@@ -58,7 +58,10 @@ export interface CrawlerConfig {
    * crawler never spends a request discovering that a store has no `byRange` axis.
    */
   rangeStores: string[];
-  /** ID-RANGE: max ids walked per store per run (the window size asked of GET /catalog?range=1). */
+  /**
+   * ID-RANGE: max ids walked per store per run (the window size asked of GET /catalog?range=1),
+   * clamped to MAX_RANGE_IDS_PER_RUN — the engine would silently hand back a shorter window.
+   */
   rangeIdsPerRun: number;
   /**
    * Seed frontiers per siteId, from `CRAWLER_RANGE_FRONTIER_<SITEID>`, used ONLY when the store's
@@ -69,6 +72,14 @@ export interface CrawlerConfig {
 }
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * The largest id-range window the engine will serve: GET /catalog?range=1 clamps `count` to 200
+ * (MAX_ID_RANGE_COUNT in src/driver/assembleCatalog.ts — the crawler imports nothing from the driver,
+ * so the two must be kept in step). Asking for more silently yields 200, so the operator's value is
+ * clamped HERE, once, with a WARN, rather than being truncated invisibly on the wire.
+ */
+export const MAX_RANGE_IDS_PER_RUN = 200;
 
 /** The first store armed for continuous collection (orzgk: Woo Store API, 100/page, newest-first). */
 export const DEFAULT_CRAWLER_STORES = ['orzgk'];
@@ -157,6 +168,14 @@ const parseFrontiers = (env: Env, stores: string[]): Record<string, number> => {
   return out;
 };
 
+/** Positive int, clamped to `max` with a WARN naming the env var when the operator asked for more. */
+const clampedPosInt = (raw: string | undefined, fallback: number, max: number, envName: string): number => {
+  const n = posInt(raw, fallback);
+  if (n <= max) return n;
+  logger.warn(`[CRAWLER] ${envName} clamped to the engine's window ceiling`, { requested: n, applied: max });
+  return max;
+};
+
 const parseMode = (raw: string | undefined): CrawlerMode => (raw === 'recent' || raw === 'backfill' ? raw : 'both');
 
 export function loadCrawlerConfig(env: Env = process.env): CrawlerConfig {
@@ -183,7 +202,7 @@ export function loadCrawlerConfig(env: Env = process.env): CrawlerConfig {
     reobserveAfterMs: nonNegInt(env.CRAWLER_REOBSERVE_AFTER_MS, DEFAULTS.reobserveAfterMs),
     exhaustedRecheckMs: posInt(env.CRAWLER_EXHAUSTED_RECHECK_MS, DEFAULTS.exhaustedRecheckMs),
     rangeStores: csv(env.CRAWLER_RANGE_STORES ?? ''),
-    rangeIdsPerRun: posInt(env.CRAWLER_RANGE_IDS_PER_RUN, DEFAULTS.rangeIdsPerRun),
+    rangeIdsPerRun: clampedPosInt(env.CRAWLER_RANGE_IDS_PER_RUN, DEFAULTS.rangeIdsPerRun, MAX_RANGE_IDS_PER_RUN, 'CRAWLER_RANGE_IDS_PER_RUN'),
     rangeFrontiers: parseFrontiers(env, stores),
   };
 }

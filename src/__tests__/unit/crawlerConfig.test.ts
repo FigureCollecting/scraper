@@ -171,4 +171,18 @@ describe('loadCrawlerConfig', () => {
     expect(loadCrawlerConfig({ CRAWLER_RANGE_IDS_PER_RUN: '0' }).rangeIdsPerRun).toBe(50);
     expect(loadCrawlerConfig({ CRAWLER_RANGE_IDS_PER_RUN: 'x' }).rangeIdsPerRun).toBe(50);
   });
+
+  it('clamps CRAWLER_RANGE_IDS_PER_RUN to the engine window ceiling (200) with a WARN naming the var', () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      expect(loadCrawlerConfig({ CRAWLER_RANGE_IDS_PER_RUN: '1000' }).rangeIdsPerRun).toBe(200);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('CRAWLER_RANGE_IDS_PER_RUN'))).toBe(true);
+      expect(warn).toHaveBeenCalledTimes(1);
+      // At or below the ceiling nothing is clamped and nothing is warned.
+      expect(loadCrawlerConfig({ CRAWLER_RANGE_IDS_PER_RUN: '200' }).rangeIdsPerRun).toBe(200);
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
 });

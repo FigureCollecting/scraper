@@ -72,7 +72,11 @@ export type IdRangeResult =
   | { status: 'cooldown'; siteId: string; host: string; remainingMs: number }
   | { status: 'failed'; siteId: string; reason: string };
 
-/** Default and clamp for an id-range window's size (ids per call). */
+/**
+ * Default and clamp for an id-range window's size (ids per call). The crawler clamps its own
+ * CRAWLER_RANGE_IDS_PER_RUN to the same ceiling (MAX_RANGE_IDS_PER_RUN in src/crawler/config.ts) so
+ * an operator asking for more is warned there instead of silently receiving a shorter window here.
+ */
 const DEFAULT_ID_RANGE_COUNT = 50;
 const MAX_ID_RANGE_COUNT = 200;
 

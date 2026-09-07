@@ -534,7 +534,7 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
 | `CRAWLER_REOBSERVE_AFTER_MS` | `604800000` (7d) | Recent only: re-POST a known item once its entry is this old; `0` = never |
 | `CRAWLER_EXHAUSTED_RECHECK_MS` | `604800000` (7d) | Re-check an exhausted store's last cursor after this long |
 | `CRAWLER_RANGE_STORES` | *(none)* | csv of siteIds that walk their sequential id space; empty = no id-range walking at all |
-| `CRAWLER_RANGE_IDS_PER_RUN` | `50` | Max ids walked per store per run (the window asked of `/catalog?range=1`) |
+| `CRAWLER_RANGE_IDS_PER_RUN` | `50` | Max ids walked per store per run (the window asked of `/catalog?range=1`); clamped to the engine's `200`-id ceiling with a WARN |
 | `CRAWLER_RANGE_FRONTIER_<SITEID>` | *(none)* | Seed frontier for a store whose ledger has no numeric itemId yet; `<SITEID>` = the siteId uppercased with every non-alphanumeric character replaced by `_` |
 
 **Ledger** — one file per store, `<CRAWLER_LEDGER_DIR>/<siteId>.json`, written as
