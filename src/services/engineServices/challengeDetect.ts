@@ -18,9 +18,11 @@
 /**
  * CF-challenge-specific script/token markers. Each of these strings is emitted by Cloudflare's
  * challenge machinery and does not occur on a real product page:
- *   - __cf_chl_               — challenge script globals (e.g. __cf_chl_ctx / __cf_chl_managed_tk__)
  *   - _cf_chl_opt             — window._cf_chl_opt challenge options object
  *   - cf-browser-verification — legacy "I'm Under Attack" verification container
+ *
+ * The challenge script globals are matched by CHALLENGE_GLOBAL below rather than by a bare
+ * `__cf_chl_` substring, which also matched the challenge token in a post-challenge page's referrer.
  *
  * The bare token 'challenge-platform' is deliberately NOT a marker. Cloudflare injects the
  * Bot-Management TELEMETRY scripts /cdn-cgi/challenge-platform/scripts/jsd/main.js and
@@ -29,10 +31,23 @@
  * challenge's own loader is matched by CHALLENGE_LOADER instead, which telemetry never satisfies.
  */
 const TOKEN_MARKERS = [
-  '__cf_chl_',
   '_cf_chl_opt',
   'cf-browser-verification',
 ] as const;
+
+/**
+ * The challenge script GLOBALS — `__cf_chl_ctx`, `__cf_chl_managed_tk__`, `__cf_chl_f_tk` — but NOT
+ * the challenge TOKEN carried in a URL (`__cf_chl_tk=` / `__cf_chl_rt_tk=`, raw or percent-encoded).
+ *
+ * The page a browser lands on AFTER passing a challenge is the store's real document, and it carries
+ * the challenge URL it arrived from as a referrer: measured on www.suruga-ya.jp 2026-09-07, 115 KB of
+ * genuine product HTML contained `…%3F__cf_chl_tk%3DHrivctpp…` inside an analytics `ref=` parameter.
+ * The bare `__cf_chl_` prefix flagged that real page as an interstitial — which, on the ingest path,
+ * hard-fails the first fetch of every challenge-gated store, i.e. exactly the fetches the browser
+ * lane exists to make. Nothing is lost by excluding the URL form: a genuine interstitial always also
+ * carries the globals above and `_cf_chl_opt`.
+ */
+const CHALLENGE_GLOBAL = /__cf_chl_(?!(?:rt_)?tk(?:=|%3d))/i;
 
 /**
  * The CF managed-challenge INTERSTITIAL loader path — /cdn-cgi/challenge-platform/h/<x>/orchestrate/chl_page/…
@@ -71,13 +86,15 @@ const BLOCK_MARKER = 'cf-error-details';
 /**
  * Whether `html` is a Cloudflare interstitial — a managed-JS / IUAM challenge OR a block / rate-limit
  * error page — rather than real content. Conservative: true only when a challenge-specific token is
- * present, OR the challenge loader path is present, OR the challenge <title> is present, OR the IUAM
- * body copy is present, OR a CF block/rate-limit error-page marker is present. Non-string / empty
- * input is never a challenge.
+ * present, OR a challenge script global is present (never the challenge token in a URL), OR the
+ * challenge loader path is present, OR the challenge <title> is present, OR the IUAM body copy is
+ * present, OR a CF block/rate-limit error-page marker is present. Non-string / empty input is never
+ * a challenge.
  */
 export function isCloudflareChallenge(html: string): boolean {
   if (typeof html !== 'string' || html.length === 0) return false;
   if (TOKEN_MARKERS.some(marker => html.includes(marker))) return true;
+  if (CHALLENGE_GLOBAL.test(html)) return true;
   if (CHALLENGE_LOADER.test(html)) return true;
   if (CHALLENGE_TITLE.test(html)) return true;
   if (html.includes(IUAM_BODY_COPY)) return true;
