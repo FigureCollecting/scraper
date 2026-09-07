@@ -2,12 +2,14 @@
  * browserTimezone — which timezone a browser page must EMULATE, chosen by the egress it leaves
  * through.
  *
- * Cloudflare's non-interactive JS challenge scores the browser's environment against the exit IP's
- * geolocation, and the timezone is one of the terms. Measured 2026-09-07 on anitoysgk.com: the
- * proven clean-Chrome recipe through the residential exit (Florida) with the browser on UTC — the
- * container's own zone — never clears the challenge; the identical setup with `America/Chicago`
- * clears it in seconds. A wrong zone fails SILENTLY (the page just stays on "Just a moment"), which
- * is exactly why this is config, not a constant.
+ * Cloudflare's non-interactive JS challenge treats a browser that reports the UTC zone — the
+ * container default, and something no real person's browser reports — as automation. Measured
+ * 2026-09-07 on anitoysgk.com through the residential exit (Florida): the proven clean-Chrome recipe
+ * with the browser on UTC (or Etc/GMT) never clears; the identical setup with `America/Chicago`,
+ * `America/New_York` or even `Asia/Tokyo` clears in seconds. So the check is NOT a geolocation
+ * match — the tell is UTC itself — but matching the egress IP's zone is the defensible default and
+ * what the deploy sets. A UTC browser fails SILENTLY (the page just stays on "Just a moment"),
+ * which is exactly why this is config, not a constant.
  *
  * It cannot be the process TZ: one pooled browser serves residential and direct stores side by
  * side, so the override belongs to the PAGE (CDP `Emulation.setTimezoneOverride`, i.e. puppeteer's

@@ -420,8 +420,9 @@ export function createScrapingService(
   async function preparePage(page: Page, options: EnginePageOptions): Promise<void> {
     // TIMEZONE follows the EGRESS, per page: the residential exit's zone for a proxied context,
     // the node's own for a direct one. Applied BEFORE any navigation — a challenge samples the
-    // environment on its first script, and a zone that disagrees with the exit IP's geolocation
-    // silently never clears. Nothing configured ⇒ no CDP call (CI/tests unchanged).
+    // environment on its first script, and a browser left on the container's UTC zone silently
+    // never clears (any real named zone passes; the egress's zone is the defensible default).
+    // Nothing configured ⇒ no CDP call (CI/tests unchanged).
     await applyEgressTimezone(page, Boolean(options.proxyServer));
     if (options.viewport) {
       await page.setViewport(options.viewport);

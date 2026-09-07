@@ -817,7 +817,7 @@ See `.env.example` for complete configuration template.
   - Unset or any other value → the historical headless profile (what CI and the tests use)
   - Default: unset
 - `RESIDENTIAL_EGRESS_TIMEZONE` / `DIRECT_EGRESS_TIMEZONE`: IANA timezone each egress emulates on its browser contexts (e.g. `America/Chicago` for the residential exit, `America/New_York` for the OVH node)
-  - A timezone that disagrees with the exit IP's geolocation makes the challenge never clear, with no error at all
+  - A browser left on the container's UTC zone never clears the challenge, with no error at all (any real named zone passes; the egress IP's own zone is the defensible default)
   - Unset → emulate nothing (the browser keeps its own zone)
   - Default: unset
 
@@ -858,7 +858,7 @@ What passes, with no human, no clicking and no solver:
 | `--ozone-platform=headless` | renders headful with no X server and no Xvfb — the pod needs no display |
 | `ignoreDefaultArgs: ['--enable-automation']` + `--disable-blink-features=AutomationControlled` | removes the automation switch the challenge scores on |
 | a minimal flag list, `defaultViewport: null` | every extra flag and every device-metrics override is one more thing that can disagree with a real browser |
-| `RESIDENTIAL_EGRESS_TIMEZONE` / `DIRECT_EGRESS_TIMEZONE` | the browser's timezone must match the exit IP's geolocation. With the residential exit in the US and the browser on the container's UTC, the identical setup **never clears — silently**. Emulated per context (`page.emulateTimezone`), never as a process TZ, because one browser serves both egresses at once |
+| `RESIDENTIAL_EGRESS_TIMEZONE` / `DIRECT_EGRESS_TIMEZONE` | the browser must not report the container's UTC zone (measured 2026-09-07: UTC and Etc/GMT **never clear — silently**; America/Chicago, America/New_York and even Asia/Tokyo all clear, so the egress IP's own zone is the default, not a requirement). Emulated per context (`page.emulateTimezone`), never as a process TZ, because one browser serves both egresses at once |
 | no cosmetic UA/viewport overrides | the lane does not rewrite a Chrome 152's UA to the historical `Chrome/127` string (client hints contradict it, and Cloudflare binds the clearance to the UA that earned it), does not override the device metrics of a window that already has the size the flags asked for, and does not CDP-set `Accept-Encoding`/`Connection`. A store that DECLARES a UA still gets it; the cookie jar's pinned MINT UA is not applied in this mode (see below) |
 | no replayed `cf_clearance` | a stored clearance was minted by another client, from another exit, and Cloudflare binds it to (IP, UA). In clean-headful mode the browser lane drops it from the jar and earns its own in-context; the jar's other cookies (sessions) still pass through |
 | a warm pool of 2 (not 3) | the profile is process-wide, so the pooled browsers are headful too, and the challenge-lane browser is a fourth. Three full Chromes is what fits the pod's 3 Gi limit |

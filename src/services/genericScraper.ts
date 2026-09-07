@@ -13,8 +13,8 @@
  *
  * What FAILS, all measured the same day: `headless: true` with any user agent; puppeteer-extra's
  * stealth plugin on an older Chrome; and — silently, which is the dangerous one — the correct setup
- * with the browser's timezone left on UTC while the egress IP geolocates to the US. A challenge that
- * disagrees with its environment simply never clears; nothing errors.
+ * with the browser's timezone left on UTC (the container default; any real named zone passes, even
+ * one far from the exit IP). A UTC browser simply never clears; nothing errors.
  *
  * The rest of the lane follows from that:
  *   - TIMEZONE per context, matched to the EGRESS the context leaves through (browserTimezone.ts):
