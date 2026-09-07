@@ -8,8 +8,9 @@
  * GET /catalog?store=<siteId>&range=1&from=<id>&count=<n> — the ID-RANGE axis of the same feed: a
  * SYNTHESIZED window of `count` ids walking DOWN from `from` for a store whose ids are sequential
  * (`retrieval.byRange`). 200 `{ siteId, from, items, collectUrls, hasMore, nextFrom?, count }` ·
- * 400 bad input · 422 `unsupported` (no byRange / no byId) · 502 `catalog failed`. `range` and `page`
- * are mutually exclusive; `from` is required with `range` and ignored without it.
+ * 400 bad input · 422 `unsupported` (no byRange / no byId) · 503 `cooldown` with `Retry-After` (the
+ * item host is cooling from a CF challenge) · 502 `catalog failed`. `range` and `page` are mutually
+ * exclusive; `from` is required with `range` and ignored without it.
  */
 import { Router, type Request, type Response } from 'express';
 import type { Catalog } from '../driver/assembleCatalog.js';
@@ -69,6 +70,10 @@ export function createCatalogRoute(catalog: Catalog): Router {
           }
           case 'unsupported':
             res.status(422).json({ error: 'unsupported', siteId: result.siteId, reason: result.reason });
+            return;
+          case 'cooldown':
+            res.set('Retry-After', String(Math.ceil(result.remainingMs / 1000)));
+            res.status(503).json({ error: 'cooldown', siteId: result.siteId, host: result.host, remainingMs: result.remainingMs });
             return;
           case 'failed':
             res.status(502).json({ error: 'catalog failed', siteId: result.siteId, reason: result.reason });

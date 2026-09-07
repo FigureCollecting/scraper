@@ -198,4 +198,12 @@ describe('GET /catalog?range=1 (id-range window)', () => {
     expect(threw.status).toBe(502);
     expect(threw.body).toEqual({ error: 'catalog failed', siteId: 'mfc', reason: 'boom' });
   });
+
+  it('503 cooldown + Retry-After — the crawler must skip the store, not walk its id space into a challenge', async () => {
+    const res = await request(appWith(mk(OK, { status: 'cooldown', siteId: 'mfc', host: 'myfigurecollection.net', remainingMs: 90_001 })))
+      .get('/catalog?store=mfc&range=1&from=5');
+    expect(res.status).toBe(503);
+    expect(res.headers['retry-after']).toBe('91');
+    expect(res.body).toEqual({ error: 'cooldown', siteId: 'mfc', host: 'myfigurecollection.net', remainingMs: 90_001 });
+  });
 });

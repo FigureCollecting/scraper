@@ -233,7 +233,9 @@ with `Retry-After` while the listing host cools from a Cloudflare challenge · `
 
 A store whose ids are SEQUENTIAL (`retrieval.byRange: true` plus a `byId.urlTemplate` — mfc's ~3.6M
 numeric item ids) needs no listing to be enumerated: its id space *is* the listing. This axis
-SYNTHESIZES a descending window of that space and never fetches, parses or cools anything.
+SYNTHESIZES a descending window of that space and never fetches or parses anything. It does honour
+the challenge cooldown of the host its item urls point at: a window handed out while that host is
+cooling would be enqueued in full, ledgered as done and walked past while every item fast-failed.
 
 **Query:** `store=<siteId>` (required), `range=1` (required, exactly `1`), `from=<id>` (required,
 positive integer — the highest id in the window), `count=<n>` (optional, default `50`, clamped to
@@ -258,7 +260,8 @@ later as the ingest fetch's own 404 — a miss in the ingest lane, not an error 
 **Errors:** `400` bad input (blank `store`, `range` other than `1`, `range` with `page`, missing or
 non-positive-integer `from`, non-positive-integer `count`) · `422 { error: "unsupported", siteId, reason }`
 (unknown store, no `byRange` axis, or no `byId` template to build item urls from) ·
-`502 { error: "catalog failed", siteId, reason }`.
+`503 { error: "cooldown", siteId, host, remainingMs }` with `Retry-After` while the item host cools
+from a Cloudflare challenge · `502 { error: "catalog failed", siteId, reason }`.
 
 ### Search query encoding (`retrieval.bySearch.queryEncoding`)
 `{q}` is url-encoded into the store's `bySearch.urlTemplate` by `encodeSearchQuery`

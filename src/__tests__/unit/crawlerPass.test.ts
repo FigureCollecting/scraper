@@ -1188,6 +1188,16 @@ describe('runCrawlerPass — id-range backfill', () => {
     expect(s.stores[0]).toMatchObject({ errors: 1, rangeWalked: 0, rangeCursor: null });
   });
 
+  it('a 503 cooldown on the RANGE axis skips the store for the run: no POSTs, no cursor written', async () => {
+    const fake = makeFake({ catalog: (s) => failed(s), range: (s) => cooldown(s) });
+    const store = createMemoryLedgerStore();
+    const s = await runCrawlerPass(rangeOnly({ rangeFrontiers: { mfc: 500 } }), { fetch: fake.fetch, ledgerStore: store, now: clock().now });
+
+    expect(fake.posted()).toEqual([]);
+    expect(store.saveLog).toEqual([]);
+    expect(s.stores[0]).toMatchObject({ skipped: 1, rangeWalked: 0, rangeCursor: null });
+  });
+
   it("mode 'recent' makes no id-range request at all", async () => {
     const fake = makeFake({ catalog: (s, p) => ok(s, p, [], false) });
     await runCrawlerPass(rangeOnly({ mode: 'recent', rangeFrontiers: { mfc: 9 } }), {

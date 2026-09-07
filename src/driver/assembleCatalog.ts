@@ -69,6 +69,7 @@ export type IdRangeResult =
       count: number;
     }
   | { status: 'unsupported'; siteId: string; reason: string }
+  | { status: 'cooldown'; siteId: string; host: string; remainingMs: number }
   | { status: 'failed'; siteId: string; reason: string };
 
 /** Default and clamp for an id-range window's size (ids per call). */
@@ -80,11 +81,14 @@ export interface Catalog {
   catalog(siteId: string, page?: number): Promise<CatalogResult>;
   /**
    * One descending window of `siteId`'s SEQUENTIAL id space — `count` ids from `from` down, each
-   * decorated with the collect URL its `byId.urlTemplate` builds. PURE: it fetches nothing, parses
-   * nothing and consults no cooldown, because a store that declares `retrieval.byRange` has already
-   * told us its ids are enumerable — the id space IS the listing. Ids in the window that do not
-   * exist at the store are EXPECTED and surface downstream as the ingest fetch's own 404; this
-   * surface never probes them. `count` defaults to 50 and is clamped to [1, 200].
+   * decorated with the collect URL its `byId.urlTemplate` builds. It fetches nothing and parses
+   * nothing, because a store that declares `retrieval.byRange` has already told us its ids are
+   * enumerable — the id space IS the listing. It DOES consult the challenge cooldown of the host the
+   * window's urls point at: every id in a window handed out while that host is cooling would be
+   * POSTed, ledgered as done and walked past, only to fast-fail in the ingest queue — the ids would
+   * be burned, and this axis walks each id exactly once. Ids in the window that do not exist at the
+   * store are EXPECTED and surface downstream as the ingest fetch's own 404; this surface never
+   * probes them. `count` defaults to 50 and is clamped to [1, 200].
    */
   idRange(siteId: string, from: number, count?: number): IdRangeResult;
 }
@@ -131,6 +135,17 @@ export function assembleCatalog(services: CatalogServices): Catalog {
       if (!Number.isSafeInteger(from) || from < 1) {
         return { status: 'failed', siteId, reason: `invalid from ${from} (must be a positive integer)` };
       }
+      // CHALLENGE COOLDOWN gate, keyed by the host the window's own item urls point at — the same
+      // gate the listing axis applies before fetching. A window handed out now would be enqueued in
+      // full, ledgered and walked past while every item fast-fails on the cooling host.
+      const first = resolveByIdUrl(caps.retrieval, String(from));
+      let host: string;
+      try {
+        host = normalizeHost(new URL(first as string).hostname);
+      } catch {
+        return { status: 'unsupported', siteId, reason: 'malformed byId url template' };
+      }
+      if (cd.isOpen(host)) return { status: 'cooldown', siteId, host, remainingMs: cd.remaining(host) };
       const size = Math.min(MAX_ID_RANGE_COUNT, Math.max(1, Number.isSafeInteger(count) ? (count as number) : DEFAULT_ID_RANGE_COUNT));
       const lowest = Math.max(1, from - size + 1);
       const items: CatalogItem[] = [];

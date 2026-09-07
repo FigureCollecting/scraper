@@ -9,6 +9,7 @@
  */
 import { assembleCatalog, type CatalogServices } from '../../driver/assembleCatalog';
 import { ProfileRegistry } from '../../driver/profileRegistry';
+import { ChallengeCooldown } from '../../services/challengeCooldown';
 import type { StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
 
 const MFC: StoreCapabilities = {
@@ -28,6 +29,7 @@ const services = (...stores: StoreCapabilities[]): CatalogServices => {
     profiles,
     getRulesetForUrl: () => undefined,
     fetchSearch: jest.fn(async () => { throw new Error('idRange must never fetch'); }),
+    challengeCooldown: new ChallengeCooldown({ now: () => 1_000_000, windowMs: 30 * 60_000 }),
   };
 };
 
@@ -93,6 +95,19 @@ describe('assembleCatalog — idRange', () => {
     expect((cat.idRange('orzgk', 10, 1) as { reason: string }).reason).toContain('byRange');
     expect(cat.idRange('noid', 10, 1)).toMatchObject({ status: 'unsupported', siteId: 'noid' });
     expect((cat.idRange('noid', 10, 1) as { reason: string }).reason).toContain('byId');
+  });
+
+  it("reports 'cooldown' — not a window — while the store's own item host is cooling from a challenge", () => {
+    const svc = services(MFC);
+    svc.challengeCooldown!.open('myfigurecollection.net', 'ingest challenge page');
+    const out = assembleCatalog(svc).idRange('mfc', 3630000, 5);
+    expect(out).toEqual({ status: 'cooldown', siteId: 'mfc', host: 'myfigurecollection.net', remainingMs: 30 * 60_000 });
+  });
+
+  it('a cooldown on a DIFFERENT host leaves the window alone (the gate is per host)', () => {
+    const svc = services(MFC);
+    svc.challengeCooldown!.open('anitoysgk.com', 'ingest challenge page');
+    expect(assembleCatalog(svc).idRange('mfc', 10, 2).status).toBe('ok');
   });
 
   it('failed for a `from` that is not a positive safe integer', () => {
