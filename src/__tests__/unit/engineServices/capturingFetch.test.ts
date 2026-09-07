@@ -219,7 +219,8 @@ describe('createCapturingFetch', () => {
       expect(sink.captures).toHaveLength(1);
     });
 
-    it('never flags the browser lane even when its body looks like a challenge (browser lane owns its own detection — regression pin)', async () => {
+    it('flags challenge:true + transport:browser on the BROWSER lane too (a browser interstitial now gets the same one-shot + cooldown discipline; capture stays the lane\'s own)', async () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
       const sink = new CollectingCaptureSink();
       const t: CapturingFetchTransports = {
         http: jest.fn(),
@@ -232,8 +233,20 @@ describe('createCapturingFetch', () => {
       const fetch = createCapturingFetch(t, sink);
 
       const result = await fetch('https://myfigurecollection.net/item/12345', { transport: 'browser' });
-      expect(result).toEqual({ html: CHALLENGE }); // returned plain, NOT flagged
-      expect(sink.captures).toHaveLength(0);        // browser lane captures itself, not here
+      expect(result).toEqual({ html: CHALLENGE, challenge: true, transport: 'browser' });
+      expect(sink.captures).toHaveLength(0);        // browser lane captures itself (navigateAndCapture), not here
+      const warnLines = warnSpy.mock.calls.map(c => String(c[0])).filter(l => l.includes('[FETCH] Cloudflare challenge/block page received'));
+      expect(warnLines).toHaveLength(1);
+      expect(warnLines[0]).toContain('via browser transport');
+      warnSpy.mockRestore();
+    });
+
+    it('does NOT flag a real body on the browser lane (challenge/transport keys absent)', async () => {
+      const { t } = makeTransports();
+      const fetch = createCapturingFetch(t, new CollectingCaptureSink());
+      const result = await fetch('https://myfigurecollection.net/item/12345', { transport: 'browser' });
+      expect(result).toEqual({ html: '<html>BROWSER</html>' });
+      expect(result).not.toHaveProperty('challenge');
     });
   });
 
@@ -304,6 +317,79 @@ describe('createCapturingFetch', () => {
       const result = await fetch('https://sugo.example.test/item/1', { transport: 'http' });
       expect(result).toMatchObject({ challenge: true, transport: 'http' });
       expect(sink.captures).toHaveLength(1);
+    });
+  });
+
+  /**
+   * Stealth selection with STORED cookies (CfCookieStore): CF stores whose cookies live in the jar
+   * must ride the stealth browser even when the item carries no request cookies. The dispatcher only
+   * CHOOSES the browser; the lane (navigateAndCapture) merges the store's cookies itself, so nothing
+   * is forwarded for a store-only hit. Item cookies keep their exact pre-existing call shape.
+   */
+  describe('browser lane × stored cookies — stealth selection matrix', () => {
+    // Plain functions (not jest.fn): the harness runs resetMocks, which would wipe a describe-scoped fake's implementation.
+    const cookieStore = {
+      cookiesFor: (url: string) => (url.includes('myfigurecollection.net') ? { cf_clearance: 'FAKE_cf_1' } : undefined),
+      userAgentFor: () => undefined,
+    };
+    const ITEM = { PHPSESSID: 'FAKE_item_sess' };
+
+    it('no item cookies + no store cookies → plain scrapePage (unchanged)', async () => {
+      const { t, calls } = makeTransports();
+      const fetch = createCapturingFetch(t, new CollectingCaptureSink(), { cookieStore });
+      await fetch('https://rendered.example.test/item/1', { transport: 'browser' });
+      expect(calls).toEqual([['scrapePage', 'https://rendered.example.test/item/1']]);
+    });
+
+    it('item cookies only → scrapePageStealth(url, { cookies }) (unchanged shape)', async () => {
+      const { t, calls } = makeTransports();
+      const fetch = createCapturingFetch(t, new CollectingCaptureSink(), { cookieStore });
+      await fetch('https://rendered.example.test/item/1', undefined, { cookies: ITEM });
+      expect(calls).toEqual([['scrapePageStealth', 'https://rendered.example.test/item/1', { cookies: ITEM }]]);
+    });
+
+    it('store cookies only → scrapePageStealth with NO item cookies forwarded (the lane merges the store itself)', async () => {
+      const { t, calls } = makeTransports();
+      const fetch = createCapturingFetch(t, new CollectingCaptureSink(), { cookieStore });
+      const result = await fetch('https://myfigurecollection.net/item/12345', undefined);
+      expect(calls).toEqual([['scrapePageStealth', 'https://myfigurecollection.net/item/12345', {}]]);
+      expect(result).toEqual({ html: '<html>STEALTH</html>' });
+      expect(t.browser.scrapePage).not.toHaveBeenCalled();
+    });
+
+    it('both → scrapePageStealth(url, { cookies: item }) — item cookies still travel as before', async () => {
+      const { t, calls } = makeTransports();
+      const fetch = createCapturingFetch(t, new CollectingCaptureSink(), { cookieStore });
+      await fetch('https://myfigurecollection.net/item/12345', { transport: 'browser' }, { cookies: ITEM });
+      expect(calls).toEqual([['scrapePageStealth', 'https://myfigurecollection.net/item/12345', { cookies: ITEM }]]);
+    });
+
+    it('the store is never consulted for the impersonate / http lanes (their calls are byte-identical)', async () => {
+      const { t, calls } = makeTransports();
+      const spyStore = { cookiesFor: jest.fn(() => ({ cf_clearance: 'FAKE_cf_1' })), userAgentFor: jest.fn(() => 'FAKE-UA') };
+      const fetch = createCapturingFetch(t, new CollectingCaptureSink(), { cookieStore: spyStore });
+      await fetch('https://api.sentai.example.test/item/1', { transport: 'impersonate', browser: 'chrome142' });
+      await fetch('https://json.example.test/item/1', { transport: 'http' });
+      expect(calls).toEqual([
+        ['impersonate', 'https://api.sentai.example.test/item/1', { browser: 'chrome142', headers: undefined, userAgent: undefined }],
+        ['http', 'https://json.example.test/item/1'],
+      ]);
+      expect(spyStore.cookiesFor).not.toHaveBeenCalled();
+      expect(spyStore.userAgentFor).not.toHaveBeenCalled();
+    });
+
+    it('a stealth (store-cookie) browser fetch that returns a challenge is flagged transport:browser', async () => {
+      const t: CapturingFetchTransports = {
+        http: jest.fn(),
+        impersonate: jest.fn(),
+        browser: {
+          scrapePage: jest.fn(),
+          scrapePageStealth: jest.fn(async (url: string) => ({ html: '<html><head><title>Just a moment...</title></head><body>cf</body></html>', url, title: 'Just a moment...', statusCode: 200 })),
+        },
+      };
+      const fetch = createCapturingFetch(t, new CollectingCaptureSink(), { cookieStore });
+      const result = await fetch('https://myfigurecollection.net/item/1', undefined);
+      expect(result).toMatchObject({ challenge: true, transport: 'browser' });
     });
   });
 });

@@ -211,4 +211,72 @@ describe('createScrapingService', () => {
       expect.objectContaining({ name: 'cf_clearance', value: 'token123', domain: '.amiami.com' })
     );
   });
+
+  // Stored-cookie injection (CfCookieStore) on the browser lane — the single choke point every browser
+  // navigation passes through (ingest queue, /resolve, ruleset ctx.scraping, /lookup + /catalog
+  // browserFetch). Store cookies are merged UNDER request cookies (request wins per key), the mint UA is
+  // pinned unless the request carries its own, and each cookie is emitted with httpOnly + secure flags.
+  describe('× stored cookies (CfCookieStore) + pinned UA', () => {
+    const DEFAULT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36';
+    // Plain functions (not jest.fn): the harness runs resetMocks, which would wipe a describe-scoped fake's implementation.
+    const cookieStore = {
+      cookiesFor: (url: string) => (url.includes('cf.example.test') ? { cf_clearance: 'FAKE_cf_1', PHPSESSID: 'FAKE_sess_1' } : undefined),
+      userAgentFor: (url: string) => (url.includes('cf.example.test') ? 'Mozilla/5.0 FAKE-MINT-UA' : undefined),
+    };
+
+    it('scrapePage merges the store cookies (httpOnly + secure, domain-scoped) and pins the mint UA for a cohort host', async () => {
+      const service = createScrapingService(undefined, { cookieStore });
+
+      await service.scrapePage('https://www.cf.example.test/item/1');
+
+      expect(mockPage.setUserAgent).toHaveBeenCalledWith('Mozilla/5.0 FAKE-MINT-UA');
+      expect(mockPage.setCookie).toHaveBeenCalledTimes(1);
+      expect(mockPage.setCookie).toHaveBeenCalledWith(
+        { name: 'cf_clearance', value: 'FAKE_cf_1', domain: '.cf.example.test', path: '/', httpOnly: true, secure: true },
+        { name: 'PHPSESSID', value: 'FAKE_sess_1', domain: '.cf.example.test', path: '/', httpOnly: true, secure: true },
+      );
+    });
+
+    it('request/item cookies WIN per key over store cookies; the store\'s other cookies still ride', async () => {
+      const service = createScrapingService(undefined, { cookieStore });
+
+      await service.scrapePageStealth('https://cf.example.test/item/1', { cookies: { cf_clearance: 'FAKE_item_cf' } });
+
+      const set = (mockPage.setCookie as jest.Mock).mock.calls[0] as Array<{ name: string; value: string }>;
+      expect(set.map((c) => [c.name, c.value]).sort()).toEqual([['PHPSESSID', 'FAKE_sess_1'], ['cf_clearance', 'FAKE_item_cf']]);
+    });
+
+    it('options.userAgent wins over the pinned store UA (a request-scoped session carries its own coherent UA)', async () => {
+      const service = createScrapingService(undefined, { cookieStore });
+      await service.scrapePage('https://cf.example.test/item/1', { userAgent: 'RequestUA/1.0' });
+      expect(mockPage.setUserAgent).toHaveBeenCalledWith('RequestUA/1.0');
+    });
+
+    it('unknown host → no setCookie call and the default UA: byte-identical to the pre-store behavior', async () => {
+      const service = createScrapingService(undefined, { cookieStore });
+      await service.scrapePage('https://alpha.example.test/item/1');
+      expect(mockPage.setCookie).not.toHaveBeenCalled();
+      expect(mockPage.setUserAgent).toHaveBeenCalledWith(DEFAULT_UA);
+    });
+
+    it('browserFetch (the /lookup + /catalog browser lane) merges store cookies under request cookies and pins the UA too', async () => {
+      const service = createScrapingService(undefined, { cookieStore });
+
+      await service.browserFetch('https://cf.example.test/search?q=lucy', { stealth: false, cookies: { extra: 'FAKE_x' } });
+
+      expect(mockPage.setUserAgent).toHaveBeenCalledWith('Mozilla/5.0 FAKE-MINT-UA');
+      const set = (mockPage.setCookie as jest.Mock).mock.calls[0] as Array<{ name: string; value: string; httpOnly: boolean; secure: boolean }>;
+      expect(set.map((c) => c.name).sort()).toEqual(['PHPSESSID', 'cf_clearance', 'extra']);
+      expect(set.every((c) => c.httpOnly === true && c.secure === true)).toBe(true);
+    });
+
+    it('a plain-http url emits secure:false so the cookie is actually sent', async () => {
+      const service = createScrapingService(undefined, { cookieStore });
+      await service.scrapePage('http://cf.example.test/item/1');
+      expect(mockPage.setCookie).toHaveBeenCalledWith(
+        expect.objectContaining({ name: 'cf_clearance', secure: false, httpOnly: true }),
+        expect.objectContaining({ name: 'PHPSESSID', secure: false, httpOnly: true }),
+      );
+    });
+  });
 });

@@ -10,6 +10,8 @@
  * (unknown store / no byListing axis / no extractListing parser — a coverage gap, not a failure),
  * `cooldown` (the listing host is cooling from a recent CF challenge — skipped WITHOUT fetching), or
  * `failed` (challenge page → the host cooldown is opened; fetch error; timeout; parser throw).
+ * A challenge on a host WITH stored cookies (CfCookieStore) also marks that host's cookie stale; a
+ * clean listing marks it fresh — the operator's re-mint signal, surfaced on /health/detailed.
  * Plugin output is UNTRUSTED at runtime and guarded field by field. Everything is injected
  * (LookupServices shape) so the flow is deterministic in tests.
  */
@@ -18,6 +20,7 @@ import { withCollectUrl, withTimeout, type LookupServices } from './assembleLook
 import { sanitizeForLog } from '../utils/security.js';
 import { isCloudflareChallenge } from '../services/engineServices/challengeDetect.js';
 import { getChallengeCooldown, normalizeHost } from '../services/challengeCooldown.js';
+import { getCfCookieStore, markStaleIfStored, markFreshIfStored } from '../services/cookieJar.js';
 import type { ListingPage } from '@figurecollecting/scraper-plugin-contract';
 
 /** The catalog runtime takes exactly the lookup's injected services (registry, ruleset lookup, fetch, cooldown). */
@@ -77,6 +80,7 @@ export function assembleCatalog(services: CatalogServices): Catalog {
   // Resolved ONCE per assembly (not per call), like the lookup's module-load resolution.
   const timeoutMs = resolveCatalogStoreTimeoutMs(process.env);
   const cd = services.challengeCooldown ?? getChallengeCooldown();
+  const cfStore = services.cfCookieStore ?? getCfCookieStore();
 
   return {
     async catalog(siteId, page) {
@@ -120,8 +124,13 @@ export function assembleCatalog(services: CatalogServices): Catalog {
           // eslint-disable-next-line no-console
           console.warn(`[catalog] ${sanitizeForLog(siteId)} page ${pageNo} failed: challenge page`);
           cd.open(host, 'catalog challenge page');
+          // STORED-COOKIE STALE signal: a host WITH stored cookies still challenged → dead cookie,
+          // marked once via the lane that fetched (a host without stored cookies is never marked).
+          markStaleIfStored(cfStore, url, host, transport.transport ?? 'http', 'catalog challenge page');
           return { status: 'failed', siteId, reason: 'challenge page' };
         }
+        // A clean listing for a host WITH stored cookies is the FRESH signal (clears a stale mark).
+        markFreshIfStored(cfStore, url, host);
         // UNTRUSTED plugin output: a non-object page → no items; a non-array `items` → none; each
         // item must be an object with a non-empty string itemId (else dropped); paging signals are
         // used only when well-typed, else derived (non-empty page ⇒ more; next = page + 1).

@@ -206,6 +206,68 @@ describe('assembleCatalog × challenge cooldown', () => {
   });
 });
 
+/**
+ * Stored-cookie STALE / FRESH signals (CfCookieStore): the catalog challenge site marks a host the
+ * store has cookies for stale via the fetching lane; a clean listing marks it fresh.
+ */
+describe('assembleCatalog × stored cookies — stale / fresh signals', () => {
+  const CHALLENGE = '<html><head><title>Just a moment...</title></head><body>cf</body></html>';
+  const fakeStore = (hosts: string[]) => ({
+    cookiesFor: (url: string) => (hosts.includes(new URL(url).hostname.replace(/^www\./, '')) ? { cf_clearance: 'FAKE_cf_1' } : undefined),
+    userAgentFor: () => undefined,
+    markStale: jest.fn(() => true),
+    markFresh: jest.fn(() => true),
+  });
+
+  it('a challenge listing from a host WITH stored cookies → markStale("orzgk.com", lane, "catalog challenge page") once', async () => {
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const cd = new ChallengeCooldown({ now: () => 1000, windowMs: 60_000 });
+    const cfCookieStore = fakeStore(['orzgk.com']);
+    const { catalog } = build({ challengeCooldown: cd, fetchSearch: jest.fn(async () => CHALLENGE), cfCookieStore });
+
+    expect(await catalog.catalog('orzgk')).toEqual({ status: 'failed', siteId: 'orzgk', reason: 'challenge page' });
+    expect(cd.isOpen('orzgk.com')).toBe(true);
+    expect(cfCookieStore.markStale).toHaveBeenCalledTimes(1);
+    expect(cfCookieStore.markStale).toHaveBeenCalledWith('orzgk.com', 'http', 'catalog challenge page');
+    expect(cfCookieStore.markFresh).not.toHaveBeenCalled();
+  });
+
+  it('a clean listing → markFresh("orzgk.com"); markStale never', async () => {
+    const cfCookieStore = fakeStore(['orzgk.com']);
+    const { catalog } = build({ fetchSearch: jest.fn(async () => '[]'), cfCookieStore });
+
+    expect(await catalog.catalog('orzgk')).toMatchObject({ status: 'ok', siteId: 'orzgk' });
+    expect(cfCookieStore.markFresh).toHaveBeenCalledTimes(1);
+    expect(cfCookieStore.markFresh).toHaveBeenCalledWith('orzgk.com');
+    expect(cfCookieStore.markStale).not.toHaveBeenCalled();
+  });
+
+  it('a challenge from a host WITHOUT stored cookies → cooldown opens, markStale never', async () => {
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const cd = new ChallengeCooldown({ now: () => 1000, windowMs: 60_000 });
+    const cfCookieStore = fakeStore([]);
+    const { catalog } = build({ challengeCooldown: cd, fetchSearch: jest.fn(async () => CHALLENGE), cfCookieStore });
+
+    expect(await catalog.catalog('orzgk')).toEqual({ status: 'failed', siteId: 'orzgk', reason: 'challenge page' });
+    expect(cd.isOpen('orzgk.com')).toBe(true);
+    expect(cfCookieStore.markStale).not.toHaveBeenCalled();
+  });
+
+  it('a store whose declared searchFetch names NO transport is marked via "http" — the same default makeFetchSearch rides', async () => {
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const cfCookieStore = fakeStore(['orzgk.com']);
+    const { catalog } = build({
+      profiles: buildProfileRegistry([{ ...ORZGK, searchFetch: { headers: { 'X-Api': 'k' } } }]),
+      challengeCooldown: new ChallengeCooldown({ now: () => 1000, windowMs: 60_000 }),
+      fetchSearch: jest.fn(async () => CHALLENGE),
+      cfCookieStore,
+    });
+
+    expect(await catalog.catalog('orzgk')).toEqual({ status: 'failed', siteId: 'orzgk', reason: 'challenge page' });
+    expect(cfCookieStore.markStale).toHaveBeenCalledWith('orzgk.com', 'http', 'catalog challenge page');
+  });
+});
+
 describe('assembleCatalog — failures never throw', () => {
   it('a fetch that throws → failed with the (sanitized) reason, logged like /lookup', async () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});

@@ -22,23 +22,25 @@ import { buildRawCapture } from '../captureSink.js';
 import { sanitizeForLog } from '../../utils/security.js';
 import { resolvePrime } from '../sessionPrime.js';
 import { isCloudflareChallenge } from './challengeDetect.js';
+import { getCfCookieStore, type CfCookieSource } from '../cookieJar.js';
 
 export interface CapturingFetchResult {
   html: string;
   /**
-   * Set true ONLY when a non-browser lane (impersonate / http) received a Cloudflare
-   * challenge/block interstitial instead of the real page. Absent (never false) for a normal body
-   * and for the browser lane. The transport does NOT throw on a challenge — a ruleset's own
-   * follow-up call (ctx.scraping.fetchBody) can still recover the real record (the amiami case),
-   * so the queue's honesty gate is the authority: a challenge-flagged page that ALSO persisted
-   * nothing becomes a typed ChallengePageError, while one the ruleset recovered rows from is a
-   * logged success.
+   * Set true ONLY when the lane received a Cloudflare challenge/block interstitial instead of the
+   * real page. Absent (never false) for a normal body. The transport does NOT throw on a challenge —
+   * a ruleset's own follow-up call (ctx.scraping.fetchBody) can still recover the real record (the
+   * amiami case), so the queue's honesty gate is the authority: a challenge-flagged page that ALSO
+   * persisted nothing becomes a typed ChallengePageError, while one the ruleset recovered rows from
+   * is a logged success. The browser lane is flagged too (since the stored-cookie jar): a browser
+   * interstitial used to degrade to a retried empty_record; now it takes the same one-shot +
+   * host-cooldown exit as the other lanes.
    */
   challenge?: boolean;
   /**
-   * The non-browser lane that served this fetch — 'impersonate' | 'http' — carried so the queue
-   * can name the transport in a ChallengePageError. Present alongside `challenge`; absent for a
-   * normal body and for the browser lane.
+   * The lane that served this fetch — 'impersonate' | 'http' | 'browser' — carried so the queue can
+   * name the transport in a ChallengePageError. Present alongside `challenge`; absent for a normal
+   * body.
    */
   transport?: string;
 }
@@ -105,11 +107,21 @@ async function captureApiBody(sink: CaptureSink, url: string, body: string): Pro
   }
 }
 
+/** Optional wiring for {@link createCapturingFetch}. */
+export interface CapturingFetchDeps {
+  /** Stored-cookie source (defaults to the CfCookieStore singleton, resolved per call). */
+  cookieStore?: CfCookieSource;
+}
+
 /**
  * Build the dispatcher. `sink` backs the impit/http lanes' capture (the browser lane captures
  * itself, via whatever sink `transports.browser` was built with).
  */
-export function createCapturingFetch(transports: CapturingFetchTransports, sink: CaptureSink): CapturingFetch {
+export function createCapturingFetch(
+  transports: CapturingFetchTransports,
+  sink: CaptureSink,
+  deps: CapturingFetchDeps = {},
+): CapturingFetch {
   return async function capturingFetch(url, searchFetch, options = {}) {
     switch (searchFetch?.transport) {
       case 'impersonate': {
@@ -148,9 +160,23 @@ export function createCapturingFetch(transports: CapturingFetchTransports, sink:
       }
       case 'browser':
       default: {
-        const page = options.cookies
-          ? await transports.browser.scrapePageStealth(url, { cookies: options.cookies })
+        // STEALTH SELECTION: item (request) cookies OR stored cookies for this host ⇒ the stealth
+        // browser (CF stores ride stealth). Only the CHOICE is made here — the lane itself
+        // (navigateAndCapture) merges the store's cookies under the item's, so a store-only hit
+        // forwards nothing; item cookies keep their exact pre-existing call shape.
+        const store = deps.cookieStore ?? getCfCookieStore();
+        const stealth = options.cookies !== undefined || store.cookiesFor(url) !== undefined;
+        const page = stealth
+          ? await transports.browser.scrapePageStealth(url, options.cookies ? { cookies: options.cookies } : {})
           : await transports.browser.scrapePage(url);
+        // FLAG a browser-lane interstitial like the other lanes (capture already happened inside
+        // navigateAndCapture): the queue's honesty gate / extraction-throw door then give it the
+        // same one-shot ChallengePageError + host cooldown instead of a retried empty_record.
+        if (isCloudflareChallenge(page.html)) {
+          // eslint-disable-next-line no-console
+          console.warn(`[FETCH] Cloudflare challenge/block page received for ${sanitizeForLog(url)} via browser transport`);
+          return { html: page.html, challenge: true, transport: 'browser' };
+        }
         return { html: page.html };
       }
     }

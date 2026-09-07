@@ -27,6 +27,7 @@ import { enrichmentLogger } from '../utils/logger.js';
 import { createScrapingService } from './engineServices/scrapingService.js';
 import { createCapturingFetch, ChallengePageError, type CapturingFetch, type CapturingFetchTransports } from './engineServices/capturingFetch.js';
 import { getChallengeCooldown, ChallengeCooldownError, type ChallengeCooldown } from './challengeCooldown.js';
+import { getCfCookieStore, markStaleIfStored, markFreshIfStored, type CfCookieStoreLike } from './cookieJar.js';
 import { getRawCaptureSink } from './s3ObjectStore.js';
 import { createIngestEmitterFromEnv } from './ingestEmitter.js';
 import { impitFetchBody } from './impitFetch.js';
@@ -482,6 +483,11 @@ export class ScrapeQueue {
   // with the lookup fan-out and /health/detailed); a test may inject a clock-controlled instance.
   private challengeCooldownStore: ChallengeCooldown | null = null;
 
+  // Per-host STORED-COOKIE store (CfCookieStore, CF_COOKIE_FILE). Defaults to the process-wide
+  // singleton; a test injects a fake. Read by the ingest fetch (stealth selection) and signalled
+  // at the challenge / clean-fetch sites (markStale / markFresh) — never mutated here.
+  private cfCookieStore: CfCookieStoreLike | null = null;
+
   constructor(testMode?: boolean) {
     // Auto-detect test environment if not explicitly set
     this.testMode = testMode ?? (
@@ -562,6 +568,19 @@ export class ScrapeQueue {
   /** The active challenge-cooldown register — the injected instance, else the shared singleton. */
   private getChallengeCooldownStore(): ChallengeCooldown {
     return this.challengeCooldownStore ?? getChallengeCooldown();
+  }
+
+  /**
+   * Override the per-host stored-cookie store (tests / DI). Defaults to the process-wide singleton
+   * so the queue, the lookup fan-out, and /health/detailed all read one jar.
+   */
+  setCfCookieStore(store: CfCookieStoreLike | null): void {
+    this.cfCookieStore = store;
+  }
+
+  /** The active stored-cookie store — the injected instance, else the shared singleton. */
+  private getCfCookieStoreRef(): CfCookieStoreLike {
+    return this.cfCookieStore ?? getCfCookieStore();
   }
 
   /**
@@ -1217,6 +1236,9 @@ export class ScrapeQueue {
         browser: this.getRawPageFetcher(),
       },
       this.captureSink ?? getRawCaptureSink(),
+      // An INJECTED stored-cookie store reaches the dispatcher's stealth selection too; without one
+      // the dispatcher resolves the singleton itself, per call (hot reload).
+      this.cfCookieStore ? { cookieStore: this.cfCookieStore } : {},
     );
   }
 
@@ -1248,7 +1270,13 @@ export class ScrapeQueue {
     // Guard on !isOpen: a still-LIVE window (one the search fan-out opened on this host WHILE this
     // fetch was in flight — the fetch passed isOpen before that open) must SURVIVE, or clearing it
     // here would drop the protection and let the next item fetch the cooling host (F4 race).
-    if (host !== undefined && !page.challenge && !cooldown.isOpen(host)) cooldown.clear(host);
+    // The same clean body is the STORED-COOKIE FRESH signal (CfCookieStore): a host WITH stored
+    // cookies that served a real page has a live cookie — clear its stale mark. Same isOpen guard,
+    // for the same reason: a window (and stale mark) opened while this fetch was in flight survives.
+    if (host !== undefined && !page.challenge && !cooldown.isOpen(host)) {
+      cooldown.clear(host);
+      markFreshIfStored(this.getCfCookieStoreRef(), item.url, host);
+    }
     // Anchor for the courtesy gap (D8): the instant the PRIMARY fetch completed, so a same-store
     // `ctx.scraping.fetchBody` follow-up (extractMany's second call) waits the store's declared
     // gap against THIS fetch, not against whenever the follow-up happens to be invoked.
@@ -1294,7 +1322,15 @@ export class ScrapeQueue {
       // fast-fail on ChallengeCooldownError before any fetch). The amiami recovery is untouched — it
       // lives in door (a), where extraction did not throw.
       if (page.challenge) {
-        if (host !== undefined) cooldown.open(host, `challenge page via ${page.transport ?? 'unknown'} transport (extraction failed)`);
+        const lane = page.transport ?? 'unknown';
+        const reason = `challenge page via ${lane} transport (extraction failed)`;
+        if (host !== undefined) {
+          cooldown.open(host, reason);
+          // STORED-COOKIE STALE signal: a host WITH stored cookies still got challenged → its cookie
+          // is dead (the engine cannot re-mint; /health/detailed flags it for the operator). A host
+          // without stored cookies is never marked. Storm protection above is unchanged.
+          markStaleIfStored(this.getCfCookieStoreRef(), item.url, host, lane, reason);
+        }
         console.error(
           `[SCRAPE QUEUE] Extraction failed on a challenge page for ${sanitizeForLog(item.url)} (ruleset ${ruleset.siteId}@${ruleset.version}) — one-shot fail, host cooldown opened`
         );
@@ -1338,8 +1374,15 @@ export class ScrapeQueue {
           if (page.challenge) {
             // Genuine challenge that persisted nothing: OPEN the host's cooldown so the next item for
             // it (and the lookup fan-out's search of it) is left alone until the window expires.
-            if (host !== undefined) cooldown.open(host, `challenge page via ${page.transport ?? 'unknown'} transport`);
-            throw new ChallengePageError(item.url, page.transport ?? 'unknown', stats.warnings ?? []);
+            const lane = page.transport ?? 'unknown';
+            const reason = `challenge page via ${lane} transport`;
+            if (host !== undefined) {
+              cooldown.open(host, reason);
+              // STORED-COOKIE STALE signal (see the extraction-throw door above): only a host the
+              // store has cookies for is marked, once.
+              markStaleIfStored(this.getCfCookieStoreRef(), item.url, host, lane, reason);
+            }
+            throw new ChallengePageError(item.url, lane, stats.warnings ?? []);
           }
           throw new EmptyIngestRecordError(record.source.site, record.source.itemId, stats.warnings ?? []);
         }

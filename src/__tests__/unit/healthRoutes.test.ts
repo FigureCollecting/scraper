@@ -7,6 +7,7 @@
 import express from 'express';
 import request from 'supertest';
 import { createHealthRoutes, type HealthDeps } from '../../routes/health';
+import { CfCookieStore } from '../../services/cookieJar';
 
 const build = (over: Partial<HealthDeps> = {}) => {
   const app = express();
@@ -14,6 +15,7 @@ const build = (over: Partial<HealthDeps> = {}) => {
     version: '9.9.9',
     getBrowserPoolHealth: async () => ({ available: 2, capacity: 3, healthy: true }),
     listChallengeCooldowns: () => [],
+    listCfCookies: () => [],
     ...over,
   }));
   return app;
@@ -85,5 +87,75 @@ describe('createHealthRoutes', () => {
     expect(res.body.challengeCooldowns).toEqual([
       { host: 'coolhost.example.test', remainingMs: 1_740_000, reason: 'search challenge page' },
     ]);
+  });
+
+  /**
+   * Additive `cfCookies` view (CfCookieStore.view()): per-host cookie NAMES, UA-pin flag, load /
+   * mint / expiry timestamps and the stale mark — driven by a REAL store over an in-memory file whose
+   * values are obviously fake, so the leak assertion greps the whole JSON for them.
+   */
+  describe('cfCookies (stored-cookie view)', () => {
+    const VALUES = ['FAKE_cf_1', 'FAKE_sess_1', 'FAKE-MINT-UA'];
+    const FILE = JSON.stringify({
+      'myfigurecollection.net': {
+        cookies: { cf_clearance: 'FAKE_cf_1', PHPSESSID: 'FAKE_sess_1' },
+        userAgent: 'Mozilla/5.0 FAKE-MINT-UA',
+        mintedAt: '2026-09-06T00:00:00.000Z',
+        expiresAt: '2026-09-07T00:00:00.000Z',
+      },
+    });
+    const realStore = () => {
+      const store = new CfCookieStore({
+        path: '/x/cf-cookies.json',
+        fs: { openSync: () => 7, fstatSync: () => ({ mtimeMs: 1 }), readFileSync: () => FILE, closeSync: () => {} },
+        now: () => 1_700_000_000_000,
+      });
+      store.load();
+      return store;
+    };
+
+    it('GET /health/detailed carries cfCookies with the view shape and NO cookie/UA value anywhere in the JSON', async () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      const store = realStore();
+      store.markStale('myfigurecollection.net', 'browser', 'challenge page via browser transport');
+      const res = await request(build({ listCfCookies: () => store.view() })).get('/health/detailed');
+
+      expect(res.status).toBe(200);
+      expect(res.body.cfCookies).toEqual([{
+        host: 'myfigurecollection.net',
+        cookieNames: ['cf_clearance', 'PHPSESSID'],
+        userAgentPinned: true,
+        loadedAt: '2023-11-14T22:13:20.000Z',
+        mintedAt: '2026-09-06T00:00:00.000Z',
+        expiresAt: '2026-09-07T00:00:00.000Z',
+        stale: true,
+        staleSince: '2023-11-14T22:13:20.000Z',
+        staleReason: 'challenge page via browser transport',
+      }]);
+      const json = JSON.stringify(res.body);
+      for (const v of VALUES) expect(json).not.toContain(v);
+      // the pre-existing fields are untouched (additive)
+      expect(res.body.challengeCooldowns).toEqual([]);
+      expect(res.body.browserPool).toEqual({ available: 2, capacity: 3, healthy: true });
+      warn.mockRestore();
+    });
+
+    it('GET /health/detailed defaults cfCookies to [] when the store is disabled / empty', async () => {
+      const res = await request(build()).get('/health/detailed');
+      expect(res.status).toBe(200);
+      expect(res.body.cfCookies).toEqual([]);
+    });
+
+    it('GET /health/detailed keeps cfCookies on the degraded (500) branch', async () => {
+      const store = realStore();
+      const res = await request(build({
+        getBrowserPoolHealth: async () => { throw new Error('pool down'); },
+        listCfCookies: () => store.view(),
+      })).get('/health/detailed');
+      expect(res.status).toBe(500);
+      expect(res.body.status).toBe('degraded');
+      expect(res.body.cfCookies).toEqual([expect.objectContaining({ host: 'myfigurecollection.net', cookieNames: ['cf_clearance', 'PHPSESSID'], stale: false })]);
+      for (const v of VALUES) expect(JSON.stringify(res.body)).not.toContain(v);
+    });
   });
 });

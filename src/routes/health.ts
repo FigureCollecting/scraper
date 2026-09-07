@@ -8,12 +8,16 @@
  *   - GET /health   → same
  *   - GET /version  → { name, version, status:'ok' }
  *   - GET /health/detailed → the above + browserPool health + a timestamp, and ADDITIVELY
- *     `challengeCooldowns: [{host, remainingMs, reason}]` (the per-host CF cooldowns currently open).
+ *     `challengeCooldowns: [{host, remainingMs, reason}]` (the per-host CF cooldowns currently open)
+ *     and `cfCookies: [{host, cookieNames, userAgentPinned, loadedAt, mintedAt?, expiresAt?, stale,
+ *     staleSince?, staleReason?}]` (the stored-cookie jar's per-host view — cookie NAMES only, never a
+ *     value; `stale` = the host still served a challenge with its stored cookies → re-mint).
  *     A browser-pool-health failure still degrades to 500, now carrying { status:'degraded',
- *     challengeCooldowns, error } — the cooldown list survives (listChallengeCooldowns cannot throw).
+ *     challengeCooldowns, cfCookies, error } — both lists survive (neither lister can throw).
  */
 import { Router, type Request, type Response } from 'express';
 import type { CooldownView } from '../services/challengeCooldown.js';
+import type { CfCookieHostView } from '../services/cookieJar.js';
 
 export interface HealthDeps {
   /** The service version (package.json). */
@@ -22,6 +26,8 @@ export interface HealthDeps {
   getBrowserPoolHealth: () => Promise<unknown>;
   /** Currently-open per-host challenge cooldowns (getChallengeCooldown().list()). */
   listChallengeCooldowns: () => CooldownView[];
+  /** The stored-cookie jar's per-host view (getCfCookieStore().view()) — names and flags, never values. */
+  listCfCookies: () => CfCookieHostView[];
 }
 
 export function createHealthRoutes(deps: HealthDeps): Router {
@@ -38,7 +44,8 @@ export function createHealthRoutes(deps: HealthDeps): Router {
     res.json(healthResponse());
   });
 
-  // Detailed health endpoint with browser pool status + open challenge cooldowns (for debugging)
+  // Detailed health endpoint with browser pool status + open challenge cooldowns + the stored-cookie
+  // view (for debugging / the operator's re-mint signal)
   router.get('/health/detailed', async (_req: Request, res: Response) => {
     try {
       const browserPool = await deps.getBrowserPoolHealth();
@@ -46,6 +53,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         ...healthResponse(),
         browserPool,
         challengeCooldowns: deps.listChallengeCooldowns(),
+        cfCookies: deps.listCfCookies(),
         timestamp: new Date().toISOString(),
       });
     } catch (error) {
@@ -53,6 +61,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         ...healthResponse(),
         status: 'degraded',
         challengeCooldowns: deps.listChallengeCooldowns(),
+        cfCookies: deps.listCfCookies(),
         error: error instanceof Error ? error.message : 'Unknown error',
       });
     }

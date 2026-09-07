@@ -27,6 +27,7 @@ import { planRetrieval, composeNameQuery, normalizeText, resolveByIdUrl } from '
 import { sanitizeForLog } from '../utils/security.js';
 import { isCloudflareChallenge } from '../services/engineServices/challengeDetect.js';
 import { getChallengeCooldown, normalizeHost, type ChallengeCooldown } from '../services/challengeCooldown.js';
+import { getCfCookieStore, markStaleIfStored, markFreshIfStored, type CfCookieStoreLike } from '../services/cookieJar.js';
 import type { ProfileRegistry } from './profileRegistry.js';
 import type {
   ExtractionRuleset,
@@ -134,6 +135,13 @@ export interface LookupServices {
    * challenge opens its host's cooldown.
    */
   challengeCooldown?: ChallengeCooldown;
+  /**
+   * Per-host STORED-COOKIE store (CfCookieStore, CF_COOKIE_FILE) for the stale / fresh signals: a
+   * host the store has cookies for that STILL serves a challenge is marked stale (the operator must
+   * re-mint — the engine cannot); a clean search body marks it fresh. Optional — defaults to the
+   * process-wide singleton; tests inject a fake. Never read for the fetch itself (the lanes do that).
+   */
+  cfCookieStore?: CfCookieStoreLike;
 }
 
 export interface StoreLookupResult {
@@ -218,6 +226,7 @@ export function assembleLookup(services: LookupServices): Lookup {
     const cooldown: string[] = [];
     const resolveTargets: ResolveTarget[] = [];
     const cd = services.challengeCooldown ?? getChallengeCooldown();
+    const cfStore = services.cfCookieStore ?? getCfCookieStore();
     // CHALLENGE COOLDOWN gate (shared by detail AND search plans): this host is cooling from a recent
     // CF challenge — SKIP it WITHOUT fetching (a challenge fetch degrades the egress IP's CF
     // reputation) and list it under the additive `cooldown` list (the store is fine, we are
@@ -256,7 +265,8 @@ export function assembleLookup(services: LookupServices): Lookup {
           // BOUNDED per store: race the fetch against a timeout so one slow / hanging / CF-stalled
           // store can't keep the whole Promise.all pending. A timeout REJECTS → the catch below treats
           // it exactly like any other fetch failure (siteId → `failed`, reason logged, returns null).
-          const body = await withTimeout(services.fetchSearch(p.url, services.profiles.searchTransportFor(p.host)), STORE_TIMEOUT_MS);
+          const transport = services.profiles.searchTransportFor(p.host);
+          const body = await withTimeout(services.fetchSearch(p.url, transport), STORE_TIMEOUT_MS);
           // HONEST SEARCH LANE: a CF challenge/block body is NOT parseable content — extractCandidates
           // would silently lift 0 candidates and pose the store as "carries nothing". Detect it BEFORE
           // parsing: report the store `failed` with a logged reason, and OPEN its host's cooldown so
@@ -265,9 +275,14 @@ export function assembleLookup(services: LookupServices): Lookup {
             // eslint-disable-next-line no-console
             console.warn(`[lookup] ${sanitizeForLog(p.siteId)} search failed: challenge page`);
             cd.open(p.host, 'search challenge page');
+            // STORED-COOKIE STALE signal: a host WITH stored cookies still challenged → dead cookie,
+            // marked once via the lane that fetched (a host without stored cookies is never marked).
+            markStaleIfStored(cfStore, p.url, normalizeHost(p.host), transport.transport ?? 'http', 'search challenge page');
             failed.push(p.siteId);
             return null;
           }
+          // A clean body for a host WITH stored cookies is the FRESH signal (clears a stale mark).
+          markFreshIfStored(cfStore, p.url, normalizeHost(p.host));
           let candidates = await ruleset.extractCandidates(body, p.url);
           // Substring-store identity post-filter (record-mode): the store matched only the single
           // selective term issued as `{q}`, so drop candidates whose normalized name lacks any remaining

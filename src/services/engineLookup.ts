@@ -14,6 +14,7 @@ import { assembleLookup, type Lookup, type LookupServices } from '../driver/asse
 import { assembleCatalog, type Catalog } from '../driver/assembleCatalog.js';
 import { makeFetchSearch, type FetchSearchTransports } from './fetchSearch.js';
 import { impitFetchBody } from './impitFetch.js';
+import { getCfCookieStore, type CfCookieSource } from './cookieJar.js';
 import type { ExtractionRuleset, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
 
 /** The slice of the engine ExtractionRegistry the lookup needs. */
@@ -25,23 +26,62 @@ export interface LookupRegistry {
 const DESKTOP_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36';
 
-/**
- * Abort ceiling for the plain-HTTP lane, matching impit's own 15s cap (impitFetch TIMEOUT_MS) so
- * neither non-browser transport can outlive the other. Without it a tarpitted endpoint rides
- * undici's ~300s header/body defaults — tolerable for the ingest queue, not for the synchronous
- * /lookup and /resolve callers this lane also serves.
- */
-export const HTTP_FETCH_TIMEOUT_MS = 15_000;
+/** Abort ceiling (ms) for the plain-HTTP lane when HTTP_FETCH_TIMEOUT_MS is unset/invalid, and the clamp any override rides within. */
+const DEFAULT_HTTP_FETCH_TIMEOUT_MS = 15_000;
+const MIN_HTTP_FETCH_TIMEOUT_MS = 5_000;
+const MAX_HTTP_FETCH_TIMEOUT_MS = 120_000;
 
-/** Raw response body of a search URL via plain HTTP (Tier-1 cookieless JSON), abort-bounded. */
-export async function httpFetchBody(url: string): Promise<string> {
-  const res = await fetch(url, {
-    headers: { 'user-agent': DESKTOP_UA, accept: 'application/json, text/html' },
-    // One signal bounds headers AND body: text() streams under the same abort.
-    signal: AbortSignal.timeout(HTTP_FETCH_TIMEOUT_MS),
-  });
-  return res.text();
+/**
+ * Resolve the plain-HTTP lane's abort ceiling (ms) from the environment. HTTP_FETCH_TIMEOUT_MS
+ * overrides the 15s default (the orzgk 100-item listing takes ~15s, so ops set 30000); a missing,
+ * empty, non-numeric, or non-positive value falls back to the default, and any usable value is
+ * clamped to [5000, 120000]. Pure (env in → number out) — mirrors resolveImpitTimeoutMs.
+ */
+export function resolveHttpFetchTimeoutMs(env: NodeJS.ProcessEnv): number {
+  const n = Number(env.HTTP_FETCH_TIMEOUT_MS);
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_HTTP_FETCH_TIMEOUT_MS;
+  return Math.min(MAX_HTTP_FETCH_TIMEOUT_MS, Math.max(MIN_HTTP_FETCH_TIMEOUT_MS, n));
 }
+
+/**
+ * Abort ceiling for the plain-HTTP lane, resolved ONCE at module load. Without it a tarpitted
+ * endpoint rides undici's ~300s header/body defaults — tolerable for the ingest queue, not for the
+ * synchronous /lookup and /resolve callers this lane also serves.
+ */
+export const HTTP_FETCH_TIMEOUT_MS = resolveHttpFetchTimeoutMs(process.env);
+
+/** `name=value; name2=value2` — the Cookie request-header form of a stored cookie map. */
+function serializeCookieHeader(cookies: Record<string, string>): string {
+  return Object.entries(cookies).map(([name, value]) => `${name}=${value}`).join('; ');
+}
+
+/**
+ * Build the plain-HTTP body fetcher. STORED COOKIES + PINNED UA (CfCookieStore): a host the store has
+ * cookies for gets a `cookie` header and the mint User-Agent (cf_clearance is IP+UA-bound); an unknown
+ * host's request is BYTE-IDENTICAL to the cookieless path. `store` is injectable (tests); the default
+ * resolves the singleton per call so a hot-reloaded file is always the one consulted.
+ */
+export function createHttpFetch(options: { store?: CfCookieSource } = {}) {
+  /** Raw response body of a search URL via plain HTTP (Tier-1 cookieless JSON), abort-bounded. */
+  return async function httpFetchBody(url: string): Promise<string> {
+    const store = options.store ?? getCfCookieStore();
+    const cookies = store.cookiesFor(url);
+    const headers: Record<string, string> = {
+      'user-agent': store.userAgentFor(url) ?? DESKTOP_UA,
+      accept: 'application/json, text/html',
+      ...(cookies ? { cookie: serializeCookieHeader(cookies) } : {}),
+    };
+    const res = await fetch(url, {
+      headers,
+      // One signal bounds headers AND body: text() streams under the same abort.
+      signal: AbortSignal.timeout(HTTP_FETCH_TIMEOUT_MS),
+    });
+    return res.text();
+  };
+}
+
+/** The engine's default plain-HTTP fetcher (CfCookieStore singleton, module-load timeout). */
+export const httpFetchBody = createHttpFetch();
 
 /**
  * Build the cross-store Lookup from the engine's registered stores + the three search transports.

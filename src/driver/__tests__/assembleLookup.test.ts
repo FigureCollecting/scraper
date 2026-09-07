@@ -535,6 +535,67 @@ describe('assembleLookup × challenge cooldown — honest search lane + per-host
   });
 });
 
+/**
+ * Stored-cookie STALE / FRESH signals (CfCookieStore): at the existing search-challenge cooldown site,
+ * a host the store has cookies for is marked stale via the lane that fetched it; a clean search body
+ * marks it fresh. A host without stored cookies is never marked (the cooldown still opens).
+ */
+describe('assembleLookup × stored cookies — stale / fresh signals', () => {
+  const CHALLENGE = '<html><head><title>Just a moment...</title></head><body>cf</body></html>';
+  const fakeStore = (hosts: string[]) => ({
+    cookiesFor: (url: string) => (hosts.includes(new URL(url).hostname.replace(/^www\./, '')) ? { cf_clearance: 'FAKE_cf_1' } : undefined),
+    userAgentFor: () => undefined,
+    markStale: jest.fn(() => true),
+    markFresh: jest.fn(() => true),
+  });
+
+  it('a challenge from a host WITH stored cookies → markStale(host, lane, "search challenge page") once; a clean store → markFresh(host)', async () => {
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const cd = new ChallengeCooldown({ now: () => 1000, windowMs: 60_000 });
+    const cfCookieStore = fakeStore(['goodsmileus.com', 'solarisjapan.com']);
+    const fetchSearch = jest.fn(async (url: string) => (url.includes('goodsmileus') ? CHALLENGE : '{}'));
+    const { lookup } = build({ challengeCooldown: cd, fetchSearch, cfCookieStore });
+
+    const out = await lookup.lookup('tomie');
+
+    expect(out.failed).toContain('goodsmileus');
+    expect(cd.isOpen('goodsmileus.com')).toBe(true);
+    expect(cfCookieStore.markStale).toHaveBeenCalledTimes(1);
+    expect(cfCookieStore.markStale).toHaveBeenCalledWith('goodsmileus.com', 'http', 'search challenge page');
+    expect(cfCookieStore.markFresh).toHaveBeenCalledTimes(1);
+    expect(cfCookieStore.markFresh).toHaveBeenCalledWith('solarisjapan.com');
+  });
+
+  it('a challenge from a host WITHOUT stored cookies → cooldown opens but markStale is never called', async () => {
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const cd = new ChallengeCooldown({ now: () => 1000, windowMs: 60_000 });
+    const cfCookieStore = fakeStore([]);
+    const fetchSearch = jest.fn(async (url: string) => (url.includes('goodsmileus') ? CHALLENGE : '{}'));
+    const { lookup } = build({ challengeCooldown: cd, fetchSearch, cfCookieStore });
+
+    const out = await lookup.lookup('tomie');
+
+    expect(out.failed).toContain('goodsmileus');
+    expect(cd.isOpen('goodsmileus.com')).toBe(true);
+    expect(cfCookieStore.markStale).not.toHaveBeenCalled();
+  });
+
+  it('a store whose declared searchFetch names NO transport is marked via "http" — the same default makeFetchSearch rides', async () => {
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const cfCookieStore = fakeStore(['goodsmileus.com']);
+    const { lookup } = build({
+      profiles: buildProfileRegistry([{ ...GOODSMILEUS, searchFetch: { headers: { 'X-Api': 'k' } } }]),
+      challengeCooldown: new ChallengeCooldown({ now: () => 1000, windowMs: 60_000 }),
+      fetchSearch: jest.fn(async () => CHALLENGE),
+      cfCookieStore,
+    });
+
+    await lookup.lookup('tomie');
+
+    expect(cfCookieStore.markStale).toHaveBeenCalledWith('goodsmileus.com', 'http', 'search challenge page');
+  });
+});
+
 describe('assembleLookup — per-candidate collectUrl (the collect-ready URL; `url` stays the page link)', () => {
   // orzgk: bySearch + byId — the byId Store-API JSON collects where the CF-challenged HTML page does not.
   const ORZGK = caps('orzgk', 'www.orzgk.com', {
