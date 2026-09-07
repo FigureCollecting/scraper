@@ -278,7 +278,7 @@ export class CfCookieStore implements CfCookieSource, CfCookieStaleSignals {
     this.lastMtimeMs = mtimeMs;
     this.missingLogged = false;
     const parsed = parseCookieFile(raw);
-    if (!parsed.ok) {
+    if (parsed.ok === false) {
       // eslint-disable-next-line no-console
       console.warn(`[CF-COOKIE] malformed cookie file ${this.path}: ${parsed.reason} — keeping the last-good set (${this.entries.size} host(s))`);
       return;
