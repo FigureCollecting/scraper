@@ -32,6 +32,8 @@ export interface InitiatorConfig {
   requestTimeoutMs: number;
   /** Delay, in ms, before the ONE retry a transiently-failed lookup gets (0 = retry immediately). */
   lookupRetryDelayMs: number;
+  /** Wall-clock ceiling, in ms, on one pass: past it nothing more is dispatched (0 = no deadline). */
+  passDeadlineMs: number;
 }
 
 /** The proven-GO route inventory (tonight's run) — the safe default store set. */
@@ -54,6 +56,10 @@ const DEFAULTS = {
   // and the operator never sees the engine's bounded partial answer.
   requestTimeoutMs: 20000,
   lookupRetryDelayMs: 5000,
+  // 45 min — comfortably inside an hourly CronJob schedule. Without a deadline the worst
+  // case is maxRequests x requestTimeoutMs / maxConcurrency, which can outrun the schedule
+  // and put two passes (two independent gates) on the single egress IP at once.
+  passDeadlineMs: 45 * 60 * 1000,
 };
 
 type Env = Record<string, string | undefined>;
@@ -103,5 +109,7 @@ export function loadInitiatorConfig(env: Env = process.env): InitiatorConfig {
     requestTimeoutMs: posInt(env.INITIATOR_REQUEST_TIMEOUT_MS, DEFAULTS.requestTimeoutMs),
     // nonNeg, not pos: an explicit 0 means "retry at once", a legitimate setting.
     lookupRetryDelayMs: nonNegInt(env.INITIATOR_LOOKUP_RETRY_DELAY_MS, DEFAULTS.lookupRetryDelayMs),
+    // nonNeg, not pos: an explicit 0 disables the deadline (unbounded pass), a legitimate setting.
+    passDeadlineMs: nonNegInt(env.INITIATOR_PASS_DEADLINE_MS, DEFAULTS.passDeadlineMs),
   };
 }

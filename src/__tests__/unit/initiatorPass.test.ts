@@ -31,6 +31,7 @@ const mkCfg = (over: Partial<InitiatorConfig>): InitiatorConfig => ({
   requestSpacingMs: 0,
   requestTimeoutMs: 5000,
   lookupRetryDelayMs: 0,
+  passDeadlineMs: 0,
   ...over,
 });
 
@@ -887,5 +888,52 @@ describe('runInitiatorPass — per-lookup logging carries its identity on the he
     } finally {
       Object.values(s).forEach((x) => x.mockRestore());
     }
+  });
+});
+
+describe('runInitiatorPass — pass wall-clock deadline', () => {
+  /** A clock the fake advances by `stepMs` on every request, so a pass can be aged deterministically. */
+  const clockFake = (stepMs: number, opts: Parameters<typeof makeFake>[0]) => {
+    let t = 0;
+    const inner = makeFake(opts);
+    const fetch: FetchLike = async (url, init) => {
+      const r = await inner.fetch(url, init);
+      t += stepMs;
+      return r;
+    };
+    return { ...inner, fetch, now: () => t };
+  };
+
+  it('stops dispatching a store\'s later terms once the pass deadline has passed', async () => {
+    const fake = clockFake(600, { lookup: (_t, store) => ({ status: 200, body: lookupWith({ [store]: [] }) }) });
+    const s = await runInitiatorPass(mkCfg({ stores: ['amiami'], terms: ['t1', 't2', 't3'], passDeadlineMs: 1000 }), {
+      fetch: fake.fetch,
+      now: fake.now,
+    });
+    expect(fake.lookupCalls().length).toBe(2); // t3 is past the deadline
+    expect(s.deadlineExceeded).toBe(true);
+  });
+
+  it('stops dispatching ingest POSTs once the pass deadline has passed', async () => {
+    const fake = clockFake(600, { lookup: (_t, store) => ({ status: 200, body: lookupWith({ [store]: [`https://${store}.test/1`] }) }) });
+    const s = await runInitiatorPass(mkCfg({ stores: ['amiami'], terms: ['t1', 't2'], passDeadlineMs: 1000 }), {
+      fetch: fake.fetch,
+      now: fake.now,
+    });
+    expect(fake.ingestCalls().length).toBe(0);
+    expect(s.totalDiscovered).toBe(1);
+    expect(s.totalEnqueued).toBe(0);
+    expect(s.deadlineExceeded).toBe(true);
+  });
+
+  it('never short-circuits when the deadline is 0 (disabled)', async () => {
+    const fake = clockFake(600, { lookup: (_t, store) => ({ status: 200, body: lookupWith({ [store]: [`https://${store}.test/1`] }) }) });
+    const s = await runInitiatorPass(mkCfg({ stores: ['amiami'], terms: ['t1', 't2'], passDeadlineMs: 0, maxUrlsPerStore: 5 }), {
+      fetch: fake.fetch,
+      now: fake.now,
+    });
+    expect(fake.lookupCalls().length).toBe(2);
+    expect(fake.ingestCalls().length).toBe(1);
+    expect(s.deadlineExceeded).toBe(false);
   });
 });

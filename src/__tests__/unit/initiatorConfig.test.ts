@@ -104,6 +104,15 @@ describe('loadInitiatorConfig', () => {
     expect(loadInitiatorConfig({}).requestTimeoutMs).toBeGreaterThan(resolveLookupStoreTimeoutMs({}));
   });
 
+  it('defaults a pass wall-clock deadline that fits inside an hourly schedule', () => {
+    const c = loadInitiatorConfig({});
+    expect(c.passDeadlineMs).toBeGreaterThan(0);
+    expect(c.passDeadlineMs).toBeLessThan(60 * 60 * 1000);
+    expect(loadInitiatorConfig({ INITIATOR_PASS_DEADLINE_MS: '120000' }).passDeadlineMs).toBe(120000);
+    expect(loadInitiatorConfig({ INITIATOR_PASS_DEADLINE_MS: '0' }).passDeadlineMs).toBe(0); // explicit 0 = no deadline
+    expect(loadInitiatorConfig({ INITIATOR_PASS_DEADLINE_MS: 'soon' }).passDeadlineMs).toBe(c.passDeadlineMs);
+  });
+
   it('trims a trailing slash from SCRAPER_SERVICE_URL', () => {
     expect(loadInitiatorConfig({ SCRAPER_SERVICE_URL: 'http://scraper:3050/' }).scraperServiceUrl).toBe('http://scraper:3050');
   });

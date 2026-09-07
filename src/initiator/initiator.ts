@@ -61,6 +61,8 @@ export interface InitiatorDeps {
   gate?: RequestGate;
   /** Injectable delay used between a lookup and its retry (tests); defaults to setTimeout. */
   sleep?: (ms: number) => Promise<void>;
+  /** Injectable clock for the pass deadline (tests); defaults to Date.now. */
+  now?: () => number;
 }
 
 export interface StoreSummary {
@@ -91,6 +93,8 @@ export interface RunSummary {
   requestBudget: number;
   requestsIssued: number;
   budgetExhausted: boolean;
+  /** True when the pass stopped dispatching because INITIATOR_PASS_DEADLINE_MS was reached. */
+  deadlineExceeded: boolean;
   peakInFlight: number;
   /** Sum of the per-store lookupFailures (a failure is charged to its own store). */
   lookupFailures: number;
@@ -187,6 +191,24 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
   };
 
   let budgetExhausted = false;
+  let deadlineExceeded = false;
+  const now = deps.now ?? Date.now;
+  const passStartedMs = now();
+  /**
+   * The pass has a wall clock, not just a request budget: an hourly CronJob whose pass
+   * outruns its schedule puts two passes — two independent gates — on the single egress
+   * IP at once, which is exactly what the gate exists to prevent. Past the deadline
+   * nothing further is dispatched; what already ran is still summarized.
+   */
+  const pastDeadline = (): boolean => {
+    if (config.passDeadlineMs <= 0) return false;
+    if (now() - passStartedMs < config.passDeadlineMs) return false;
+    if (!deadlineExceeded) {
+      deadlineExceeded = true;
+      logger.warn(`[INITIATOR] pass deadline ${config.passDeadlineMs}ms reached — dispatching nothing further`);
+    }
+    return true;
+  };
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
 
   const summarize = (): RunSummary => {
@@ -207,6 +229,7 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
       requestBudget: config.maxRequests,
       requestsIssued: gate.issued(),
       budgetExhausted,
+      deadlineExceeded,
       peakInFlight: gate.peakInFlight(),
       lookupFailures: stores.reduce((n, s) => n + s.lookupFailures, 0),
       totalDiscovered: stores.reduce((n, s) => n + s.discovered, 0),
@@ -372,6 +395,7 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
       // A full URL cap makes another term's lookup pure waste — everything it returns is
       // discarded by addUrl. (Cap 0 is the documented discovery-only dry run: still look up.)
       if (config.maxUrlsPerStore > 0 && setFor(siteId).size >= config.maxUrlsPerStore) break;
+      if (pastDeadline()) break;
       await discoverOne(term, siteId, ss, state);
     }
   };
@@ -397,6 +421,7 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
   const enqueueOne = async ({ siteId, url }: { siteId: string; url: string }): Promise<void> => {
     const ss = perStore.get(siteId);
     if (!ss) return;
+    if (pastDeadline()) return;
     try {
       const r = await gate.run(() => httpPostJson(deps.fetch, ingestUrl, { url }, config.requestTimeoutMs));
       if (r.status === 'budget-exhausted') {
