@@ -11,6 +11,7 @@ import { createLookupRoute } from './routes/lookup.js';
 import { createCatalogRoute } from './routes/catalog.js';
 import { createHealthRoutes } from './routes/health.js';
 import { getChallengeCooldown } from './services/challengeCooldown.js';
+import { getCfCookieStore } from './services/cookieJar.js';
 import { createEngineLookup, createEngineCatalog } from './services/engineLookup.js';
 import { createResolveRoute } from './routes/resolve.js';
 import { createEngineResolve } from './services/engineResolve.js';
@@ -39,13 +40,15 @@ const PORT = process.env.PORT || 3080;
 app.use(cors());
 app.use(express.json());
 
-// Health check endpoints — root/health/version, plus /health/detailed (browser-pool status + the
-// per-host Cloudflare-challenge cooldowns currently open). Extracted to a route factory so the
-// surface is unit-testable without booting the server.
+// Health check endpoints — root/health/version, plus /health/detailed (browser-pool status, the
+// per-host Cloudflare-challenge cooldowns currently open, and the stored-cookie jar's per-host view —
+// names and stale flags, never values). Extracted to a route factory so the surface is unit-testable
+// without booting the server.
 app.use('/', createHealthRoutes({
   version: packageJson.version,
   getBrowserPoolHealth: () => BrowserPool.getHealth(),
   listChallengeCooldowns: () => getChallengeCooldown().list(),
+  listCfCookies: () => getCfCookieStore().view(),
 }));
 
 // Scraper routes (no /api prefix for consistency)
@@ -61,6 +64,10 @@ let loadedPlugins: ScraperPlugin[] = [];
 // Discover + register plugins (mounting their routes) before accepting
 // connections, then start the server and initialize the browser pool.
 async function startServer(): Promise<void> {
+  // STORED COOKIES (CF_COOKIE_FILE): load the hand-minted per-host cookie jar BEFORE any fetch can
+  // run, and start its mtime poller so a re-minted file (a refreshed Secret) goes live without a
+  // restart. Unset env ⇒ the store is disabled and this is a no-op. Never throws.
+  getCfCookieStore().start();
   try {
     const { registry, plugins } = await bootstrapPlugins(app);
     loadedPlugins = plugins;
@@ -129,6 +136,9 @@ async function gracefulShutdown(signal: string): Promise<void> {
   } catch (error) {
     console.error('[PAGE-SCRAPER] Error shutting down plugins:', error);
   }
+
+  // Stop the stored-cookie file poller (an unref'd timer — this is hygiene, not a shutdown blocker).
+  getCfCookieStore().stop();
 
   try {
     console.log('[PAGE-SCRAPER] Closing browser pool...');

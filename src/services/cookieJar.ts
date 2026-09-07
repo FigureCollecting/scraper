@@ -67,6 +67,28 @@ export interface CfCookieStaleSignals {
   markFresh(host: string): boolean;
 }
 
+/**
+ * The full injectable seam the challenge sites consume (read + signal) — what ScrapeQueue.setCfCookieStore,
+ * LookupServices.cfCookieStore, and the two helpers below accept; a test fake needs only these four.
+ */
+export type CfCookieStoreLike = CfCookieSource & CfCookieStaleSignals;
+
+/**
+ * The STALE signal at a challenge site: a host the store has cookies for that STILL served a
+ * challenge has a dead cookie the engine cannot re-mint (cf_clearance is IP+UA-bound), so it is
+ * marked stale — once — for /health/detailed and the operator's re-mint. A host the store knows
+ * nothing about is never marked (its challenge is an egress/reputation matter, not a cookie one).
+ * `host` is the normalized host the cooldown was opened on; `lane` names the transport that fetched.
+ */
+export function markStaleIfStored(store: CfCookieStoreLike, url: string, host: string, lane: string, reason: string): boolean {
+  return store.cookiesFor(url) !== undefined && store.markStale(host, lane, reason);
+}
+
+/** The FRESH counterpart at a clean-fetch site: a real body came back for a host WITH stored cookies. */
+export function markFreshIfStored(store: CfCookieStoreLike, url: string, host: string): boolean {
+  return store.cookiesFor(url) !== undefined && store.markFresh(host);
+}
+
 /** The fs slice the store depends on (Node's `fs` satisfies it; tests inject an in-memory fake). */
 export interface CfCookieFs {
   readFileSync(path: string, encoding: 'utf8'): string;

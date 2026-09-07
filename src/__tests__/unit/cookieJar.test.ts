@@ -17,6 +17,8 @@ import {
   getCfCookieStore,
   resetCfCookieStore,
   resolveCfCookieFilePath,
+  markStaleIfStored,
+  markFreshIfStored,
 } from '../../services/cookieJar';
 
 /** Cookie VALUES used across the fixtures — the leak assertions prove none of these ever surfaces. */
@@ -423,5 +425,59 @@ describe('resolveCfCookieFilePath + singleton (CF_COOKIE_FILE)', () => {
     expect(s.view()).toEqual([]);
     s.start(); // harmless when disabled
     s.stop();
+  });
+});
+
+/**
+ * The challenge-site helpers: the gate every cooldown.open / clean-fetch site uses. They consult
+ * cookiesFor(url) FIRST so a host the store knows nothing about is never signalled (its challenge is
+ * an egress matter, not a cookie one), and they forward the store's own transition result.
+ */
+describe('markStaleIfStored / markFreshIfStored — signal only for a host WITH stored cookies', () => {
+  const fake = (has: boolean, transition = true) => ({
+    cookiesFor: jest.fn(() => (has ? { cf_clearance: 'FAKE_cf_1' } : undefined)),
+    userAgentFor: jest.fn(() => undefined),
+    markStale: jest.fn(() => transition),
+    markFresh: jest.fn(() => transition),
+  });
+
+  it('host WITH cookies → markStale(host, lane, reason) is forwarded and its transition result returned', () => {
+    const store = fake(true);
+    expect(markStaleIfStored(store, 'https://www.anitoysgk.com/p/1', 'anitoysgk.com', 'impersonate', 'challenge page')).toBe(true);
+    expect(store.cookiesFor).toHaveBeenCalledWith('https://www.anitoysgk.com/p/1');
+    expect(store.markStale).toHaveBeenCalledWith('anitoysgk.com', 'impersonate', 'challenge page');
+    // an already-stale host reports no transition (the store's own once-only semantics pass through)
+    expect(markStaleIfStored(fake(true, false), 'https://anitoysgk.com/p/2', 'anitoysgk.com', 'http', 'again')).toBe(false);
+  });
+
+  it('host WITHOUT cookies → markStale is never called, false', () => {
+    const store = fake(false);
+    expect(markStaleIfStored(store, 'https://unknown.example/p', 'unknown.example', 'http', 'challenge page')).toBe(false);
+    expect(store.markStale).not.toHaveBeenCalled();
+  });
+
+  it('markFreshIfStored mirrors it: forwarded (and its result returned) only for a host WITH cookies', () => {
+    const withCookies = fake(true);
+    expect(markFreshIfStored(withCookies, 'https://anitoysgk.com/p/3', 'anitoysgk.com')).toBe(true);
+    expect(withCookies.markFresh).toHaveBeenCalledWith('anitoysgk.com');
+    expect(markFreshIfStored(fake(true, false), 'https://anitoysgk.com/p/3', 'anitoysgk.com')).toBe(false);
+    const without = fake(false);
+    expect(markFreshIfStored(without, 'https://unknown.example/p', 'unknown.example')).toBe(false);
+    expect(without.markFresh).not.toHaveBeenCalled();
+  });
+
+  it('end to end on a REAL store: stale flips view().stale once, fresh clears it, an unknown host is untouched', () => {
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    jest.spyOn(console, 'log').mockImplementation(() => {});
+    const { fs } = fakeFs(FILE_V1);
+    const store = new CfCookieStore({ path: '/x/cf-cookies.json', fs, now: () => 5_000 });
+    store.load();
+    expect(markStaleIfStored(store, 'https://www.anitoysgk.com/p/1', 'anitoysgk.com', 'impersonate', 'challenge page via impersonate transport')).toBe(true);
+    expect(markStaleIfStored(store, 'https://www.anitoysgk.com/p/1', 'anitoysgk.com', 'impersonate', 'challenge page via impersonate transport')).toBe(false);
+    expect(store.view().find((v) => v.host === 'anitoysgk.com')).toMatchObject({ stale: true, staleReason: 'challenge page via impersonate transport' });
+    expect(markStaleIfStored(store, 'https://unknown.example/p', 'unknown.example', 'http', 'x')).toBe(false);
+    expect(markFreshIfStored(store, 'https://anitoysgk.com/p/2', 'anitoysgk.com')).toBe(true);
+    expect(store.view().find((v) => v.host === 'anitoysgk.com')).toMatchObject({ stale: false });
+    expect(store.view().find((v) => v.host === 'myfigurecollection.net')).toMatchObject({ stale: false });
   });
 });
