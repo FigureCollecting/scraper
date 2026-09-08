@@ -115,8 +115,15 @@ export function classifyImageBytes(contentType: string | undefined | null, bytes
   return sniffed ? { image: true, contentType: sniffed.contentType } : { image: false };
 }
 
-/** True for a fetch that was aborted by its own timeout signal (undici throws TimeoutError/AbortError). */
+/**
+ * True for a request that ran out of time. undici names it (`TimeoutError` / `AbortError` from the
+ * abort signal); impit's native binding does not — it throws a plain Error whose MESSAGE says so, so
+ * the message is the only signal available for that lane. Matching on it is deliberately narrow: the
+ * cost of a false positive is one expired fetch reported as 'timeout' instead of thrown, and the
+ * cost of missing it is a timeout escaping as a fault the queue would classify as a hard failure.
+ */
 export function isTimeoutError(err: unknown): boolean {
-  const name = err instanceof Error ? err.name : '';
-  return name === 'TimeoutError' || name === 'AbortError';
+  if (!(err instanceof Error)) return false;
+  if (err.name === 'TimeoutError' || err.name === 'AbortError') return true;
+  return /\btimed out\b|\btimeout\b/i.test(err.message);
 }
