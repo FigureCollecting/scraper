@@ -301,7 +301,17 @@ export function residentialEgressView(
  * a non-retried config failure — never a silent fetch from the node IP.
  */
 export function refuseHttpLaneResidentialEgress(url: string, proxyUrl: string): never {
-  throw new ResidentialEgressUnavailableError(
+  throw httpLaneResidentialRefusal(url, proxyUrl);
+}
+
+/**
+ * The same refusal as a VALUE. The image BYTES lanes answer every expected outcome with a typed
+ * result rather than an exception, so they need the refusal without the throw — and must not restate
+ * its wording, or the two copies drift apart. This is the single source of that wording;
+ * {@link refuseHttpLaneResidentialEgress} is this factory plus a throw.
+ */
+export function httpLaneResidentialRefusal(url: string, proxyUrl: string): ResidentialEgressUnavailableError {
+  return new ResidentialEgressUnavailableError(
     url,
     'unsupported-lane',
     isSocksProxy(proxyUrl)
