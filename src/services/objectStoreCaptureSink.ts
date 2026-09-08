@@ -107,6 +107,19 @@ export interface SinkStats {
 const SUPPORTED_KEY_SCHEME = 'sha256-v1';
 const DEFAULT_PUT_TIMEOUT_MS = 5_000;
 const MAX_METADATA_VALUE_LEN = 1024;
+/**
+ * S3 caps USER METADATA as a SET (2 KB of `x-amz-meta-*` header bytes), not per
+ * value — an over-budget set fails the whole PUT with 400 MetadataTooLarge and the
+ * bytes are lost (write-once, nothing re-queues). We aim well under the limit so a
+ * signed CDN image URL plus a long referring page URL can never cost the object.
+ */
+const MAX_METADATA_TOTAL_BYTES = 1800;
+/** The header name S3 counts alongside each value. */
+const METADATA_HEADER_PREFIX = 'x-amz-meta-';
+/** Least-valuable provenance first: what gets dropped when the set is over budget. */
+const METADATA_SHED_ORDER = ['declared-content-type', 'source-url', 'position', 'bytes'];
+/** No value is truncated below this — a stub still identifies the object. */
+const MIN_BUDGETED_VALUE_LEN = 64;
 const DEFAULT_IMAGE_PREFIX = 'raw-img/';
 /** 10 MiB — comfortably above a storefront hero image, well below a stall. */
 export const DEFAULT_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -166,6 +179,35 @@ function headerSafe(value: string): string {
   }
   s = s.replace(/[\x00-\x1f\x7f]/g, ''); // strip any residual control chars
   return s.length > MAX_METADATA_VALUE_LEN ? s.slice(0, MAX_METADATA_VALUE_LEN) : s;
+}
+
+/** The header bytes S3 actually counts for a metadata set. */
+function metadataBytes(md: Record<string, string>): number {
+  let n = 0;
+  for (const [k, v] of Object.entries(md)) {
+    n += Buffer.byteLength(`${METADATA_HEADER_PREFIX}${k}`, 'utf8') + Buffer.byteLength(v, 'utf8');
+  }
+  return n;
+}
+
+/**
+ * Fits a metadata set inside MAX_METADATA_TOTAL_BYTES. Per-value capping is not
+ * enough: the asset lane emits several independently-capped, store-controlled
+ * values (the image URL and the declared Content-Type both come from the store).
+ * Sheds the optional provenance in priority order first, then halves the longest
+ * survivor until it fits — a degraded tag is always better than a lost object.
+ */
+function budgetMetadata(md: Record<string, string>): Record<string, string> {
+  for (const k of METADATA_SHED_ORDER) {
+    if (metadataBytes(md) <= MAX_METADATA_TOTAL_BYTES) return md;
+    delete md[k];
+  }
+  while (metadataBytes(md) > MAX_METADATA_TOTAL_BYTES) {
+    const longest = Object.entries(md).sort((a, b) => b[1].length - a[1].length)[0];
+    if (!longest || longest[1].length <= MIN_BUDGETED_VALUE_LEN) break;
+    md[longest[0]] = longest[1].slice(0, Math.max(MIN_BUDGETED_VALUE_LEN, Math.ceil(longest[1].length / 2)));
+  }
+  return md;
 }
 
 /** The URL's hostname, or undefined when it is not parseable (best-effort tagging). */
@@ -318,10 +360,10 @@ export class ObjectStoreCaptureSink implements CaptureSink {
 
   private metadata(c: RawCapture): Record<string, string> {
     const url = c.finalUrl ?? c.url;
-    const md: Record<string, string> = { url: headerSafe(url), 'fetched-at': c.fetchedAt };
+    const md: Record<string, string> = { url: headerSafe(url), 'fetched-at': headerSafe(c.fetchedAt) };
     const host = hostOf(url); // best-effort — a malformed URL just omits the site tag
     if (host) md.site = headerSafe(host);
-    return md;
+    return budgetMetadata(md);
   }
 
   /**
@@ -333,7 +375,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     const url = c.finalUrl ?? c.url;
     const md: Record<string, string> = {
       url: headerSafe(url),
-      'fetched-at': c.fetchedAt,
+      'fetched-at': headerSafe(c.fetchedAt),
       lane: 'asset',
       bytes: String(c.bytes.length),
     };
@@ -343,9 +385,9 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     if (site) md.site = headerSafe(site);
     if (c.sourceItem) md['source-item'] = headerSafe(`${c.sourceItem.site}/${c.sourceItem.itemId}`);
     if (c.sourceUrl) md['source-url'] = headerSafe(c.sourceUrl);
-    if (c.position !== undefined) md.position = String(c.position);
+    if (c.position !== undefined) md.position = headerSafe(String(c.position));
     if (c.contentType) md['declared-content-type'] = headerSafe(c.contentType);
-    return md;
+    return budgetMetadata(md);
   }
 
   private withTimeout<T>(p: Promise<T>): Promise<T> {

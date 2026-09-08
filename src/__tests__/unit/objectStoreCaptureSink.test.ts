@@ -415,3 +415,78 @@ describe('ObjectStoreCaptureSink — per-lane enable flags', () => {
     expect(sink.stats().assetSkipped.disabled).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// S3 caps USER METADATA as a SET (~2 KB of header bytes), not per value. Two of
+// the asset lane's inputs are wholly store-controlled (the image URL it serves and
+// the Content-Type header it returns), so an unbudgeted set is a way for a hostile
+// store to 400 every one of its own images out of the corpus.
+// ---------------------------------------------------------------------------
+
+/** The header bytes S3 actually counts: `x-amz-meta-<key>` + value, summed. */
+const metadataBytes = (md: Record<string, string> = {}) =>
+  Object.entries(md).reduce(
+    (n, [k, v]) => n + Buffer.byteLength(`x-amz-meta-${k}`, 'utf8') + Buffer.byteLength(v, 'utf8'),
+    0,
+  );
+
+describe('ObjectStoreCaptureSink — user-metadata is budgeted as a whole', () => {
+  let store: FakeObjectStore;
+  let sink: ObjectStoreCaptureSink;
+
+  beforeEach(() => {
+    store = new FakeObjectStore();
+    sink = new ObjectStoreCaptureSink(store, CONFIG);
+  });
+
+  const LONG_IMG = `https://cdn.x.test/i/${'a'.repeat(2000)}.jpg`;
+  const LONG_PAGE = `https://x.test/item/${'b'.repeat(2000)}`;
+
+  it('keeps a hostile asset metadata set under the S3 ceiling instead of failing the PUT', async () => {
+    await sink.capture(
+      asset(JPEG, {
+        url: LONG_IMG,
+        sourceUrl: LONG_PAGE,
+        contentType: `image/jpeg;${'c'.repeat(1500)}`,
+      }),
+    );
+
+    expect(store.puts).toHaveLength(1);
+    expect(metadataBytes(store.puts[0].opts.metadata)).toBeLessThan(2048);
+    expect(sink.stats().assetStored).toBe(1);
+  });
+
+  it('sheds the least valuable provenance first: declared-content-type, then source-url', async () => {
+    await sink.capture(
+      asset(JPEG, { url: LONG_IMG, sourceUrl: LONG_PAGE, contentType: `image/jpeg;${'c'.repeat(1500)}` }),
+    );
+    const md = store.puts[0].opts.metadata!;
+    expect(md['declared-content-type']).toBeUndefined();
+    expect(md['source-item']).toBe('x.test/12345'); // the identity survives
+    expect(md.url).toBeDefined();
+  });
+
+  it('budgets the page lanes too — a hostile URL cannot blow their metadata either', async () => {
+    await sink.capture(cap({ url: `https://${'d'.repeat(1200)}.test/${'e'.repeat(1200)}` }));
+    expect(metadataBytes(store.puts[0].opts.metadata)).toBeLessThan(2048);
+  });
+
+  it('leaves an ordinary asset metadata set completely intact', async () => {
+    await sink.capture(asset(JPEG));
+    expect(Object.keys(store.puts[0].opts.metadata!).sort()).toEqual([
+      'bytes', 'declared-content-type', 'fetched-at', 'lane', 'position', 'site', 'source-item', 'source-url', 'url',
+    ]);
+  });
+
+  it('header-safes every metadata value, including fetched-at and position', async () => {
+    await sink.capture(
+      asset(JPEG, {
+        fetchedAt: '2026-09-08T00:00:00.000Z\r\nx-amz-acl: public-read',
+        position: '3\r\nx-amz-acl: public-read' as unknown as number,
+      }),
+    );
+    const md = store.puts[0].opts.metadata!;
+    expect(md['fetched-at']).not.toMatch(/[\r\n]/);
+    expect(md.position).not.toMatch(/[\r\n]/);
+  });
+});
