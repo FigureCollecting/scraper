@@ -2,6 +2,7 @@ import { jest } from '@jest/globals';
 import { NoopCaptureSink } from '../../services/captureSink';
 import { ObjectStoreCaptureSink } from '../../services/objectStoreCaptureSink';
 import {
+  MAX_CONFIGURABLE_IMAGE_BYTES,
   rawStoreView,
   loadRawStoreConfigFromEnv,
   createRawCaptureSink,
@@ -232,5 +233,23 @@ describe('rawStoreView — the ops-readable view of whichever sink was built', (
   it('never throws when stats() does — health must not 500 on a counter read', () => {
     const hostile = { capture: async () => {}, stats: () => { throw new Error('boom'); } };
     expect(rawStoreView(hostile as never)).toEqual({ configured: false });
+  });
+});
+
+describe('RAW_STORE_IMAGE_MAX_BYTES is bounded from above too', () => {
+  it('clamps an absurd ceiling instead of removing the ceiling', () => {
+    const loaded = loadRawStoreConfigFromEnv({
+      ...FULL_ENV,
+      RAW_STORE_IMAGE_MAX_BYTES: '1e30',
+    } as unknown as NodeJS.ProcessEnv)!;
+    expect(loaded.config.maxImageBytes).toBe(MAX_CONFIGURABLE_IMAGE_BYTES);
+  });
+
+  it('leaves a sane ceiling exactly as configured', () => {
+    const loaded = loadRawStoreConfigFromEnv({
+      ...FULL_ENV,
+      RAW_STORE_IMAGE_MAX_BYTES: '2048',
+    } as unknown as NodeJS.ProcessEnv)!;
+    expect(loaded.config.maxImageBytes).toBe(2048);
   });
 });

@@ -98,6 +98,19 @@ function parsePositive(raw: string | undefined): number | undefined {
 }
 
 /**
+ * The largest ceiling RAW_STORE_IMAGE_MAX_BYTES may set. Without an upper bound a
+ * typo (`1e30`) silently removes the ceiling, and the ceiling is what stops a body
+ * that is already fully buffered and hashed from also being stored.
+ */
+export const MAX_CONFIGURABLE_IMAGE_BYTES = 64 * 1024 * 1024;
+
+/** A positive byte ceiling from env, clamped so a typo cannot disable the ceiling. */
+function parseImageMaxBytes(raw: string | undefined): number | undefined {
+  const n = parsePositive(raw);
+  return n === undefined ? undefined : Math.min(n, MAX_CONFIGURABLE_IMAGE_BYTES);
+}
+
+/**
  * The asset lane's own kill switch, deliberately SEPARATE from PERSIST_RAW_HTML:
  * images are a different corpus with different volume and different rights, so
  * turning page capture on must not start pulling binaries. Off unless the value is
@@ -169,7 +182,7 @@ export function loadRawStoreConfigFromEnv(
     assetsEnabled,
     putTimeoutMs: parsePositive(env.RAW_STORE_PUT_TIMEOUT_MS),
     imagePutTimeoutMs: parsePositive(env.RAW_STORE_IMAGE_PUT_TIMEOUT_MS),
-    maxImageBytes: parsePositive(env.RAW_STORE_IMAGE_MAX_BYTES),
+    maxImageBytes: parseImageMaxBytes(env.RAW_STORE_IMAGE_MAX_BYTES),
     pathStyle: env.RAW_STORE_S3_PATH_STYLE !== undefined ? env.RAW_STORE_S3_PATH_STYLE === 'true' : undefined,
   };
   return { config, creds: { accessKeyId, secretAccessKey } };

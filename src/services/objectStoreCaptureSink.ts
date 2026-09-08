@@ -39,7 +39,11 @@ export interface PutOptions {
    * clients. Present on the port only so tests can assert it stays unset.
    */
   contentEncoding?: string;
-  /** Best-effort convenience metadata describing the FIRST capture only. */
+  /**
+   * Best-effort convenience metadata describing the FIRST capture only — the key is
+   * the content address, so bytes reused across items keep the first capture's tags.
+   * The spine's capture event log (one row per reference) is the authoritative index.
+   */
   metadata?: Record<string, string>;
 }
 
@@ -129,7 +133,11 @@ const METADATA_SHED_ORDER = ['declared-content-type', 'source-url', 'position', 
 /** No value is truncated below this — a stub still identifies the object. */
 const MIN_BUDGETED_VALUE_LEN = 64;
 const DEFAULT_IMAGE_PREFIX = 'raw-img/';
-/** 10 MiB — comfortably above a storefront hero image, well below a stall. */
+/**
+ * 10 MiB — comfortably above a storefront hero image, well below a stall. This
+ * bounds what is STORED, not what is fetched: the body reaches the sink already
+ * buffered and already hashed, so the fetcher owns the download bound.
+ */
 export const DEFAULT_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 
 /** An image format this lane will store: its file extension and true media type. */
