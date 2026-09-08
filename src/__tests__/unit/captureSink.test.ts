@@ -27,6 +27,31 @@ describe('buildRawCapture', () => {
     expect(() => new Date(c.fetchedAt).toISOString()).not.toThrow();
     expect(c.fetchedAt).toBe(new Date(c.fetchedAt).toISOString());
   });
+
+  it('carries the asset lane and its image provenance through unchanged', () => {
+    const bytes = Buffer.from([0xff, 0xd8, 0xff, 0xe0]);
+    const c = buildRawCapture({
+      url: 'https://cdn.x.test/img/9.jpg',
+      lane: 'asset',
+      bytes,
+      contentType: 'image/jpeg',
+      sourceItem: { site: 'x.test', itemId: '12345' },
+      sourceUrl: 'https://x.test/item/12345',
+      position: 2,
+    });
+    expect(c.lane).toBe('asset');
+    expect(c.sourceItem).toEqual({ site: 'x.test', itemId: '12345' });
+    expect(c.sourceUrl).toBe('https://x.test/item/12345');
+    expect(c.position).toBe(2);
+    expect(c.sha256).toBe(sha(bytes));
+  });
+
+  it('omits the asset provenance fields entirely when they are not supplied', () => {
+    const c = buildRawCapture({ url: 'https://x/1', lane: 'wire', bytes: Buffer.from('x') });
+    expect('sourceItem' in c).toBe(false);
+    expect('sourceUrl' in c).toBe(false);
+    expect('position' in c).toBe(false);
+  });
 });
 
 describe('scrapingService capture hook', () => {
