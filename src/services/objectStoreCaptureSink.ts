@@ -11,6 +11,15 @@
  *   write = HEAD-then-PUT, write-once: a dedup hit records nothing here (the spine
  *           capture table is the authoritative event log); nothing is ever DELETEd.
  *
+ * The ASSET lane (product images) is the one exception to the body rules above:
+ *
+ *   key   = <imagePrefix>sha256/<aa>/<sha256hex>.<ext>   (ext from the MAGIC BYTES)
+ *   body  = the ORIGINAL bytes, unaltered — no gzip, no re-encode, no derivative
+ *   type  = the sniffed image type; the store's declared Content-Type is advisory
+ *           only and is recorded as metadata beside it
+ *   skips = a body that is not an image, is oversized, or is empty is SKIPPED with
+ *           a typed reason and counted — never stored, never thrown.
+ *
  * The store is injected via a minimal SDK-agnostic port so this logic is unit-
  * testable without creds, a network, or the real S3 SDK. A slow/broken store must
  * NEVER break or stall a scrape: every op is timeout-bounded and failures are
@@ -22,7 +31,7 @@ import { sanitizeForLog } from '../utils/security.js';
 
 /** Options for a single object write. */
 export interface PutOptions {
-  /** Always `application/gzip`. */
+  /** `application/gzip` for page bodies; the sniffed image type on the asset lane. */
   contentType: string;
   /**
    * Intentionally never set by this sink — the `.gz` suffix declares compression
@@ -51,6 +60,10 @@ export interface RawStoreConfig {
   prefix: string;
   /** Capture-type prefix for the json (api) lane, e.g. `raw-json/`. */
   jsonPrefix?: string;
+  /** Capture-type prefix for the asset (image) lane, e.g. `raw-img/`. */
+  imagePrefix?: string;
+  /** Hard ceiling on one stored image's bytes; larger bodies are SKIPPED. */
+  maxImageBytes?: number;
   /** Key-scheme contract version; this writer only knows `sha256-v1`. */
   keyScheme: string;
   /** Hard bound on each HEAD/PUT so a slow store can't stall the fetch path. */
@@ -62,16 +75,69 @@ export interface RawStoreConfig {
   pathStyle?: boolean;
 }
 
+/** Why an asset-lane capture was skipped without being stored. */
+export type AssetSkipReason = 'notImage' | 'tooLarge' | 'empty';
+
+/** Per-reason skip tally for the asset lane. */
+export type AssetSkipCounts = Record<AssetSkipReason, number>;
+
 /** Observable counters — the leak/failure surface for prod (mirrors BrowserPool). */
 export interface SinkStats {
   stored: number;
   deduped: number;
   failed: number;
+  /** Asset lane, counted separately so page-body volume stays readable. */
+  assetStored: number;
+  assetDeduped: number;
+  assetSkipped: AssetSkipCounts;
+  assetFailed: number;
 }
 
 const SUPPORTED_KEY_SCHEME = 'sha256-v1';
 const DEFAULT_PUT_TIMEOUT_MS = 5_000;
 const MAX_METADATA_VALUE_LEN = 1024;
+const DEFAULT_IMAGE_PREFIX = 'raw-img/';
+/** 10 MiB — comfortably above a storefront hero image, well below a stall. */
+export const DEFAULT_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+
+/** An image format this lane will store: its file extension and true media type. */
+interface ImageType {
+  ext: string;
+  contentType: string;
+}
+
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const AVIF_BRANDS = new Set(['avif', 'avis']);
+
+/**
+ * Identifies an image from its leading bytes. The store's declared Content-Type is
+ * NOT trusted: CDNs mislabel images as `application/octet-stream`, and a challenge
+ * or error page is routinely served with the image's own Content-Type. Only the
+ * magic bytes decide what — if anything — gets stored.
+ */
+export function sniffImageType(bytes: Buffer): ImageType | undefined {
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return { ext: 'jpg', contentType: 'image/jpeg' };
+  }
+  if (bytes.length >= 8 && bytes.subarray(0, 8).equals(PNG_SIGNATURE)) {
+    return { ext: 'png', contentType: 'image/png' };
+  }
+  if (bytes.length >= 6) {
+    const head = bytes.toString('latin1', 0, 6);
+    if (head === 'GIF87a' || head === 'GIF89a') return { ext: 'gif', contentType: 'image/gif' };
+  }
+  if (bytes.length >= 12) {
+    // RIFF container: bytes 0-3 'RIFF', 4-7 size, 8-11 the form type.
+    if (bytes.toString('latin1', 0, 4) === 'RIFF' && bytes.toString('latin1', 8, 12) === 'WEBP') {
+      return { ext: 'webp', contentType: 'image/webp' };
+    }
+    // ISO-BMFF: bytes 4-7 'ftyp', 8-11 the major brand.
+    if (bytes.toString('latin1', 4, 8) === 'ftyp' && AVIF_BRANDS.has(bytes.toString('latin1', 8, 12))) {
+      return { ext: 'avif', contentType: 'image/avif' };
+    }
+  }
+  return undefined;
+}
 
 /**
  * S3 user-metadata is carried in HTTP headers: values must be header-safe (ASCII,
@@ -91,11 +157,25 @@ function headerSafe(value: string): string {
   return s.length > MAX_METADATA_VALUE_LEN ? s.slice(0, MAX_METADATA_VALUE_LEN) : s;
 }
 
+/** The URL's hostname, or undefined when it is not parseable (best-effort tagging). */
+function hostOf(url: string): string | undefined {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return undefined;
+  }
+}
+
 export class ObjectStoreCaptureSink implements CaptureSink {
   private readonly putTimeoutMs: number;
+  private readonly maxImageBytes: number;
   private stored = 0;
   private deduped = 0;
   private failed = 0;
+  private assetStored = 0;
+  private assetDeduped = 0;
+  private assetFailed = 0;
+  private readonly assetSkipped: AssetSkipCounts = { notImage: 0, tooLarge: 0, empty: 0 };
 
   constructor(
     private readonly store: ObjectStore,
@@ -108,13 +188,24 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     }
     const t = config.putTimeoutMs;
     this.putTimeoutMs = typeof t === 'number' && Number.isFinite(t) && t > 0 ? t : DEFAULT_PUT_TIMEOUT_MS;
+    const m = config.maxImageBytes;
+    this.maxImageBytes = typeof m === 'number' && Number.isFinite(m) && m > 0 ? m : DEFAULT_MAX_IMAGE_BYTES;
   }
 
   stats(): SinkStats {
-    return { stored: this.stored, deduped: this.deduped, failed: this.failed };
+    return {
+      stored: this.stored,
+      deduped: this.deduped,
+      failed: this.failed,
+      assetStored: this.assetStored,
+      assetDeduped: this.assetDeduped,
+      assetSkipped: { ...this.assetSkipped },
+      assetFailed: this.assetFailed,
+    };
   }
 
   async capture(c: RawCapture): Promise<void> {
+    if (c.lane === 'asset') return this.captureAsset(c);
     try {
       const key = this.objectKey(c);
 
@@ -146,6 +237,48 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     }
   }
 
+  /**
+   * The asset lane: store the ORIGINAL image bytes, unaltered. A body that is not
+   * an image, is oversized, or is empty is a typed SKIP — counted, never stored and
+   * never thrown, because a mislabelled or challenge-page response on this lane is
+   * routine and must not disturb the scrape.
+   */
+  private async captureAsset(c: RawCapture): Promise<void> {
+    if (c.bytes.length === 0) return void (this.assetSkipped.empty += 1);
+    if (c.bytes.length > this.maxImageBytes) return void (this.assetSkipped.tooLarge += 1);
+    const type = sniffImageType(c.bytes);
+    if (!type) return void (this.assetSkipped.notImage += 1);
+
+    try {
+      const prefix = this.config.imagePrefix ?? DEFAULT_IMAGE_PREFIX;
+      const key = `${prefix}sha256/${c.sha256.slice(0, 2)}/${c.sha256}.${type.ext}`;
+
+      if (await this.withTimeout(this.store.exists(key))) {
+        this.assetDeduped += 1;
+        return;
+      }
+
+      // No gzip and no Content-Encoding: an image is already compressed, and the
+      // original must be readable as itself straight out of the bucket.
+      await this.withTimeout(
+        this.store.put(key, c.bytes, {
+          contentType: type.contentType,
+          metadata: this.assetMetadata(c),
+        }),
+      );
+      this.assetStored += 1;
+    } catch (err) {
+      this.assetFailed += 1;
+      // eslint-disable-next-line no-console
+      console.warn(
+        // lgtm[js/log-injection] — url is caller-influenced; sanitize before logging
+        `[RAW-STORE] asset capture failed for ${sanitizeForLog(c.url)} (sha ${c.sha256.slice(0, 12)}…): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
   /** `<prefix>sha256/<aa>/<sha256hex><ext>` — the json (api) lane uses jsonPrefix. */
   private objectKey(c: RawCapture): string {
     const aa = c.sha256.slice(0, 2);
@@ -167,11 +300,32 @@ export class ObjectStoreCaptureSink implements CaptureSink {
   private metadata(c: RawCapture): Record<string, string> {
     const url = c.finalUrl ?? c.url;
     const md: Record<string, string> = { url: headerSafe(url), 'fetched-at': c.fetchedAt };
-    try {
-      md.site = headerSafe(new URL(url).hostname);
-    } catch {
-      /* best-effort — a malformed URL just omits the site tag */
-    }
+    const host = hostOf(url); // best-effort — a malformed URL just omits the site tag
+    if (host) md.site = headerSafe(host);
+    return md;
+  }
+
+  /**
+   * Asset provenance: which item's page referenced these bytes, where in its image
+   * list, and what the store CLAIMED they were (kept beside the sniffed type that
+   * actually decided the object's Content-Type).
+   */
+  private assetMetadata(c: RawCapture): Record<string, string> {
+    const url = c.finalUrl ?? c.url;
+    const md: Record<string, string> = {
+      url: headerSafe(url),
+      'fetched-at': c.fetchedAt,
+      lane: 'asset',
+      bytes: String(c.bytes.length),
+    };
+    // The DECLARING store when we know it — an image usually lives on a CDN host
+    // that says nothing about whose catalogue it belongs to.
+    const site = c.sourceItem?.site ?? hostOf(url);
+    if (site) md.site = headerSafe(site);
+    if (c.sourceItem) md['source-item'] = headerSafe(`${c.sourceItem.site}/${c.sourceItem.itemId}`);
+    if (c.sourceUrl) md['source-url'] = headerSafe(c.sourceUrl);
+    if (c.position !== undefined) md.position = String(c.position);
+    if (c.contentType) md['declared-content-type'] = headerSafe(c.contentType);
     return md;
   }
 
