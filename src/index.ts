@@ -13,6 +13,7 @@ import { createHealthRoutes } from './routes/health.js';
 import { getChallengeCooldown } from './services/challengeCooldown.js';
 import { getCfCookieStore } from './services/cookieJar.js';
 import { residentialEgressView } from './services/residentialEgress.js';
+import { rawStoreView } from './services/s3ObjectStore.js';
 import { createEngineLookup, createEngineCatalog } from './services/engineLookup.js';
 import { createResolveRoute } from './routes/resolve.js';
 import { createEngineResolve } from './services/engineResolve.js';
@@ -52,6 +53,7 @@ app.use('/', createHealthRoutes({
   listCfCookies: () => getCfCookieStore().view(),
   getResidentialEgress: () => residentialEgressView(),
   getBrowserLane: () => browserLaneView(),
+  getRawStore: () => rawStoreView(),
 }));
 
 // Scraper routes (no /api prefix for consistency)

@@ -2,6 +2,7 @@ import { jest } from '@jest/globals';
 import { NoopCaptureSink } from '../../services/captureSink';
 import { ObjectStoreCaptureSink } from '../../services/objectStoreCaptureSink';
 import {
+  rawStoreView,
   loadRawStoreConfigFromEnv,
   createRawCaptureSink,
   isImagePersistenceEnabled,
@@ -214,5 +215,22 @@ describe('RAW_STORE_IMAGE_PUT_TIMEOUT_MS', () => {
       RAW_STORE_IMAGE_PUT_TIMEOUT_MS: '0',
     } as unknown as NodeJS.ProcessEnv)!;
     expect(loaded.config.imagePutTimeoutMs).toBeUndefined();
+  });
+});
+
+describe('rawStoreView — the ops-readable view of whichever sink was built', () => {
+  it('reports configured:false for a Noop sink (no counters to read)', () => {
+    expect(rawStoreView(new NoopCaptureSink())).toEqual({ configured: false });
+  });
+
+  it('reports the live counters for a real sink', () => {
+    const view = rawStoreView(createRawCaptureSink(FULL_ENV));
+    expect(view.configured).toBe(true);
+    expect(view.stats).toMatchObject({ stored: 0, assetStored: 0, assetSkipped: { notImage: 0 } });
+  });
+
+  it('never throws when stats() does — health must not 500 on a counter read', () => {
+    const hostile = { capture: async () => {}, stats: () => { throw new Error('boom'); } };
+    expect(rawStoreView(hostile as never)).toEqual({ configured: false });
   });
 });

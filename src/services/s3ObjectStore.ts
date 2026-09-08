@@ -27,6 +27,7 @@ import {
   type ObjectStore,
   type PutOptions,
   type RawStoreConfig,
+  type SinkStats,
 } from './objectStoreCaptureSink.js';
 
 export interface S3Credentials {
@@ -184,6 +185,28 @@ export function createRawCaptureSink(env: NodeJS.ProcessEnv = process.env): Capt
   if (!loaded) return new NoopCaptureSink();
   const store = new S3ObjectStore(loaded.config.bucket, loaded.config, loaded.creds);
   return new ObjectStoreCaptureSink(store, loaded.config);
+}
+
+/**
+ * The ops-readable view of whichever sink the composition root built. `configured`
+ * separates "no sink at all" (both switches off / incomplete config) from a live
+ * one, and the counters make an all-skipping asset lane — every image answered with
+ * a challenge page, say — visible instead of looking exactly like an idle one.
+ */
+export interface RawStoreView {
+  configured: boolean;
+  stats?: SinkStats;
+}
+
+/** Duck-typed: only a real sink carries stats(). Never throws — health reads this. */
+export function rawStoreView(sink: CaptureSink = getRawCaptureSink()): RawStoreView {
+  const s = sink as { stats?: () => SinkStats };
+  if (typeof s.stats !== 'function') return { configured: false };
+  try {
+    return { configured: true, stats: s.stats() };
+  } catch {
+    return { configured: false };
+  }
 }
 
 // Process-wide singleton so every fetch path shares one client + one set of

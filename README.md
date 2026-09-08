@@ -1146,7 +1146,7 @@ Asset objects carry their provenance as user metadata: `url` (the image URL), `f
 
 Op timeouts are a race, not a cancellation (the minio client takes no `AbortSignal`): a timed-out PUT is counted as a failure but may still land in the bucket, after which the next capture of those bytes dedupes. Sizing the asset budget to the payload is what keeps that from being routine.
 
-The sink's counters (`stored` / `deduped` / `failed` / `skippedDisabled`, plus `assetStored` / `assetDeduped` / `assetSkipped` / `assetFailed`) are exposed by `ObjectStoreCaptureSink.stats()`.
+The sink's counters (`stored` / `deduped` / `failed` / `skippedDisabled`, plus `assetStored` / `assetDeduped` / `assetSkipped` / `assetFailed`) are exposed by `ObjectStoreCaptureSink.stats()` and published on `GET /health/detailed` as `rawStore: { configured, stats? }`. `configured:false` means no sink was built at all (both switches off, or an incomplete store config) — the distinction an operator needs, since an asset lane whose every body is refused as `notImage` (a CDN answering image requests with a challenge page) otherwise looks exactly like an idle one.
 
 **MFC Cookie Security:**
 - `MFC_ALLOWED_COOKIES`: Whitelist of cookie names allowed during authenticated MFC scraping
