@@ -107,9 +107,22 @@ export function isImagePersistenceEnabled(env: NodeJS.ProcessEnv = process.env):
   return env.PERSIST_RAW_IMAGES === 'true';
 }
 
+/** Names the switch(es) that were turned on, for the enabled-but-incomplete warning. */
+function enabledSwitches(pages: boolean, assets: boolean): string {
+  const on = [pages ? 'PERSIST_RAW_HTML=true' : '', assets ? 'PERSIST_RAW_IMAGES=true' : ''].filter(Boolean);
+  return on.join(' + ');
+}
+
 /**
  * Reads the raw-store contract + credential from the environment. Returns null
- * when capture is off (PERSIST_RAW_HTML !== 'true') or the config is incomplete.
+ * when BOTH capture switches are off, or the config is incomplete.
+ *
+ * Either switch on its own builds the sink: the asset lane is genuinely independent
+ * of page capture (a different corpus, different volume, different rights), so an
+ * images-only wiring must not silently collapse to a Noop. Which LANES may then
+ * write is carried into the config as pagesEnabled/assetsEnabled and enforced at
+ * the sink's write boundary.
+ *
  * An ENABLED-but-incomplete state is logged loudly — never a silent Noop — because
  * a name/wiring mismatch would otherwise disable the (irrecoverable) insurance
  * corpus with no signal.
@@ -117,19 +130,28 @@ export function isImagePersistenceEnabled(env: NodeJS.ProcessEnv = process.env):
 export function loadRawStoreConfigFromEnv(
   env: NodeJS.ProcessEnv = process.env,
 ): { config: RawStoreConfig; creds: S3Credentials } | null {
-  // se-09 kill-switch: capture is off by default; absence here is intended silence.
-  if (env.PERSIST_RAW_HTML !== 'true') return null;
+  // se-09 kill-switches: capture is off by default; absence here is intended silence.
+  const pagesEnabled = env.PERSIST_RAW_HTML === 'true';
+  const assetsEnabled = isImagePersistenceEnabled(env);
+  if (!pagesEnabled && !assetsEnabled) return null;
 
   const endpoint = env.RAW_STORE_S3_ENDPOINT;
   const bucket = env.RAW_STORE_S3_BUCKET;
   const accessKeyId = env.RAW_STORE_S3_ACCESS_KEY_ID;
   const secretAccessKey = env.RAW_STORE_S3_SECRET_ACCESS_KEY;
 
-  if (!endpoint || !bucket || !accessKeyId || !secretAccessKey) {
+  const missing = [
+    ['RAW_STORE_S3_ENDPOINT', endpoint],
+    ['RAW_STORE_S3_BUCKET', bucket],
+    ['RAW_STORE_S3_ACCESS_KEY_ID', accessKeyId],
+    ['RAW_STORE_S3_SECRET_ACCESS_KEY', secretAccessKey],
+  ].filter(([, v]) => !v).map(([k]) => k as string);
+
+  if (missing.length > 0) {
     // eslint-disable-next-line no-console
     console.warn(
-      '[RAW-STORE] PERSIST_RAW_HTML=true but required config/credentials are missing — capture DISABLED ' +
-        '(needs RAW_STORE_S3_ENDPOINT, RAW_STORE_S3_BUCKET, RAW_STORE_S3_ACCESS_KEY_ID, RAW_STORE_S3_SECRET_ACCESS_KEY)',
+      `[RAW-STORE] ${enabledSwitches(pagesEnabled, assetsEnabled)} but required config/credentials are missing — capture DISABLED ` +
+        `(needs RAW_STORE_S3_ENDPOINT, RAW_STORE_S3_BUCKET, RAW_STORE_S3_ACCESS_KEY_ID, RAW_STORE_S3_SECRET_ACCESS_KEY; missing: ${missing.join(', ')})`,
     );
     return null;
   }
@@ -142,6 +164,8 @@ export function loadRawStoreConfigFromEnv(
     jsonPrefix: env.RAW_STORE_S3_JSON_PREFIX ?? 'raw-json/',
     imagePrefix: env.RAW_STORE_S3_IMAGE_PREFIX ?? 'raw-img/',
     keyScheme: env.RAW_STORE_KEY_SCHEME ?? 'sha256-v1',
+    pagesEnabled,
+    assetsEnabled,
     putTimeoutMs: parsePositive(env.RAW_STORE_PUT_TIMEOUT_MS),
     maxImageBytes: parsePositive(env.RAW_STORE_IMAGE_MAX_BYTES),
     pathStyle: env.RAW_STORE_S3_PATH_STYLE !== undefined ? env.RAW_STORE_S3_PATH_STYLE === 'true' : undefined,

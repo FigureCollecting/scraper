@@ -147,3 +147,54 @@ describe('toS3MetaData — the real S3 header boundary', () => {
     expect(toS3MetaData({ contentType: 'application/gzip' })).toEqual({ 'Content-Type': 'application/gzip' });
   });
 });
+
+// The docs sell an images-only wiring (a different corpus, different rights). The
+// composition root has to actually build a sink for it, and the sink it builds has
+// to refuse the lane whose switch is off.
+describe('the two switches gate the composition root independently', () => {
+  const IMAGES_ONLY = (() => {
+    const env = { ...FULL_ENV, PERSIST_RAW_IMAGES: 'true' } as Record<string, unknown>;
+    delete env.PERSIST_RAW_HTML;
+    return env as unknown as NodeJS.ProcessEnv;
+  })();
+
+  it('builds a REAL sink for an images-only env (never a silent Noop)', () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    expect(createRawCaptureSink(IMAGES_ONLY)).toBeInstanceOf(ObjectStoreCaptureSink);
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it('warns loudly when an images-only env is incompletely configured', () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const env = { ...IMAGES_ONLY } as Record<string, unknown>;
+    delete env.RAW_STORE_S3_BUCKET;
+    expect(loadRawStoreConfigFromEnv(env as NodeJS.ProcessEnv)).toBeNull();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String((warn.mock.calls[0] ?? [])[0])).toMatch(/RAW_STORE_S3_BUCKET/);
+    warn.mockRestore();
+  });
+
+  it('carries each switch into the config as a per-lane enable flag', () => {
+    expect(loadRawStoreConfigFromEnv(IMAGES_ONLY)!.config).toMatchObject({
+      pagesEnabled: false,
+      assetsEnabled: true,
+    });
+    expect(loadRawStoreConfigFromEnv(FULL_ENV)!.config).toMatchObject({
+      pagesEnabled: true,
+      assetsEnabled: false,
+    });
+    expect(
+      loadRawStoreConfigFromEnv({ ...FULL_ENV, PERSIST_RAW_IMAGES: 'true' } as unknown as NodeJS.ProcessEnv)!.config,
+    ).toMatchObject({ pagesEnabled: true, assetsEnabled: true });
+  });
+
+  it('stays null and silent when BOTH switches are off', () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const env = { ...FULL_ENV } as Record<string, unknown>;
+    delete env.PERSIST_RAW_HTML;
+    expect(loadRawStoreConfigFromEnv(env as NodeJS.ProcessEnv)).toBeNull();
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+});

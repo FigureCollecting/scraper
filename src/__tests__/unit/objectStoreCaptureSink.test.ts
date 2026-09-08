@@ -294,7 +294,7 @@ describe('ObjectStoreCaptureSink — the asset lane', () => {
     await expect(sink.capture(asset(bytes as Buffer))).resolves.toBeUndefined();
     expect(store.puts).toHaveLength(0);
     expect(store.headCalls).toBe(0); // skipped before any store op
-    expect(sink.stats().assetSkipped).toEqual({ notImage: 1, tooLarge: 0, empty: 0 });
+    expect(sink.stats().assetSkipped).toEqual({ notImage: 1, tooLarge: 0, empty: 0, disabled: 0 });
     expect(sink.stats().assetFailed).toBe(0);
   });
 
@@ -302,7 +302,7 @@ describe('ObjectStoreCaptureSink — the asset lane', () => {
     const big = Buffer.concat([JPEG, Buffer.alloc(11 * 1024 * 1024)]);
     await expect(sink.capture(asset(big))).resolves.toBeUndefined();
     expect(store.puts).toHaveLength(0);
-    expect(sink.stats().assetSkipped).toEqual({ notImage: 0, tooLarge: 1, empty: 0 });
+    expect(sink.stats().assetSkipped).toEqual({ notImage: 0, tooLarge: 1, empty: 0, disabled: 0 });
   });
 
   it('honours a configured maxImageBytes', async () => {
@@ -315,7 +315,7 @@ describe('ObjectStoreCaptureSink — the asset lane', () => {
   it('SKIPS an empty body as empty', async () => {
     await expect(sink.capture(asset(Buffer.alloc(0)))).resolves.toBeUndefined();
     expect(store.puts).toHaveLength(0);
-    expect(sink.stats().assetSkipped).toEqual({ notImage: 0, tooLarge: 0, empty: 1 });
+    expect(sink.stats().assetSkipped).toEqual({ notImage: 0, tooLarge: 0, empty: 1, disabled: 0 });
   });
 
   it('counts an asset store failure as assetFailed, never throwing', async () => {
@@ -331,10 +331,11 @@ describe('ObjectStoreCaptureSink — the asset lane', () => {
       stored: 1,
       deduped: 0,
       failed: 0,
+      skippedDisabled: 0,
       assetStored: 1,
       assetDeduped: 0,
       assetFailed: 0,
-      assetSkipped: { notImage: 0, tooLarge: 0, empty: 0 },
+      assetSkipped: { notImage: 0, tooLarge: 0, empty: 0, disabled: 0 },
     });
   });
 
@@ -358,5 +359,59 @@ describe('ObjectStoreCaptureSink — the asset lane', () => {
     await sink.capture(cap({ contentType: 'image/png' }));
     expect(store.puts[0].key.startsWith('raw-html/')).toBe(true);
     expect(store.puts[0].key.endsWith('.html.gz')).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The kill switches are enforced at the WRITE boundary, not only by convention:
+// a caller that ignores PERSIST_RAW_IMAGES must still not put bytes in the bucket.
+// ---------------------------------------------------------------------------
+describe('ObjectStoreCaptureSink — per-lane enable flags', () => {
+  let store: FakeObjectStore;
+
+  beforeEach(() => {
+    store = new FakeObjectStore();
+  });
+
+  it('refuses the asset lane when assetsEnabled is false — counted as a disabled skip, no store op', async () => {
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, assetsEnabled: false });
+    await sink.capture(asset(JPEG));
+
+    expect(store.puts).toHaveLength(0);
+    expect(store.headCalls).toBe(0);
+    expect(sink.stats().assetSkipped.disabled).toBe(1);
+    expect(sink.stats().assetStored).toBe(0);
+  });
+
+  it('refuses the page lanes when pagesEnabled is false — counted, no store op', async () => {
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, pagesEnabled: false });
+    await sink.capture(cap());
+    await sink.capture(cap({ lane: 'api', bytes: Buffer.from('{"a":1}', 'utf8') }));
+
+    expect(store.puts).toHaveLength(0);
+    expect(store.headCalls).toBe(0);
+    expect(sink.stats().skippedDisabled).toBe(2);
+    expect(sink.stats().stored).toBe(0);
+  });
+
+  it('runs one lane while the other is off (images-only wiring stores images, never pages)', async () => {
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, pagesEnabled: false, assetsEnabled: true });
+    await sink.capture(cap());
+    await sink.capture(asset(PNG));
+
+    expect(store.puts).toHaveLength(1);
+    expect(store.puts[0].key.startsWith('raw-img/')).toBe(true);
+    expect(sink.stats().skippedDisabled).toBe(1);
+    expect(sink.stats().assetStored).toBe(1);
+  });
+
+  it('defaults both lanes ON when the flags are absent (existing construction is unchanged)', async () => {
+    const sink = new ObjectStoreCaptureSink(store, CONFIG);
+    await sink.capture(cap());
+    await sink.capture(asset(JPEG));
+    expect(sink.stats().stored).toBe(1);
+    expect(sink.stats().assetStored).toBe(1);
+    expect(sink.stats().skippedDisabled).toBe(0);
+    expect(sink.stats().assetSkipped.disabled).toBe(0);
   });
 });

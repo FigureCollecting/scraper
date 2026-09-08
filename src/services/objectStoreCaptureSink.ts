@@ -64,6 +64,15 @@ export interface RawStoreConfig {
   imagePrefix?: string;
   /** Hard ceiling on one stored image's bytes; larger bodies are SKIPPED. */
   maxImageBytes?: number;
+  /**
+   * Per-lane kill switches, resolved from PERSIST_RAW_HTML / PERSIST_RAW_IMAGES by
+   * the composition root. Enforced HERE, at the write boundary, so a caller that
+   * ignores the switch still cannot put bytes in the bucket — the image switch is a
+   * RIGHTS control, and a rights control enforced only by convention is not one.
+   * Undefined = on, so a directly-constructed sink behaves as it always has.
+   */
+  pagesEnabled?: boolean;
+  assetsEnabled?: boolean;
   /** Key-scheme contract version; this writer only knows `sha256-v1`. */
   keyScheme: string;
   /** Hard bound on each HEAD/PUT so a slow store can't stall the fetch path. */
@@ -76,7 +85,7 @@ export interface RawStoreConfig {
 }
 
 /** Why an asset-lane capture was skipped without being stored. */
-export type AssetSkipReason = 'notImage' | 'tooLarge' | 'empty';
+export type AssetSkipReason = 'notImage' | 'tooLarge' | 'empty' | 'disabled';
 
 /** Per-reason skip tally for the asset lane. */
 export type AssetSkipCounts = Record<AssetSkipReason, number>;
@@ -86,6 +95,8 @@ export interface SinkStats {
   stored: number;
   deduped: number;
   failed: number;
+  /** Page-lane captures refused because PERSIST_RAW_HTML is off. */
+  skippedDisabled: number;
   /** Asset lane, counted separately so page-body volume stays readable. */
   assetStored: number;
   assetDeduped: number;
@@ -169,13 +180,16 @@ function hostOf(url: string): string | undefined {
 export class ObjectStoreCaptureSink implements CaptureSink {
   private readonly putTimeoutMs: number;
   private readonly maxImageBytes: number;
+  private readonly pagesEnabled: boolean;
+  private readonly assetsEnabled: boolean;
   private stored = 0;
   private deduped = 0;
   private failed = 0;
+  private skippedDisabled = 0;
   private assetStored = 0;
   private assetDeduped = 0;
   private assetFailed = 0;
-  private readonly assetSkipped: AssetSkipCounts = { notImage: 0, tooLarge: 0, empty: 0 };
+  private readonly assetSkipped: AssetSkipCounts = { notImage: 0, tooLarge: 0, empty: 0, disabled: 0 };
 
   constructor(
     private readonly store: ObjectStore,
@@ -190,6 +204,8 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     this.putTimeoutMs = typeof t === 'number' && Number.isFinite(t) && t > 0 ? t : DEFAULT_PUT_TIMEOUT_MS;
     const m = config.maxImageBytes;
     this.maxImageBytes = typeof m === 'number' && Number.isFinite(m) && m > 0 ? m : DEFAULT_MAX_IMAGE_BYTES;
+    this.pagesEnabled = config.pagesEnabled !== false;
+    this.assetsEnabled = config.assetsEnabled !== false;
   }
 
   stats(): SinkStats {
@@ -197,6 +213,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       stored: this.stored,
       deduped: this.deduped,
       failed: this.failed,
+      skippedDisabled: this.skippedDisabled,
       assetStored: this.assetStored,
       assetDeduped: this.assetDeduped,
       assetSkipped: { ...this.assetSkipped },
@@ -206,6 +223,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
 
   async capture(c: RawCapture): Promise<void> {
     if (c.lane === 'asset') return this.captureAsset(c);
+    if (!this.pagesEnabled) return void (this.skippedDisabled += 1);
     try {
       const key = this.objectKey(c);
 
@@ -244,6 +262,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
    * routine and must not disturb the scrape.
    */
   private async captureAsset(c: RawCapture): Promise<void> {
+    if (!this.assetsEnabled) return void (this.assetSkipped.disabled += 1);
     if (c.bytes.length === 0) return void (this.assetSkipped.empty += 1);
     if (c.bytes.length > this.maxImageBytes) return void (this.assetSkipped.tooLarge += 1);
     const type = sniffImageType(c.bytes);

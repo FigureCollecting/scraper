@@ -1128,7 +1128,7 @@ Two lanes, two switches, two prefixes:
 | images (`asset`) | `PERSIST_RAW_IMAGES` | `RAW_STORE_S3_IMAGE_PREFIX` (`raw-img/`) | the ORIGINAL bytes, unaltered — no gzip, real image `Content-Type`, extension from the magic bytes |
 
 - `PERSIST_RAW_HTML`: `true` enables page/API capture. Anything else (including unset) disables it silently. Enabled but incompletely configured is never a silent no-op — it logs one loud warning naming the missing variable and stays disabled.
-- `PERSIST_RAW_IMAGES`: **a separate kill switch for the asset lane**, `true` (exactly) to enable, default OFF. It is independent of `PERSIST_RAW_HTML` in both directions: images are a different corpus with different volume and different rights, so turning page capture on must never start pulling binaries. The caller that decides to fetch an image consults it (`isImagePersistenceEnabled()`); the sink stores whatever it is handed.
+- `PERSIST_RAW_IMAGES`: **a separate kill switch for the asset lane**, `true` (exactly) to enable, default OFF. It is independent of `PERSIST_RAW_HTML` in both directions: images are a different corpus with different volume and different rights, so turning page capture on must never start pulling binaries, and an images-only wiring (`PERSIST_RAW_IMAGES=true` with page capture off) is a supported configuration — **either** switch alone builds the real sink, and only the lane whose switch is off is refused. The refusal is at the WRITE boundary, not by convention: a lane whose switch is off is a counted skip (`skippedDisabled` / `assetSkipped.disabled`) that reaches no bucket, so a caller that forgets to consult `isImagePersistenceEnabled()` still cannot store an image. With **both** switches off the loader returns null and the process gets a `NoopCaptureSink` (intended silence); with either on but the store config incomplete, one loud warning names the switch and every missing variable.
 - `RAW_STORE_S3_IMAGE_PREFIX`: bucket prefix for the asset lane. Default: `raw-img/`
 - `RAW_STORE_IMAGE_MAX_BYTES`: hard ceiling on ONE stored image. A larger body is skipped, not truncated and not stored. Unset/invalid → the default. Default: `10485760` (10 MiB)
 - `RAW_STORE_S3_ENDPOINT` / `_REGION` / `_BUCKET` / `_PREFIX` / `_JSON_PREFIX` / `_PATH_STYLE`, `RAW_STORE_KEY_SCHEME` (only `sha256-v1` is understood — an unknown scheme fails fast at boot), `RAW_STORE_PUT_TIMEOUT_MS` (default `5000`), and the credential pair `RAW_STORE_S3_ACCESS_KEY_ID` / `RAW_STORE_S3_SECRET_ACCESS_KEY`.
@@ -1140,10 +1140,11 @@ On the asset lane the store's declared `Content-Type` is **advisory only** — C
 | `notImage` | the bytes are not one of the five formats (html, json, svg, text — an error or challenge page) |
 | `tooLarge` | over `RAW_STORE_IMAGE_MAX_BYTES` |
 | `empty` | a zero-length body |
+| `disabled` | `PERSIST_RAW_IMAGES` is not `true` — the lane refuses the write regardless of the caller |
 
 Asset objects carry their provenance as user metadata: `url` (the image URL), `fetched-at`, `site` (the DECLARING store, since the image usually lives on a CDN host that says nothing about whose catalogue it belongs to), `source-item` (`<site>/<itemId>`), `source-url` (the page that referenced it), `position` (its index in that page's image list), `lane`, `declared-content-type` and `bytes`. Originals are stored unaltered and are **never shown** — any surfaced image is a sanitized derivative produced downstream.
 
-The sink's counters (`stored` / `deduped` / `failed`, plus `assetStored` / `assetDeduped` / `assetSkipped` / `assetFailed`) are exposed by `ObjectStoreCaptureSink.stats()`.
+The sink's counters (`stored` / `deduped` / `failed` / `skippedDisabled`, plus `assetStored` / `assetDeduped` / `assetSkipped` / `assetFailed`) are exposed by `ObjectStoreCaptureSink.stats()`.
 
 **MFC Cookie Security:**
 - `MFC_ALLOWED_COOKIES`: Whitelist of cookie names allowed during authenticated MFC scraping
