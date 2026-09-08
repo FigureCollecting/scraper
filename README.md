@@ -1034,6 +1034,13 @@ See `.env.example` for complete configuration template.
   - Unset/invalid → default; any value is clamped to `[1000, 120000]`
   - Default: `30000`
 
+- `IMAGE_HOST_POLICY_JSON`: Inline `{ host: rule }` table saying how each IMAGE host is fetched — see **Image bytes lanes** below
+  - Unset/blank (default): the built-in table, which is the permaban alone
+  - Unparseable or not an object → ignored with ONE warning; the default table stands
+- `IMAGE_HOST_POLICY_FILE`: Path to a file holding that same table (consulted only when `IMAGE_HOST_POLICY_JSON` is unset)
+  - Unreadable → ignored with ONE warning; the default table stands
+  - Example: `/etc/fc/image-host-policy.json` (a ConfigMap mounted as a directory, so an edit changes the file's mtime)
+
 **Residential egress (`RESIDENTIAL_PROXY_URL`):**
 
 A few Cloudflare-fronted stores gate on IP/ASN REPUTATION, not on browser fingerprint: the very same impit `chrome142` client that is challenged from the datacenter node gets a plain 200 from a residential IP, and their challenge-passage windows are far shorter than a hand-minted `cf_clearance` can survive. Those stores declare `searchFetch.egress: 'residential'` in their profile and the engine routes ONLY their fetches through the configured proxy; every other store keeps leaving through the node as before.
@@ -1055,6 +1062,42 @@ Two paths deliberately sit OUTSIDE it, because neither has a declaring store to 
 The proxy is scoped to the DECLARING store's own hosts (its domain and subdomains). A ruleset follow-up to some other host — an image CDN, a third-party API — is fetched directly rather than inheriting the residential exit: that exit is a home line, and handing its IP to a host that never declared it both exposes it and spends its reputation on unrelated traffic.
 
 The refusal is deliberate and load-bearing: **a residential store is never silently fetched from the node IP.** With `RESIDENTIAL_PROXY_URL` unset (or unusable), the fetch raises `ResidentialEgressUnavailableError`, which the scrape queue classifies as `extraction_unavailable` — one attempt, no retry, no global rate-limit backoff, and never a cookie/auth session pause. Falling back would burn the datacenter path's remaining reputation and tell the store we tried.
+
+**Image bytes lanes (`IMAGE_HOST_POLICY_JSON` / `IMAGE_HOST_POLICY_FILE`):**
+
+Every transport described above returns a STRING — `res.text()`, impit's `.text()`, the rendered DOM. That is right for a document and destructive for an image: JPEG/PNG bytes decoded as utf-8 are gone. The image lanes are SIBLINGS of those transports, identical in egress rules and pacing, differing in that they hand back a `Buffer` and answer every expected outcome with a typed result (`{ ok: true, bytes, contentType, status, finalUrl, headers }`, or `{ ok: false, reason }` where reason is `http-status` | `not-image` | `timeout` | `unsupported` | `refused`). Nothing on the page path changes; nothing is stored yet (the ingest hook lands separately).
+
+| Lane | Used for | Residential egress |
+|---|---|---|
+| `http` | The default for a third-party CDN. Plain GET, image `Accept`, abort-bounded | **Refused** — same rule and same wording as the string lane: Node's fetch cannot proxy |
+| `impit` | A CDN behind a TLS-fingerprint gate, and every residential image that is not on the browser lane | Supported (`proxyUrl` on the session; one session per profile+proxy) |
+| `browser` | A CDN behind the same Cloudflare gate as its store: a TAB of that store's gated browser, navigated at the image, read with the page lane's own document-only main-frame guard | Supported (the gated browser for that egress) |
+
+On the `impit` lane the body is read through a feature-detected binary capability (`bytes()`, else `arrayBuffer()`). An impit build exposing only `text()` returns `unsupported` and the body is left unread — a silently corrupted image is worse than a visible refusal.
+
+**Which lane an image takes** is decided by the policy table first, then by the engine's existing suffix rule. An image on the DECLARING store's own hosts inherits that store's transport and egress; anything else has the declared egress DROPPED (the residential exit is a home line — it is not spent on a host that never declared it) and takes the plain lane. The table OVERRIDES both directions, and the `http` lane paired with residential egress is refused outright, since that pairing has no transport.
+
+The table is `{ host: rule }`, matched by LONGEST host suffix (`cdn.example.com` beats `example.com`; a host that merely ends with the same string does not match — the dot is load-bearing). Keys are normalized (lowercased, leading `.` and `www.` stripped).
+
+| Field | Values | Meaning |
+|---|---|---|
+| `lane` | `http` \| `impit` \| `browser` | Force the lane, overriding what the store declared |
+| `egress` | `direct` \| `residential` | Force the egress, overriding the suffix rule in either direction |
+| `referer` | `true` \| `false` | Send the declaring page as `Referer` (hotlink-protected CDNs need it). Default: on-store `true`, off-store `false` |
+| `ua` | `chrome` \| `default` | User-agent profile. Default: `chrome` on the impit/browser lanes, `default` on `http` |
+| `deny` | `true` | Never fetch this host |
+
+```json
+{
+  "cdn11.bigcommerce.com": { "lane": "http", "referer": true },
+  "cdn.anitoysgk.com":     { "lane": "browser", "egress": "residential" },
+  "images.example.test":   { "deny": true }
+}
+```
+
+An unknown or wrongly-typed field is dropped with a warning and the rest of the rule stands; an unusable table leaves the default in place. **otakumode.com and every host under it are permanently DENIED**, and that is answered before the table is consulted at all — no entry can re-enable it, not even one naming a subdomain (which would otherwise win the longest-suffix match).
+
+**Pacing** is keyed on the IMAGE host, not the store's: a shared CDN (`cdn.shopify.com`, `cdn11.bigcommerce.com`) serves many of these stores, so it gets ONE budget that every store draws from, on the same `HostRateLimiter` the driver uses. A `403`/`429`/`503` from a CDN backs that host off.
 
 **The browser lane (launch profile, timezone, gated browsers):**
 
