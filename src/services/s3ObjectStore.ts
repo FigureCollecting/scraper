@@ -154,14 +154,15 @@ export function loadRawStoreConfigFromEnv(
   const accessKeyId = env.RAW_STORE_S3_ACCESS_KEY_ID;
   const secretAccessKey = env.RAW_STORE_S3_SECRET_ACCESS_KEY;
 
-  const missing = [
-    ['RAW_STORE_S3_ENDPOINT', endpoint],
-    ['RAW_STORE_S3_BUCKET', bucket],
-    ['RAW_STORE_S3_ACCESS_KEY_ID', accessKeyId],
-    ['RAW_STORE_S3_SECRET_ACCESS_KEY', secretAccessKey],
-  ].filter(([, v]) => !v).map(([k]) => k as string);
-
-  if (missing.length > 0) {
+  if (!endpoint || !bucket || !accessKeyId || !secretAccessKey) {
+    const missing = [
+      ['RAW_STORE_S3_ENDPOINT', endpoint],
+      ['RAW_STORE_S3_BUCKET', bucket],
+      ['RAW_STORE_S3_ACCESS_KEY_ID', accessKeyId],
+      ['RAW_STORE_S3_SECRET_ACCESS_KEY', secretAccessKey],
+    ]
+      .filter(([, v]) => !v)
+      .map(([k]) => k as string);
     // eslint-disable-next-line no-console
     console.warn(
       `[RAW-STORE] ${enabledSwitches(pagesEnabled, assetsEnabled)} but required config/credentials are missing — capture DISABLED ` +
