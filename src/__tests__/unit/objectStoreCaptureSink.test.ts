@@ -1,3 +1,4 @@
+import { jest } from '@jest/globals';
 import { gunzipSync } from 'node:zlib';
 import { buildRawCapture } from '../../services/captureSink';
 import {
@@ -522,5 +523,62 @@ describe('ObjectStoreCaptureSink — the asset lane has its own op budget', () =
     const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 50, imagePutTimeoutMs: 5_000 });
     await sink.capture(cap());
     expect(sink.stats().failed).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// What the sniffer must and must not promise. It types the PREFIX; it does not
+// validate the tail, and it must never be the thing that throws out of capture().
+// ---------------------------------------------------------------------------
+describe('ObjectStoreCaptureSink — sniffing is total and never throws', () => {
+  let store: FakeObjectStore;
+  let sink: ObjectStoreCaptureSink;
+
+  beforeEach(() => {
+    store = new FakeObjectStore();
+    sink = new ObjectStoreCaptureSink(store, CONFIG);
+  });
+
+  it('accepts AVIF whose MAJOR brand is mif1 with avif among the compatible brands', async () => {
+    const bytes = Buffer.concat([
+      Buffer.from([0, 0, 0, 0x1c]),
+      Buffer.from('ftypmif1'),
+      Buffer.from([0, 0, 0, 0]), // minor version
+      Buffer.from('mif1avifmiaf'), // the compatible-brand list
+    ]);
+    await sink.capture(asset(bytes));
+    expect(store.puts[0].key.endsWith('.avif')).toBe(true);
+    expect(store.puts[0].opts.contentType).toBe('image/avif');
+  });
+
+  it('still refuses a non-AVIF ISO-BMFF container (an mp4 is not an image)', async () => {
+    const mp4 = Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from('ftypisomisomiso2')]);
+    await sink.capture(asset(mp4));
+    expect(store.puts).toHaveLength(0);
+    expect(sink.stats().assetSkipped.notImage).toBe(1);
+  });
+
+  it('handles a plain Uint8Array body (what `new Uint8Array(await res.arrayBuffer())` yields)', async () => {
+    const view = new Uint8Array(PNG) as unknown as Buffer;
+    await expect(sink.capture(asset(view))).resolves.toBeUndefined();
+    expect(store.puts).toHaveLength(1);
+    expect(store.puts[0].key.endsWith('.png')).toBe(true);
+    expect(sink.stats().assetFailed).toBe(0);
+  });
+
+  it('COUNTS a malformed capture instead of rejecting out of capture()', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const broken = { ...asset(JPEG), bytes: undefined as unknown as Buffer };
+    await expect(sink.capture(broken)).resolves.toBeUndefined();
+    expect(sink.stats().assetFailed).toBe(1);
+    expect(store.puts).toHaveLength(0);
+    warn.mockRestore();
+  });
+
+  it('types the PREFIX only: a GIF89a polyglot is stored as a gif (documented, not accidental)', async () => {
+    const polyglot = Buffer.from('GIF89a/*<script>alert(1)</script>*/', 'binary');
+    await sink.capture(asset(polyglot));
+    expect(store.puts[0].opts.contentType).toBe('image/gif');
+    expect(store.puts[0].key.endsWith('.gif')).toBe(true);
   });
 });

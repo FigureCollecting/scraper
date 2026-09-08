@@ -141,13 +141,25 @@ interface ImageType {
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 const AVIF_BRANDS = new Set(['avif', 'avis']);
 
+/** Any binary view as a Buffer — a caller may hand a Uint8Array from arrayBuffer(). */
+function asBuffer(bytes: Buffer | Uint8Array): Buffer {
+  return Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+}
+
 /**
  * Identifies an image from its leading bytes. The store's declared Content-Type is
  * NOT trusted: CDNs mislabel images as `application/octet-stream`, and a challenge
  * or error page is routinely served with the image's own Content-Type. Only the
  * magic bytes decide what — if anything — gets stored.
+ *
+ * This types the PREFIX; it does not validate the tail. A GIF89a- or FFD8FF-prefixed
+ * polyglot that is also a valid script is a real image header and IS stored — which
+ * is why originals are private, never served, and never shown. Total by construction:
+ * anything that is not a binary view is simply "not an image", never a throw.
  */
-export function sniffImageType(bytes: Buffer): ImageType | undefined {
+export function sniffImageType(input: Buffer | Uint8Array): ImageType | undefined {
+  if (!ArrayBuffer.isView(input)) return undefined;
+  const bytes = asBuffer(input);
   if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
     return { ext: 'jpg', contentType: 'image/jpeg' };
   }
@@ -163,9 +175,20 @@ export function sniffImageType(bytes: Buffer): ImageType | undefined {
     if (bytes.toString('latin1', 0, 4) === 'RIFF' && bytes.toString('latin1', 8, 12) === 'WEBP') {
       return { ext: 'webp', contentType: 'image/webp' };
     }
-    // ISO-BMFF: bytes 4-7 'ftyp', 8-11 the major brand.
-    if (bytes.toString('latin1', 4, 8) === 'ftyp' && AVIF_BRANDS.has(bytes.toString('latin1', 8, 12))) {
-      return { ext: 'avif', contentType: 'image/avif' };
+    // ISO-BMFF: bytes 4-7 'ftyp', 8-11 the MAJOR brand, then (from byte 16) the
+    // COMPATIBLE-brand list in 4-byte strides. Real AVIF is emitted with a major
+    // brand of mif1/miaf and `avif` only in that list, so both must be read.
+    if (bytes.toString('latin1', 4, 8) === 'ftyp') {
+      if (AVIF_BRANDS.has(bytes.toString('latin1', 8, 12))) {
+        return { ext: 'avif', contentType: 'image/avif' };
+      }
+      const boxSize = bytes.readUInt32BE(0);
+      const end = Math.min(bytes.length, boxSize > 16 ? boxSize : bytes.length);
+      for (let o = 16; o + 4 <= end; o += 4) {
+        if (AVIF_BRANDS.has(bytes.toString('latin1', o, o + 4))) {
+          return { ext: 'avif', contentType: 'image/avif' };
+        }
+      }
     }
   }
   return undefined;
@@ -317,12 +340,15 @@ export class ObjectStoreCaptureSink implements CaptureSink {
    */
   private async captureAsset(c: RawCapture): Promise<void> {
     if (!this.assetsEnabled) return void (this.assetSkipped.disabled += 1);
-    if (c.bytes.length === 0) return void (this.assetSkipped.empty += 1);
-    if (c.bytes.length > this.maxImageBytes) return void (this.assetSkipped.tooLarge += 1);
-    const type = sniffImageType(c.bytes);
-    if (!type) return void (this.assetSkipped.notImage += 1);
-
     try {
+      // Inside the try: the sink's contract is swallowed-but-counted, so even a
+      // malformed capture must be a counter, never a rejection out of capture().
+      const bytes = asBuffer(c.bytes);
+      if (bytes.length === 0) return void (this.assetSkipped.empty += 1);
+      if (bytes.length > this.maxImageBytes) return void (this.assetSkipped.tooLarge += 1);
+      const type = sniffImageType(bytes);
+      if (!type) return void (this.assetSkipped.notImage += 1);
+
       const prefix = this.config.imagePrefix ?? DEFAULT_IMAGE_PREFIX;
       const key = `${prefix}sha256/${c.sha256.slice(0, 2)}/${c.sha256}.${type.ext}`;
 
@@ -334,7 +360,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       // No gzip and no Content-Encoding: an image is already compressed, and the
       // original must be readable as itself straight out of the bucket.
       await this.withTimeout(
-        this.store.put(key, c.bytes, {
+        this.store.put(key, bytes, {
           contentType: type.contentType,
           metadata: this.assetMetadata(c),
         }),
@@ -390,7 +416,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       url: headerSafe(url),
       'fetched-at': headerSafe(c.fetchedAt),
       lane: 'asset',
-      bytes: String(c.bytes.length),
+      bytes: String(asBuffer(c.bytes).length),
     };
     // The DECLARING store when we know it — an image usually lives on a CDN host
     // that says nothing about whose catalogue it belongs to.
