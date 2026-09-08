@@ -198,3 +198,21 @@ describe('the two switches gate the composition root independently', () => {
     warn.mockRestore();
   });
 });
+
+describe('RAW_STORE_IMAGE_PUT_TIMEOUT_MS', () => {
+  it('is read into the config so the asset lane can outlast the page budget', () => {
+    const loaded = loadRawStoreConfigFromEnv({
+      ...FULL_ENV,
+      RAW_STORE_IMAGE_PUT_TIMEOUT_MS: '45000',
+    } as unknown as NodeJS.ProcessEnv)!;
+    expect(loaded.config.imagePutTimeoutMs).toBe(45000);
+  });
+
+  it('drops an invalid value so the sink keeps its default', () => {
+    const loaded = loadRawStoreConfigFromEnv({
+      ...FULL_ENV,
+      RAW_STORE_IMAGE_PUT_TIMEOUT_MS: '0',
+    } as unknown as NodeJS.ProcessEnv)!;
+    expect(loaded.config.imagePutTimeoutMs).toBeUndefined();
+  });
+});

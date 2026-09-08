@@ -2,6 +2,7 @@ import { gunzipSync } from 'node:zlib';
 import { buildRawCapture } from '../../services/captureSink';
 import {
   ObjectStoreCaptureSink,
+  DEFAULT_IMAGE_PUT_TIMEOUT_MS,
   type ObjectStore,
   type PutOptions,
   type RawStoreConfig,
@@ -488,5 +489,38 @@ describe('ObjectStoreCaptureSink — user-metadata is budgeted as a whole', () =
     const md = store.puts[0].opts.metadata!;
     expect(md['fetched-at']).not.toMatch(/[\r\n]/);
     expect(md.position).not.toMatch(/[\r\n]/);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// A 10 MiB image needs ~2 MiB/s to fit the page lanes' 5 s budget. The asset lane
+// gets its OWN budget so a large original is not counted as a failure that in fact
+// completed behind the sink's back.
+// ---------------------------------------------------------------------------
+describe('ObjectStoreCaptureSink — the asset lane has its own op budget', () => {
+  it('defaults the asset budget well above the page budget', () => {
+    expect(DEFAULT_IMAGE_PUT_TIMEOUT_MS).toBeGreaterThan(5_000);
+  });
+
+  it('bounds a hung asset PUT by imagePutTimeoutMs, not by the page putTimeoutMs', async () => {
+    const store = new FakeObjectStore();
+    store.hangPut = true;
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 50, imagePutTimeoutMs: 300 });
+
+    let settled = false;
+    const done = sink.capture(asset(JPEG)).then(() => { settled = true; });
+    await new Promise(r => setTimeout(r, 150));
+    expect(settled).toBe(false); // the page lane's 50ms did NOT apply
+    await done;
+    expect(sink.stats().assetFailed).toBe(1);
+  });
+
+  it('leaves the page lanes on their own putTimeoutMs', async () => {
+    const store = new FakeObjectStore();
+    store.hangPut = true;
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 50, imagePutTimeoutMs: 5_000 });
+    await sink.capture(cap());
+    expect(sink.stats().failed).toBe(1);
   });
 });

@@ -78,6 +78,12 @@ export interface RawStoreConfig {
   /** Hard bound on each HEAD/PUT so a slow store can't stall the fetch path. */
   putTimeoutMs?: number;
   /**
+   * The asset lane's own HEAD/PUT bound. An original image is up to maxImageBytes
+   * (10 MiB by default) against a page body's ~30 KB gzipped, so it cannot share
+   * the page budget without timing out on payload size alone.
+   */
+  imagePutTimeoutMs?: number;
+  /**
    * S3 addressing style for the adapter. Hetzner uses virtual-hosted style, so
    * the adapter defaults to `false` (path-style off). Unused by the sink logic.
    */
@@ -106,6 +112,8 @@ export interface SinkStats {
 
 const SUPPORTED_KEY_SCHEME = 'sha256-v1';
 const DEFAULT_PUT_TIMEOUT_MS = 5_000;
+/** 30 s — 10 MiB at a pessimistic ~350 KB/s, so payload size alone never times out. */
+export const DEFAULT_IMAGE_PUT_TIMEOUT_MS = 30_000;
 const MAX_METADATA_VALUE_LEN = 1024;
 /**
  * S3 caps USER METADATA as a SET (2 KB of `x-amz-meta-*` header bytes), not per
@@ -221,6 +229,7 @@ function hostOf(url: string): string | undefined {
 
 export class ObjectStoreCaptureSink implements CaptureSink {
   private readonly putTimeoutMs: number;
+  private readonly imagePutTimeoutMs: number;
   private readonly maxImageBytes: number;
   private readonly pagesEnabled: boolean;
   private readonly assetsEnabled: boolean;
@@ -244,6 +253,9 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     }
     const t = config.putTimeoutMs;
     this.putTimeoutMs = typeof t === 'number' && Number.isFinite(t) && t > 0 ? t : DEFAULT_PUT_TIMEOUT_MS;
+    const it = config.imagePutTimeoutMs;
+    this.imagePutTimeoutMs =
+      typeof it === 'number' && Number.isFinite(it) && it > 0 ? it : DEFAULT_IMAGE_PUT_TIMEOUT_MS;
     const m = config.maxImageBytes;
     this.maxImageBytes = typeof m === 'number' && Number.isFinite(m) && m > 0 ? m : DEFAULT_MAX_IMAGE_BYTES;
     this.pagesEnabled = config.pagesEnabled !== false;
@@ -314,7 +326,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       const prefix = this.config.imagePrefix ?? DEFAULT_IMAGE_PREFIX;
       const key = `${prefix}sha256/${c.sha256.slice(0, 2)}/${c.sha256}.${type.ext}`;
 
-      if (await this.withTimeout(this.store.exists(key))) {
+      if (await this.withTimeout(this.store.exists(key), this.imagePutTimeoutMs)) {
         this.assetDeduped += 1;
         return;
       }
@@ -326,6 +338,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
           contentType: type.contentType,
           metadata: this.assetMetadata(c),
         }),
+        this.imagePutTimeoutMs,
       );
       this.assetStored += 1;
     } catch (err) {
@@ -390,13 +403,17 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     return budgetMetadata(md);
   }
 
-  private withTimeout<T>(p: Promise<T>): Promise<T> {
+  /**
+   * Bounds one store op. NOTE: this is a race, not a cancellation — the underlying
+   * request is abandoned, not aborted (the minio client takes no AbortSignal), so a
+   * timed-out PUT may still complete into the bucket after it has been counted as a
+   * failure. That is why the asset lane gets a budget sized to its payload rather
+   * than sharing the page lanes'.
+   */
+  private withTimeout<T>(p: Promise<T>, budgetMs: number = this.putTimeoutMs): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(
-        () => reject(new Error(`raw-store op exceeded ${this.putTimeoutMs}ms`)),
-        this.putTimeoutMs,
-      );
+      timer = setTimeout(() => reject(new Error(`raw-store op exceeded ${budgetMs}ms`)), budgetMs);
     });
     return Promise.race([p, timeout]).finally(() => {
       if (timer) clearTimeout(timer);

@@ -167,6 +167,7 @@ export function loadRawStoreConfigFromEnv(
     pagesEnabled,
     assetsEnabled,
     putTimeoutMs: parsePositive(env.RAW_STORE_PUT_TIMEOUT_MS),
+    imagePutTimeoutMs: parsePositive(env.RAW_STORE_IMAGE_PUT_TIMEOUT_MS),
     maxImageBytes: parsePositive(env.RAW_STORE_IMAGE_MAX_BYTES),
     pathStyle: env.RAW_STORE_S3_PATH_STYLE !== undefined ? env.RAW_STORE_S3_PATH_STYLE === 'true' : undefined,
   };
