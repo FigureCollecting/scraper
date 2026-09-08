@@ -1,0 +1,148 @@
+/**
+ * PER-IMAGE-HOST pacing. The driver already paces a store's own host; an image usually is not on it.
+ * A CDN is the shared resource — cdn.shopify.com serves hundreds of the stores in this engine — so
+ * the budget that matters is the one keyed on the IMAGE host, and it must be ONE budget across every
+ * store that happens to point at that CDN. Pacing the store instead would let a dozen stores hammer
+ * one CDN at their own individual rates.
+ */
+import { HostRateLimiter } from '../../driver/hostRateLimiter';
+import { paceImageBytesByHost } from '../../services/images/imageBytesPacing';
+import type { ImageBytesResult } from '../../services/images/imageBytes';
+
+/** A round base delay, and a success threshold high enough that ONE success never moves it. */
+const config = {
+  baseDelayMs: 1000,
+  minDelayMs: 100,
+  maxDelayMs: 60_000,
+  backoffMultiplier: 2,
+  recoveryDivisor: 2,
+  successThreshold: 3,
+};
+
+/** The same, with recovery on the FIRST success — for the backoff/recovery assertions. */
+const quickRecovery = { ...config, successThreshold: 1 };
+
+const ok = (): ImageBytesResult => ({
+  ok: true,
+  bytes: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  contentType: 'image/png',
+  status: 200,
+  finalUrl: 'https://cdn.shopify.com/i/1.png',
+  headers: {},
+});
+
+const harness = () => {
+  let clock = 0;
+  const slept: number[] = [];
+  const limiter = new HostRateLimiter(() => config, config);
+  const fetcher = jest.fn(async (_url: string) => ok());
+  const paced = paceImageBytesByHost(fetcher, limiter, {
+    now: () => clock,
+    sleep: async (ms: number) => { slept.push(ms); clock += ms; },
+  });
+  return { paced, fetcher, slept, limiter, advance: (ms: number) => { clock += ms; }, clockNow: () => clock };
+};
+
+describe('paceImageBytesByHost', () => {
+  it('gives a SHARED CDN one budget across stores — the second store waits for the first', async () => {
+    const { paced, slept, fetcher } = harness();
+
+    // Two different stores, the same CDN host.
+    await paced('https://cdn.shopify.com/s/files/store-a/1.png');
+    await paced('https://cdn.shopify.com/s/files/store-b/2.png');
+
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(slept).toEqual([1000]);
+  });
+
+  it('keys on the IMAGE host, so a different CDN is an independent budget', async () => {
+    const { paced, slept } = harness();
+
+    await paced('https://cdn.shopify.com/i/1.png');
+    await paced('https://cdn11.bigcommerce.com/i/2.png');
+
+    expect(slept).toEqual([]);
+  });
+
+  it('collapses host spellings (case, www.) onto the one budget', async () => {
+    const { paced, slept } = harness();
+
+    await paced('https://CDN.shopify.com/i/1.png');
+    await paced('https://www.cdn.shopify.com/i/2.png');
+
+    expect(slept).toEqual([1000]);
+  });
+
+  it('needs no wait once the budget has elapsed on its own', async () => {
+    const { paced, slept, advance } = harness();
+
+    await paced('https://cdn.shopify.com/i/1.png');
+    advance(1500);
+    await paced('https://cdn.shopify.com/i/2.png');
+
+    expect(slept).toEqual([]);
+  });
+
+  it('backs the image host off when the CDN answers 429, and recovers on success', async () => {
+    let clock = 0;
+    const limiter = new HostRateLimiter(() => quickRecovery, quickRecovery);
+    const rateLimited = jest.fn(async (_url: string): Promise<ImageBytesResult> => ({ ok: false, reason: 'http-status', status: 429 }));
+    const paced = paceImageBytesByHost(rateLimited, limiter, { now: () => clock, sleep: async (ms: number) => { clock += ms; } });
+
+    await paced('https://cdn.shopify.com/i/1.png');
+    expect(limiter.currentDelay('cdn.shopify.com')).toBe(2000);
+
+    const succeeding = paceImageBytesByHost(jest.fn(async (_url: string) => ok()), limiter, { now: () => clock, sleep: async (ms: number) => { clock += ms; } });
+    await succeeding('https://cdn.shopify.com/i/2.png');
+    expect(limiter.currentDelay('cdn.shopify.com')).toBe(1000);
+  });
+
+  it('treats a 403 as a block too, and leaves the budget alone for a plain 404', async () => {
+    const blockedLimiter = new HostRateLimiter(() => config, config);
+    let clock = 0;
+    const sleep = async (ms: number) => { clock += ms; };
+    await paceImageBytesByHost(async () => ({ ok: false, reason: 'http-status', status: 403 }), blockedLimiter, { now: () => clock, sleep })('https://cdn.shopify.com/i/1.png');
+    expect(blockedLimiter.currentDelay('cdn.shopify.com')).toBe(2000);
+
+    const missingLimiter = new HostRateLimiter(() => config, config);
+    await paceImageBytesByHost(async () => ({ ok: false, reason: 'http-status', status: 404 }), missingLimiter, { now: () => clock, sleep })('https://cdn.shopify.com/i/1.png');
+    expect(missingLimiter.currentDelay('cdn.shopify.com')).toBe(1000);
+  });
+
+  it('passes the options through and fetches an unparseable URL without pacing it', async () => {
+    const { paced, fetcher, slept } = harness();
+
+    await paced('https://cdn.shopify.com/i/1.png', { referer: 'https://shop.test/p/1' });
+    expect(fetcher).toHaveBeenCalledWith('https://cdn.shopify.com/i/1.png', { referer: 'https://shop.test/p/1' });
+
+    await paced('not a url');
+    await paced('not a url');
+    expect(slept).toEqual([]);
+    expect(fetcher).toHaveBeenCalledTimes(3);
+  });
+
+  it('paces on the real clock and timer when no clock is injected', async () => {
+    const tiny = { ...config, baseDelayMs: 5, minDelayMs: 1 };
+    const limiter = new HostRateLimiter(() => tiny, tiny);
+    const fetcher = jest.fn(async (_url: string) => ok());
+    const paced = paceImageBytesByHost(fetcher, limiter);
+
+    const started = Date.now();
+    await paced('https://cdn.shopify.com/i/1.png');
+    await paced('https://cdn.shopify.com/i/2.png');
+
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(1);
+  });
+
+  it('records the dispatch even when the fetch throws, so a fault does not un-pace the host', async () => {
+    let clock = 0;
+    const limiter = new HostRateLimiter(() => config, config);
+    const slept: number[] = [];
+    const faulty = jest.fn(async (_url: string): Promise<ImageBytesResult> => { throw new Error('ECONNRESET'); });
+    const paced = paceImageBytesByHost(faulty, limiter, { now: () => clock, sleep: async (ms: number) => { slept.push(ms); clock += ms; } });
+
+    await expect(paced('https://cdn.shopify.com/i/1.png')).rejects.toThrow(/ECONNRESET/);
+    expect(limiter.msUntilReady('cdn.shopify.com', clock)).toBe(1000);
+  });
+});
