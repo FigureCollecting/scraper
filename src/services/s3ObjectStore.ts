@@ -7,6 +7,7 @@
  * (fc-infra nodes/fc-app-01/raw-store/README.md — the "1.B scraper Deployment
  * wiring" fragment):
  *   PERSIST_RAW_HTML=true                                        (the se-09 kill-switch)
+ *   PERSIST_RAW_IMAGES=true                                      (the SEPARATE asset-lane switch)
  *   RAW_STORE_S3_ENDPOINT / _REGION / _BUCKET / _PREFIX / _KEY_SCHEME   (ConfigMap, envFrom)
  *   RAW_STORE_S3_ACCESS_KEY_ID / RAW_STORE_S3_SECRET_ACCESS_KEY   (Secret raw-store-s3-creds,
  *       whose internal keys are ACCESS_KEY_ID/SECRET_ACCESS_KEY, mapped to these
@@ -88,11 +89,22 @@ export function toS3MetaData(opts: PutOptions): Record<string, string> {
   return metaData;
 }
 
-/** A finite, positive millisecond value from env, or undefined (sink uses its default). */
-function parsePositiveMs(raw: string | undefined): number | undefined {
+/** A finite, positive number from env, or undefined (the sink uses its default). */
+function parsePositive(raw: string | undefined): number | undefined {
   if (raw === undefined) return undefined;
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+/**
+ * The asset lane's own kill switch, deliberately SEPARATE from PERSIST_RAW_HTML:
+ * images are a different corpus with different volume and different rights, so
+ * turning page capture on must not start pulling binaries. Off unless the value is
+ * exactly `true`, and consulted by the caller that decides to fetch an image at all
+ * — the sink itself stores whatever it is handed.
+ */
+export function isImagePersistenceEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.PERSIST_RAW_IMAGES === 'true';
 }
 
 /**
@@ -128,8 +140,10 @@ export function loadRawStoreConfigFromEnv(
     bucket,
     prefix: env.RAW_STORE_S3_PREFIX ?? 'raw-html/',
     jsonPrefix: env.RAW_STORE_S3_JSON_PREFIX ?? 'raw-json/',
+    imagePrefix: env.RAW_STORE_S3_IMAGE_PREFIX ?? 'raw-img/',
     keyScheme: env.RAW_STORE_KEY_SCHEME ?? 'sha256-v1',
-    putTimeoutMs: parsePositiveMs(env.RAW_STORE_PUT_TIMEOUT_MS),
+    putTimeoutMs: parsePositive(env.RAW_STORE_PUT_TIMEOUT_MS),
+    maxImageBytes: parsePositive(env.RAW_STORE_IMAGE_MAX_BYTES),
     pathStyle: env.RAW_STORE_S3_PATH_STYLE !== undefined ? env.RAW_STORE_S3_PATH_STYLE === 'true' : undefined,
   };
   return { config, creds: { accessKeyId, secretAccessKey } };

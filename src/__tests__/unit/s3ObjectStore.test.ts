@@ -4,6 +4,7 @@ import { ObjectStoreCaptureSink } from '../../services/objectStoreCaptureSink';
 import {
   loadRawStoreConfigFromEnv,
   createRawCaptureSink,
+  isImagePersistenceEnabled,
   toS3MetaData,
 } from '../../services/s3ObjectStore';
 
@@ -67,6 +68,49 @@ describe('loadRawStoreConfigFromEnv', () => {
   it('drops an invalid putTimeoutMs so the sink falls back to its default', () => {
     const loaded = loadRawStoreConfigFromEnv({ ...FULL_ENV, RAW_STORE_PUT_TIMEOUT_MS: 'nope' } as unknown as NodeJS.ProcessEnv)!;
     expect(loaded.config.putTimeoutMs).toBeUndefined();
+  });
+
+  it('defaults the asset lane: imagePrefix raw-img/ and no explicit byte ceiling', () => {
+    const loaded = loadRawStoreConfigFromEnv(FULL_ENV)!;
+    expect(loaded.config.imagePrefix).toBe('raw-img/');
+    expect(loaded.config.maxImageBytes).toBeUndefined();
+  });
+
+  it('reads RAW_STORE_S3_IMAGE_PREFIX and RAW_STORE_IMAGE_MAX_BYTES', () => {
+    const loaded = loadRawStoreConfigFromEnv({
+      ...FULL_ENV,
+      RAW_STORE_S3_IMAGE_PREFIX: 'img/',
+      RAW_STORE_IMAGE_MAX_BYTES: '2048',
+    } as unknown as NodeJS.ProcessEnv)!;
+    expect(loaded.config.imagePrefix).toBe('img/');
+    expect(loaded.config.maxImageBytes).toBe(2048);
+  });
+
+  it('drops an invalid RAW_STORE_IMAGE_MAX_BYTES so the sink keeps its 10 MiB default', () => {
+    const loaded = loadRawStoreConfigFromEnv({
+      ...FULL_ENV,
+      RAW_STORE_IMAGE_MAX_BYTES: '-1',
+    } as unknown as NodeJS.ProcessEnv)!;
+    expect(loaded.config.maxImageBytes).toBeUndefined();
+  });
+});
+
+describe('isImagePersistenceEnabled — the asset lane kill switch', () => {
+  it('is OFF by default, even with page capture fully enabled', () => {
+    expect(isImagePersistenceEnabled(FULL_ENV)).toBe(false);
+    expect(isImagePersistenceEnabled({} as NodeJS.ProcessEnv)).toBe(false);
+  });
+
+  it('requires the exact string "true" — no truthy near-misses', () => {
+    for (const v of ['TRUE', 'True', '1', 'yes', 'on', '']) {
+      expect(isImagePersistenceEnabled({ PERSIST_RAW_IMAGES: v } as NodeJS.ProcessEnv)).toBe(false);
+    }
+    expect(isImagePersistenceEnabled({ PERSIST_RAW_IMAGES: 'true' } as NodeJS.ProcessEnv)).toBe(true);
+  });
+
+  it('is INDEPENDENT of PERSIST_RAW_HTML in both directions', () => {
+    expect(isImagePersistenceEnabled({ PERSIST_RAW_IMAGES: 'true' } as NodeJS.ProcessEnv)).toBe(true);
+    expect(isImagePersistenceEnabled({ PERSIST_RAW_HTML: 'true' } as NodeJS.ProcessEnv)).toBe(false);
   });
 });
 
