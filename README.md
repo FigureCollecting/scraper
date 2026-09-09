@@ -1179,6 +1179,7 @@ See `.env.example` for complete configuration template.
   - Unset/blank (default): the built-in table, which is the permaban alone
   - Unparseable or not an object → ONE warning, and `IMAGE_HOST_POLICY_FILE` is consulted instead (a malformed inline edit never stands in for the file an operator also mounted)
 - `IMAGE_HOST_POLICY_FILE`: Path to a file holding that same table (consulted when `IMAGE_HOST_POLICY_JSON` is unset **or unusable**)
+- `IMAGE_ACCEPT`: The `Accept` all three image lanes send (default `image/jpeg, image/png, image/gif, image/*;q=0.9, */*;q=0.8` — the ARCHIVAL header, which names no webp and no avif). Must be a plain header value; anything with CR/LF or outside printable ASCII is refused with one warning and the default stands — see **Image bytes lanes** below
 - `IMAGE_MAX_PER_ITEM`: Images captured per item (default `12`, clamped to 100) — see **Image capture** below
 - `IMAGE_MEMO_SIZE`: Urls the capture memo holds (default `50000`) — see **Image capture** below
 - `IMAGE_RESIDENTIAL_BYTES_PER_DAY`: Rolling-24-hour byte ceiling on the residential exit for images (default `1073741824`; `0` closes it) — see **Image capture** below
@@ -1215,11 +1216,21 @@ Every transport described above returns a STRING — `res.text()`, impit's `.tex
 
 | Lane | Used for | Residential egress |
 |---|---|---|
-| `http` | The default for a third-party CDN. Plain GET, image `Accept`, abort-bounded | **Refused** — same rule and same wording as the string lane: Node's fetch cannot proxy. Refused on the DECLARED egress too, so a residential fetch whose proxy never resolved does not degrade into a direct one |
+| `http` | The default for a third-party CDN. Plain GET, archival `Accept`, abort-bounded | **Refused** — same rule and same wording as the string lane: Node's fetch cannot proxy. Refused on the DECLARED egress too, so a residential fetch whose proxy never resolved does not degrade into a direct one |
 | `impit` | A CDN behind a TLS-fingerprint gate, and every residential image that is not on the browser lane. Seeds the host's stored cf cookies and lets the pinned mint UA win, as the string lane does | Supported (`proxyUrl` on the session; one session per profile+proxy). A fetch declared residential with no proxy is REFUSED |
 | `browser` | A CDN behind the same Cloudflare gate as its store: a TAB of that store's gated browser, navigated at the image, read with the page lane's own document-only main-frame guard **and its challenge wait** (`domcontentloaded` fires on the interstitial, and leaving then cancels the challenge script). The gate itself comes from the store's declared `access: 'cloudflare'`, so an ungated store's images ride the ordinary ephemeral context | Supported (the gated browser for that egress) |
 
 On the `impit` lane the body is read through a feature-detected binary capability (`bytes()`, else `arrayBuffer()`). An impit build exposing only `text()` returns `unsupported` and the body is left unread — a silently corrupted image is worse than a visible refusal.
+
+**The `Accept` these lanes send is ARCHIVAL, and it is the single highest-impact setting in the image policy.** A browser's image `Accept` (`image/avif,image/webp,image/apng,…`) is a downgrade switch: eight of the nineteen image hosts in the 2026-09-08 lane matrix content-negotiate off it — Cloudflare Polish, Shopify, BigCommerce, hpoi and the rest — and on one of them it turned a 1 227 923-byte PNG master into a 111 240-byte webp at identical pixels. What comes back then is a DERIVATIVE the CDN re-encoded, and an archive of derivatives answers none of the questions the originals were kept for. So the default names the lossless/original families first and mentions neither webp nor avif:
+
+```
+image/jpeg, image/png, image/gif, image/*;q=0.9, */*;q=0.8
+```
+
+It is deliberately not `*/*`: a few hotlink guards check that an image request looks like one, and the trailing `image/*;q=0.9` still takes a webp-only host's bytes rather than refusing them. `IMAGE_ACCEPT` replaces it process-wide; a policy row's `accept` replaces it for one host and beats the env. On the browser lane the header is set on the IMAGE TAB alone (`setExtraHTTPHeaders` inside that navigation) — never on the gated browser's defaults, which would put an image `Accept` on every storefront document the same session fetches.
+
+A negotiated response is RECORDED rather than refused: the asset's object metadata carries `declared-content-type` (what the server said) beside `content-encoding` and `vary` (present only when the server sent them), so an object that turned out to be a rendition says so.
 
 **Which lane an image takes** is decided by the policy table first, then by the engine's existing suffix rule. An image on the DECLARING store's own hosts inherits that store's transport and egress; anything else has the declared egress DROPPED (the residential exit is a home line — it is not spent on a host that never declared it) and takes the plain lane. The table OVERRIDES both directions. Two pairings are refused outright rather than resolved, and neither is silently downgraded — a downgrade answers a misconfigured row with a different symptom somewhere else:
 
@@ -1233,6 +1244,7 @@ The table is `{ host: rule }`, matched by LONGEST host suffix (`cdn.example.com`
 | `lane` | `http` \| `impit` \| `browser` | Force the lane, overriding what the store declared |
 | `egress` | `direct` \| `residential` | Force the egress, overriding the suffix rule in either direction |
 | `referer` | `true` \| `false` | Send the declaring page as `Referer` (hotlink-protected CDNs need it). Default: `true` — hotlink guards live on third-party CDNs, so defaulting it off there is the one place it hurts |
+| `accept` | a header value | The `Accept` to send THIS host instead of the archival default — for a CDN that needs the ask narrowed further, or widened for one that answers nothing else. Validated as a plain header value: a row carrying CR/LF is header injection, not a preference, and is dropped with a warning |
 | `ua` | `chrome` \| `default` | User-agent profile, resolved to a header by `resolveImageUserAgent` (`chrome` = the desktop Chrome string, whose major tracks the engine's impersonation profile; `default` = whatever the lane already sends). Default: `chrome` on the impit/browser lanes, `default` on `http` |
 | `deny` | `true` | Never fetch this host |
 
@@ -1369,7 +1381,7 @@ Two lanes, two switches, two prefixes:
 |---|---|---|---|
 | page bodies (`wire`, `dom`) | `PERSIST_RAW_HTML` | `RAW_STORE_S3_PREFIX` (`raw-html/`) | `gzip(body)`, `.html.gz`, `Content-Type: application/gzip` |
 | API responses (`api`) | `PERSIST_RAW_HTML` | `RAW_STORE_S3_JSON_PREFIX` (`raw-json/`) | `gzip(body)`, `.json.gz`, `Content-Type: application/gzip` |
-| images (`asset`) | `PERSIST_RAW_IMAGES` | `RAW_STORE_S3_IMAGE_PREFIX` (`raw-img/`) | the ORIGINAL bytes, unaltered — no gzip, real image `Content-Type`, extension from the magic bytes |
+| images (`asset`) | `PERSIST_RAW_IMAGES` | `RAW_STORE_S3_IMAGE_PREFIX` (`raw-img/`) | the ORIGINAL bytes, unaltered — no gzip, real image `Content-Type`, extension from the magic bytes. Metadata carries `declared-content-type` plus the negotiation witnesses `content-encoding` and `vary`, so a re-encoded or transfer-encoded response is visible on the object |
 
 - `PERSIST_RAW_HTML`: `true` enables page/API capture. Anything else (including unset) disables it silently. Enabled but incompletely configured is never a silent no-op — it logs one loud warning naming the missing variable and stays disabled.
 - `PERSIST_RAW_IMAGES`: **a separate kill switch for the asset lane**, `true` (exactly) to enable, default OFF. It is independent of `PERSIST_RAW_HTML` in both directions: images are a different corpus with different volume and different rights, so turning page capture on must never start pulling binaries, and an images-only wiring (`PERSIST_RAW_IMAGES=true` with page capture off) is a supported configuration — **either** switch alone builds the real sink, and only the lane whose switch is off is refused. The refusal is at the WRITE boundary, not by convention: a lane whose switch is off is a counted skip (`skippedDisabled` / `assetSkipped.disabled`) that reaches no bucket, so a caller that forgets to consult `isImagePersistenceEnabled()` still cannot store an image. With **both** switches off the loader returns null and the process gets a `NoopCaptureSink` (intended silence); with either on but the store config incomplete, one loud warning names the switch and every missing variable.

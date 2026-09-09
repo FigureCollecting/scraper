@@ -264,6 +264,25 @@ describe('ObjectStoreCaptureSink — the asset lane', () => {
     expect(md['bytes']).toBe(String(JPEG.length));
   });
 
+  it('records the NEGOTIATION witnesses, so a re-encoded response is visible in the object', async () => {
+    // The archival Accept asks for originals; a Polish/Shopify host may still answer with a
+    // rendition. `vary: Accept` says the response was chosen from the request header and
+    // `content-encoding` says the wire body was not the stored one — neither is readable from the
+    // bytes afterwards, so both are kept beside the type the store declared.
+    await sink.capture(asset(JPEG, { contentType: 'image/webp', contentEncoding: 'br', vary: 'Accept' }));
+    const md = store.puts[0].opts.metadata ?? {};
+    expect(md['declared-content-type']).toBe('image/webp');
+    expect(md['content-encoding']).toBe('br');
+    expect(md['vary']).toBe('Accept');
+  });
+
+  it('omits both witnesses when the server sent neither', async () => {
+    await sink.capture(asset(JPEG));
+    const md = store.puts[0].opts.metadata ?? {};
+    expect(md).not.toHaveProperty('content-encoding');
+    expect(md).not.toHaveProperty('vary');
+  });
+
   it('falls back to the image host for site when no source item is carried', async () => {
     await sink.capture(asset(JPEG, { sourceItem: undefined, sourceUrl: undefined, position: undefined }));
     const md = store.puts[0].opts.metadata ?? {};
@@ -458,11 +477,19 @@ describe('ObjectStoreCaptureSink — user-metadata is budgeted as a whole', () =
     expect(sink.stats().assetStored).toBe(1);
   });
 
-  it('sheds the least valuable provenance first: declared-content-type, then source-url', async () => {
+  it('sheds the least valuable provenance first: the negotiation witnesses, then declared-content-type, then source-url', async () => {
     await sink.capture(
-      asset(JPEG, { url: LONG_IMG, sourceUrl: LONG_PAGE, contentType: `image/jpeg;${'c'.repeat(1500)}` }),
+      asset(JPEG, {
+        url: LONG_IMG,
+        sourceUrl: LONG_PAGE,
+        contentType: `image/jpeg;${'c'.repeat(1500)}`,
+        contentEncoding: 'br',
+        vary: 'Accept',
+      }),
     );
     const md = store.puts[0].opts.metadata!;
+    expect(md['vary']).toBeUndefined();
+    expect(md['content-encoding']).toBeUndefined();
     expect(md['declared-content-type']).toBeUndefined();
     expect(md['source-item']).toBe('x.test/12345'); // the identity survives
     expect(md.url).toBeDefined();

@@ -7,8 +7,14 @@
  *     string lane — Node's global fetch cannot proxy, so a residential image must ride impit or the
  *     gated tab. It is refused BEFORE the network, never fetched from the node IP.
  */
-import { createHttpBytesFetch, IMAGE_ACCEPT } from '../../services/images/httpBytesFetch';
-import { IMAGE_CHROME_UA, classifyImageBytes, resolveImageUserAgent } from '../../services/images/imageBytes';
+import { ARCHIVAL_IMAGE_ACCEPT, createHttpBytesFetch } from '../../services/images/httpBytesFetch';
+import {
+  IMAGE_CHROME_UA,
+  classifyImageBytes,
+  isPlainHeaderValue,
+  resolveImageAccept,
+  resolveImageUserAgent,
+} from '../../services/images/imageBytes';
 import { DEFAULT_PROFILE } from '../../services/impitFetch';
 
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13]);
@@ -56,18 +62,51 @@ describe('createHttpBytesFetch', () => {
     expect(result.bytes.equals(PNG)).toBe(true);
   });
 
-  it('sends the image Accept header and a desktop UA, and the referer ONLY when one is given', async () => {
+  it('sends the ARCHIVAL Accept, a desktop UA, and the referer ONLY when one is given', async () => {
     const fetchImpl = jest.fn(async (_url: string, _init: FakeInit) => response());
     const fetchBytes = createHttpBytesFetch({ fetchImpl: fetchImpl as never });
 
     await fetchBytes('https://cdn.example.com/a.png');
-    expect(fetchImpl.mock.calls[0][1].headers.accept).toBe(IMAGE_ACCEPT);
+    expect(fetchImpl.mock.calls[0][1].headers.accept).toBe(ARCHIVAL_IMAGE_ACCEPT);
+    // The point of the whole header: no webp and no avif, so a Polish/Shopify/BigCommerce host
+    // cannot negotiate the master down to a re-encode and hand the archive a derivative.
+    expect(fetchImpl.mock.calls[0][1].headers.accept).not.toMatch(/webp|avif/);
     expect(fetchImpl.mock.calls[0][1].headers['user-agent']).toMatch(/Mozilla/);
     expect(fetchImpl.mock.calls[0][1].headers.referer).toBeUndefined();
 
     await fetchBytes('https://cdn.example.com/a.png', { referer: 'https://store.example/p/1', userAgent: 'UA/1' });
     expect(fetchImpl.mock.calls[1][1].headers.referer).toBe('https://store.example/p/1');
     expect(fetchImpl.mock.calls[1][1].headers['user-agent']).toBe('UA/1');
+  });
+
+  it('takes the operator\'s IMAGE_ACCEPT over the archival default, and ignores an unusable one', async () => {
+    const previous = process.env.IMAGE_ACCEPT;
+    try {
+      process.env.IMAGE_ACCEPT = 'image/tiff, image/*;q=0.5';
+      const fetchImpl = jest.fn(async (_url: string, _init: FakeInit) => response());
+      await createHttpBytesFetch({ fetchImpl: fetchImpl as never })('https://cdn.example.com/a.png');
+      expect(fetchImpl.mock.calls[0][1].headers.accept).toBe('image/tiff, image/*;q=0.5');
+
+      // A value that would SPLIT the header is not an override; the archival default stands and the
+      // refusal is named once rather than sent.
+      process.env.IMAGE_ACCEPT = 'image/png\r\nX-Injected: 1';
+      const warn = jest.fn();
+      const second = jest.fn(async (_url: string, _init: FakeInit) => response());
+      await createHttpBytesFetch({ fetchImpl: second as never, warn })('https://cdn.example.com/a.png');
+      expect(second.mock.calls[0][1].headers.accept).toBe(ARCHIVAL_IMAGE_ACCEPT);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('IMAGE_ACCEPT'));
+    } finally {
+      if (previous === undefined) delete process.env.IMAGE_ACCEPT;
+      else process.env.IMAGE_ACCEPT = previous;
+    }
+  });
+
+  it('lets a per-request Accept (the policy table\'s per-host row) beat the lane default', async () => {
+    const fetchImpl = jest.fn(async (_url: string, _init: FakeInit) => response());
+    await createHttpBytesFetch({ fetchImpl: fetchImpl as never })('https://cdn.example.com/a.png', {
+      accept: 'image/png',
+    });
+    expect(fetchImpl.mock.calls[0][1].headers.accept).toBe('image/png');
   });
 
   it('sends a UA that tracks the engine\'s impersonation profile, not a frozen old Chrome', async () => {
@@ -260,5 +299,43 @@ describe('classifyImageBytes', () => {
     expect(classifyImageBytes('application/json', PNG).image).toBe(false);
     expect(classifyImageBytes(undefined, Buffer.from('<html>')).image).toBe(false);
     expect(classifyImageBytes('application/octet-stream', Buffer.alloc(2)).image).toBe(false);
+  });
+});
+
+describe('resolveImageAccept', () => {
+  const withEnv = <T>(value: string | undefined, run: () => T): T => {
+    const previous = process.env.IMAGE_ACCEPT;
+    if (value === undefined) delete process.env.IMAGE_ACCEPT;
+    else process.env.IMAGE_ACCEPT = value;
+    try {
+      return run();
+    } finally {
+      if (previous === undefined) delete process.env.IMAGE_ACCEPT;
+      else process.env.IMAGE_ACCEPT = previous;
+    }
+  };
+
+  it('is the archival header when the operator set nothing, or set only whitespace', () => {
+    expect(withEnv(undefined, () => resolveImageAccept())).toBe(ARCHIVAL_IMAGE_ACCEPT);
+    expect(withEnv('   ', () => resolveImageAccept())).toBe(ARCHIVAL_IMAGE_ACCEPT);
+    expect(ARCHIVAL_IMAGE_ACCEPT).not.toMatch(/webp|avif/);
+  });
+
+  it('names an unusable value through the console when no warn sink was injected', () => {
+    const consoleWarn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      expect(withEnv('image/png\nX: 1', () => resolveImageAccept())).toBe(ARCHIVAL_IMAGE_ACCEPT);
+      expect(consoleWarn).toHaveBeenCalledWith(expect.stringContaining('IMAGE_ACCEPT'));
+    } finally {
+      consoleWarn.mockRestore();
+    }
+  });
+
+  it('refuses a header value that is empty, over-long, or outside printable ASCII', () => {
+    expect(isPlainHeaderValue('')).toBe(false);
+    expect(isPlainHeaderValue('image/*'.padEnd(257, 'x'))).toBe(false);
+    expect(isPlainHeaderValue('image/*'.padEnd(256, 'x'))).toBe(true);
+    expect(isPlainHeaderValue('image/png\u0000')).toBe(false);
+    expect(isPlainHeaderValue('image/png, image/jpeg\t')).toBe(true);
   });
 });

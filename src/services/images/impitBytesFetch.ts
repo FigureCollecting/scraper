@@ -39,11 +39,11 @@ import {
   BLOCK_SIGNAL_HEADERS,
   CAPTURED_IMAGE_HEADERS,
   DEFAULT_MAX_IMAGE_BYTES,
-  IMAGE_ACCEPT,
   classifyImageBytes,
   imageTooLarge,
   isTimeoutError,
   overImageSizeCap,
+  resolveImageAccept,
   refusedFinalUrl,
   resolveImageTimeout,
   type ImageBytesFetcher,
@@ -73,6 +73,10 @@ export interface ImpitBytesFetchOptions {
   browser?: string;
   /** Body ceiling (default {@link DEFAULT_MAX_IMAGE_BYTES}). */
   maxBytes?: number;
+  /** The Accept every request sends (default: `IMAGE_ACCEPT`, else the archival header). */
+  accept?: string;
+  /** Where an unusable `IMAGE_ACCEPT` is named (default: the console). */
+  warn?: (message: string) => void;
 }
 
 /**
@@ -159,6 +163,7 @@ export function createImpitBytesFetch(options: ImpitBytesFetchOptions = {}): Ima
   const getImpit = options.getImpit ?? createImpitSessionProvider();
   const browser = options.browser ?? DEFAULT_PROFILE;
   const maxBytes = options.maxBytes ?? DEFAULT_MAX_IMAGE_BYTES;
+  const accept = options.accept ?? resolveImageAccept(process.env, options.warn);
   return async function impitBytesFetch(url, opts = {}): Promise<ImageBytesResult> {
     // EGRESS, before the session: a fetch DECLARED residential whose proxy never resolved is
     // refused, not quietly sent from the node IP. This lane is chosen precisely for hosts whose
@@ -172,7 +177,7 @@ export function createImpitBytesFetch(options: ImpitBytesFetchOptions = {}): Ima
     // bound to IP + UA, so any other UA voids it. An unknown host seeds nothing and pins nothing.
     const pinnedUa = store.userAgentFor(url);
     const headers: Record<string, string> = {
-      accept: opts.accept ?? IMAGE_ACCEPT,
+      accept: opts.accept ?? accept,
       ...(opts.referer ? { referer: opts.referer } : {}),
       ...(opts.userAgent ? { 'user-agent': opts.userAgent } : {}),
       ...(pinnedUa ? { 'user-agent': pinnedUa } : {}),

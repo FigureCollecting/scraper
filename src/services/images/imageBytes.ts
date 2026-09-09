@@ -32,7 +32,19 @@ export type ImageBytesFailureReason =
   | 'refused';
 
 /** Response headers kept alongside the bytes — provenance only, never a cookie or an auth header. */
-export const CAPTURED_IMAGE_HEADERS = ['content-type', 'content-length', 'etag', 'last-modified'] as const;
+export const CAPTURED_IMAGE_HEADERS = [
+  'content-type',
+  'content-length',
+  'etag',
+  'last-modified',
+  // The two NEGOTIATION witnesses. These lanes ask for originals, but a host may still answer with a
+  // re-encode or a transfer-encoded body, and neither is visible in the bytes: `vary: Accept` says
+  // the response was chosen from the request header, `content-encoding` says the body on the wire
+  // was not the body on disk. Stored beside the declared type, they are what later says whether an
+  // archived object is the merchant's original or a rendition of it.
+  'content-encoding',
+  'vary',
+] as const;
 
 /**
  * Headers that distinguish "this host is throttling or challenging us" from "this URL is not for
@@ -89,7 +101,7 @@ export type ImageBytesResult = ImageBytesOk | ImageBytesFailure;
 export interface ImageFetchOptions {
   /** `Referer` to send — hotlink-protected CDNs serve a block page without it. */
   referer?: string;
-  /** Overrides {@link IMAGE_ACCEPT}. */
+  /** Overrides the lane's Accept (the policy table's per-host `accept`, or a caller's own). */
   accept?: string;
   /** Overrides the lane's default user agent. */
   userAgent?: string;
@@ -173,10 +185,54 @@ export function resolveImageTimeout(requested: number | undefined, fallback: num
 }
 
 /**
- * The Accept a browser sends for an <img> request. Some CDNs vary their response on it (serving webp
- * or avif to a client that declares support), and a few hotlink guards check that it is not `* / *`.
+ * The ARCHIVAL Accept these lanes send — the provenance lane's most consequential header.
+ *
+ * A browser's image Accept (`image/avif,image/webp,image/apng,...`) is a DOWNGRADE SWITCH. Eight of
+ * the nineteen image hosts in the 2026-09-08 lane matrix content-negotiate off it — Cloudflare
+ * Polish, Shopify, BigCommerce, hpoi and the rest — and on one of them it turned a 1 227 923-byte
+ * PNG master into a 111 240-byte webp at identical pixels. What comes back then is a DERIVATIVE the
+ * CDN re-encoded, not the merchant's original bytes, and an archive of derivatives answers none of
+ * the questions the originals were kept for.
+ *
+ * So this Accept names the lossless/original families FIRST and never mentions webp or avif. It is
+ * not `* / *`: a few hotlink guards check that an image request looks like one, and `image/*;q=0.9`
+ * still takes a webp-only host's bytes rather than refusing them — a negotiated response is
+ * RECORDED (see the `content-encoding` / `vary` provenance headers) rather than rejected.
  */
-export const IMAGE_ACCEPT = 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8';
+export const ARCHIVAL_IMAGE_ACCEPT = 'image/jpeg, image/png, image/gif, image/*;q=0.9, */*;q=0.8';
+
+/** The env var an operator overrides {@link ARCHIVAL_IMAGE_ACCEPT} with, for all three lanes. */
+export const IMAGE_ACCEPT_ENV = 'IMAGE_ACCEPT';
+
+/**
+ * Whether a string may be sent as an HTTP header VALUE: printable ASCII (plus tab), no CR/LF, and
+ * bounded. The check is a refusal, not politeness — a value carrying a newline is header injection,
+ * and both the operator's env var and the policy table's per-host `accept` are configuration this
+ * process did not write.
+ */
+export function isPlainHeaderValue(value: string): boolean {
+  return value.length > 0 && value.length <= 256 && /^[\t\x20-\x7e]+$/.test(value);
+}
+
+/**
+ * The Accept the lanes send, resolved once per lane build: `IMAGE_ACCEPT` when the operator set a
+ * usable one, else the archival default. An unusable value is REFUSED rather than sent — a header
+ * the transport would reject (or worse, split) is not an override, it is a broken deployment — and
+ * it is named once so the operator can see which value was ignored.
+ */
+export function resolveImageAccept(
+  env: NodeJS.ProcessEnv = process.env,
+  // eslint-disable-next-line no-console
+  warn: (message: string) => void = message => console.warn(message),
+): string {
+  const raw = (env[IMAGE_ACCEPT_ENV] ?? '').trim();
+  if (raw === '') return ARCHIVAL_IMAGE_ACCEPT;
+  if (!isPlainHeaderValue(raw)) {
+    warn(`[IMAGE-ACCEPT] ${IMAGE_ACCEPT_ENV} is not a plain header value — using the archival default.`);
+    return ARCHIVAL_IMAGE_ACCEPT;
+  }
+  return raw;
+}
 
 /** SVG: an `image/*` type whose body is active content. Never accepted as an image by these lanes. */
 const SVG_CONTENT_TYPE = /^image\/svg(\+xml)?\b/i;

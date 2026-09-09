@@ -158,6 +158,24 @@ describe('loadImageHostPolicy', () => {
     expect(policy.ruleFor('otakumode.com')).toEqual({ deny: true });
     expect(policy.ruleFor('cdn.otakumode.com')).toEqual({ deny: true });
   });
+
+  it('keeps a per-host Accept, and drops one that is not a plain header value', () => {
+    const warn = jest.fn();
+    const policy = loadImageHostPolicy({
+      IMAGE_HOST_POLICY_JSON: JSON.stringify({
+        // A host whose masters are only served when the archival Accept is narrowed further.
+        'cdn.example.test': { accept: 'image/png, image/jpeg' },
+        // Header INJECTION, and a non-string: both dropped, the rest of the rule survives.
+        'split.example.test': { lane: 'http', accept: 'image/png\r\nX-Injected: 1' },
+        'typed.example.test': { lane: 'http', accept: 7 },
+      }),
+    } as NodeJS.ProcessEnv, { warn });
+
+    expect(policy.ruleFor('cdn.example.test')).toEqual({ accept: 'image/png, image/jpeg' });
+    expect(policy.ruleFor('split.example.test')).toEqual({ lane: 'http' });
+    expect(policy.ruleFor('typed.example.test')).toEqual({ lane: 'http' });
+    expect(warn).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe('chooseImageLane', () => {
@@ -184,6 +202,15 @@ describe('chooseImageLane', () => {
   it('does not treat a look-alike host as the store (the dot in the suffix test is load-bearing)', () => {
     expect(chooseImageLane(PAGE, 'https://evilanitoysgk.com/i/1.jpg', { transport: 'impersonate', egress: 'residential' }, empty))
       .toMatchObject({ ok: true, lane: 'http', egress: 'direct' });
+  });
+
+  it('carries a per-host Accept into the decision, and omits it when the row sets none', () => {
+    const policy = buildImageHostPolicy({ 'cdn11.bigcommerce.com': { accept: 'image/png' } });
+
+    expect(chooseImageLane(PAGE, 'https://cdn11.bigcommerce.com/s-x/images/1.jpg', { transport: 'http' }, policy))
+      .toEqual({ ok: true, lane: 'http', egress: 'direct', referer: PAGE, ua: 'default', accept: 'image/png' });
+    expect(chooseImageLane(PAGE, 'https://cdn.shopify.com/i/1.jpg', { transport: 'http' }, policy))
+      .not.toHaveProperty('accept');
   });
 
   it('lets the POLICY override the suffix rule in both directions', () => {

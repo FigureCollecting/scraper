@@ -387,6 +387,9 @@ export function createImageCaptureHook(deps: ImageCaptureHookDeps): ImageCapture
       egress: decision.egress,
       ...(job.searchFetch?.access === 'cloudflare' ? { challengeGated: true } : {}),
       ...(decision.referer !== undefined ? { referer: decision.referer } : {}),
+      // Only when the TABLE named one. Absent, the lane sends its own archival Accept — the header
+      // that keeps a negotiating CDN from answering with a re-encode instead of the original.
+      ...(decision.accept !== undefined ? { accept: decision.accept } : {}),
       ...(userAgent !== undefined ? { userAgent } : {}),
       ...(proxyUrl !== undefined ? { proxyUrl } : {}),
       // Re-assert on what the bytes ACTUALLY came from: the lane decision only ever saw the
@@ -476,13 +479,20 @@ export function createImageCaptureHook(deps: ImageCaptureHookDeps): ImageCapture
 
     if (decision.egress === 'residential') budget.record(result.bytes.length, now());
 
+    // What the SERVER declared, not what classification settled on: `declared-content-type` is the
+    // store's own claim, and the sniffed type it falls back to is already the object's real
+    // Content-Type. Alongside it go the two negotiation witnesses — with the archival Accept in
+    // place a re-encode should not happen, and if one does, the object says so.
+    const served = result.headers['content-type'] ?? result.contentType;
     const capture = buildRawCapture({
       url,
       finalUrl: result.finalUrl,
       lane: 'asset',
       bytes: result.bytes,
       statusCode: result.status,
-      contentType: result.contentType,
+      contentType: served,
+      ...(result.headers['content-encoding'] !== undefined ? { contentEncoding: result.headers['content-encoding'] } : {}),
+      ...(result.headers.vary !== undefined ? { vary: result.headers.vary } : {}),
       sourceItem: { site: job.site, itemId: job.itemId },
       sourceUrl: job.pageUrl,
       position,

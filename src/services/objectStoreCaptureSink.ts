@@ -129,7 +129,7 @@ const MAX_METADATA_TOTAL_BYTES = 1800;
 /** The header name S3 counts alongside each value. */
 const METADATA_HEADER_PREFIX = 'x-amz-meta-';
 /** Least-valuable provenance first: what gets dropped when the set is over budget. */
-const METADATA_SHED_ORDER = ['declared-content-type', 'source-url', 'position', 'bytes'];
+const METADATA_SHED_ORDER = ['vary', 'content-encoding', 'declared-content-type', 'source-url', 'position', 'bytes'];
 /** No value is truncated below this — a stub still identifies the object. */
 const MIN_BUDGETED_VALUE_LEN = 64;
 const DEFAULT_IMAGE_PREFIX = 'raw-img/';
@@ -415,8 +415,9 @@ export class ObjectStoreCaptureSink implements CaptureSink {
 
   /**
    * Asset provenance: which item's page referenced these bytes, where in its image
-   * list, and what the store CLAIMED they were (kept beside the sniffed type that
-   * actually decided the object's Content-Type).
+   * list, what the store CLAIMED they were (kept beside the sniffed type that
+   * actually decided the object's Content-Type), and whether the response was
+   * NEGOTIATED or transfer-encoded rather than served as-is.
    */
   private assetMetadata(c: RawCapture): Record<string, string> {
     const url = c.finalUrl ?? c.url;
@@ -435,6 +436,12 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     if (c.position !== undefined) md.position = headerSafe(String(c.position));
     if (c.role) md.role = headerSafe(c.role);
     if (c.contentType) md['declared-content-type'] = headerSafe(c.contentType);
+    // The NEGOTIATION witnesses, beside the declared type they qualify: `vary` says the server chose
+    // this representation from the request headers, `content-encoding` that the wire body was not
+    // the stored one. Absent — never empty — when the server sent neither, which is the ordinary
+    // case and the one that means "this is the object as served".
+    if (c.contentEncoding) md['content-encoding'] = headerSafe(c.contentEncoding);
+    if (c.vary) md['vary'] = headerSafe(c.vary);
     return budgetMetadata(md);
   }
 

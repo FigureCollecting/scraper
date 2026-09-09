@@ -28,6 +28,7 @@
 import { readFileSync } from 'node:fs';
 import type { SearchFetch } from '@figurecollecting/scraper-plugin-contract';
 import { isDeclaringStoreUrl, withoutDeclaredEgress } from '../residentialEgress.js';
+import { isPlainHeaderValue } from './imageBytes.js';
 import { sanitizeForLog } from '../../utils/security.js';
 
 /** Which bytes lane an image rides. `impit` is the string lane's `impersonate`, under its own name. */
@@ -41,6 +42,15 @@ export interface ImageHostRule {
   /** Send the declaring PAGE as `Referer` (hotlink-protected CDNs need it). */
   referer?: boolean;
   ua?: 'chrome' | 'default';
+  /**
+   * The `Accept` to send this host instead of the lanes' archival default.
+   *
+   * The default already refuses webp/avif so a negotiating CDN cannot hand the archive a re-encode;
+   * this row is for the host that needs the ask narrowed further (or widened, for one that answers
+   * nothing else). It is validated as a PLAIN HEADER VALUE — an operator table is configuration this
+   * process did not write, and a value carrying CR/LF is header injection, not a preference.
+   */
+  accept?: string;
   /** Never fetch this host at all. */
   deny?: boolean;
 }
@@ -143,6 +153,7 @@ function validateRule(host: string, raw: unknown, warn: (message: string) => voi
     if (field === 'lane' && typeof value === 'string' && LANES.includes(value)) rule.lane = value as ImageLane;
     else if (field === 'egress' && typeof value === 'string' && EGRESSES.includes(value)) rule.egress = value as ImageEgress;
     else if (field === 'ua' && typeof value === 'string' && UAS.includes(value)) rule.ua = value as 'chrome' | 'default';
+    else if (field === 'accept' && typeof value === 'string' && isPlainHeaderValue(value.trim())) rule.accept = value.trim();
     else if (field === 'referer' && typeof value === 'boolean') rule.referer = value;
     else if (field === 'deny' && typeof value === 'boolean') rule.deny = value;
     else if (field === 'deny') {
@@ -216,7 +227,7 @@ export function loadImageHostPolicy(
 
 /** The lane an image is fetched on, or the typed reason it is not fetched at all. */
 export type ImageLaneDecision =
-  | { ok: true; lane: ImageLane; egress: ImageEgress; referer?: string; ua: 'chrome' | 'default' }
+  | { ok: true; lane: ImageLane; egress: ImageEgress; referer?: string; ua: 'chrome' | 'default'; accept?: string }
   | { ok: false; reason: 'denied' | 'http-lane-residential' | 'off-store-residential'; detail?: string };
 
 /** The store's declared transport under the image lanes' names; undeclared ⇒ browser (ingest default). */
@@ -295,5 +306,8 @@ export function chooseImageLane(
     egress,
     ...(sendReferer ? { referer: declaringPageUrl } : {}),
     ua: rule.ua ?? (lane === 'http' ? 'default' : 'chrome'),
+    // ABSENT unless the table named one, so the lane sends its own archival default rather than a
+    // value restated here — one place decides what an unconfigured host is asked for.
+    ...(rule.accept !== undefined ? { accept: rule.accept } : {}),
   };
 }

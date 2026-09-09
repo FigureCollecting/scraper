@@ -205,6 +205,48 @@ describe('the image capture hook', () => {
     });
   });
 
+  describe('the Accept and the negotiation witnesses', () => {
+    it('hands the lane the per-host Accept the policy row named, and none when it named none', async () => {
+      const h = harness({ policy: { 'cdn.test': { accept: 'image/png' } } });
+      await capture(h, rulesetDescribing([gallery('https://cdn.test/a.jpg')]));
+      expect(h.calls[0].plan.accept).toBe('image/png');
+
+      const plain = harness();
+      await capture(plain, rulesetDescribing([gallery('https://cdn.test/a.jpg')]));
+      // Absent, not empty: the lane then sends its OWN archival default, which is the point.
+      expect(plain.calls[0].plan).not.toHaveProperty('accept');
+    });
+
+    it('stores what the server DECLARED, plus the negotiation witnesses it sent', async () => {
+      // The classified type decides the object; the DECLARED one plus `vary`/`content-encoding` are
+      // what later say whether these bytes are the merchant's original or a negotiated rendition.
+      const h = harness({
+        fetch: async () => ({
+          ok: true,
+          bytes: PNG,
+          contentType: 'image/png',
+          status: 200,
+          finalUrl: 'https://cdn.test/a.jpg',
+          headers: { 'content-type': 'application/octet-stream', 'content-encoding': 'br', vary: 'Accept' },
+        }),
+      });
+      await capture(h, rulesetDescribing([gallery('https://cdn.test/a.jpg')]));
+      expect(h.sink.captures[0]).toMatchObject({
+        contentType: 'application/octet-stream',
+        contentEncoding: 'br',
+        vary: 'Accept',
+      });
+    });
+
+    it('falls back to the classified type, and carries no witnesses, when the server sent none', async () => {
+      const h = harness();
+      await capture(h, rulesetDescribing([gallery('https://cdn.test/a.jpg')]));
+      expect(h.sink.captures[0].contentType).toBe('image/png');
+      expect(h.sink.captures[0]).not.toHaveProperty('contentEncoding');
+      expect(h.sink.captures[0]).not.toHaveProperty('vary');
+    });
+  });
+
   describe('the redirect guard', () => {
     // `chooseImageLane` only ever saw the url that was REQUESTED, and every lane follows redirects.
     // So the decision is re-asserted on the url the bytes actually came from — otherwise an allowed
