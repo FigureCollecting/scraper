@@ -169,15 +169,19 @@ describe('runInitiatorPass × fetch-failure ledger', () => {
       kind: 'record',
       origin: 'initiator',
       reasonClass: 'ruleset',
-      httpStatus: 400,
       target: ITEM_URL,
     });
+    // The 400 is OUR /ingest/scrape's answer, while the row's target is the STORE's url: recording
+    // it as the row's http_status would assert a response that store never gave.
+    expect(reports[0].httpStatus).toBeUndefined();
+    expect(reports[0].message).toContain('400');
   });
 
   it('E13: a 5xx from the enqueue POST is reported as http_5xx, a throw as network', async () => {
     const a = harness({ ingest: async () => resp(502, { error: 'unwell' }) });
     await runInitiatorPass(mkCfg(), a.deps);
-    expect(a.reports[0]).toMatchObject({ reasonClass: 'http_5xx', httpStatus: 502, kind: 'record' });
+    expect(a.reports[0]).toMatchObject({ reasonClass: 'http_5xx', kind: 'record' });
+    expect(a.reports[0].httpStatus).toBeUndefined();
 
     const b = harness({ ingest: async () => { throw new Error('socket hang up'); } });
     await runInitiatorPass(mkCfg(), b.deps);

@@ -524,13 +524,15 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
         logger.warn(`[INITIATOR] ingest rejected store=${siteId} status=${res.status} url=${url}`);
         // E13 — a 4xx is a DETERMINISTIC refusal of this url (typically no ruleset matches): ours,
         // and terminal. A 5xx is the scraper faulting, which the ledger retries on its own schedule.
+        // NO httpStatus: the status is our own /ingest/scrape's, while the row's target is the
+        // STORE's url — recording it would assert a response that store never gave. It stays in the
+        // message, where it reads as what it is.
         emitFailure({
           site: siteId,
           target: url,
           kind: 'record',
           origin: 'initiator',
           reasonClass: res.status >= 500 ? 'http_5xx' : 'ruleset',
-          httpStatus: res.status,
           message: `the scraper refused this url with ${res.status}`,
         });
         return;
