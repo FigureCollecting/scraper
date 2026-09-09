@@ -14,6 +14,12 @@
  *      declared egress DROPPED (`withoutDeclaredEgress`) and takes the plain lane. The residential
  *      exit is a home line: it is never spent on a host that did not declare it.
  *
+ * Two pairings are REFUSED outright rather than resolved: the plain lane with residential egress
+ * (Node's fetch cannot proxy, so it has no transport), and residential egress on a host that is not
+ * the declaring store's (the exit is scoped to that store, so the bytes would be fetched and then
+ * thrown away). Neither is silently downgraded — a downgrade answers a misconfiguration with a
+ * different symptom somewhere else.
+ *
  * Above both sits the DENY list, which nothing overrides. otakumode.com is permanently banned — not
  * crawled, not fetched, not emitted — so the ban is answered BEFORE the table is consulted at all,
  * and a table entry trying to re-enable it (or to claim one of its subdomains, which would otherwise
@@ -211,7 +217,7 @@ export function loadImageHostPolicy(
 /** The lane an image is fetched on, or the typed reason it is not fetched at all. */
 export type ImageLaneDecision =
   | { ok: true; lane: ImageLane; egress: ImageEgress; referer?: string; ua: 'chrome' | 'default' }
-  | { ok: false; reason: 'denied' | 'http-lane-residential'; detail?: string };
+  | { ok: false; reason: 'denied' | 'http-lane-residential' | 'off-store-residential'; detail?: string };
 
 /** The store's declared transport under the image lanes' names; undeclared ⇒ browser (ingest default). */
 function laneOfTransport(transport: SearchFetch['transport'] | undefined): ImageLane {
@@ -253,6 +259,29 @@ export function chooseImageLane(
       ok: false,
       reason: 'http-lane-residential',
       detail: "the plain-HTTP lane cannot proxy — put this host on 'impit' or 'browser' to fetch it residentially",
+    };
+  }
+  // RESIDENTIAL OFF-STORE is self-defeating, and the engine says so rather than trying it.
+  //
+  // The exit is scoped to the DECLARING store's own hosts — that is the rule the suffix logic above
+  // enforces, and the caller's final-url guard re-asserts it on whatever the bytes actually came
+  // from. So a table row pointing an off-store host at the residential exit produces a fetch that
+  // leaves through the home line, downloads the body, and is then rejected: every cost of the
+  // residential exit paid, and nothing kept.
+  //
+  // The refusal is deliberately not a silent downgrade to direct. The operator wrote that row
+  // BECAUSE they believed the host needs the residential exit; answering them with a quiet direct
+  // fetch turns their configuration error into a 403 somewhere else, hours later. Naming it here
+  // costs one image and explains itself. The engine still boots and every other row still stands —
+  // this cannot be caught when the table is LOADED, because whether a host is off-store is a fact
+  // about the page an image was found on, which no table knows.
+  if (egress === 'residential' && !onStore) {
+    return {
+      ok: false,
+      reason: 'off-store-residential',
+      detail:
+        `${sanitizeForLog(imageHost)} is not on ${sanitizeForLog(hostOf(declaringPageUrl) ?? declaringPageUrl)}, so the residential exit ` +
+        'it was given cannot carry it — the final-url guard rejects bytes fetched residentially from off-store hosts',
     };
   }
   // Referer DEFAULTS ON, on-store and off. Hotlink protection is a third-party-CDN mechanism, so

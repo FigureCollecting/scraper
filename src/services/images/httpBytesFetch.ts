@@ -108,18 +108,18 @@ export function createHttpBytesFetch(options: HttpBytesFetchOptions = {}): Image
       throw err;
     }
     // And again on what actually arrived — a CDN that declares no length is only caught here.
-    if (overImageSizeCap(bytes.byteLength, maxBytes)) return imageTooLarge(bytes.byteLength, maxBytes);
+    if (overImageSizeCap(bytes.byteLength, maxBytes)) return imageTooLarge(bytes.byteLength, maxBytes, bytes.byteLength);
     const served = res.headers.get('content-type') ?? undefined;
     const classified = classifyImageBytes(served, bytes);
     if (!classified.image) {
-      return { ok: false, reason: 'not-image', status: res.status, ...(served ? { contentType: served } : {}) };
+      return { ok: false, reason: 'not-image', status: res.status, bytesRead: bytes.byteLength, ...(served ? { contentType: served } : {}) };
     }
     const finalUrl = res.url && res.url !== '' ? res.url : url;
     // REDIRECTS: the lane follows them, and the lane decision only ever saw the REQUESTED url. The
     // permaban is re-asserted on what the bytes actually came from, then the caller's own guard.
-    if (isDeniedImageUrl(finalUrl)) return refusedFinalUrl(finalUrl, 'is on the image deny list');
+    if (isDeniedImageUrl(finalUrl)) return refusedFinalUrl(finalUrl, 'is on the image deny list', bytes.byteLength);
     if (opts.allowFinalUrl && !opts.allowFinalUrl(finalUrl)) {
-      return refusedFinalUrl(finalUrl, 'the caller\'s final-URL guard rejected');
+      return refusedFinalUrl(finalUrl, 'the caller\'s final-URL guard rejected', bytes.byteLength);
     }
     return {
       ok: true,

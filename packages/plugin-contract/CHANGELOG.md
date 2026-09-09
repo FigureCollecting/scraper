@@ -4,6 +4,30 @@ All notable changes to `@figurecollecting/scraper-plugin-contract` will be docum
 file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this
 package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-09-09
+
+Additive, backward-compatible: a ruleset that declares nothing behaves exactly as before, and every
+existing ruleset compiles unchanged. This release carries ONE addition — the image description hook,
+the seam that lets the engine capture a store's product images without learning that store's schema.
+
+### Added
+- `ExtractionRuleset.describeImages?(fields): ImageRef[]` (and the `ImageRef` / `ImageRole` exports)
+  — the ruleset translates its OWN field shapes into a normalized, store-agnostic list of images the
+  extraction found. It is handed the fields it just produced, never the html, and it is synchronous:
+  it does no parsing and no I/O, it only names what is already there.
+  This is a SEPARATION, not a convenience. Store image fields differ in name, in shape and in
+  meaning, and every one of those differences is private to the store's ruleset; an engine that read
+  them directly would have one store's schema compiled into it, and a second store would need engine
+  code. The roles are the whole interface: `gallery` (a product plate the store published — the
+  corpus worth keeping), `thumbnail` (a downscaled derivative of a plate available at full size —
+  deliberately NOT captured, since storing it duplicates the plate at a worse resolution), `user` (a
+  community upload — a rights question this lane does not answer), and `other` (a store image that
+  is none of the above, captured with the gallery because it is still the store's own).
+  `url` may be RELATIVE — the engine resolves it against the page the ref came from, so a ruleset
+  never reconstructs a base. `position` is the image's index in the order the store presents it, and
+  it is stored beside the bytes so a gallery can later be put back in the store's own order without
+  re-fetching the page.
+
 ## [0.9.0] - 2026-09-09
 
 Additive, backward-compatible: every existing store profile, ruleset and `ScrapePageResult` consumer

@@ -343,17 +343,17 @@ export function createGatedTabBytesFetch(
         // SIZE: the renderer has already buffered the body, so this is the ceiling on what leaves
         // the lane — an oversized document is dropped rather than handed on.
         if (overImageSizeCap(headers['content-length'], maxBytes)) return imageTooLarge(headers['content-length'], maxBytes);
-        if (overImageSizeCap(bytes.byteLength, maxBytes)) return imageTooLarge(bytes.byteLength, maxBytes);
+        if (overImageSizeCap(bytes.byteLength, maxBytes)) return imageTooLarge(bytes.byteLength, maxBytes, bytes.byteLength);
         const servedType = headers['content-type'];
         const classified = classifyImageBytes(servedType, bytes);
         if (!classified.image) {
-          return { ok: false, reason: 'not-image', status, ...(servedType ? { contentType: servedType } : {}) };
+          return { ok: false, reason: 'not-image', status, bytesRead: bytes.byteLength, ...(servedType ? { contentType: servedType } : {}) };
         }
         const finalUrl = response.url() || url;
         // A navigation follows redirects like every other lane — re-assert the ban, then the guard.
-        if (isDeniedImageUrl(finalUrl)) return refusedFinalUrl(finalUrl, 'is on the image deny list');
+        if (isDeniedImageUrl(finalUrl)) return refusedFinalUrl(finalUrl, 'is on the image deny list', bytes.byteLength);
         if (opts.allowFinalUrl && !opts.allowFinalUrl(finalUrl)) {
-          return refusedFinalUrl(finalUrl, 'the caller\'s final-URL guard rejected');
+          return refusedFinalUrl(finalUrl, 'the caller\'s final-URL guard rejected', bytes.byteLength);
         }
         return {
           ok: true,

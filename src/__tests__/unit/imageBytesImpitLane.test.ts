@@ -229,7 +229,9 @@ describe('createImpitBytesFetch', () => {
     const bare = { bytes: async () => new Uint8Array(Buffer.from('<html>blocked</html>')), text } as unknown;
     const { impit } = fakeImpit(() => bare);
     expect(await createImpitBytesFetch({ getImpit: async () => impit })('https://cdn.anitoysgk.com/a.png'))
-      .toEqual({ ok: false, reason: 'not-image' });
+      // The body still crossed the wire, so it is reported for the residential byte budget even
+      // though nothing else about this response is known.
+      .toEqual({ ok: false, reason: 'not-image', bytesRead: 20 });
   });
 
   it('reads a Headers-like response header bag as well as a plain object', async () => {

@@ -14,6 +14,7 @@ import { getChallengeCooldown } from './services/challengeCooldown.js';
 import { getCfCookieStore } from './services/cookieJar.js';
 import { residentialEgressView } from './services/residentialEgress.js';
 import { rawStoreView } from './services/s3ObjectStore.js';
+import { imageCaptureView } from './services/images/assembleImageCapture.js';
 import { fetchFailureReportView } from './services/failureReporter.js';
 import { sessionCanaryView } from './services/sessionCanary.js';
 import { createEngineLookup, createEngineCatalog } from './services/engineLookup.js';
@@ -56,6 +57,7 @@ app.use('/', createHealthRoutes({
   getResidentialEgress: () => residentialEgressView(),
   getBrowserLane: () => browserLaneView(),
   getRawStore: () => rawStoreView(),
+  getImageCapture: () => imageCaptureView(),
   getFailureLedger: () => fetchFailureReportView(),
   getSessionCanary: () => sessionCanaryView(),
 }));

@@ -50,6 +50,8 @@ export interface CrawlWorkerServices {
   resolveContext?: (task: CrawlTask, url: string) => ExtractContext | undefined;
   /** Override the throttle statuses; default [403, 429, 503] (see the CLOUDFLARE NOTE). */
   throttleStatuses?: number[];
+  /** Optional image capture seam, passed straight through to the worker (see `CrawlWorkerDeps`). */
+  captureImages?: (records: ExtractedData[], url: string, ruleset: ExtractionRuleset) => void;
 }
 
 /** Build the CrawlLoop-ready worker from concrete engine services. */
@@ -64,6 +66,7 @@ export function assembleCrawlWorker(services: CrawlWorkerServices): (task: Crawl
     emit: services.emit,
     ledger: services.ledger,
     ...(services.resolveContext ? { resolveContext: services.resolveContext } : {}),
+    ...(services.captureImages ? { captureImages: services.captureImages } : {}),
     throttleStatuses: services.throttleStatuses ?? DEFAULT_CRAWL_THROTTLE_STATUSES,
   });
 }

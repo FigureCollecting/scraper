@@ -17,6 +17,7 @@
  */
 import { buildProfileRegistry } from '../driver/profileRegistry.js';
 import { assembleResolve, type Resolve } from '../driver/assembleResolve.js';
+import { createRecordImageCapture } from './images/assembleImageCapture.js';
 import { createCapturingFetch, type BrowserLaneFetcher, type CapturingFetchTransports } from './engineServices/capturingFetch.js';
 import { buildExtractContext, DEFAULT_FETCH_BODY_GAP_MS } from './engineServices/extractContext.js';
 import { createPluginLogger } from './engineServices/pluginLogger.js';
@@ -76,6 +77,16 @@ export function createEngineResolve(
       const laneOptions = resolveBrowserLaneOptions(url, searchFetch, resolveProxy());
       return laneOptions ? fetchDetail(url, laneOptions) : fetchDetail(url);
     },
+    // IMAGE CAPTURE: a confirm is a READ, but it fetched a real detail page, so the store's plates
+    // are nameable here exactly as they are on the ingest leg — same switch, same memo, so a
+    // re-confirmed item costs nothing after its first pass.
+    captureImages: createRecordImageCapture('lookup', url => {
+      try {
+        return profiles.searchTransportFor(new URL(url).hostname);
+      } catch {
+        return undefined;
+      }
+    }),
     ...(extract.now ? { now: extract.now } : {}),
     ...(extract.sleep ? { sleep: extract.sleep } : {}),
     resolveContext: (ruleset, url, primaryFetchedAt, lastFetchedAt) => {

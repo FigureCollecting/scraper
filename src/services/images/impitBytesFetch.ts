@@ -200,7 +200,7 @@ export function createImpitBytesFetch(options: ImpitBytesFetchOptions = {}): Ima
       const declaredLength = readHeaders(res, ['content-length'])['content-length'];
       if (overImageSizeCap(declaredLength, maxBytes)) return imageTooLarge(declaredLength, maxBytes);
       bytes = await readBytes(res);
-      if (bytes !== undefined && overImageSizeCap(bytes.byteLength, maxBytes)) return imageTooLarge(bytes.byteLength, maxBytes);
+      if (bytes !== undefined && overImageSizeCap(bytes.byteLength, maxBytes)) return imageTooLarge(bytes.byteLength, maxBytes, bytes.byteLength);
     } catch (err) {
       if (isTimeoutError(err)) return { ok: false, reason: 'timeout', detail: (err as Error).message };
       throw err;
@@ -219,15 +219,16 @@ export function createImpitBytesFetch(options: ImpitBytesFetchOptions = {}): Ima
       return {
         ok: false,
         reason: 'not-image',
+        bytesRead: bytes.byteLength,
         ...(typeof res.status === 'number' ? { status: res.status } : {}),
         ...(served ? { contentType: served } : {}),
       };
     }
     const finalUrl = typeof res.url === 'string' && res.url !== '' ? res.url : url;
     // impit follows redirects too — the ban, then the caller's guard, on what actually served.
-    if (isDeniedImageUrl(finalUrl)) return refusedFinalUrl(finalUrl, 'is on the image deny list');
+    if (isDeniedImageUrl(finalUrl)) return refusedFinalUrl(finalUrl, 'is on the image deny list', bytes.byteLength);
     if (opts.allowFinalUrl && !opts.allowFinalUrl(finalUrl)) {
-      return refusedFinalUrl(finalUrl, 'the caller\'s final-URL guard rejected');
+      return refusedFinalUrl(finalUrl, 'the caller\'s final-URL guard rejected', bytes.byteLength);
     }
     return {
       ok: true,

@@ -43,6 +43,8 @@ import { extractRecords, EmptyExtractionError } from './engineServices/extractRe
 import { buildExtractContext } from './engineServices/extractContext.js';
 import { createPluginLogger } from './engineServices/pluginLogger.js';
 import type { CaptureSink } from './captureSink.js';
+import { getImageCaptureHook } from './images/assembleImageCapture.js';
+import type { ImageCaptureHook } from './images/imageCaptureHook.js';
 import type {
   ExtractionRuleset,
   ExtractContext,
@@ -539,6 +541,7 @@ export class ScrapeQueue {
   // Raw-capture sink for the ingest path's impit/http lanes (tests / DI); defaults lazily to the
   // shared engine sink — the same one the browser lane's navigateAndCapture writes to.
   private captureSink: CaptureSink | null = null;
+  private imageCaptureHook: ImageCaptureHook | null = null;
 
   // Per-host Cloudflare-challenge cooldown register. Defaults to the process-wide singleton (shared
   // with the lookup fan-out and /health/detailed); a test may inject a clock-controlled instance.
@@ -627,6 +630,60 @@ export class ScrapeQueue {
    */
   setCaptureSink(sink: CaptureSink | null): void {
     this.captureSink = sink;
+  }
+
+  /**
+   * Override the image capture hook (tests / DI). Defaults lazily to the process hook, which is
+   * itself inert unless PERSIST_RAW_IMAGES is on.
+   */
+  setImageCaptureHook(hook: ImageCaptureHook | null): void {
+    this.imageCaptureHook = hook;
+  }
+
+  /**
+   * Offer an extraction's records to the image capture lane.
+   *
+   * Called AFTER extraction succeeded and BESIDE the emit, never inside it, and deliberately NOT
+   * awaited: the item's fate is already decided, and making it wait on a CDN would let a slow image
+   * host throttle live ingest. The try/catch is for a hook that throws SYNCHRONOUSLY (a broken DI
+   * override, a bug in the composition root) — an image lane that cannot start must not be able to
+   * fail an item that scraped perfectly well.
+   *
+   * One request per record, because an extractMany store's editions each carry their own plates and
+   * each is its own item downstream. `pageUrl` is the page that was FETCHED — it is the base every
+   * relative image url resolves against, the Referer a hotlink guard checks, and the provenance
+   * stored beside the bytes.
+   */
+  private captureRecordImages(
+    records: PluginExtractedData[],
+    item: QueueItem,
+    ruleset: ExtractionRuleset,
+    searchFetch: SearchFetch | undefined,
+  ): void {
+    try {
+      const hook = this.imageCaptureHook ?? getImageCaptureHook();
+      for (const record of records) {
+        // The real hook resolves whatever happens; the catch is for an injected one that does not,
+        // because an unhandled rejection out here would take the process with it.
+        void hook
+          .capture({
+            site: record.source.site,
+            itemId: record.source.itemId,
+            pageUrl: item.url,
+            fields: record.fields,
+            ruleset,
+            searchFetch,
+            origin: 'ingest',
+          })
+          .catch(() => undefined);
+      }
+    } catch (error) {
+      console.warn(
+        `[SCRAPE QUEUE] image capture could not start for ${sanitizeForLog(item.url)}: ${sanitizeForLog(
+          error instanceof Error ? error.message : String(error),
+        )}`
+      );
+    }
   }
 
   /**
@@ -1437,6 +1494,10 @@ export class ScrapeQueue {
       }
       throw error instanceof Error ? error : new Error(String(error));
     }
+
+    // IMAGE CAPTURE (capture-only): the extraction succeeded, so the store's own plates are now
+    // nameable. Fire-and-forget, ahead of the emit it is independent of — see captureRecordImages.
+    this.captureRecordImages(records, item, ruleset, searchFetch);
 
     // D2: N sequential unary Ingest calls in array order, parent FIRST, each awaited — STOP at
     // the first failure. The ingest server commits a record before the call resolves, so an

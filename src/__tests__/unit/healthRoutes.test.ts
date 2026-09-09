@@ -8,6 +8,18 @@ import express from 'express';
 import request from 'supertest';
 import { createHealthRoutes, type HealthDeps } from '../../routes/health';
 import { CfCookieStore } from '../../services/cookieJar';
+import type { ImageCaptureStats } from '../../services/images/imageCaptureHook';
+
+const NO_IMAGE_CAPTURE: ImageCaptureStats = {
+  enabled: false,
+  reason: 'PERSIST_RAW_IMAGES is not true',
+  attempted: 0,
+  stored: 0,
+  deduped: 0,
+  skipped: { policyDeny: 0, memo: 0, thumbnailRole: 0, userRole: 0, cap: 0, residentialBudget: 0, notImage: 0, tooLarge: 0, refused: 0, unsupported: 0, inFlight: 0 },
+  failed: 0,
+  residentialBytesToday: 0,
+};
 
 const build = (over: Partial<HealthDeps> = {}) => {
   const app = express();
@@ -20,6 +32,7 @@ const build = (over: Partial<HealthDeps> = {}) => {
     getBrowserLane: () => ({ launchMode: 'headless', residentialTimezone: null, directTimezone: null, processTimezone: null, gatedBrowsers: [] }),
     getRawStore: () => ({ configured: false }),
     getFailureLedger: () => ({ enabled: false, reported: 0, failed: 0, suppressed: 0 }),
+    getImageCapture: () => NO_IMAGE_CAPTURE,
     getSessionCanary: () => ({ site: 'mfc', configured: false, stale: false }),
     ...over,
   }));
@@ -433,5 +446,51 @@ describe('createHealthRoutes — failureLedger', () => {
     expect(res.status).toBe(500);
     expect(res.body.status).toBe('degraded');
     expect(res.body.sessionCanary).toEqual({ site: 'mfc', configured: true, stale: true });
+  });
+});
+
+/**
+ * IMAGE CAPTURE counters. The lane is best-effort by design — it never fails an item — so its own
+ * counters are the ONLY way to tell a store that publishes no images from one whose every plate is
+ * being refused. The named skips carry that difference, and they have to survive the degraded
+ * response too, since a browser pool that is down is exactly when an operator goes looking.
+ */
+describe('createHealthRoutes — imageCapture', () => {
+  const busy: ImageCaptureStats = {
+    enabled: true,
+    attempted: 40,
+    stored: 31,
+    deduped: 4,
+    skipped: { policyDeny: 2, memo: 9, thumbnailRole: 12, userRole: 3, cap: 1, residentialBudget: 5, notImage: 2, tooLarge: 1, refused: 4, unsupported: 1, inFlight: 7 },
+    failed: 3,
+    residentialBytesToday: 12_345,
+  };
+
+  it('GET /health/detailed reports the capture counters and every named skip', async () => {
+    const res = await request(build({ getImageCapture: () => busy })).get('/health/detailed');
+
+    expect(res.status).toBe(200);
+    expect(res.body.imageCapture).toEqual(busy);
+  });
+
+  it('shows the lane OFF, and WHICH half of its configuration is missing', async () => {
+    const res = await request(build()).get('/health/detailed');
+
+    expect(res.body.imageCapture).toEqual(NO_IMAGE_CAPTURE);
+    // The half that is missing is the whole point: `enabled: false` next to a switch an operator
+    // can see is set to `true` is otherwise an hour of staring at a ConfigMap.
+    expect(res.body.imageCapture.reason).toBe('PERSIST_RAW_IMAGES is not true');
+  });
+
+  it('keeps the counters on the degraded (500) response too', async () => {
+    const app = build({
+      getBrowserPoolHealth: async () => { throw new Error('pool down'); },
+      getImageCapture: () => busy,
+    });
+
+    const res = await request(app).get('/health/detailed');
+
+    expect(res.status).toBe(500);
+    expect(res.body.imageCapture).toEqual(busy);
   });
 });

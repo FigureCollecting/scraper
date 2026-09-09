@@ -20,6 +20,7 @@
  * ExtractContext are later refinements.
  */
 import { buildProfileRegistry, type ProfileRegistry } from './profileRegistry.js';
+import { createRecordImageCapture } from '../services/images/assembleImageCapture.js';
 import { assembleScheduler } from './assembleScheduler.js';
 import { assembleCrawlWorker } from './assembleCrawlWorker.js';
 import { wrapFetchBodyWithLimiter } from './hostRateLimiter.js';
@@ -97,6 +98,16 @@ export function assembleCrawlDriver(services: CrawlDriverServices): CrawlDriver 
         retrievalFor: (h) => profiles.retrievalFor(h),
         emit: services.emit,
         ledger,
+        // IMAGE CAPTURE: the crawl leg's plates, under the same PERSIST_RAW_IMAGES switch the ingest
+        // queue rides. The store's own declared transport decides the lane for an image that sits on
+        // the store's own hosts; anything on a CDN is decided by the operator's policy table.
+        captureImages: createRecordImageCapture('crawler', url => {
+          try {
+            return profiles.searchTransportFor(new URL(url).hostname);
+          } catch {
+            return undefined;
+          }
+        }),
         // H1 seam 2: route a resolved ExtractContext's ctx.scraping.fetchBody (the ruleset's
         // in-slot same-host follow-up) through the SAME HostRateLimiter that paces primary
         // dispatches — otherwise the follow-up is invisible to it, and the NEXT primary dispatch

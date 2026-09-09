@@ -67,6 +67,20 @@ export interface ImageBytesFailure {
   detail?: string;
   /** {@link BLOCK_SIGNAL_HEADERS} the rejecting response carried — what separates a throttle from a verdict. */
   signals?: Record<string, string>;
+  /**
+   * Bytes that ACTUALLY crossed the wire before this failure was decided, when any did.
+   *
+   * A rejected body is not a free one. A hotlink interstitial, a challenge page, an oversized file
+   * and a redirect off the declaring store were all downloaded in full before anything here could
+   * tell; the residential byte budget bounds what a DOMESTIC LINE carries, and a line does not care
+   * whether the bytes turned out to be useful. Counting only successes would let a store whose every
+   * image is refused run all day against a counter reading zero.
+   *
+   * ABSENT — never zero-by-default — when the refusal was decided before the body was taken: a
+   * declared Content-Length over the cap, a non-2xx whose body these lanes never read, a request
+   * refused before the network. Nothing was spent, so nothing is claimed.
+   */
+  bytesRead?: number;
 }
 
 export type ImageBytesResult = ImageBytesOk | ImageBytesFailure;
@@ -113,9 +127,20 @@ export function overImageSizeCap(length: number | string | undefined | null, max
   return typeof n === 'number' && Number.isFinite(n) && n > maxBytes;
 }
 
-/** The typed refusal for a body past the cap; `length` is the declared or measured size. */
-export function imageTooLarge(length: number | string, maxBytes: number): ImageBytesFailure {
-  return { ok: false, reason: 'too-large', detail: `body of ${length} bytes exceeds the ${maxBytes}-byte image size cap` };
+/**
+ * The typed refusal for a body past the cap; `length` is the declared or measured size.
+ *
+ * `bytesRead` is supplied only by the MEASURED call site — a body caught on its declared length was
+ * refused before the read, and claiming it against the residential budget would charge a line for
+ * traffic it never carried.
+ */
+export function imageTooLarge(length: number | string, maxBytes: number, bytesRead?: number): ImageBytesFailure {
+  return {
+    ok: false,
+    reason: 'too-large',
+    detail: `body of ${length} bytes exceeds the ${maxBytes}-byte image size cap`,
+    ...(bytesRead !== undefined ? { bytesRead } : {}),
+  };
 }
 
 /** An image bytes transport: url + options in, a typed result out. */
@@ -200,8 +225,15 @@ export function classifyImageBytes(contentType: string | undefined | null, bytes
  * The refusal a lane returns when the bytes came from somewhere the decision did not allow — a
  * redirect into a denied host, or off the declaring store on a residential fetch.
  */
-export function refusedFinalUrl(finalUrl: string, why: string): ImageBytesFailure {
-  return { ok: false, reason: 'refused', detail: `the bytes came from ${finalUrl}, which ${why}` };
+export function refusedFinalUrl(finalUrl: string, why: string, bytesRead?: number): ImageBytesFailure {
+  // This refusal is always decided AFTER the body arrived — the final url is only known once the
+  // response is in hand — so the bytes are booked even though they are then thrown away.
+  return {
+    ok: false,
+    reason: 'refused',
+    detail: `the bytes came from ${finalUrl}, which ${why}`,
+    ...(bytesRead !== undefined ? { bytesRead } : {}),
+  };
 }
 
 /**

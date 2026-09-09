@@ -433,6 +433,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     if (c.sourceItem) md['source-item'] = headerSafe(`${c.sourceItem.site}/${c.sourceItem.itemId}`);
     if (c.sourceUrl) md['source-url'] = headerSafe(c.sourceUrl);
     if (c.position !== undefined) md.position = headerSafe(String(c.position));
+    if (c.role) md.role = headerSafe(c.role);
     if (c.contentType) md['declared-content-type'] = headerSafe(c.contentType);
     return budgetMetadata(md);
   }
