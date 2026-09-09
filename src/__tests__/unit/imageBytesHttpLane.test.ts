@@ -110,6 +110,24 @@ describe('createHttpBytesFetch', () => {
     expect(result).toMatchObject({ ok: false, reason: 'not-image', status: 200, contentType: 'text/html; charset=utf-8' });
   });
 
+  it('REFUSES a body over the size cap — by content-length before the read, and by length after it', async () => {
+    const declared = jest.fn(async (_url: string, _init: FakeInit) => response({ headers: { 'content-length': '999999' } }));
+    const result = await createHttpBytesFetch({ fetchImpl: declared as never, maxBytes: 1024 })('https://cdn.example.com/huge.png');
+    expect(result).toMatchObject({ ok: false, reason: 'too-large' });
+
+    // A CDN that streams without declaring a length is caught on the bytes it actually produced.
+    const undeclared = jest.fn(async (_url: string, _init: FakeInit) => response({ body: Buffer.alloc(4096, 0x41), contentType: 'image/png' }));
+    expect(await createHttpBytesFetch({ fetchImpl: undeclared as never, maxBytes: 1024 })('https://cdn.example.com/huge.png'))
+      .toMatchObject({ ok: false, reason: 'too-large' });
+  });
+
+  it('does not read a body whose declared length is over the cap', async () => {
+    const arrayBuffer = jest.fn(async () => new ArrayBuffer(8));
+    const fetchImpl = jest.fn(async (_url: string, _init: FakeInit) => ({ ...response({ headers: { 'content-length': '999999' } }), arrayBuffer }));
+    await createHttpBytesFetch({ fetchImpl: fetchImpl as never, maxBytes: 1024 })('https://cdn.example.com/huge.png');
+    expect(arrayBuffer).not.toHaveBeenCalled();
+  });
+
   it('reports an aborted/timed-out fetch as timeout rather than throwing', async () => {
     const timeout = Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' });
     const fetchImpl = jest.fn(async (_url: string, _init: FakeInit) => { throw timeout; });

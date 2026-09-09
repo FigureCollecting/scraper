@@ -24,9 +24,12 @@ import type { EgressKind } from '../gatedBrowsers.js';
 import {
   BLOCK_SIGNAL_HEADERS,
   CAPTURED_IMAGE_HEADERS,
+  DEFAULT_MAX_IMAGE_BYTES,
   IMAGE_ACCEPT,
   classifyImageBytes,
+  imageTooLarge,
   isTimeoutError,
+  overImageSizeCap,
   type ImageBytesResult,
   type ImageFetchOptions,
 } from './imageBytes.js';
@@ -71,6 +74,8 @@ export interface GatedTabBytesFetchOptions {
   proxyUrlFor?: (egress: EgressKind) => string | undefined;
   /** Navigation budget (default {@link GATED_IMAGE_NAV_TIMEOUT_MS}). */
   timeoutMs?: number;
+  /** Body ceiling (default {@link DEFAULT_MAX_IMAGE_BYTES}). */
+  maxBytes?: number;
 }
 
 /** An image fetch on the gated lane: the egress and STORE host it belongs to, plus the image URL. */
@@ -102,6 +107,7 @@ export function createGatedTabBytesFetch(
 ): GatedTabBytesFetcher {
   const proxyUrlFor = options.proxyUrlFor ?? ((egress: EgressKind) => (egress === 'residential' ? getResidentialProxyUrl() : undefined));
   const timeout = options.timeoutMs ?? GATED_IMAGE_NAV_TIMEOUT_MS;
+  const maxBytes = options.maxBytes ?? DEFAULT_MAX_IMAGE_BYTES;
 
   return async function fetchBytesViaGatedTab(egress, host, url, opts = {}): Promise<ImageBytesResult> {
     // EGRESS first, before the browser is touched: a residential image with no proxy is REFUSED, the
@@ -165,6 +171,10 @@ export function createGatedTabBytesFetch(
           return { ok: false, reason: 'unsupported', detail: 'the response body was no longer retrievable from the browser' };
         }
         const headers = headerSubset(response);
+        // SIZE: the renderer has already buffered the body, so this is the ceiling on what leaves
+        // the lane — an oversized document is dropped rather than handed on.
+        if (overImageSizeCap(headers['content-length'], maxBytes)) return imageTooLarge(headers['content-length'], maxBytes);
+        if (overImageSizeCap(bytes.byteLength, maxBytes)) return imageTooLarge(bytes.byteLength, maxBytes);
         const servedType = headers['content-type'];
         const classified = classifyImageBytes(servedType, bytes);
         if (!classified.image) {

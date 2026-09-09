@@ -120,6 +120,23 @@ describe('createImpitBytesFetch', () => {
       .toEqual({ ok: false, reason: 'http-status', status: 403, signals: { 'cf-mitigated': 'challenge' } });
   });
 
+  it('REFUSES a body over the size cap, on the declared length and on the bytes read', async () => {
+    const declared = {
+      status: 200,
+      headers: { 'content-type': 'image/png', 'content-length': '999999' },
+      text,
+      bytes: jest.fn(async () => new Uint8Array(PNG)),
+    };
+    const { impit: big } = fakeImpit(() => declared);
+    expect(await createImpitBytesFetch({ getImpit: async () => big, maxBytes: 1024 })('https://cdn.anitoysgk.com/huge.png'))
+      .toMatchObject({ ok: false, reason: 'too-large' });
+    expect(declared.bytes).not.toHaveBeenCalled();
+
+    const { impit: undeclared } = fakeImpit(() => impitResponse({ body: Buffer.alloc(4096, 0x41), contentType: 'image/png' }));
+    expect(await createImpitBytesFetch({ getImpit: async () => undeclared, maxBytes: 1024 })('https://cdn.anitoysgk.com/huge.png'))
+      .toMatchObject({ ok: false, reason: 'too-large' });
+  });
+
   it('reports an impit timeout as timeout, and rethrows a genuine fault', async () => {
     const timedOut = { fetch: async () => { throw new Error('operation timed out'); } } as unknown as ImpitLike;
     expect(await createImpitBytesFetch({ getImpit: async () => timedOut })('https://cdn.anitoysgk.com/a.png'))

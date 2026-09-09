@@ -24,6 +24,8 @@ export type ImageBytesFailureReason =
   | 'timeout'
   /** The lane cannot carry bytes at all (an impit build exposing only `text()`). */
   | 'unsupported'
+  /** The body is larger than the image size cap — refused before, or abandoned after, the read. */
+  | 'too-large'
   /** Refused before the network: a denied host, or residential egress on a lane that cannot proxy. */
   | 'refused';
 
@@ -79,6 +81,25 @@ export interface ImageFetchOptions {
   proxyUrl?: string;
   /** Per-request budget (ms); the lane clamps/defaults it. */
   timeoutMs?: number;
+}
+
+/**
+ * Ceiling on ONE image body. An image is a small object; a body far past this is a video, an archive
+ * or a CDN error streaming without terminating — none of which this lane should hold in memory,
+ * least of all several at once. The classification that would reject it only runs once the WHOLE
+ * body is resident, so the cap has to sit before that.
+ */
+export const DEFAULT_MAX_IMAGE_BYTES = 32 * 1024 * 1024;
+
+/** Whether a declared or measured length is past the cap. A missing/garbage length is not. */
+export function overImageSizeCap(length: number | string | undefined | null, maxBytes: number): boolean {
+  const n = typeof length === 'string' ? Number(length) : length;
+  return typeof n === 'number' && Number.isFinite(n) && n > maxBytes;
+}
+
+/** The typed refusal for a body past the cap; `length` is the declared or measured size. */
+export function imageTooLarge(length: number | string, maxBytes: number): ImageBytesFailure {
+  return { ok: false, reason: 'too-large', detail: `body of ${length} bytes exceeds the ${maxBytes}-byte image size cap` };
 }
 
 /** An image bytes transport: url + options in, a typed result out. */

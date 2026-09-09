@@ -1065,7 +1065,7 @@ The refusal is deliberate and load-bearing: **a residential store is never silen
 
 **Image bytes lanes (`IMAGE_HOST_POLICY_JSON` / `IMAGE_HOST_POLICY_FILE`):**
 
-Every transport described above returns a STRING — `res.text()`, impit's `.text()`, the rendered DOM. That is right for a document and destructive for an image: JPEG/PNG bytes decoded as utf-8 are gone. The image lanes are SIBLINGS of those transports, identical in egress rules and pacing, differing in that they hand back a `Buffer` and answer every expected outcome with a typed result (`{ ok: true, bytes, contentType, status, finalUrl, headers }`, or `{ ok: false, reason }` where reason is `http-status` | `not-image` | `timeout` | `unsupported` | `refused`). Nothing on the page path changes; nothing is stored yet (the ingest hook lands separately).
+Every transport described above returns a STRING — `res.text()`, impit's `.text()`, the rendered DOM. That is right for a document and destructive for an image: JPEG/PNG bytes decoded as utf-8 are gone. The image lanes are SIBLINGS of those transports, identical in egress rules and pacing, differing in that they hand back a `Buffer` and answer every expected outcome with a typed result (`{ ok: true, bytes, contentType, status, finalUrl, headers }`, or `{ ok: false, reason }` where reason is `http-status` | `not-image` | `timeout` | `too-large` | `unsupported` | `refused`). Nothing on the page path changes; nothing is stored yet (the ingest hook lands separately).
 
 | Lane | Used for | Residential egress |
 |---|---|---|

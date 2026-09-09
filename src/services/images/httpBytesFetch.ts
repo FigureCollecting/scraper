@@ -11,9 +11,12 @@ import { httpLaneResidentialRefusal } from '../residentialEgress.js';
 import {
   BLOCK_SIGNAL_HEADERS,
   CAPTURED_IMAGE_HEADERS,
+  DEFAULT_MAX_IMAGE_BYTES,
   IMAGE_ACCEPT,
   classifyImageBytes,
+  imageTooLarge,
   isTimeoutError,
+  overImageSizeCap,
   type ImageBytesFetcher,
   type ImageBytesResult,
 } from './imageBytes.js';
@@ -44,6 +47,8 @@ export interface HttpBytesFetchOptions {
   fetchImpl?: BytesFetchImpl;
   /** Abort ceiling for every request this fetcher makes (default {@link DEFAULT_IMAGE_FETCH_TIMEOUT_MS}). */
   timeoutMs?: number;
+  /** Body ceiling (default {@link DEFAULT_MAX_IMAGE_BYTES}). */
+  maxBytes?: number;
 }
 
 /** The named headers the response actually carried, lowercased. */
@@ -62,6 +67,7 @@ function headerSubset(res: BytesResponseLike, names: readonly string[] = CAPTURE
  */
 export function createHttpBytesFetch(options: HttpBytesFetchOptions = {}): ImageBytesFetcher {
   const timeoutMs = options.timeoutMs ?? DEFAULT_IMAGE_FETCH_TIMEOUT_MS;
+  const maxBytes = options.maxBytes ?? DEFAULT_MAX_IMAGE_BYTES;
   return async function httpBytesFetch(url, opts = {}): Promise<ImageBytesResult> {
     // EGRESS, before the network: this lane cannot proxy, so a residential image is refused here
     // rather than fetched from the node IP (the string lane's rule, same wording).
@@ -87,6 +93,10 @@ export function createHttpBytesFetch(options: HttpBytesFetchOptions = {}): Image
       const signals = headerSubset(res, BLOCK_SIGNAL_HEADERS);
       return { ok: false, reason: 'http-status', status: res.status, ...(Object.keys(signals).length > 0 ? { signals } : {}) };
     }
+    // SIZE, before the read where the server declared one: an oversized body must not be buffered
+    // just to be rejected afterwards.
+    const declaredLength = res.headers.get('content-length');
+    if (overImageSizeCap(declaredLength, maxBytes)) return imageTooLarge(declaredLength as string, maxBytes);
     let bytes: Buffer;
     try {
       bytes = Buffer.from(await res.arrayBuffer());
@@ -94,6 +104,8 @@ export function createHttpBytesFetch(options: HttpBytesFetchOptions = {}): Image
       if (isTimeoutError(err)) return { ok: false, reason: 'timeout', detail: (err as Error).message };
       throw err;
     }
+    // And again on what actually arrived — a CDN that declares no length is only caught here.
+    if (overImageSizeCap(bytes.byteLength, maxBytes)) return imageTooLarge(bytes.byteLength, maxBytes);
     const served = res.headers.get('content-type') ?? undefined;
     const classified = classifyImageBytes(served, bytes);
     if (!classified.image) {

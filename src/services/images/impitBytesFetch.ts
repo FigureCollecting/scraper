@@ -30,9 +30,12 @@ import {
 import {
   BLOCK_SIGNAL_HEADERS,
   CAPTURED_IMAGE_HEADERS,
+  DEFAULT_MAX_IMAGE_BYTES,
   IMAGE_ACCEPT,
   classifyImageBytes,
+  imageTooLarge,
   isTimeoutError,
+  overImageSizeCap,
   type ImageBytesFetcher,
   type ImageBytesResult,
 } from './imageBytes.js';
@@ -45,6 +48,8 @@ export interface ImpitBytesFetchOptions {
   getImpit?: ImpitProvider;
   /** Impersonation profile (default: the engine's current chrome profile). */
   browser?: string;
+  /** Body ceiling (default {@link DEFAULT_MAX_IMAGE_BYTES}). */
+  maxBytes?: number;
 }
 
 /**
@@ -103,6 +108,7 @@ async function readBytes(res: ImpitResponseLike): Promise<Buffer | undefined> {
 export function createImpitBytesFetch(options: ImpitBytesFetchOptions = {}): ImageBytesFetcher {
   const getImpit = options.getImpit ?? createImpitSessionProvider();
   const browser = options.browser ?? DEFAULT_PROFILE;
+  const maxBytes = options.maxBytes ?? DEFAULT_MAX_IMAGE_BYTES;
   return async function impitBytesFetch(url, opts = {}): Promise<ImageBytesResult> {
     const headers: Record<string, string> = {
       accept: opts.accept ?? IMAGE_ACCEPT,
@@ -121,7 +127,11 @@ export function createImpitBytesFetch(options: ImpitBytesFetchOptions = {}): Ima
         const signals = readHeaders(res, BLOCK_SIGNAL_HEADERS);
         return { ok: false, reason: 'http-status', status: res.status, ...(Object.keys(signals).length > 0 ? { signals } : {}) };
       }
+      // SIZE before the read where impit reports a length, and again on the bytes that arrived.
+      const declaredLength = readHeaders(res, ['content-length'])['content-length'];
+      if (overImageSizeCap(declaredLength, maxBytes)) return imageTooLarge(declaredLength, maxBytes);
       bytes = await readBytes(res);
+      if (bytes !== undefined && overImageSizeCap(bytes.byteLength, maxBytes)) return imageTooLarge(bytes.byteLength, maxBytes);
     } catch (err) {
       if (isTimeoutError(err)) return { ok: false, reason: 'timeout', detail: (err as Error).message };
       throw err;

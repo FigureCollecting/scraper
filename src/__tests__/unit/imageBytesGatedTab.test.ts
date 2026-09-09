@@ -161,6 +161,13 @@ describe('createGatedTabBytesFetch', () => {
       .toMatchObject({ ok: false, reason: 'unsupported' });
   });
 
+  it('REFUSES a document over the size cap', async () => {
+    const huge = { ...resp({ body: Buffer.alloc(4096, 0x41) }), headers: () => ({ 'content-type': 'image/png', 'content-length': '4096' }) };
+    const { page } = fakePage([huge]);
+    expect(await createGatedTabBytesFetch(laneFor(page).lane, { maxBytes: 1024 })('direct', 'anitoysgk.com', 'https://cdn.anitoysgk.com/huge.png'))
+      .toMatchObject({ ok: false, reason: 'too-large' });
+  });
+
   it('reports a navigation timeout as timeout, and rethrows a genuine browser fault', async () => {
     const timedOut = fakePage([], Object.assign(new Error('Navigation timeout of 20000 ms exceeded'), { name: 'TimeoutError' }));
     expect(await createGatedTabBytesFetch(laneFor(timedOut.page).lane)('direct', 'anitoysgk.com', 'https://cdn.anitoysgk.com/a.png'))
