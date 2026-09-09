@@ -238,7 +238,11 @@ export function chooseImageLane(
       detail: "the plain-HTTP lane cannot proxy — put this host on 'impit' or 'browser' to fetch it residentially",
     };
   }
-  const sendReferer = rule.referer ?? onStore;
+  // Referer DEFAULTS ON, on-store and off. Hotlink protection is a third-party-CDN mechanism, so
+  // defaulting it off exactly where it is needed produced a 403 on every image of a hotlink-guarded
+  // CDN — and, on a SHARED CDN, one store's 403s spend a budget every store draws from. A browser
+  // sends a referrer in both directions; the table turns it off for a CDN that dislikes it.
+  const sendReferer = rule.referer ?? true;
   return {
     ok: true,
     lane,

@@ -176,9 +176,9 @@ describe('chooseImageLane', () => {
       .toMatchObject({ ok: true, lane: 'browser', egress: 'direct' });
   });
 
-  it('DROPS the declared egress off-store, and takes the plain lane with no referer', () => {
+  it('DROPS the declared egress off-store, and takes the plain lane', () => {
     const decision = chooseImageLane(PAGE, 'https://cdn11.bigcommerce.com/s-x/images/1.jpg', { transport: 'browser', egress: 'residential' }, empty);
-    expect(decision).toEqual({ ok: true, lane: 'http', egress: 'direct', ua: 'default' });
+    expect(decision).toEqual({ ok: true, lane: 'http', egress: 'direct', referer: PAGE, ua: 'default' });
   });
 
   it('does not treat a look-alike host as the store (the dot in the suffix test is load-bearing)', () => {
@@ -233,6 +233,15 @@ describe('chooseImageLane', () => {
     expect(chooseImageLane(PAGE, 'not a url', { transport: 'http' }, empty)).toMatchObject({ ok: false, reason: 'denied' });
     expect(chooseImageLane('not a url', 'https://cdn.example.com/i/1.jpg', { transport: 'http' }, empty))
       .toMatchObject({ ok: true, lane: 'http', egress: 'direct' });
+  });
+
+  it('sends the declaring page as Referer by DEFAULT, off-store as well as on', () => {
+    // Hotlink protection is a THIRD-PARTY-CDN mechanism, so the off-store case is exactly the one
+    // that needs the header; a real browser sends a referrer for both.
+    expect(chooseImageLane(PAGE, 'https://cdn11.bigcommerce.com/s-x/images/1.jpg', { transport: 'http' }, empty))
+      .toMatchObject({ ok: true, lane: 'http', referer: PAGE });
+    expect(chooseImageLane(PAGE, 'https://cdn.anitoysgk.com/i/1.jpg', { transport: 'http' }, empty))
+      .toMatchObject({ ok: true, referer: PAGE });
   });
 
   it('honours an explicit referer:true off-store and referer:false on-store', () => {

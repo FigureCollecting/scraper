@@ -1083,7 +1083,7 @@ The table is `{ host: rule }`, matched by LONGEST host suffix (`cdn.example.com`
 |---|---|---|
 | `lane` | `http` \| `impit` \| `browser` | Force the lane, overriding what the store declared |
 | `egress` | `direct` \| `residential` | Force the egress, overriding the suffix rule in either direction |
-| `referer` | `true` \| `false` | Send the declaring page as `Referer` (hotlink-protected CDNs need it). Default: on-store `true`, off-store `false` |
+| `referer` | `true` \| `false` | Send the declaring page as `Referer` (hotlink-protected CDNs need it). Default: `true` — hotlink guards live on third-party CDNs, so defaulting it off there is the one place it hurts |
 | `ua` | `chrome` \| `default` | User-agent profile. Default: `chrome` on the impit/browser lanes, `default` on `http` |
 | `deny` | `true` | Never fetch this host |
 
