@@ -14,11 +14,14 @@
  *      declared egress DROPPED (`withoutDeclaredEgress`) and takes the plain lane. The residential
  *      exit is a home line: it is never spent on a host that did not declare it.
  *
- * Two pairings are REFUSED outright rather than resolved: the plain lane with residential egress
- * (Node's fetch cannot proxy, so it has no transport), and residential egress on a host that is not
- * the declaring store's (the exit is scoped to that store, so the bytes would be fetched and then
- * thrown away). Neither is silently downgraded — a downgrade answers a misconfiguration with a
- * different symptom somewhere else.
+ * Three pairings are REFUSED outright rather than resolved: the plain lane with residential egress
+ * (Node's fetch cannot proxy, so it has no transport), residential egress on a host that is not the
+ * declaring store's (the exit is scoped to that store, so the bytes would be fetched and then thrown
+ * away), and the browser lane with `ua: 'default'` (a tab always carries the browser's own identity,
+ * so "claim no browser" has no way onto that wire). None is silently downgraded — a downgrade
+ * answers a misconfiguration with a different symptom somewhere else. The checks are ORDERED —
+ * `http-lane-residential`, then `browser-lane-default-ua`, then `off-store-residential` — so a row
+ * contradictory more than one way surfaces ONE reason per deploy, the next only once that is fixed.
  *
  * Above both sits the DENY list, which nothing overrides. otakumode.com is permanently banned — not
  * crawled, not fetched, not emitted — so the ban is answered BEFORE the table is consulted at all,
@@ -43,15 +46,20 @@ export interface ImageHostRule {
   referer?: boolean;
   /**
    * Which identity the fetch claims. `chrome` sends the lanes' Chrome string; `default` sends NO
-   * browser claim and lets the transport's own identity stand (undici's `node`, impit's
-   * impersonation profile). `default` is the row an operator writes for a host with an INVERTED
-   * gate — hobby-genki.com answers 200 to a request claiming no browser and 403
-   * cf-mitigated:challenge to one claiming Chrome, on any Chrome version — so no lane may quietly
-   * put a browser string back (see `resolveImageUserAgent`).
+   * browser claim and lets the transport's own identity stand (undici's `node`; on `impit` the
+   * impersonation profile's UA — or, for a host with hand-minted cookies, the mint UA those cookies
+   * are bound to, which that lane always sends). `default` is the row an operator writes for a
+   * host with an INVERTED gate — hobby-genki.com answers 200 to a request claiming no browser and
+   * 403 cf-mitigated:challenge to one claiming Chrome, on any Chrome version — so no lane may
+   * quietly put a browser string back (see `resolveImageUserAgent`).
    *
-   * On `lane: 'browser'` the token cannot deliver that: the transport IS a browser and its UA is a
-   * Chrome string whichever value is written here. A host that needs `default` needs `http` or
-   * `impit`.
+   * On `lane: 'browser'` the token cannot be delivered — the transport IS a browser and its UA is a
+   * Chrome string whichever value is written here — so the pairing is REFUSED rather than resolved
+   * to Chrome: the loader warns on a row that writes it, and `chooseImageLane` refuses every image
+   * that would ride it (`browser-lane-default-ua`), including when the browser lane is inherited
+   * from the store rather than written. A host that needs `default` needs `http` or `impit`.
+   * Every browser-lane row therefore resolves to `chrome`, and that string is pinned onto the tab
+   * over its own UA rules — see `resolveImageUserAgent` for what that costs.
    */
   ua?: 'chrome' | 'default';
   /**
@@ -173,6 +181,22 @@ function validateRule(host: string, raw: unknown, warn: (message: string) => voi
       warn(`[IMAGE-POLICY] host ${sanitizeForLog(host)} has a non-boolean 'deny' — reading it as deny:true.`);
     } else warn(`[IMAGE-POLICY] ignoring unknown or invalid field '${sanitizeForLog(field)}' on host ${sanitizeForLog(host)}.`);
   }
+  // A CROSS-FIELD refusal, after the fields themselves: `ua: 'default'` asks the lane to claim no
+  // browser, and a browser tab cannot — its user agent is the browser's own, always a Chrome string,
+  // whatever the row says. Resolving the row to Chrome would invert the one decision the operator
+  // made, so it is named here, where the operator reads the boot warnings, and refused at the
+  // decision (`browser-lane-default-ua`). The row is KEPT, not dropped: an unregistered host falls
+  // through to whatever rule sits above it and is fetched under an identity the operator never
+  // wrote — the "different symptom somewhere else" this table refuses to answer with. Only a row
+  // that WRITES the browser lane can be caught here; one that inherits it is the decision's. A row
+  // that also carries `deny` is not named: the decision answers `denied` before it resolves a lane,
+  // so blaming the pairing would send the operator to fix a refusal that is the deny they wrote.
+  if (rule.lane === 'browser' && rule.ua === 'default' && !rule.deny) {
+    warn(
+      `[IMAGE-POLICY] host ${sanitizeForLog(host)} pairs lane:'browser' with ua:'default' — a browser tab always carries ` +
+        "the browser's identity, so its images are refused (browser-lane-default-ua); put the host on 'http' or 'impit' to send no browser claim.",
+    );
+  }
   return rule;
 }
 
@@ -240,7 +264,7 @@ export function loadImageHostPolicy(
 /** The lane an image is fetched on, or the typed reason it is not fetched at all. */
 export type ImageLaneDecision =
   | { ok: true; lane: ImageLane; egress: ImageEgress; referer?: string; ua: 'chrome' | 'default'; accept?: string }
-  | { ok: false; reason: 'denied' | 'http-lane-residential' | 'off-store-residential'; detail?: string };
+  | { ok: false; reason: 'denied' | 'http-lane-residential' | 'off-store-residential' | 'browser-lane-default-ua'; detail?: string };
 
 /** The store's declared transport under the image lanes' names; undeclared ⇒ browser (ingest default). */
 function laneOfTransport(transport: SearchFetch['transport'] | undefined): ImageLane {
@@ -282,6 +306,28 @@ export function chooseImageLane(
       ok: false,
       reason: 'http-lane-residential',
       detail: "the plain-HTTP lane cannot proxy — put this host on 'impit' or 'browser' to fetch it residentially",
+    };
+  }
+  // `ua: 'default'` is "claim no browser", and a browser TAB cannot deliver it: its user agent is
+  // the browser's own Chrome string whatever the row says, and rewriting it contradicts the client
+  // hints the same browser sends. Before this refusal the pairing did NOT resolve to Chrome: it
+  // reached the gated tab with no request UA, so the tab's own rules stood (clean-headful: the real
+  // Chrome's UA; headless: the host's mint UA, else the engine default). It is refused anyway so
+  // the token means ONE thing on every lane — and the cost is named: browser + `default` was the
+  // only row that meant "pin no image UA on this tab", and the lane's remaining value, `chrome`,
+  // pins `IMAGE_CHROME_UA` over those rules (`resolveUserAgent` lets a request UA win). A token for
+  // "inherit the tab's" is its own unit. Typed, like the two pairings around it: the loader already
+  // named a row that WRITES the browser lane; this also catches the row that names no lane and
+  // INHERITS the browser one from the store's declaration, which no table can know.
+  if (lane === 'browser' && rule.ua === 'default') {
+    return {
+      ok: false,
+      reason: 'browser-lane-default-ua',
+      detail:
+        (rule.lane === 'browser'
+          ? `${sanitizeForLog(imageHost)} is on the browser lane with ua:'default'`
+          : `${sanitizeForLog(imageHost)} inherits the declaring store's browser lane with ua:'default'`) +
+        " — a browser tab always carries the browser's identity; put this host on 'http' or 'impit' to send no browser claim",
     };
   }
   // RESIDENTIAL OFF-STORE is self-defeating, and the engine says so rather than trying it.

@@ -187,11 +187,23 @@ export const IMAGE_CHROME_UA =
  * version — including the engine's own page-lane UA. The token exists to keep that claim off the
  * wire, so a lane that adds one back has inverted the only decision the operator made.
  *
- * That contract binds the HTTP and IMPIT lanes, which is where `default` can be delivered. The gated
- * tab cannot honour it and does not pretend to: a browser tab carries the browser's identity, always
- * a Chrome string, and `gatedTabBytesFetch` resolving one through the page lane's own rules is the
- * transport being consistent with itself, not a lane substituting an identity. A host that needs
- * `default` needs `http` or `impit` — see `ImageHostRule.ua`.
+ * That contract is the lanes' whole story, because `default` only ever reaches the two that can
+ * honour it: the http lane sends no user agent; the impit lane sends whatever it already sends —
+ * its impersonation profile's UA or, on a host with hand-minted cookies, the mint UA those cookies
+ * are bound to, which `impitBytesFetch` puts on the wire LAST whatever this resolves to. The
+ * browser lane cannot — a tab carries the browser's own identity, always a Chrome string, and
+ * rewriting it contradicts the client hints the same browser sends — so `chooseImageLane` never
+ * emits `default` for it: the pairing is a typed refusal (`browser-lane-default-ua`), and the
+ * table loader names a row that writes it at boot.
+ *
+ * Plainly, then: the browser lane ALWAYS pins `IMAGE_CHROME_UA`. With `default` refused its only
+ * value is `chrome`, the hook puts this string on the plan, and the gated tab's `resolveUserAgent`
+ * lets a request UA win over both the host's mint UA and clean-headful's deliberate no-pin — a
+ * Chrome 152 tab is told to announce Chrome 142 beside its own client hints. That is a pin, not
+ * the tab being itself; and browser + `default` was the one row that reached the tab with NO
+ * request UA, so refusing it removed the only way to say "pin nothing on this tab". A token that
+ * means "inherit the tab's" (or no pin on this lane) is its own unit — `default` is refused
+ * because it is undeliverable, not because the tab is left alone today. See `ImageHostRule.ua`.
  */
 export function resolveImageUserAgent(ua: 'chrome' | 'default' | undefined): string | undefined {
   return ua === 'chrome' ? IMAGE_CHROME_UA : undefined;
