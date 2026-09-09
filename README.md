@@ -322,15 +322,19 @@ copy, free to diverge from the plugin.
 {
   "siteId": "examplestore",
   "seedLists": [
-    { "id": "new-arrivals", "cadence": "daily", "note": "front shelf" },
-    { "id": "staff-picks", "cadence": "weekly" }
+    { "id": "new-arrivals", "url": "https://example.test/new", "cadence": "daily", "note": "front shelf" },
+    { "id": "staff-picks", "url": "https://example.test/picks", "cadence": "weekly" }
   ],
   "count": 2
 }
 ```
-Deliberately WITHOUT the urls: discovery NAMES the lists, the seed axis is what fetches one.
+The url is reported so a poller can see when TWO declared ids resolve to the SAME page — an authoring
+slip that would otherwise cost a store one wholly redundant fetch per pass, on the axis whose whole
+point is a cost knowable in advance. Fetching a list is still this axis's job, never the caller's.
 Malformed entries in an untrusted declaration (no id, no url, a cadence outside the contract's two,
-a repeated id) are dropped rather than reported as lists that would never yield anything.
+a repeated id) are dropped rather than reported as lists that would never yield anything. Two entries
+sharing one url are BOTH reported here: collapsing them is the caller's call, since dropping one
+engine-side would make that id unaddressable.
 
 **Errors:** `400` `seeds` other than `1`, or combined with another axis ·
 `422 { error: "unsupported", siteId, reason }` (unknown store, or it declares no seed lists) ·
@@ -608,6 +612,7 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
 | `CRAWLER_MAX_ENQUEUE_PER_STORE` | `50` | Max ingest POSTs per store per run; `0` = discovery-only dry run |
 | `CRAWLER_STORE_ENQUEUE_CAPS` | *(none)* | csv of `siteId:cap` overriding the global cap for those stores (`anitoys:15,mfc:30`); an explicit `0` pulls the store out of the run. A malformed entry is ignored with a WARN naming it; the rest still apply |
 | `CRAWLER_MAX_CONCURRENCY` | `2` | Global max in-flight requests across all stores |
+| `CRAWLER_SEED_SPACING_MS` | `10000` | `seed` mode: min wait between ONE store's consecutive seed fetches (independent of the global spacing); `0` disables |
 | `CRAWLER_REQUEST_SPACING_MS` | `1000` | Minimum spacing between consecutive dispatches |
 | `CRAWLER_REQUEST_TIMEOUT_MS` | `45000` | Per-request abort timeout (keep above the engine's `CATALOG_STORE_TIMEOUT_MS`) |
 | `CRAWLER_REOBSERVE_AFTER_MS` | `604800000` (7d) | Recent only: re-POST a known item once its entry is this old; `0` = never |
@@ -731,17 +736,45 @@ only phase that runs in this mode.
 - **Same machinery** — the same durable ledger for dedup (a shelf shows the same items for weeks;
   the ledger is what stops the poll from re-POSTing them), the same per-store enqueue cap, the same
   global `CRAWLER_MAX_REQUESTS`, and the same request gate for `CRAWLER_REQUEST_SPACING_MS` and
-  concurrency. The engine applies the store's own declared rate floor on its side of each fetch, as
-  it does for the listing axis.
+  concurrency.
+- **The engine applies NO per-host floor on this lane** — and none on the listing lane either. A
+  store's declared `rateLimit` (`baseDelayMs` and friends) governs the INGEST/record queue's
+  dispatch, not a `/catalog` or `/lookup` fetch: those ride the plain body-returning transports with
+  a timeout and the challenge cooldown, and nothing else. The crawler's own knobs are therefore the
+  ONLY pacing the seed axis has, which is why it carries a floor of its own.
+- **Per-store seed floor** — `CRAWLER_SEED_SPACING_MS` (default `10000`) is the minimum wait between
+  one store's consecutive seed fetches, applied by the crawler and INDEPENDENT of the global
+  `CRAWLER_REQUEST_SPACING_MS` (which spaces every dispatch across every store and axis). It is not
+  applied before a store's first list, there being nothing yet to space from. `0` disables it. This
+  is the operational floor for the axis: set it to what polling that store looks defensible at, and
+  remember that the store's declared cadence is `weekly` or `daily`, never per-run.
 - **Never re-observes** — a known id is skipped however old its ledger entry is, whatever
   `CRAWLER_REOBSERVE_AFTER_MS` says. Re-observation belongs to the recent phase; here it would turn a
   bounded poll into a periodic re-collection of a whole shelf.
-- **One list once** — a list id repeated in a declaration is polled once. The ledger is saved after
+- **One list once** — a list id repeated in a declaration is polled once, and so is a repeated URL:
+  two ids resolving to the same page cost ONE fetch, the losing ids are credited on the polled list's
+  stats as `alsoDeclaredAs`, and the authoring slip is WARNed by siteId. The ledger is saved after
   EVERY list, so a pass killed between two lists never re-POSTs what the first one enqueued.
+- **Cap-aware** — once the store's enqueue ceiling is spent, the remaining lists are NOT fetched
+  (`seedStopped: "cap"`). On an axis justified by a knowable cost, a fetch guaranteed to enqueue
+  nothing is exactly the request not to make.
 - **Stop on the first refusal** — a challenge, a cooldown or any 4xx on a list STOPS that store for
   the run and the remaining lists are left alone; `seedStopped` on the store summary says why
-  (`cooldown`, `unsupported`, `failed`, `budget`). Pushing on to the next list after a challenge is
-  precisely what burns the egress IP's reputation for every other store sharing it.
+  (`cooldown`, `unsupported`, `failed`, `budget`, `cap`). Pushing on to the next list after a
+  challenge is precisely what burns the egress IP's reputation for every other store sharing it. The
+  reason is the REAL one: a `/ingest/scrape` 5xx or a thrown POST reports `failed`, and only a
+  genuinely spent `CRAWLER_MAX_REQUESTS` reports `budget`.
+- **KNOWN LIMIT: the seed lane is status-blind.** Like the listing lane, it rides the
+  string-returning search transports, so the engine sees a body and never an HTTP status or a
+  post-redirect final url. A store answering `404`, a page-cap `400` or a transient `5xx` with a body
+  the ruleset parses to zero items is therefore indistinguishable here from a list that genuinely has
+  nothing new — it reports as a clean, empty poll. (Cloudflare challenge bodies ARE detected and do
+  stop the store; that check is on the body, not the status.) The record/ingest lane no longer has
+  this blind spot, but giving it to the catalog lane would mean widening the injected `fetchSearch`
+  seam to carry `{status, finalUrl}` on all three transports — a change to the shared lookup/catalog
+  wiring, not to this axis — so it is recorded here rather than worked around. On a WEEKLY or DAILY
+  cadence a silently empty list is a silence worth checking for by hand: watch `seedLists[].discovered`
+  going to zero for a list that used to yield.
 - **Reporting** — `seedLists` on the store summary carries `{ listId, discovered, known, enqueued }`
   per list, in the order they were polled: the numbers an operator reads to decide whether a list
   still earns its cadence. It is empty in every other mode.
