@@ -103,7 +103,12 @@ export interface ImageFetchOptions {
   referer?: string;
   /** Overrides the lane's Accept (the policy table's per-host `accept`, or a caller's own). */
   accept?: string;
-  /** Overrides the lane's default user agent. */
+  /**
+   * The user agent to send. ABSENT means the transport's own — undici's `node`, impit's
+   * impersonation profile, the browser's real UA — which is what the policy table's
+   * `ua: 'default'` resolves to. No lane may read this absence as a licence to send a browser
+   * string of its own; see {@link resolveImageUserAgent}.
+   */
   userAgent?: string;
   /** Residential egress for this fetch. The plain-HTTP lane REFUSES it (it cannot proxy). */
   proxyUrl?: string;
@@ -168,8 +173,17 @@ export const IMAGE_CHROME_UA =
 
 /**
  * The image host policy's `ua` token resolved to an actual user agent: `chrome` is the lanes' Chrome
- * string, `default` means "whatever the lane already sends" and so overrides nothing. This is what
- * turns `chooseImageLane`'s `ua` from a documented symbol into a header the CDN actually sees.
+ * string; `default` is a DELIBERATE REFUSAL to claim a browser, and resolves to nothing to override
+ * with. This is what turns `chooseImageLane`'s `ua` from a documented symbol into a header the CDN
+ * actually sees.
+ *
+ * The `undefined` this returns for `default` is a CONTRACT ON THE LANES, not an absence of opinion:
+ * a lane must send the transport's OWN identity (undici's `node`, impit's impersonation profile, the
+ * browser's real UA) and must never substitute a browser string of its own. Reading it as "so send
+ * Chrome" is what broke every hobby-genki image capture in 2026-09; that host's CDN answers 200 to a
+ * request that claims no browser and 403 cf-mitigated to one that claims Chrome, on ANY Chrome
+ * version — including the engine's own page-lane UA. The token exists to keep that claim off the
+ * wire, so a lane that adds one back has inverted the only decision the operator made.
  */
 export function resolveImageUserAgent(ua: 'chrome' | 'default' | undefined): string | undefined {
   return ua === 'chrome' ? IMAGE_CHROME_UA : undefined;

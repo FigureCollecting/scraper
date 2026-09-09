@@ -7,7 +7,7 @@
  * a silently corrupted JPEG is far worse than a refusal.
  */
 import { createImpitBytesFetch, createImpitSessionProvider } from '../../services/images/impitBytesFetch';
-import { ARCHIVAL_IMAGE_ACCEPT } from '../../services/images/imageBytes';
+import { ARCHIVAL_IMAGE_ACCEPT, resolveImageUserAgent } from '../../services/images/imageBytes';
 import type { CookieJarLike, ImpitLike } from '../../services/impitFetch';
 
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);
@@ -230,6 +230,33 @@ describe('createImpitBytesFetch', () => {
     const headers = fetch.mock.calls[0][1].headers as Record<string, string>;
     expect(headers.referer).toBeUndefined();
     expect(headers['user-agent']).toBeUndefined();
+  });
+
+  /**
+   * The sibling of the http lane's 2026-09-09 defect, pinned so it cannot appear here. The policy
+   * table's ua:'default' reaches every lane as an ABSENT user agent, and no lane may answer that by
+   * inventing a browser string: this one leaves the header off entirely and lets impit send the UA
+   * belonging to the impersonation profile its TLS handshake actually used. That is the one identity
+   * consistent with this transport — a `node` UA over a Chrome TLS fingerprint is the very
+   * claim/fingerprint mismatch that gets a request challenged — and the store's PINNED mint UA still
+   * beats both, because a cf_clearance is bound to the UA that earned it.
+   */
+  it('adds NO user agent of its own for the policy table\'s ua:default, pinned or not', async () => {
+    const bare = { cookiesFor: jest.fn(() => undefined), userAgentFor: jest.fn(() => undefined) };
+    const { impit, fetch } = fakeImpit(() => impitResponse());
+    const userAgent = resolveImageUserAgent('default');
+    await createImpitBytesFetch({ getImpit: async () => impit, cookieStore: bare })('https://cdn.anitoysgk.com/a.png', {
+      ...(userAgent !== undefined ? { userAgent } : {}),
+    });
+    expect((fetch.mock.calls[0][1].headers as Record<string, string>)['user-agent']).toBeUndefined();
+
+    // ...and where the host HAS a hand-minted clearance, that UA wins, exactly as before.
+    const pinned = { cookiesFor: jest.fn(() => undefined), userAgentFor: jest.fn(() => 'MintUA/1') };
+    const second = fakeImpit(() => impitResponse());
+    await createImpitBytesFetch({ getImpit: async () => second.impit, cookieStore: pinned })('https://cdn.anitoysgk.com/a.png', {
+      ...(userAgent !== undefined ? { userAgent } : {}),
+    });
+    expect((second.fetch.mock.calls[0][1].headers as Record<string, string>)['user-agent']).toBe('MintUA/1');
   });
 
   it('accepts a bare impit response that reports no status, headers or url (sniffing the body)', async () => {

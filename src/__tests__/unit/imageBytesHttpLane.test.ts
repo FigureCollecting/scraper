@@ -16,6 +16,7 @@ import {
   resolveImageUserAgent,
 } from '../../services/images/imageBytes';
 import { DEFAULT_PROFILE } from '../../services/impitFetch';
+import { buildImageHostPolicy, chooseImageLane, type ImageHostRule } from '../../services/images/imageHostPolicy';
 
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13]);
 
@@ -62,7 +63,7 @@ describe('createHttpBytesFetch', () => {
     expect(result.bytes.equals(PNG)).toBe(true);
   });
 
-  it('sends the ARCHIVAL Accept, a desktop UA, and the referer ONLY when one is given', async () => {
+  it('sends the ARCHIVAL Accept, NO user agent of its own, and the referer ONLY when one is given', async () => {
     const fetchImpl = jest.fn(async (_url: string, _init: FakeInit) => response());
     const fetchBytes = createHttpBytesFetch({ fetchImpl: fetchImpl as never });
 
@@ -70,7 +71,10 @@ describe('createHttpBytesFetch', () => {
     // The point of the whole header: NO preference is expressed, so a Polish/Shopify/BigCommerce
     // host has nothing to negotiate on and serves the format it actually stores.
     expect(fetchImpl.mock.calls[0][1].headers.accept).toBe('*/*');
-    expect(fetchImpl.mock.calls[0][1].headers['user-agent']).toMatch(/Mozilla/);
+    // The UA is the CALLER's to choose. This lane inventing a Chrome string when none was given is
+    // what made the policy table's ua:'default' unreachable; unset, undici sends its own `node`,
+    // which is the identity the connection's TLS fingerprint actually belongs to.
+    expect(fetchImpl.mock.calls[0][1].headers['user-agent']).toBeUndefined();
     expect(fetchImpl.mock.calls[0][1].headers.referer).toBeUndefined();
 
     await fetchBytes('https://cdn.example.com/a.png', { referer: 'https://store.example/p/1', userAgent: 'UA/1' });
@@ -112,7 +116,11 @@ describe('createHttpBytesFetch', () => {
     const major = /(\d+)/.exec(DEFAULT_PROFILE)?.[1];
     expect(IMAGE_CHROME_UA).toContain(`Chrome/${major}.`);
     const fetchImpl = jest.fn(async (_url: string, _init: FakeInit) => response());
-    await createHttpBytesFetch({ fetchImpl: fetchImpl as never })('https://cdn.example.com/a.png');
+    // Driven through the policy token rather than the lane default: a Chrome UA now reaches the wire
+    // because a host was CONFIGURED for one (ua:'chrome'), never because the lane assumed it.
+    await createHttpBytesFetch({ fetchImpl: fetchImpl as never })('https://cdn.example.com/a.png', {
+      userAgent: resolveImageUserAgent('chrome'),
+    });
     expect(fetchImpl.mock.calls[0][1].headers['user-agent']).toBe(IMAGE_CHROME_UA);
   });
 
@@ -263,9 +271,64 @@ describe('createHttpBytesFetch', () => {
 describe('resolveImageUserAgent', () => {
   it('maps the policy table\'s ua token to a real user agent', () => {
     expect(resolveImageUserAgent('chrome')).toBe(IMAGE_CHROME_UA);
-    // 'default' means "whatever the lane sends", so it resolves to nothing to override with.
+    // 'default' is a refusal to claim a browser, so it resolves to nothing to override with — and
+    // the lanes are then obliged to send the transport's own identity rather than one of their own.
     expect(resolveImageUserAgent('default')).toBeUndefined();
     expect(resolveImageUserAgent(undefined)).toBeUndefined();
+  });
+});
+
+/**
+ * The POLICY-to-WIRE seam — where the 2026-09-09 hobby-genki defect actually lived. Neither side was
+ * wrong on its own: `chooseImageLane` resolved the operator's ua:'default', `resolveImageUserAgent`
+ * turned that into `undefined` meaning "override nothing", and the LANE then read that `undefined` as
+ * "so send Chrome". An operator row written precisely to keep a browser identity OFF the wire put one
+ * there, and every hobby-genki image 403'd (28 ledger rows).
+ *
+ * hobby-genki.com has an INVERTED UA gate. Measured 2026-09-09 from the home line against
+ * https://hobby-genki.com/101923-large_default/julia-original-character-by-gogoko-16-scale-figure.jpg:
+ *   no user-agent header  -> 200, image/jpeg, 27 653 bytes
+ *   Chrome/152            -> 403, text/html, 5 972 bytes, cf-mitigated: challenge
+ *   Chrome/127            -> 403, text/html, 5 972 bytes, cf-mitigated: challenge
+ * The second Chrome is the engine's OWN page-lane UA, so "reuse the page lane's default" is not a fix
+ * either: what the gate refuses is a browser CLAIM over a non-browser TLS fingerprint. 'default' has
+ * to reach the wire as something that is not a browser.
+ */
+describe('the image host policy ua token, on the wire', () => {
+  /** The caller's own composition (imageCaptureHook), so this covers the SEAM, not one side of it. */
+  const sendViaPolicy = async (pageUrl: string, imageUrl: string, rule: ImageHostRule, host: string) => {
+    const decision = chooseImageLane(pageUrl, imageUrl, { transport: 'browser' }, buildImageHostPolicy({ [host]: rule }));
+    if (!decision.ok) throw new Error(`the lane was refused: ${decision.reason}`);
+    const userAgent = resolveImageUserAgent(decision.ua);
+    const fetchImpl = jest.fn(async (_url: string, _init: FakeInit) => response());
+    await createHttpBytesFetch({ fetchImpl: fetchImpl as never })(imageUrl, {
+      ...(userAgent !== undefined ? { userAgent } : {}),
+    });
+    return fetchImpl.mock.calls[0][1].headers;
+  };
+
+  it('sends NO browser identity for ua:default — hobby-genki 403s a Chrome UA and 200s without one', async () => {
+    const headers = await sendViaPolicy(
+      'https://hobby-genki.com/en/101923-julia.html',
+      'https://hobby-genki.com/101923-large_default/julia.jpg',
+      { lane: 'http', egress: 'direct', referer: false, ua: 'default' },
+      'hobby-genki.com',
+    );
+    // Asserted on the identity that REACHES the CDN, not on the header's presence: an absent header
+    // is undici's own `node`, which is equally a non-browser default and equally passes the gate.
+    const onTheWire = headers['user-agent'] ?? 'node';
+    expect(onTheWire).not.toBe(IMAGE_CHROME_UA);
+    expect(onTheWire).not.toMatch(/Mozilla|Chrome/);
+  });
+
+  it('still sends IMAGE_CHROME_UA for ua:chrome — the hpoi row that was PROVEN to need it', async () => {
+    const headers = await sendViaPolicy(
+      'https://www.hpoi.net/hobby/101923',
+      'https://rfx.hpoi.net/hobby/101923/cover.jpg',
+      { lane: 'http', egress: 'direct', referer: true, ua: 'chrome' },
+      'rfx.hpoi.net',
+    );
+    expect(headers['user-agent']).toBe(IMAGE_CHROME_UA);
   });
 });
 
