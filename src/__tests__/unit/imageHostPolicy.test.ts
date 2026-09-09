@@ -188,16 +188,52 @@ describe('chooseImageLane', () => {
 
   it('lets the POLICY override the suffix rule in both directions', () => {
     const policy = buildImageHostPolicy({
-      // An off-store CDN the operator has decided must ride the store's residential exit.
-      'cdn11.bigcommerce.com': { lane: 'impit', egress: 'residential', referer: true },
+      // An off-store CDN the operator has pinned to the impersonating lane.
+      'cdn11.bigcommerce.com': { lane: 'impit', referer: true },
       // An on-store CDN that must NOT inherit the store's browser lane.
       'cdn.anitoysgk.com': { lane: 'http', egress: 'direct', referer: false, ua: 'default' },
+      // An on-store CDN the operator has put ON the residential exit, overriding a direct store.
+      'img.anitoysgk.com': { lane: 'impit', egress: 'residential' },
     });
 
     expect(chooseImageLane(PAGE, 'https://cdn11.bigcommerce.com/s-x/images/1.jpg', { transport: 'http' }, policy))
-      .toEqual({ ok: true, lane: 'impit', egress: 'residential', referer: PAGE, ua: 'chrome' });
+      .toEqual({ ok: true, lane: 'impit', egress: 'direct', referer: PAGE, ua: 'chrome' });
     expect(chooseImageLane(PAGE, 'https://cdn.anitoysgk.com/i/1.jpg', { transport: 'browser', egress: 'residential' }, policy))
       .toEqual({ ok: true, lane: 'http', egress: 'direct', ua: 'default' });
+    expect(chooseImageLane(PAGE, 'https://img.anitoysgk.com/i/1.jpg', { transport: 'http' }, policy))
+      .toEqual({ ok: true, lane: 'impit', egress: 'residential', referer: PAGE, ua: 'chrome' });
+  });
+
+  /**
+   * A policy row putting an OFF-STORE host on the residential exit cannot work, and the reason is
+   * two rules meeting: the exit is scoped to the declaring store's own hosts, so the final-url guard
+   * re-asserts `isDeclaringStoreUrl` on whatever the bytes came from and rejects them. The fetch
+   * would leave through the home line, download the body, and then be thrown away — every cost of
+   * the residential exit paid, nothing kept.
+   *
+   * So the pairing is refused at the DECISION, before the line is touched. Silently downgrading it
+   * to direct would be worse than useless: the operator wrote that row because they believed the
+   * host needed the residential exit, and a quiet direct fetch would answer them with a 403 they
+   * then have to explain. The refusal names what is wrong instead.
+   */
+  it('refuses a policy row putting an OFF-STORE host on the residential exit', () => {
+    const policy = buildImageHostPolicy({ 'cdn11.bigcommerce.com': { lane: 'impit', egress: 'residential' } });
+    const decision = chooseImageLane(PAGE, 'https://cdn11.bigcommerce.com/s-x/images/1.jpg', { transport: 'http' }, policy);
+
+    expect(decision).toMatchObject({ ok: false, reason: 'off-store-residential' });
+    expect(!decision.ok && decision.detail).toMatch(/anitoysgk\.com/);
+  });
+
+  it('allows the same row on the browser lane too — the refusal is about the EGRESS, not the lane', () => {
+    const policy = buildImageHostPolicy({ 'cdn11.bigcommerce.com': { lane: 'browser', egress: 'residential' } });
+    expect(chooseImageLane(PAGE, 'https://cdn11.bigcommerce.com/s-x/images/1.jpg', { transport: 'http' }, policy))
+      .toMatchObject({ ok: false, reason: 'off-store-residential' });
+  });
+
+  it('still allows an ON-STORE host on the residential exit, which is what the exit is for', () => {
+    const policy = buildImageHostPolicy({ 'anitoysgk.com': { lane: 'impit', egress: 'residential' } });
+    expect(chooseImageLane(PAGE, 'https://www.anitoysgk.com/i/1.jpg', { transport: 'http' }, policy))
+      .toMatchObject({ ok: true, egress: 'residential' });
   });
 
   it('DENIES a banned host no matter what the store declared', () => {

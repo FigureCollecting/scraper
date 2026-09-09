@@ -177,12 +177,31 @@ describe('the image capture hook', () => {
       expect(h.hook.stats().skipped.policyDeny).toBe(1);
     });
 
+    it('SAYS SO when a policy row is self-defeating, rather than skipping it quietly', async () => {
+      // A deny-list hit is the table working and needs no log. These two are the operator's table
+      // contradicting itself, and they are invisible in the counters alone — both land on policyDeny.
+      const h = harness({ policy: { 'cdn.test': { lane: 'impit', egress: 'residential' } } });
+      await capture(h, rulesetDescribing([gallery('https://cdn.test/a.jpg', 0), gallery('https://cdn.test/b.jpg', 1)]));
+
+      expect(h.calls).toHaveLength(0);
+      expect(h.hook.stats().skipped.policyDeny).toBe(2);
+      expect(h.warnings).toHaveLength(1);
+      expect(h.warnings[0]).toMatch(/off-store-residential/);
+    });
+
+    it('stays quiet for a deny-list hit, which is the table doing its job', async () => {
+      const h = harness({ policy: { 'cdn.test': { deny: true } } });
+      await capture(h, rulesetDescribing([gallery('https://cdn.test/a.jpg')]));
+      expect(h.warnings).toHaveLength(0);
+    });
+
     it('counts a lane the policy cannot serve as a refusal, not a failure', async () => {
       // Plain HTTP cannot proxy, so http + residential has no transport at all.
-      const h = harness({ policy: { 'cdn.test': { lane: 'http', egress: 'residential' } } });
-      await capture(h, rulesetDescribing([gallery('https://cdn.test/a.jpg')]));
+      const h = harness({ policy: { 'store.test': { lane: 'http', egress: 'residential' } } });
+      await capture(h, rulesetDescribing([gallery('https://store.test/img/a.jpg')]));
       expect(h.calls).toHaveLength(0);
       expect(h.hook.stats()).toMatchObject({ failed: 0, skipped: expect.objectContaining({ policyDeny: 1 }) });
+      expect(h.warnings[0]).toMatch(/http-lane-residential/);
     });
   });
 
@@ -206,8 +225,10 @@ describe('the image capture hook', () => {
     });
 
     it('refuses bytes that carried a residential fetch off the declaring store', async () => {
-      const guard = await allowFinalUrl({ policy: { 'cdn.test': { lane: 'impit', egress: 'residential' } } });
-      expect(guard('https://store.test/img/a.jpg')).toBe(true);
+      const h = harness({ policy: { 'store.test': { lane: 'impit', egress: 'residential' } } });
+      await capture(h, rulesetDescribing([gallery('https://store.test/img/a.jpg')]));
+      const guard = h.calls[0].plan.allowFinalUrl as (finalUrl: string) => boolean;
+      expect(guard('https://store.test/img/redirected.jpg')).toBe(true);
       expect(guard('https://elsewhere.test/img/a.jpg')).toBe(false);
     });
   });
@@ -239,35 +260,37 @@ describe('the image capture hook', () => {
   });
 
   describe('the residential budget', () => {
-    const residential = { 'cdn.test': { lane: 'impit' as const, egress: 'residential' as const } };
+    // ON-STORE, because that is the only host the residential exit may carry: the exit is scoped to
+    // the declaring store, and a policy row pointing it at an off-store CDN is refused outright.
+    const residential = { 'store.test': { lane: 'impit' as const, egress: 'residential' as const } };
 
     it('spends the home line and books what it spent', async () => {
       const h = harness({ policy: residential });
-      await capture(h, rulesetDescribing([gallery('https://cdn.test/a.jpg')]));
+      await capture(h, rulesetDescribing([gallery('https://store.test/img/a.jpg')]));
       expect(h.calls[0].plan).toMatchObject({ egress: 'residential', proxyUrl: 'http://proxy.test:1080' });
       expect(h.hook.stats().residentialBytesToday).toBe(PNG.length);
     });
 
     it('stops fetching residentially once the day is spent, without failing the item', async () => {
       const h = harness({ policy: residential, residentialBytesPerDay: PNG.length, fetch: async (url: string) => okBytes(Buffer.from(url), url) });
-      await capture(h, rulesetDescribing([gallery('https://cdn.test/a.jpg', 0), gallery('https://cdn.test/b.jpg', 1)]));
+      await capture(h, rulesetDescribing([gallery('https://store.test/img/a.jpg', 0), gallery('https://store.test/img/b.jpg', 1)]));
       expect(h.calls).toHaveLength(1);
       expect(h.hook.stats()).toMatchObject({ failed: 0, skipped: expect.objectContaining({ residentialBudget: 1 }) });
     });
 
     it('gates only the residential lane — a DIRECT image is untouched by the ceiling', async () => {
-      const h = harness({ policy: { 'cdn.test': { lane: 'impit', egress: 'residential' }, 'other.test': {} }, residentialBytesPerDay: 0 });
-      await capture(h, rulesetDescribing([gallery('https://cdn.test/a.jpg', 0), gallery('https://other.test/b.jpg', 1)]));
+      const h = harness({ policy: { 'store.test': { lane: 'impit', egress: 'residential' }, 'other.test': {} }, residentialBytesPerDay: 0 });
+      await capture(h, rulesetDescribing([gallery('https://store.test/img/a.jpg', 0), gallery('https://other.test/b.jpg', 1)]));
       expect(h.calls.map(c => c.url)).toEqual(['https://other.test/b.jpg']);
     });
 
     it('spends again once the rolling day has rolled', async () => {
       const h = harness({ policy: residential, residentialBytesPerDay: PNG.length, fetch: async (url: string) => okBytes(Buffer.from(url), url) });
-      await capture(h, rulesetDescribing([gallery('https://cdn.test/a.jpg')]));
+      await capture(h, rulesetDescribing([gallery('https://store.test/img/a.jpg')]));
       h.clock.now += 25 * 3_600_000;
-      await capture(h, rulesetDescribing([gallery('https://cdn.test/b.jpg')]));
+      await capture(h, rulesetDescribing([gallery('https://store.test/img/b.jpg')]));
       expect(h.calls).toHaveLength(2);
-      expect(h.hook.stats().residentialBytesToday).toBe(Buffer.from('https://cdn.test/b.jpg').length);
+      expect(h.hook.stats().residentialBytesToday).toBe(Buffer.from('https://store.test/img/b.jpg').length);
     });
 
     it('books bytes that were read and then REFUSED — the line carried them either way', async () => {
@@ -277,7 +300,7 @@ describe('the image capture hook', () => {
         policy: residential,
         fetch: async () => ({ ok: false, reason: 'refused', detail: 'the bytes came from elsewhere', bytesRead: 4096 }),
       });
-      await capture(h, rulesetDescribing([gallery('https://cdn.test/a.jpg')]));
+      await capture(h, rulesetDescribing([gallery('https://store.test/img/a.jpg')]));
       expect(h.hook.stats().residentialBytesToday).toBe(4096);
     });
 
@@ -286,19 +309,19 @@ describe('the image capture hook', () => {
         policy: residential,
         fetch: async () => ({ ok: false, reason: 'not-image', status: 200, contentType: 'text/html', bytesRead: 900 }),
       });
-      await capture(h, rulesetDescribing([gallery('https://cdn.test/a.jpg')]));
+      await capture(h, rulesetDescribing([gallery('https://store.test/img/a.jpg')]));
       expect(h.hook.stats().residentialBytesToday).toBe(900);
     });
 
     it('books nothing for a failure that never read a body', async () => {
       const h = harness({ policy: residential, fetch: async () => ({ ok: false, reason: 'http-status', status: 404 }) });
-      await capture(h, rulesetDescribing([gallery('https://cdn.test/a.jpg')]));
+      await capture(h, rulesetDescribing([gallery('https://store.test/img/a.jpg')]));
       expect(h.hook.stats().residentialBytesToday).toBe(0);
     });
 
     it('never books a DIRECT fetch against the home line', async () => {
       const h = harness({ fetch: async () => ({ ok: false, reason: 'not-image', status: 200, bytesRead: 900 }) });
-      await capture(h, rulesetDescribing([gallery('https://cdn.test/a.jpg')]));
+      await capture(h, rulesetDescribing([gallery('https://store.test/img/a.jpg')]));
       expect(h.hook.stats().residentialBytesToday).toBe(0);
     });
 
@@ -308,7 +331,7 @@ describe('the image capture hook', () => {
         residentialBytesPerDay: 1000,
         fetch: async (url: string) => ({ ok: false, reason: 'not-image', status: 200, bytesRead: url.endsWith('a.jpg') ? 1000 : 10 }),
       });
-      await capture(h, rulesetDescribing([gallery('https://cdn.test/a.jpg', 0), gallery('https://cdn.test/b.jpg', 1)]));
+      await capture(h, rulesetDescribing([gallery('https://store.test/img/a.jpg', 0), gallery('https://store.test/img/b.jpg', 1)]));
       expect(h.calls).toHaveLength(1);
       expect(h.hook.stats().skipped.residentialBudget).toBe(1);
     });
@@ -325,7 +348,7 @@ describe('the image capture hook', () => {
         proxyUrlFor: () => undefined,
         now: () => h.clock.now,
       });
-      await noProxy.capture({ site: 'examplestore', itemId: 'lucy-1', pageUrl: PAGE, fields: {}, ruleset: rulesetDescribing([gallery('https://cdn.test/a.jpg')]), origin: 'ingest' });
+      await noProxy.capture({ site: 'examplestore', itemId: 'lucy-1', pageUrl: PAGE, fields: {}, ruleset: rulesetDescribing([gallery('https://store.test/img/a.jpg')]), origin: 'ingest' });
       expect(h.calls).toHaveLength(0);
       expect(noProxy.stats().skipped.policyDeny).toBe(1);
     });
