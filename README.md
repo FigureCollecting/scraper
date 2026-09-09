@@ -1036,10 +1036,10 @@ See `.env.example` for complete configuration template.
 
 - `IMAGE_HOST_POLICY_JSON`: Inline `{ host: rule }` table saying how each IMAGE host is fetched — see **Image bytes lanes** below
   - Unset/blank (default): the built-in table, which is the permaban alone
-  - Unparseable or not an object → ignored with ONE warning; the default table stands
-- `IMAGE_HOST_POLICY_FILE`: Path to a file holding that same table (consulted only when `IMAGE_HOST_POLICY_JSON` is unset)
+  - Unparseable or not an object → ONE warning, and `IMAGE_HOST_POLICY_FILE` is consulted instead (a malformed inline edit never stands in for the file an operator also mounted)
+- `IMAGE_HOST_POLICY_FILE`: Path to a file holding that same table (consulted when `IMAGE_HOST_POLICY_JSON` is unset **or unusable**)
   - Unreadable → ignored with ONE warning; the default table stands
-  - Example: `/etc/fc/image-host-policy.json` (a ConfigMap mounted as a directory, so an edit changes the file's mtime)
+  - Example: `/etc/fc/image-host-policy.json`. The table is read ONCE, when the policy is loaded — unlike the cf-cookie store there is no mtime poll, so **an edit needs a pod restart**
 
 **Residential egress (`RESIDENTIAL_PROXY_URL`):**
 
@@ -1069,9 +1069,9 @@ Every transport described above returns a STRING — `res.text()`, impit's `.tex
 
 | Lane | Used for | Residential egress |
 |---|---|---|
-| `http` | The default for a third-party CDN. Plain GET, image `Accept`, abort-bounded | **Refused** — same rule and same wording as the string lane: Node's fetch cannot proxy |
-| `impit` | A CDN behind a TLS-fingerprint gate, and every residential image that is not on the browser lane | Supported (`proxyUrl` on the session; one session per profile+proxy) |
-| `browser` | A CDN behind the same Cloudflare gate as its store: a TAB of that store's gated browser, navigated at the image, read with the page lane's own document-only main-frame guard | Supported (the gated browser for that egress) |
+| `http` | The default for a third-party CDN. Plain GET, image `Accept`, abort-bounded | **Refused** — same rule and same wording as the string lane: Node's fetch cannot proxy. Refused on the DECLARED egress too, so a residential fetch whose proxy never resolved does not degrade into a direct one |
+| `impit` | A CDN behind a TLS-fingerprint gate, and every residential image that is not on the browser lane. Seeds the host's stored cf cookies and lets the pinned mint UA win, as the string lane does | Supported (`proxyUrl` on the session; one session per profile+proxy). A fetch declared residential with no proxy is REFUSED |
+| `browser` | A CDN behind the same Cloudflare gate as its store: a TAB of that store's gated browser, navigated at the image, read with the page lane's own document-only main-frame guard **and its challenge wait** (`domcontentloaded` fires on the interstitial, and leaving then cancels the challenge script). The gate itself comes from the store's declared `access: 'cloudflare'`, so an ungated store's images ride the ordinary ephemeral context | Supported (the gated browser for that egress) |
 
 On the `impit` lane the body is read through a feature-detected binary capability (`bytes()`, else `arrayBuffer()`). An impit build exposing only `text()` returns `unsupported` and the body is left unread — a silently corrupted image is worse than a visible refusal.
 
@@ -1084,7 +1084,7 @@ The table is `{ host: rule }`, matched by LONGEST host suffix (`cdn.example.com`
 | `lane` | `http` \| `impit` \| `browser` | Force the lane, overriding what the store declared |
 | `egress` | `direct` \| `residential` | Force the egress, overriding the suffix rule in either direction |
 | `referer` | `true` \| `false` | Send the declaring page as `Referer` (hotlink-protected CDNs need it). Default: `true` — hotlink guards live on third-party CDNs, so defaulting it off there is the one place it hurts |
-| `ua` | `chrome` \| `default` | User-agent profile. Default: `chrome` on the impit/browser lanes, `default` on `http` |
+| `ua` | `chrome` \| `default` | User-agent profile, resolved to a header by `resolveImageUserAgent` (`chrome` = the desktop Chrome string, whose major tracks the engine's impersonation profile; `default` = whatever the lane already sends). Default: `chrome` on the impit/browser lanes, `default` on `http` |
 | `deny` | `true` | Never fetch this host |
 
 ```json
@@ -1095,9 +1095,11 @@ The table is `{ host: rule }`, matched by LONGEST host suffix (`cdn.example.com`
 }
 ```
 
-An unknown or wrongly-typed field is dropped with a warning and the rest of the rule stands; an unusable table leaves the default in place. **otakumode.com and every host under it are permanently DENIED**, and that is answered before the table is consulted at all — no entry can re-enable it, not even one naming a subdomain (which would otherwise win the longest-suffix match).
+An unknown or wrongly-typed field is dropped with a warning and the rest of the rule stands — with two exceptions, both of which fail CLOSED: an entry that is not an object at all is SKIPPED entirely (so it cannot mask the valid parent rule its subtree would otherwise inherit), and a `deny` that is present but not a boolean reads as `deny: true`. Host keys are canonicalized, including the root-anchored trailing dot: `otakumode.com.` is the same host as `otakumode.com` and is denied identically. A URL whose scheme is not `http(s)` is refused outright. **otakumode.com and every host under it are permanently DENIED**, and that is answered before the table is consulted at all — no entry can re-enable it, not even one naming a subdomain (which would otherwise win the longest-suffix match).
 
-**Pacing** is keyed on the IMAGE host, not the store's: a shared CDN (`cdn.shopify.com`, `cdn11.bigcommerce.com`) serves many of these stores, so it gets ONE budget that every store draws from, on the same `HostRateLimiter` the driver uses. A `403`/`429`/`503` from a CDN backs that host off.
+**Pacing** is keyed on the IMAGE host, not the store's: a shared CDN (`cdn.shopify.com`, `cdn11.bigcommerce.com`) serves many of these stores, so it gets ONE budget that every store draws from, on the same `HostRateLimiter` the driver uses. The wait and the dispatch record are serialized per host, so N concurrent images off one PDP are spread across N budgets rather than arriving in one burst. What backs a host off is what actually signals a throttle: `429`/`503`, a timeout, and a 2xx body that is not an image (the shape of a managed challenge). A bare `403` does NOT — it is normally a per-URL hotlink or signed-URL verdict, and booking it on a shared CDN would spend every other store's budget on one store's misconfiguration; a `403` carrying `cf-mitigated` or `retry-after` does. A host with an open **challenge cooldown** is not fetched at all.
+
+Every lane refuses a body past a size cap (32 MB), re-checks the deny list against the URL the bytes actually came from (all three follow redirects), and rejects `image/svg+xml` — an `image/*` type whose body is active content. The gated browser lane holds at most one image tab per store host, so a burst of images can never take both of that store's page-lane tab slots; curry it through `asImageBytesFetcher` to pace it like the other two.
 
 **The browser lane (launch profile, timezone, gated browsers):**
 
