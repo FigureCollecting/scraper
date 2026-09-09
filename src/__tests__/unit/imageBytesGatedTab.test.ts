@@ -141,6 +141,16 @@ describe('createGatedTabBytesFetch', () => {
       .toMatchObject({ ok: false, reason: 'not-image', status: 200, contentType: 'text/html' });
   });
 
+  it('carries the mitigation SIGNALS a non-2xx document sent', async () => {
+    const blocked = {
+      ...resp({ status: 503 }),
+      headers: () => ({ 'content-type': 'text/html', 'retry-after': '30' }),
+    };
+    const { page } = fakePage([blocked]);
+    expect(await createGatedTabBytesFetch(laneFor(page).lane)('direct', 'anitoysgk.com', 'https://cdn.anitoysgk.com/a.png'))
+      .toEqual({ ok: false, reason: 'http-status', status: 503, signals: { 'retry-after': '30' } });
+  });
+
   it('reports a navigation that yields no document, or whose body is gone, as unsupported', async () => {
     const nothing = fakePage([]);
     expect(await createGatedTabBytesFetch(laneFor(nothing.page).lane)('direct', 'anitoysgk.com', 'https://cdn.anitoysgk.com/a.png'))

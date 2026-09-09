@@ -93,6 +93,17 @@ describe('createHttpBytesFetch', () => {
     expect(arrayBuffer).not.toHaveBeenCalled();
   });
 
+  it('carries the Cloudflare mitigation / retry-after SIGNALS a non-2xx response sent', async () => {
+    const withSignal = jest.fn(async (_url: string, _init: FakeInit) => response({ status: 403, headers: { 'cf-mitigated': 'challenge', 'retry-after': '120' } }));
+    expect(await createHttpBytesFetch({ fetchImpl: withSignal as never })('https://cdn.example.com/a.png'))
+      .toEqual({ ok: false, reason: 'http-status', status: 403, signals: { 'cf-mitigated': 'challenge', 'retry-after': '120' } });
+
+    // A bare 403 carries none — the pacing wrapper reads that as a per-URL verdict, not a throttle.
+    const bare = jest.fn(async (_url: string, _init: FakeInit) => response({ status: 403 }));
+    expect(await createHttpBytesFetch({ fetchImpl: bare as never })('https://cdn.example.com/a.png'))
+      .toEqual({ ok: false, reason: 'http-status', status: 403 });
+  });
+
   it('reports an HTML body served at an image URL as not-image (a hotlink block page is not an image)', async () => {
     const fetchImpl = jest.fn(async (_url: string, _init: FakeInit) => response({ contentType: 'text/html; charset=utf-8', body: Buffer.from('<html>denied</html>') }));
     const result = await createHttpBytesFetch({ fetchImpl: fetchImpl as never })('https://cdn.example.com/a.png');
@@ -163,6 +174,13 @@ describe('classifyImageBytes', () => {
     const avif = Buffer.concat([Buffer.from([0, 0, 0, 0x20]), Buffer.from('ftypavif')]);
     expect(classifyImageBytes(null, avif)).toEqual({ image: true, contentType: 'image/avif' });
     expect(classifyImageBytes(undefined, Buffer.from('BM\u0000\u0000'))).toEqual({ image: true, contentType: 'image/bmp' });
+  });
+
+  it('REFUSES image/svg+xml — an image content type whose body is active content', () => {
+    const svg = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>');
+    expect(classifyImageBytes('image/svg+xml', svg).image).toBe(false);
+    expect(classifyImageBytes('image/svg+xml; charset=utf-8', svg).image).toBe(false);
+    expect(classifyImageBytes('image/svg', svg).image).toBe(false);
   });
 
   it('rejects a non-image type, and an untyped body whose bytes are not an image', () => {

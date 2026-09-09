@@ -106,16 +106,35 @@ describe('paceImageBytesByHost', () => {
     expect(limiter.currentDelay('cdn.shopify.com')).toBe(1000);
   });
 
-  it('treats a 403 as a block too, and leaves the budget alone for a plain 404', async () => {
-    const blockedLimiter = new HostRateLimiter(() => config, config);
+  /** Runs one outcome through a fresh limiter and reports the host's delay afterwards. */
+  const delayAfter = async (result: ImageBytesResult): Promise<number> => {
     let clock = 0;
-    const sleep = async (ms: number) => { clock += ms; };
-    await paceImageBytesByHost(async () => ({ ok: false, reason: 'http-status', status: 403 }), blockedLimiter, { now: () => clock, sleep })('https://cdn.shopify.com/i/1.png');
-    expect(blockedLimiter.currentDelay('cdn.shopify.com')).toBe(2000);
+    const limiter = new HostRateLimiter(() => config, config);
+    const paced = paceImageBytesByHost(async () => result, limiter, { now: () => clock, sleep: async (ms: number) => { clock += ms; } });
+    await paced('https://cdn.shopify.com/i/1.png');
+    return limiter.currentDelay('cdn.shopify.com');
+  };
 
-    const missingLimiter = new HostRateLimiter(() => config, config);
-    await paceImageBytesByHost(async () => ({ ok: false, reason: 'http-status', status: 404 }), missingLimiter, { now: () => clock, sleep })('https://cdn.shopify.com/i/1.png');
-    expect(missingLimiter.currentDelay('cdn.shopify.com')).toBe(1000);
+  it('leaves the budget alone for a plain 404 and for a BARE 403 (a per-URL hotlink verdict)', async () => {
+    expect(await delayAfter({ ok: false, reason: 'http-status', status: 404 })).toBe(1000);
+    // A hotlink guard or an expired signed URL answers 403 for THAT url and would answer it for
+    // every image of that store. Backing a SHARED CDN off on it spends every other store's budget.
+    expect(await delayAfter({ ok: false, reason: 'http-status', status: 403 })).toBe(1000);
+  });
+
+  it('backs off on 429/503, and on a 403 that carries a Cloudflare mitigation signal', async () => {
+    expect(await delayAfter({ ok: false, reason: 'http-status', status: 429 })).toBe(2000);
+    expect(await delayAfter({ ok: false, reason: 'http-status', status: 503 })).toBe(2000);
+    expect(await delayAfter({ ok: false, reason: 'http-status', status: 403, signals: { 'cf-mitigated': 'challenge' } })).toBe(2000);
+    expect(await delayAfter({ ok: false, reason: 'http-status', status: 403, signals: { 'retry-after': '120' } })).toBe(2000);
+  });
+
+  it('backs off on a 2xx interstitial served at an image URL, and on a timeout', async () => {
+    // A managed challenge frequently answers 200 with an HTML body — the one case the backoff is for.
+    expect(await delayAfter({ ok: false, reason: 'not-image', status: 200, contentType: 'text/html' })).toBe(2000);
+    expect(await delayAfter({ ok: false, reason: 'timeout' })).toBe(2000);
+    // A refusal never reached the host, so it says nothing about the host's rate.
+    expect(await delayAfter({ ok: false, reason: 'refused', detail: 'no proxy' })).toBe(1000);
   });
 
   it('SERIALIZES concurrent fetches on one host — N images are spread over N budgets, not one burst', async () => {

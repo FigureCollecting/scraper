@@ -28,6 +28,7 @@ import {
   type MakeImpit,
 } from '../impitFetch.js';
 import {
+  BLOCK_SIGNAL_HEADERS,
   CAPTURED_IMAGE_HEADERS,
   IMAGE_ACCEPT,
   classifyImageBytes,
@@ -68,14 +69,14 @@ export function createImpitSessionProvider(makeImpit: MakeImpit = defaultMakeImp
   };
 }
 
-/** A response's headers as a lowercased record, whether impit hands back a `Headers` or a record. */
-function readHeaders(res: ImpitResponseLike): Record<string, string> {
+/** The named headers as a lowercased record, whether impit hands back a `Headers` or a record. */
+function readHeaders(res: ImpitResponseLike, names: readonly string[] = CAPTURED_IMAGE_HEADERS): Record<string, string> {
   const bag = res.headers;
   const out: Record<string, string> = {};
   if (bag == null) return out;
   const getter = (bag as { get?: unknown }).get;
   if (typeof getter === 'function') {
-    for (const name of CAPTURED_IMAGE_HEADERS) {
+    for (const name of names) {
       const value = (bag as { get(name: string): unknown }).get(name);
       if (typeof value === 'string' && value !== '') out[name] = value;
     }
@@ -83,9 +84,7 @@ function readHeaders(res: ImpitResponseLike): Record<string, string> {
   }
   for (const [name, value] of Object.entries(bag as Record<string, unknown>)) {
     const key = name.toLowerCase();
-    if ((CAPTURED_IMAGE_HEADERS as readonly string[]).includes(key) && typeof value === 'string' && value !== '') {
-      out[key] = value;
-    }
+    if (names.includes(key) && typeof value === 'string' && value !== '') out[key] = value;
   }
   return out;
 }
@@ -119,7 +118,8 @@ export function createImpitBytesFetch(options: ImpitBytesFetchOptions = {}): Ima
       // are not images. An impit build that reports no status is treated as 2xx (the pre-status
       // behavior) rather than being failed on a value it never had.
       if (typeof res.status === 'number' && (res.status < 200 || res.status > 299)) {
-        return { ok: false, reason: 'http-status', status: res.status };
+        const signals = readHeaders(res, BLOCK_SIGNAL_HEADERS);
+        return { ok: false, reason: 'http-status', status: res.status, ...(Object.keys(signals).length > 0 ? { signals } : {}) };
       }
       bytes = await readBytes(res);
     } catch (err) {

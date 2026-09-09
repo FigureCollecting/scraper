@@ -22,6 +22,7 @@ import { ChallengeLaneUnavailableError } from '../browserChallenge.js';
 import { ResidentialEgressUnavailableError, getResidentialProxyUrl } from '../residentialEgress.js';
 import type { EgressKind } from '../gatedBrowsers.js';
 import {
+  BLOCK_SIGNAL_HEADERS,
   CAPTURED_IMAGE_HEADERS,
   IMAGE_ACCEPT,
   classifyImageBytes,
@@ -80,15 +81,13 @@ export type GatedTabBytesFetcher = (
   options?: ImageFetchOptions,
 ) => Promise<ImageBytesResult>;
 
-/** The {@link CAPTURED_IMAGE_HEADERS} a response carried, lowercased. */
-function headerSubset(response: ImageResponseLike): Record<string, string> {
+/** The named headers a response carried, lowercased. */
+function headerSubset(response: ImageResponseLike, names: readonly string[] = CAPTURED_IMAGE_HEADERS): Record<string, string> {
   const headers = response.headers() ?? {};
   const out: Record<string, string> = {};
   for (const [name, value] of Object.entries(headers)) {
     const key = name.toLowerCase();
-    if ((CAPTURED_IMAGE_HEADERS as readonly string[]).includes(key) && typeof value === 'string' && value !== '') {
-      out[key] = value;
-    }
+    if (names.includes(key) && typeof value === 'string' && value !== '') out[key] = value;
   }
   return out;
 }
@@ -155,7 +154,10 @@ export function createGatedTabBytesFetch(
           return { ok: false, reason: 'unsupported', detail: 'the navigation produced no main-frame document response' };
         }
         const status = response.status();
-        if (status < 200 || status > 299) return { ok: false, reason: 'http-status', status };
+        if (status < 200 || status > 299) {
+          const signals = headerSubset(response, BLOCK_SIGNAL_HEADERS);
+          return { ok: false, reason: 'http-status', status, ...(Object.keys(signals).length > 0 ? { signals } : {}) };
+        }
         // The event-time buffer first; the served response is the fallback for a navigation whose
         // listener never got to read it.
         const bytes = (await buffered) ?? (await response.buffer().catch(() => undefined));

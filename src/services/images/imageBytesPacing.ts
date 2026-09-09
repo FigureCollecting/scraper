@@ -15,8 +15,29 @@
 import type { HostRateLimiter } from '../../driver/hostRateLimiter.js';
 import type { ImageBytesFailure, ImageBytesFetcher, ImageFetchOptions, ImageBytesResult } from './imageBytes.js';
 
-/** Statuses that mean "you are going too fast / you are blocked" rather than "no such image". */
-const BLOCKED_STATUSES = new Set([403, 429, 503]);
+/** Statuses that mean "you are going too fast" on their own, with no further evidence needed. */
+const RATE_LIMITED_STATUSES = new Set([429, 503]);
+
+/**
+ * Whether an outcome says something about the HOST's rate rather than about this one URL.
+ *
+ * 429/503 always do. A 403 usually does NOT — it is a hotlink guard, an expired signed URL or a
+ * referrer policy answer, a per-URL verdict that will repeat for every image of that store; booking
+ * it on a SHARED CDN drives one budget every store draws from to the ceiling over one store's
+ * misconfiguration. So a 403 counts only when the response carried a genuine mitigation/throttle
+ * signal ({@link BLOCK_SIGNAL_HEADERS}).
+ *
+ * Two non-status outcomes DO count, and used to book nothing: a 2xx body that is not an image is the
+ * documented shape of a managed challenge or an interstitial (Cloudflare frequently answers 200),
+ * and a timeout is the classic overload signal.
+ */
+function saysHostIsThrottling(failure: ImageBytesFailure): boolean {
+  if (failure.reason === 'timeout') return true;
+  if (failure.reason === 'not-image') return failure.status !== undefined && failure.status >= 200 && failure.status <= 299;
+  if (failure.reason !== 'http-status' || failure.status === undefined) return false;
+  if (RATE_LIMITED_STATUSES.has(failure.status)) return true;
+  return failure.status === 403 && Object.keys(failure.signals ?? {}).length > 0;
+}
 
 /** Injectable clock and sleeper — tests drive pacing deterministically, with no real timers. */
 export interface ImageBytesPacingDeps {
@@ -84,9 +105,7 @@ export function paceImageBytesByHost(
     // config, where a boolean discriminant does not narrow a union.
     const failure = result.ok ? undefined : (result as ImageBytesFailure);
     if (!failure) limiter.recordSuccess(host);
-    else if (failure.reason === 'http-status' && failure.status !== undefined && BLOCKED_STATUSES.has(failure.status)) {
-      limiter.recordRateLimited(host);
-    }
+    else if (saysHostIsThrottling(failure)) limiter.recordRateLimited(host);
     return result;
   };
 }

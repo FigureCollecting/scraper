@@ -9,6 +9,7 @@
  */
 import { httpLaneResidentialRefusal } from '../residentialEgress.js';
 import {
+  BLOCK_SIGNAL_HEADERS,
   CAPTURED_IMAGE_HEADERS,
   IMAGE_ACCEPT,
   classifyImageBytes,
@@ -45,10 +46,10 @@ export interface HttpBytesFetchOptions {
   timeoutMs?: number;
 }
 
-/** The {@link CAPTURED_IMAGE_HEADERS} the response actually carried, lowercased. */
-function headerSubset(res: BytesResponseLike): Record<string, string> {
+/** The named headers the response actually carried, lowercased. */
+function headerSubset(res: BytesResponseLike, names: readonly string[] = CAPTURED_IMAGE_HEADERS): Record<string, string> {
   const out: Record<string, string> = {};
-  for (const name of CAPTURED_IMAGE_HEADERS) {
+  for (const name of names) {
     const value = res.headers.get(name);
     if (value != null && value !== '') out[name] = value;
   }
@@ -81,7 +82,11 @@ export function createHttpBytesFetch(options: HttpBytesFetchOptions = {}): Image
       throw err;
     }
     // A non-2xx body is never stored: a 403 hotlink page and a 404 stub are both "no image here".
-    if (res.status < 200 || res.status > 299) return { ok: false, reason: 'http-status', status: res.status };
+    if (res.status < 200 || res.status > 299) {
+      // The block SIGNALS ride along so the pacing wrapper can tell a throttle from a per-URL verdict.
+      const signals = headerSubset(res, BLOCK_SIGNAL_HEADERS);
+      return { ok: false, reason: 'http-status', status: res.status, ...(Object.keys(signals).length > 0 ? { signals } : {}) };
+    }
     let bytes: Buffer;
     try {
       bytes = Buffer.from(await res.arrayBuffer());

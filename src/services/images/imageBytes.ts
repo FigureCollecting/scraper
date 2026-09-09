@@ -30,6 +30,15 @@ export type ImageBytesFailureReason =
 /** Response headers kept alongside the bytes — provenance only, never a cookie or an auth header. */
 export const CAPTURED_IMAGE_HEADERS = ['content-type', 'content-length', 'etag', 'last-modified'] as const;
 
+/**
+ * Headers that distinguish "this host is throttling or challenging us" from "this URL is not for
+ * you". A 403 is normally the SECOND thing — a hotlink guard, an expired signed URL — and treating
+ * it as a rate signal on a shared CDN spends every other store's budget on one store's
+ * misconfiguration. These two headers are what a genuine Cloudflare mitigation or a real throttle
+ * carries, so they are read on a non-2xx and handed to the pacing wrapper as `signals`.
+ */
+export const BLOCK_SIGNAL_HEADERS = ['cf-mitigated', 'retry-after'] as const;
+
 export interface ImageBytesOk {
   ok: true;
   /** The body EXACTLY as served — never re-encoded, never decoded through a string. */
@@ -52,6 +61,8 @@ export interface ImageBytesFailure {
   contentType?: string;
   /** A human-readable reason, for the refusal and the unsupported lane. Never carries a secret. */
   detail?: string;
+  /** {@link BLOCK_SIGNAL_HEADERS} the rejecting response carried — what separates a throttle from a verdict. */
+  signals?: Record<string, string>;
 }
 
 export type ImageBytesResult = ImageBytesOk | ImageBytesFailure;
@@ -78,6 +89,9 @@ export type ImageBytesFetcher = (url: string, options?: ImageFetchOptions) => Pr
  * or avif to a client that declares support), and a few hotlink guards check that it is not `* / *`.
  */
 export const IMAGE_ACCEPT = 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8';
+
+/** SVG: an `image/*` type whose body is active content. Never accepted as an image by these lanes. */
+const SVG_CONTENT_TYPE = /^image\/svg(\+xml)?\b/i;
 
 /** Content types that mean "bytes, type unknown" — the only ones worth sniffing. */
 const GENERIC_CONTENT_TYPE = /^(application|binary)\/octet-stream\b/i;
@@ -109,6 +123,10 @@ export interface ImageClassification {
  */
 export function classifyImageBytes(contentType: string | undefined | null, bytes: Buffer): ImageClassification {
   const declared = (contentType ?? '').trim();
+  // SVG is the exception to "a declared image/* is an image": it is a DOCUMENT format that carries
+  // script, and these lanes exist to store bytes a media warehouse later serves to browsers. A
+  // hostile or compromised store CDN would otherwise hand us stored XSS under an image content type.
+  if (SVG_CONTENT_TYPE.test(declared)) return { image: false };
   if (/^image\//i.test(declared)) return { image: true, contentType: declared };
   if (declared !== '' && !GENERIC_CONTENT_TYPE.test(declared)) return { image: false };
   const sniffed = SIGNATURES.find(s => s.test(bytes));

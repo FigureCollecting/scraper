@@ -108,6 +108,18 @@ describe('createImpitBytesFetch', () => {
       .toMatchObject({ ok: false, reason: 'not-image', contentType: 'text/html' });
   });
 
+  it('carries the mitigation SIGNALS a non-2xx impit response sent', async () => {
+    const blocked = {
+      status: 403,
+      headers: { 'cf-mitigated': 'challenge', 'content-type': 'text/html' },
+      text,
+      bytes: async () => new Uint8Array(),
+    };
+    const { impit } = fakeImpit(() => blocked);
+    expect(await createImpitBytesFetch({ getImpit: async () => impit })('https://cdn.anitoysgk.com/a.png'))
+      .toEqual({ ok: false, reason: 'http-status', status: 403, signals: { 'cf-mitigated': 'challenge' } });
+  });
+
   it('reports an impit timeout as timeout, and rethrows a genuine fault', async () => {
     const timedOut = { fetch: async () => { throw new Error('operation timed out'); } } as unknown as ImpitLike;
     expect(await createImpitBytesFetch({ getImpit: async () => timedOut })('https://cdn.anitoysgk.com/a.png'))
