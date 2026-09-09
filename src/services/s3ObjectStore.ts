@@ -11,6 +11,7 @@
  *   RAW_STORE_S3_ENDPOINT / _REGION / _BUCKET / _PREFIX / _KEY_SCHEME   (ConfigMap, envFrom)
  *   RAW_STORE_CONCURRENCY / RAW_STORE_QUEUE_MAX / _QUEUE_MAX_BYTES (the sink's admission bounds)
  *   RAW_STORE_ASSET_QUEUE_SHARE                                  (the asset lane's share of them)
+ *   RAW_STORE_ASSET_MAX_WAIT_MS                                  (how long an asset waits behind pages before it goes next)
  *   RAW_STORE_S3_ACCESS_KEY_ID / RAW_STORE_S3_SECRET_ACCESS_KEY   (Secret raw-store-s3-creds,
  *       whose internal keys are ACCESS_KEY_ID/SECRET_ACCESS_KEY, mapped to these
  *       prefixed env-var names via secretKeyRef — the process sees the prefixed names)
@@ -26,6 +27,7 @@ import type { CaptureSink } from './captureSink.js';
 import { NoopCaptureSink } from './captureSink.js';
 import {
   ObjectStoreCaptureSink,
+  MIN_RAW_STORE_ASSET_MAX_WAIT_MS,
   type ObjectStore,
   type PutOptions,
   type RawStoreConfig,
@@ -119,6 +121,17 @@ function parseAssetQueueShare(raw: string | undefined): number | undefined {
   return n === undefined ? undefined : Math.min(n, 1);
 }
 
+/**
+ * How long the asset lane may wait behind pages before its oldest capture goes next, from
+ * env. Clamped from BELOW: a window under a second is round-robin wearing a number, which
+ * hands the page reservation's turn straight back to the images it was taken from. A 0, a
+ * negative or a nonsense value falls through to the sink's 30 s default.
+ */
+function parseAssetMaxWaitMs(raw: string | undefined): number | undefined {
+  const n = parsePositive(raw);
+  return n === undefined ? undefined : Math.max(n, MIN_RAW_STORE_ASSET_MAX_WAIT_MS);
+}
+
 /** A positive byte ceiling from env, clamped so a typo cannot disable the ceiling. */
 function parseImageMaxBytes(raw: string | undefined): number | undefined {
   const n = parsePositive(raw);
@@ -202,6 +215,7 @@ export function loadRawStoreConfigFromEnv(
     queueMax: parsePositive(env.RAW_STORE_QUEUE_MAX),
     queueMaxBytes: parsePositive(env.RAW_STORE_QUEUE_MAX_BYTES),
     assetQueueShare: parseAssetQueueShare(env.RAW_STORE_ASSET_QUEUE_SHARE),
+    assetMaxWaitMs: parseAssetMaxWaitMs(env.RAW_STORE_ASSET_MAX_WAIT_MS),
     maxImageBytes: parseImageMaxBytes(env.RAW_STORE_IMAGE_MAX_BYTES),
     pathStyle: env.RAW_STORE_S3_PATH_STYLE !== undefined ? env.RAW_STORE_S3_PATH_STYLE === 'true' : undefined,
   };
@@ -272,6 +286,9 @@ export interface RawStoreFlushOutcome {
  * with nothing anywhere that would fetch them again. Draining cannot be unbounded
  * either — so we wait `RAW_STORE_SHUTDOWN_FLUSH_MS`, then say plainly how many
  * captures we are dropping on the floor. Never throws: shutdown continues regardless.
+ * The sink drains PAGES before assets, so the budget goes to the captures nothing
+ * will fetch again, and what the bound abandons is — as far as the backlog allows —
+ * images the next pass re-fetches.
  */
 export async function flushRawCaptureSink(
   opts: { sink?: CaptureSink; timeoutMs?: number; env?: NodeJS.ProcessEnv } = {},
