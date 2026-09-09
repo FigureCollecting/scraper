@@ -1266,17 +1266,19 @@ describe('ObjectStoreCaptureSink — the asset lane cannot evict the page lanes'
     // Depth is nowhere near binding: only the byte share can decide this.
     const sink = await parkedSink(store, { queueMax: 100, queueMaxBytes: 1000, assetQueueShare: 0.5 });
 
-    const [a1, a2, a3] = assets(3, 200);
+    const [a1, a2] = assets(2, 300);
+    // Nothing is waiting yet, so the first asset displaces nobody and goes in.
     await expect(sink.capture(a1)).resolves.toEqual({ admitted: true });
-    await expect(sink.capture(a2)).resolves.toEqual({ admitted: true });
-    // A third would take the queue to 600, past the assets' 500-byte share — and the
-    // share counts the capture's own size, so it is refused BEFORE it crosses.
-    await expect(sink.capture(a3)).resolves.toEqual({ admitted: false, reason: 'assetReserve' });
+    // The SECOND is refused, not the third: the share counts what the queue WOULD hold
+    // (300 + 300 > 500), because one asset is a variable and possibly enormous number of
+    // bytes where one slot is only ever one slot. Measured on occupancy alone this asset
+    // was admitted instead and the budget then stood at 600 of 1000, reserve gone.
+    await expect(sink.capture(a2)).resolves.toEqual({ admitted: false, reason: 'assetReserve' });
 
     await expect(sink.capture(pages(1, 300)[0])).resolves.toEqual({ admitted: true });
 
     expect(sink.stats()).toMatchObject({
-      queued: 3, queuedBytes: 700, assetRefusedReserve: 1, dropped: 0, droppedBytes: 0,
+      queued: 2, queuedBytes: 600, assetRefusedReserve: 1, dropped: 0, droppedBytes: 0,
     });
 
     await release(store, sink);
@@ -1289,23 +1291,26 @@ describe('ObjectStoreCaptureSink — the asset lane cannot evict the page lanes'
     // A legal configuration: RAW_STORE_IMAGE_MAX_BYTES can be set as high as 64 MiB,
     // which is EXACTLY the quarter of the 256 MiB default budget the reservation is
     // meant to hold. Scaled down here by 1000, one asset is a quarter of the budget.
-    const sink = await parkedSink(store, { queueMax: 100, queueMaxBytes: 256_000 });
+    const sink = await parkedSink(store, { queueMax: 100, queueMaxBytes: 256_000, maxImageBytes: 64_000 });
 
-    const [a1, a2, a3, a4] = assets(4, 63_999);
-    for (const a of [a1, a2, a3]) await expect(sink.capture(a)).resolves.toEqual({ admitted: true });
-    expect(sink.stats().queuedBytes).toBe(191_997); // a hair under the 192000 share line
+    // The walk that emptied the reserve at that configuration: 63999 + 64000 + 64000 all
+    // landed while the queue was still short of the 192000 share line.
+    await expect(sink.capture(assets(1, 63_999)[0])).resolves.toEqual({ admitted: true });
+    const [a2, a3, a4] = assets(3, 64_000);
+    for (const a of [a2, a3]) await expect(sink.capture(a)).resolves.toEqual({ admitted: true });
+    expect(sink.stats().queuedBytes).toBe(191_999); // a single byte under the share line
 
     // Admitting on occupancy alone, this asset was let in BECAUSE the queue had not
-    // yet crossed the line — and it took the queue to 255996, spending the pages'
-    // whole reserve on one image. The share has to be tested against what the queue
-    // WOULD hold, not what it holds.
+    // yet crossed the line — and it took the queue to 255999 of 256000, spending the
+    // pages' whole reserve on one image. The share has to be tested against what the
+    // queue WOULD hold, not what it holds.
     await expect(sink.capture(a4)).resolves.toEqual({ admitted: false, reason: 'assetReserve' });
 
     // The page the reserve exists for. This is the assertion the old rule failed:
     // it was refused queueBytesFull with the byte budget spent entirely on images.
     await expect(sink.capture(pages(1, 100)[0])).resolves.toEqual({ admitted: true });
 
-    expect(sink.stats()).toMatchObject({ droppedBytes: 0, assetRefusedReserve: 1, queuedBytes: 192_097 });
+    expect(sink.stats()).toMatchObject({ droppedBytes: 0, assetRefusedReserve: 1, queuedBytes: 192_099 });
 
     await release(store, sink);
     warn.mockRestore();
