@@ -15,6 +15,7 @@ import { EmptyIngestRecordError } from '../../services/scrapeQueue.js';
 import { EmptyExtractionError } from '../../services/engineServices/extractRecords.js';
 import { ResidentialEgressUnavailableError } from '../../services/residentialEgress.js';
 import { ChallengeLaneUnavailableError } from '../../services/browserChallenge.js';
+import { RecordFetchStatusError } from '../../services/recordFetchGate.js';
 
 describe('classifyFetchFailure — typed errors (class wins over message text)', () => {
   it('maps a cooldown fast-fail to cooldown', () => {
@@ -183,5 +184,82 @@ describe('classifyFetchFailure — a Cloudflare block folded into rate_limited',
   it('leaves a real rate limit as http_429', () => {
     const err = new Error('rate limit hit, slow down');
     expect(classifyFetchFailure({ error: err, errorType: 'rate_limited' }).reasonClass).toBe('http_429');
+  });
+});
+
+/**
+ * The RECORD lane's own status failures (R1). The queue raises a typed RecordFetchStatusError the
+ * moment a lane reports a response the record cannot come from, and hands the classifier what that
+ * error OBSERVED — its status, or the fact that the fetch ended on the store's front page. These
+ * cases pin the exact shape the queue passes, so the ledger's verdict on a store's answer can never
+ * drift back into `other` or into a verdict against our own ruleset.
+ */
+describe('classifyFetchFailure — record-lane status failures', () => {
+  const statusError = (args: { status?: number; finalUrl?: string; redirectedHome?: boolean }) =>
+    new RecordFetchStatusError({ url: 'https://store.test/product/1', transport: 'http', ...args });
+
+  it.each([
+    [404, 'gone_404'],
+    [410, 'gone_410'],
+    [403, 'http_403'],
+    [429, 'http_429'],
+    [500, 'http_5xx'],
+    [503, 'http_5xx'],
+  ])('books a %s answer as %s and echoes the status', (status, reasonClass) => {
+    const error = statusError({ status });
+    expect(classifyFetchFailure({ error, errorType: 'unknown', httpStatus: error.status })).toEqual({
+      reasonClass,
+      httpStatus: status,
+    });
+  });
+
+  it('books a bounce to the store home page as redirect_home', () => {
+    const error = statusError({ status: 200, finalUrl: 'https://store.test/', redirectedHome: true });
+    expect(
+      classifyFetchFailure({ error, errorType: 'not_found', httpStatus: error.status, redirectedHome: true }).reasonClass,
+    ).toBe('redirect_home');
+  });
+
+  it("keeps the STORE's status over the queue's coarser ErrorType (a 5xx is not a gone item)", () => {
+    // classifyError maps a 5xx to 'network' for retry purposes; the ledger must still say http_5xx.
+    const error = statusError({ status: 503 });
+    expect(classifyFetchFailure({ error, errorType: 'network', httpStatus: 503 }).reasonClass).toBe('http_5xx');
+  });
+
+  it('falls back to the status IN the message if a caller forgets to pass it (never `other`)', () => {
+    expect(classifyFetchFailure({ error: statusError({ status: 404 }) }).reasonClass).toBe('gone_404');
+  });
+});
+
+/**
+ * THE AMBIGUOUS 404 (owner rule, 2026-09-09). On myfigurecollection.net a 404 may be an unentitled
+ * NSFW item rather than a missing one, so the row must NOT be gone_404 — that class is what closes
+ * a target as removed. It is booked as http_403 instead: reviewable, re-mintable, never auto-closed.
+ */
+describe('classifyFetchFailure — denied-or-gone', () => {
+  it('books an ambiguous 404 as http_403 while still echoing the real status', () => {
+    expect(classifyFetchFailure({ httpStatus: 404, deniedOrGone: true })).toEqual({
+      reasonClass: 'http_403',
+      httpStatus: 404,
+    });
+  });
+
+  it('wins over the status reading that would have closed the target as gone', () => {
+    const error = new RecordFetchStatusError({
+      url: 'https://myfigurecollection.net/item/999999999',
+      transport: 'impersonate',
+      status: 404,
+      deniedOrGoneSite: 'mfc',
+    });
+    expect(classifyFetchFailure({ error, errorType: 'auth_required', httpStatus: 404, deniedOrGone: true }).reasonClass)
+      .toBe('http_403');
+  });
+
+  it('leaves an UNAMBIGUOUS 404 as gone_404', () => {
+    expect(classifyFetchFailure({ httpStatus: 404, deniedOrGone: false }).reasonClass).toBe('gone_404');
+  });
+
+  it('never invents the class for a non-404 (the flag only ever rides a 404)', () => {
+    expect(classifyFetchFailure({ httpStatus: 503 }).reasonClass).toBe('http_5xx');
   });
 });

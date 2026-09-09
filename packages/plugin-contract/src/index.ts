@@ -51,9 +51,17 @@ export interface ScrapePageOptions {
 
 export interface ScrapePageResult {
   html: string;
+  /** The url that was REQUESTED. Echoed back verbatim — never the page's post-redirect location. */
   url: string;
   title: string;
   statusCode?: number;
+  /**
+   * The url the navigation actually ENDED on, when the served response reported one. Distinct from
+   * `url` precisely because a redirect makes them differ: an item URL that lands on a store's front
+   * page is how a dead item presents itself on a rendered store. ABSENT when the response reported
+   * nothing — a caller must never read a fabricated final url, so there is no fallback to `url`.
+   */
+  finalUrl?: string;
 }
 
 export interface PageOptions {

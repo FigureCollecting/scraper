@@ -20,7 +20,7 @@ jest.mock('impit', () => ({
   },
 }));
 
-import { createImpitFetch, resolveImpitTimeoutMs, type ImpitLike, type CookieJarLike } from '../../services/impitFetch';
+import { createImpitFetch, createImpitFetchDetailed, createImpitFetchers, resolveImpitTimeoutMs, type ImpitLike, type CookieJarLike } from '../../services/impitFetch';
 
 describe('createImpitFetch', () => {
   it('fetches via impit with the default chrome142 profile and returns the body text', async () => {
@@ -690,5 +690,129 @@ describe('createImpitFetch — residential egress (proxyUrl threading + per-prox
     await createImpitFetch()('https://x.test/s', { browser: 'chrome142' });
     expect(mockImpitCtorOpts).toHaveLength(1);
     expect(mockImpitCtorOpts[0]).not.toHaveProperty('proxyUrl');
+  });
+});
+
+/**
+ * The STATUS-AWARE impit lane (R1). The ingest path reads the response's status and post-redirect
+ * URL off the same impit response the body came from — both are OPTIONAL members of
+ * ImpitResponseLike, so a build (or a fake) that carries neither yields neither field, never a
+ * fabricated 200. `createImpitFetch` stays the body projection of this fetcher: one request path.
+ */
+describe('createImpitFetchDetailed — status + final URL off the same impit response', () => {
+  it('returns the body with the status and the URL the response reports', async () => {
+    const fake = (_browser: string): ImpitLike => ({
+      fetch: async () => ({ text: async () => 'GONE', status: 410, url: 'https://x.test/item/1' }),
+    });
+
+    await expect(createImpitFetchDetailed(fake)('https://x.test/item/1')).resolves.toEqual({
+      body: 'GONE',
+      status: 410,
+      finalUrl: 'https://x.test/item/1',
+    });
+  });
+
+  it('omits what an impit build did not expose (a bare { text() } response)', async () => {
+    const fake = (_browser: string): ImpitLike => ({ fetch: async () => ({ text: async () => 'ok' }) });
+
+    const detail = await createImpitFetchDetailed(fake)('https://x.test/item/1');
+    expect(detail).toEqual({ body: 'ok' });
+  });
+
+  it('reports the RE-PRIMED attempt\'s response, not the challenged first one', async () => {
+    let target = 0;
+    const fake = (_browser: string, jar?: CookieJarLike): ImpitLike => ({
+      fetch: async (url) => {
+        if (url === 'https://gated.test' || url === 'https://gated.test/') {
+          await jar?.setCookie?.('cf_clearance=ok; Path=/', url);
+          return { text: async () => 'homepage', status: 200, url };
+        }
+        target++;
+        return target === 1
+          ? { text: async () => '<title>Just a moment...</title>', status: 403, url }
+          : { text: async () => 'REAL', status: 200, url: 'https://gated.test/item/1' };
+      },
+    });
+
+    const detail = await createImpitFetchDetailed(fake)('https://gated.test/item/1', {
+      prime: { url: 'https://gated.test' },
+    });
+
+    expect(target).toBe(2);              // challenged once, re-primed, fetched again
+    expect(detail.body).toBe('REAL');
+    expect(detail.status).toBe(200);     // the SECOND response's status, not the 403
+  });
+
+  it('leaves the string lane resolving a plain body (unchanged signature)', async () => {
+    const fake = (_browser: string): ImpitLike => ({
+      fetch: async () => ({ text: async () => 'PLAIN', status: 500, url: 'https://x.test/s' }),
+    });
+    await expect(createImpitFetch(fake)('https://x.test/s')).resolves.toBe('PLAIN');
+  });
+});
+
+/**
+ * ONE IMPIT INSTANCE PER PROCESS (review of PR #295). An Impit session owns a cookie jar and a prime
+ * ledger, and a Cloudflare clearance is bound to the session that minted it. Building the body lane
+ * and the detail lane from two separate factories gave the ingest path and the search//resolve path
+ * their own sessions: two homepage primes per TTL on every session-gated host, each one a real
+ * request against the estate's scarcest resource — the egress IP's reputation.
+ *
+ * createImpitFetchers hands out both surfaces over ONE session cache, which is what the module's
+ * default exports are built from.
+ */
+describe('createImpitFetchers — the two lanes share one session', () => {
+  const ORIGIN = 'https://gated.test';
+  const TARGET = 'https://gated.test/item/1';
+  const CHALLENGE = '<html><head><title>Just a moment...</title></head><body>cf</body></html>';
+  const REAL = '<html><body>real product page</body></html>';
+
+  /** A gated Impit that serves REAL only to a jar carrying clearance, and counts homepage primes. */
+  function gated() {
+    let primes = 0;
+    const make = (_browser: string, jar?: CookieJarLike): ImpitLike => ({
+      fetch: async (url) => {
+        if (url === ORIGIN || url === `${ORIGIN}/`) {
+          primes++;
+          await jar?.setCookie?.('cf_clearance=ok; Path=/', url);
+          return { text: async () => 'homepage', status: 200, url };
+        }
+        const cookies = (await jar?.getCookieString?.(url)) ?? '';
+        const ok = cookies.includes('cf_clearance');
+        return { text: async () => (ok ? REAL : CHALLENGE), status: ok ? 200 : 403, url };
+      },
+    });
+    return { make, primes: () => primes };
+  }
+
+  it('primes ONCE across both lanes', async () => {
+    const g = gated();
+    const { body, detailed } = createImpitFetchers(g.make);
+
+    const first = await body(TARGET, { browser: 'chrome142', prime: { url: ORIGIN } });
+    const second = await detailed(TARGET, { browser: 'chrome142', prime: { url: ORIGIN } });
+
+    expect(first).toBe(REAL);
+    expect(second.body).toBe(REAL);
+    expect(second.status).toBe(200);
+    expect(g.primes()).toBe(1);      // ONE session, one prime — not one per lane
+  });
+
+  it('serves the second lane from the FIRST lane\'s clearance (the jar is shared, not copied)', async () => {
+    const g = gated();
+    const { body, detailed } = createImpitFetchers(g.make);
+
+    await body(TARGET, { browser: 'chrome142', prime: { url: ORIGIN } });
+    // No prime option at all this time: only a shared jar can still carry the clearance.
+    await expect(detailed(TARGET, { browser: 'chrome142' })).resolves.toMatchObject({ body: REAL });
+    expect(g.primes()).toBe(1);
+  });
+
+  it('shows what two SEPARATE factories cost — the regression this replaces', async () => {
+    const g = gated();
+    await createImpitFetch(g.make)(TARGET, { browser: 'chrome142', prime: { url: ORIGIN } });
+    await createImpitFetchDetailed(g.make)(TARGET, { browser: 'chrome142', prime: { url: ORIGIN } });
+
+    expect(g.primes()).toBe(2);      // two sessions, two primes, two hits on the egress IP
   });
 });

@@ -25,7 +25,9 @@ import { getSessionManager, resetSessionManager, SessionManager, SessionPausedEv
 import { notifyItemFailed } from './webhookClient.js';
 import { enrichmentLogger } from '../utils/logger.js';
 import { createScrapingService } from './engineServices/scrapingService.js';
-import { createCapturingFetch, ChallengePageError, type CapturingFetch, type CapturingFetchTransports } from './engineServices/capturingFetch.js';
+import { createCapturingFetch, laneOf, ChallengePageError, type CapturingFetch, type CapturingFetchTransports } from './engineServices/capturingFetch.js';
+import { evaluateRecordFetch, RecordFetchStatusError } from './recordFetchGate.js';
+import { observeMfcItemFetch } from './sessionCanary.js';
 import { getChallengeCooldown, ChallengeCooldownError, type ChallengeCooldown } from './challengeCooldown.js';
 import { classifyFetchFailure } from './failureClassifier.js';
 import { createFailureReporterFromEnv, type FetchFailureReport } from './failureReporter.js';
@@ -34,8 +36,8 @@ import { ChallengeLaneUnavailableError } from './browserChallenge.js';
 import { getCfCookieStore, markStaleIfStored, markFreshIfStored, type CfCookieStoreLike } from './cookieJar.js';
 import { getRawCaptureSink } from './s3ObjectStore.js';
 import { createIngestEmitterFromEnv } from './ingestEmitter.js';
-import { impitFetchBody } from './impitFetch.js';
-import { httpFetchBody } from './engineLookup.js';
+import { impitFetchBodyDetailed } from './impitFetch.js';
+import { httpFetchBodyDetailed } from './engineLookup.js';
 import { buildProfileRegistry, ProfileRegistry } from '../driver/profileRegistry.js';
 import { extractRecords, EmptyExtractionError } from './engineServices/extractRecords.js';
 import { buildExtractContext } from './engineServices/extractContext.js';
@@ -348,6 +350,25 @@ function classifyError(error: Error | string): ErrorType {
   }
   if (error instanceof EmptyIngestRecordError) {
     return 'empty_record';
+  }
+  // A RecordFetchStatusError is the store's own answer, and its STATUS — never its message — decides
+  // this queue's retry policy. 404 / 410 and a bounce to the front page are terminal-by-store, so
+  // they take 'not_found' (one fetch, then FAILED) instead of being retried to exhaustion. 401 / 403
+  // are a closed door: re-knocking cannot open it and only spends the egress IP's reputation, so
+  // they take 'auth_required' (also never retried). 429 rides the existing rate-limit backoff, a 5xx
+  // is a transient upstream ('network'), and anything else keeps the bounded generic retry.
+  if (error instanceof RecordFetchStatusError) {
+    // AMBIGUOUS 404 first: on a store where a 404 may be an entitlement denial (mfc's NSFW items),
+    // 'not_found' would close a live item as removed. It is an access failure — never retried,
+    // because no number of retries re-mints a session cookie — and the ledger books it http_403.
+    if (error.deniedOrGone) return 'auth_required';
+    if (error.redirectedHome) return 'not_found';
+    const status = error.status ?? 0;
+    if (status === 404 || status === 410) return 'not_found';
+    if (status === 401 || status === 403) return 'auth_required';
+    if (status === 429) return 'rate_limited';
+    if (status >= 500) return 'network';
+    return 'unknown';
   }
   // A ResidentialEgressUnavailableError is a CONFIG shortfall raised before any fetch: the store
   // declares residential egress and no usable proxy is wired (or its lane cannot proxy). Booked
@@ -1282,8 +1303,11 @@ export class ScrapeQueue {
   private getCapturingFetch(): CapturingFetch {
     return createCapturingFetch(
       {
-        impersonate: this.impersonateFetch ?? impitFetchBody,
-        http: this.httpFetch ?? httpFetchBody,
+        // The DETAILED variants: same request, same profile/jar/cookies/timeout, but they carry the
+        // response's status and post-redirect URL through to the gate below. An injected transport
+        // (tests, and any caller still handing over a bare string fetcher) is used as given.
+        impersonate: this.impersonateFetch ?? impitFetchBodyDetailed,
+        http: this.httpFetch ?? httpFetchBodyDetailed,
         browser: this.getRawPageFetcher(),
       },
       this.captureSink ?? getRawCaptureSink(),
@@ -1327,6 +1351,30 @@ export class ScrapeQueue {
     if (host !== undefined && !page.challenge && !cooldown.isOpen(host)) {
       cooldown.clear(host);
       markFreshIfStored(this.getCfCookieStoreRef(), item.url, host);
+    }
+    // SESSION CANARY: this fetch is already an observation. On a store whose 404 may be an
+    // entitlement denial, a 404 on the configured canary item plus a 200 on any other item of the
+    // same store within the hour proves the scrape session lost its entitlement (→ the stale flag on
+    // /health/detailed, and the cookie runbook). Costs one comparison on traffic that was happening
+    // anyway, moves nothing unless that exact pair is seen, and never throws.
+    observeMfcItemFetch(item.url, page.status);
+    // STATUS GATE (R1) — what the STORE said, before the ruleset is asked to lift anything. Every
+    // lane now surfaces {status, finalUrl}, so a 404/410 (the item is gone), a 403/429/5xx (the door
+    // is closed or the host is unwell) and an item URL that bounced to the store's front page each
+    // fail HERE, named by the store's own answer. Left un-gated they reached the ruleset, failed
+    // extraction, and were booked against OUR parser — a `parse` / `ruleset` / `other` row for
+    // something we did not do, with a terminal 404 retried to exhaustion first.
+    //
+    // A CHALLENGE-flagged body is deliberately exempt: a Cloudflare interstitial usually carries a
+    // 403/503, and its recovery (a ruleset's own follow-up transport — the amiami case) and its
+    // discipline (one shot + host cooldown) belong to the challenge path below. Gating it here would
+    // book it as http_403 and skip the cooldown that protects the egress IP.
+    if (!page.challenge) {
+      const statusFailure = evaluateRecordFetch(item.url, page, laneOf(searchFetch));
+      if (statusFailure) {
+        console.warn(`[FETCH] ${sanitizeForLog(statusFailure.message)}`);
+        throw statusFailure;
+      }
     }
     // Anchor for the courtesy gap (D8): the instant the PRIMARY fetch completed, so a same-store
     // `ctx.scraping.fetchBody` follow-up (extractMany's second call) waits the store's declared
@@ -1850,12 +1898,22 @@ export class ScrapeQueue {
     if (!reporter) return;
     try {
       const ruleset = this.lookupRuleset(item.url);
-      const { reasonClass, httpStatus } = classifyFetchFailure({ error, errorType });
+      // A status failure hands the classifier what the LANE observed — the status it answered with,
+      // or the fact that the fetch ended on the store's home page. Both are properties of the typed
+      // error, so the row's reason class never depends on reading its message.
+      const statusFailure = error instanceof RecordFetchStatusError ? error : undefined;
+      const { reasonClass, httpStatus } = classifyFetchFailure({
+        error,
+        errorType,
+        ...(statusFailure?.status !== undefined ? { httpStatus: statusFailure.status } : {}),
+        ...(statusFailure?.redirectedHome ? { redirectedHome: true } : {}),
+        ...(statusFailure?.deniedOrGone ? { deniedOrGone: true } : {}),
+      });
       // A cooldown fast-fail KNOWS when the host is next fetchable; the spine takes the later of this
       // hint and its own backoff (a hint may delay a retry, never pull one forward).
       const nextRetryHint =
         error instanceof ChallengeCooldownError ? new Date(Date.now() + error.remainingMs).toISOString() : undefined;
-      const transport = error instanceof ChallengePageError ? error.transport : undefined;
+      const transport = error instanceof ChallengePageError ? error.transport : statusFailure?.transport;
       // mfcId doubles as the dedup key — the trigger routes pass the URL itself, which is not a
       // native id and must not be recorded as one.
       const itemId = item.mfcId && item.mfcId !== item.url ? item.mfcId : undefined;
