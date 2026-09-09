@@ -125,7 +125,7 @@ describe('Browser Pool Management', () => {
 
       // Verify critical security and stability flags are present
       // Note: Implementation may include additional flags for improved stability
-      const launchCall = jest.mocked(puppeteer.launch).mock.calls[0][0];
+      const launchCall = jest.mocked(puppeteer.launch).mock.calls[0][0]!;
 
       expect(launchCall).toMatchObject({
         headless: true,
@@ -139,7 +139,7 @@ describe('Browser Pool Management', () => {
 
       // Verify args is an array
       expect(Array.isArray(launchCall.args)).toBe(true);
-      expect(launchCall.args.length).toBeGreaterThan(0);
+      expect(launchCall.args!.length).toBeGreaterThan(0);
     });
 
     it('should use PUPPETEER_EXECUTABLE_PATH when set', async () => {
@@ -174,7 +174,7 @@ describe('Browser Pool Management', () => {
         // Check that executablePath is undefined (not set)
         const launchCalls = jest.mocked(puppeteer.launch).mock.calls;
         launchCalls.forEach(call => {
-          const config = call[0];
+          const config = call[0]!;
           expect(config.executablePath).toBeUndefined();
         });
       } finally {

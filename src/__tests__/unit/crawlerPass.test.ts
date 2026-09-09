@@ -901,7 +901,7 @@ describe('runCrawlerPass — backfill exhaustion must not be CONFIRMED on a page
   const seeded = (cursor: number) => createMemoryLedgerStore({ orzgk: { ...createEmptyLedger('orzgk'), backfill: { cursor } } });
   const twoRuns = async (store: ReturnType<typeof createMemoryLedgerStore>, catalog: (s: string, p: number) => Reply, ingest?: (u: string) => Reply) => {
     const c = clock();
-    const runs = [];
+    const runs: Array<{ s: Awaited<ReturnType<typeof runCrawlerPass>>; fake: ReturnType<typeof makeFake> }> = [];
     for (let i = 0; i < 3; i++) {
       const fake = makeFake({ catalog, ingest });
       const s = await runCrawlerPass(mkCfg({ mode: 'backfill' }), { fetch: fake.fetch, ledgerStore: store, now: c.now });
