@@ -44,6 +44,7 @@ import { ScrapeQueue, resetScrapeQueue } from '../../services/scrapeQueue';
 import { ChallengeCooldown, resetChallengeCooldown } from '../../services/challengeCooldown';
 import { createExtractionRegistry, ExtractionRegistryImpl } from '../../services/extractionRegistry';
 import { resetSessionManager } from '../../services/sessionManager';
+import { sessionCanaryView, resetSessionCanary } from '../../services/sessionCanary';
 import type { FetchFailureReport } from '../../services/failureReporter';
 
 const FIXTURE_HTML = '<html><body><h1 class="title">Kitagawa Marin</h1></body></html>';
@@ -143,10 +144,12 @@ describe('ScrapeQueue × record-fetch status gate', () => {
   }
 
   /** Run one item to its terminal outcome and hand back the http mock for call-count assertions. */
+  /** Stop whatever queue the previous call built, so a multi-item case leaves nothing running. */
   async function runItem(
     body: unknown,
     opts: { maxRetries?: number; send?: jest.Mock; transport?: 'http' | 'impersonate'; domain?: string; url?: string } = {},
   ) {
+    if (queue) { queue.stop(); queue.clear(); }
     const http = jest.fn().mockResolvedValue(body);
     const send = opts.send ?? jest.fn().mockResolvedValue(HEALTHY_STATS);
     queue = buildQueue(http, send, opts.transport ?? 'http', opts.domain ?? HOST);
@@ -331,6 +334,59 @@ describe('ScrapeQueue × record-fetch status gate', () => {
     it('keeps gone_404 for a store where a 404 IS unambiguous', async () => {
       await runItem({ body: 'not found', status: 404, finalUrl: ITEM_URL });
       expect(reports[0].reasonClass).toBe('gone_404');
+    });
+  });
+
+  /**
+   * THE SESSION CANARY, driven by ordinary ingest traffic. A 404 on the configured NSFW+ canary id
+   * plus a 200 on any other mfc item inside the hour is the only pair that proves the scrape
+   * session lost its entitlement — and both halves are fetches the queue was making anyway.
+   */
+  describe('mfc session canary', () => {
+    const MFC_HOST = 'myfigurecollection.net';
+    const CANARY_ID = '777777';
+    const CANARY_URL = `https://${MFC_HOST}/item/${CANARY_ID}`;
+    const OTHER_URL = `https://${MFC_HOST}/item/12345`;
+    const priorEnv = process.env.MFC_SESSION_CANARY_ITEM;
+
+    beforeEach(() => {
+      process.env.MFC_SESSION_CANARY_ITEM = CANARY_ID;
+      resetSessionCanary();
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+    });
+    afterEach(() => {
+      if (priorEnv === undefined) delete process.env.MFC_SESSION_CANARY_ITEM;
+      else process.env.MFC_SESSION_CANARY_ITEM = priorEnv;
+      resetSessionCanary();
+    });
+
+    it('flags the session stale after a served mfc item and a 404 on the canary item', async () => {
+      await runItem({ body: FIXTURE_HTML, status: 200, finalUrl: OTHER_URL },
+        { transport: 'impersonate', domain: MFC_HOST, url: OTHER_URL });
+      expect(sessionCanaryView().stale).toBe(false);   // one healthy fetch proves nothing on its own
+
+      await runItem({ body: '<html>does not exist</html>', status: 404, finalUrl: CANARY_URL },
+        { transport: 'impersonate', domain: MFC_HOST, url: CANARY_URL });
+
+      expect(sessionCanaryView().stale).toBe(true);
+      expect(sessionCanaryView().staleReason).toContain('entitle');
+    });
+
+    it('does NOT flag on a 404 for an ordinary mfc item — that ambiguity is exactly the point', async () => {
+      await runItem({ body: FIXTURE_HTML, status: 200, finalUrl: OTHER_URL },
+        { transport: 'impersonate', domain: MFC_HOST, url: OTHER_URL });
+      await runItem({ body: '<html>does not exist</html>', status: 404, finalUrl: OTHER_URL },
+        { transport: 'impersonate', domain: MFC_HOST, url: OTHER_URL });
+
+      expect(sessionCanaryView().stale).toBe(false);
+    });
+
+    it('leaves the flag alone for another store entirely', async () => {
+      await runItem({ body: FIXTURE_HTML, status: 200, finalUrl: ITEM_URL });
+      await runItem({ body: 'not found', status: 404, finalUrl: `https://${HOST}/item/${CANARY_ID}` },
+        { url: `https://${HOST}/item/${CANARY_ID}` });
+
+      expect(sessionCanaryView().stale).toBe(false);
     });
   });
 });

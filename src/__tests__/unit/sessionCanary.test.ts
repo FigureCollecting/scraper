@@ -13,6 +13,7 @@
 import {
   resolveCanaryItemId,
   observeSessionCanary,
+  observeMfcItemFetch,
   sessionCanaryView,
   resetSessionCanary,
 } from '../../services/sessionCanary';
@@ -98,5 +99,94 @@ describe('sessionCanaryView — the /health/detailed shape', () => {
     const view = sessionCanaryView({ MFC_SESSION_CANARY_ITEM: '123456' } as NodeJS.ProcessEnv);
     expect(view.configured).toBe(true);
     expect(JSON.stringify(view)).not.toContain('123456');
+  });
+});
+
+/**
+ * THE QUEUE-DRIVEN CANARY (owner rule, 2026-09-09). The pairing above needs no dedicated fetch: the
+ * ingest queue already fetches mfc items all day, and every one of those fetches now surfaces a
+ * status. A 404 on the configured NSFW+ canary id plus a 200 on ANY other mfc item within the same
+ * hour is the same proof, paid for by traffic that was happening anyway.
+ *
+ * The hour matters: a 200 from yesterday says nothing about the session now, and two observations
+ * that never overlap must never be read as a pair.
+ */
+describe('observeMfcItemFetch — the pair assembled from ordinary queue traffic', () => {
+  const ENV = { MFC_SESSION_CANARY_ITEM: '777777' } as NodeJS.ProcessEnv;
+  const CANARY = 'https://myfigurecollection.net/item/777777';
+  const OTHER = 'https://myfigurecollection.net/item/12345';
+  const T0 = Date.UTC(2026, 8, 9, 4, 0, 0);
+  let warn: jest.SpyInstance;
+
+  beforeEach(() => {
+    resetSessionCanary();
+    warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+  afterEach(() => { warn.mockRestore(); resetSessionCanary(); });
+
+  it('flags the session stale on a canary 404 after a 200 on another mfc item', () => {
+    observeMfcItemFetch(OTHER, 200, { env: ENV, now: T0 });
+    const verdict = observeMfcItemFetch(CANARY, 404, { env: ENV, now: T0 + 60_000 });
+
+    expect(verdict).toBe('stale');
+    expect(sessionCanaryView(ENV).stale).toBe(true);
+  });
+
+  it('flags it in the other order too (the canary 404 arriving first)', () => {
+    observeMfcItemFetch(CANARY, 404, { env: ENV, now: T0 });
+    expect(observeMfcItemFetch(OTHER, 200, { env: ENV, now: T0 + 5 * 60_000 })).toBe('stale');
+  });
+
+  it('does NOT pair observations more than an hour apart', () => {
+    observeMfcItemFetch(OTHER, 200, { env: ENV, now: T0 });
+    expect(observeMfcItemFetch(CANARY, 404, { env: ENV, now: T0 + 61 * 60_000 })).toBe('inconclusive');
+    expect(sessionCanaryView(ENV).stale).toBe(false);
+  });
+
+  it('does not flag on a canary 404 alone — no proof the store is even healthy', () => {
+    expect(observeMfcItemFetch(CANARY, 404, { env: ENV, now: T0 })).toBe('inconclusive');
+    expect(sessionCanaryView(ENV).stale).toBe(false);
+  });
+
+  it('clears the flag the moment the canary itself is served', () => {
+    observeMfcItemFetch(OTHER, 200, { env: ENV, now: T0 });
+    observeMfcItemFetch(CANARY, 404, { env: ENV, now: T0 + 60_000 });
+    expect(sessionCanaryView(ENV).stale).toBe(true);
+
+    expect(observeMfcItemFetch(CANARY, 200, { env: ENV, now: T0 + 2 * 60_000 })).toBe('fresh');
+    expect(sessionCanaryView(ENV).stale).toBe(false);
+  });
+
+  it('ignores a 404 on an ordinary item — only the CANARY id is the entitlement probe', () => {
+    observeMfcItemFetch(OTHER, 200, { env: ENV, now: T0 });
+    expect(observeMfcItemFetch(OTHER, 404, { env: ENV, now: T0 + 60_000 })).toBe('inconclusive');
+    expect(sessionCanaryView(ENV).stale).toBe(false);
+  });
+
+  it('ignores every other store', () => {
+    observeMfcItemFetch('https://store.example.test/product/1', 200, { env: ENV, now: T0 });
+    expect(observeMfcItemFetch('https://store.example.test/item/777777', 404, { env: ENV, now: T0 + 60_000 }))
+      .toBe('inconclusive');
+    expect(sessionCanaryView(ENV).stale).toBe(false);
+  });
+
+  it('is inert when no canary id is configured', () => {
+    observeMfcItemFetch(OTHER, 200, { env: {} as NodeJS.ProcessEnv, now: T0 });
+    expect(observeMfcItemFetch(CANARY, 404, { env: {} as NodeJS.ProcessEnv, now: T0 + 60_000 })).toBe('inconclusive');
+    expect(sessionCanaryView().stale).toBe(false);
+  });
+
+  it('is inert when the lane surfaced no status, and never throws on a junk URL', () => {
+    expect(observeMfcItemFetch(CANARY, undefined, { env: ENV, now: T0 })).toBe('inconclusive');
+    expect(() => observeMfcItemFetch('not a url', 404, { env: ENV, now: T0 })).not.toThrow();
+  });
+
+  it('logs the transition exactly once across many observations', () => {
+    observeMfcItemFetch(OTHER, 200, { env: ENV, now: T0 });
+    observeMfcItemFetch(CANARY, 404, { env: ENV, now: T0 + 60_000 });
+    observeMfcItemFetch(CANARY, 404, { env: ENV, now: T0 + 120_000 });
+    observeMfcItemFetch(OTHER, 200, { env: ENV, now: T0 + 180_000 });
+
+    expect(warn.mock.calls.map((c) => String(c[0])).filter((l) => l.includes('[MFC SESSION]'))).toHaveLength(1);
   });
 });

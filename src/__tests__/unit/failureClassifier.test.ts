@@ -249,7 +249,7 @@ describe('classifyFetchFailure — denied-or-gone', () => {
       url: 'https://myfigurecollection.net/item/999999999',
       transport: 'impersonate',
       status: 404,
-      deniedOrGone: true,
+      deniedOrGoneSite: 'mfc',
     });
     expect(classifyFetchFailure({ error, errorType: 'auth_required', httpStatus: 404, deniedOrGone: true }).reasonClass)
       .toBe('http_403');

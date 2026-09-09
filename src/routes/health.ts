@@ -15,10 +15,11 @@
  *     `rawStore: {configured, stats?}` (the raw-capture sink's counters — page + asset lanes),
  *     `failureLedger: {enabled, reported, failed, suppressed}` (the durable fetch-failure ledger's
  *     reporting counters — a ledger nobody is writing to is otherwise invisible),
- *     `sessionCanary: {site, configured, stale, staleSince?, staleReason?}` (the mfc scrape
- *     session's entitlement flag — a session that lost its NSFW entitlement shows up ONLY as 404s
- *     that look like missing items, so the operator needs it named; the canary item id is never
- *     exposed)
+ *     `sessionCanary: {site, configured, stale, staleSince?, staleReason?}` plus the flat
+ *     `mfcSessionStale` boolean it mirrors (the mfc scrape session's entitlement flag — a session
+ *     that lost its NSFW entitlement shows up ONLY as 404s that look like missing items, so the
+ *     operator needs it named; the flat form is what an alert rule keys on, and the canary item id
+ *     is never exposed)
  *     and `cfCookies: [{host, cookieNames, userAgentPinned, loadedAt, mintedAt?, expiresAt?, stale,
  *     staleSince?, staleReason?}]` (the stored-cookie jar's per-host view — cookie NAMES only, never a
  *     value; `stale` = the host still served a challenge with its stored cookies → re-mint).
@@ -106,6 +107,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         rawStore: deps.getRawStore(),
         failureLedger: deps.getFailureLedger(),
         sessionCanary: deps.getSessionCanary(),
+        mfcSessionStale: deps.getSessionCanary().stale,
         timestamp: new Date().toISOString(),
       });
     } catch (error) {
@@ -119,6 +121,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         rawStore: deps.getRawStore(),
         failureLedger: deps.getFailureLedger(),
         sessionCanary: deps.getSessionCanary(),
+        mfcSessionStale: deps.getSessionCanary().stale,
         error: error instanceof Error ? error.message : 'Unknown error',
       });
     }

@@ -35,21 +35,28 @@ import { sanitizeForLog } from '../utils/security.js';
  * Keyed by registrable host, matched on the host itself or any subdomain of it — never by substring,
  * which would hand `myfigurecollection.net.evil.test` the same exemption.
  */
-const AMBIGUOUS_NOT_FOUND_HOSTS: readonly string[] = ['myfigurecollection.net'];
+const AMBIGUOUS_NOT_FOUND_STORES: readonly { host: string; site: string }[] = [
+  { host: 'myfigurecollection.net', site: 'mfc' },
+];
 
-/** Why a 404 from one of those stores cannot be read as "gone" — carried into the ledger message. */
-const DENIED_OR_GONE_NOTE =
-  'denied-or-gone (an unentitled NSFW item and a missing item answer alike here; session may need re-minting)';
-
-/** Is this URL's host one of the stores whose 404 is ambiguous? Unparseable input is never a match. */
-export function isAmbiguousNotFoundHost(url: string): boolean {
+/**
+ * The store whose 404 is ambiguous, by its siteId, or `undefined` when this URL's host is not one of
+ * them. Matched on the host itself or a subdomain of it — never by substring, which would hand
+ * `myfigurecollection.net.evil.test` the same exemption. Unparseable input is never a match.
+ */
+export function ambiguousNotFoundSite(url: string): string | undefined {
   let host: string;
   try {
     host = new URL(url).hostname.toLowerCase();
   } catch {
-    return false;
+    return undefined;
   }
-  return AMBIGUOUS_NOT_FOUND_HOSTS.some((known) => host === known || host.endsWith(`.${known}`));
+  return AMBIGUOUS_NOT_FOUND_STORES.find(({ host: known }) => host === known || host.endsWith(`.${known}`))?.site;
+}
+
+/** Is this URL's host one of the stores whose 404 is ambiguous? */
+export function isAmbiguousNotFoundHost(url: string): boolean {
+  return ambiguousNotFoundSite(url) !== undefined;
 }
 
 /**
@@ -80,6 +87,8 @@ export class RecordFetchStatusError extends Error {
    * re-mintable — instead of gone_404, which would close a live item as removed.
    */
   readonly deniedOrGone: boolean;
+  /** The siteId of the ambiguous-404 store, when this is one — `undefined` otherwise. */
+  readonly deniedOrGoneSite: string | undefined;
 
   constructor(args: {
     url: string;
@@ -87,13 +96,17 @@ export class RecordFetchStatusError extends Error {
     status?: number;
     finalUrl?: string;
     redirectedHome?: boolean;
-    deniedOrGone?: boolean;
+    /** The store's siteId, when its 404 is ambiguous — it NAMES the store in the ledger message. */
+    deniedOrGoneSite?: string;
   }) {
     const redirectedHome = args.redirectedHome === true;
-    const deniedOrGone = args.deniedOrGone === true;
+    const deniedOrGone = args.deniedOrGoneSite !== undefined;
+    // The exact operator-facing token: "<site> 404: denied-or-gone, session may need re-minting".
     const what = redirectedHome
       ? `redirected to the store home page ${sanitizeForLog(args.finalUrl ?? '')}`
-      : `answered HTTP ${args.status}${deniedOrGone ? `: ${DENIED_OR_GONE_NOTE}` : ''}`;
+      : deniedOrGone
+        ? `answered ${args.deniedOrGoneSite} 404: denied-or-gone, session may need re-minting (an unentitled NSFW item and a missing item answer alike here)`
+        : `answered HTTP ${args.status}`;
     super(`Record fetch for ${sanitizeForLog(args.url)} via ${args.transport} transport ${what}.`);
     this.name = 'RecordFetchStatusError';
     this.url = args.url;
@@ -102,6 +115,7 @@ export class RecordFetchStatusError extends Error {
     this.finalUrl = args.finalUrl;
     this.redirectedHome = redirectedHome;
     this.deniedOrGone = deniedOrGone;
+    this.deniedOrGoneSite = args.deniedOrGoneSite;
   }
 }
 
@@ -158,13 +172,13 @@ export function evaluateRecordFetch(
   if (status !== undefined && status >= 400) {
     // Only a 404 is ambiguous, and only at the stores in the table. A 410 there is an explicit
     // Gone, and a 403 is already the class an entitlement failure belongs in.
-    const deniedOrGone = status === 404 && isAmbiguousNotFoundHost(url);
+    const ambiguousSite = status === 404 ? ambiguousNotFoundSite(url) : undefined;
     return new RecordFetchStatusError({
       url,
       transport,
       status,
       ...(meta.finalUrl !== undefined ? { finalUrl: meta.finalUrl } : {}),
-      ...(deniedOrGone ? { deniedOrGone: true } : {}),
+      ...(ambiguousSite !== undefined ? { deniedOrGoneSite: ambiguousSite } : {}),
     });
   }
   if (isRedirectHome(url, meta.finalUrl)) {

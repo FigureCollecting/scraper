@@ -113,8 +113,9 @@ describe('evaluateRecordFetch — stores where a 404 is ambiguous', () => {
 
     expect(failure.deniedOrGone).toBe(true);
     expect(failure.status).toBe(404);
-    expect(failure.message).toContain('denied-or-gone');
-    expect(failure.message).toContain('session may need re-minting');
+    // the exact operator-facing token the owner specified
+    expect(failure.message).toContain('mfc 404: denied-or-gone, session may need re-minting');
+    expect(failure.deniedOrGoneSite).toBe('mfc');
   });
 
   it.each([

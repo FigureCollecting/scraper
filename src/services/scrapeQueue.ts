@@ -27,6 +27,7 @@ import { enrichmentLogger } from '../utils/logger.js';
 import { createScrapingService } from './engineServices/scrapingService.js';
 import { createCapturingFetch, laneOf, ChallengePageError, type CapturingFetch, type CapturingFetchTransports } from './engineServices/capturingFetch.js';
 import { evaluateRecordFetch, RecordFetchStatusError } from './recordFetchGate.js';
+import { observeMfcItemFetch } from './sessionCanary.js';
 import { getChallengeCooldown, ChallengeCooldownError, type ChallengeCooldown } from './challengeCooldown.js';
 import { classifyFetchFailure } from './failureClassifier.js';
 import { createFailureReporterFromEnv, type FetchFailureReport } from './failureReporter.js';
@@ -1351,6 +1352,12 @@ export class ScrapeQueue {
       cooldown.clear(host);
       markFreshIfStored(this.getCfCookieStoreRef(), item.url, host);
     }
+    // SESSION CANARY: this fetch is already an observation. On a store whose 404 may be an
+    // entitlement denial, a 404 on the configured canary item plus a 200 on any other item of the
+    // same store within the hour proves the scrape session lost its entitlement (→ the stale flag on
+    // /health/detailed, and the cookie runbook). Costs one comparison on traffic that was happening
+    // anyway, moves nothing unless that exact pair is seen, and never throws.
+    observeMfcItemFetch(item.url, page.status);
     // STATUS GATE (R1) — what the STORE said, before the ruleset is asked to lift anything. Every
     // lane now surfaces {status, finalUrl}, so a 404/410 (the item is gone), a 403/429/5xx (the door
     // is closed or the host is unwell) and an item URL that bounced to the store's front page each

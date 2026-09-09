@@ -402,6 +402,7 @@ describe('createHealthRoutes — failureLedger', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.sessionCanary).toEqual({ site: 'mfc', configured: true, stale: false });
+    expect(res.body.mfcSessionStale).toBe(false);   // the flat form an alert rule keys on
   });
 
   it('surfaces a STALE session with its reason and timestamp', async () => {
@@ -419,6 +420,7 @@ describe('createHealthRoutes — failureLedger', () => {
     expect(res.body.sessionCanary.stale).toBe(true);
     expect(res.body.sessionCanary.staleSince).toBe('2026-09-09T04:34:00.000Z');
     expect(res.body.sessionCanary.staleReason).toContain('404');
+    expect(res.body.mfcSessionStale).toBe(true);
   });
 
   it('keeps the session canary visible on the DEGRADED response (a stale session outlives a sick pool)', async () => {
