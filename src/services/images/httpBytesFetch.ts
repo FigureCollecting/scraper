@@ -1,8 +1,8 @@
 /**
  * httpBytesFetch — the plain-HTTP image BYTES lane, sibling of `createHttpFetch`'s string transport.
  *
- * Same shape as the string lane (one abort signal bounds headers AND body, a desktop UA, no cookies
- * of its own) with two differences that matter for an image: the body is read as an ARRAY BUFFER,
+ * Same shape as the string lane (one abort signal bounds headers AND body, no cookies of its own)
+ * with two differences that matter for an image: the body is read as an ARRAY BUFFER,
  * never `text()`, and residential egress is REFUSED here rather than silently ignored — Node's
  * global fetch cannot proxy, so a residential image rides impit or the gated tab. The refusal
  * carries the very wording `refuseHttpLaneResidentialEgress` throws for the string lane, and it is
@@ -15,7 +15,6 @@ import {
   BLOCK_SIGNAL_HEADERS,
   CAPTURED_IMAGE_HEADERS,
   DEFAULT_MAX_IMAGE_BYTES,
-  IMAGE_CHROME_UA,
   classifyImageBytes,
   imageTooLarge,
   isTimeoutError,
@@ -85,7 +84,15 @@ export function createHttpBytesFetch(options: HttpBytesFetchOptions = {}): Image
       return { ok: false, reason: 'refused', detail: httpLaneResidentialRefusal(url, opts.proxyUrl ?? '(unresolved)').message };
     }
     const headers: Record<string, string> = {
-      'user-agent': opts.userAgent ?? IMAGE_CHROME_UA,
+      // UA — and the one line where the policy table's ua:'default' has to SURVIVE. That token means
+      // "send no browser identity", and it arrives here as an absent `userAgent`; substituting a
+      // Chrome string for it (as this line did until 2026-09-09) inverted the operator's decision
+      // into its opposite. hobby-genki.com is the proof: measured on 2026-09-09, its CDN answers a
+      // request with no user agent 200/image/jpeg and one claiming Chrome 403/cf-mitigated:challenge
+      // — a browser CLAIM over a non-browser TLS fingerprint is what it refuses, so the engine's own
+      // page-lane Chrome UA is refused just the same. Absent, this lane sends undici's `node`: a
+      // non-browser default that matches the fingerprint the connection actually has.
+      ...(opts.userAgent ? { 'user-agent': opts.userAgent } : {}),
       accept: opts.accept ?? accept,
       ...(opts.referer ? { referer: opts.referer } : {}),
     };

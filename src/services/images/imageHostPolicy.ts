@@ -41,6 +41,18 @@ export interface ImageHostRule {
   egress?: ImageEgress;
   /** Send the declaring PAGE as `Referer` (hotlink-protected CDNs need it). */
   referer?: boolean;
+  /**
+   * Which identity the fetch claims. `chrome` sends the lanes' Chrome string; `default` sends NO
+   * browser claim and lets the transport's own identity stand (undici's `node`, impit's
+   * impersonation profile). `default` is the row an operator writes for a host with an INVERTED
+   * gate — hobby-genki.com answers 200 to a request claiming no browser and 403
+   * cf-mitigated:challenge to one claiming Chrome, on any Chrome version — so no lane may quietly
+   * put a browser string back (see `resolveImageUserAgent`).
+   *
+   * On `lane: 'browser'` the token cannot deliver that: the transport IS a browser and its UA is a
+   * Chrome string whichever value is written here. A host that needs `default` needs `http` or
+   * `impit`.
+   */
   ua?: 'chrome' | 'default';
   /**
    * The `Accept` to send this host instead of the lanes' archival default.
