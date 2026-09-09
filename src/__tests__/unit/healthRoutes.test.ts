@@ -16,7 +16,7 @@ const NO_IMAGE_CAPTURE: ImageCaptureStats = {
   attempted: 0,
   stored: 0,
   deduped: 0,
-  skipped: { policyDeny: 0, memo: 0, thumbnailRole: 0, userRole: 0, cap: 0, residentialBudget: 0, notImage: 0, tooLarge: 0, inFlight: 0 },
+  skipped: { policyDeny: 0, memo: 0, thumbnailRole: 0, userRole: 0, cap: 0, residentialBudget: 0, notImage: 0, tooLarge: 0, refused: 0, unsupported: 0, inFlight: 0 },
   failed: 0,
   residentialBytesToday: 0,
 };
@@ -461,7 +461,7 @@ describe('createHealthRoutes — imageCapture', () => {
     attempted: 40,
     stored: 31,
     deduped: 4,
-    skipped: { policyDeny: 2, memo: 9, thumbnailRole: 12, userRole: 3, cap: 1, residentialBudget: 5, notImage: 2, tooLarge: 1, inFlight: 7 },
+    skipped: { policyDeny: 2, memo: 9, thumbnailRole: 12, userRole: 3, cap: 1, residentialBudget: 5, notImage: 2, tooLarge: 1, refused: 4, unsupported: 1, inFlight: 7 },
     failed: 3,
     residentialBytesToday: 12_345,
   };

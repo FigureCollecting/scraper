@@ -368,6 +368,32 @@ describe('the image capture hook', () => {
       expect(h.hook.stats().skipped.tooLarge).toBe(1);
     });
 
+    it('counts OUR OWN refusal as a skip, and never files it against the store', async () => {
+      // 'refused' is this engine deciding not to take bytes — a challenge cooldown on the image
+      // host, a redirect off the declaring store, a residential fetch with no proxy. Filing it in
+      // the store's ledger would blame the store for our policy, and would then feed a triage queue
+      // with rows an operator can do nothing about.
+      const h = harness({ fetch: async () => ({ ok: false, reason: 'refused', detail: 'cdn.test is cooling from a Cloudflare challenge' }) });
+      await capture(h, rulesetDescribing([gallery('https://cdn.test/a.jpg')]));
+
+      expect(h.hook.stats()).toMatchObject({ attempted: 1, failed: 0, skipped: expect.objectContaining({ refused: 1 }) });
+      expect(h.reports).toHaveLength(0);
+    });
+
+    it('counts a lane that cannot carry bytes as a skip — that is OUR build, not their server', async () => {
+      const h = harness({ fetch: async () => ({ ok: false, reason: 'unsupported', detail: 'this impit build exposes no bytes()' }) });
+      await capture(h, rulesetDescribing([gallery('https://cdn.test/a.jpg')]));
+
+      expect(h.hook.stats()).toMatchObject({ failed: 0, skipped: expect.objectContaining({ unsupported: 1 }) });
+      expect(h.reports).toHaveLength(0);
+    });
+
+    it('still logs our own refusals once per host, so they are not silent', async () => {
+      const h = harness({ fetch: async () => ({ ok: false, reason: 'refused', detail: 'no' }) });
+      await capture(h, rulesetDescribing(Array.from({ length: 4 }, (_, i) => gallery(`https://cdn.test/${i}.jpg`, i))));
+      expect(h.warnings).toHaveLength(1);
+    });
+
     it('reports a 404 to the failure ledger under the image kind, named by the image url', async () => {
       const h = harness({ fetch: async () => ({ ok: false, reason: 'http-status', status: 404 }) });
       await capture(h, rulesetDescribing([gallery('https://cdn.test/a.jpg')]));
@@ -391,7 +417,6 @@ describe('the image capture hook', () => {
         [{ ok: false, reason: 'http-status', status: 503 }, 'http_5xx'],
         [{ ok: false, reason: 'http-status', status: 418 }, 'other'],
         [{ ok: false, reason: 'timeout' }, 'timeout'],
-        [{ ok: false, reason: 'unsupported', detail: 'no bytes on this lane' }, 'other'],
       ];
       for (const [result, reasonClass] of cases) {
         const h = harness({ fetch: async () => result });

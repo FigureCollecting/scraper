@@ -202,9 +202,15 @@ describe('the process hook', () => {
     const ruleset = { describeImages: () => [{ url: 'https://cdn.test/a.jpg', role: 'gallery' as const, position: 0 }] };
     await hook.capture({ site: 's', itemId: 'i1', pageUrl: 'not-a-url', fields: {}, ruleset, origin: 'ingest' });
     await hook.capture({ site: 's', itemId: 'i2', pageUrl: 'not-a-url', fields: {}, ruleset, origin: 'ingest' });
-    // Both attempts reached the lane: a FAILED fetch is deliberately not memoized, since the memo
-    // records what was stored, not what was tried. The lane itself is built once and reused.
-    expect(hook.stats()).toMatchObject({ attempted: 2, stored: 0, failed: 2, skipped: expect.objectContaining({ memo: 0 }) });
+    // Both attempts reached the lane, which refused each on the store host it was handed. A refused
+    // fetch is deliberately not memoized (the memo records what was STORED, not what was tried), and
+    // the refusal is OURS, so it is a skip and never a store failure. The lane is built once.
+    expect(hook.stats()).toMatchObject({
+      attempted: 2,
+      stored: 0,
+      failed: 0,
+      skipped: expect.objectContaining({ memo: 0, refused: 2 }),
+    });
   });
 
   it('wires the failure ledger when the spine is configured', async () => {
@@ -259,7 +265,8 @@ describe('the process hook', () => {
       ruleset: { describeImages: () => [{ url: 'https://cdn.test/a.jpg', role: 'gallery', position: 0 }] },
       origin: 'ingest',
     });
-    expect(hook.stats()).toMatchObject({ attempted: 1, stored: 0, failed: 1 });
+    // A missing browser is this deployment's shape, not the store's answer: a skip, not a failure.
+    expect(hook.stats()).toMatchObject({ attempted: 1, stored: 0, failed: 0, skipped: expect.objectContaining({ unsupported: 1 }) });
   });
 });
 

@@ -154,6 +154,13 @@ export interface ImageCaptureSkipCounts {
   notImage: number;
   /** A body past the image size cap. */
   tooLarge: number;
+  /**
+   * WE declined the bytes: an image host inside a challenge cooldown, a redirect off the declaring
+   * store, a residential fetch whose proxy did not resolve. Our policy, not the store's answer.
+   */
+  refused: number;
+  /** The lane could not carry bytes at all (an impit build exposing only `text()`). Our build. */
+  unsupported: number;
   /** Dropped un-attempted because too many items were already waiting for the lane. */
   inFlight: number;
 }
@@ -256,6 +263,9 @@ function storeHostOf(pageUrl: string): string {
 /**
  * The ledger's reason class for a failed image fetch. Named by what the STORE said, so an image row
  * reads the same way a record row does: a 404 is a gone item, not a parse problem of ours.
+ *
+ * Only outcomes the store actually produced reach here. 'refused' and 'unsupported' are OUR OWN
+ * decisions and are counted as skips before this is called — the ledger records what stores did.
  */
 function reasonClassFor(failure: ImageBytesFailure): FetchReasonClass {
   switch (failure.reason) {
@@ -299,6 +309,8 @@ export function createImageCaptureHook(deps: ImageCaptureHookDeps): ImageCapture
     residentialBudget: 0,
     notImage: 0,
     tooLarge: 0,
+    refused: 0,
+    unsupported: 0,
     inFlight: 0,
   };
   const lastLoggedByHost = new Map<string, number>();
@@ -431,13 +443,24 @@ export function createImageCaptureHook(deps: ImageCaptureHookDeps): ImageCapture
         skipped.tooLarge += 1;
         return;
       }
+      // OURS, not theirs. 'refused' is this engine declining the bytes (a cooling host, a redirect
+      // off the declaring store, a residential fetch with no proxy) and 'unsupported' is this
+      // BUILD's lane being unable to carry them. Neither is anything the store did, so neither is
+      // filed in the store's fetch-failure ledger — a ledger full of our own policy decisions is a
+      // triage queue nobody can act on, and it would misattribute our configuration to their site.
+      // They are still logged, once per host, so they are counted but never silent.
+      const ours = failure.reason === 'refused' || failure.reason === 'unsupported';
+      const message = `[IMAGE-CAPTURE] ${sanitizeForLog(host)} image ${ours ? 'fetch refused by this engine' : 'fetch failed'} (${
+        failure.reason
+      }${failure.status !== undefined ? ` ${failure.status}` : ''})${failure.detail ? `: ${sanitizeForLog(failure.detail)}` : ''}`;
+      if (ours) {
+        if (failure.reason === 'refused') skipped.refused += 1;
+        else skipped.unsupported += 1;
+        logOncePerHost(host, message);
+        return;
+      }
       failed += 1;
-      logOncePerHost(
-        host,
-        `[IMAGE-CAPTURE] ${sanitizeForLog(host)} image fetch failed (${failure.reason}${
-          failure.status !== undefined ? ` ${failure.status}` : ''
-        })${failure.detail ? `: ${sanitizeForLog(failure.detail)}` : ''}`,
-      );
+      logOncePerHost(host, message);
       await report({
         site: job.site,
         itemId: job.itemId,
