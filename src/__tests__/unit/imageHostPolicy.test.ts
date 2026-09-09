@@ -176,6 +176,73 @@ describe('loadImageHostPolicy', () => {
     expect(policy.ruleFor('typed.example.test')).toEqual({ lane: 'http' });
     expect(warn).toHaveBeenCalledTimes(2);
   });
+
+  /**
+   * A browser tab always carries the browser's identity, so `ua: 'default'` — "claim no browser" —
+   * is not something the browser lane can deliver. Before this the row passed the loader silently.
+   * It did NOT resolve to Chrome: it reached the gated tab with no request UA, so the tab's own
+   * rules stood (clean-headful: the real Chrome's UA; headless: the host's mint UA, else the engine
+   * default) — the 2026-09-09 hobby-genki inversion was the http lane's `?? IMAGE_CHROME_UA`, not
+   * this pairing. It is refused anyway so the token means ONE thing on every lane. The other
+   * contradictory pairings this table knows (http+residential, off-store+residential) are TYPED
+   * refusals, so this
+   * one is too — named at boot, where the operator reads the [IMAGE-POLICY] warnings, and refused at
+   * the decision. The row is KEPT rather than dropped: dropping it would let the host fall through
+   * to a parent rule and be fetched under an identity the operator never wrote.
+   */
+  it('warns at boot on a row pairing lane:browser with ua:default, naming the host, and keeps the row for the decision to refuse', () => {
+    const warn = jest.fn();
+    const policy = loadImageHostPolicy({
+      IMAGE_HOST_POLICY_JSON: JSON.stringify({
+        'cdn.example.test': { lane: 'browser', ua: 'default' },
+        'ok.example.test': { lane: 'impit' },
+      }),
+    } as NodeJS.ProcessEnv, { warn });
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toMatch(/^\[IMAGE-POLICY\]/);
+    expect(warn.mock.calls[0][0]).toMatch(/cdn\.example\.test/);
+    expect(warn.mock.calls[0][0]).toMatch(/browser/);
+    expect(warn.mock.calls[0][0]).toMatch(/default/);
+    expect(policy.ruleFor('cdn.example.test')).toEqual({ lane: 'browser', ua: 'default' });
+    expect(policy.ruleFor('ok.example.test')).toEqual({ lane: 'impit' });
+  });
+
+  it('does not warn for ua:default on the http or impit lanes, for ua:chrome on the browser lane, or for a row naming no lane', () => {
+    const warn = jest.fn();
+    loadImageHostPolicy({
+      IMAGE_HOST_POLICY_JSON: JSON.stringify({
+        'a.test': { lane: 'http', ua: 'default' },
+        'b.test': { lane: 'impit', ua: 'default' },
+        'c.test': { lane: 'browser', ua: 'chrome' },
+        // No lane written: which one this host inherits is a fact about the store's declaration,
+        // which the loader does not have — that case is the decision's to refuse.
+        'd.test': { ua: 'default' },
+      }),
+    } as NodeJS.ProcessEnv, { warn });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('does not warn on a deny:true row that also pairs lane:browser with ua:default — its images are refused as denied, not as the pairing', () => {
+    const warn = jest.fn();
+    const policy = loadImageHostPolicy({
+      IMAGE_HOST_POLICY_JSON: JSON.stringify({
+        // The deny is answered at the decision BEFORE the lane is even resolved, so a boot line
+        // blaming the pairing would send the operator to fix a row whose refusal is the deny they
+        // wrote. The lane/ua fields still survive the load, unchanged, for the day the deny is lifted.
+        'shut.example.test': { deny: true, lane: 'browser', ua: 'default' },
+        // A non-boolean deny reads as deny:true (fail closed) and earns ONE warning — that one, not
+        // the pairing's.
+        'typo.example.test': { lane: 'browser', ua: 'default', deny: 'yes' },
+      }),
+    } as NodeJS.ProcessEnv, { warn });
+
+    expect(policy.ruleFor('shut.example.test')).toEqual({ deny: true, lane: 'browser', ua: 'default' });
+    expect(policy.ruleFor('typo.example.test')).toEqual({ deny: true, lane: 'browser', ua: 'default' });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toMatch(/non-boolean 'deny'/);
+    expect(warn.mock.calls.map(c => c[0]).join('\n')).not.toMatch(/browser-lane-default-ua/);
+  });
 });
 
 describe('chooseImageLane', () => {
@@ -257,6 +324,15 @@ describe('chooseImageLane', () => {
       .toMatchObject({ ok: false, reason: 'off-store-residential' });
   });
 
+  it('answers a row contradictory BOTH ways with browser-lane-default-ua first — one reason per deploy', () => {
+    // The refusals are ORDERED (http-lane-residential, then browser-lane-default-ua, then
+    // off-store-residential): this row surfaces the ua pairing now and the off-store egress only
+    // once that is fixed. Pinned so the module header's account of the order stays true.
+    const policy = buildImageHostPolicy({ 'cdn11.bigcommerce.com': { lane: 'browser', ua: 'default', egress: 'residential' } });
+    expect(chooseImageLane(PAGE, 'https://cdn11.bigcommerce.com/s-x/images/1.jpg', { transport: 'http' }, policy))
+      .toMatchObject({ ok: false, reason: 'browser-lane-default-ua' });
+  });
+
   it('still allows an ON-STORE host on the residential exit, which is what the exit is for', () => {
     const policy = buildImageHostPolicy({ 'anitoysgk.com': { lane: 'impit', egress: 'residential' } });
     expect(chooseImageLane(PAGE, 'https://www.anitoysgk.com/i/1.jpg', { transport: 'http' }, policy))
@@ -313,5 +389,71 @@ describe('chooseImageLane', () => {
       .toMatchObject({ ok: true, referer: PAGE });
     expect(chooseImageLane(PAGE, 'https://www.anitoysgk.com/i/1.jpg', { transport: 'browser' }, policy))
       .toEqual({ ok: true, lane: 'browser', egress: 'direct', ua: 'chrome' });
+  });
+
+  /**
+   * `ua: 'default'` means "claim no browser". The http lane delivers it by sending no user agent and
+   * the impit lane by sending whatever it already sends (its impersonation profile's, or a pinned
+   * mint UA); a browser TAB cannot deliver it at all — its user agent is the browser's own Chrome
+   * string whatever the row says. So the pairing is a refusal, in the same shape as
+   * http+residential: typed, named, and never a silent resolution to Chrome. (Before, it reached
+   * the tab with no request UA and the tab's own rules stood; the inversion was the http lane's
+   * `?? IMAGE_CHROME_UA`.)
+   */
+  it('refuses a row pairing the browser lane with ua:default — a tab cannot claim no browser', () => {
+    const policy = buildImageHostPolicy({ 'cdn11.bigcommerce.com': { lane: 'browser', ua: 'default' } });
+    const decision = chooseImageLane(PAGE, 'https://cdn11.bigcommerce.com/s-x/images/1.jpg', { transport: 'http' }, policy);
+
+    expect(decision).toMatchObject({ ok: false, reason: 'browser-lane-default-ua' });
+    expect(!decision.ok && decision.detail).toMatch(/cdn11\.bigcommerce\.com/);
+    expect(!decision.ok && decision.detail).toMatch(/'http' or 'impit'/);
+  });
+
+  it('refuses ua:default when the browser lane is INHERITED from the store rather than written in the row', () => {
+    // The loader cannot catch this one: which lane an on-store image inherits is a fact about the
+    // store's declaration, which no table knows — the same reason off-store-residential is refused
+    // at the decision rather than at load.
+    const policy = buildImageHostPolicy({ 'cdn.anitoysgk.com': { ua: 'default' } });
+    const declaredBrowser = chooseImageLane(PAGE, 'https://cdn.anitoysgk.com/i/1.jpg', { transport: 'browser' }, policy);
+    expect(declaredBrowser).toMatchObject({ ok: false, reason: 'browser-lane-default-ua' });
+    expect(!declaredBrowser.ok && declaredBrowser.detail).toMatch(/anitoysgk\.com/);
+    // An UNDECLARED store is the browser lane on its own hosts (the ingest default) — refused too.
+    expect(chooseImageLane(PAGE, 'https://cdn.anitoysgk.com/i/1.jpg', undefined, policy))
+      .toMatchObject({ ok: false, reason: 'browser-lane-default-ua' });
+  });
+
+  it('still honours ua:default on the http and impit lanes, written in the row or inherited', () => {
+    const policy = buildImageHostPolicy({
+      'cdn.shopify.com': { lane: 'impit', ua: 'default' },
+      'cdn.anitoysgk.com': { ua: 'default' },
+    });
+    expect(chooseImageLane(PAGE, 'https://cdn.shopify.com/i/1.jpg', { transport: 'browser' }, policy))
+      .toMatchObject({ ok: true, lane: 'impit', ua: 'default' });
+    expect(chooseImageLane(PAGE, 'https://cdn.anitoysgk.com/i/1.jpg', { transport: 'http' }, policy))
+      .toMatchObject({ ok: true, lane: 'http', ua: 'default' });
+    expect(chooseImageLane(PAGE, 'https://cdn.anitoysgk.com/i/1.jpg', { transport: 'impersonate' }, policy))
+      .toMatchObject({ ok: true, lane: 'impit', ua: 'default' });
+  });
+
+  it('NEVER emits browser + default, whatever the row, the store declaration and the host', () => {
+    const lanes = [undefined, 'http', 'impit', 'browser'] as const;
+    const uas = [undefined, 'chrome', 'default'] as const;
+    const transports = [undefined, 'http', 'impersonate', 'browser'] as const;
+    const urls = ['https://cdn.anitoysgk.com/i/1.jpg', 'https://cdn11.bigcommerce.com/s-x/images/1.jpg'];
+    let decisions = 0;
+    for (const lane of lanes) for (const ua of uas) for (const transport of transports) for (const url of urls) {
+      const row = { ...(lane !== undefined ? { lane } : {}), ...(ua !== undefined ? { ua } : {}) };
+      const policy = buildImageHostPolicy({ 'cdn.anitoysgk.com': row, 'cdn11.bigcommerce.com': row });
+      const decision = chooseImageLane(PAGE, url, transport !== undefined ? { transport } : undefined, policy);
+      decisions += 1;
+      if (decision.ok) expect(`${decision.lane}+${decision.ua}`).not.toBe('browser+default');
+      else {
+        // Nothing else in this sweep can refuse: no deny, no residential egress. So a refusal is this
+        // one, and only ever for a row that asked for `default`.
+        expect(decision.reason).toBe('browser-lane-default-ua');
+        expect(ua).toBe('default');
+      }
+    }
+    expect(decisions).toBe(lanes.length * uas.length * transports.length * urls.length);
   });
 });
