@@ -63,7 +63,13 @@
  * the page behind them. So the two lanes wait in two queues, and a worker takes a PAGE
  * whenever one is waiting and an asset only when none is; FIFO inside each. Every bound
  * — depth, bytes, the share — is measured over the two queues COMBINED, exactly as with
- * one queue: priority changes who goes next, never who gets in.
+ * one queue: priority changes no single admission decision, only who goes next. What it
+ * does change over time is which lane's captures stay RESIDENT: under sustained page
+ * load the assets never drain, so they keep holding their slots and their bytes, and a
+ * page can be refused `queueBytesFull` against bytes a waiting asset holds where
+ * first-come-first-served would have drained it and given them back. The page reserve
+ * `(1 − assetQueueShare) × queueMaxBytes` holds either way; what priority costs a page
+ * is the opportunistic headroom above it.
  *
  * WHAT THE SHARE MEASURES: the queue — captures WAITING for a worker. An upload that is
  * running has left the queue and holds no slot in it (the concurrency bounds what runs,
