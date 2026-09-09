@@ -20,7 +20,7 @@ jest.mock('impit', () => ({
   },
 }));
 
-import { createImpitFetch, resolveImpitTimeoutMs, type ImpitLike, type CookieJarLike } from '../../services/impitFetch';
+import { createImpitFetch, createImpitFetchDetailed, resolveImpitTimeoutMs, type ImpitLike, type CookieJarLike } from '../../services/impitFetch';
 
 describe('createImpitFetch', () => {
   it('fetches via impit with the default chrome142 profile and returns the body text', async () => {
@@ -690,5 +690,63 @@ describe('createImpitFetch — residential egress (proxyUrl threading + per-prox
     await createImpitFetch()('https://x.test/s', { browser: 'chrome142' });
     expect(mockImpitCtorOpts).toHaveLength(1);
     expect(mockImpitCtorOpts[0]).not.toHaveProperty('proxyUrl');
+  });
+});
+
+/**
+ * The STATUS-AWARE impit lane (R1). The ingest path reads the response's status and post-redirect
+ * URL off the same impit response the body came from — both are OPTIONAL members of
+ * ImpitResponseLike, so a build (or a fake) that carries neither yields neither field, never a
+ * fabricated 200. `createImpitFetch` stays the body projection of this fetcher: one request path.
+ */
+describe('createImpitFetchDetailed — status + final URL off the same impit response', () => {
+  it('returns the body with the status and the URL the response reports', async () => {
+    const fake = (_browser: string): ImpitLike => ({
+      fetch: async () => ({ text: async () => 'GONE', status: 410, url: 'https://x.test/item/1' }),
+    });
+
+    await expect(createImpitFetchDetailed(fake)('https://x.test/item/1')).resolves.toEqual({
+      body: 'GONE',
+      status: 410,
+      finalUrl: 'https://x.test/item/1',
+    });
+  });
+
+  it('omits what an impit build did not expose (a bare { text() } response)', async () => {
+    const fake = (_browser: string): ImpitLike => ({ fetch: async () => ({ text: async () => 'ok' }) });
+
+    const detail = await createImpitFetchDetailed(fake)('https://x.test/item/1');
+    expect(detail).toEqual({ body: 'ok' });
+  });
+
+  it('reports the RE-PRIMED attempt\'s response, not the challenged first one', async () => {
+    let target = 0;
+    const fake = (_browser: string, jar?: CookieJarLike): ImpitLike => ({
+      fetch: async (url) => {
+        if (url === 'https://gated.test' || url === 'https://gated.test/') {
+          await jar?.setCookie?.('cf_clearance=ok; Path=/', url);
+          return { text: async () => 'homepage', status: 200, url };
+        }
+        target++;
+        return target === 1
+          ? { text: async () => '<title>Just a moment...</title>', status: 403, url }
+          : { text: async () => 'REAL', status: 200, url: 'https://gated.test/item/1' };
+      },
+    });
+
+    const detail = await createImpitFetchDetailed(fake)('https://gated.test/item/1', {
+      prime: { url: 'https://gated.test' },
+    });
+
+    expect(target).toBe(2);              // challenged once, re-primed, fetched again
+    expect(detail.body).toBe('REAL');
+    expect(detail.status).toBe(200);     // the SECOND response's status, not the 403
+  });
+
+  it('leaves the string lane resolving a plain body (unchanged signature)', async () => {
+    const fake = (_browser: string): ImpitLike => ({
+      fetch: async () => ({ text: async () => 'PLAIN', status: 500, url: 'https://x.test/s' }),
+    });
+    await expect(createImpitFetch(fake)('https://x.test/s')).resolves.toBe('PLAIN');
   });
 });

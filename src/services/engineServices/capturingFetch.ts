@@ -40,6 +40,47 @@ import { resolvePrime } from '../sessionPrime.js';
 import { isCloudflareChallenge } from './challengeDetect.js';
 import { getCfCookieStore, type CfCookieSource } from '../cookieJar.js';
 
+/**
+ * What a non-browser lane answers with. A transport may return the BARE BODY (every fetcher written
+ * before the lane surfaced anything about the response, and every fake shaped like one) or this
+ * DETAIL — the dispatcher normalizes both. That is what keeps the string-returning `httpFetchBody` /
+ * `impitFetchBody` the search fan-out and /resolve share untouched while the ingest path rides the
+ * status-aware variants of the very same fetchers.
+ */
+export interface FetchBodyDetail {
+  body: string;
+  /** Upstream HTTP status, when the lane observed one. */
+  status?: number;
+  /** The URL the body actually came from, after redirects. */
+  finalUrl?: string;
+}
+
+/** Either transport answer: the bare body, or the body plus what the lane observed about it. */
+export type FetchBodyOutcome = string | FetchBodyDetail;
+
+/** Normalize either answer to the detail shape. A bare string observed no metadata — and says so. */
+export function detailOf(outcome: FetchBodyOutcome): FetchBodyDetail {
+  return typeof outcome === 'string' ? { body: outcome } : outcome;
+}
+
+/**
+ * The metadata fields of a {@link CapturingFetchResult}, each present ONLY when the lane really
+ * observed it: a status a real response can carry (100-599, never a defensive read's 0 / NaN /
+ * sentinel) and a non-empty final URL. Absent beats fabricated — the record gate reads absence as
+ * "nothing known", never as 200, and the ledger echoes what is here verbatim.
+ */
+function metaFields(detail: { status?: number; finalUrl?: string }): Pick<CapturingFetchResult, 'status' | 'finalUrl'> {
+  const status =
+    typeof detail.status === 'number' && Number.isInteger(detail.status) && detail.status >= 100 && detail.status <= 599
+      ? detail.status
+      : undefined;
+  const finalUrl = typeof detail.finalUrl === 'string' && detail.finalUrl !== '' ? detail.finalUrl : undefined;
+  return {
+    ...(status !== undefined ? { status } : {}),
+    ...(finalUrl !== undefined ? { finalUrl } : {}),
+  };
+}
+
 export interface CapturingFetchResult {
   html: string;
   /**
@@ -59,6 +100,18 @@ export interface CapturingFetchResult {
    * body.
    */
   transport?: string;
+  /**
+   * The upstream HTTP status this fetch ended on, when the lane observed one: the plain-HTTP and
+   * impit lanes read it off the response, the browser lane off ScrapePageResult.statusCode. ABSENT
+   * when the transport surfaced only bytes — the record lane was status-BLIND before this field
+   * existed, and an absent status keeps that honest instead of implying a 200 nobody saw.
+   */
+  status?: number;
+  /**
+   * The URL the body actually came from, after redirects — the input to the redirect-to-home signal
+   * (an item URL that lands on the store's front page carries a 200 and no record).
+   */
+  finalUrl?: string;
 }
 
 /**
@@ -94,10 +147,10 @@ export interface BrowserLaneFetcher {
 }
 
 export interface CapturingFetchTransports {
-  /** Plain HTTP GET (Tier-1 cookieless JSON/HTML). */
-  http: (url: string) => Promise<string>;
+  /** Plain HTTP GET (Tier-1 cookieless JSON/HTML). May answer with the status-aware detail. */
+  http: (url: string) => Promise<FetchBodyOutcome>;
   /** impit TLS-impersonating GET (Cloudflare-fronted JSON APIs). `prime` primes a session-gated host; `proxyUrl` is residential egress. */
-  impersonate: (url: string, opts: { browser?: string; headers?: Record<string, string>; userAgent?: string; prime?: { url: string }; proxyUrl?: string }) => Promise<string>;
+  impersonate: (url: string, opts: { browser?: string; headers?: Record<string, string>; userAgent?: string; prime?: { url: string }; proxyUrl?: string }) => Promise<FetchBodyOutcome>;
   /** Pooled browser navigation — the fallback for `browser`/undeclared transports. */
   browser: BrowserLaneFetcher;
 }
@@ -153,13 +206,15 @@ export function createCapturingFetch(
         // prime GET happens INSIDE the transport and its body is discarded there, so only THIS
         // target body is captured below — a prime never produces a raw.capture (capture-neutral).
         const prime = resolvePrime(searchFetch, url);
-        const html = await transports.impersonate(url, {
+        const detail = detailOf(await transports.impersonate(url, {
           browser: searchFetch.browser,
           headers: searchFetch.headers,
           userAgent: searchFetch.userAgent,
           ...(prime ? { prime } : {}),
           ...(proxyUrl ? { proxyUrl } : {}),
-        });
+        }));
+        const html = detail.body;
+        const meta = metaFields(detail);
         // Capture FIRST (provenance is recorded even for a challenge body), THEN FLAG a challenge
         // interstitial rather than throwing — a ruleset's own follow-up transport may still recover
         // the record. The queue's honesty gate turns a flagged page that persisted nothing into a
@@ -168,22 +223,24 @@ export function createCapturingFetch(
         if (isCloudflareChallenge(html)) {
           // eslint-disable-next-line no-console
           console.warn(`[FETCH] Cloudflare challenge/block page received for ${sanitizeForLog(url)} via impersonate transport`);
-          return { html, challenge: true, transport: 'impersonate' };
+          return { html, challenge: true, transport: 'impersonate', ...meta };
         }
-        return { html };
+        return { html, ...meta };
       }
       case 'http': {
         // The plain-HTTP lane cannot proxy (see refuseHttpLaneResidentialEgress) — a residential
         // store on it is refused, never quietly fetched from the node IP.
         if (proxyUrl) refuseHttpLaneResidentialEgress(url, proxyUrl);
-        const html = await transports.http(url);
+        const detail = detailOf(await transports.http(url));
+        const html = detail.body;
+        const meta = metaFields(detail);
         await captureApiBody(sink, url, html);
         if (isCloudflareChallenge(html)) {
           // eslint-disable-next-line no-console
           console.warn(`[FETCH] Cloudflare challenge/block page received for ${sanitizeForLog(url)} via http transport`);
-          return { html, challenge: true, transport: 'http' };
+          return { html, challenge: true, transport: 'http', ...meta };
         }
-        return { html };
+        return { html, ...meta };
       }
       case 'browser':
       default: {
@@ -216,12 +273,15 @@ export function createCapturingFetch(
         // FLAG a browser-lane interstitial like the other lanes (capture already happened inside
         // navigateAndCapture): the queue's honesty gate / extraction-throw door then give it the
         // same one-shot ChallengePageError + host cooldown instead of a retried empty_record.
+        // The browser lane has carried both fields all along (ScrapePageResult.statusCode / .url);
+        // they were simply dropped on the floor here.
+        const meta = metaFields({ status: page.statusCode, finalUrl: page.url });
         if (isCloudflareChallenge(page.html)) {
           // eslint-disable-next-line no-console
           console.warn(`[FETCH] Cloudflare challenge/block page received for ${sanitizeForLog(url)} via browser transport`);
-          return { html: page.html, challenge: true, transport: 'browser' };
+          return { html: page.html, challenge: true, transport: 'browser', ...meta };
         }
-        return { html: page.html };
+        return { html: page.html, ...meta };
       }
     }
   };

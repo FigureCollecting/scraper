@@ -6,6 +6,7 @@
  * factory) so unit tests and non-impersonate code paths never touch the native binary. One Impit
  * instance — WITH a per-profile cookie jar — is cached per impersonation profile.
  */
+import type { FetchBodyDetail } from './engineServices/capturingFetch.js';
 import { CookieJar } from 'tough-cookie';
 import { isCloudflareChallenge } from './engineServices/challengeDetect.js';
 import { getCfCookieStore, type CfCookieSource } from './cookieJar.js';
@@ -249,13 +250,29 @@ export interface CreateImpitFetchOptions {
 }
 
 /**
- * Build an impit body-fetcher. `makeImpit` is injectable (tests pass a fake); the default lazily
- * loads the native impit and threads a per-profile tough-cookie jar into it. Returns
- * `(url, opts?) => Promise<string>` — the same shape the lookup's fetchSearch dispatcher consumes. A
- * `prime` option triggers a same-session homepage prime for session-gated stores (see
- * {@link ImpitFetchOptions.prime}); absent, behavior is byte-identical to the pre-prime path.
+ * Read one impit response into the status-aware detail shape. `status` and `url` are OPTIONAL
+ * members of {@link ImpitResponseLike} (not every build exposes them, and no fake has to), so each
+ * is carried only when it is really there — an absent status is honest, a fabricated 200 is not.
  */
-export function createImpitFetch(makeImpit: MakeImpit = defaultMakeImpit, options: CreateImpitFetchOptions = {}) {
+async function readDetail(res: ImpitResponseLike): Promise<FetchBodyDetail> {
+  const body = await res.text();
+  return {
+    body,
+    ...(typeof res.status === 'number' ? { status: res.status } : {}),
+    ...(typeof res.url === 'string' && res.url !== '' ? { finalUrl: res.url } : {}),
+  };
+}
+
+/**
+ * Build the STATUS-AWARE impit fetcher: the same request, the same prime/re-prime discipline, but
+ * answering `{ body, status?, finalUrl? }` so the ingest path can tell what the store said from what
+ * our ruleset could not lift. On the re-prime path it is the SECOND (post-clearance) response that
+ * is reported — the one whose body the caller receives.
+ *
+ * `makeImpit` is injectable (tests pass a fake); the default lazily loads the native impit and
+ * threads a per-profile tough-cookie jar into it.
+ */
+export function createImpitFetchDetailed(makeImpit: MakeImpit = defaultMakeImpit, options: CreateImpitFetchOptions = {}) {
   const now = options.now ?? Date.now;
   const primeTtlMs = options.primeTtlMs ?? PRIME_TTL_MS;
   // Cache the SESSION promise (not the resolved session) so the get-then-set is synchronous and two
@@ -280,7 +297,7 @@ export function createImpitFetch(makeImpit: MakeImpit = defaultMakeImpit, option
     }
     return sp;
   }
-  return async function impitFetchBody(url: string, opts: ImpitFetchOptions = {}): Promise<string> {
+  return async function impitFetchDetail(url: string, opts: ImpitFetchOptions = {}): Promise<FetchBodyDetail> {
     const browser = opts.browser || DEFAULT_PROFILE;
     const session = await getSession(browser, opts.proxyUrl);
     // STORED COOKIES + PINNED UA (CfCookieStore): seed the host's hand-minted cookies into the jar
@@ -297,26 +314,41 @@ export function createImpitFetch(makeImpit: MakeImpit = defaultMakeImpit, option
       ...(pinnedUa ? { 'User-Agent': pinnedUa } : {}),
     };
     if (!opts.prime) {
-      const res = await session.impit.fetch(url, { method: 'GET', headers });
-      return res.text();
+      return readDetail(await session.impit.fetch(url, { method: 'GET', headers }));
     }
     const primeUrl = opts.prime.url;
     await ensurePrimed(session, primeUrl, headers, now(), primeTtlMs);
-    let body = await (await session.impit.fetch(url, { method: 'GET', headers })).text();
+    let detail = await readDetail(await session.impit.fetch(url, { method: 'GET', headers }));
     // Only a parseable prime host can be re-primed; an unparseable one has nothing to retry against,
     // so it returns the body as-is rather than re-fetching the target for no gain.
-    if (hostOf(primeUrl) !== undefined && looksLikeChallenge(body)) {
+    if (hostOf(primeUrl) !== undefined && looksLikeChallenge(detail.body)) {
       // Primed host still challenged ⇒ the clearance expired within its TTL, or CF rotated the
       // challenge. Invalidate and re-prime ONCE (bounded — no loop), then retry the target. Still
       // challenged ⇒ return it; the ruleset yields empty and the caller's own retry/backoff owns the
       // next attempt.
       invalidatePrime(session, primeUrl);
       await ensurePrimed(session, primeUrl, headers, now(), primeTtlMs);
-      body = await (await session.impit.fetch(url, { method: 'GET', headers })).text();
+      detail = await readDetail(await session.impit.fetch(url, { method: 'GET', headers }));
     }
-    return body;
+    return detail;
   };
 }
+
+/**
+ * Build the impit BODY fetcher — {@link createImpitFetchDetailed}'s body, nothing else. The lookup's
+ * fetchSearch dispatcher, /resolve and the plugins' own follow-up fetches all consume
+ * `(url, opts?) => Promise<string>`; projecting the one fetcher keeps a single request path, so the
+ * two lanes can never drift in profile, jar, prime discipline or timeout.
+ */
+export function createImpitFetch(makeImpit: MakeImpit = defaultMakeImpit, options: CreateImpitFetchOptions = {}) {
+  const detailed = createImpitFetchDetailed(makeImpit, options);
+  return async function impitFetchBody(url: string, opts: ImpitFetchOptions = {}): Promise<string> {
+    return (await detailed(url, opts)).body;
+  };
+}
+
+/** The engine's default status-aware impit fetcher (the ingest path's impersonate lane). */
+export const impitFetchBodyDetailed = createImpitFetchDetailed();
 
 /** The engine's default impit fetcher (real native impit, per-profile cookie jar, chrome142 default profile). */
 export const impitFetchBody = createImpitFetch();

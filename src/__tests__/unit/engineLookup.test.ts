@@ -3,7 +3,7 @@
  * registry (allStores → ProfileRegistry) + a fetch, and fans a query to parse candidates.
  */
 import { join } from 'path';
-import { createEngineLookup, createEngineCatalog, httpFetchBody, createHttpFetch, resolveHttpFetchTimeoutMs, HTTP_FETCH_TIMEOUT_MS, type LookupRegistry } from '../../services/engineLookup';
+import { createEngineLookup, createEngineCatalog, httpFetchBody, httpFetchBodyDetailed, createHttpFetch, createHttpFetchDetailed, resolveHttpFetchTimeoutMs, HTTP_FETCH_TIMEOUT_MS, type LookupRegistry } from '../../services/engineLookup';
 import { getCfCookieStore, resetCfCookieStore } from '../../services/cookieJar';
 import type { ExtractionRuleset, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
 
@@ -309,5 +309,67 @@ describe('resolveHttpFetchTimeoutMs — pure env → ms resolver (HTTP_FETCH_TIM
       global.fetch = orig;
       if (ORIGINAL === undefined) delete process.env.HTTP_FETCH_TIMEOUT_MS; else process.env.HTTP_FETCH_TIMEOUT_MS = ORIGINAL;
     }
+  });
+});
+
+/**
+ * The STATUS-AWARE plain-HTTP lane (R1). The ingest path needs the response's status and
+ * post-redirect URL, which `res.text()` alone threw away. The detail variant reads both off the
+ * very same fetch; the string variant is that variant's body, so both lanes stay byte-identical on
+ * the wire and every existing caller of `httpFetchBody` keeps its `Promise<string>` signature.
+ */
+describe('createHttpFetchDetailed — status + final URL off the same request', () => {
+  const orig = global.fetch;
+  afterEach(() => { global.fetch = orig; });
+
+  it('returns the body with the status and the post-redirect URL', async () => {
+    global.fetch = jest.fn(async () => ({
+      text: async () => 'BODY',
+      status: 404,
+      url: 'https://x.test/item/1',
+    })) as unknown as typeof fetch;
+
+    await expect(createHttpFetchDetailed()('https://x.test/item/1')).resolves.toEqual({
+      body: 'BODY',
+      status: 404,
+      finalUrl: 'https://x.test/item/1',
+    });
+  });
+
+  it('carries the FINAL url of a followed redirect, not the requested one', async () => {
+    global.fetch = jest.fn(async () => ({
+      text: async () => 'HOME',
+      status: 200,
+      url: 'https://x.test/',
+    })) as unknown as typeof fetch;
+
+    const detail = await httpFetchBodyDetailed('https://x.test/item/1');
+    expect(detail.finalUrl).toBe('https://x.test/');
+    expect(detail.body).toBe('HOME');
+  });
+
+  it('omits what a response did not carry rather than inventing it', async () => {
+    global.fetch = jest.fn(async () => ({ text: async () => 'BODY' })) as unknown as typeof fetch;
+
+    const detail = await createHttpFetchDetailed()('https://x.test/item/1');
+    expect(detail.body).toBe('BODY');
+    expect(detail.status).toBeUndefined();
+    expect(detail.finalUrl).toBeUndefined();
+  });
+
+  it('sends the SAME request the string lane sends (headers unchanged)', async () => {
+    const fetchMock = jest.fn(async (_url: string, _init?: RequestInit) => ({ text: async () => 'ok', status: 200, url: 'https://x.test/s' }));
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    await httpFetchBody('https://x.test/s');
+    await httpFetchBodyDetailed('https://x.test/s');
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect((fetchMock.mock.calls[0][1] as RequestInit).headers).toEqual((fetchMock.mock.calls[1][1] as RequestInit).headers);
+  });
+
+  it('still resolves the plain body on the string lane (unchanged signature)', async () => {
+    global.fetch = jest.fn(async () => ({ text: async () => 'PLAIN', status: 500, url: 'https://x.test/s' })) as unknown as typeof fetch;
+    await expect(httpFetchBody('https://x.test/s')).resolves.toBe('PLAIN');
   });
 });

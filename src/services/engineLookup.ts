@@ -16,6 +16,7 @@ import { makeFetchSearch, type FetchSearchTransports } from './fetchSearch.js';
 import { impitFetchBody } from './impitFetch.js';
 import { getCfCookieStore, type CfCookieSource } from './cookieJar.js';
 import { createFailureReporterFromEnv } from './failureReporter.js';
+import type { FetchBodyDetail } from './engineServices/capturingFetch.js';
 import type { ExtractionRuleset, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
 
 /** The slice of the engine ExtractionRegistry the lookup needs. */
@@ -62,9 +63,15 @@ function serializeCookieHeader(cookies: Record<string, string>): string {
  * host's request is BYTE-IDENTICAL to the cookieless path. `store` is injectable (tests); the default
  * resolves the singleton per call so a hot-reloaded file is always the one consulted.
  */
-export function createHttpFetch(options: { store?: CfCookieSource } = {}) {
-  /** Raw response body of a search URL via plain HTTP (Tier-1 cookieless JSON), abort-bounded. */
-  return async function httpFetchBody(url: string): Promise<string> {
+export function createHttpFetchDetailed(options: { store?: CfCookieSource } = {}) {
+  /**
+   * Raw response body of a URL via plain HTTP (Tier-1 cookieless JSON), abort-bounded, WITH what the
+   * response said about itself: its status and the URL it ended on after redirects. Reading them
+   * costs nothing (they are already on the Response) and is what lets the ingest path tell a store's
+   * 404 or a bounce to the front page from a ruleset that failed to lift a record. A response object
+   * that carries neither (a test double shaped like `{ text() }`) yields neither field.
+   */
+  return async function httpFetchDetail(url: string): Promise<FetchBodyDetail> {
     const store = options.store ?? getCfCookieStore();
     const cookies = store.cookiesFor(url);
     const headers: Record<string, string> = {
@@ -77,9 +84,30 @@ export function createHttpFetch(options: { store?: CfCookieSource } = {}) {
       // One signal bounds headers AND body: text() streams under the same abort.
       signal: AbortSignal.timeout(HTTP_FETCH_TIMEOUT_MS),
     });
-    return res.text();
+    const body = await res.text();
+    return {
+      body,
+      ...(typeof res.status === 'number' ? { status: res.status } : {}),
+      ...(typeof res.url === 'string' && res.url !== '' ? { finalUrl: res.url } : {}),
+    };
   };
 }
+
+/**
+ * Build the plain-HTTP BODY fetcher — {@link createHttpFetchDetailed}'s body, nothing else. The
+ * search fan-out, /resolve and the crawler's catalog lane all consume `Promise<string>`; keeping
+ * this a thin projection of the detailed fetcher means there is exactly ONE request path, so the
+ * two lanes can never drift in headers, cookies, UA pinning or timeout.
+ */
+export function createHttpFetch(options: { store?: CfCookieSource } = {}) {
+  const detailed = createHttpFetchDetailed(options);
+  return async function httpFetchBody(url: string): Promise<string> {
+    return (await detailed(url)).body;
+  };
+}
+
+/** The engine's default status-aware plain-HTTP fetcher (the ingest path's http lane). */
+export const httpFetchBodyDetailed = createHttpFetchDetailed();
 
 /** The engine's default plain-HTTP fetcher (CfCookieStore singleton, module-load timeout). */
 export const httpFetchBody = createHttpFetch();

@@ -118,7 +118,7 @@ describe('createCapturingFetch', () => {
 
     const result = await fetch('https://rendered.example.test/item/1', { transport: 'browser' });
 
-    expect(result).toEqual({ html: '<html>BROWSER</html>' });
+    expect(result).toEqual({ html: '<html>BROWSER</html>', status: 200, finalUrl: 'https://rendered.example.test/item/1' });
     expect(calls).toEqual([['scrapePage', 'https://rendered.example.test/item/1']]);
     // capturingFetch does not double-capture the browser lane (navigateAndCapture owns that)
     expect(sink.captures).toHaveLength(0);
@@ -131,7 +131,7 @@ describe('createCapturingFetch', () => {
 
     const result = await fetch('https://myfigurecollection.net/item/12345', undefined);
 
-    expect(result).toEqual({ html: '<html>BROWSER</html>' });
+    expect(result).toEqual({ html: '<html>BROWSER</html>', status: 200, finalUrl: 'https://myfigurecollection.net/item/12345' });
     expect(calls).toEqual([['scrapePage', 'https://myfigurecollection.net/item/12345']]);
     expect(sink.captures).toHaveLength(0);
   });
@@ -144,7 +144,7 @@ describe('createCapturingFetch', () => {
 
     const result = await fetch('https://myfigurecollection.net/item/12345', undefined, { cookies });
 
-    expect(result).toEqual({ html: '<html>STEALTH</html>' });
+    expect(result).toEqual({ html: '<html>STEALTH</html>', status: 200, finalUrl: 'https://myfigurecollection.net/item/12345' });
     expect(calls).toEqual([['scrapePageStealth', 'https://myfigurecollection.net/item/12345', { cookies }]]);
   });
 
@@ -236,7 +236,7 @@ describe('createCapturingFetch', () => {
       const fetch = createCapturingFetch(t, sink);
 
       const result = await fetch('https://myfigurecollection.net/item/12345', { transport: 'browser' });
-      expect(result).toEqual({ html: CHALLENGE, challenge: true, transport: 'browser' });
+      expect(result).toEqual({ html: CHALLENGE, challenge: true, transport: 'browser', status: 200, finalUrl: 'https://myfigurecollection.net/item/12345' });
       expect(sink.captures).toHaveLength(0);        // browser lane captures itself (navigateAndCapture), not here
       const warnLines = warnSpy.mock.calls.map(c => String(c[0])).filter(l => l.includes('[FETCH] Cloudflare challenge/block page received'));
       expect(warnLines).toHaveLength(1);
@@ -248,7 +248,7 @@ describe('createCapturingFetch', () => {
       const { t } = makeTransports();
       const fetch = createCapturingFetch(t, new CollectingCaptureSink());
       const result = await fetch('https://myfigurecollection.net/item/12345', { transport: 'browser' });
-      expect(result).toEqual({ html: '<html>BROWSER</html>' });
+      expect(result).toEqual({ html: '<html>BROWSER</html>', status: 200, finalUrl: 'https://myfigurecollection.net/item/12345' });
       expect(result).not.toHaveProperty('challenge');
     });
   });
@@ -356,7 +356,7 @@ describe('createCapturingFetch', () => {
       const fetch = createCapturingFetch(t, new CollectingCaptureSink(), { cookieStore });
       const result = await fetch('https://myfigurecollection.net/item/12345', undefined);
       expect(calls).toEqual([['scrapePageStealth', 'https://myfigurecollection.net/item/12345', {}]]);
-      expect(result).toEqual({ html: '<html>STEALTH</html>' });
+      expect(result).toEqual({ html: '<html>STEALTH</html>', status: 200, finalUrl: 'https://myfigurecollection.net/item/12345' });
       expect(t.browser.scrapePage).not.toHaveBeenCalled();
     });
 
@@ -613,5 +613,93 @@ describe('createCapturingFetch — browser lane resolves the SAME options as the
     })).rejects.toThrow(ResidentialEgressUnavailableError);
 
     expect(calls).toHaveLength(0);
+  });
+});
+
+/**
+ * STATUS + FINAL URL (R1). Every lane now surfaces what it observed about the RESPONSE, not only
+ * its bytes: `status` and `finalUrl` ride alongside `html`, so the ingest path can tell a store's
+ * 404 from our own parse gap. A transport that returns a bare string observed neither — the fields
+ * are then ABSENT, never a fabricated 200.
+ */
+describe('createCapturingFetch — response metadata (status / finalUrl)', () => {
+  /** A lane that answers with the status-aware detail shape instead of a bare body string. */
+  function detailTransports(detail: { body: string; status?: number; finalUrl?: string }) {
+    const { t } = makeTransports();
+    t.http = jest.fn(async () => detail);
+    t.impersonate = jest.fn(async () => detail);
+    return t;
+  }
+
+  it('surfaces the http lane\'s status and final URL', async () => {
+    const t = detailTransports({ body: 'GONE', status: 404, finalUrl: 'https://json.example.test/item/1' });
+    const fetch = createCapturingFetch(t, new CollectingCaptureSink());
+
+    await expect(fetch('https://json.example.test/item/1', { transport: 'http' })).resolves.toEqual({
+      html: 'GONE',
+      status: 404,
+      finalUrl: 'https://json.example.test/item/1',
+    });
+  });
+
+  it('surfaces the impersonate lane\'s status and final URL, and captures the body it carried', async () => {
+    const t = detailTransports({ body: '{"e":1}', status: 503, finalUrl: 'https://api.example.test/item/1' });
+    const sink = new CollectingCaptureSink();
+    const fetch = createCapturingFetch(t, sink);
+
+    const result = await fetch('https://api.example.test/item/1', { transport: 'impersonate', browser: 'chrome142' });
+
+    expect(result).toEqual({ html: '{"e":1}', status: 503, finalUrl: 'https://api.example.test/item/1' });
+    expect(sink.captures[0].bytes.toString('utf8')).toBe('{"e":1}'); // the DETAIL's body, not "[object Object]"
+  });
+
+  it("surfaces the browser lane's statusCode and post-redirect url", async () => {
+    const { t } = makeTransports();
+    t.browser.scrapePage = jest.fn(async () => ({
+      html: '<html>HOME</html>',
+      url: 'https://rendered.example.test/',
+      title: 'Home',
+      statusCode: 200,
+    })) as any;
+    const fetch = createCapturingFetch(t, new CollectingCaptureSink());
+
+    await expect(fetch('https://rendered.example.test/item/1', { transport: 'browser' })).resolves.toEqual({
+      html: '<html>HOME</html>',
+      status: 200,
+      finalUrl: 'https://rendered.example.test/',
+    });
+  });
+
+  it('omits both fields when the transport returned a bare string (nothing observed, nothing invented)', async () => {
+    const { t } = makeTransports();
+    const fetch = createCapturingFetch(t, new CollectingCaptureSink());
+
+    const result = await fetch('https://json.example.test/item/1', { transport: 'http' });
+
+    expect(result).toEqual({ html: 'HTTP-BODY' });
+    expect(result).not.toHaveProperty('status');
+    expect(result).not.toHaveProperty('finalUrl');
+  });
+
+  it('omits a sentinel status a defensive read produced, and an empty final URL', async () => {
+    const t = detailTransports({ body: 'ok', status: 0, finalUrl: '' });
+    const fetch = createCapturingFetch(t, new CollectingCaptureSink());
+
+    await expect(fetch('https://json.example.test/item/1', { transport: 'http' })).resolves.toEqual({ html: 'ok' });
+  });
+
+  it('carries the status ALONGSIDE a challenge flag (a 403 interstitial is both)', async () => {
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const challenge = fixture('cf-block-1020-amiami.html');
+    const t = detailTransports({ body: challenge, status: 403, finalUrl: 'https://cf.example.test/item/1' });
+    const fetch = createCapturingFetch(t, new CollectingCaptureSink());
+
+    await expect(fetch('https://cf.example.test/item/1', { transport: 'http' })).resolves.toEqual({
+      html: challenge,
+      challenge: true,
+      transport: 'http',
+      status: 403,
+      finalUrl: 'https://cf.example.test/item/1',
+    });
   });
 });
