@@ -10,13 +10,14 @@
  *   1. CLASS. A typed engine error's taxonomy must never depend on free text in its message — the
  *      same RS-2 rule scrapeQueue's own classifyError follows. ChallengePageError's message NAMES
  *      Cloudflare, EmptyIngestRecordError's carries server warnings; neither may be re-read.
- *   2. REDIRECT HOME. An item URL that bounced to a landing page is terminal-by-store even though
+ *   2. EXTRACTION. The record lane's own '[EXTRACT …]' family — ours to fix, never a store verdict.
+ *   3. REDIRECT HOME. An item URL that bounced to a landing page is terminal-by-store even though
  *      it usually carries a 200.
- *   3. STATUS, when the transport surfaced one. Rare on the record lane today (the engine's http
+ *   4. STATUS, when the transport surfaced one. Rare on the record lane today (the engine's http
  *      fetch is status-blind) — which is exactly why an absent status is honest, never fabricated.
- *   4. ErrorType — the queue's own classification, already load-bearing for retry/backoff.
- *   5. MESSAGE, for the untyped Errors the search fan-out and the crawler still throw.
- *   6. The challenge FLAG, else `other` — the operator's triage bucket.
+ *   5. ErrorType — the queue's own classification, already load-bearing for retry/backoff.
+ *   6. MESSAGE, for the untyped Errors the search fan-out and the crawler still throw.
+ *   7. The challenge FLAG, else `other` — the operator's triage bucket.
  *
  * TERMINAL means "the producer has stopped trying for this cycle". Only a terminal outcome is
  * reported: reporting per internal retry would inflate the ledger's `attempts` (which drives the
@@ -26,6 +27,7 @@ import { ConnectError, Code } from '@connectrpc/connect';
 import { ChallengeCooldownError } from './challengeCooldown.js';
 import { ChallengePageError } from './engineServices/capturingFetch.js';
 import { EmptyIngestRecordError } from './scrapeQueue.js';
+import { EmptyExtractionError } from './engineServices/extractRecords.js';
 import { ResidentialEgressUnavailableError } from './residentialEgress.js';
 import { ChallengeLaneUnavailableError } from './browserChallenge.js';
 import type { ErrorType } from './scrapeQueue.js';
@@ -103,6 +105,20 @@ function fromClass(error: unknown): FetchReasonClass | undefined {
   return undefined;
 }
 
+/**
+ * Step 2 — the record lane's EXTRACTION family. scrapeQueue rethrows these raw (scrapeQueue.ts's
+ * non-challenge branch), and their free text would otherwise be read as a STORE verdict: a guard
+ * violation naming a selector "not found" becomes ErrorType 'not_found' -> gone_404 -> closed as
+ * "the store removed it", and everything else falls to the `other` triage bucket. Extraction is
+ * OURS: an empty lift is a `ruleset` gap, a violated guard is a `parse` fault. Both go to review.
+ */
+function fromExtraction(error: unknown): FetchReasonClass | undefined {
+  if (error instanceof EmptyExtractionError) return 'ruleset';
+  // The engine prefixes every extraction throw with its stage marker; nothing else in the estate
+  // emits it, so the prefix is a TAXONOMY token, not free text.
+  return messageOf(error).startsWith('[EXTRACT ') ? 'parse' : undefined;
+}
+
 /** Step 3 — an upstream status the transport actually surfaced. */
 function fromStatus(status: number | undefined): FetchReasonClass | undefined {
   if (status === undefined) return undefined;
@@ -115,14 +131,23 @@ function fromStatus(status: number | undefined): FetchReasonClass | undefined {
 }
 
 /** Step 4 — the queue's ErrorType, the classification the retry/backoff logic already trusts. */
-function fromErrorType(errorType: ErrorType | undefined): FetchReasonClass | undefined {
+function fromErrorType(
+  errorType: ErrorType | undefined,
+  message: string,
+  challenge: boolean,
+): FetchReasonClass | undefined {
   switch (errorType) {
     case 'timeout':
       return 'timeout';
     case 'network':
       return 'network';
     case 'rate_limited':
-      return 'http_429';
+      // classifyError folds a Cloudflare block INTO rate_limited (its message rule names both), and
+      // the queue's own RT-1 branch re-detects it by the same text. The two classes need different
+      // spine policies — a challenge escalates to review after 3 attempts, a 429 rides the 10-attempt
+      // transient ladder — so recover here what the coarse ErrorType lost. Seven extra CF fetches per
+      // target is a real cost against the estate's scarcest resource, the egress IP's reputation.
+      return challenge || /cloudflare|just a moment/i.test(message) ? 'challenge' : 'http_429';
     case 'not_found':
       return 'gone_404';
     // A missing emitter, an unmatched ruleset, and a persisted-nothing ingest are all OUR coverage
@@ -164,12 +189,14 @@ function fromMessage(message: string): FetchReasonClass | undefined {
  */
 export function classifyFetchFailure(outcome: FetchOutcome): FetchClassification {
   const httpStatus = usableStatus(outcome.httpStatus);
+  const message = messageOf(outcome.error);
   const reasonClass: FetchReasonClass =
     fromClass(outcome.error) ??
+    fromExtraction(outcome.error) ??
     (outcome.redirectedHome === true ? 'redirect_home' : undefined) ??
     fromStatus(httpStatus) ??
-    fromErrorType(outcome.errorType) ??
-    fromMessage(messageOf(outcome.error)) ??
+    fromErrorType(outcome.errorType, message, outcome.challenge === true) ??
+    fromMessage(message) ??
     (outcome.challenge === true ? 'challenge' : 'other');
 
   return {

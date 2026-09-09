@@ -12,6 +12,7 @@ import { classifyFetchFailure } from '../../services/failureClassifier.js';
 import { ChallengeCooldownError } from '../../services/challengeCooldown.js';
 import { ChallengePageError } from '../../services/engineServices/capturingFetch.js';
 import { EmptyIngestRecordError } from '../../services/scrapeQueue.js';
+import { EmptyExtractionError } from '../../services/engineServices/extractRecords.js';
 import { ResidentialEgressUnavailableError } from '../../services/residentialEgress.js';
 import { ChallengeLaneUnavailableError } from '../../services/browserChallenge.js';
 
@@ -141,5 +142,48 @@ describe('classifyFetchFailure — terminal', () => {
   it('is true once the producer has stopped', () => {
     expect(classifyFetchFailure({ errorType: 'timeout', willRetry: false }).terminal).toBe(true);
     expect(classifyFetchFailure({ errorType: 'timeout' }).terminal).toBe(true);
+  });
+});
+
+describe('classifyFetchFailure — the record lane extraction family', () => {
+  it('maps an EmptyExtractionError to ruleset, not the triage bucket', () => {
+    const err = new EmptyExtractionError('mfc@0.9.15');
+    expect(classifyFetchFailure({ error: err, errorType: 'unknown' }).reasonClass).toBe('ruleset');
+  });
+
+  it('maps a D11 guard violation to parse — our selector, our queue', () => {
+    const err = new Error('[EXTRACT RECORDS] mfc@0.9.15: record[2] has no source.itemId');
+    expect(classifyFetchFailure({ error: err, errorType: 'unknown' }).reasonClass).toBe('parse');
+  });
+
+  it('never lets extraction text posing as a store verdict become gone_404', () => {
+    // classifyError reads "not found" anywhere in the text as errorType 'not_found'; an extraction
+    // fault is OURS and must never be closed as "the store removed it".
+    const err = new Error('[EXTRACT RECORDS] mfc@0.9.15: selector .price not found');
+    expect(classifyFetchFailure({ error: err, errorType: 'not_found' }).reasonClass).toBe('parse');
+  });
+
+  it('maps the ExtractContext shortfall to parse', () => {
+    const err = new Error('[EXTRACT CONTEXT] mfc@0.9.15: context query produced nothing');
+    expect(classifyFetchFailure({ error: err }).reasonClass).toBe('parse');
+  });
+});
+
+describe('classifyFetchFailure — a Cloudflare block folded into rate_limited', () => {
+  it('recovers challenge from the message the queue coarsened to rate_limited', () => {
+    // scrapeQueue's classifyError maps any 'Cloudflare' text to ErrorType 'rate_limited'; the two
+    // need DIFFERENT spine policies (challenge escalates to review at 3, a 429 rides the transient
+    // ladder), so the distinction must survive.
+    const err = new Error('Cloudflare challenge on a cookied lane');
+    expect(classifyFetchFailure({ error: err, errorType: 'rate_limited' }).reasonClass).toBe('challenge');
+  });
+
+  it('recovers challenge from a challenge-flagged body under rate_limited', () => {
+    expect(classifyFetchFailure({ errorType: 'rate_limited', challenge: true }).reasonClass).toBe('challenge');
+  });
+
+  it('leaves a real rate limit as http_429', () => {
+    const err = new Error('rate limit hit, slow down');
+    expect(classifyFetchFailure({ error: err, errorType: 'rate_limited' }).reasonClass).toBe('http_429');
   });
 });
