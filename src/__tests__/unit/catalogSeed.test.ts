@@ -77,17 +77,36 @@ describe('assembleCatalog — seedLists (discovery)', () => {
       status: 'ok',
       siteId: 'examplestore',
       seedLists: [
-        { id: 'new-arrivals', cadence: 'daily', note: 'front shelf' },
-        { id: 'staff-picks', cadence: 'weekly' },
+        { id: 'new-arrivals', url: 'https://example.test/new', cadence: 'daily', note: 'front shelf' },
+        { id: 'staff-picks', url: 'https://example.test/picks', cadence: 'weekly' },
       ],
       count: 2,
     });
     expect(svc.fetchSearch).not.toHaveBeenCalled();
   });
 
-  it('never leaks the declared URLs — discovery names the lists, the seed axis fetches them', () => {
-    const out = assembleCatalog(services()).seedLists('examplestore');
-    expect(JSON.stringify(out)).not.toContain('https://example.test/new');
+  it('reports each list\'s url, so a poller can see when two ids resolve to the SAME page', () => {
+    const twins = {
+      ...STORE,
+      siteId: 'twins',
+      retrieval: {
+        seedLists: [
+          { id: 'new-arrivals', url: 'https://example.test/shelf', cadence: 'daily' },
+          { id: 'front-shelf', url: 'https://example.test/shelf', cadence: 'weekly' },
+        ],
+      },
+    } as unknown as StoreCapabilities;
+    const out = assembleCatalog(services({ stores: [twins] })).seedLists('twins');
+
+    // Both ids survive here: collapsing them is the CALLER's call (it credits both), not the
+    // engine's, which would otherwise make the second id unaddressable.
+    expect(out).toMatchObject({
+      status: 'ok',
+      seedLists: [
+        { id: 'new-arrivals', url: 'https://example.test/shelf' },
+        { id: 'front-shelf', url: 'https://example.test/shelf' },
+      ],
+    });
   });
 
   it('unsupported for an unknown store', () => {
@@ -119,7 +138,7 @@ describe('assembleCatalog — seedLists (discovery)', () => {
       },
     } as unknown as StoreCapabilities;
     const out = assembleCatalog(services({ stores: [messy] })).seedLists('messy');
-    expect(out).toEqual({ status: 'ok', siteId: 'messy', seedLists: [{ id: 'good', cadence: 'weekly' }], count: 1 });
+    expect(out).toEqual({ status: 'ok', siteId: 'messy', seedLists: [{ id: 'good', url: 'https://example.test/good', cadence: 'weekly' }], count: 1 });
   });
 });
 

@@ -51,7 +51,10 @@ const SEED_OK: SeedResult = {
 const SEEDS_OK: SeedListsResult = {
   status: 'ok',
   siteId: 'examplestore',
-  seedLists: [{ id: 'new-arrivals', cadence: 'daily', note: 'front shelf' }, { id: 'staff-picks', cadence: 'weekly' }],
+  seedLists: [
+    { id: 'new-arrivals', url: 'https://example.test/new', cadence: 'daily', note: 'front shelf' },
+    { id: 'staff-picks', url: 'https://example.test/picks', cadence: 'weekly' },
+  ],
   count: 2,
 };
 

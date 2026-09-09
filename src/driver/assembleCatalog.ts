@@ -73,11 +73,14 @@ export type IdRangeResult =
   | { status: 'failed'; siteId: string; reason: string };
 
 /**
- * One declared seed list as DISCOVERY reports it: the id it is addressed by and the operator-facing
- * metadata. Deliberately WITHOUT the url — discovery names the lists a store declares, the seed axis
- * is what fetches one; a caller that never needs the url can never mistakenly walk it itself.
+ * One declared seed list as DISCOVERY reports it: the id it is addressed by, the url it resolves to,
+ * and the operator-facing metadata. The url is reported (rather than kept engine-side) because a
+ * poller has to be able to tell that TWO declared ids resolve to the SAME page — an authoring slip
+ * that would otherwise cost a store one wholly redundant fetch per pass, on the one axis whose whole
+ * justification is that its cost is knowable in advance. Fetching a list is still the seed axis's
+ * job, never the caller's.
  */
-export type SeedListSummary = { id: string; cadence: SeedList['cadence']; note?: string };
+export type SeedListSummary = { id: string; url: string; cadence: SeedList['cadence']; note?: string };
 
 export type SeedListsResult =
   | { status: 'ok'; siteId: string; seedLists: SeedListSummary[]; count: number }
@@ -206,7 +209,7 @@ export function assembleCatalog(services: CatalogServices): Catalog {
       if (!caps) return { status: 'unsupported', siteId, reason: 'unknown store' };
       const lists = declaredSeedLists(caps.retrieval);
       if (lists.length === 0) return { status: 'unsupported', siteId, reason: 'store declares no seed lists' };
-      const seedLists: SeedListSummary[] = lists.map((l) => ({ id: l.id, cadence: l.cadence, ...(l.note ? { note: l.note } : {}) }));
+      const seedLists: SeedListSummary[] = lists.map((l) => ({ id: l.id, url: l.url, cadence: l.cadence, ...(l.note ? { note: l.note } : {}) }));
       return { status: 'ok', siteId, seedLists, count: seedLists.length };
     },
 
