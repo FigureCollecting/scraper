@@ -335,20 +335,39 @@ export function createImpitFetchDetailed(makeImpit: MakeImpit = defaultMakeImpit
 }
 
 /**
- * Build the impit BODY fetcher — {@link createImpitFetchDetailed}'s body, nothing else. The lookup's
- * fetchSearch dispatcher, /resolve and the plugins' own follow-up fetches all consume
- * `(url, opts?) => Promise<string>`; projecting the one fetcher keeps a single request path, so the
- * two lanes can never drift in profile, jar, prime discipline or timeout.
+ * Build BOTH impit surfaces over ONE session cache: `detailed` for the ingest path (which needs the
+ * response's status) and `body` for the lookup's fetchSearch dispatcher, /resolve and the plugins'
+ * own follow-up fetches (which consume `(url, opts?) => Promise<string>`).
+ *
+ * THE SESSION MUST BE SHARED. An Impit session owns a cookie jar and a prime ledger, and a
+ * Cloudflare clearance is bound to the session that minted it — so two factories mean two jars, two
+ * prime ledgers and a SECOND homepage prime per TTL on every session-gated host. Each of those is a
+ * real request spending the estate's scarcest resource, the egress IP's reputation, for a clearance
+ * the process already held.
  */
-export function createImpitFetch(makeImpit: MakeImpit = defaultMakeImpit, options: CreateImpitFetchOptions = {}) {
+export function createImpitFetchers(makeImpit: MakeImpit = defaultMakeImpit, options: CreateImpitFetchOptions = {}) {
   const detailed = createImpitFetchDetailed(makeImpit, options);
-  return async function impitFetchBody(url: string, opts: ImpitFetchOptions = {}): Promise<string> {
-    return (await detailed(url, opts)).body;
+  return {
+    detailed,
+    body: async function impitFetchBody(url: string, opts: ImpitFetchOptions = {}): Promise<string> {
+      return (await detailed(url, opts)).body;
+    },
   };
 }
 
+/**
+ * Build a standalone impit BODY fetcher. Its OWN session — use {@link createImpitFetchers} when a
+ * caller needs both surfaces, or the two will prime the same gated host twice.
+ */
+export function createImpitFetch(makeImpit: MakeImpit = defaultMakeImpit, options: CreateImpitFetchOptions = {}) {
+  return createImpitFetchers(makeImpit, options).body;
+}
+
+/** The engine's default impit session — ONE per process, shared by both exports below. */
+const defaultImpitFetchers = createImpitFetchers();
+
 /** The engine's default status-aware impit fetcher (the ingest path's impersonate lane). */
-export const impitFetchBodyDetailed = createImpitFetchDetailed();
+export const impitFetchBodyDetailed = defaultImpitFetchers.detailed;
 
 /** The engine's default impit fetcher (real native impit, per-profile cookie jar, chrome142 default profile). */
-export const impitFetchBody = createImpitFetch();
+export const impitFetchBody = defaultImpitFetchers.body;

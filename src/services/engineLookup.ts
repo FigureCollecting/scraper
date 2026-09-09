@@ -109,8 +109,13 @@ export function createHttpFetch(options: { store?: CfCookieSource } = {}) {
 /** The engine's default status-aware plain-HTTP fetcher (the ingest path's http lane). */
 export const httpFetchBodyDetailed = createHttpFetchDetailed();
 
-/** The engine's default plain-HTTP fetcher (CfCookieStore singleton, module-load timeout). */
-export const httpFetchBody = createHttpFetch();
+/**
+ * The engine's default plain-HTTP fetcher (CfCookieStore singleton, module-load timeout) — the body
+ * of the very same fetcher above. This lane holds no session state (the cookie store is resolved per
+ * call), so a second instance would be harmless here rather than costly as it is on the impit lane;
+ * projecting the one instance anyway keeps "one fetcher per lane" true without exception.
+ */
+export const httpFetchBody = async (url: string): Promise<string> => (await httpFetchBodyDetailed(url)).body;
 
 /**
  * Build the cross-store Lookup from the engine's registered stores + the three search transports.

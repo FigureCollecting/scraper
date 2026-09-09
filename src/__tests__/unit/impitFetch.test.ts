@@ -20,7 +20,7 @@ jest.mock('impit', () => ({
   },
 }));
 
-import { createImpitFetch, createImpitFetchDetailed, resolveImpitTimeoutMs, type ImpitLike, type CookieJarLike } from '../../services/impitFetch';
+import { createImpitFetch, createImpitFetchDetailed, createImpitFetchers, resolveImpitTimeoutMs, type ImpitLike, type CookieJarLike } from '../../services/impitFetch';
 
 describe('createImpitFetch', () => {
   it('fetches via impit with the default chrome142 profile and returns the body text', async () => {
@@ -748,5 +748,71 @@ describe('createImpitFetchDetailed — status + final URL off the same impit res
       fetch: async () => ({ text: async () => 'PLAIN', status: 500, url: 'https://x.test/s' }),
     });
     await expect(createImpitFetch(fake)('https://x.test/s')).resolves.toBe('PLAIN');
+  });
+});
+
+/**
+ * ONE IMPIT INSTANCE PER PROCESS (review of PR #295). An Impit session owns a cookie jar and a prime
+ * ledger, and a Cloudflare clearance is bound to the session that minted it. Building the body lane
+ * and the detail lane from two separate factories gave the ingest path and the search//resolve path
+ * their own sessions: two homepage primes per TTL on every session-gated host, each one a real
+ * request against the estate's scarcest resource — the egress IP's reputation.
+ *
+ * createImpitFetchers hands out both surfaces over ONE session cache, which is what the module's
+ * default exports are built from.
+ */
+describe('createImpitFetchers — the two lanes share one session', () => {
+  const ORIGIN = 'https://gated.test';
+  const TARGET = 'https://gated.test/item/1';
+  const CHALLENGE = '<html><head><title>Just a moment...</title></head><body>cf</body></html>';
+  const REAL = '<html><body>real product page</body></html>';
+
+  /** A gated Impit that serves REAL only to a jar carrying clearance, and counts homepage primes. */
+  function gated() {
+    let primes = 0;
+    const make = (_browser: string, jar?: CookieJarLike): ImpitLike => ({
+      fetch: async (url) => {
+        if (url === ORIGIN || url === `${ORIGIN}/`) {
+          primes++;
+          await jar?.setCookie?.('cf_clearance=ok; Path=/', url);
+          return { text: async () => 'homepage', status: 200, url };
+        }
+        const cookies = (await jar?.getCookieString?.(url)) ?? '';
+        const ok = cookies.includes('cf_clearance');
+        return { text: async () => (ok ? REAL : CHALLENGE), status: ok ? 200 : 403, url };
+      },
+    });
+    return { make, primes: () => primes };
+  }
+
+  it('primes ONCE across both lanes', async () => {
+    const g = gated();
+    const { body, detailed } = createImpitFetchers(g.make);
+
+    const first = await body(TARGET, { browser: 'chrome142', prime: { url: ORIGIN } });
+    const second = await detailed(TARGET, { browser: 'chrome142', prime: { url: ORIGIN } });
+
+    expect(first).toBe(REAL);
+    expect(second.body).toBe(REAL);
+    expect(second.status).toBe(200);
+    expect(g.primes()).toBe(1);      // ONE session, one prime — not one per lane
+  });
+
+  it('serves the second lane from the FIRST lane\'s clearance (the jar is shared, not copied)', async () => {
+    const g = gated();
+    const { body, detailed } = createImpitFetchers(g.make);
+
+    await body(TARGET, { browser: 'chrome142', prime: { url: ORIGIN } });
+    // No prime option at all this time: only a shared jar can still carry the clearance.
+    await expect(detailed(TARGET, { browser: 'chrome142' })).resolves.toMatchObject({ body: REAL });
+    expect(g.primes()).toBe(1);
+  });
+
+  it('shows what two SEPARATE factories cost — the regression this replaces', async () => {
+    const g = gated();
+    await createImpitFetch(g.make)(TARGET, { browser: 'chrome142', prime: { url: ORIGIN } });
+    await createImpitFetchDetailed(g.make)(TARGET, { browser: 'chrome142', prime: { url: ORIGIN } });
+
+    expect(g.primes()).toBe(2);      // two sessions, two primes, two hits on the egress IP
   });
 });
