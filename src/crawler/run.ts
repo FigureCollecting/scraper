@@ -47,6 +47,9 @@ async function main(): Promise<void> {
     ledgerStore: createFileLedgerStore(config.ledgerDir),
     ...(reporter ? { reportFailure: (report) => reporter.report(report) } : {}),
   });
+  // Every emit point is fire-and-forget and the process exits the instant this resolves, which
+  // aborts an open socket: drain before returning or the pass's last report never lands.
+  if (reporter) await reporter.drain();
 }
 
 main()

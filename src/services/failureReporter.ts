@@ -50,6 +50,11 @@ const INTERNAL_MAX_TRIES = 2;
 /** The server caps `message` at 1 KB; trim here so the wire never carries what will be discarded. */
 const MAX_MESSAGE_BYTES = 1024;
 /**
+ * How long drain() waits for the reports still on the wire. Long enough for a normal round trip and
+ * the UNAVAILABLE ladder's first sleep, short enough that a hung spine cannot hold a CronJob open.
+ */
+export const DEFAULT_DRAIN_TIMEOUT_MS = 5_000;
+/**
  * How long a cooldown report suppresses the NEXT report for the same target when the producer gave
  * no usable hint. Matches challengeCooldown's own default window.
  */
@@ -177,6 +182,13 @@ export class FailureReporter {
   private readonly now: () => number;
   /** target key → epoch ms until which a further COOLDOWN report is suppressed. */
   private readonly cooldownUntil = new Map<string, number>();
+  /**
+   * Reports still on the wire. EVERY emit point is fire-and-forget, and both CronJob entrypoints
+   * end with process.exit(0) the moment the pass resolves — which aborts an open socket. Without
+   * this set the last report of every pass (and, in a pass that only skipped cooling hosts, EVERY
+   * report) would die exactly as it did before this feature existed.
+   */
+  private readonly inFlight = new Set<Promise<void>>();
 
   constructor(options: FailureReporterOptions) {
     this.client =
@@ -191,7 +203,41 @@ export class FailureReporter {
    * Report ONE terminal fetch failure. Resolves either way: a refused, dropped, or undeliverable
    * report is counted and logged, never thrown — the caller's own failure handling is untouched.
    */
-  async report(report: FetchFailureReport): Promise<void> {
+  report(report: FetchFailureReport): Promise<void> {
+    const settled = this.deliver(report);
+    const tracked = settled.finally(() => {
+      this.inFlight.delete(tracked);
+    });
+    this.inFlight.add(tracked);
+    return tracked;
+  }
+
+  /**
+   * Wait for every in-flight report to settle, bounded by `timeoutMs`. Call it at the seam where a
+   * process is about to exit; it never rejects, and a report still unsettled at the deadline is
+   * abandoned rather than allowed to hold the process open.
+   */
+  async drain(timeoutMs: number = DEFAULT_DRAIN_TIMEOUT_MS): Promise<void> {
+    const deadline = this.now() + Math.max(0, timeoutMs);
+    // A loop, not one allSettled: a report may be fired while an earlier one is still draining.
+    while (this.inFlight.size > 0) {
+      const remaining = deadline - this.now();
+      if (remaining <= 0) break;
+      let timer: NodeJS.Timeout | undefined;
+      const expiry = new Promise<'timeout'>((resolve) => {
+        timer = setTimeout(() => resolve('timeout'), remaining);
+        timer.unref?.();
+      });
+      const outcome = await Promise.race([Promise.allSettled([...this.inFlight]).then(() => 'done' as const), expiry]);
+      if (timer) clearTimeout(timer);
+      if (outcome === 'timeout') break;
+    }
+    if (this.inFlight.size > 0) {
+      console.warn(`[FAILURE LEDGER] ${this.inFlight.size} report(s) abandoned undelivered at the drain deadline`);
+    }
+  }
+
+  private async deliver(report: FetchFailureReport): Promise<void> {
     try {
       // The spine would answer INVALID_ARGUMENT for either of these; refusing locally keeps a
       // producer bug out of the retry ladder and off the server's error budget.

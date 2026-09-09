@@ -302,3 +302,67 @@ describe('fetchFailureReportView', () => {
     expect(fetchFailureReportView().reported).toBe(0);
   });
 });
+
+describe('FailureReporter — drain (the CronJob entrypoints exit the moment the pass resolves)', () => {
+  /** A client that only answers when the test releases it, on a later macrotask. */
+  function gatedClient() {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const calls: any[] = [];
+    const client: FetchFailureClient = {
+      reportFetchFailure: async (message: any) => {
+        await gate;
+        calls.push(message);
+        return { id: 'row-1', attempts: 1, reviewStatus: 2, reopened: false } as any;
+      },
+    };
+    return { client, calls, release };
+  }
+
+  it('waits for a fire-and-forget report that has not reached the wire yet', async () => {
+    const { client, calls, release } = gatedClient();
+    const reporter = new FailureReporter({ client });
+
+    // Exactly what every emit point does: fire, never await.
+    void reporter.report(baseReport()).catch(() => {});
+
+    let drained = false;
+    const draining = reporter.drain(5_000).then(() => { drained = true; });
+
+    await Promise.resolve();
+    expect(drained).toBe(false); // process.exit(0) here would destroy the report
+    expect(calls).toHaveLength(0);
+
+    release();
+    await draining;
+    expect(drained).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(fetchFailureReportView().reported).toBe(1);
+  });
+
+  it('returns immediately with nothing in flight', async () => {
+    const { client } = fakeClient();
+    await expect(new FailureReporter({ client }).drain(50)).resolves.toBeUndefined();
+  });
+
+  it('gives up at the deadline rather than holding the pass open on a hung spine', async () => {
+    const { client } = gatedClient(); // never released
+    const reporter = new FailureReporter({ client });
+    void reporter.report(baseReport()).catch(() => {});
+
+    const started = Date.now();
+    await reporter.drain(20);
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  it('never rejects, even when every in-flight report fails', async () => {
+    const client: FetchFailureClient = {
+      reportFetchFailure: async () => { throw new ConnectError('nope', Code.InvalidArgument); },
+    };
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    const reporter = new FailureReporter({ client });
+    void reporter.report(baseReport()).catch(() => {});
+    await expect(reporter.drain(1_000)).resolves.toBeUndefined();
+    expect(fetchFailureReportView().failed).toBe(1);
+  });
+});
