@@ -81,6 +81,14 @@ export interface ImageFetchOptions {
   proxyUrl?: string;
   /** Per-request budget (ms); the lane clamps/defaults it. */
   timeoutMs?: number;
+  /**
+   * Extra check on the URL the bytes actually came from, AFTER redirects. Every lane follows them
+   * and `chooseImageLane` only ever saw the requested URL, so this is where a caller re-asserts a
+   * decision a redirect could have invalidated — most importantly that a RESIDENTIAL fetch is still
+   * on the declaring store's own hosts. Returning false refuses the result. The permaban is enforced
+   * by the lanes themselves and needs no guard.
+   */
+  allowFinalUrl?: (finalUrl: string) => boolean;
 }
 
 /**
@@ -152,6 +160,14 @@ export function classifyImageBytes(contentType: string | undefined | null, bytes
   if (declared !== '' && !GENERIC_CONTENT_TYPE.test(declared)) return { image: false };
   const sniffed = SIGNATURES.find(s => s.test(bytes));
   return sniffed ? { image: true, contentType: sniffed.contentType } : { image: false };
+}
+
+/**
+ * The refusal a lane returns when the bytes came from somewhere the decision did not allow — a
+ * redirect into a denied host, or off the declaring store on a residential fetch.
+ */
+export function refusedFinalUrl(finalUrl: string, why: string): ImageBytesFailure {
+  return { ok: false, reason: 'refused', detail: `the bytes came from ${finalUrl}, which ${why}` };
 }
 
 /**

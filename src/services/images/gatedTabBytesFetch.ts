@@ -21,6 +21,7 @@
 import { ChallengeLaneUnavailableError } from '../browserChallenge.js';
 import { ResidentialEgressUnavailableError, getResidentialProxyUrl } from '../residentialEgress.js';
 import type { EgressKind } from '../gatedBrowsers.js';
+import { isDeniedImageUrl } from './imageHostPolicy.js';
 import {
   BLOCK_SIGNAL_HEADERS,
   CAPTURED_IMAGE_HEADERS,
@@ -30,6 +31,7 @@ import {
   imageTooLarge,
   isTimeoutError,
   overImageSizeCap,
+  refusedFinalUrl,
   type ImageBytesResult,
   type ImageFetchOptions,
 } from './imageBytes.js';
@@ -180,12 +182,18 @@ export function createGatedTabBytesFetch(
         if (!classified.image) {
           return { ok: false, reason: 'not-image', status, ...(servedType ? { contentType: servedType } : {}) };
         }
+        const finalUrl = response.url() || url;
+        // A navigation follows redirects like every other lane — re-assert the ban, then the guard.
+        if (isDeniedImageUrl(finalUrl)) return refusedFinalUrl(finalUrl, 'is on the image deny list');
+        if (opts.allowFinalUrl && !opts.allowFinalUrl(finalUrl)) {
+          return refusedFinalUrl(finalUrl, 'the caller\'s final-URL guard rejected');
+        }
         return {
           ok: true,
           bytes,
           contentType: classified.contentType as string,
           status,
-          finalUrl: response.url() || url,
+          finalUrl,
           headers,
         };
       }, {

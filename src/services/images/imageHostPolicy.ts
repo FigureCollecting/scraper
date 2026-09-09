@@ -78,17 +78,34 @@ function hostOf(url: string): string | undefined {
   return normalizeHost(parsed.hostname);
 }
 
+/** Whether a host is on the hardcoded permaban (exact host, or any host under it). */
+function isBannedHost(host: string): boolean {
+  const target = normalizeHost(host);
+  return DENIED_IMAGE_HOSTS.map(normalizeHost).some(ban => target === ban || target.endsWith(`.${ban}`));
+}
+
+/**
+ * Whether a URL lands on a permanently-denied host. Exported for the LANES: `chooseImageLane` sees
+ * only the URL that was requested, and every lane follows redirects, so an allowed CDN answering a
+ * 302 into a banned host would otherwise deliver its bytes. This is the ban re-asserted on what the
+ * bytes actually came from. A URL that does not parse, or is not http(s), is denied too — it is not
+ * something these lanes fetched on purpose.
+ */
+export function isDeniedImageUrl(url: string): boolean {
+  const host = hostOf(url);
+  return host === undefined || isBannedHost(host);
+}
+
 /** Build a policy over an already-validated table, with the permaban re-imposed on top. */
 export function buildImageHostPolicy(table: Record<string, ImageHostRule>): ImageHostPolicy {
   const rules = new Map<string, ImageHostRule>();
   for (const [host, rule] of Object.entries(table)) rules.set(normalizeHost(host), rule);
-  const denied = DENIED_IMAGE_HOSTS.map(normalizeHost);
   return {
     ruleFor(host: string): ImageHostRule {
       const target = normalizeHost(host);
       // The ban is answered BEFORE the table is consulted at all — not merged into it, or a
       // configured entry for a SUBDOMAIN of a banned host (a longer suffix) would outrank it.
-      if (denied.some(ban => target === ban || target.endsWith(`.${ban}`))) return { deny: true };
+      if (isBannedHost(target)) return { deny: true };
       let best: { key: string; rule: ImageHostRule } | undefined;
       for (const [key, rule] of rules) {
         // Exact host, or a host UNDER it — the dot is load-bearing: `nototakumode.com` merely ends

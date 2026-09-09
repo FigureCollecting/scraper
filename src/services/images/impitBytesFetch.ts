@@ -27,6 +27,7 @@ import {
   type ImpitResponseLike,
   type MakeImpit,
 } from '../impitFetch.js';
+import { isDeniedImageUrl } from './imageHostPolicy.js';
 import {
   BLOCK_SIGNAL_HEADERS,
   CAPTURED_IMAGE_HEADERS,
@@ -36,6 +37,7 @@ import {
   imageTooLarge,
   isTimeoutError,
   overImageSizeCap,
+  refusedFinalUrl,
   type ImageBytesFetcher,
   type ImageBytesResult,
 } from './imageBytes.js';
@@ -154,12 +156,18 @@ export function createImpitBytesFetch(options: ImpitBytesFetchOptions = {}): Ima
         ...(served ? { contentType: served } : {}),
       };
     }
+    const finalUrl = typeof res.url === 'string' && res.url !== '' ? res.url : url;
+    // impit follows redirects too — the ban, then the caller's guard, on what actually served.
+    if (isDeniedImageUrl(finalUrl)) return refusedFinalUrl(finalUrl, 'is on the image deny list');
+    if (opts.allowFinalUrl && !opts.allowFinalUrl(finalUrl)) {
+      return refusedFinalUrl(finalUrl, 'the caller\'s final-URL guard rejected');
+    }
     return {
       ok: true,
       bytes,
       contentType: classified.contentType as string,
       status: typeof res.status === 'number' ? res.status : 200,
-      finalUrl: typeof res.url === 'string' && res.url !== '' ? res.url : url,
+      finalUrl,
       headers: headerSubset,
     };
   };

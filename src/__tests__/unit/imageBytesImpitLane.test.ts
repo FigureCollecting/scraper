@@ -157,6 +157,12 @@ describe('createImpitBytesFetch', () => {
       .toMatchObject({ ok: true, finalUrl: 'https://cdn.anitoysgk.com/a.png' });
   });
 
+  it('REFUSES bytes that came from a DENIED host after a redirect', async () => {
+    const { impit } = fakeImpit(() => impitResponse({ url: 'https://cdn.otakumode.com/i/1.png' }));
+    expect(await createImpitBytesFetch({ getImpit: async () => impit })('https://cdn.anitoysgk.com/a.png'))
+      .toMatchObject({ ok: false, reason: 'refused' });
+  });
+
   it('carries the referer only when asked, and no user-agent header when none is given', async () => {
     const { impit, fetch } = fakeImpit(() => impitResponse());
     await createImpitBytesFetch({ getImpit: async () => impit })('https://cdn.anitoysgk.com/a.png');

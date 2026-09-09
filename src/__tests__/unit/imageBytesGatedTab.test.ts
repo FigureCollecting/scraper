@@ -31,7 +31,7 @@ interface FakeRespInit {
 const resp = (init: FakeRespInit = {}) => ({
   status: () => init.status ?? 200,
   url: () => init.url ?? 'https://cdn.anitoysgk.com/a.png',
-  headers: () => ({ 'content-type': init.contentType ?? 'image/png', 'content-length': '12' }),
+  headers: (): Record<string, string> => ({ 'content-type': init.contentType ?? 'image/png', 'content-length': '12' }),
   buffer: async () => {
     if (init.bufferFails) throw new Error('Could not load body for this request');
     return init.body ?? PNG;
@@ -200,6 +200,12 @@ describe('createGatedTabBytesFetch', () => {
     );
 
     expect(withPage.mock.calls[0][1]).toMatchObject({ proxyServer: 'socks5://engine.test:1055' });
+  });
+
+  it('REFUSES bytes that came from a DENIED host after a redirect', async () => {
+    const { page } = fakePage([resp({ url: 'https://cdn.otakumode.com/i/1.png' })]);
+    expect(await createGatedTabBytesFetch(laneFor(page).lane)('direct', 'anitoysgk.com', 'https://cdn.anitoysgk.com/a.png'))
+      .toMatchObject({ ok: false, reason: 'refused' });
   });
 
   it('falls back to the served response body when the event-time buffer could not be read', async () => {

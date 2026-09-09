@@ -8,6 +8,7 @@
  * carries the very wording `refuseHttpLaneResidentialEgress` throws for the string lane.
  */
 import { httpLaneResidentialRefusal } from '../residentialEgress.js';
+import { isDeniedImageUrl } from './imageHostPolicy.js';
 import {
   BLOCK_SIGNAL_HEADERS,
   CAPTURED_IMAGE_HEADERS,
@@ -17,6 +18,7 @@ import {
   imageTooLarge,
   isTimeoutError,
   overImageSizeCap,
+  refusedFinalUrl,
   type ImageBytesFetcher,
   type ImageBytesResult,
 } from './imageBytes.js';
@@ -111,12 +113,19 @@ export function createHttpBytesFetch(options: HttpBytesFetchOptions = {}): Image
     if (!classified.image) {
       return { ok: false, reason: 'not-image', status: res.status, ...(served ? { contentType: served } : {}) };
     }
+    const finalUrl = res.url && res.url !== '' ? res.url : url;
+    // REDIRECTS: the lane follows them, and the lane decision only ever saw the REQUESTED url. The
+    // permaban is re-asserted on what the bytes actually came from, then the caller's own guard.
+    if (isDeniedImageUrl(finalUrl)) return refusedFinalUrl(finalUrl, 'is on the image deny list');
+    if (opts.allowFinalUrl && !opts.allowFinalUrl(finalUrl)) {
+      return refusedFinalUrl(finalUrl, 'the caller\'s final-URL guard rejected');
+    }
     return {
       ok: true,
       bytes,
       contentType: classified.contentType as string,
       status: res.status,
-      finalUrl: res.url && res.url !== '' ? res.url : url,
+      finalUrl,
       headers: headerSubset(res),
     };
   };

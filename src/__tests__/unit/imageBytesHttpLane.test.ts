@@ -164,6 +164,21 @@ describe('createHttpBytesFetch', () => {
       .rejects.toThrow(/ECONNRESET/);
   });
 
+  it('REFUSES bytes that came from a DENIED host after a redirect', async () => {
+    const redirected = jest.fn(async (_url: string, _init: FakeInit) => response({ url: 'https://cdn.otakumode.com/i/1.png' }));
+    const result = await createHttpBytesFetch({ fetchImpl: redirected as never })('https://cdn.example.com/a.png');
+    expect(result).toMatchObject({ ok: false, reason: 'refused' });
+    expect((result as { detail?: string }).detail).toMatch(/deny list/);
+  });
+
+  it('honours the caller\'s finalUrl guard — a redirect off the declaring store is refused', async () => {
+    const redirected = jest.fn(async (_url: string, _init: FakeInit) => response({ url: 'https://tracker.example/i.png' }));
+    const result = await createHttpBytesFetch({ fetchImpl: redirected as never })('https://cdn.example.com/a.png', {
+      allowFinalUrl: (finalUrl: string) => finalUrl.startsWith('https://cdn.example.com/'),
+    });
+    expect(result).toMatchObject({ ok: false, reason: 'refused' });
+  });
+
   it('falls back to the requested URL when the response reports none', async () => {
     const fetchImpl = jest.fn(async (_url: string, _init: FakeInit) => ({ ...response(), url: '' }));
     const result = await createHttpBytesFetch({ fetchImpl: fetchImpl as never })('https://cdn.example.com/a.png');
