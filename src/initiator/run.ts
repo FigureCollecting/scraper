@@ -9,6 +9,7 @@
 import dotenv from 'dotenv';
 import { loadInitiatorConfig } from './config.js';
 import { runInitiatorPass, type FetchLike } from './initiator.js';
+import { createFailureReporterFromEnv } from '../services/failureReporter.js';
 import { logger } from '../utils/logger.js';
 
 dotenv.config();
@@ -30,7 +31,13 @@ async function main(): Promise<void> {
     passDeadlineMs: config.passDeadlineMs,
     lookupRetryDelayMs: config.lookupRetryDelayMs,
   });
-  await runInitiatorPass(config, { fetch: httpFetch });
+  // The durable fetch-failure ledger (INGEST_BASE_URL + REPORT_FETCH_FAILURES). Null = off, and
+  // every emit point in the pass is a no-op.
+  const reporter = createFailureReporterFromEnv();
+  await runInitiatorPass(config, {
+    fetch: httpFetch,
+    ...(reporter ? { reportFailure: (report) => reporter.report(report) } : {}),
+  });
 }
 
 main()

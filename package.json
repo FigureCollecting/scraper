@@ -30,7 +30,7 @@
     "@connectrpc/connect": "^2.1.2",
     "@connectrpc/connect-node": "^2.1.2",
     "@figurecollecting/fc-shared": "^1.6.0",
-    "@figurecollecting/ingest-contract": "^0.2.1",
+    "@figurecollecting/ingest-contract": "^0.3.0",
     "@figurecollecting/scraper-plugin-contract": "file:packages/plugin-contract",
     "@opentelemetry/api": "^1.9.1",
     "@opentelemetry/auto-instrumentations-node": "^0.80.0",

@@ -19,6 +19,7 @@ const build = (over: Partial<HealthDeps> = {}) => {
     getResidentialEgress: () => ({ configured: false }),
     getBrowserLane: () => ({ launchMode: 'headless', residentialTimezone: null, directTimezone: null, processTimezone: null, gatedBrowsers: [] }),
     getRawStore: () => ({ configured: false }),
+    getFailureLedger: () => ({ enabled: false, reported: 0, failed: 0, suppressed: 0 }),
     ...over,
   }));
   return app;
@@ -353,5 +354,39 @@ describe('createHealthRoutes — rawStore counters', () => {
     const res = await request(app).get('/health/detailed');
     expect(res.status).toBe(500);
     expect(res.body.rawStore).toEqual({ configured: true, stats: STATS });
+  });
+});
+
+/**
+ * FETCH-FAILURE LEDGER counters: whether the engine is reporting terminal fetch failures at all,
+ * and how that reporting is going. A ledger nobody is writing to looks exactly like a healthy crawl
+ * from outside the pod, which is the failure mode this block exists to make visible.
+ */
+describe('createHealthRoutes — failureLedger', () => {
+  it('GET /health/detailed reports the ledger counters', async () => {
+    const app = build({ getFailureLedger: () => ({ enabled: true, reported: 12, failed: 1, suppressed: 4 }) });
+
+    const res = await request(app).get('/health/detailed');
+
+    expect(res.status).toBe(200);
+    expect(res.body.failureLedger).toEqual({ enabled: true, reported: 12, failed: 1, suppressed: 4 });
+  });
+
+  it('shows reporting OFF when no reporter was built', async () => {
+    const res = await request(build()).get('/health/detailed');
+
+    expect(res.body.failureLedger).toEqual({ enabled: false, reported: 0, failed: 0, suppressed: 0 });
+  });
+
+  it('keeps the counters on the degraded (500) response too', async () => {
+    const app = build({
+      getBrowserPoolHealth: async () => { throw new Error('pool down'); },
+      getFailureLedger: () => ({ enabled: true, reported: 3, failed: 0, suppressed: 0 }),
+    });
+
+    const res = await request(app).get('/health/detailed');
+
+    expect(res.status).toBe(500);
+    expect(res.body.failureLedger).toEqual({ enabled: true, reported: 3, failed: 0, suppressed: 0 });
   });
 });

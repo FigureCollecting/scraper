@@ -28,6 +28,8 @@ import { sanitizeForLog } from '../utils/security.js';
 import { isCloudflareChallenge } from '../services/engineServices/challengeDetect.js';
 import { getChallengeCooldown, normalizeHost, type ChallengeCooldown } from '../services/challengeCooldown.js';
 import { getCfCookieStore, markStaleIfStored, markFreshIfStored, type CfCookieStoreLike } from '../services/cookieJar.js';
+import { classifyFetchFailure } from '../services/failureClassifier.js';
+import type { FetchFailureReport, ReportFetchFailure } from '../services/failureReporter.js';
 import type { ProfileRegistry } from './profileRegistry.js';
 import type {
   ExtractionRuleset,
@@ -142,6 +144,13 @@ export interface LookupServices {
    * process-wide singleton; tests inject a fake. Never read for the fetch itself (the lanes do that).
    */
   cfCookieStore?: CfCookieStoreLike;
+  /**
+   * The durable fetch-failure ledger seam (createFailureReporterFromEnv). Optional — absent means
+   * reporting is OFF and every emit point is a no-op. The fan-out is terminal by construction (one
+   * pass, one attempt per store), so each of its exits reports exactly once, keyed on the
+   * environment-free `fc:search/<siteId>?q=…&mode=…` target.
+   */
+  reportFailure?: ReportFetchFailure;
 }
 
 export interface StoreLookupResult {
@@ -205,6 +214,26 @@ export interface Lookup {
   lookupByIdentity(identity: IdentityQuery, opts?: { mode?: LookupMode; stores?: string[] }): Promise<LookupResult>;
 }
 
+/**
+ * The CANONICAL ledger target for one store's search of one query (spec §1.1). Not the store's real
+ * search URL: the ledger needs one stable identity per (store, query, mode) so a repeat failure
+ * bumps `attempts` instead of forking a second row when a template changes.
+ */
+export function searchFailureTarget(siteId: string, query: string, mode: LookupMode): string {
+  return `fc:search/${siteId}?q=${encodeURIComponent(query)}&mode=${mode}`;
+}
+
+/**
+ * The reason for something thrown inside the fan-out's per-store try. The classifier recognizes the
+ * transport shapes (withTimeout's rejection, a socket fault, a challenge); anything it cannot name
+ * got past the fetch and died in the parser, which is `parse` — OUR fault, the operator's queue —
+ * never the catch-all `other` triage bucket.
+ */
+function parseOrClassified(err: unknown): FetchFailureReport['reasonClass'] {
+  const { reasonClass } = classifyFetchFailure({ error: err });
+  return reasonClass === 'other' ? 'parse' : reasonClass;
+}
+
 /** Representative `query` label for a record-mode result: the JAN if present, else the composed name. */
 const identityLabel = (identity: IdentityQuery): string => identity.gtin14 ?? composeNameQuery(identity) ?? '';
 
@@ -227,17 +256,42 @@ export function assembleLookup(services: LookupServices): Lookup {
     const resolveTargets: ResolveTarget[] = [];
     const cd = services.challengeCooldown ?? getChallengeCooldown();
     const cfStore = services.cfCookieStore ?? getCfCookieStore();
+    /**
+     * Fire ONE ledger row. Best effort in every direction: no reporter is a no-op, and neither a
+     * synchronous throw nor a rejected report may take a store — let alone the whole fan-out —
+     * down. The fan-out's own `failed`/`cooldown` lists are the caller's contract and never move.
+     */
+    const emitFailure = (report: FetchFailureReport): void => {
+      if (!services.reportFailure) return;
+      try {
+        void Promise.resolve(services.reportFailure(report)).catch(() => {});
+      } catch {
+        // bookkeeping never breaks a search
+      }
+    };
     // CHALLENGE COOLDOWN gate (shared by detail AND search plans): this host is cooling from a recent
     // CF challenge — SKIP it WITHOUT fetching (a challenge fetch degrades the egress IP's CF
     // reputation) and list it under the additive `cooldown` list (the store is fine, we are
     // deliberately leaving its host alone). A cooling byId host must be gated HERE too, so its detail
     // target is never handed to the caller as a /resolve confirm that would fetch the cooling host.
-    const skipCooling = (p: { host: string; url: string; siteId: string }): boolean => {
+    const skipCooling = (p: { host: string; url: string; siteId: string }, kind: 'search' | 'record'): boolean => {
       if (!cd.isOpen(p.host)) return false;
-      const minsLeft = Math.max(1, Math.ceil(cd.remaining(p.host) / 60_000));
+      const remainingMs = cd.remaining(p.host);
+      const minsLeft = Math.max(1, Math.ceil(remainingMs / 60_000));
       // eslint-disable-next-line no-console
       console.warn(`[COOLDOWN] skipped ${sanitizeForLog(p.url)} (${normalizeHost(p.host)} cooling, ${minsLeft} min left)`);
       cooldown.push(p.siteId);
+      // E3 — a cooldown SKIP is reported (the operator asked to see hosts we are deliberately
+      // leaving alone), carrying the window's end so the spine's backoff is never pulled forward.
+      emitFailure({
+        site: p.siteId,
+        target: kind === 'search' ? searchFailureTarget(p.siteId, query, mode) : p.url,
+        kind,
+        origin: 'lookup',
+        reasonClass: 'cooldown',
+        message: `host ${normalizeHost(p.host)} is cooling after a Cloudflare challenge; ${minsLeft} min remaining`,
+        nextRetryHint: new Date(Date.now() + remainingMs).toISOString(),
+      });
       return true;
     };
 
@@ -247,7 +301,7 @@ export function assembleLookup(services: LookupServices): Lookup {
         // UNVERIFIED (we haven't fetched it), so segregate it into resolveTargets — never surface it
         // as a phantom candidate (no name=barcode into the matcher, no unfetched hit in orderable mode).
         if (p.kind === 'detail') {
-          if (skipCooling(p)) return null; // cooling host → cooldown list, never a resolveTarget
+          if (skipCooling(p, 'record')) return null; // cooling host → cooldown list, never a resolveTarget
           resolveTargets.push({ siteId: p.siteId, host: p.host, itemId: p.itemId ?? '', url: p.url });
           return null;
         }
@@ -257,7 +311,7 @@ export function assembleLookup(services: LookupServices): Lookup {
           unsupported.push(p.siteId); // has a bySearch URL but no parser yet
           return null;
         }
-        if (skipCooling(p)) return null;
+        if (skipCooling(p, 'search')) return null;
         const retrieval = services.profiles.retrievalFor(p.host);
         const scope = retrieval?.bySearch?.scope ?? 'listed';
         if (mode === 'listed' && scope === 'orderable') orderableOnly.push(p.siteId);
@@ -279,6 +333,17 @@ export function assembleLookup(services: LookupServices): Lookup {
             // marked once via the lane that fetched (a host without stored cookies is never marked).
             markStaleIfStored(cfStore, p.url, normalizeHost(p.host), transport.transport ?? 'http', 'search challenge page');
             failed.push(p.siteId);
+            // E4 — the body WAS fetched and it was an interstitial: a real, attempted failure.
+            emitFailure({
+              site: p.siteId,
+              target: searchFailureTarget(p.siteId, query, mode),
+              kind: 'search',
+              origin: 'lookup',
+              reasonClass: 'challenge',
+              message: `search returned a Cloudflare challenge page for ${p.url}`,
+              transport: transport.transport ?? 'http',
+              ...(ruleset.version !== undefined ? { rulesetVersion: ruleset.version } : {}),
+            });
             return null;
           }
           // A clean body for a host WITH stored cookies is the FRESH signal (clears a stale mark).
@@ -317,6 +382,19 @@ export function assembleLookup(services: LookupServices): Lookup {
           // eslint-disable-next-line no-console
           console.warn(`[lookup] ${sanitizeForLog(p.siteId)} search failed: ${sanitizeForLog(err instanceof Error ? err.message : String(err))}`);
           failed.push(p.siteId);
+          // E5 — the fan-out's own catch: a bounded-fetch timeout, a transport fault, or the
+          // ruleset's extractCandidates throwing on a body we DID fetch. The classifier separates
+          // withTimeout's rejection from the rest; anything that reached the parser is `parse`
+          // (our selector, our problem) rather than a transport class.
+          emitFailure({
+            site: p.siteId,
+            target: searchFailureTarget(p.siteId, query, mode),
+            kind: 'search',
+            origin: 'lookup',
+            reasonClass: parseOrClassified(err),
+            message: err instanceof Error ? err.message : String(err),
+            ...(ruleset.version !== undefined ? { rulesetVersion: ruleset.version } : {}),
+          });
           return null;
         }
       }),
