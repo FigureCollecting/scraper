@@ -282,9 +282,12 @@ export function createCapturingFetch(
         // FLAG a browser-lane interstitial like the other lanes (capture already happened inside
         // navigateAndCapture): the queue's honesty gate / extraction-throw door then give it the
         // same one-shot ChallengePageError + host cooldown instead of a retried empty_record.
-        // The browser lane has carried both fields all along (ScrapePageResult.statusCode / .url);
-        // they were simply dropped on the floor here.
-        const meta = metaFields({ status: page.statusCode, finalUrl: page.url });
+        // `page.url` is the REQUESTED url (navigateAndCapture echoes its own argument), so reading
+        // the final url from it compared the request against itself and the redirect-to-home signal
+        // could never fire on this lane — the default lane for every undeclared transport. The
+        // post-redirect location is `page.finalUrl`, and it is read with NO fallback: absent means
+        // the navigation reported none, which the gate must be able to tell from "ended elsewhere".
+        const meta = metaFields({ status: page.statusCode, finalUrl: page.finalUrl });
         if (isCloudflareChallenge(page.html)) {
           // eslint-disable-next-line no-console
           console.warn(`[FETCH] Cloudflare challenge/block page received for ${sanitizeForLog(url)} via browser transport`);

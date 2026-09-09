@@ -118,7 +118,7 @@ describe('createCapturingFetch', () => {
 
     const result = await fetch('https://rendered.example.test/item/1', { transport: 'browser' });
 
-    expect(result).toEqual({ html: '<html>BROWSER</html>', status: 200, finalUrl: 'https://rendered.example.test/item/1' });
+    expect(result).toEqual({ html: '<html>BROWSER</html>', status: 200 });
     expect(calls).toEqual([['scrapePage', 'https://rendered.example.test/item/1']]);
     // capturingFetch does not double-capture the browser lane (navigateAndCapture owns that)
     expect(sink.captures).toHaveLength(0);
@@ -131,7 +131,7 @@ describe('createCapturingFetch', () => {
 
     const result = await fetch('https://myfigurecollection.net/item/12345', undefined);
 
-    expect(result).toEqual({ html: '<html>BROWSER</html>', status: 200, finalUrl: 'https://myfigurecollection.net/item/12345' });
+    expect(result).toEqual({ html: '<html>BROWSER</html>', status: 200 });
     expect(calls).toEqual([['scrapePage', 'https://myfigurecollection.net/item/12345']]);
     expect(sink.captures).toHaveLength(0);
   });
@@ -144,7 +144,7 @@ describe('createCapturingFetch', () => {
 
     const result = await fetch('https://myfigurecollection.net/item/12345', undefined, { cookies });
 
-    expect(result).toEqual({ html: '<html>STEALTH</html>', status: 200, finalUrl: 'https://myfigurecollection.net/item/12345' });
+    expect(result).toEqual({ html: '<html>STEALTH</html>', status: 200 });
     expect(calls).toEqual([['scrapePageStealth', 'https://myfigurecollection.net/item/12345', { cookies }]]);
   });
 
@@ -236,7 +236,7 @@ describe('createCapturingFetch', () => {
       const fetch = createCapturingFetch(t, sink);
 
       const result = await fetch('https://myfigurecollection.net/item/12345', { transport: 'browser' });
-      expect(result).toEqual({ html: CHALLENGE, challenge: true, transport: 'browser', status: 200, finalUrl: 'https://myfigurecollection.net/item/12345' });
+      expect(result).toEqual({ html: CHALLENGE, challenge: true, transport: 'browser', status: 200 });
       expect(sink.captures).toHaveLength(0);        // browser lane captures itself (navigateAndCapture), not here
       const warnLines = warnSpy.mock.calls.map(c => String(c[0])).filter(l => l.includes('[FETCH] Cloudflare challenge/block page received'));
       expect(warnLines).toHaveLength(1);
@@ -248,7 +248,7 @@ describe('createCapturingFetch', () => {
       const { t } = makeTransports();
       const fetch = createCapturingFetch(t, new CollectingCaptureSink());
       const result = await fetch('https://myfigurecollection.net/item/12345', { transport: 'browser' });
-      expect(result).toEqual({ html: '<html>BROWSER</html>', status: 200, finalUrl: 'https://myfigurecollection.net/item/12345' });
+      expect(result).toEqual({ html: '<html>BROWSER</html>', status: 200 });
       expect(result).not.toHaveProperty('challenge');
     });
   });
@@ -356,7 +356,7 @@ describe('createCapturingFetch', () => {
       const fetch = createCapturingFetch(t, new CollectingCaptureSink(), { cookieStore });
       const result = await fetch('https://myfigurecollection.net/item/12345', undefined);
       expect(calls).toEqual([['scrapePageStealth', 'https://myfigurecollection.net/item/12345', {}]]);
-      expect(result).toEqual({ html: '<html>STEALTH</html>', status: 200, finalUrl: 'https://myfigurecollection.net/item/12345' });
+      expect(result).toEqual({ html: '<html>STEALTH</html>', status: 200 });
       expect(t.browser.scrapePage).not.toHaveBeenCalled();
     });
 
@@ -655,9 +655,10 @@ describe('createCapturingFetch — response metadata (status / finalUrl)', () =>
 
   it("surfaces the browser lane's statusCode and post-redirect url", async () => {
     const { t } = makeTransports();
-    t.browser.scrapePage = jest.fn(async () => ({
+    t.browser.scrapePage = jest.fn(async (url: string) => ({
       html: '<html>HOME</html>',
-      url: 'https://rendered.example.test/',
+      url,
+      finalUrl: 'https://rendered.example.test/',
       title: 'Home',
       statusCode: 200,
     })) as any;
@@ -701,5 +702,43 @@ describe('createCapturingFetch — response metadata (status / finalUrl)', () =>
       status: 403,
       finalUrl: 'https://cf.example.test/item/1',
     });
+  });
+});
+
+/**
+ * THE BROWSER LANE'S FINAL URL (review of PR #295). `ScrapePageResult.url` is the REQUESTED url —
+ * navigateAndCapture fills it with its own argument — so reading finalUrl from it compared the
+ * request against itself and the redirect-to-home signal could never fire on the browser lane,
+ * which is the DEFAULT lane for every undeclared transport. The post-redirect url is its own field
+ * now, and when the response never reported one it is ABSENT: a fabricated finalUrl is worse than
+ * none, because the gate would then be comparing a guess.
+ */
+describe('createCapturingFetch — the browser lane\'s post-redirect URL', () => {
+  it('carries the page\'s finalUrl when the navigation reported one', async () => {
+    const { t } = makeTransports();
+    t.browser.scrapePage = jest.fn(async (url: string) => ({
+      html: '<html>HOME</html>',
+      url,
+      finalUrl: 'https://rendered.example.test/',
+      title: 'Home',
+      statusCode: 200,
+    })) as any;
+    const fetch = createCapturingFetch(t, new CollectingCaptureSink());
+
+    await expect(fetch('https://rendered.example.test/item/1', { transport: 'browser' })).resolves.toEqual({
+      html: '<html>HOME</html>',
+      status: 200,
+      finalUrl: 'https://rendered.example.test/',
+    });
+  });
+
+  it('does NOT echo the requested url as the final one when the page reported none', async () => {
+    const { t } = makeTransports();   // the default fake returns { html, url, title, statusCode }
+    const fetch = createCapturingFetch(t, new CollectingCaptureSink());
+
+    const result = await fetch('https://rendered.example.test/item/1', { transport: 'browser' });
+
+    expect(result).toEqual({ html: '<html>BROWSER</html>', status: 200 });
+    expect(result).not.toHaveProperty('finalUrl');
   });
 });

@@ -85,6 +85,21 @@ function makeRegistry(ruleset: ExtractionRuleset, transport: 'http' | 'impersona
   return registry;
 }
 
+/** A registry declaring NO searchFetch — the ingest dispatcher defaults such a store to the browser lane. */
+function makeBrowserRegistry(ruleset: ExtractionRuleset): ExtractionRegistryImpl {
+  const registry = createExtractionRegistry();
+  registry.registerSite({
+    siteId: ruleset.siteId,
+    name: 'Rendered Store',
+    domains: [HOST],
+    rateLimit: { domain: HOST, baseDelayMs: 1000, minDelayMs: 500, maxDelayMs: 5000, backoffMultiplier: 1.5, recoveryDivisor: 1.5, successThreshold: 3 },
+    requiresBrowser: true,
+    allowedCookies: [],
+  });
+  registry.registerRuleset(ruleset);
+  return registry;
+}
+
 function makeScrapingStub() {
   const page = { html: FIXTURE_HTML, url: ITEM_URL, title: 'Item', statusCode: 200 };
   return { scrapePage: jest.fn().mockResolvedValue(page), scrapePageStealth: jest.fn().mockResolvedValue(page) };
@@ -387,6 +402,71 @@ describe('ScrapeQueue × record-fetch status gate', () => {
         { url: `https://${HOST}/item/${CANARY_ID}` });
 
       expect(sessionCanaryView().stale).toBe(false);
+    });
+  });
+
+  /**
+   * THE BROWSER LANE (review of PR #295). It is the DEFAULT lane for any store that declares no
+   * transport, and it was the one lane whose redirect signal could never fire: the result's `url` is
+   * the url that was REQUESTED, so the gate was comparing the request against itself. With the
+   * navigation's real post-redirect location on its own field, a rendered store that bounces a dead
+   * item to its front page finally lands in the ledger as redirect_home.
+   */
+  describe('browser lane — the default lane for an undeclared transport', () => {
+    /** Build the queue around a browser stub whose navigation ENDS somewhere other than the request. */
+    function buildBrowserQueue(page: Record<string, unknown>, send: jest.Mock): ScrapeQueue {
+      const q = new ScrapeQueue(false);
+      q.setPluginRegistry(makeBrowserRegistry(makeRuleset(extract)));
+      q.setIngestEmitter({ send });
+      q.setScrapingService({
+        scrapePage: jest.fn().mockResolvedValue(page),
+        scrapePageStealth: jest.fn().mockResolvedValue(page),
+      });
+      q.setChallengeCooldown(cd);
+      q.setFailureReporter({ report: async (r: FetchFailureReport) => { reports.push(r); } });
+      return q;
+    }
+
+    it('books a rendered item that landed on the store root as redirect_home', async () => {
+      const send = jest.fn().mockResolvedValue(HEALTHY_STATS);
+      queue = buildBrowserQueue(
+        { html: '<html>front page</html>', url: ITEM_URL, finalUrl: `https://${HOST}/`, title: 'Home', statusCode: 200 },
+        send,
+      );
+      const result = queue.enqueue(ITEM_URL, { url: ITEM_URL, maxRetries: 2 });
+      result.promise.catch(() => {});
+      await advanceUntil(() => queue.getStats().failed === 1 || queue.getStats().completed === 1);
+
+      expect(extract).not.toHaveBeenCalled();
+      expect(send).not.toHaveBeenCalled();
+      expect(reports).toHaveLength(1);
+      expect(reports[0]).toMatchObject({ reasonClass: 'redirect_home', transport: 'browser' });
+    });
+
+    it('leaves a rendered item that stayed on its own url completely alone', async () => {
+      const send = jest.fn().mockResolvedValue(HEALTHY_STATS);
+      queue = buildBrowserQueue(
+        { html: FIXTURE_HTML, url: ITEM_URL, finalUrl: ITEM_URL, title: 'Item', statusCode: 200 },
+        send,
+      );
+      const result = queue.enqueue(ITEM_URL, { url: ITEM_URL, maxRetries: 2 });
+      await advanceUntil(() => queue.getStats().completed === 1 || queue.getStats().failed === 1);
+      await result.promise;
+
+      expect(queue.getStats().completed).toBe(1);
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(reports).toHaveLength(0);
+    });
+
+    it('does not invent a redirect for a navigation that reported no final url at all', async () => {
+      const send = jest.fn().mockResolvedValue(HEALTHY_STATS);
+      queue = buildBrowserQueue({ html: FIXTURE_HTML, url: ITEM_URL, title: 'Item', statusCode: 200 }, send);
+      const result = queue.enqueue(ITEM_URL, { url: ITEM_URL, maxRetries: 2 });
+      await advanceUntil(() => queue.getStats().completed === 1 || queue.getStats().failed === 1);
+      await result.promise;
+
+      expect(queue.getStats().completed).toBe(1);
+      expect(reports).toHaveLength(0);
     });
   });
 });

@@ -429,7 +429,12 @@ async function navigateAndCapture(
 
   // Hand both lanes to the sink. Capturing must never break a scrape.
   const fetchedAt = new Date().toISOString();
-  const finalUrl = served?.url?.() ?? url;
+  // What the response says it came FROM, which after a redirect is not what we asked for. The sink
+  // has always been given the requested url as its fallback (a capture must be attributable either
+  // way); the RESULT carries only the real thing, so a reader can tell "ended elsewhere" from
+  // "nothing was reported" — see ScrapePageResult.finalUrl.
+  const servedUrl = served?.url?.();
+  const finalUrl = servedUrl ?? url;
   try {
     if (wire) {
       await sink.capture(buildRawCapture({
@@ -452,6 +457,7 @@ async function navigateAndCapture(
     url,
     title,
     statusCode: served?.status(),
+    ...(servedUrl ? { finalUrl: servedUrl } : {}),
   };
 }
 
