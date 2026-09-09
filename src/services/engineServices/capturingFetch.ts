@@ -161,6 +161,15 @@ export type CapturingFetch = (
   options?: { cookies?: Record<string, string> },
 ) => Promise<CapturingFetchResult>;
 
+/**
+ * The LANE a store's declared transport resolves to, in the dispatcher's own words: an UNDECLARED
+ * transport is the browser lane (the deliberate divergence documented in this file's header). Kept
+ * here so the queue can name the lane of a fetch failure without re-deriving that default rule.
+ */
+export function laneOf(searchFetch: SearchFetch | undefined): string {
+  return searchFetch?.transport ?? 'browser';
+}
+
 /** Hand a non-browser-lane body to the sink under the 'api' lane. Capturing must never break a fetch. */
 async function captureApiBody(sink: CaptureSink, url: string, body: string): Promise<void> {
   try {

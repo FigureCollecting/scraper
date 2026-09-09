@@ -26,12 +26,15 @@
  *             global budget, or a sick scraper is re-fetched next run (known ids skip).
  *             `nextPage` is ignored: a contradictory {hasMore:false, nextPage:N} exists.
  *
- * END-OF-CATALOG IS CONFIRMED, NEVER INFERRED FROM ONE PAGE. The engine's http fetch
- * is status-blind (a Shopify page-cap 400 or a transient 5xx parses as an empty
- * listing), so an empty / hasMore:false page only records an EXHAUSTION CANDIDATE at
- * that cursor and stops the run without advancing. Only when the NEXT run sees the
- * same cursor empty again is the store marked exhausted (cursor kept); items
- * reappearing clear the candidate. A last page CUT SHORT (cap / budget / sick
+ * END-OF-CATALOG IS CONFIRMED, NEVER INFERRED FROM ONE PAGE. The LISTING lane is still
+ * status-blind: /catalog rides the string-returning http fetch, so a Shopify page-cap
+ * 400 or a transient 5xx parses as an empty listing here exactly as before. (The RECORD
+ * lane no longer is — every ingest transport now surfaces {status, finalUrl} and the
+ * queue's status gate fails a 404/410/403/429/5xx as the store's own answer — but that
+ * says nothing about the page THIS pass just read.) So an empty / hasMore:false page
+ * only records an EXHAUSTION CANDIDATE at that cursor and stops the run without
+ * advancing. Only when the NEXT run sees the same cursor empty again is the store
+ * marked exhausted (cursor kept); items reappearing clear the candidate. A last page CUT SHORT (cap / budget / sick
  * scraper) is neither a candidate nor a confirmation: its marks are kept as they were
  * and the page is re-fetched next run. An exhausted store is re-checked at its last
  * cursor once exhaustedRecheckMs has elapsed.
@@ -752,7 +755,8 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
         return;
       }
       if (exhaustionSignal) {
-        // Never trust one empty page (status-blind upstream fetch). Confirm across runs at the SAME cursor.
+        // Never trust one empty page (the LISTING fetch is still status-blind — see the header).
+        // Confirm across runs at the SAME cursor.
         if (b.exhaustedAt !== undefined || b.exhaustCandidateCursor === cursor) {
           clearExhaustion(ledger);
           b.exhaustedAt = iso();

@@ -52,6 +52,12 @@ describe('evaluateRecordFetch — an item URL that landed on the store home page
     expect(failure!.message).toContain('home');
   });
 
+  it('flags the redirect from a lane that surfaced the final URL but NO status (browser without a statusCode)', () => {
+    const failure = evaluateRecordFetch(ITEM, { finalUrl: 'https://store.example.test/' }, 'browser')!;
+    expect(failure.redirectedHome).toBe(true);
+    expect(failure.status).toBeUndefined();
+  });
+
   it('lets a FAILING status win over the redirect (the status is the more specific truth)', () => {
     const failure = evaluateRecordFetch(ITEM, { status: 404, finalUrl: 'https://store.example.test/' }, 'http')!;
     expect(failure.status).toBe(404);

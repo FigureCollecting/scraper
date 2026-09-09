@@ -1160,6 +1160,16 @@ File format — a JSON object keyed by host; keys are normalized (lower-cased, l
 - Stale semantics: the engine never refreshes or retries a cookie. When a host the jar has cookies for STILL serves a challenge — at any of the existing cooldown sites (ingest honesty gate / extraction-throw door, `/lookup` search, `/catalog` listing, on any lane) — the host is marked `stale` once (`[CF-COOKIE] STALE <host> via <lane>: …` naming cookie NAMES only) and `/health/detailed` → `cfCookies[].stale` flips true with `staleSince` / `staleReason`. The existing storm protection is unchanged: one probe fetch per host per cooldown window, then the host cooldown fast-fails everything else. A clean body for that host marks it fresh again. A host the jar knows nothing about is never marked — its challenge is an egress matter, not a cookie one.
 - Logs and the health view carry cookie NAMES only, never a value.
 
+**Fetch-failure ledger (`REPORT_FETCH_FAILURES`):**
+
+Every TERMINAL fetch failure the engine gives up on — the scrape queue's give-up branch, the crawler's axis stop, the lookup fan-out's per-store catch — is reported to the spine as one durable, classified row (`ingest.v1.SpineIngest/ReportFetchFailure`), so a dead item, a blocked store or a stale cookie survives the pod that saw it. One row per give-up, never one per internal retry: the row's `attempts` drives the spine's own backoff.
+
+- `REPORT_FETCH_FAILURES`: the kill switch, **ON by default**. Unset, empty, or whitespace all mean "not configured" and leave reporting ON; only an explicit `false` / `0` / `no` / `off` (any case) turns it off. Off = every emit point is a no-op with no client built.
+- Reporting rides the SAME `INGEST_BASE_URL` as the ingest emitter (one spine, one hop). With `INGEST_BASE_URL` unset there is nothing to report to and the ledger is off regardless of this switch.
+- `REPORT_FAILURE_TIMEOUT_MS`: per-call deadline for a ledger RPC. Unset/invalid → default. Default: `10000`
+- Reporting is best effort in every direction: a report never rejects, never throws, and never changes an item's outcome. Failures are counted and surfaced on `/health/detailed` (`fetchFailureLedger`), not propagated.
+- Each row carries the store's `siteId` (or the reserved `unmatched` when no ruleset claimed the URL), the target URL, the reason class (`gone_404`, `http_429`, `challenge`, `redirect_home`, `ruleset`, …), the upstream HTTP status when a lane surfaced one, and the transport that served the fetch.
+
 **Raw capture store (`PERSIST_RAW_HTML`, `PERSIST_RAW_IMAGES`):**
 
 Captured bytes are written to a content-addressed S3-compatible bucket under the ratified `sha256-v1` key scheme — `<prefix>sha256/<aa>/<sha256hex><ext>`, where the digest is of the UNCOMPRESSED bytes and `aa` is its first two hex characters. Writes are HEAD-then-PUT and write-once; nothing is ever deleted, every op is timeout-bounded, and a store failure is swallowed-but-counted so a slow or broken bucket can never break or stall a scrape.
