@@ -19,18 +19,18 @@ import { ChallengeLaneUnavailableError } from '../../services/browserChallenge.j
 describe('classifyFetchFailure — typed errors (class wins over message text)', () => {
   it('maps a cooldown fast-fail to cooldown', () => {
     const err = new ChallengeCooldownError('anitoysgk.com', 600_000);
-    expect(classifyFetchFailure({ error: err })).toEqual({ reasonClass: 'cooldown', terminal: true });
+    expect(classifyFetchFailure({ error: err })).toEqual({ reasonClass: 'cooldown' });
   });
 
   it('maps a challenge page to challenge even though its message names Cloudflare', () => {
     const err = new ChallengePageError('https://s/x', 'impersonate');
     expect(err.message).toContain('Cloudflare');
-    expect(classifyFetchFailure({ error: err })).toEqual({ reasonClass: 'challenge', terminal: true });
+    expect(classifyFetchFailure({ error: err })).toEqual({ reasonClass: 'challenge' });
   });
 
   it('maps a persisted-nothing ingest to ruleset', () => {
     const err = new EmptyIngestRecordError('mfc', '123', []);
-    expect(classifyFetchFailure({ error: err })).toEqual({ reasonClass: 'ruleset', terminal: true });
+    expect(classifyFetchFailure({ error: err })).toEqual({ reasonClass: 'ruleset' });
   });
 
   it('maps both config shortfalls to network', () => {
@@ -57,15 +57,15 @@ describe('classifyFetchFailure — status, when a lane surfaced one', () => {
     [500, 'http_5xx'],
     [503, 'http_5xx'],
   ])('maps status %s to %s and echoes the status', (status, reasonClass) => {
-    expect(classifyFetchFailure({ httpStatus: status as number })).toEqual({ reasonClass, httpStatus: status, terminal: true });
+    expect(classifyFetchFailure({ httpStatus: status as number })).toEqual({ reasonClass, httpStatus: status });
   });
 
   it('leaves an unmapped 4xx to the other rules but still echoes the status', () => {
-    expect(classifyFetchFailure({ httpStatus: 418 })).toEqual({ reasonClass: 'other', httpStatus: 418, terminal: true });
+    expect(classifyFetchFailure({ httpStatus: 418 })).toEqual({ reasonClass: 'other', httpStatus: 418 });
   });
 
   it('ignores an out-of-band status', () => {
-    expect(classifyFetchFailure({ httpStatus: 0 })).toEqual({ reasonClass: 'other', terminal: true });
+    expect(classifyFetchFailure({ httpStatus: 0 })).toEqual({ reasonClass: 'other' });
   });
 
   it('lets a typed error beat the status', () => {
@@ -134,14 +134,12 @@ describe('classifyFetchFailure — the exact strings the engine throws today', (
   });
 });
 
-describe('classifyFetchFailure — terminal', () => {
-  it('is false while the producer will try again this cycle', () => {
-    expect(classifyFetchFailure({ errorType: 'timeout', willRetry: true }).terminal).toBe(false);
-  });
-
-  it('is true once the producer has stopped', () => {
-    expect(classifyFetchFailure({ errorType: 'timeout', willRetry: false }).terminal).toBe(true);
-    expect(classifyFetchFailure({ errorType: 'timeout' }).terminal).toBe(true);
+describe('classifyFetchFailure — the classification carries nothing it cannot know', () => {
+  it('returns only the reason class and, when there is one, the status', () => {
+    // TERMINALITY is a property of the CALL SITE, not of the outcome: every emit point sits at its
+    // producer's give-up seam. A flag here would only have restated that placement, unchecked.
+    expect(Object.keys(classifyFetchFailure({ errorType: 'timeout' }))).toEqual(['reasonClass']);
+    expect(Object.keys(classifyFetchFailure({ httpStatus: 503 })).sort()).toEqual(['httpStatus', 'reasonClass']);
   });
 });
 

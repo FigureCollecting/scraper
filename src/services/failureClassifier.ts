@@ -19,18 +19,30 @@
  *   6. MESSAGE, for the untyped Errors the search fan-out and the crawler still throw.
  *   7. The challenge FLAG, else `other` — the operator's triage bucket.
  *
- * TERMINAL means "the producer has stopped trying for this cycle". Only a terminal outcome is
- * reported: reporting per internal retry would inflate the ledger's `attempts` (which drives the
- * backoff) and turn one failing item into a row that never cools.
+ * TERMINALITY is NOT modelled here, deliberately: it is a property of the CALL SITE, not of the
+ * outcome. Every emit point sits at its producer's give-up seam (the queue's gave-up branch, the
+ * crawler's axis stop, the fan-out's per-store catch). Reporting per internal retry would inflate
+ * the ledger's `attempts` — which drives the spine's backoff — and turn one failing item into a row
+ * that never cools; that discipline lives where the calls are made.
  */
 import { ConnectError, Code } from '@connectrpc/connect';
 import { ChallengeCooldownError } from './challengeCooldown.js';
 import { ChallengePageError } from './engineServices/capturingFetch.js';
-import { EmptyIngestRecordError } from './scrapeQueue.js';
 import { EmptyExtractionError } from './engineServices/extractRecords.js';
 import { ResidentialEgressUnavailableError } from './residentialEgress.js';
 import { ChallengeLaneUnavailableError } from './browserChallenge.js';
 import type { ErrorType } from './scrapeQueue.js';
+
+/**
+ * Match one of the engine's own error classes by its DECLARED name. Used only where a value import
+ * would be a liability: scrapeQueue imports THIS module, so importing its EmptyIngestRecordError
+ * back would be a cycle — and would drag the whole engine graph (genericScraper -> puppeteer,
+ * s3ObjectStore -> minio) into the two CronJob CLIs, which never open a browser or an object store.
+ * `name` is the class's own declared identity, not free text: nothing else in the estate sets it.
+ */
+function isNamed(error: unknown, name: string): boolean {
+  return error instanceof Error && error.name === name;
+}
 
 /** The ledger's reason vocabulary — 1:1 with `fetch_failure_reason` (migration 0020). */
 export type FetchReasonClass =
@@ -61,19 +73,12 @@ export interface FetchOutcome {
   challenge?: boolean;
   /** The fetch ended on the store's home/landing page instead of the requested item. */
   redirectedHome?: boolean;
-  /**
-   * The producer is going to try again in this cycle. `true` makes the outcome NON-terminal, so the
-   * caller must not report it. Absent means the caller is already at its give-up seam.
-   */
-  willRetry?: boolean;
 }
 
 export interface FetchClassification {
   reasonClass: FetchReasonClass;
   /** Echoed only when the caller supplied a real HTTP status (100–599). */
   httpStatus?: number;
-  /** True when the producer has stopped trying for this cycle — the ONLY state that may be reported. */
-  terminal: boolean;
 }
 
 /** The message text of whatever was thrown, `''` when there is nothing to read. */
@@ -94,7 +99,7 @@ function usableStatus(status: number | undefined): number | undefined {
 function fromClass(error: unknown): FetchReasonClass | undefined {
   if (error instanceof ChallengeCooldownError) return 'cooldown';
   if (error instanceof ChallengePageError) return 'challenge';
-  if (error instanceof EmptyIngestRecordError) return 'ruleset';
+  if (isNamed(error, 'EmptyIngestRecordError')) return 'ruleset';
   // Both config shortfalls are refusals to SPEND the egress: no proxy wired, or a launch profile
   // that cannot clear the gate. Neither is our parser's fault and neither is the store's — they are
   // an unusable path to the host, which is what `network` names.
@@ -202,6 +207,5 @@ export function classifyFetchFailure(outcome: FetchOutcome): FetchClassification
   return {
     reasonClass,
     ...(httpStatus !== undefined ? { httpStatus } : {}),
-    terminal: outcome.willRetry !== true,
   };
 }
