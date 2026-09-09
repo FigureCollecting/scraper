@@ -24,10 +24,31 @@
  * testable without creds, a network, or the real S3 SDK. A slow/broken store must
  * NEVER break or stall a scrape: every op is timeout-bounded and failures are
  * swallowed-but-counted (observable via stats()).
+ *
+ * ADMISSION: capture() does the cheap, no-I/O decisions in the caller's stack (the
+ * kill switches, and the asset lane's empty/tooLarge/notImage skips) and then hands
+ * the store round trip to an internal bounded worker pool, returning at once. That
+ * bound is the point: without it a crawl wave put one HEAD+PUT pair in flight per
+ * captured page, so hundreds of ops contended for DNS-lookup slots on the 4-thread
+ * libuv pool, for TLS handshakes, and for an event loop that synchronous gzip was
+ * blocking — and each op's WALL CLOCK ran past a budget sized for the upload alone.
+ * The op budget now starts when the store call is made, and the wait for a worker
+ * slot is reported separately (queueWaitP50/P95) instead of being charged to it.
+ * A capture offered when the queue is already full is DROPPED and counted rather
+ * than making the backlog unbounded.
  */
-import { gzipSync } from 'node:zlib';
+import { gzip } from 'node:zlib';
+import { promisify } from 'node:util';
 import type { CaptureSink, RawCapture } from './captureSink.js';
 import { sanitizeForLog } from '../utils/security.js';
+
+/**
+ * Compression runs on libuv's threadpool, not the event loop. `gzipSync` on a wave of
+ * page bodies is milliseconds of blocking each, and it blocks the very loop the store
+ * ops' timers and socket callbacks live on — so the synchronous call inflates the
+ * measured duration of every op running beside it.
+ */
+const gzipAsync = promisify(gzip);
 
 /** Options for a single object write. */
 export interface PutOptions {
@@ -88,6 +109,18 @@ export interface RawStoreConfig {
    */
   imagePutTimeoutMs?: number;
   /**
+   * How many store ops (a HEAD or a PUT) may be in flight at once, across BOTH
+   * lanes. This is the admission bound that keeps a crawl wave from turning every
+   * captured page into a simultaneous socket + DNS lookup + TLS handshake.
+   */
+  concurrency?: number;
+  /**
+   * Hard ceiling on captures waiting for a worker. Beyond it a capture is DROPPED
+   * and counted: raw capture is best-effort insurance, and an unbounded backlog of
+   * buffered page bodies is a memory leak with a scrape attached to it.
+   */
+  queueMax?: number;
+  /**
    * S3 addressing style for the adapter. Hetzner uses virtual-hosted style, so
    * the adapter defaults to `false` (path-style off). Unused by the sink logic.
    */
@@ -112,10 +145,36 @@ export interface SinkStats {
   assetDeduped: number;
   assetSkipped: AssetSkipCounts;
   assetFailed: number;
+  /** Captures waiting for a worker slot right now. */
+  queued: number;
+  /** Store ops executing right now — never above the configured concurrency. */
+  inFlight: number;
+  /** Captures refused because the queue was already at queueMax. Irrecoverable. */
+  dropped: number;
+  /** Milliseconds a capture waited for a slot. Deliberately OUTSIDE the op budget. */
+  queueWaitP50: number;
+  queueWaitP95: number;
+  /** Milliseconds the PUT itself took, once it actually began. */
+  putP50: number;
+  putP95: number;
 }
 
 const SUPPORTED_KEY_SCHEME = 'sha256-v1';
 const DEFAULT_PUT_TIMEOUT_MS = 5_000;
+/** Four concurrent ops: enough to keep the link busy, few enough to stay off the cliff. */
+export const DEFAULT_RAW_STORE_CONCURRENCY = 4;
+/**
+ * Ceiling on the configured concurrency. Without one a typo (`RAW_STORE_CONCURRENCY=1000`)
+ * silently restores the unbounded fan-out this queue exists to remove — the same reason
+ * the image byte ceiling is clamped.
+ */
+export const MAX_RAW_STORE_CONCURRENCY = 64;
+/** Backlog ceiling. Page bodies are buffered, so the queue is memory we are holding. */
+export const DEFAULT_RAW_STORE_QUEUE_MAX = 500;
+/** Drops are loud, but once a minute — a wave must not turn into a log flood. */
+const DROP_LOG_INTERVAL_MS = 60_000;
+/** Rolling latency window. Percentiles over the recent past, at a fixed memory cost. */
+const LATENCY_SAMPLE_MAX = 512;
 /** 30 s — 10 MiB at a pessimistic ~350 KB/s, so payload size alone never times out. */
 export const DEFAULT_IMAGE_PUT_TIMEOUT_MS = 30_000;
 const MAX_METADATA_VALUE_LEN = 1024;
@@ -249,6 +308,18 @@ function budgetMetadata(md: Record<string, string>): Record<string, string> {
   return md;
 }
 
+/**
+ * The p-th percentile of a rolling sample, nearest-rank. Zero for an empty sample:
+ * a lane that has not run yet reports 0, which is what an operator reads as "no
+ * signal", rather than a null the health surface would have to special-case.
+ */
+function percentile(samples: number[], p: number): number {
+  if (samples.length === 0) return 0;
+  const sorted = [...samples].sort((a, b) => a - b);
+  const rank = Math.ceil((p / 100) * sorted.length) - 1;
+  return sorted[Math.min(sorted.length - 1, Math.max(0, rank))] ?? 0;
+}
+
 /** The URL's hostname, or undefined when it is not parseable (best-effort tagging). */
 function hostOf(url: string): string | undefined {
   try {
@@ -258,12 +329,29 @@ function hostOf(url: string): string | undefined {
   }
 }
 
+/** One admitted capture, waiting for a worker. */
+interface QueuedOp {
+  /** Owns its own try/catch — a worker's `await` on this must never reject. */
+  readonly run: () => Promise<void>;
+  readonly enqueuedAt: number;
+}
+
 export class ObjectStoreCaptureSink implements CaptureSink {
   private readonly putTimeoutMs: number;
   private readonly imagePutTimeoutMs: number;
   private readonly maxImageBytes: number;
   private readonly pagesEnabled: boolean;
   private readonly assetsEnabled: boolean;
+  private readonly concurrency: number;
+  private readonly queueMax: number;
+  private readonly queue: QueuedOp[] = [];
+  private inFlight = 0;
+  private dropped = 0;
+  private droppedSinceLog = 0;
+  private lastDropLogAt = 0;
+  private readonly queueWaits: number[] = [];
+  private readonly putDurations: number[] = [];
+  private readonly drainWaiters: Array<() => void> = [];
   private stored = 0;
   private deduped = 0;
   private failed = 0;
@@ -291,6 +379,13 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     this.maxImageBytes = typeof m === 'number' && Number.isFinite(m) && m > 0 ? m : DEFAULT_MAX_IMAGE_BYTES;
     this.pagesEnabled = config.pagesEnabled !== false;
     this.assetsEnabled = config.assetsEnabled !== false;
+    const c = config.concurrency;
+    this.concurrency =
+      typeof c === 'number' && Number.isFinite(c) && c > 0
+        ? Math.min(Math.floor(c), MAX_RAW_STORE_CONCURRENCY)
+        : DEFAULT_RAW_STORE_CONCURRENCY;
+    const q = config.queueMax;
+    this.queueMax = typeof q === 'number' && Number.isFinite(q) && q > 0 ? Math.floor(q) : DEFAULT_RAW_STORE_QUEUE_MAX;
   }
 
   stats(): SinkStats {
@@ -303,12 +398,41 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       assetDeduped: this.assetDeduped,
       assetSkipped: { ...this.assetSkipped },
       assetFailed: this.assetFailed,
+      queued: this.queue.length,
+      inFlight: this.inFlight,
+      dropped: this.dropped,
+      queueWaitP50: percentile(this.queueWaits, 50),
+      queueWaitP95: percentile(this.queueWaits, 95),
+      putP50: percentile(this.putDurations, 50),
+      putP95: percentile(this.putDurations, 95),
     };
   }
 
+  /**
+   * Resolves once the queue is empty and every worker has finished. For tests and
+   * for a graceful shutdown — the fetch path never calls it, because waiting for the
+   * object store is the exact thing this queue exists to stop it doing.
+   */
+  async flush(): Promise<void> {
+    if (this.queue.length === 0 && this.inFlight === 0) return;
+    await new Promise<void>(resolve => {
+      this.drainWaiters.push(resolve);
+    });
+  }
+
+  /**
+   * ADMIT a capture. Returns as soon as the capture is queued (or refused) — the
+   * store round trip runs on a worker, so a slow bucket costs the fetch path
+   * nothing. Never rejects: this lane is insurance, not a dependency.
+   */
   async capture(c: RawCapture): Promise<void> {
-    if (c.lane === 'asset') return this.captureAsset(c);
+    if (c.lane === 'asset') return this.admitAsset(c);
     if (!this.pagesEnabled) return void (this.skippedDisabled += 1);
+    this.enqueue(() => this.storePage(c));
+  }
+
+  /** The page/api lanes' store round trip, on a worker. Swallows-but-counts. */
+  private async storePage(c: RawCapture): Promise<void> {
     try {
       const key = this.objectKey(c);
 
@@ -318,13 +442,18 @@ export class ObjectStoreCaptureSink implements CaptureSink {
         return;
       }
 
-      const body = gzipSync(c.bytes);
+      // Off the event loop, and deliberately OUTSIDE the op budget: compression is
+      // our own cost, not the store's, and charging it to the upload's timeout is
+      // how a busy process ends up calling a healthy bucket slow.
+      const body = await gzipAsync(c.bytes);
+      const startedAt = Date.now();
       await this.withTimeout(
         this.store.put(key, body, {
           contentType: 'application/gzip',
           metadata: this.metadata(c),
         }),
       );
+      this.record(this.putDurations, Date.now() - startedAt);
       this.stored += 1;
     } catch (err) {
       // Raw capture is best-effort insurance; a store failure must never break or
@@ -346,17 +475,33 @@ export class ObjectStoreCaptureSink implements CaptureSink {
    * never thrown, because a mislabelled or challenge-page response on this lane is
    * routine and must not disturb the scrape.
    */
-  private async captureAsset(c: RawCapture): Promise<void> {
+  private async admitAsset(c: RawCapture): Promise<void> {
     if (!this.assetsEnabled) return void (this.assetSkipped.disabled += 1);
+    let bytes: Buffer;
+    let type: ImageType | undefined;
     try {
       // Inside the try: the sink's contract is swallowed-but-counted, so even a
       // malformed capture must be a counter, never a rejection out of capture().
-      const bytes = asBuffer(c.bytes);
+      // These decisions cost no round trip, so they are settled HERE rather than
+      // spending a queue slot to discover that nothing was going to be stored.
+      bytes = asBuffer(c.bytes);
       if (bytes.length === 0) return void (this.assetSkipped.empty += 1);
       if (bytes.length > this.maxImageBytes) return void (this.assetSkipped.tooLarge += 1);
-      const type = sniffImageType(bytes);
+      type = sniffImageType(bytes);
       if (!type) return void (this.assetSkipped.notImage += 1);
+    } catch (err) {
+      this.assetFailed += 1;
+      this.warnAssetFailure(c, err);
+      return;
+    }
+    const stored = bytes;
+    const imageType = type;
+    this.enqueue(() => this.storeAsset(c, stored, imageType));
+  }
 
+  /** The asset lane's store round trip, on a worker — the SAME queue as the pages. */
+  private async storeAsset(c: RawCapture, bytes: Buffer, type: ImageType): Promise<void> {
+    try {
       const prefix = this.config.imagePrefix ?? DEFAULT_IMAGE_PREFIX;
       const key = `${prefix}sha256/${c.sha256.slice(0, 2)}/${c.sha256}.${type.ext}`;
 
@@ -367,6 +512,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
 
       // No gzip and no Content-Encoding: an image is already compressed, and the
       // original must be readable as itself straight out of the bucket.
+      const startedAt = Date.now();
       await this.withTimeout(
         this.store.put(key, bytes, {
           contentType: type.contentType,
@@ -374,17 +520,78 @@ export class ObjectStoreCaptureSink implements CaptureSink {
         }),
         this.imagePutTimeoutMs,
       );
+      this.record(this.putDurations, Date.now() - startedAt);
       this.assetStored += 1;
     } catch (err) {
       this.assetFailed += 1;
-      // eslint-disable-next-line no-console
-      console.warn(
-        // lgtm[js/log-injection] — url is caller-influenced; sanitize before logging
-        `[RAW-STORE] asset capture failed for ${sanitizeForLog(c.url)} (sha ${c.sha256.slice(0, 12)}…): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
+      this.warnAssetFailure(c, err);
     }
+  }
+
+  private warnAssetFailure(c: RawCapture, err: unknown): void {
+    // eslint-disable-next-line no-console
+    console.warn(
+      // lgtm[js/log-injection] — url is caller-influenced; sanitize before logging
+      `[RAW-STORE] asset capture failed for ${sanitizeForLog(c.url)} (sha ${String(c.sha256).slice(0, 12)}…): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+
+  /**
+   * Admit one store op, or drop it. Dropping is the deliberate alternative to an
+   * unbounded backlog: a queue of buffered page bodies that outruns the store is
+   * memory we are holding on a scrape's behalf, and the capture it is holding is
+   * already stale by the time it would be written.
+   */
+  private enqueue(run: () => Promise<void>): void {
+    if (this.queue.length >= this.queueMax) {
+      this.dropped += 1;
+      this.droppedSinceLog += 1;
+      this.logDrops();
+      return;
+    }
+    this.queue.push({ run, enqueuedAt: Date.now() });
+    // `.catch` for the same reason the queue's other fire-and-forget call sites have
+    // one: an unhandled rejection out here would take the process with it, and this
+    // lane is insurance — it is never allowed to be the thing that kills a scraper.
+    if (this.inFlight < this.concurrency) void this.work().catch(() => undefined);
+  }
+
+  /** One worker: take ops until the queue is empty, then release any flush() waiters. */
+  private async work(): Promise<void> {
+    this.inFlight += 1;
+    try {
+      for (;;) {
+        const job = this.queue.shift();
+        if (!job) break;
+        this.record(this.queueWaits, Date.now() - job.enqueuedAt);
+        await job.run(); // storePage/storeAsset own their try/catch — this cannot reject
+      }
+    } finally {
+      this.inFlight -= 1;
+      if (this.queue.length === 0 && this.inFlight === 0) {
+        for (const resolve of this.drainWaiters.splice(0)) resolve();
+      }
+    }
+  }
+
+  private record(into: number[], ms: number): void {
+    into.push(ms);
+    if (into.length > LATENCY_SAMPLE_MAX) into.shift();
+  }
+
+  private logDrops(): void {
+    const now = Date.now();
+    if (now - this.lastDropLogAt < DROP_LOG_INTERVAL_MS) return;
+    this.lastDropLogAt = now;
+    const since = this.droppedSinceLog;
+    this.droppedSinceLog = 0;
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[RAW-STORE] capture queue full (max ${this.queueMax}, concurrency ${this.concurrency}) — ` +
+        `dropped ${since} capture(s) since the last report, ${this.dropped} in total`,
+    );
   }
 
   /** `<prefix>sha256/<aa>/<sha256hex><ext>` — the json (api) lane uses jsonPrefix. */

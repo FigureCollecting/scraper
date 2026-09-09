@@ -353,6 +353,15 @@ describe('createHealthRoutes — rawStore counters', () => {
     assetDeduped: 7,
     assetSkipped: { notImage: 118, tooLarge: 1, empty: 0, disabled: 0 },
     assetFailed: 2,
+    // The admission queue's view: a backlog and a drop count are what separate
+    // "the bucket is slow" from "we are dropping captures on the floor".
+    queued: 9,
+    inFlight: 4,
+    dropped: 2,
+    queueWaitP50: 40,
+    queueWaitP95: 900,
+    putP50: 310,
+    putP95: 1200,
   };
 
   it('publishes the sink counters on GET /health/detailed', async () => {

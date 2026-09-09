@@ -13,7 +13,9 @@
  *     `browserLane: {launchMode, residentialTimezone, directTimezone, processTimezone,
  *     navigationTimeoutMs, gatedBrowsers}`,
  *     `challengeCooldowns: [{host, remainingMs, reason}]` (the per-host CF cooldowns currently open),
- *     `rawStore: {configured, stats?}` (the raw-capture sink's counters — page + asset lanes),
+ *     `rawStore: {configured, stats?}` (the raw-capture sink's counters — page + asset lanes,
+ *     plus its admission queue: `queued`, `inFlight`, `dropped`, and the `queueWaitP50/P95` vs
+ *     `putP50/P95` split that says whether a slow lane is a slow BUCKET or a backlog behind it),
  *     `imageCapture: {enabled, attempted, stored, deduped, skipped{…}, failed, residentialBytesToday}`
  *     (the image capture hook's counters — a best-effort lane that stores nothing looks exactly like
  *     an idle one from outside, so the NAMED skips are the signal: a deny list, an exhausted home

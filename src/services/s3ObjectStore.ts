@@ -9,6 +9,7 @@
  *   PERSIST_RAW_HTML=true                                        (the se-09 kill-switch)
  *   PERSIST_RAW_IMAGES=true                                      (the SEPARATE asset-lane switch)
  *   RAW_STORE_S3_ENDPOINT / _REGION / _BUCKET / _PREFIX / _KEY_SCHEME   (ConfigMap, envFrom)
+ *   RAW_STORE_CONCURRENCY / RAW_STORE_QUEUE_MAX                  (the sink's admission bounds)
  *   RAW_STORE_S3_ACCESS_KEY_ID / RAW_STORE_S3_SECRET_ACCESS_KEY   (Secret raw-store-s3-creds,
  *       whose internal keys are ACCESS_KEY_ID/SECRET_ACCESS_KEY, mapped to these
  *       prefixed env-var names via secretKeyRef — the process sees the prefixed names)
@@ -183,6 +184,8 @@ export function loadRawStoreConfigFromEnv(
     assetsEnabled,
     putTimeoutMs: parsePositive(env.RAW_STORE_PUT_TIMEOUT_MS),
     imagePutTimeoutMs: parsePositive(env.RAW_STORE_IMAGE_PUT_TIMEOUT_MS),
+    concurrency: parsePositive(env.RAW_STORE_CONCURRENCY),
+    queueMax: parsePositive(env.RAW_STORE_QUEUE_MAX),
     maxImageBytes: parseImageMaxBytes(env.RAW_STORE_IMAGE_MAX_BYTES),
     pathStyle: env.RAW_STORE_S3_PATH_STYLE !== undefined ? env.RAW_STORE_S3_PATH_STYLE === 'true' : undefined,
   };
