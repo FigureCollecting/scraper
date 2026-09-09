@@ -37,6 +37,7 @@ const mkCfg = (over: Partial<CrawlerConfig> = {}): CrawlerConfig => ({
   rangeStores: [],
   rangeIdsPerRun: 50,
   rangeFrontiers: {},
+  seedSpacingMs: 10_000,
   ...over,
 });
 

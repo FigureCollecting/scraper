@@ -102,6 +102,13 @@ export interface SeedListStat {
   known: number;
   /** POSTs the scraper accepted from this list. */
   enqueued: number;
+  /**
+   * Other declared ids that resolve to the SAME url as this one, and were therefore served by this
+   * single fetch. Present only when the store's declaration actually repeats a url (an authoring
+   * slip): the ids are credited here rather than dropped, so the summary still accounts for every id
+   * the store declared without double-counting one page's items.
+   */
+  alsoDeclaredAs?: string[];
 }
 
 export interface CrawlerStoreSummary {
@@ -152,7 +159,7 @@ export interface CrawlerStoreSummary {
    * run at all). A seed pass is a handful of requests, so a store that quietly did three of its five
    * lists must not look the same as one that did all five.
    */
-  seedStopped: StopReason | null;
+  seedStopped: SeedStopReason | null;
   /** The store's backfill cursor after this run (null until backfill first runs). */
   backfillCursor: number | null;
   /** An empty page was seen at the cursor once; awaiting confirmation next run. */
@@ -192,10 +199,23 @@ interface CatalogItem {
 /** Why a /catalog GET stopped its axis — surfaced on the id-range summary, ignored by the listing phases. */
 type StopReason = 'budget' | 'cooldown' | 'unsupported' | 'failed';
 
+/**
+ * Why the SEED pass stopped a store early. The fetch stop reasons, plus `cap`: the store's enqueue
+ * ceiling was spent, so the lists after it were not fetched at all. Starvation by the cap otherwise
+ * looks exactly like a store that simply declared fewer lists.
+ */
+export type SeedStopReason = StopReason | 'cap';
+
 /** Why the id-range walk made no window request this run. */
 export type RangeSkipReason = StopReason | 'not-configured' | 'not-run' | 'store-stopped' | 'cap' | 'no-frontier' | 'floor' | 'window-malformed';
 
 type PageOutcome = { kind: 'page'; items: CatalogItem[]; hasMore: boolean } | { kind: 'stopped'; reason: StopReason };
+
+/** One seed list the pass will actually poll, plus the declared ids that collapsed onto its url. */
+interface SeedListTarget {
+  id: string;
+  aliases: string[];
+}
 
 type PostOutcome = 'accepted' | 'accepted-dedup' | 'rejected' | 'transient' | 'budget';
 
@@ -270,6 +290,10 @@ const sanitizeItems = (raw: unknown[]): CatalogItem[] => {
 
 export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): Promise<CrawlerSummary> {
   const now = deps.now ?? Date.now;
+  // The seed axis's own wait. Shares the injected seam with the gate's spacing so one fake clock
+  // drives both in tests, but is a SEPARATE floor: the gate spaces every dispatch globally, this
+  // spaces one store's seed fetches from each other.
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const iso = (): string => new Date(now()).toISOString();
   const startedAtMs = now();
   const gate =
@@ -527,7 +551,9 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       // The store does not serve THIS axis (no byListing / no extractListing; or no byRange / byId):
       // a configuration or coverage gap, NOT exhaustion. A listing gap leaves the id-range axis alive.
       st.summary.errors++;
-      if (axis !== 'range') st.listingUnsupported = true;
+      // ONLY the listing axes carry this flag: it is what lets the id-range walk survive a store with
+      // no byListing. A 422 from the seed or range axis says nothing about the listing axis.
+      if (axis === 'recent' || axis === 'backfill') st.listingUnsupported = true;
       logger.warn('[CRAWLER] catalog unsupported — axis stopped', { siteId: st.siteId, ...where, axis });
       return stop('unsupported');
     }
@@ -653,12 +679,15 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     st: StoreState,
     items: CatalogItem[],
     phase: Phase,
-  ): Promise<{ newCount: number; allAttempted: boolean; handled: number; accepted: number; rejected: number }> => {
+  ): Promise<{ newCount: number; allAttempted: boolean; handled: number; accepted: number; rejected: number; stopReason?: StopReason }> => {
     const ledger = st.ledger!;
     let newCount = 0;
     let allAttempted = true;
     let accepted = 0;
     let rejected = 0;
+    // WHY this page stopped the store, when it did. `st.stopped` alone cannot tell a sick scraper
+    // from a spent budget, and a caller that guesses would mislabel one as the other.
+    let stopReason: StopReason | undefined;
     // Index of the FIRST item this run did not get through (cap / budget / a sick scraper). Everything
     // before it was dealt with — POSTed, deliberately skipped, or deterministically rejected — which is
     // exactly how far a durable cursor may move. Undefined ⇒ the whole page was handled.
@@ -714,6 +743,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
         case 'transient':
           st.summary.errors++;
           st.stopped = true;
+          stopReason ??= 'failed';
           allAttempted = false;
           firstUnhandled ??= index; // the POST failed transiently: this id must be retried, not walked past
           break;
@@ -723,12 +753,13 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
           st.attempted.delete(item.itemId);
           budgetExhausted = true;
           st.stopped = true;
+          stopReason ??= 'budget';
           allAttempted = false;
           firstUnhandled ??= index;
           break;
       }
     }
-    return { newCount, allAttempted, handled: firstUnhandled ?? items.length, accepted, rejected };
+    return { newCount, allAttempted, handled: firstUnhandled ?? items.length, accepted, rejected, ...(stopReason ? { stopReason } : {}) };
   };
 
   // --- phases -----------------------------------------------------------------------------------
@@ -849,9 +880,15 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
    * bounded poll into a periodic re-collection of a whole shelf.
    *
    * The store STOPS at the first list that challenges, cools, or answers a 4xx, and the summary
-   * records why. A seed pass is a handful of requests against a store being treated gently; pushing
-   * on to the next list after a challenge is exactly the behaviour that burns the egress IP's
-   * reputation for every other store sharing it.
+   * records the REAL reason — a sick scraper is `failed`, only a spent budget is `budget`. A seed
+   * pass is a handful of requests against a store being treated gently; pushing on to the next list
+   * after a challenge is exactly the behaviour that burns the egress IP's reputation for every other
+   * store sharing it. Once the store's cap is spent the remaining lists are not fetched at all
+   * (`cap`): a request guaranteed to enqueue nothing is the one this axis must not make.
+   *
+   * PACING is this phase's own, because the engine has none to lend: a store's declared rateLimit
+   * governs the ingest queue's dispatch, NOT a /catalog fetch. config.seedSpacingMs therefore spaces
+   * one store's consecutive seed fetches, independently of the gate's global dispatch spacing.
    */
   const seedPhase = async (st: StoreState): Promise<void> => {
     if (!st.ledger || st.stopped) return;
@@ -859,15 +896,36 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       label: 'a seed-list declaration',
       parse: (body) => {
         if (!Array.isArray(body.seedLists)) return undefined;
-        // UNTRUSTED: an entry without a usable id names no list this axis could ask for, and a
-        // REPEATED id would poll the same page twice in one run — the one thing a declared, bounded
-        // poll must never do. First occurrence wins, declared order is kept.
-        const ids: string[] = [];
+        // UNTRUSTED: an entry without a usable id names no list this axis could ask for. A repeat is
+        // dropped TWICE OVER — by id, and by url — because polling one page twice in a run is the one
+        // thing a declared, bounded poll must never do, and two ids pointing at one url is an
+        // authoring slip that would otherwise cost a real store a wholly redundant fetch every pass.
+        // First occurrence wins and declared order is kept; the losing ids are CREDITED as aliases,
+        // never silently dropped, so the summary still accounts for every id the store declared.
+        const lists: SeedListTarget[] = [];
+        const byId = new Set<string>();
+        const byUrl = new Map<string, SeedListTarget>();
         for (const entry of body.seedLists) {
           if (!isPlainObject(entry) || typeof entry.id !== 'string' || entry.id.length === 0) continue;
-          if (!ids.includes(entry.id)) ids.push(entry.id);
+          if (byId.has(entry.id)) continue;
+          byId.add(entry.id);
+          const url = typeof entry.url === 'string' && entry.url.length > 0 ? entry.url : undefined;
+          // An entry with no url cannot be url-deduped; it is still addressable by id, so it polls.
+          const twin = url !== undefined ? byUrl.get(url) : undefined;
+          if (twin) {
+            twin.aliases.push(entry.id);
+            logger.warn('[CRAWLER] two declared seed lists share the same url — polled once, both ids credited', {
+              siteId: st.siteId,
+              polled: twin.id,
+              alias: entry.id,
+            });
+            continue;
+          }
+          const target: SeedListTarget = { id: entry.id, aliases: [] };
+          lists.push(target);
+          if (url !== undefined) byUrl.set(url, target);
         }
-        return ids;
+        return lists;
       },
     });
     if (found.kind !== 'ok') {
@@ -875,12 +933,23 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       return;
     }
 
-    for (const listId of found.value) {
-      if (st.stopped) {
-        st.summary.seedStopped = 'budget';
+    let first = true;
+    for (const list of found.value) {
+      // The store's enqueue cap is already spent: every remaining list would be fetched only to
+      // discover it may POST nothing. On the axis whose justification is a knowable cost, a fetch
+      // guaranteed to yield zero is exactly the request not to make.
+      if (st.capReached) {
+        st.summary.seedStopped = 'cap';
         return;
       }
-      const out = await fetchCatalog(st, seedUrl(st.siteId, listId), { seed: listId }, 'seed');
+      // PER-STORE SEED FLOOR. The engine applies no per-host delay on this lane (a store's declared
+      // rateLimit governs the ingest queue, not the catalog/seed fetch), so without this wait a
+      // store's whole declared set leaves back to back. Not applied before the FIRST list: there is
+      // nothing yet to be spaced from.
+      if (!first && config.seedSpacingMs > 0) await sleep(config.seedSpacingMs);
+      first = false;
+
+      const out = await fetchCatalog(st, seedUrl(st.siteId, list.id), { seed: list.id }, 'seed');
       if (out.kind !== 'page') {
         st.summary.seedStopped = out.reason;
         return;
@@ -888,17 +957,24 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       // The per-list numbers are DELTAS of the store's own counters: one list's yield is what the
       // operator reads to decide whether that list still earns its cadence.
       const before = { discovered: st.summary.discovered, known: st.summary.known, enqueued: st.summary.enqueued };
-      await processPage(st, out.items, 'seed');
+      const { stopReason } = await processPage(st, out.items, 'seed');
       st.summary.seedLists.push({
-        listId,
+        listId: list.id,
         discovered: st.summary.discovered - before.discovered,
         known: st.summary.known - before.known,
         enqueued: st.summary.enqueued - before.enqueued,
+        ...(list.aliases.length > 0 ? { alsoDeclaredAs: list.aliases } : {}),
       });
       // Saved after EVERY list, like the listing axis saves after every page: a pass killed between
       // two lists must not re-POST what the first one already enqueued.
       if (!(await persist(st))) {
         st.summary.seedStopped = 'failed';
+        return;
+      }
+      // The POST loop stopped the store: report WHY it stopped, not what the next iteration would
+      // have guessed. A sick scraper and a spent budget are different operator problems.
+      if (stopReason) {
+        st.summary.seedStopped = stopReason;
         return;
       }
     }
