@@ -167,9 +167,14 @@ export interface SinkStats {
   /** Milliseconds a capture waited for a slot. Deliberately OUTSIDE the op budget. */
   queueWaitP50: number;
   queueWaitP95: number;
-  /** Milliseconds the PUT itself took, once it actually began. */
+  /** Milliseconds the PUT itself took, once it actually began. Sampled on failure
+   * too — an op that spent its whole budget is the one an operator most needs. */
   putP50: number;
   putP95: number;
+  /** Milliseconds the HEAD took. Half this sink's round trips, and the ONLY one a
+   * dedup hit makes, so leaving it untimed hid half the latency. */
+  headP50: number;
+  headP95: number;
 }
 
 const SUPPORTED_KEY_SCHEME = 'sha256-v1';
@@ -387,6 +392,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
   private lastDropLogAt = 0;
   private readonly queueWaits: number[] = [];
   private readonly putDurations: number[] = [];
+  private readonly headDurations: number[] = [];
   private readonly drainWaiters: Array<() => void> = [];
   private stored = 0;
   private deduped = 0;
@@ -449,6 +455,8 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       queueWaitP95: percentile(this.queueWaits, 95),
       putP50: percentile(this.putDurations, 50),
       putP95: percentile(this.putDurations, 95),
+      headP50: percentile(this.headDurations, 50),
+      headP95: percentile(this.headDurations, 95),
     };
   }
 
@@ -481,7 +489,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       const key = this.objectKey(c);
 
       // HEAD-then-PUT: content-addressed, so an existing key means identical bytes.
-      if (await this.withTimeout(this.store.exists(key))) {
+      if (await this.timed(this.headDurations, () => this.withTimeout(this.store.exists(key)))) {
         this.deduped += 1;
         return;
       }
@@ -490,14 +498,14 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       // our own cost, not the store's, and charging it to the upload's timeout is
       // how a busy process ends up calling a healthy bucket slow.
       const body = await gzipAsync(c.bytes);
-      const startedAt = Date.now();
-      await this.withTimeout(
-        this.store.put(key, body, {
-          contentType: 'application/gzip',
-          metadata: this.metadata(c),
-        }),
+      await this.timed(this.putDurations, () =>
+        this.withTimeout(
+          this.store.put(key, body, {
+            contentType: 'application/gzip',
+            metadata: this.metadata(c),
+          }),
+        ),
       );
-      this.record(this.putDurations, Date.now() - startedAt);
       this.stored += 1;
     } catch (err) {
       // Raw capture is best-effort insurance; a store failure must never break or
@@ -549,22 +557,24 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       const prefix = this.config.imagePrefix ?? DEFAULT_IMAGE_PREFIX;
       const key = `${prefix}sha256/${c.sha256.slice(0, 2)}/${c.sha256}.${type.ext}`;
 
-      if (await this.withTimeout(this.store.exists(key), this.imagePutTimeoutMs)) {
+      if (
+        await this.timed(this.headDurations, () => this.withTimeout(this.store.exists(key), this.imagePutTimeoutMs))
+      ) {
         this.assetDeduped += 1;
         return;
       }
 
       // No gzip and no Content-Encoding: an image is already compressed, and the
       // original must be readable as itself straight out of the bucket.
-      const startedAt = Date.now();
-      await this.withTimeout(
-        this.store.put(key, bytes, {
-          contentType: type.contentType,
-          metadata: this.assetMetadata(c),
-        }),
-        this.imagePutTimeoutMs,
+      await this.timed(this.putDurations, () =>
+        this.withTimeout(
+          this.store.put(key, bytes, {
+            contentType: type.contentType,
+            metadata: this.assetMetadata(c),
+          }),
+          this.imagePutTimeoutMs,
+        ),
       );
-      this.record(this.putDurations, Date.now() - startedAt);
       this.assetStored += 1;
     } catch (err) {
       this.assetFailed += 1;
@@ -628,6 +638,21 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       if (this.queue.length === 0 && this.inFlight === 0) {
         for (const resolve of this.drainWaiters.splice(0)) resolve();
       }
+    }
+  }
+
+  /**
+   * Run one store op and sample how long it took — on the way out either way. A
+   * percentile built from successes only is the one an operator cannot use: the ops
+   * that consume the whole budget are exactly the ones being dropped from it, so a
+   * lane timing out on every upload reports the same fast p95 as a healthy one.
+   */
+  private async timed<T>(into: number[], op: () => Promise<T>): Promise<T> {
+    const startedAt = Date.now();
+    try {
+      return await op();
+    } finally {
+      this.record(into, Date.now() - startedAt);
     }
   }
 

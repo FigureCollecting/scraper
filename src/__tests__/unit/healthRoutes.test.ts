@@ -364,6 +364,8 @@ describe('createHealthRoutes — rawStore counters', () => {
     queueWaitP95: 900,
     putP50: 310,
     putP95: 1200,
+    headP50: 90,
+    headP95: 400,
   };
 
   it('publishes the sink counters on GET /health/detailed', async () => {

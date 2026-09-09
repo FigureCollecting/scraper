@@ -17,6 +17,7 @@ class FakeObjectStore implements ObjectStore {
   readonly existing = new Set<string>();
   headCalls = 0;
   putDelayMs = 0;
+  existsDelayMs = 0;
   failPut = false;
   hangPut = false;
   hangExists = false;
@@ -24,6 +25,7 @@ class FakeObjectStore implements ObjectStore {
   async exists(key: string): Promise<boolean> {
     this.headCalls += 1;
     if (this.hangExists) return new Promise<boolean>(() => {}); // never resolves
+    if (this.existsDelayMs) await new Promise(r => setTimeout(r, this.existsDelayMs));
     return this.existing.has(key);
   }
 
@@ -377,6 +379,8 @@ describe('ObjectStoreCaptureSink — the asset lane', () => {
       queueWaitP95: 0,
       putP50: 0,
       putP95: 0,
+      headP50: 0,
+      headP95: 0,
     });
   });
 
@@ -781,21 +785,74 @@ describe('ObjectStoreCaptureSink — bounded admission queue', () => {
 
   it('times only the upload: a long queue wait never trips the op budget', async () => {
     const store = new GatedObjectStore();
-    store.putMs = 20; // each upload is comfortably inside the 60ms budget
     const sink = new ObjectStoreCaptureSink(store, {
       ...CONFIG, putTimeoutMs: 60, concurrency: 1, queueMax: 100,
     });
+    let now = 1_700_000_000_000;
+    const clock = jest.spyOn(Date, 'now').mockImplementation(() => now);
 
-    // 10 serialized 20ms uploads = ~200ms of wall clock, far beyond the 60ms
-    // per-op budget. Under the old timer (started at capture time) the tail of
-    // this batch would have been counted as timeouts and silently lost.
-    for (const c of distinct(10)) await sink.capture(c);
+    // Park the worker so the rest genuinely queue behind it, then advance the clock
+    // by five minutes: five thousand times the op budget, spent entirely in the
+    // queue. Under the old timer — armed when the capture was offered — every one of
+    // these would have been abandoned as a store timeout and silently lost.
+    await sink.capture(cap({ bytes: Buffer.from('first', 'utf8') }));
+    await until(() => store.parked.length === 1);
+    for (const c of distinct(5)) await sink.capture(c);
+    now += 5 * 60_000;
+
+    store.open = true;
+    store.release();
     await sink.flush();
 
-    expect(sink.stats().stored).toBe(10);
-    expect(sink.stats().failed).toBe(0);
     expect(sink.stats().queueWaitP95).toBeGreaterThan(60);
-    expect(sink.stats().putP95).toBeLessThan(60);
+    expect(sink.stats().failed).toBe(0);
+    expect(sink.stats().stored).toBe(6);
+    clock.mockRestore();
+  });
+
+  it('samples a PUT that TIMED OUT, so a failing lane cannot hide behind a fast p95', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new FakeObjectStore();
+    store.hangPut = true;
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 60 });
+
+    await sink.capture(cap());
+    await sink.flush();
+
+    expect(sink.stats().failed).toBe(1);
+    // The op that consumed the whole budget is the one an operator most needs in
+    // the percentile; sampling successes only makes a dying lane look healthy.
+    expect(sink.stats().putP95).toBeGreaterThanOrEqual(50);
+    warn.mockRestore();
+  });
+
+  it('times the HEAD as well as the PUT', async () => {
+    const store = new FakeObjectStore();
+    store.existsDelayMs = 25;
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 5_000 });
+
+    await sink.capture(cap());
+    await sink.flush();
+
+    // HEAD is half the round trips this sink makes; leaving it untimed hid half the
+    // latency, and a dedup hit is nothing BUT a HEAD.
+    expect(sink.stats().headP95).toBeGreaterThanOrEqual(20);
+    expect(sink.stats().headP50).toBeGreaterThanOrEqual(20);
+  });
+
+  it('samples the HEAD on a dedup hit, where there is no PUT to measure', async () => {
+    const store = new FakeObjectStore();
+    store.existsDelayMs = 25;
+    const c = cap();
+    store.existing.add(`raw-html/sha256/${c.sha256.slice(0, 2)}/${c.sha256}.html.gz`);
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 5_000 });
+
+    await sink.capture(c);
+    await sink.flush();
+
+    expect(sink.stats().deduped).toBe(1);
+    expect(sink.stats().headP95).toBeGreaterThanOrEqual(20);
+    expect(sink.stats().putP95).toBe(0); // no upload happened, so nothing to report
   });
 
   it('reports queue wait and upload time separately on the stats', async () => {
