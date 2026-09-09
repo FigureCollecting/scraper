@@ -688,8 +688,14 @@ class GatedObjectStore implements ObjectStore {
 /** One turn of the event loop, including the threadpool work async gzip does. */
 const tick = () => new Promise(r => setImmediate(r));
 
-/** Spin the loop until `cond` holds (or we give up), without a fixed sleep. */
-const until = async (cond: () => boolean, turns = 500): Promise<void> => {
+/**
+ * Spin the loop until `cond` holds (or we give up), without a fixed sleep. The budget
+ * is generous because gzip runs on libuv's 4-thread pool: filling a 64-deep worker
+ * set means 64 compressions, and on a contended CI runner those need far more than a
+ * few hundred turns. The loop exits the moment the condition holds, so a large budget
+ * costs a passing test nothing.
+ */
+const until = async (cond: () => boolean, turns = 20_000): Promise<void> => {
   for (let i = 0; i < turns; i += 1) {
     if (cond()) return;
     await tick();
