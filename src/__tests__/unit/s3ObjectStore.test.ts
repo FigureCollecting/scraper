@@ -98,6 +98,31 @@ describe('loadRawStoreConfigFromEnv', () => {
     expect(loaded.config.queueMaxBytes).toBeUndefined();
   });
 
+  it('reads RAW_STORE_ASSET_QUEUE_SHARE — the slice of the queue assets may occupy', () => {
+    const loaded = loadRawStoreConfigFromEnv({
+      ...FULL_ENV,
+      RAW_STORE_ASSET_QUEUE_SHARE: '0.5',
+    } as unknown as NodeJS.ProcessEnv)!;
+    expect(loaded.config.assetQueueShare).toBe(0.5);
+  });
+
+  it('clamps the asset share at 1 and drops a nonsense one, so the sink keeps its 0.75', () => {
+    const over = loadRawStoreConfigFromEnv({
+      ...FULL_ENV,
+      RAW_STORE_ASSET_QUEUE_SHARE: '4',
+    } as unknown as NodeJS.ProcessEnv)!;
+    // A share above the whole queue is not a bigger reservation, it is none at all.
+    expect(over.config.assetQueueShare).toBe(1);
+
+    for (const raw of ['most', '0', '-0.5']) {
+      const bad = loadRawStoreConfigFromEnv({
+        ...FULL_ENV,
+        RAW_STORE_ASSET_QUEUE_SHARE: raw,
+      } as unknown as NodeJS.ProcessEnv)!;
+      expect(bad.config.assetQueueShare).toBeUndefined();
+    }
+  });
+
   it('defaults the asset lane: imagePrefix raw-img/ and no explicit byte ceiling', () => {
     const loaded = loadRawStoreConfigFromEnv(FULL_ENV)!;
     expect(loaded.config.imagePrefix).toBe('raw-img/');

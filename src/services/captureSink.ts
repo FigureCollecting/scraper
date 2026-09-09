@@ -93,13 +93,20 @@ export interface RawCaptureInput {
 }
 
 /**
- * Why a sink could not take a capture. Both are TRANSIENT — the sink's queue was
- * full — which is the whole point of naming them: a caller that keeps a per-url memo
- * must not record a refused capture as done, or the bytes are lost AND the retry is
- * suppressed. A kill switch or a typed skip is NOT a refusal: the sink resolved the
- * capture, and offering it again would change nothing.
+ * Why a sink could not take a capture. All three are TRANSIENT — the sink had no room
+ * for this capture right now — which is the whole point of naming them: a caller that
+ * keeps a per-url memo must not record a refused capture as done, or the bytes are lost
+ * AND the retry is suppressed. A kill switch or a typed skip is NOT a refusal: the sink
+ * resolved the capture, and offering it again would change nothing.
+ *
+ * `assetReserve` is the queue saying it still has room, but not for THIS lane: the
+ * asset lane is held to a share of the budget so that page bodies — irreplaceable
+ * provenance behind claims already written, where an image is simply re-fetched on the
+ * next pass — always have somewhere to land. Named apart from the two full-queue
+ * reasons because the operator response differs: one means the store is behind, the
+ * other means the reservation is doing its job.
  */
-export type CaptureRefusal = 'queueFull' | 'queueBytesFull';
+export type CaptureRefusal = 'queueFull' | 'queueBytesFull' | 'assetReserve';
 
 /** What a sink says about a capture it was offered. */
 export interface CaptureAdmission {

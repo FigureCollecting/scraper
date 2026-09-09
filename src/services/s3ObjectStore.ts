@@ -10,6 +10,7 @@
  *   PERSIST_RAW_IMAGES=true                                      (the SEPARATE asset-lane switch)
  *   RAW_STORE_S3_ENDPOINT / _REGION / _BUCKET / _PREFIX / _KEY_SCHEME   (ConfigMap, envFrom)
  *   RAW_STORE_CONCURRENCY / RAW_STORE_QUEUE_MAX / _QUEUE_MAX_BYTES (the sink's admission bounds)
+ *   RAW_STORE_ASSET_QUEUE_SHARE                                  (the asset lane's share of them)
  *   RAW_STORE_S3_ACCESS_KEY_ID / RAW_STORE_S3_SECRET_ACCESS_KEY   (Secret raw-store-s3-creds,
  *       whose internal keys are ACCESS_KEY_ID/SECRET_ACCESS_KEY, mapped to these
  *       prefixed env-var names via secretKeyRef — the process sees the prefixed names)
@@ -105,6 +106,19 @@ function parsePositive(raw: string | undefined): number | undefined {
  */
 export const MAX_CONFIGURABLE_IMAGE_BYTES = 64 * 1024 * 1024;
 
+/**
+ * The asset lane's share of the queue budgets, from env: a fraction in (0, 1].
+ *
+ * Clamped at 1 because "assets may hold more than the whole queue" is not a larger
+ * reservation, it is none at all. A 0, a negative or a nonsense value falls through to
+ * the sink's default rather than closing the lane — shutting the asset lane off is
+ * PERSIST_RAW_IMAGES' job, and a knob that silently does it by rounding is a trap.
+ */
+function parseAssetQueueShare(raw: string | undefined): number | undefined {
+  const n = parsePositive(raw);
+  return n === undefined ? undefined : Math.min(n, 1);
+}
+
 /** A positive byte ceiling from env, clamped so a typo cannot disable the ceiling. */
 function parseImageMaxBytes(raw: string | undefined): number | undefined {
   const n = parsePositive(raw);
@@ -187,6 +201,7 @@ export function loadRawStoreConfigFromEnv(
     concurrency: parsePositive(env.RAW_STORE_CONCURRENCY),
     queueMax: parsePositive(env.RAW_STORE_QUEUE_MAX),
     queueMaxBytes: parsePositive(env.RAW_STORE_QUEUE_MAX_BYTES),
+    assetQueueShare: parseAssetQueueShare(env.RAW_STORE_ASSET_QUEUE_SHARE),
     maxImageBytes: parseImageMaxBytes(env.RAW_STORE_IMAGE_MAX_BYTES),
     pathStyle: env.RAW_STORE_S3_PATH_STYLE !== undefined ? env.RAW_STORE_S3_PATH_STYLE === 'true' : undefined,
   };

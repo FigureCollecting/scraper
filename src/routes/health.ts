@@ -14,7 +14,9 @@
  *     navigationTimeoutMs, gatedBrowsers}`,
  *     `challengeCooldowns: [{host, remainingMs, reason}]` (the per-host CF cooldowns currently open),
  *     `rawStore: {configured, stats?}` (the raw-capture sink's counters — page + asset lanes,
- *     plus its admission queue: `queued`, `inFlight`, `dropped`, and the `queueWaitP50/P95` vs
+ *     plus its admission queue: `queued`, `inFlight`, `dropped`, `assetRefusedReserve` (images
+ *     held back so page bodies keep their share of the queue — deferred, not lost, where a
+ *     `dropped` page IS lost), and the `queueWaitP50/P95` vs
  *     `headP50/P95` + `putP50/P95` split that says whether a slow lane is a slow BUCKET or a
  *     backlog behind it — the op percentiles sample failures too, so a lane timing out on every
  *     upload cannot report the same fast p95 as a healthy one),

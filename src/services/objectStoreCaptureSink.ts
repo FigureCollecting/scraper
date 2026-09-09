@@ -37,6 +37,20 @@
  * A capture offered when the queue is already full is DROPPED and counted rather
  * than making the backlog unbounded — and capture() SAYS SO, so a caller keeping a
  * per-url memo does not record a lost capture as done and suppress its own retry.
+ *
+ * THE PAGE RESERVATION: that one queue carries two lanes whose losses are not
+ * comparable. A page body is the provenance behind a claim already written to the
+ * spine and NOTHING will ever fetch it again; an image is a re-fetchable ~10 MiB
+ * blob that the next crawl pass would pick up anyway. Shared first-come-first-served,
+ * the cheap half evicts the expensive one — in prod on 2026-09-09, arming the image
+ * lane put the queue on its depth ceiling and refused 1561 captures, ≈63 of them
+ * pages: a permanent provenance gap bought with re-fetchable bytes. So the asset lane
+ * is admitted only while the queue sits BELOW `assetQueueShare` of BOTH budgets
+ * (RAW_STORE_ASSET_QUEUE_SHARE, default 0.75; 1 = no reservation), and the remaining
+ * share is there for pages. An asset refused that way is told `assetReserve` — a
+ * refusal like any other, so its caller still retries, and counted apart
+ * (`assetRefusedReserve`) so "the store is behind" stays distinguishable from "the
+ * reservation is working".
  */
 import { gzip } from 'node:zlib';
 import { promisify } from 'node:util';
@@ -130,6 +144,14 @@ export interface RawStoreConfig {
    */
   queueMaxBytes?: number;
   /**
+   * The share of BOTH queue budgets (depth and bytes) the asset lane may occupy —
+   * the rest is reserved for page bodies, which are irreplaceable where an image is
+   * merely re-fetched. A fraction in (0, 1]; 1 means no reservation (the lanes share
+   * the queue first-come-first-served, as they did before this existed). Turning the
+   * asset lane OFF is `assetsEnabled`/PERSIST_RAW_IMAGES' job, never a share of 0.
+   */
+  assetQueueShare?: number;
+  /**
    * S3 addressing style for the adapter. Hetzner uses virtual-hosted style, so
    * the adapter defaults to `false` (path-style off). Unused by the sink logic.
    */
@@ -164,6 +186,13 @@ export interface SinkStats {
    * `dropped` so an operator can see WHICH ceiling bound: a depth problem and a
    * payload problem want different settings. */
   droppedBytes: number;
+  /**
+   * Asset-lane captures refused because the queue was above the asset SHARE, while
+   * the page lanes still had room. Never folded into `dropped`: a rising count here
+   * is the reservation holding the line (and those images come back on the next
+   * pass), where a rising `dropped` is page provenance being lost outright.
+   */
+  assetRefusedReserve: number;
   /** Bytes currently held by queued captures — the live reading of that budget. */
   queuedBytes: number;
   /** Milliseconds a capture waited for a slot. Deliberately OUTSIDE the op budget. */
@@ -204,6 +233,13 @@ export const MAX_RAW_STORE_QUEUE_MAX = 5000;
  * what is being held: 500 page bodies is ~15 MB and 500 originals is up to ~5 GB.
  */
 export const DEFAULT_RAW_STORE_QUEUE_MAX_BYTES = 256 * 1024 * 1024;
+/**
+ * Three quarters of the queue for images, the last quarter held for page bodies.
+ * Sized from what the two lanes actually hold: a gzipped page is ~40 KB against an
+ * original's megabytes, so a quarter of the budget is thousands of pages of headroom
+ * while still leaving the image lane the bulk of a queue built for it.
+ */
+export const DEFAULT_RAW_STORE_ASSET_QUEUE_SHARE = 0.75;
 /** Drops are loud, but once a minute — a wave must not turn into a log flood. */
 const DROP_LOG_INTERVAL_MS = 60_000;
 /** Rolling latency window. Percentiles over the recent past, at a fixed memory cost. */
@@ -385,6 +421,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
   private readonly concurrency: number;
   private readonly queueMax: number;
   private readonly queueMaxBytes: number;
+  private readonly assetQueueShare: number;
   private readonly queue: QueuedOp[] = [];
   private queuedBytes = 0;
   private inFlight = 0;
@@ -392,6 +429,9 @@ export class ObjectStoreCaptureSink implements CaptureSink {
   private droppedBytes = 0;
   private droppedSinceLog = 0;
   private lastDropLogAt = 0;
+  private assetRefusedReserve = 0;
+  private assetHeldSinceLog = 0;
+  private lastAssetHoldLogAt = 0;
   private readonly queueWaits: number[] = [];
   private readonly putDurations: number[] = [];
   private readonly headDurations: number[] = [];
@@ -443,6 +483,14 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     const qb = config.queueMaxBytes;
     this.queueMaxBytes =
       typeof qb === 'number' && Number.isFinite(qb) && qb > 0 ? Math.floor(qb) : DEFAULT_RAW_STORE_QUEUE_MAX_BYTES;
+    // Clamped like the other bounds, and for the same reason: a share above 1 is not a
+    // bigger reservation but none at all, and a zero/negative one would silently close
+    // the asset lane behind PERSIST_RAW_IMAGES' back.
+    const as = config.assetQueueShare;
+    this.assetQueueShare =
+      typeof as === 'number' && Number.isFinite(as) && as > 0
+        ? Math.min(as, 1)
+        : DEFAULT_RAW_STORE_ASSET_QUEUE_SHARE;
   }
 
   stats(): SinkStats {
@@ -459,6 +507,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       inFlight: this.inFlight,
       dropped: this.dropped,
       droppedBytes: this.droppedBytes,
+      assetRefusedReserve: this.assetRefusedReserve,
       queuedBytes: this.queuedBytes,
       queueWaitP50: percentile(this.queueWaits, 50),
       queueWaitP95: percentile(this.queueWaits, 95),
@@ -492,7 +541,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       this.skippedDisabled += 1;
       return CAPTURE_ADMITTED; // a DECISION, not a refusal — re-offering changes nothing
     }
-    return this.enqueue(() => this.storePage(c), byteLengthOf(c.bytes));
+    return this.enqueue(() => this.storePage(c), byteLengthOf(c.bytes), 'page');
   }
 
   /** The page/api lanes' store round trip, on a worker. Swallows-but-counts. */
@@ -583,7 +632,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     }
     const stored = bytes;
     const imageType = type;
-    return this.enqueue(() => this.storeAsset(c, stored, imageType), stored.byteLength);
+    return this.enqueue(() => this.storeAsset(c, stored, imageType), stored.byteLength, 'asset');
   }
 
   /** The asset lane's store round trip, on a worker — the SAME queue as the pages. */
@@ -642,7 +691,27 @@ export class ObjectStoreCaptureSink implements CaptureSink {
    * memory we are holding on a scrape's behalf, and the capture it is holding is
    * already stale by the time it would be written.
    */
-  private enqueue(run: () => Promise<void>, bytes: number): CaptureAdmission {
+  private enqueue(run: () => Promise<void>, bytes: number, lane: 'page' | 'asset'): CaptureAdmission {
+    // The PAGE RESERVATION. Both lanes share this queue, but not the consequences of
+    // losing a slot: a refused page body is provenance gone for good behind a claim
+    // already written, a refused image is one the next crawl pass re-fetches. So the
+    // asset lane may enter only while the queue is BELOW its share of both budgets,
+    // and the remainder stays there for pages. The test is on what the queue holds
+    // NOW rather than on what this capture would add, which is deliberate: an empty
+    // queue always admits an asset (no page is displaced by a capture that waits for
+    // nobody), one asset may straddle the line, and the full ceilings below still
+    // bound the memory either way.
+    if (lane === 'asset' && this.assetQueueShare < 1) {
+      if (
+        this.queue.length >= this.assetQueueShare * this.queueMax ||
+        this.queuedBytes >= this.assetQueueShare * this.queueMaxBytes
+      ) {
+        this.assetRefusedReserve += 1;
+        this.holdAndLog();
+        // A refusal, not a skip: the caller must retry rather than memoize this url.
+        return { admitted: false, reason: 'assetReserve' };
+      }
+    }
     if (this.queue.length >= this.queueMax) {
       this.dropped += 1;
       this.dropAndLog('depth');
@@ -720,6 +789,29 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       `[RAW-STORE] capture queue full (${bound} reached, concurrency ${this.concurrency}) — ` +
         `dropped ${since} capture(s) since the last report, ${this.dropped} on depth and ` +
         `${this.droppedBytes} on bytes in total`,
+    );
+  }
+
+  /**
+   * Tally one held-back asset and report the burst, at most once a minute — on its
+   * OWN line and its own window, never mixed into the drop report. The two events say
+   * different things to an operator: "capture queue full" is captures being lost, this
+   * one is captures being deferred to protect the ones that cannot be.
+   */
+  private holdAndLog(): void {
+    this.assetHeldSinceLog += 1;
+    const now = Date.now();
+    if (now - this.lastAssetHoldLogAt < DROP_LOG_INTERVAL_MS) return;
+    this.lastAssetHoldLogAt = now;
+    const since = this.assetHeldSinceLog;
+    this.assetHeldSinceLog = 0;
+    // eslint-disable-next-line no-console
+    console.warn(
+      '[RAW-STORE] asset capture held back for the page reservation ' +
+        `(asset share ${this.assetQueueShare} of depth ${this.queueMax} and ${this.queueMaxBytes} bytes, ` +
+        `${this.queue.length} queued) — refused ${since} asset capture(s) since the last report, ` +
+        `${this.assetRefusedReserve} in total; those images are re-fetchable next pass, ` +
+        'the page bodies the space is held for are not',
     );
   }
 
