@@ -514,6 +514,59 @@ describe('the image capture hook', () => {
       expect(hook.stats()).toMatchObject({ stored: 0, failed: 2 });
     });
 
+    it('does NOT memoize a capture the sink refused, so the next pass retries it', async () => {
+      // A full sink queue drops the bytes. Counting that as stored and remembering the
+      // url is the worst of both: the capture is lost AND the retry is suppressed.
+      const sink = { capture: jest.fn(async () => ({ admitted: false, reason: 'queueFull' as const })) };
+      const hook = createImageCaptureHook({
+        sink,
+        policy: buildImageHostPolicy({}),
+        fetchBytes: async (url: string) => okBytes(Buffer.from(url), url),
+        now: () => 0,
+      });
+      const request = {
+        site: 'examplestore',
+        itemId: 'lucy-1',
+        pageUrl: PAGE,
+        fields: {},
+        ruleset: rulesetDescribing([gallery('https://cdn.test/a.jpg', 0)]),
+        origin: 'ingest' as const,
+      };
+
+      await expect(hook.capture(request)).resolves.toBeUndefined();
+      expect(hook.stats()).toMatchObject({ stored: 0, failed: 1 });
+      expect(hook.stats().skipped.sinkQueueFull).toBe(1);
+
+      // The memo was never written, so the same url is fetched and offered again.
+      await expect(hook.capture(request)).resolves.toBeUndefined();
+      expect(sink.capture).toHaveBeenCalledTimes(2);
+      expect(hook.stats().skipped.memo).toBe(0);
+    });
+
+    it('still counts an ADMITTED capture as stored and memoizes it', async () => {
+      const sink = { capture: jest.fn(async () => ({ admitted: true })) };
+      const hook = createImageCaptureHook({
+        sink,
+        policy: buildImageHostPolicy({}),
+        fetchBytes: async (url: string) => okBytes(Buffer.from(url), url),
+        now: () => 0,
+      });
+      const request = {
+        site: 'examplestore',
+        itemId: 'lucy-1',
+        pageUrl: PAGE,
+        fields: {},
+        ruleset: rulesetDescribing([gallery('https://cdn.test/a.jpg', 0)]),
+        origin: 'ingest' as const,
+      };
+
+      await hook.capture(request);
+      await hook.capture(request);
+      expect(hook.stats()).toMatchObject({ stored: 1, failed: 0 });
+      expect(hook.stats().skipped.memo).toBe(1); // the second pass was memoized away
+      expect(sink.capture).toHaveBeenCalledTimes(1);
+    });
+
     it('survives a failure reporter that itself fails', async () => {
       const hook = createImageCaptureHook({
         sink: new CollectingCaptureSink(),

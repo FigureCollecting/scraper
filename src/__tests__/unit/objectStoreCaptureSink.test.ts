@@ -375,12 +375,14 @@ describe('ObjectStoreCaptureSink — the asset lane', () => {
       dropped: 0,
       droppedBytes: 0,
       queuedBytes: 0,
-      queueWaitP50: 0,
-      queueWaitP95: 0,
-      putP50: 0,
-      putP95: 0,
-      headP50: 0,
-      headP95: 0,
+      // Latencies are wall clock, so the SHAPE is asserted and the values are not:
+      // a real HEAD that happens to cross a millisecond boundary is not a defect.
+      queueWaitP50: expect.any(Number),
+      queueWaitP95: expect.any(Number),
+      putP50: expect.any(Number),
+      putP95: expect.any(Number),
+      headP50: expect.any(Number),
+      headP95: expect.any(Number),
     });
   });
 
@@ -874,7 +876,7 @@ describe('ObjectStoreCaptureSink — bounded admission queue', () => {
     const store = new GatedObjectStore();
     const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 60_000, concurrency: 1 });
 
-    await expect(sink.capture(cap())).resolves.toBeUndefined();
+    await expect(sink.capture(cap())).resolves.toEqual({ admitted: true });
     await until(() => store.parked.length === 1);
 
     expect(store.parked.length).toBe(1); // the upload is still in flight…
@@ -892,7 +894,8 @@ describe('ObjectStoreCaptureSink — bounded admission queue', () => {
     };
     const sink = new ObjectStoreCaptureSink(boom, { ...CONFIG, concurrency: 2 });
 
-    await expect(sink.capture(cap())).resolves.toBeUndefined();
+    // Admitted, then the store blew up on the worker: the failure is counted, never thrown.
+    await expect(sink.capture(cap())).resolves.toEqual({ admitted: true });
     await sink.flush();
 
     expect(sink.stats().failed).toBe(1);
@@ -1064,6 +1067,60 @@ describe('ObjectStoreCaptureSink — bounded admission queue', () => {
     await sink.flush();
     expect(sink.stats().queued).toBe(0);
     warn.mockRestore();
+  });
+
+  it('tells the caller a dropped capture was NOT admitted, and why', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new GatedObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, {
+      ...CONFIG, putTimeoutMs: 60_000, concurrency: 1, queueMax: 1,
+    });
+
+    await expect(sink.capture(cap({ bytes: Buffer.from('a') }))).resolves.toEqual({ admitted: true });
+    await expect(sink.capture(cap({ bytes: Buffer.from('b') }))).resolves.toEqual({ admitted: true });
+    // Third one: the queue is full. Silence here is what let the image hook count a
+    // dropped capture as stored and memoize the url, suppressing its own retry.
+    await expect(sink.capture(cap({ bytes: Buffer.from('c') }))).resolves.toEqual({
+      admitted: false, reason: 'queueFull',
+    });
+
+    store.open = true;
+    store.release();
+    await sink.flush();
+    warn.mockRestore();
+  });
+
+  it('names the BYTE ceiling as the reason when that is the one that bound', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new GatedObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, {
+      ...CONFIG, putTimeoutMs: 60_000, concurrency: 1, queueMax: 100, queueMaxBytes: 500,
+    });
+
+    await sink.capture(cap({ bytes: Buffer.alloc(400, 1) })); // straight to the worker
+    await sink.capture(cap({ bytes: Buffer.alloc(400, 2) })); // queued, 400 of 500
+    await expect(sink.capture(cap({ bytes: Buffer.alloc(400, 3) }))).resolves.toEqual({
+      admitted: false, reason: 'queueBytesFull',
+    });
+
+    store.open = true;
+    store.release();
+    await sink.flush();
+    warn.mockRestore();
+  });
+
+  it('treats a typed skip and a disabled lane as ADMITTED — decisions, not refusals', async () => {
+    const store = new GatedObjectStore();
+    store.open = true;
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, concurrency: 1 });
+
+    // The sink resolved these captures. Re-offering them changes nothing, so they
+    // must NOT read as "try again" — only a full queue means that.
+    await expect(sink.capture(asset(Buffer.from('<html>nope</html>')))).resolves.toEqual({ admitted: true });
+    const off = new ObjectStoreCaptureSink(store, { ...CONFIG, pagesEnabled: false, assetsEnabled: false });
+    await expect(off.capture(cap())).resolves.toEqual({ admitted: true });
+    await expect(off.capture(asset(PNG))).resolves.toEqual({ admitted: true });
+    await sink.flush();
   });
 
   it('flush() resolves immediately when nothing is queued', async () => {

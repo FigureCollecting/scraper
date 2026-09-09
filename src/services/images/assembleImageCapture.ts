@@ -215,7 +215,7 @@ export function imageCaptureView(hook: ImageCaptureHook = getImageCaptureHook())
       attempted: 0,
       stored: 0,
       deduped: 0,
-      skipped: { policyDeny: 0, memo: 0, thumbnailRole: 0, userRole: 0, cap: 0, residentialBudget: 0, notImage: 0, tooLarge: 0, refused: 0, unsupported: 0, inFlight: 0 },
+      skipped: { policyDeny: 0, memo: 0, thumbnailRole: 0, userRole: 0, cap: 0, residentialBudget: 0, notImage: 0, tooLarge: 0, refused: 0, unsupported: 0, inFlight: 0, sinkQueueFull: 0 },
       failed: 0,
       residentialBytesToday: 0,
     };

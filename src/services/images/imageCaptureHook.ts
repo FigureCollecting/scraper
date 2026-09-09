@@ -26,7 +26,7 @@
  *   sink                              (content-addressed write)
  */
 import type { ExtractionRuleset, SearchFetch } from '@figurecollecting/scraper-plugin-contract';
-import { buildRawCapture, type CaptureSink } from '../captureSink.js';
+import { buildRawCapture, wasAdmitted, type CaptureSink } from '../captureSink.js';
 import type { FetchOriginName, FetchFailureReport, ReportFetchFailure } from '../failureReporter.js';
 import type { FetchReasonClass } from '../failureClassifier.js';
 import { isDeclaringStoreUrl } from '../residentialEgress.js';
@@ -163,6 +163,14 @@ export interface ImageCaptureSkipCounts {
   unsupported: number;
   /** Dropped un-attempted because too many items were already waiting for the lane. */
   inFlight: number;
+  /**
+   * FETCHED, then refused by the raw-store sink because its queue was full. Counted
+   * here as well as in `failed` on purpose: these bytes cost us a request and were
+   * thrown away, and the named reason is what separates "the store is behind" from
+   * "the store is broken". The url is deliberately NOT memoized, so the next pass
+   * tries again.
+   */
+  sinkQueueFull: number;
 }
 
 export interface ImageCaptureStats {
@@ -312,6 +320,7 @@ export function createImageCaptureHook(deps: ImageCaptureHookDeps): ImageCapture
     refused: 0,
     unsupported: 0,
     inFlight: 0,
+    sinkQueueFull: 0,
   };
   const lastLoggedByHost = new Map<string, number>();
   const inFlight = new Set<Promise<void>>();
@@ -506,7 +515,16 @@ export function createImageCaptureHook(deps: ImageCaptureHookDeps): ImageCapture
       return;
     }
     try {
-      await deps.sink.capture(capture);
+      const admission = await deps.sink.capture(capture);
+      if (!wasAdmitted(admission)) {
+        // The sink's queue was full, so these bytes are gone. Counting that as stored
+        // and remembering the url would be the worst of both outcomes: the capture is
+        // lost AND the retry that would have recovered it is suppressed.
+        failed += 1;
+        skipped.sinkQueueFull += 1;
+        logOncePerHost(host, `[IMAGE-CAPTURE] raw-store queue full — ${sanitizeForLog(url)} not stored, will retry`);
+        return;
+      }
       stored += 1;
       // Remembered only on a write that did not throw: a url whose bytes never reached the sink must
       // be retried on the next pass, not memoized as done.

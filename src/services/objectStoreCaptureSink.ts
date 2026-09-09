@@ -35,11 +35,13 @@
  * The op budget now starts when the store call is made, and the wait for a worker
  * slot is reported separately (queueWaitP50/P95) instead of being charged to it.
  * A capture offered when the queue is already full is DROPPED and counted rather
- * than making the backlog unbounded.
+ * than making the backlog unbounded — and capture() SAYS SO, so a caller keeping a
+ * per-url memo does not record a lost capture as done and suppress its own retry.
  */
 import { gzip } from 'node:zlib';
 import { promisify } from 'node:util';
-import type { CaptureSink, RawCapture } from './captureSink.js';
+import type { CaptureAdmission, CaptureSink, RawCapture } from './captureSink.js';
+import { CAPTURE_ADMITTED } from './captureSink.js';
 import { sanitizeForLog } from '../utils/security.js';
 
 /**
@@ -477,10 +479,13 @@ export class ObjectStoreCaptureSink implements CaptureSink {
    * store round trip runs on a worker, so a slow bucket costs the fetch path
    * nothing. Never rejects: this lane is insurance, not a dependency.
    */
-  async capture(c: RawCapture): Promise<void> {
+  async capture(c: RawCapture): Promise<CaptureAdmission> {
     if (c.lane === 'asset') return this.admitAsset(c);
-    if (!this.pagesEnabled) return void (this.skippedDisabled += 1);
-    this.enqueue(() => this.storePage(c), byteLengthOf(c.bytes));
+    if (!this.pagesEnabled) {
+      this.skippedDisabled += 1;
+      return CAPTURE_ADMITTED; // a DECISION, not a refusal — re-offering changes nothing
+    }
+    return this.enqueue(() => this.storePage(c), byteLengthOf(c.bytes));
   }
 
   /** The page/api lanes' store round trip, on a worker. Swallows-but-counts. */
@@ -527,8 +532,11 @@ export class ObjectStoreCaptureSink implements CaptureSink {
    * never thrown, because a mislabelled or challenge-page response on this lane is
    * routine and must not disturb the scrape.
    */
-  private async admitAsset(c: RawCapture): Promise<void> {
-    if (!this.assetsEnabled) return void (this.assetSkipped.disabled += 1);
+  private async admitAsset(c: RawCapture): Promise<CaptureAdmission> {
+    if (!this.assetsEnabled) {
+      this.assetSkipped.disabled += 1;
+      return CAPTURE_ADMITTED;
+    }
     let bytes: Buffer;
     let type: ImageType | undefined;
     try {
@@ -537,18 +545,27 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       // These decisions cost no round trip, so they are settled HERE rather than
       // spending a queue slot to discover that nothing was going to be stored.
       bytes = asBuffer(c.bytes);
-      if (bytes.length === 0) return void (this.assetSkipped.empty += 1);
-      if (bytes.length > this.maxImageBytes) return void (this.assetSkipped.tooLarge += 1);
+      if (bytes.length === 0) {
+        this.assetSkipped.empty += 1;
+        return CAPTURE_ADMITTED;
+      }
+      if (bytes.length > this.maxImageBytes) {
+        this.assetSkipped.tooLarge += 1;
+        return CAPTURE_ADMITTED;
+      }
       type = sniffImageType(bytes);
-      if (!type) return void (this.assetSkipped.notImage += 1);
+      if (!type) {
+        this.assetSkipped.notImage += 1;
+        return CAPTURE_ADMITTED;
+      }
     } catch (err) {
       this.assetFailed += 1;
       this.warnAssetFailure(c, err);
-      return;
+      return CAPTURE_ADMITTED; // counted and logged — the sink has resolved it
     }
     const stored = bytes;
     const imageType = type;
-    this.enqueue(() => this.storeAsset(c, stored, imageType), stored.byteLength);
+    return this.enqueue(() => this.storeAsset(c, stored, imageType), stored.byteLength);
   }
 
   /** The asset lane's store round trip, on a worker — the SAME queue as the pages. */
@@ -598,11 +615,11 @@ export class ObjectStoreCaptureSink implements CaptureSink {
    * memory we are holding on a scrape's behalf, and the capture it is holding is
    * already stale by the time it would be written.
    */
-  private enqueue(run: () => Promise<void>, bytes: number): void {
+  private enqueue(run: () => Promise<void>, bytes: number): CaptureAdmission {
     if (this.queue.length >= this.queueMax) {
       this.dropped += 1;
       this.dropAndLog('depth');
-      return;
+      return { admitted: false, reason: 'queueFull' };
     }
     // The byte budget, checked against what the queue would hold AFTER this capture.
     // A count ceiling is not a memory bound: the depth that is 15 MB of page bodies
@@ -610,7 +627,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     if (this.queuedBytes + bytes > this.queueMaxBytes) {
       this.droppedBytes += 1;
       this.dropAndLog('bytes');
-      return;
+      return { admitted: false, reason: 'queueBytesFull' };
     }
     this.queuedBytes += bytes;
     this.queue.push({ run, enqueuedAt: Date.now(), bytes });
@@ -618,6 +635,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     // one: an unhandled rejection out here would take the process with it, and this
     // lane is insurance — it is never allowed to be the thing that kills a scraper.
     if (this.inFlight < this.concurrency) void this.work().catch(() => undefined);
+    return CAPTURE_ADMITTED;
   }
 
   /** One worker: take ops until the queue is empty, then release any flush() waiters. */

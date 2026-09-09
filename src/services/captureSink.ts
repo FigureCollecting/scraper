@@ -92,9 +92,38 @@ export interface RawCaptureInput {
   role?: string;
 }
 
-/** A destination for raw captures. Implementations store bytes + emit metadata. */
+/**
+ * Why a sink could not take a capture. Both are TRANSIENT — the sink's queue was
+ * full — which is the whole point of naming them: a caller that keeps a per-url memo
+ * must not record a refused capture as done, or the bytes are lost AND the retry is
+ * suppressed. A kill switch or a typed skip is NOT a refusal: the sink resolved the
+ * capture, and offering it again would change nothing.
+ */
+export type CaptureRefusal = 'queueFull' | 'queueBytesFull';
+
+/** What a sink says about a capture it was offered. */
+export interface CaptureAdmission {
+  /** False only when the sink could not take it and offering it AGAIN could succeed. */
+  admitted: boolean;
+  reason?: CaptureRefusal;
+}
+
+/**
+ * A destination for raw captures. Implementations store bytes + emit metadata.
+ *
+ * `capture` may answer with a {@link CaptureAdmission}; a sink that returns nothing is
+ * read as having accepted, so the Noop/Collecting sinks and every test fake stay valid.
+ */
 export interface CaptureSink {
-  capture(c: RawCapture): Promise<void>;
+  capture(c: RawCapture): Promise<void | CaptureAdmission>;
+}
+
+/** The shared "the sink took it" answer — no allocation per capture. */
+export const CAPTURE_ADMITTED: CaptureAdmission = Object.freeze({ admitted: true });
+
+/** True unless the sink explicitly refused. Absent/void answers mean accepted. */
+export function wasAdmitted(result: void | CaptureAdmission): boolean {
+  return !result || result.admitted !== false;
 }
 
 /** Build a RawCapture, computing the content address from the bytes. */
