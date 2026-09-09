@@ -106,8 +106,10 @@ export interface ImageFetchOptions {
   /**
    * The user agent to send. ABSENT means the transport's own — undici's `node`, impit's
    * impersonation profile, the browser's real UA — which is what the policy table's
-   * `ua: 'default'` resolves to. No lane may read this absence as a licence to send a browser
-   * string of its own; see {@link resolveImageUserAgent}.
+   * `ua: 'default'` resolves to. On the http and impit lanes no lane may read this absence as a
+   * licence to send a browser string of its own; a browser tab always carries the browser's
+   * identity, so there the absence is honoured by leaving that UA alone rather than by withholding
+   * one. See {@link resolveImageUserAgent}.
    */
   userAgent?: string;
   /** Residential egress for this fetch. The plain-HTTP lane REFUSES it (it cannot proxy). */
@@ -184,6 +186,12 @@ export const IMAGE_CHROME_UA =
  * request that claims no browser and 403 cf-mitigated to one that claims Chrome, on ANY Chrome
  * version — including the engine's own page-lane UA. The token exists to keep that claim off the
  * wire, so a lane that adds one back has inverted the only decision the operator made.
+ *
+ * That contract binds the HTTP and IMPIT lanes, which is where `default` can be delivered. The gated
+ * tab cannot honour it and does not pretend to: a browser tab carries the browser's identity, always
+ * a Chrome string, and `gatedTabBytesFetch` resolving one through the page lane's own rules is the
+ * transport being consistent with itself, not a lane substituting an identity. A host that needs
+ * `default` needs `http` or `impit` — see `ImageHostRule.ua`.
  */
 export function resolveImageUserAgent(ua: 'chrome' | 'default' | undefined): string | undefined {
   return ua === 'chrome' ? IMAGE_CHROME_UA : undefined;
