@@ -89,10 +89,32 @@ describe('runInitiatorPass × fetch-failure ledger', () => {
       site: 'amiami',
       kind: 'search',
       origin: 'initiator',
-      reasonClass: 'gone_404',
+      reasonClass: 'other',
       httpStatus: 404,
       target: 'fc:search/amiami?q=lucy&mode=listed',
     });
+  });
+
+  it('E12: no status from OUR OWN /lookup may ever be filed as a store verdict', async () => {
+    // /lookup is the scraper's own endpoint (it answers 400/502/200, never 404). A 404/403/410 there
+    // is route drift or a rolled-back deploy — infrastructure, not "the store removed its search".
+    // gone_* closes a row as 'gone': never retried, never in the review queue.
+    for (const status of [403, 404, 410]) {
+      const { reports, deps } = harness({ lookup: async () => resp(status, { error: 'nope' }) });
+      await runInitiatorPass(mkCfg(), deps);
+      expect(reports).toHaveLength(1);
+      expect(reports[0].reasonClass).toBe('other');
+    }
+  });
+
+  it('E12: a 429 and a 408 from our own /lookup keep their transient classes', async () => {
+    const { reports: r429, deps: d429 } = harness({ lookup: async () => resp(429, {}) });
+    await runInitiatorPass(mkCfg(), d429);
+    expect(r429.map((r) => r.reasonClass)).toEqual(['http_429']);
+
+    const { reports: r408, deps: d408 } = harness({ lookup: async () => resp(408, {}) });
+    await runInitiatorPass(mkCfg(), d408);
+    expect(r408.map((r) => r.reasonClass)).toEqual(['timeout']);
   });
 
   it('E12: a transient lookup is reported ONCE, after the retry also failed — never per attempt', async () => {

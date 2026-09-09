@@ -307,19 +307,39 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
   const searchTarget = (term: string, siteId: string): string =>
     `fc:search/${siteId}?q=${encodeURIComponent(term)}&mode=${config.mode}`;
 
+  /**
+   * The reason class for a status THE SCRAPER ITSELF answered. /lookup is our own endpoint (it emits
+   * 400, 502 or 200 — never 404), so a 404/403/410 there is route drift, a rolled-back deploy, or a
+   * mis-pointed SCRAPER_SERVICE_URL. Routing it through the store-verdict table would file it as
+   * gone_404, which the spine closes as 'gone': never retried, never in the review queue — a whole
+   * discovery outage recording itself as "the stores removed these searches". Only a 5xx names a
+   * fault we can attribute; the two genuinely transient 4xx keep their classes; everything else is
+   * triage. Same rule the crawler applies to /catalog (E8).
+   */
+  const ourOwnStatusClass = (status: number): FetchFailureReport['reasonClass'] => {
+    if (status >= 500) return 'http_5xx';
+    if (status === 429) return 'http_429';
+    if (status === 408) return 'timeout';
+    return 'other';
+  };
+
   /** One terminal lookup failure → one row. `parseFailure` is a 2xx we could not read: ours to fix. */
   const reportLookupFailure = (term: string, siteId: string, outcome: { reason: string; status?: number; parseFailure?: boolean }): void => {
-    const { reasonClass, httpStatus } = classifyFetchFailure({
-      error: outcome.reason,
-      ...(outcome.status !== undefined ? { httpStatus: outcome.status } : {}),
-    });
+    const reasonClass: FetchFailureReport['reasonClass'] = outcome.parseFailure
+      ? 'parse'
+      : outcome.status !== undefined
+        ? ourOwnStatusClass(outcome.status)
+        // No status at all: the transport threw, and the message is the only signal there is.
+        : classifyFetchFailure({ error: outcome.reason }).reasonClass;
     emitFailure({
       site: siteId,
       target: searchTarget(term, siteId),
       kind: 'search',
       origin: 'initiator',
-      reasonClass: outcome.parseFailure ? 'parse' : reasonClass,
-      ...(httpStatus !== undefined && !outcome.parseFailure ? { httpStatus } : {}),
+      reasonClass,
+      // The status IS honest here: the target of a `fc:search` row is the lookup we issued, and the
+      // status is the answer that lookup got. Only the CLASS must not pose as a store verdict.
+      ...(outcome.status !== undefined && !outcome.parseFailure ? { httpStatus: outcome.status } : {}),
       message: outcome.reason,
     });
   };
