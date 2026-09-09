@@ -1,6 +1,6 @@
 import { jest } from '@jest/globals';
 import { NoopCaptureSink, buildRawCapture } from '../../services/captureSink';
-import { ObjectStoreCaptureSink, type ObjectStore } from '../../services/objectStoreCaptureSink';
+import { ObjectStoreCaptureSink, MIN_RAW_STORE_ASSET_MAX_WAIT_MS, type ObjectStore } from '../../services/objectStoreCaptureSink';
 import {
   MAX_CONFIGURABLE_IMAGE_BYTES,
   rawStoreView,
@@ -121,6 +121,33 @@ describe('loadRawStoreConfigFromEnv', () => {
       } as unknown as NodeJS.ProcessEnv)!;
       expect(bad.config.assetQueueShare).toBeUndefined();
     }
+  });
+
+  it('reads RAW_STORE_ASSET_MAX_WAIT_MS — how long the asset lane may wait behind pages before it goes next', () => {
+    const loaded = loadRawStoreConfigFromEnv({
+      ...FULL_ENV,
+      RAW_STORE_ASSET_MAX_WAIT_MS: '45000',
+    } as unknown as NodeJS.ProcessEnv)!;
+    expect(loaded.config.assetMaxWaitMs).toBe(45_000);
+  });
+
+  it('clamps RAW_STORE_ASSET_MAX_WAIT_MS at 1 s from below and drops a nonsense one, so the sink keeps its 30 s', () => {
+    const low = loadRawStoreConfigFromEnv({
+      ...FULL_ENV,
+      RAW_STORE_ASSET_MAX_WAIT_MS: '250',
+    } as unknown as NodeJS.ProcessEnv)!;
+    // A window under a second is round-robin wearing a number: the page reservation's turn
+    // handed straight back to the images it was taken from.
+    expect(low.config.assetMaxWaitMs).toBe(MIN_RAW_STORE_ASSET_MAX_WAIT_MS);
+
+    for (const raw of ['soon', '0', '-5']) {
+      const bad = loadRawStoreConfigFromEnv({
+        ...FULL_ENV,
+        RAW_STORE_ASSET_MAX_WAIT_MS: raw,
+      } as unknown as NodeJS.ProcessEnv)!;
+      expect(bad.config.assetMaxWaitMs).toBeUndefined();
+    }
+    expect(loadRawStoreConfigFromEnv(FULL_ENV)!.config.assetMaxWaitMs).toBeUndefined();
   });
 
   it('defaults the asset lane: imagePrefix raw-img/ and no explicit byte ceiling', () => {

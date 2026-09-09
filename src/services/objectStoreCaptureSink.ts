@@ -58,29 +58,50 @@
  *
  * PAGE PRIORITY: the reservation buys a page ADMISSION, not a turn. Drained first-come-
  * first-served, a page admitted into the reserved tail waited behind every asset queued
- * before it — at prod scale 375 uploads of up to 10 MiB across four workers — and at
+ * before it — at prod scale 375 uploads of up to 10 MiB across twelve workers — and at
  * SIGTERM the bounded flush spent its whole budget on re-fetchable images and abandoned
  * the page behind them. So the two lanes wait in two queues, and a worker takes a PAGE
  * whenever one is waiting and an asset only when none is; FIFO inside each. Every bound
  * — depth, bytes, the share — is measured over the two queues COMBINED, exactly as with
  * one queue: priority changes no single admission decision, only who goes next. What it
- * does change over time is which lane's captures stay RESIDENT: under sustained page
- * load the assets never drain, so they keep holding their slots and their bytes, and a
- * page can be refused `queueBytesFull` against bytes a waiting asset holds where
- * first-come-first-served would have drained it and given them back. The page reserve
+ * does change over time is which lane's captures stay RESIDENT: while pages keep coming
+ * the assets do not drain, so they keep holding their slots and their bytes, and a page
+ * can be refused `queueBytesFull` against bytes a waiting asset holds where first-come-
+ * first-served would have drained it and given them back. The page reserve
  * `(1 − assetQueueShare) × queueMaxBytes` holds either way; what priority costs a page
- * is the opportunistic headroom above it.
+ * is the opportunistic headroom above it. And priority reorders only what is WAITING:
+ * a shutdown budget (RAW_STORE_SHUTDOWN_FLUSH_MS) shorter than one PUT's p95 cannot
+ * rescue a page when every worker is mid-PUT at SIGTERM, because no worker frees inside
+ * it — that is a deployment tuning note (the budget against the measured PUT p95), not
+ * something this queue can fix.
+ *
+ * THE ASSET LANE NEVER STARVES: strict priority let a crawler burst (~17 min of every
+ * hour in prod) park the whole resident asset backlog for its duration — nothing
+ * uploaded, every new asset refused `assetReserve`, and the hold line naming
+ * RAW_STORE_QUEUE_MAX, a knob that frees nothing, because those captures were short of
+ * a worker that prefers pages, not of space. So an asset that has waited LONGER THAN
+ * `assetMaxWaitMs` (RAW_STORE_ASSET_MAX_WAIT_MS, default 30 s, never under 1 s) goes
+ * next — ONE of them, then a page again. That alternation is the bound: out of a page
+ * burst the asset lane gets at most every other take, so a page never waits behind more
+ * than one asset, and the window bounds how long the lane waits for its next turn, not
+ * how long every asset waits (a 375-deep backlog still drains one asset per page). The
+ * shutdown flush is exempt and stays strictly pages first: its budget is for the
+ * captures nothing will fetch again.
  *
  * WHAT THE SHARE MEASURES: the queue — captures WAITING for a worker. An upload that is
  * running has left the queue and holds no slot in it (the concurrency bounds what runs,
- * the queue bounds what waits: the same split the byte budget makes). So the asset
- * lane's whole footprint is `assetQueueShare × queueMax` waiting PLUS up to
- * `concurrency` uploads running — 375 + 4 at the defaults — and a page admitted behind
- * them waits for at most ONE of those uploads before a worker takes it. Counting the
- * running uploads against the share was tried and rejected: at a legal configuration
- * (RAW_STORE_QUEUE_MAX=8, RAW_STORE_CONCURRENCY=8) it refuses the seventh asset with
- * the queue EMPTY and two workers idle — the empty-queue admission the reservation
- * promises, broken by a knob that is not the concurrency knob.
+ * the queue bounds what waits: the same split the byte budget makes), and its bytes sit
+ * OUTSIDE RAW_STORE_QUEUE_MAX_BYTES. So the sink's footprint is, in captures, `queueMax`
+ * waiting + `concurrency` running, and in bytes `queueMaxBytes` + `concurrency` ×
+ * `maxImageBytes` (RAW_STORE_IMAGE_MAX_BYTES — the most one running upload can hold).
+ * At the deployed RAW_STORE_CONCURRENCY=12 that is 500 + 12 captures and 256 MiB +
+ * 12 × 10 MiB = 376 MiB, of which the asset lane's share is 375 + 12 captures and
+ * 192 MiB + 120 MiB = 312 MiB. A page admitted behind them waits for at most ONE of
+ * those uploads — plus one aged asset, when the lane's turn has come — before a worker
+ * takes it. Counting the running uploads against the share was tried and rejected: at a
+ * legal configuration (RAW_STORE_QUEUE_MAX=8, RAW_STORE_CONCURRENCY=8) it refuses the
+ * seventh asset with the queue EMPTY and two workers idle — the empty-queue admission
+ * the reservation promises, broken by a knob that is not the concurrency knob.
  */
 import { gzip } from 'node:zlib';
 import { promisify } from 'node:util';
@@ -184,6 +205,14 @@ export interface RawStoreConfig {
    */
   assetQueueShare?: number;
   /**
+   * How long an asset may wait behind pages before its lane's oldest capture goes next
+   * (one of them, then a page again). Pages go first otherwise. Bounds the starvation
+   * that strict priority allowed for the length of a crawler burst; never under
+   * MIN_RAW_STORE_ASSET_MAX_WAIT_MS, because a window of a few milliseconds is
+   * round-robin, which hands the page reservation's turn back to the images.
+   */
+  assetMaxWaitMs?: number;
+  /**
    * S3 addressing style for the adapter. Hetzner uses virtual-hosted style, so
    * the adapter defaults to `false` (path-style off). Unused by the sink logic.
    */
@@ -208,8 +237,15 @@ export interface SinkStats {
   assetDeduped: number;
   assetSkipped: AssetSkipCounts;
   assetFailed: number;
-  /** Captures waiting for a worker slot right now — both lanes, combined. */
+  /** Captures waiting for a worker slot right now — both lanes, combined: the number every budget is measured on. */
   queued: number;
+  /**
+   * The same depth by lane. `queued` alone cannot tell "375 images parked behind pages"
+   * from "375 pages backed up", and the two want different responses: the first is the
+   * reservation and the priority doing their job, the second is the store falling behind.
+   */
+  queuedPages: number;
+  queuedAssets: number;
   /** Store ops executing right now — never above the configured concurrency. */
   inFlight: number;
   /** Captures refused because the queue was already at queueMax. Irrecoverable. */
@@ -281,6 +317,13 @@ export const DEFAULT_RAW_STORE_QUEUE_MAX_BYTES = 256 * 1024 * 1024;
  * while still leaving the image lane the bulk of a queue built for it.
  */
 export const DEFAULT_RAW_STORE_ASSET_QUEUE_SHARE = 0.75;
+/**
+ * 30 s: three of the ~10 s HEAD+PUT round trips the deployed lane measures, so a page
+ * burst hands the asset lane a turn a few uploads in rather than at the burst's end.
+ */
+export const DEFAULT_RAW_STORE_ASSET_MAX_WAIT_MS = 30_000;
+/** Floor on the window. Below it the priority is round-robin with extra steps. */
+export const MIN_RAW_STORE_ASSET_MAX_WAIT_MS = 1_000;
 /** Drops are loud, but once a minute — a wave must not turn into a log flood. */
 const DROP_LOG_INTERVAL_MS = 60_000;
 /** Rolling latency window. Percentiles over the recent past, at a fixed memory cost. */
@@ -463,6 +506,12 @@ export class ObjectStoreCaptureSink implements CaptureSink {
   private readonly queueMax: number;
   private readonly queueMaxBytes: number;
   private readonly assetQueueShare: number;
+  private readonly assetMaxWaitMs: number;
+  /**
+   * Set when a worker took an aged asset ahead of a waiting page; the next take from a
+   * mixed queue is a page, whatever the assets' age. Cleared by that page take.
+   */
+  private pageOwed = false;
   /**
    * Two queues, one budget. Pages and assets wait apart so a worker can take a page
    * whenever one is waiting; every bound is measured over the two COMBINED (see
@@ -539,6 +588,11 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       typeof as === 'number' && Number.isFinite(as) && as > 0
         ? Math.min(as, 1)
         : DEFAULT_RAW_STORE_ASSET_QUEUE_SHARE;
+    const w = config.assetMaxWaitMs;
+    this.assetMaxWaitMs =
+      typeof w === 'number' && Number.isFinite(w) && w > 0
+        ? Math.max(w, MIN_RAW_STORE_ASSET_MAX_WAIT_MS)
+        : DEFAULT_RAW_STORE_ASSET_MAX_WAIT_MS;
   }
 
   stats(): SinkStats {
@@ -552,6 +606,8 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       assetSkipped: { ...this.assetSkipped },
       assetFailed: this.assetFailed,
       queued: this.queueDepth(),
+      queuedPages: this.pageQueue.length,
+      queuedAssets: this.assetQueue.length,
       inFlight: this.inFlight,
       dropped: this.dropped,
       droppedBytes: this.droppedBytes,
@@ -581,7 +637,8 @@ export class ObjectStoreCaptureSink implements CaptureSink {
    * Resolves once both queues are empty and every worker has finished. For tests and
    * for a graceful shutdown — the fetch path never calls it, because waiting for the
    * object store is the exact thing this queue exists to stop it doing. Pages drain
-   * first, so a bounded shutdown spends its budget on the captures it cannot get back.
+   * first — strictly, the aged-asset turn suspended — so a bounded shutdown spends its
+   * budget on the captures it cannot get back.
    */
   async flush(): Promise<void> {
     if (this.queueDepth() === 0 && this.inFlight === 0) return;
@@ -819,10 +876,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     this.inFlight += 1;
     try {
       for (;;) {
-        // A page whenever one is waiting, an asset only when none is; FIFO inside each.
-        // The page is the capture nothing will fetch again, and it must not wait behind
-        // a backlog of images the next pass would re-fetch anyway.
-        const job = this.pageQueue.shift() ?? this.assetQueue.shift();
+        const job = this.nextJob();
         if (!job) break;
         // The budget bounds what is WAITING; what is running is already bounded by
         // the concurrency, so a dequeued capture gives its bytes back immediately.
@@ -836,6 +890,36 @@ export class ObjectStoreCaptureSink implements CaptureSink {
         for (const resolve of this.drainWaiters.splice(0)) resolve();
       }
     }
+  }
+
+  /**
+   * Which capture a freed worker takes. A page whenever one is waiting, an asset only
+   * when none is, FIFO inside each — the page is the capture nothing will fetch again,
+   * and it must not wait behind a backlog of images the next pass would re-fetch anyway.
+   * The one exception is an asset that has waited LONGER THAN `assetMaxWaitMs` while
+   * pages kept coming: it goes next, ONE of them, and then a page again (`pageOwed`), so
+   * the lane never starves and a page never waits behind more than one asset. A shutdown
+   * flush — a drain waiter registered — is strictly pages first: that budget is for the
+   * captures nothing will fetch again.
+   */
+  private nextJob(): QueuedOp | undefined {
+    const oldestAsset = this.assetQueue[0];
+    if (
+      oldestAsset !== undefined &&
+      this.pageQueue.length > 0 &&
+      !this.pageOwed &&
+      this.drainWaiters.length === 0 &&
+      Date.now() - oldestAsset.enqueuedAt > this.assetMaxWaitMs
+    ) {
+      this.pageOwed = true;
+      return this.assetQueue.shift();
+    }
+    const page = this.pageQueue.shift();
+    if (page) {
+      this.pageOwed = false;
+      return page;
+    }
+    return this.assetQueue.shift();
   }
 
   /**
@@ -891,12 +975,17 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     this.lastAssetHoldLogAt = now;
     const since = this.assetHeldSinceLog;
     this.assetHeldSinceLog = 0;
+    // By lane, always: the share is a share of the WHOLE queue, so "the asset share is
+    // spent" can be true with no asset waiting at all — pages spent it — and the line
+    // must not read as an image backlog when it is a page backlog.
+    const lanes = `${this.pageQueue.length} page(s) + ${this.assetQueue.length} asset(s)`;
     const bound =
       budget === 'depth'
         ? `the asset share of the queue DEPTH is spent (share ${this.assetQueueShare} of ` +
-          `RAW_STORE_QUEUE_MAX ${this.queueMax}: ${this.queueDepth()} queued)`
+          `RAW_STORE_QUEUE_MAX ${this.queueMax}: ${this.queueDepth()} queued = ${lanes})`
         : `the asset share of the queue BYTES is spent (share ${this.assetQueueShare} of ` +
-          `RAW_STORE_QUEUE_MAX_BYTES ${this.queueMaxBytes}: ${this.queuedBytes} queued + ${bytes} offered)`;
+          `RAW_STORE_QUEUE_MAX_BYTES ${this.queueMaxBytes}: ${this.queuedBytes} queued + ${bytes} offered, ` +
+          `held by ${lanes})`;
     // eslint-disable-next-line no-console
     console.warn(
       `[RAW-STORE] asset capture held back for the page reservation — ${bound} — ` +

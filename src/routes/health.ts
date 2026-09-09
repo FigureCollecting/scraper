@@ -14,7 +14,8 @@
  *     navigationTimeoutMs, gatedBrowsers}`,
  *     `challengeCooldowns: [{host, remainingMs, reason}]` (the per-host CF cooldowns currently open),
  *     `rawStore: {configured, stats?}` (the raw-capture sink's counters — page + asset lanes,
- *     plus its admission queue: `queued`, `inFlight`, `dropped`, `assetRefusedReserve` (images
+ *     plus its admission queue: `queued` (with its lane split `queuedPages` / `queuedAssets`, so
+ *     images parked behind pages read differently from pages backed up), `inFlight`, `dropped`, `assetRefusedReserve` (images
  *     held back so page bodies keep their share of the queue — deferred, not lost, where a
  *     `dropped` page IS lost — split as `assetRefusedReserveDepth` / `assetRefusedReserveBytes`
  *     by the budget that held them, so the operator knows whether RAW_STORE_QUEUE_MAX or

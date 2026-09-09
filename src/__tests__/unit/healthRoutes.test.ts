@@ -9,6 +9,7 @@ import request from 'supertest';
 import { createHealthRoutes, type HealthDeps } from '../../routes/health';
 import { CfCookieStore } from '../../services/cookieJar';
 import type { ImageCaptureStats } from '../../services/images/imageCaptureHook';
+import type { SinkStats } from '../../services/objectStoreCaptureSink';
 
 const NO_IMAGE_CAPTURE: ImageCaptureStats = {
   enabled: false,
@@ -344,7 +345,9 @@ describe('browserLaneView', () => {
 // working: a store that answers every image request with a challenge page shows up
 // as assetSkipped.notImage and nothing else. They have to reach an ops surface.
 describe('createHealthRoutes — rawStore counters', () => {
-  const STATS = {
+  // Typed, so the fixture cannot drift from the sink: a counter added to SinkStats must
+  // reach this surface, and a counter this fixture invents must exist on the sink.
+  const STATS: SinkStats = {
     stored: 12,
     deduped: 3,
     failed: 0,
@@ -356,6 +359,9 @@ describe('createHealthRoutes — rawStore counters', () => {
     // The admission queue's view: a backlog and a drop count are what separate
     // "the bucket is slow" from "we are dropping captures on the floor".
     queued: 9,
+    // …by lane, so "375 images parked behind pages" reads differently from "375 pages backed up".
+    queuedPages: 6,
+    queuedAssets: 3,
     inFlight: 4,
     dropped: 2,
     droppedBytes: 1,
@@ -377,6 +383,7 @@ describe('createHealthRoutes — rawStore counters', () => {
     const res = await request(build({ getRawStore: () => ({ configured: true, stats: STATS }) })).get('/health/detailed');
     expect(res.status).toBe(200);
     expect(res.body.rawStore).toEqual({ configured: true, stats: STATS });
+    expect(res.body.rawStore.stats).toMatchObject({ queued: 9, queuedPages: 6, queuedAssets: 3 });
   });
 
   it('reports the unconfigured sink rather than omitting the block', async () => {

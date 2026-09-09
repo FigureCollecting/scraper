@@ -4,6 +4,8 @@ import { buildRawCapture, type RawCapture } from '../../services/captureSink';
 import {
   ObjectStoreCaptureSink,
   DEFAULT_IMAGE_PUT_TIMEOUT_MS,
+  DEFAULT_RAW_STORE_ASSET_MAX_WAIT_MS,
+  MIN_RAW_STORE_ASSET_MAX_WAIT_MS,
   type ObjectStore,
   type PutOptions,
   type RawStoreConfig,
@@ -369,8 +371,10 @@ describe('ObjectStoreCaptureSink — the asset lane', () => {
       assetDeduped: 0,
       assetFailed: 0,
       assetSkipped: { notImage: 0, tooLarge: 0, empty: 0, disabled: 0 },
-      // The queue's own view, drained: nothing waiting, nothing running, nothing lost.
+      // The queue's own view, drained: nothing waiting in either lane, nothing running, nothing lost.
       queued: 0,
+      queuedPages: 0,
+      queuedAssets: 0,
       inFlight: 0,
       dropped: 0,
       droppedBytes: 0,
@@ -1471,7 +1475,7 @@ describe('ObjectStoreCaptureSink — pages reach a worker before assets', () => 
     for (const c of [a1, a2, a3, p1, p2, a4, p3]) {
       await expect(sink.capture(c)).resolves.toEqual({ admitted: true });
     }
-    expect(sink.stats()).toMatchObject({ queued: 7, inFlight: 1 });
+    expect(sink.stats()).toMatchObject({ queued: 7, queuedPages: 3, queuedAssets: 4, inFlight: 1 });
 
     store.open = true;
     store.release();
@@ -1572,7 +1576,7 @@ describe('ObjectStoreCaptureSink — a held-back asset is counted against the bu
     expect(held()).toHaveLength(1);
     // The line names the budget AND the knob that raises it.
     expect(held()[0]).toContain('share of the queue DEPTH is spent');
-    expect(held()[0]).toContain('RAW_STORE_QUEUE_MAX 4');
+    expect(held()[0]).toContain('RAW_STORE_QUEUE_MAX 4: 2 queued = 0 page(s) + 2 asset(s)');
     expect(held()[0]).toContain('1 on depth and 0 on bytes in total');
     expect(held()[0]).not.toContain('RAW_STORE_QUEUE_MAX_BYTES');
 
@@ -1586,7 +1590,7 @@ describe('ObjectStoreCaptureSink — a held-back asset is counted against the bu
     });
     expect(held()).toHaveLength(2);
     expect(held()[1]).toContain('share of the queue BYTES is spent');
-    expect(held()[1]).toContain('RAW_STORE_QUEUE_MAX_BYTES 1000');
+    expect(held()[1]).toContain('RAW_STORE_QUEUE_MAX_BYTES 1000: 300 queued + 300 offered, held by 0 page(s) + 1 asset(s)');
     expect(held()[1]).toContain('0 on depth and 1 on bytes in total');
 
     // The compatibility counter is exactly the sum, and stays so as both climb.
@@ -1598,6 +1602,147 @@ describe('ObjectStoreCaptureSink — a held-back asset is counted against the bu
       store.release();
       await sink.flush();
     }
+    warn.mockRestore();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The asset lane must not starve. Strict pages-first parked the whole resident asset
+// backlog for the length of a crawler burst: nothing uploaded, every new asset refused
+// assetReserve, and the hold line naming RAW_STORE_QUEUE_MAX — a knob that frees nothing,
+// because those captures were short of a worker, not of space. An asset that has waited
+// LONGER THAN the window goes next; one of them, then a page again.
+// ---------------------------------------------------------------------------
+
+/**
+ * Two assets queued, aged by `ageMs`, then three pages queued behind them; returns the order
+ * the single worker takes them once its parked upload finishes (that parked page excluded).
+ * `flushFirst` registers a shutdown flush before the worker is freed, as SIGTERM would.
+ */
+const takeOrder = async (over: Partial<RawStoreConfig>, ageMs: number, flushFirst = false): Promise<string[]> => {
+  let now = 1_700_000_000_000;
+  const clock = jest.spyOn(Date, 'now').mockImplementation(() => now);
+  const store = new GatedObjectStore();
+  const sink = await parkedSink(store, { queueMax: 100, ...over });
+  const [a1, a2] = assets(2);
+  const [p1, p2, p3] = pages(3);
+  for (const a of [a1, a2]) await expect(sink.capture(a)).resolves.toEqual({ admitted: true });
+  now += ageMs;
+  for (const p of [p1, p2, p3]) await expect(sink.capture(p)).resolves.toEqual({ admitted: true });
+  // A flush registered BEFORE the worker is freed, or no flush at all until the queue has
+  // drained on its own — a flush() call is what makes the drain a shutdown drain.
+  const flushing = flushFirst ? sink.flush() : undefined;
+  store.open = true;
+  store.release();
+  await until(() => sink.stats().queued === 0 && sink.stats().inFlight === 0);
+  await flushing;
+  clock.mockRestore();
+  const names = new Map([
+    [assetKey(a1), 'a1'], [assetKey(a2), 'a2'], [pageKey(p1), 'p1'], [pageKey(p2), 'p2'], [pageKey(p3), 'p3'],
+  ]);
+  return store.keys.slice(1).map(k => names.get(k) ?? k);
+};
+
+describe('ObjectStoreCaptureSink — an asset that has waited past RAW_STORE_ASSET_MAX_WAIT_MS goes next', () => {
+  it('exports the window bounds: 30 s by default, never under 1 s', () => {
+    expect(DEFAULT_RAW_STORE_ASSET_MAX_WAIT_MS).toBe(30_000);
+    expect(MIN_RAW_STORE_ASSET_MAX_WAIT_MS).toBe(1_000);
+  });
+
+  it('takes the aged asset before the next page, then a page again — one aged asset per turn, never the backlog', async () => {
+    // a2 has waited exactly as long as a1, and still p1 goes between them: the take is
+    // bounded to ONE aged asset per turn, so a page burst can never flip into assets-first.
+    expect(await takeOrder({ assetMaxWaitMs: 30_000 }, 30_001)).toEqual(['a1', 'p1', 'a2', 'p2', 'p3']);
+  });
+
+  it('keeps pages first while the oldest asset is inside the window — LONGER than, so the window itself is not enough', async () => {
+    expect(await takeOrder({ assetMaxWaitMs: 30_000 }, 30_000)).toEqual(['p1', 'p2', 'p3', 'a1', 'a2']);
+  });
+
+  it('defaults the window to 30 s, and falls back to it on a nonsense value', async () => {
+    for (const over of [{}, { assetMaxWaitMs: Number.NaN }, { assetMaxWaitMs: 0 }, { assetMaxWaitMs: -5 }]) {
+      expect(await takeOrder(over, 29_999)).toEqual(['p1', 'p2', 'p3', 'a1', 'a2']);
+      expect(await takeOrder(over, 30_001)).toEqual(['a1', 'p1', 'a2', 'p2', 'p3']);
+    }
+  });
+
+  it('clamps the window at 1 s from below, so a typo cannot turn priority into round-robin', async () => {
+    expect(await takeOrder({ assetMaxWaitMs: 5 }, 999)).toEqual(['p1', 'p2', 'p3', 'a1', 'a2']);
+    expect(await takeOrder({ assetMaxWaitMs: 5 }, 1_001)).toEqual(['a1', 'p1', 'a2', 'p2', 'p3']);
+  });
+
+  it('the shutdown flush still drains pages first, however long the assets have waited', async () => {
+    expect(await takeOrder({ assetMaxWaitMs: 1_000 }, 600_000, true)).toEqual(['p1', 'p2', 'p3', 'a1', 'a2']);
+  });
+
+  it('serves an asset within the window of a page burst that strict priority would have starved it through', async () => {
+    let now = 1_700_000_000_000;
+    const clock = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    const store = new GatedObjectStore();
+    const sink = await parkedSink(store, { queueMax: 100, assetMaxWaitMs: 30_000 });
+    const [a1] = assets(1);
+    await expect(sink.capture(a1)).resolves.toEqual({ admitted: true });
+
+    // The burst: a new page lands every upload, each upload takes 5 s, and there is ALWAYS a
+    // page waiting when the worker frees. Under strict priority a1 would upload only after the
+    // burst ended — twelve pages, sixty seconds, for as long as the crawler kept going.
+    const burst = pages(12);
+    for (let round = 1; round <= 10; round += 1) {
+      await expect(sink.capture(burst[round - 1])).resolves.toEqual({ admitted: true });
+      now += 5_000;
+      store.parked.splice(0, 1).forEach(r => r()); // the running upload finishes
+      await until(() => store.parked.length === 1); // the worker took the next capture and parked on its PUT
+    }
+    // Rounds 1–6: pages, a1 aged 5 s … 30 s (not yet LONGER than the window). Round 7, at 35 s:
+    // a1 goes next even though p7 is waiting; round 8 the worker is back on pages.
+    expect(store.keys.slice(1, 7)).toEqual(burst.slice(0, 6).map(pageKey));
+    expect(store.keys[7]).toBe(assetKey(a1));
+    expect(store.keys[8]).toBe(pageKey(burst[6]));
+    expect(sink.stats()).toMatchObject({ assetStored: 1, queuedAssets: 0 });
+
+    clock.mockRestore();
+    await drain(store, sink);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The queue depth by lane. `queued` alone cannot tell "375 images parked behind pages"
+// from "375 pages backed up", and the DEPTH hold line could claim the asset share was
+// spent while the queue held no asset at all — the share is a share of the whole queue.
+// ---------------------------------------------------------------------------
+
+describe('ObjectStoreCaptureSink — the queue depth is reported by lane', () => {
+  it('reports queuedPages and queuedAssets beside their sum, live as the lanes drain', async () => {
+    const store = new GatedObjectStore();
+    const sink = await parkedSink(store, { queueMax: 100 });
+    const [a1, a2] = assets(2);
+    const [p1] = pages(1);
+    for (const c of [a1, p1, a2]) await expect(sink.capture(c)).resolves.toEqual({ admitted: true });
+    expect(sink.stats()).toMatchObject({ queued: 3, queuedPages: 1, queuedAssets: 2, inFlight: 1 });
+
+    // The freed worker takes the page; the two assets are what is left waiting.
+    store.parked.splice(0, 1).forEach(r => r());
+    await until(() => store.keys.length === 2);
+    expect(sink.stats()).toMatchObject({ queued: 2, queuedPages: 0, queuedAssets: 2 });
+
+    await drain(store, sink);
+    expect(sink.stats()).toMatchObject({ queued: 0, queuedPages: 0, queuedAssets: 0 });
+  });
+
+  it('names the lanes on the DEPTH hold line, so a share spent by PAGES is never read as an asset backlog', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new GatedObjectStore();
+    const sink = await parkedSink(store, { queueMax: 4, assetQueueShare: 0.5 });
+    // Two pages reach the asset share of the depth with no asset waiting at all.
+    for (const p of pages(2)) await expect(sink.capture(p)).resolves.toEqual({ admitted: true });
+    await expect(sink.capture(assets(1)[0])).resolves.toEqual({ admitted: false, reason: 'assetReserve' });
+    expect(sink.stats()).toMatchObject({ queued: 2, queuedPages: 2, queuedAssets: 0, assetRefusedReserveDepth: 1 });
+    const line = warn.mock.calls.map(a => String(a[0])).find(l => l.includes('held back for the page reservation'));
+    expect(line).toContain('2 queued = 2 page(s) + 0 asset(s)');
+
+    store.open = true;
+    store.release();
+    await sink.flush();
     warn.mockRestore();
   });
 });
