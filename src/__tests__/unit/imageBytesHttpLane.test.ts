@@ -8,7 +8,8 @@
  *     gated tab. It is refused BEFORE the network, never fetched from the node IP.
  */
 import { createHttpBytesFetch, IMAGE_ACCEPT } from '../../services/images/httpBytesFetch';
-import { classifyImageBytes } from '../../services/images/imageBytes';
+import { IMAGE_CHROME_UA, classifyImageBytes, resolveImageUserAgent } from '../../services/images/imageBytes';
+import { DEFAULT_PROFILE } from '../../services/impitFetch';
 
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13]);
 
@@ -67,6 +68,28 @@ describe('createHttpBytesFetch', () => {
     await fetchBytes('https://cdn.example.com/a.png', { referer: 'https://store.example/p/1', userAgent: 'UA/1' });
     expect(fetchImpl.mock.calls[1][1].headers.referer).toBe('https://store.example/p/1');
     expect(fetchImpl.mock.calls[1][1].headers['user-agent']).toBe('UA/1');
+  });
+
+  it('sends a UA that tracks the engine\'s impersonation profile, not a frozen old Chrome', async () => {
+    const major = /(\d+)/.exec(DEFAULT_PROFILE)?.[1];
+    expect(IMAGE_CHROME_UA).toContain(`Chrome/${major}.`);
+    const fetchImpl = jest.fn(async (_url: string, _init: FakeInit) => response());
+    await createHttpBytesFetch({ fetchImpl: fetchImpl as never })('https://cdn.example.com/a.png');
+    expect(fetchImpl.mock.calls[0][1].headers['user-agent']).toBe(IMAGE_CHROME_UA);
+  });
+
+  it('clamps an absurd per-request budget instead of aborting instantly', async () => {
+    // timeoutMs: 0 became AbortSignal.timeout(0), which fires on the next tick — every real fetch
+    // would report as a timeout.
+    let signal: AbortSignal | undefined;
+    const fetchImpl = jest.fn(async (_url: string, init: FakeInit) => {
+      signal = init.signal;
+      await new Promise(resolve => setTimeout(resolve, 10));
+      return response();
+    });
+    expect(await createHttpBytesFetch({ fetchImpl: fetchImpl as never })('https://cdn.example.com/a.png', { timeoutMs: 0 }))
+      .toMatchObject({ ok: true });
+    expect(signal?.aborted).toBe(false);
   });
 
   it('carries a header subset (content-length, etag, last-modified) for provenance', async () => {
@@ -196,6 +219,15 @@ describe('createHttpBytesFetch', () => {
     const fetchImpl = jest.fn(async (_url: string, _init: FakeInit) => response());
     await createHttpBytesFetch({ fetchImpl: fetchImpl as never, timeoutMs: 1234 })('https://cdn.example.com/a.png');
     expect(fetchImpl.mock.calls[0][1].signal).toBeInstanceOf(AbortSignal);
+  });
+});
+
+describe('resolveImageUserAgent', () => {
+  it('maps the policy table\'s ua token to a real user agent', () => {
+    expect(resolveImageUserAgent('chrome')).toBe(IMAGE_CHROME_UA);
+    // 'default' means "whatever the lane sends", so it resolves to nothing to override with.
+    expect(resolveImageUserAgent('default')).toBeUndefined();
+    expect(resolveImageUserAgent(undefined)).toBeUndefined();
   });
 });
 

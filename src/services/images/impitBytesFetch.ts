@@ -45,6 +45,7 @@ import {
   isTimeoutError,
   overImageSizeCap,
   refusedFinalUrl,
+  resolveImageTimeout,
   type ImageBytesFetcher,
   type ImageBytesResult,
 } from './imageBytes.js';
@@ -184,7 +185,10 @@ export function createImpitBytesFetch(options: ImpitBytesFetchOptions = {}): Ima
       const jar = 'impit' in session ? session.jar : undefined;
       const stored = store.cookiesFor(url);
       if (jar && stored) await seedJar(jar, url, stored);
-      res = await withRequestBudget(impit.fetch(url, { method: 'GET', headers }), opts.timeoutMs);
+      res = await withRequestBudget(
+        impit.fetch(url, { method: 'GET', headers }),
+        opts.timeoutMs === undefined ? undefined : resolveImageTimeout(opts.timeoutMs, opts.timeoutMs),
+      );
       // STATUS before BODY: a 403 hotlink page is not worth reading, and impit's own error bodies
       // are not images. An impit build that reports no status is treated as 2xx (the pre-status
       // behavior) rather than being failed on a value it never had.

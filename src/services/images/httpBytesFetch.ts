@@ -16,19 +16,18 @@ import {
   CAPTURED_IMAGE_HEADERS,
   DEFAULT_MAX_IMAGE_BYTES,
   IMAGE_ACCEPT,
+  IMAGE_CHROME_UA,
   classifyImageBytes,
   imageTooLarge,
   isTimeoutError,
   overImageSizeCap,
   refusedFinalUrl,
+  resolveImageTimeout,
   type ImageBytesFetcher,
   type ImageBytesResult,
 } from './imageBytes.js';
 
 export { IMAGE_ACCEPT } from './imageBytes.js';
-
-const DESKTOP_UA =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36';
 
 /** Abort ceiling (ms) for one image GET. An image is a small body; it does not get the listing budget. */
 export const DEFAULT_IMAGE_FETCH_TIMEOUT_MS = 15_000;
@@ -79,14 +78,14 @@ export function createHttpBytesFetch(options: HttpBytesFetchOptions = {}): Image
       return { ok: false, reason: 'refused', detail: httpLaneResidentialRefusal(url, opts.proxyUrl ?? '(unresolved)').message };
     }
     const headers: Record<string, string> = {
-      'user-agent': opts.userAgent ?? DESKTOP_UA,
+      'user-agent': opts.userAgent ?? IMAGE_CHROME_UA,
       accept: opts.accept ?? IMAGE_ACCEPT,
       ...(opts.referer ? { referer: opts.referer } : {}),
     };
     const fetchImpl = options.fetchImpl ?? (globalThis.fetch as unknown as BytesFetchImpl);
     let res: BytesResponseLike;
     try {
-      res = await fetchImpl(url, { headers, signal: AbortSignal.timeout(opts.timeoutMs ?? timeoutMs) });
+      res = await fetchImpl(url, { headers, signal: AbortSignal.timeout(resolveImageTimeout(opts.timeoutMs, timeoutMs)) });
     } catch (err) {
       if (isTimeoutError(err)) return { ok: false, reason: 'timeout', detail: (err as Error).message };
       throw err;

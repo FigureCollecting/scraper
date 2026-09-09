@@ -38,6 +38,7 @@ import {
   isTimeoutError,
   overImageSizeCap,
   refusedFinalUrl,
+  resolveImageTimeout,
   type ImageBytesFetcher,
   type ImageBytesResult,
   type ImageFetchOptions,
@@ -307,7 +308,7 @@ export function createGatedTabBytesFetch(
               ...(opts.referer ? { referer: opts.referer } : {}),
             });
           }
-          navigated = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: opts.timeoutMs ?? timeout });
+          navigated = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: resolveImageTimeout(opts.timeoutMs, timeout) });
           // CHALLENGE: `domcontentloaded` fires on the INTERSTITIAL, so leaving here would both read
           // the challenge HTML as the image and cancel the challenge script mid-run — the browser
           // never earns the clearance and the attempt still spends the exit IP's reputation. This is

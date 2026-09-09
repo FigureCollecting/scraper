@@ -14,6 +14,8 @@
  * fault, and it is classified by the queue exactly as it is for the string lanes.
  */
 
+import { DEFAULT_PROFILE } from '../impitFetch.js';
+
 /** Why an image fetch did not yield bytes. */
 export type ImageBytesFailureReason =
   /** The server answered, but not with 2xx. */
@@ -118,6 +120,32 @@ export function imageTooLarge(length: number | string, maxBytes: number): ImageB
 
 /** An image bytes transport: url + options in, a typed result out. */
 export type ImageBytesFetcher = (url: string, options?: ImageFetchOptions) => Promise<ImageBytesResult>;
+
+/**
+ * The desktop Chrome user agent the image lanes send, with its major version taken from the engine's
+ * live impersonation profile. Hardcoding one froze the plain lane on a Chrome 15 majors older than
+ * the same pod's impersonated fetches — an inconsistency a UA-age bot rule reads as automation.
+ */
+export const IMAGE_CHROME_UA =
+  `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${/(\d+)/.exec(DEFAULT_PROFILE)?.[1] ?? '142'}.0.0.0 Safari/537.36`;
+
+/**
+ * The image host policy's `ua` token resolved to an actual user agent: `chrome` is the lanes' Chrome
+ * string, `default` means "whatever the lane already sends" and so overrides nothing. This is what
+ * turns `chooseImageLane`'s `ua` from a documented symbol into a header the CDN actually sees.
+ */
+export function resolveImageUserAgent(ua: 'chrome' | 'default' | undefined): string | undefined {
+  return ua === 'chrome' ? IMAGE_CHROME_UA : undefined;
+}
+
+/** Floor on a per-request budget (ms). `timeoutMs: 0` otherwise aborts every fetch instantly. */
+export const MIN_IMAGE_FETCH_TIMEOUT_MS = 1_000;
+
+/** The caller's budget, clamped to the floor; absent or unusable ⇒ the lane's own default. */
+export function resolveImageTimeout(requested: number | undefined, fallback: number): number {
+  if (requested === undefined || !Number.isFinite(requested)) return fallback;
+  return Math.max(MIN_IMAGE_FETCH_TIMEOUT_MS, requested);
+}
 
 /**
  * The Accept a browser sends for an <img> request. Some CDNs vary their response on it (serving webp
