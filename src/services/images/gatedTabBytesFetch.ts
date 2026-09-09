@@ -23,7 +23,7 @@
  * whose clearance the store earned, and it is counted against that host's tab budget.
  */
 import { ChallengeLaneUnavailableError, awaitChallengeClearance, type ChallengeAwarePage, type ChallengeCookie } from '../browserChallenge.js';
-import { ResidentialEgressUnavailableError, getResidentialProxyUrl } from '../residentialEgress.js';
+import { ResidentialEgressUnavailableError, getResidentialProxyUrl, resolveResidentialProxyUrl } from '../residentialEgress.js';
 import type { EgressKind } from '../gatedBrowsers.js';
 import { isDeniedImageUrl } from './imageHostPolicy.js';
 import { buildCookieParams, mergeStoredCookies, resolveUserAgent } from '../engineServices/scrapingService.js';
@@ -38,6 +38,7 @@ import {
   isTimeoutError,
   overImageSizeCap,
   refusedFinalUrl,
+  type ImageBytesFetcher,
   type ImageBytesResult,
   type ImageFetchOptions,
 } from './imageBytes.js';
@@ -162,6 +163,79 @@ function headerSubset(response: ImageResponseLike, names: readonly string[] = CA
 }
 
 /**
+ * How many image tabs one (store host, egress) may hold at once.
+ *
+ * The gated browser's per-host tab budget is 2, and its own comment says what those two are for: "a
+ * `/lookup` fan-out reaches a store once, the ingest queue once". Image tabs are booked against that
+ * same key, so a product's ten images could take BOTH slots for the length of ten navigations and a
+ * user-facing lookup would queue behind background image work. One is this lane's share: images
+ * never starve the page lane, and they still pace themselves per CDN on top of this.
+ */
+export const MAX_CONCURRENT_IMAGE_TABS_PER_HOST = 1;
+
+/**
+ * A navigation Chrome ABANDONED rather than failed. A response carrying
+ * `Content-Disposition: attachment` (several store CDNs serve originals that way) makes Chrome start
+ * a download and reject the `goto` with `net::ERR_ABORTED`; a blocked response does the same. The
+ * main-frame document has usually already reached the response listener by then, so this is an
+ * outcome to fall through on, not a fault to propagate.
+ */
+function isAbandonedNavigation(err: unknown): boolean {
+  return err instanceof Error && /net::ERR_ABORTED|net::ERR_BLOCKED_BY_RESPONSE/.test(err.message);
+}
+
+/** A bare hostname — what the gated session is keyed on. A URL here would key it on nonsense. */
+function isBareHost(host: string): boolean {
+  const trimmed = host.trim();
+  if (trimmed === '' || /[/\s:@]/.test(trimmed)) return false;
+  try {
+    return new URL(`https://${trimmed}/`).hostname === trimmed.toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A caller-supplied proxy put through the engine's own parse/canonicalize before it reaches
+ * Chromium's `--proxy-server`, which accepts only a credential-free `socks5|http|https://host:port`
+ * (and needs `socks5h://` folded to `socks5://`). Anything else is ERR_NO_SUPPORTED_PROXIES on every
+ * fetch — a refusal here is the same answer, visible.
+ */
+function canonicalProxy(proxyUrl: string): string | undefined {
+  return resolveResidentialProxyUrl({ RESIDENTIAL_PROXY_URL: proxyUrl } as NodeJS.ProcessEnv, () => undefined);
+}
+
+/** Serializes image tabs per (store host, egress) — see {@link MAX_CONCURRENT_IMAGE_TABS_PER_HOST}. */
+function createImageTabGate(): <T>(key: string, run: () => Promise<T>) => Promise<T> {
+  const tails = new Map<string, Promise<unknown>>();
+  return <T>(key: string, run: () => Promise<T>): Promise<T> => {
+    const tail = tails.get(key) ?? Promise.resolve();
+    // `then(run, run)` so a predecessor's failure releases the gate instead of wedging the host.
+    const mine = tail.then(run, run);
+    const chained = mine.catch(() => undefined);
+    tails.set(key, chained);
+    return mine.finally(() => {
+      if (tails.get(key) === chained) tails.delete(key);
+    });
+  };
+}
+
+/**
+ * Curry a gated-tab fetcher into the shared {@link ImageBytesFetcher} shape so the browser lane can
+ * be handed to `paceImageBytesByHost` like the other two. Without this the one lane that costs a
+ * browser tab and up to a 20 s navigation is the one lane structurally excluded from pacing — so the
+ * gated lane MUST be wrapped through here before it is used.
+ */
+export function asImageBytesFetcher(
+  fetcher: GatedTabBytesFetcher,
+  egress: EgressKind,
+  host: string,
+  defaults: GatedTabFetchOptions = {},
+): ImageBytesFetcher {
+  return (url, options) => fetcher(egress, host, url, { ...defaults, ...(options ?? {}) });
+}
+
+/**
  * Build the gated-tab image bytes fetcher over the engine's browser-lane door. Every expected outcome
  * is a typed result — a refused lane included — and only a genuine browser fault propagates.
  */
@@ -172,8 +246,14 @@ export function createGatedTabBytesFetch(
   const proxyUrlFor = options.proxyUrlFor ?? ((egress: EgressKind) => (egress === 'residential' ? getResidentialProxyUrl() : undefined));
   const timeout = options.timeoutMs ?? GATED_IMAGE_NAV_TIMEOUT_MS;
   const maxBytes = options.maxBytes ?? DEFAULT_MAX_IMAGE_BYTES;
+  const tabGate = createImageTabGate();
 
   return async function fetchBytesViaGatedTab(egress, host, url, opts = {}): Promise<ImageBytesResult> {
+    // The gated session is keyed on this host; a URL (or anything else that is not a bare hostname)
+    // would key the browser and its tab budget on a string no store owns.
+    if (!isBareHost(host)) {
+      return { ok: false, reason: 'refused', detail: `'${host}' is not a bare store hostname` };
+    }
     // STORED COOKIES + UA, resolved by the page lane's OWN rules (which differ per launch profile:
     // clean-headful deliberately replays no stored cf_clearance and pins no UA, because this browser
     // earns its own clearance and a rewritten UA contradicts the client hints it sends).
@@ -185,14 +265,17 @@ export function createGatedTabBytesFetch(
     // through the node IP.
     let proxyServer: string | undefined;
     if (egress === 'residential') {
-      proxyServer = opts.proxyUrl ?? proxyUrlFor(egress);
+      const requested = opts.proxyUrl ?? proxyUrlFor(egress);
+      // A caller-supplied value is canonicalized by the engine's own resolver rather than trusted:
+      // the boot-resolved one already is, and an unusable one is refused, not handed to Chromium.
+      proxyServer = requested === undefined ? undefined : canonicalProxy(requested);
       if (!proxyServer) {
         return { ok: false, reason: 'refused', detail: new ResidentialEgressUnavailableError(url, 'unconfigured').message };
       }
     }
 
     try {
-      return await lane.withPage(async (page): Promise<ImageBytesResult> => {
+      return await tabGate(`${host}|${egress}`, () => lane.withPage(async (page): Promise<ImageBytesResult> => {
         // The document-only main-frame guard, recorded SYNCHRONOUSLY (so the last document of the
         // navigation is the one kept) with its body buffered inside the event — a body the browser
         // has already consumed may no longer be retrievable afterwards.
@@ -212,7 +295,7 @@ export function createGatedTabBytesFetch(
           }
         };
         page.on('response', onResponse);
-        let navigated: ImageResponseLike | null;
+        let navigated: ImageResponseLike | null = null;
         try {
           if (cookies && page.setCookie) {
             const params = buildCookieParams(url, cookies);
@@ -232,6 +315,10 @@ export function createGatedTabBytesFetch(
           // response listener is still attached, so the post-challenge document replaces `served`.
           const aware = challengeAwareImagePage(page);
           if (aware) await awaitChallengeClearance(aware, navigated ?? undefined, url, options.challenge ?? {});
+        } catch (err) {
+          // An ABANDONED navigation that already delivered its document is read from the listener;
+          // one that captured nothing is a real fault and still propagates.
+          if (!isAbandonedNavigation(err) || served === undefined) throw err;
         } finally {
           page.off('response', onResponse);
         }
@@ -286,7 +373,7 @@ export function createGatedTabBytesFetch(
         stealth: false,
         ...(userAgent ? { userAgent } : {}),
         ...(proxyServer ? { proxyServer } : {}),
-      });
+      }));
     } catch (err) {
       // A gate declared where the launch profile cannot clear it is a CONFIG outcome, not a fault:
       // the caller decides whether to try another lane, so it comes back as a refusal.

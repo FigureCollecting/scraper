@@ -10,7 +10,7 @@
  * The gated key is the STORE host, not the CDN's: the image rides the session the store's own
  * clearance lives in.
  */
-import { createGatedTabBytesFetch } from '../../services/images/gatedTabBytesFetch';
+import { asImageBytesFetcher, createGatedTabBytesFetch } from '../../services/images/gatedTabBytesFetch';
 import { ChallengeLaneUnavailableError } from '../../services/browserChallenge';
 
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 9, 9, 9, 9]);
@@ -323,6 +323,97 @@ describe('createGatedTabBytesFetch', () => {
     // No proxyUrlFor injected: the engine's own RESIDENTIAL_PROXY_URL is unset under test.
     expect(await createGatedTabBytesFetch(laneFor(page).lane)('residential', 'anitoysgk.com', 'https://cdn.anitoysgk.com/a.png'))
       .toMatchObject({ ok: false, reason: 'refused' });
+  });
+
+  it('adapts to the shared ImageBytesFetcher shape, so the browser lane can be PACED like the others', async () => {
+    const { page } = fakePage([resp()]);
+    const { lane, withPage } = laneFor(page);
+    const fetchBytes = asImageBytesFetcher(createGatedTabBytesFetch(lane), 'residential', 'anitoysgk.com', { challengeGated: true });
+
+    const result = await fetchBytes('https://cdn.anitoysgk.com/a.png', { proxyUrl: 'socks5://p.test:1055', referer: 'https://www.anitoysgk.com/p/1' });
+
+    expect(result).toMatchObject({ ok: true });
+    expect(withPage.mock.calls[0][1]).toMatchObject({ targetUrl: 'https://anitoysgk.com/', challengeGated: true, proxyServer: 'socks5://p.test:1055' });
+  });
+
+  it('gives image tabs their own SHARE of the store\'s gated browser — they never run two at a time', async () => {
+    // The store's gated tab budget is 2, sized for the page lane (one /lookup, one ingest item).
+    // A burst of image tabs must not be able to take both and starve a user-facing lookup.
+    let open = 0;
+    let maxOpen = 0;
+    const withPage = jest.fn(async (fn: (p: never) => Promise<unknown>, _options?: unknown) => {
+      open += 1;
+      maxOpen = Math.max(maxOpen, open);
+      await new Promise(resolve => setTimeout(resolve, 5));
+      try {
+        return await fn(fakePage([resp()]).page as never);
+      } finally {
+        open -= 1;
+      }
+    });
+    const fetchBytes = createGatedTabBytesFetch({ withPage } as never);
+
+    await Promise.all([
+      fetchBytes('direct', 'anitoysgk.com', 'https://cdn.anitoysgk.com/1.png'),
+      fetchBytes('direct', 'anitoysgk.com', 'https://cdn.anitoysgk.com/2.png'),
+      fetchBytes('direct', 'anitoysgk.com', 'https://cdn.anitoysgk.com/3.png'),
+    ]);
+
+    expect(withPage).toHaveBeenCalledTimes(3);
+    expect(maxOpen).toBe(1);
+  });
+
+  it('REFUSES a caller-supplied proxy Chromium cannot use, rather than failing every fetch opaquely', async () => {
+    const { page } = fakePage([resp()]);
+    const { lane, withPage } = laneFor(page);
+    // Credentials in a --proxy-server value are ERR_NO_SUPPORTED_PROXIES; so is a bare host.
+    const result = await createGatedTabBytesFetch(lane)('residential', 'anitoysgk.com', 'https://cdn.anitoysgk.com/a.png', {
+      proxyUrl: 'socks5://user:pass@p.test:1055',
+    });
+    expect(result).toMatchObject({ ok: false, reason: 'refused' });
+    expect(withPage).not.toHaveBeenCalled();
+  });
+
+  it('canonicalizes socks5h:// to the form every lane accepts', async () => {
+    const { page } = fakePage([resp()]);
+    const { lane, withPage } = laneFor(page);
+    await createGatedTabBytesFetch(lane)('residential', 'anitoysgk.com', 'https://cdn.anitoysgk.com/a.png', {
+      proxyUrl: 'socks5h://p.test:1055',
+    });
+    expect(withPage.mock.calls[0][1]).toMatchObject({ proxyServer: 'socks5://p.test:1055' });
+  });
+
+  it('REFUSES a store host that is not a bare hostname, rather than keying the browser on nonsense', async () => {
+    const { page } = fakePage([resp()]);
+    const { lane, withPage } = laneFor(page);
+    const result = await createGatedTabBytesFetch(lane)('direct', 'https://anitoysgk.com/p/1', 'https://cdn.anitoysgk.com/a.png');
+    expect(result).toMatchObject({ ok: false, reason: 'refused' });
+    expect(withPage).not.toHaveBeenCalled();
+  });
+
+  it('returns the captured document when the navigation aborts on a Content-Disposition download', async () => {
+    // A CDN serving originals as an attachment makes Chrome start a download and REJECT the
+    // navigation with net::ERR_ABORTED — the bytes are already in hand on the response listener.
+    const served = resp();
+    const handlers: ((r: unknown) => void)[] = [];
+    const page = {
+      on: (_event: string, handler: (r: unknown) => void) => { handlers.push(handler); },
+      off: jest.fn(),
+      mainFrame: () => MAIN_FRAME,
+      goto: jest.fn(async () => {
+        handlers.forEach(h => h(served));
+        throw new Error('net::ERR_ABORTED at https://cdn.anitoysgk.com/a.png');
+      }),
+    };
+    const result = await createGatedTabBytesFetch(laneFor(page).lane)('direct', 'anitoysgk.com', 'https://cdn.anitoysgk.com/a.png');
+    if (!result.ok) throw new Error(`expected ok, got ${JSON.stringify(result)}`);
+    expect(result.bytes.equals(PNG)).toBe(true);
+  });
+
+  it('still rethrows an aborted navigation that captured nothing', async () => {
+    const nothing = fakePage([], new Error('net::ERR_ABORTED at https://cdn.anitoysgk.com/a.png'));
+    await expect(createGatedTabBytesFetch(laneFor(nothing.page).lane)('direct', 'anitoysgk.com', 'https://cdn.anitoysgk.com/a.png'))
+      .rejects.toThrow(/ERR_ABORTED/);
   });
 
   it('reports a refused challenge lane (no clean-headful profile) as refused, not as a throw', async () => {
