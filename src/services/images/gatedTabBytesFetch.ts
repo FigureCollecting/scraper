@@ -10,7 +10,9 @@
  *
  * The bytes are read with the SAME guard `navigateAndCapture` uses for its wire lane: only the MAIN
  * FRAME's DOCUMENT responses count, and the LAST one wins — after an interstitial or a redirect
- * chain, the response `goto` resolves with is the challenge, not the image. The body is buffered
+ * chain, the response `goto` resolves with is the challenge, not the image. And with the same WAIT:
+ * `awaitChallengeClearance` runs immediately after `goto`, because `domcontentloaded` fires on the
+ * interstitial and walking away from it cancels the challenge script. The body is buffered
  * inside the response event (after the browser consumes it, it may no longer be retrievable) with
  * the served response as the fallback. Nothing about the page lane changes: this is a sibling
  * navigation, not an edit to that path.
@@ -18,7 +20,7 @@
  * The gated session is keyed on the STORE host, not the image host: the image must ride the session
  * whose clearance the store earned, and it is counted against that host's tab budget.
  */
-import { ChallengeLaneUnavailableError } from '../browserChallenge.js';
+import { ChallengeLaneUnavailableError, awaitChallengeClearance, type ChallengeAwarePage, type ChallengeCookie } from '../browserChallenge.js';
 import { ResidentialEgressUnavailableError, getResidentialProxyUrl } from '../residentialEgress.js';
 import type { EgressKind } from '../gatedBrowsers.js';
 import { isDeniedImageUrl } from './imageHostPolicy.js';
@@ -49,13 +51,52 @@ export interface ImageResponseLike {
   frame(): unknown;
 }
 
-/** The slice of a puppeteer Page this lane drives. */
+/**
+ * The slice of a puppeteer Page this lane drives. Everything the CHALLENGE WAIT reads is optional
+ * and feature-detected: a page surface that cannot report a title has no interstitial to wait out
+ * (and a test double that supplies one drives the wait exactly as the page lane's does).
+ */
 export interface ImagePageLike {
   on(event: 'response', handler: (response: ImageResponseLike) => void): unknown;
   off(event: 'response', handler: (response: ImageResponseLike) => void): unknown;
   mainFrame(): unknown;
   goto(url: string, options?: { waitUntil?: string; timeout?: number }): Promise<ImageResponseLike | null>;
   setExtraHTTPHeaders?(headers: Record<string, string>): Promise<void>;
+  title?(): Promise<string>;
+  evaluate?(pageFunction: () => unknown): Promise<unknown>;
+  url?(): string;
+  cookies?(): Promise<ChallengeCookie[]>;
+  browserContext?(): { cookies?(): Promise<ChallengeCookie[]> } | undefined;
+  browser?(): { cookies?(): Promise<ChallengeCookie[]> } | undefined;
+}
+
+/**
+ * The page as the challenge wait sees it — the same wrapper the page lane builds, over this lane's
+ * structural surface. The clearance COOKIE is the wait's only positive evidence, so the jar is
+ * resolved the way puppeteer 25 exposes it for a default-context tab: the context's, else the
+ * browser's, else the page's own.
+ */
+function challengeAwareImagePage(page: ImagePageLike): ChallengeAwarePage | undefined {
+  if (typeof page.title !== 'function') return undefined;
+  const wrapper: ChallengeAwarePage = { title: () => page.title!() };
+  if (typeof page.evaluate === 'function') {
+    wrapper.evaluate = (fn: () => any) => page.evaluate!(fn as () => unknown);
+  }
+  if (typeof page.url === 'function') wrapper.url = () => page.url!();
+  const owner = (get: (() => { cookies?(): Promise<ChallengeCookie[]> } | undefined) | undefined) => {
+    if (typeof get !== 'function') return undefined;
+    try {
+      return get();
+    } catch {
+      return undefined;
+    }
+  };
+  const context = owner(page.browserContext);
+  const browser = owner(page.browser);
+  if (context && typeof context.cookies === 'function') wrapper.cookies = () => context.cookies!();
+  else if (browser && typeof browser.cookies === 'function') wrapper.cookies = () => browser.cookies!();
+  else if (typeof page.cookies === 'function') wrapper.cookies = () => page.cookies!();
+  return wrapper;
 }
 
 /** The per-request wiring the engine's `withPage` reads (a subset of EnginePageOptions). */
@@ -78,6 +119,8 @@ export interface GatedTabBytesFetchOptions {
   timeoutMs?: number;
   /** Body ceiling (default {@link DEFAULT_MAX_IMAGE_BYTES}). */
   maxBytes?: number;
+  /** Challenge-wait tuning, passed straight to `awaitChallengeClearance` (defaults are its own). */
+  challenge?: { timeoutMs?: number; pollMs?: number };
 }
 
 /** An image fetch on the gated lane: the egress and STORE host it belongs to, plus the image URL. */
@@ -153,6 +196,13 @@ export function createGatedTabBytesFetch(
             });
           }
           navigated = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: opts.timeoutMs ?? timeout });
+          // CHALLENGE: `domcontentloaded` fires on the INTERSTITIAL, so leaving here would both read
+          // the challenge HTML as the image and cancel the challenge script mid-run — the browser
+          // never earns the clearance and the attempt still spends the exit IP's reputation. This is
+          // the same wait, in the same position, that navigateAndCapture uses on the page lane; the
+          // response listener is still attached, so the post-challenge document replaces `served`.
+          const aware = challengeAwareImagePage(page);
+          if (aware) await awaitChallengeClearance(aware, navigated ?? undefined, url, options.challenge ?? {});
         } finally {
           page.off('response', onResponse);
         }

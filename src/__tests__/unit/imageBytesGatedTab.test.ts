@@ -89,6 +89,59 @@ describe('createGatedTabBytesFetch', () => {
     expect(result.headers).toEqual({ 'content-type': 'image/png', 'content-length': '12' });
   });
 
+  it('WAITS OUT a Cloudflare interstitial and returns the image the challenge cleared into', async () => {
+    // The page lane's own rule: `goto` resolves on the interstitial at domcontentloaded, so leaving
+    // right then both misses the image AND cancels the challenge script mid-run — the attempt still
+    // spends that exit IP's Cloudflare reputation and the browser never earns the clearance.
+    const challenge = resp({ status: 200, contentType: 'text/html', body: Buffer.from('<html>Just a moment...</html>') });
+    const image = resp({ url: 'https://cdn.anitoysgk.com/cleared.png' });
+    const handlers: ((r: unknown) => void)[] = [];
+    let titleCalls = 0;
+    const page = {
+      on: (_event: string, handler: (r: unknown) => void) => { handlers.push(handler); },
+      off: jest.fn(),
+      mainFrame: () => MAIN_FRAME,
+      goto: jest.fn(async () => { handlers.forEach(h => h(challenge)); return challenge; }),
+      // Two polls of the interstitial, then the store's own document — with the post-challenge
+      // navigation delivering the image on the same response listener.
+      title: jest.fn(async () => {
+        titleCalls += 1;
+        if (titleCalls <= 2) return 'Just a moment...';
+        handlers.forEach(h => h(image));
+        return 'Lucy figure';
+      }),
+    };
+
+    const result = await createGatedTabBytesFetch(laneFor(page).lane, { challenge: { pollMs: 1 } })(
+      'residential', 'anitoysgk.com', 'https://cdn.anitoysgk.com/a.png', { proxyUrl: 'socks5://p.test:1055' },
+    );
+
+    if (!result.ok) throw new Error(`expected ok, got ${JSON.stringify(result)}`);
+    expect(result.bytes.equals(PNG)).toBe(true);
+    expect(result.finalUrl).toBe('https://cdn.anitoysgk.com/cleared.png');
+    expect(page.title).toHaveBeenCalled();
+  });
+
+  it('reports the interstitial as not-image when the challenge never clears, rather than hanging', async () => {
+    const challenge = resp({ status: 200, contentType: 'text/html', body: Buffer.from('<html>Just a moment...</html>') });
+    const handlers: ((r: unknown) => void)[] = [];
+    const page = {
+      on: (_event: string, handler: (r: unknown) => void) => { handlers.push(handler); },
+      off: jest.fn(),
+      mainFrame: () => MAIN_FRAME,
+      goto: jest.fn(async () => { handlers.forEach(h => h(challenge)); return challenge; }),
+      title: jest.fn(async () => 'Just a moment...'),
+    };
+    jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    const result = await createGatedTabBytesFetch(laneFor(page).lane, { challenge: { pollMs: 1, timeoutMs: 5 } })(
+      'direct', 'anitoysgk.com', 'https://cdn.anitoysgk.com/a.png',
+    );
+
+    expect(result).toMatchObject({ ok: false, reason: 'not-image', contentType: 'text/html' });
+    (console.warn as jest.Mock).mockRestore();
+  });
+
   it('ignores responses that are not the main frame\'s document (subresources, other frames)', async () => {
     const subresource = resp({ resourceType: 'image', body: Buffer.from('not the document') });
     const otherFrame = resp({ frame: OTHER_FRAME, body: Buffer.from('another frame') });
