@@ -118,6 +118,28 @@ describe('paceImageBytesByHost', () => {
     expect(missingLimiter.currentDelay('cdn.shopify.com')).toBe(1000);
   });
 
+  it('SERIALIZES concurrent fetches on one host — N images are spread over N budgets, not one burst', async () => {
+    // On the REAL clock and timer, because the race is between the msUntilReady check and the
+    // recordDispatch that follows it across an await: under a check-then-act gap every concurrent
+    // caller reads the same budget and they all wake together (a PDP's images hitting one CDN in one
+    // instant). A small base delay keeps the test fast while still being a real interval.
+    // successThreshold high enough that recovery never shortens the delay mid-run.
+    const paced6 = { ...config, baseDelayMs: 60, minDelayMs: 10, successThreshold: 100 };
+    const limiter = new HostRateLimiter(() => paced6, paced6);
+    // jest.spyOn keeps the real implementation, so the limiter still books each dispatch.
+    const recordDispatch = jest.spyOn(limiter, 'recordDispatch');
+    const paced = paceImageBytesByHost(jest.fn(async (_url: string) => ok()), limiter);
+
+    await Promise.all(Array.from({ length: 6 }, (_v, i) => paced(`https://cdn.shopify.com/i/${i}.png`)));
+
+    const dispatchedAt = recordDispatch.mock.calls.map(call => call[1] as number).sort((a, b) => a - b);
+    expect(dispatchedAt).toHaveLength(6);
+    for (let i = 1; i < dispatchedAt.length; i += 1) {
+      // Timer slop is one-sided (a timer never fires early), so the floor is the assertion.
+      expect(dispatchedAt[i] - dispatchedAt[i - 1]).toBeGreaterThanOrEqual(paced6.baseDelayMs - 5);
+    }
+  });
+
   it('passes the options through and fetches an unparseable URL without pacing it', async () => {
     const { paced, fetcher, slept } = harness();
 

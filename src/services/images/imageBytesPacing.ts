@@ -53,12 +53,32 @@ export function paceImageBytesByHost(
 ): ImageBytesFetcher {
   const now = deps.now ?? Date.now;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
+  // One PROLOGUE at a time per host. The wait and the dispatch record are separated by an await, so
+  // without this every concurrent caller reads the same msUntilReady before any of them records and
+  // they all wake together — a PDP's dozen images arriving at a shared CDN in one burst, which is
+  // exactly what the budget exists to prevent. The driver's own scheduler has no such gap (it checks
+  // and records in one synchronous tick); this chain restores that property here.
+  const prologues = new Map<string, Promise<void>>();
+  const awaitTurn = (host: string): Promise<void> => {
+    const tail = prologues.get(host) ?? Promise.resolve();
+    const prologue = tail.then(async () => {
+      const wait = limiter.msUntilReady(host, now());
+      if (wait > 0) await sleep(wait);
+      limiter.recordDispatch(host, now());
+    });
+    // The stored tail never rejects, so one failed prologue cannot wedge the host's whole queue.
+    const chained = prologue.catch(() => undefined);
+    prologues.set(host, chained);
+    return prologue.finally(() => {
+      // Drop the entry once this call is the last one on the chain, so an idle host costs nothing.
+      if (prologues.get(host) === chained) prologues.delete(host);
+    });
+  };
+
   return async function pacedImageBytesFetch(url: string, options?: ImageFetchOptions): Promise<ImageBytesResult> {
     const host = imageHostOf(url);
     if (host === undefined) return fetcher(url, options);
-    const wait = limiter.msUntilReady(host, now());
-    if (wait > 0) await sleep(wait);
-    limiter.recordDispatch(host, now());
+    await awaitTurn(host);
     const result = await fetcher(url, options);
     // Cast rather than narrow on `ok`: this module is also compiled under the tests' non-strict
     // config, where a boolean discriminant does not narrow a union.
