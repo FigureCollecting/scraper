@@ -401,6 +401,13 @@ export function createImageCaptureHook(deps: ImageCaptureHookDeps): ImageCapture
 
     if (!result.ok) {
       const failure = result as ImageBytesFailure;
+      // BOOK FIRST, whatever the verdict. The home line carried these bytes; that the lane then
+      // rejected them is a fact about the body, not about the connection. Booking only on success
+      // would let a store answering every image with an interstitial run all day against a counter
+      // that never moves.
+      if (decision.egress === 'residential' && failure.bytesRead !== undefined) {
+        budget.record(failure.bytesRead, now());
+      }
       // not-image and too-large are VERDICTS, not faults: the store answered, and what it answered
       // with is not something this lane stores. Reporting them would fill the ledger with rows an
       // operator can do nothing about.

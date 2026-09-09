@@ -270,6 +270,49 @@ describe('the image capture hook', () => {
       expect(h.hook.stats().residentialBytesToday).toBe(Buffer.from('https://cdn.test/b.jpg').length);
     });
 
+    it('books bytes that were read and then REFUSED — the line carried them either way', async () => {
+      // A store whose every image is a hotlink interstitial would otherwise pull all day against a
+      // counter reading zero, which is precisely the overrun the ceiling exists to stop.
+      const h = harness({
+        policy: residential,
+        fetch: async () => ({ ok: false, reason: 'refused', detail: 'the bytes came from elsewhere', bytesRead: 4096 }),
+      });
+      await capture(h, rulesetDescribing([gallery('https://cdn.test/a.jpg')]));
+      expect(h.hook.stats().residentialBytesToday).toBe(4096);
+    });
+
+    it('books bytes read by a body that turned out not to be an image', async () => {
+      const h = harness({
+        policy: residential,
+        fetch: async () => ({ ok: false, reason: 'not-image', status: 200, contentType: 'text/html', bytesRead: 900 }),
+      });
+      await capture(h, rulesetDescribing([gallery('https://cdn.test/a.jpg')]));
+      expect(h.hook.stats().residentialBytesToday).toBe(900);
+    });
+
+    it('books nothing for a failure that never read a body', async () => {
+      const h = harness({ policy: residential, fetch: async () => ({ ok: false, reason: 'http-status', status: 404 }) });
+      await capture(h, rulesetDescribing([gallery('https://cdn.test/a.jpg')]));
+      expect(h.hook.stats().residentialBytesToday).toBe(0);
+    });
+
+    it('never books a DIRECT fetch against the home line', async () => {
+      const h = harness({ fetch: async () => ({ ok: false, reason: 'not-image', status: 200, bytesRead: 900 }) });
+      await capture(h, rulesetDescribing([gallery('https://cdn.test/a.jpg')]));
+      expect(h.hook.stats().residentialBytesToday).toBe(0);
+    });
+
+    it('closes the day on refused bytes alone, without a single stored image', async () => {
+      const h = harness({
+        policy: residential,
+        residentialBytesPerDay: 1000,
+        fetch: async (url: string) => ({ ok: false, reason: 'not-image', status: 200, bytesRead: url.endsWith('a.jpg') ? 1000 : 10 }),
+      });
+      await capture(h, rulesetDescribing([gallery('https://cdn.test/a.jpg', 0), gallery('https://cdn.test/b.jpg', 1)]));
+      expect(h.calls).toHaveLength(1);
+      expect(h.hook.stats().skipped.residentialBudget).toBe(1);
+    });
+
     it('refuses residentially when no proxy resolves, rather than leaving through the node', async () => {
       const h = harness({ policy: residential });
       const noProxy = createImageCaptureHook({
