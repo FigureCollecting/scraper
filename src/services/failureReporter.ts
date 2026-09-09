@@ -47,7 +47,7 @@ export const DEFAULT_REPORT_TIMEOUT_MS = 10_000;
 const UNAVAILABLE_MAX_TRIES = 3;
 /** Total tries for INTERNAL: the first call plus exactly one delayed retry. */
 const INTERNAL_MAX_TRIES = 2;
-/** The server caps `message` at 1 KB; trim here so the wire never carries what will be discarded. */
+/** The server caps `message` at 1 KB (octet_length); trim to BYTES so the wire carries only what it keeps. */
 const MAX_MESSAGE_BYTES = 1024;
 /**
  * How long drain() waits for the reports still on the wire. Long enough for a normal round trip and
@@ -78,7 +78,7 @@ export interface FetchFailureReport {
   reasonClass: FetchReasonClass;
   /** The upstream status when the lane surfaced one. Absent is honest and common. */
   httpStatus?: number;
-  /** Failure text, sanitized and trimmed here. Never a cookie, header, or secret. */
+  /** Failure text: sanitized, credential-redacted and byte-trimmed here before it is persisted. */
   message?: string;
   /** The lane the failing attempt used: http | impersonate | browser | api. */
   transport?: string;
@@ -269,12 +269,18 @@ export class FailureReporter {
    */
   private suppressedByCooldownWindow(report: FetchFailureReport): boolean {
     if (report.reasonClass !== 'cooldown') return false;
-    const key = `${report.site} ${report.kind} ${report.target}`;
+    const key = `${report.site}\u001f${report.kind}\u001f${report.target}`;
     const now = this.now();
     const until = this.cooldownUntil.get(key);
     if (until !== undefined && until > now) return true;
 
     const hinted = report.nextRetryHint ? Date.parse(report.nextRetryHint) : Number.NaN;
+    // Sweep first: the key is per (site, kind, TARGET), so a long cooldown over a busy store leaves
+    // one entry per item url. Without this the map only ever grows, and it grows fastest exactly
+    // when the host is unhealthy — in a server process that lives for days.
+    for (const [k, expiry] of this.cooldownUntil) {
+      if (expiry <= now) this.cooldownUntil.delete(k);
+    }
     this.cooldownUntil.set(key, Number.isFinite(hinted) && hinted > now ? hinted : now + DEFAULT_COOLDOWN_SUPPRESS_MS);
     return false;
   }
@@ -343,10 +349,36 @@ function reportingEnabled(raw: string | undefined): boolean {
   return !(value === 'false' || value === '0' || value === 'no' || value === 'off');
 }
 
-/** Sanitize + hard-trim the failure text. The server caps at 1 KB; never send more than it will keep. */
+/**
+ * Strip credentials a transport fault may have embedded in its text. sanitizeForLog defends the LOG
+ * (newlines, ANSI, control chars); this defends the LEDGER, which is durable and read by an
+ * operator. The impersonate lane accepts a credentialed proxy, so `scheme://user:pass@host` is a
+ * shape that genuinely reaches here — /health/detailed already redacts the same value.
+ */
+function redactCredentials(text: string): string {
+  return text
+    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+(?::[^/\s@]*)?@/gi, '$1<redacted>@')
+    .replace(/\b(authorization|cookie|set-cookie|x-api-key)\s*[:=]\s*\S+/gi, '$1: <redacted>');
+}
+
+/**
+ * Cut `text` to at most `maxBytes` UTF-8 BYTES, never mid code point. The server's CHECK is
+ * octet_length(message) <= 1024, and a Japanese store error surfaced through JSON.parse is ~3 bytes
+ * per character — slicing code units would send three times what the row can hold.
+ */
+function trimToBytes(text: string, maxBytes: number): string {
+  const bytes = Buffer.from(text, 'utf8');
+  if (bytes.length <= maxBytes) return text;
+  let end = maxBytes;
+  // Back off over any UTF-8 continuation byte (0b10xxxxxx) so the cut lands on a boundary.
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end--;
+  return bytes.subarray(0, end).toString('utf8');
+}
+
+/** Sanitize, redact + hard-trim the failure text. The server caps at 1 KB; never send more. */
 function trimMessage(message: string | undefined): string {
   if (!message) return '';
-  return sanitizeForLog(message).slice(0, MAX_MESSAGE_BYTES);
+  return trimToBytes(redactCredentials(sanitizeForLog(message)), MAX_MESSAGE_BYTES);
 }
 
 /** Map one engine report onto the contract message. Optional fields stay ABSENT when absent. */

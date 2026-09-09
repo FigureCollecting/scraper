@@ -96,6 +96,31 @@ describe('FailureReporter — the wire message', () => {
     expect(calls[0].message).not.toContain('\n');
   });
 
+  it('trims by BYTES, not code units — the server caps octet_length', async () => {
+    const { client, calls } = fakeClient();
+    const reporter = new FailureReporter({ client });
+
+    // A Japanese store's error page surfaced through JSON.parse: 1024 characters is ~3 KB of UTF-8.
+    await reporter.report(baseReport({ message: '\u30a8\u30e9\u30fc'.repeat(1000) }));
+
+    expect(Buffer.byteLength(calls[0].message, 'utf8')).toBeLessThanOrEqual(1024);
+    expect(calls[0].message).not.toContain('\ufffd'); // never cut mid code point
+    expect(calls[0].message.startsWith('\u30a8\u30e9\u30fc')).toBe(true);
+  });
+
+  it('redacts proxy credentials before they are persisted', async () => {
+    const { client, calls } = fakeClient();
+    const reporter = new FailureReporter({ client });
+
+    await reporter.report(
+      baseReport({ message: 'proxy connect failed: socks5://someuser:s3cret@egress.internal:1080 refused' }),
+    );
+
+    expect(calls[0].message).not.toContain('s3cret');
+    expect(calls[0].message).not.toContain('someuser');
+    expect(calls[0].message).toContain('egress.internal:1080'); // the endpoint stays triageable
+  });
+
   it('omits an absent status, transport and hint rather than sending zeros', async () => {
     const { client, calls } = fakeClient();
     const reporter = new FailureReporter({ client });
