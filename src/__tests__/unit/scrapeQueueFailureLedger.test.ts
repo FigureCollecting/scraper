@@ -9,7 +9,7 @@
  *   2. A cooldown fast-fail is reported as `cooldown` carrying the next-retry hint (the operator
  *      asked to see hosts we are deliberately leaving alone).
  *   3. The row carries the store's siteId + ruleset version when a ruleset matched, and falls back
- *      to the URL's host when none did (an EXTRACTION_UNAVAILABLE row is still actionable).
+ *      to the reserved 'unmatched' site when none did (the target still names the url).
  *   4. A reporter that throws NEVER reaches the item's own outcome.
  */
 
@@ -192,7 +192,7 @@ describe('ScrapeQueue × fetch-failure ledger', () => {
     expect(reports[0].transport).toBe('http');
   });
 
-  it('falls back to the URL host as the site when no ruleset matched', async () => {
+  it('files a url no ruleset claims under the reserved site, never its hostname', async () => {
     const http = jest.fn();
     const send = jest.fn();
     queue = buildQueue({ http, send, registry: null });
@@ -203,7 +203,10 @@ describe('ScrapeQueue × fetch-failure ledger', () => {
     await advanceUntil(() => queue.getStats().failed === 1);
 
     expect(reports).toHaveLength(1);
-    expect(reports[0].site).toBe(HOST); // www-stripped, lowercased
+    // A hostname as `site` would register a host-shaped source in the shared spine vocabulary and
+    // split one store's ledger in two the moment a ruleset skew comes and goes.
+    expect(reports[0].site).toBe('unmatched');
+    expect(reports[0].target).toBe(url); // the host stays recoverable from the target
     expect(reports[0].reasonClass).toBe('ruleset');
     expect(reports[0].rulesetVersion).toBeUndefined();
   });

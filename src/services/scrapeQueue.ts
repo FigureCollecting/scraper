@@ -26,7 +26,7 @@ import { notifyItemFailed } from './webhookClient.js';
 import { enrichmentLogger } from '../utils/logger.js';
 import { createScrapingService } from './engineServices/scrapingService.js';
 import { createCapturingFetch, ChallengePageError, type CapturingFetch, type CapturingFetchTransports } from './engineServices/capturingFetch.js';
-import { getChallengeCooldown, ChallengeCooldownError, normalizeHost, type ChallengeCooldown } from './challengeCooldown.js';
+import { getChallengeCooldown, ChallengeCooldownError, type ChallengeCooldown } from './challengeCooldown.js';
 import { classifyFetchFailure } from './failureClassifier.js';
 import { createFailureReporterFromEnv, type FetchFailureReport } from './failureReporter.js';
 import { ResidentialEgressUnavailableError } from './residentialEgress.js';
@@ -396,17 +396,15 @@ function classifyError(error: Error | string): ErrorType {
 }
 
 /**
- * The ledger `site` for a URL no ruleset claims: its normalized host (the same key the cooldown
- * register and ProfileRegistry use). An unparseable URL degrades to 'unknown' rather than an empty
- * site the spine would refuse — a row the operator can still see beats a row that never lands.
+ * The ledger `site` for a URL NO ruleset claims. Deliberately a single reserved key, never the URL's
+ * hostname: the spine registers an unseen site on first sight, so a hostname here would mint
+ * host-shaped rows in the shared `source` vocabulary that the claim lanes and the per-site config
+ * key off — and a ruleset skew that comes and goes would split one store's ledger in two
+ * ('mfc' rows before it, 'myfigurecollection.net' rows during), with no join between them and no
+ * chance of the record row resolving when the re-drive later succeeds under the real siteId. The
+ * host is not lost: the row's target IS the url.
  */
-function failureSiteFromUrl(url: string): string {
-  try {
-    return normalizeHost(new URL(url).hostname);
-  } catch {
-    return 'unknown';
-  }
-}
+const UNMATCHED_SITE = 'unmatched';
 
 function shouldRetry(error: Error | string, errorType: ErrorType, retryCount: number, maxRetries: number): boolean {
   // Never retry auth errors without new cookies
@@ -1845,8 +1843,7 @@ export class ScrapeQueue {
    * because bookkeeping failed.
    *
    * `site` prefers the matched ruleset's siteId; with no ruleset (the EXTRACTION_UNAVAILABLE case)
-   * it falls back to the URL's normalized host, so an unmatched store still lands an actionable row
-   * instead of none at all.
+   * it falls back to the reserved UNMATCHED_SITE, whose row still names the url as its target.
    */
   private reportTerminalFailure(item: QueueItem, error: Error, errorType: ErrorType): void {
     const reporter = this.failureReporter;
@@ -1865,7 +1862,7 @@ export class ScrapeQueue {
 
       void reporter
         .report({
-          site: ruleset?.siteId ?? failureSiteFromUrl(item.url),
+          site: ruleset?.siteId ?? UNMATCHED_SITE,
           ...(itemId !== undefined ? { itemId } : {}),
           target: item.url,
           kind: 'record',
