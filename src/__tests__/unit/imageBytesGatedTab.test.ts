@@ -416,6 +416,58 @@ describe('createGatedTabBytesFetch', () => {
       .rejects.toThrow(/ERR_ABORTED/);
   });
 
+  it('reads the clearance jar the challenge wait needs from the context, the browser, or the page', async () => {
+    // The wait's only positive evidence is the cf_clearance cookie, and puppeteer 25 exposes the
+    // default-context tab's jar off the BROWSER. A surface that throws on one is skipped, not fatal.
+    const build = (extra: Record<string, unknown>) => {
+      const handlers: ((r: unknown) => void)[] = [];
+      const image = resp();
+      let titleCalls = 0;
+      return {
+        on: (_e: string, h: (r: unknown) => void) => { handlers.push(h); },
+        off: jest.fn(),
+        mainFrame: () => MAIN_FRAME,
+        goto: jest.fn(async () => { handlers.forEach(h => h(resp({ contentType: 'text/html', body: Buffer.from('<html>Just a moment...</html>') }))); return null; }),
+        title: jest.fn(async () => {
+          titleCalls += 1;
+          if (titleCalls <= 1) return 'Just a moment...';
+          handlers.forEach(h => h(image));
+          return 'Lucy figure';
+        }),
+        evaluate: jest.fn(async () => 'complete'),
+        url: () => 'https://cdn.anitoysgk.com/a.png',
+        ...extra,
+      };
+    };
+    const cookies = jest.fn(async () => [{ name: 'cf_clearance', value: 'v', domain: '.anitoysgk.com' }]);
+
+    for (const surface of [
+      { browserContext: () => ({ cookies }) },
+      { browserContext: () => { throw new Error('detached'); }, browser: () => ({ cookies }) },
+      { cookies },
+    ]) {
+      const result = await createGatedTabBytesFetch(laneFor(build(surface)).lane, { challenge: { pollMs: 1 } })(
+        'direct', 'anitoysgk.com', 'https://cdn.anitoysgk.com/a.png',
+      );
+      expect(result).toMatchObject({ ok: true });
+    }
+    expect(cookies).toHaveBeenCalled();
+  });
+
+  it('honours the caller\'s finalUrl guard on the browser lane too', async () => {
+    const { page } = fakePage([resp({ url: 'https://tracker.example/i.png' })]);
+    expect(await createGatedTabBytesFetch(laneFor(page).lane)('direct', 'anitoysgk.com', 'https://cdn.anitoysgk.com/a.png', {
+      allowFinalUrl: (finalUrl: string) => finalUrl.startsWith('https://cdn.anitoysgk.com/'),
+    })).toMatchObject({ ok: false, reason: 'refused' });
+  });
+
+  it('refuses an empty or malformed store host', async () => {
+    const { page } = fakePage([resp()]);
+    const fetchBytes = createGatedTabBytesFetch(laneFor(page).lane);
+    expect(await fetchBytes('direct', '   ', 'https://cdn.anitoysgk.com/a.png')).toMatchObject({ ok: false, reason: 'refused' });
+    expect(await fetchBytes('direct', 'not a host!', 'https://cdn.anitoysgk.com/a.png')).toMatchObject({ ok: false, reason: 'refused' });
+  });
+
   it('reports a refused challenge lane (no clean-headful profile) as refused, not as a throw', async () => {
     const withPage = jest.fn(async () => { throw new ChallengeLaneUnavailableError('https://cdn.anitoysgk.com/a.png'); });
     const result = await createGatedTabBytesFetch({ withPage } as never)('direct', 'anitoysgk.com', 'https://cdn.anitoysgk.com/a.png');
