@@ -124,11 +124,11 @@ describe('ScrapeQueue — image capture after extraction', () => {
   }
 
   it('offers EVERY extracted record to the hook, with the page it was fetched from', async () => {
-    const capture = jest.fn(async () => undefined);
+    const capture = jest.fn(async (_req: ImageCaptureRequest) => undefined);
     await runOne({ capture }, { transport: 'browser' });
 
     expect(capture).toHaveBeenCalledTimes(2);
-    const requests = capture.mock.calls.map(c => c[0] as ImageCaptureRequest);
+    const requests = capture.mock.calls.map(c => c[0]);
     expect(requests.map(r => r.itemId)).toEqual(['P', 'C1']);
     expect(requests[0]).toMatchObject({
       site: 'imgstore',

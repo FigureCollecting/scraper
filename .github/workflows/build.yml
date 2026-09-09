@@ -58,6 +58,13 @@ jobs:
       - name: Run linter
         run: npm run lint || true
 
+      # The test sources are never type-checked by anything else: jest transpiles them
+      # per-file with no cross-file checking, and `npm run build` excludes them from the
+      # source project. Without this step a test can carry type errors through a green CI
+      # run, which is how the image-capture units landed 24 of them.
+      - name: Typecheck tests
+        run: npm run typecheck:tests
+
       - name: Run unit tests with coverage
         run: npm run test:ci -- --coverage
 

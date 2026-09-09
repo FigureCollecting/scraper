@@ -244,7 +244,7 @@ describe('browser lane gated browsers', () => {
   it('waits out a challenge on the prime navigation before navigating to the target', async () => {
     const primeUrl = 'https://www.anitoysgk.com';
     const target = 'https://www.anitoysgk.com/search?q=lucy';
-    wire((url) => (url === primeUrl
+    wire((url): Record<string, string> => (url === primeUrl
       ? { 'content-type': 'text/html', 'cf-mitigated': 'challenge' }
       : { 'content-type': 'text/html' }));
     const service = createScrapingService();

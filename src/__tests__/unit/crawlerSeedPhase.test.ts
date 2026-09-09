@@ -343,7 +343,7 @@ describe('runCrawlerPass — seed mode', () => {
 
   it('SPACING: waits CRAWLER_SEED_SPACING_MS between consecutive seed fetches, but not before the first', async () => {
     const fake = makeFake({ seeds: (s) => seedsOk(s, ['one', 'two', 'three']) });
-    const sleep = jest.fn(async () => {});
+    const sleep = jest.fn(async (_ms: number) => {});
     await runCrawlerPass(
       mkCfg({ seedSpacingMs: 10_000 }),
       { fetch: fake.fetch, ledgerStore: createMemoryLedgerStore(), now: clock().now, sleep },
@@ -356,7 +356,7 @@ describe('runCrawlerPass — seed mode', () => {
 
   it('SPACING: a per-store floor of 0 disables the wait', async () => {
     const fake = makeFake({ seeds: (s) => seedsOk(s, ['one', 'two']) });
-    const sleep = jest.fn(async () => {});
+    const sleep = jest.fn(async (_ms: number) => {});
     await runCrawlerPass(mkCfg({ seedSpacingMs: 0 }), { fetch: fake.fetch, ledgerStore: createMemoryLedgerStore(), now: clock().now, sleep });
 
     expect(fake.seedsAsked()).toEqual(['one', 'two']);

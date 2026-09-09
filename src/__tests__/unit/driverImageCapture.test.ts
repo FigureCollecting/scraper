@@ -100,7 +100,7 @@ describe('assembleResolve — image capture', () => {
     fetchDetail: async () => ({ html: '<html></html>', statusCode: 200 }),
     now: () => 0,
     sleep: async () => undefined,
-    challengeCooldown: new ChallengeCooldown(() => 0),
+    challengeCooldown: new ChallengeCooldown({ now: () => 0 }),
     ...over,
   });
 

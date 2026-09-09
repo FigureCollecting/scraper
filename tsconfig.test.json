@@ -7,7 +7,11 @@
     "isolatedModules": true,
     "strict": false,
     "noImplicitAny": false,
-    "strictNullChecks": false,
+    // Kept ON deliberately. The other strict flags are relaxed so old tests can pass loose
+    // fakes, but without strictNullChecks TypeScript stops narrowing a discriminated union
+    // by its `ok` flag, so `if (!r.ok)` leaves `r` as the whole union and every field of the
+    // failure arm reads as an error - in the tests AND in the source files they import.
+    "strictNullChecks": true,
     "strictFunctionTypes": false,
     "strictBindCallApply": false,
     "strictPropertyInitialization": false,
