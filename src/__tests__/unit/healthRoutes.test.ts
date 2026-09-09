@@ -18,6 +18,7 @@ const build = (over: Partial<HealthDeps> = {}) => {
     listCfCookies: () => [],
     getResidentialEgress: () => ({ configured: false }),
     getBrowserLane: () => ({ launchMode: 'headless', residentialTimezone: null, directTimezone: null, processTimezone: null, gatedBrowsers: [] }),
+    getRawStore: () => ({ configured: false }),
     ...over,
   }));
   return app;
@@ -315,5 +316,42 @@ describe('browserLaneView', () => {
       processTimezone: null,
       gatedBrowsers: [],
     });
+  });
+});
+
+// The raw-capture sink's counters are the ONLY signal that the asset lane is
+// working: a store that answers every image request with a challenge page shows up
+// as assetSkipped.notImage and nothing else. They have to reach an ops surface.
+describe('createHealthRoutes — rawStore counters', () => {
+  const STATS = {
+    stored: 12,
+    deduped: 3,
+    failed: 0,
+    skippedDisabled: 0,
+    assetStored: 40,
+    assetDeduped: 7,
+    assetSkipped: { notImage: 118, tooLarge: 1, empty: 0, disabled: 0 },
+    assetFailed: 2,
+  };
+
+  it('publishes the sink counters on GET /health/detailed', async () => {
+    const res = await request(build({ getRawStore: () => ({ configured: true, stats: STATS }) })).get('/health/detailed');
+    expect(res.status).toBe(200);
+    expect(res.body.rawStore).toEqual({ configured: true, stats: STATS });
+  });
+
+  it('reports the unconfigured sink rather than omitting the block', async () => {
+    const res = await request(build()).get('/health/detailed');
+    expect(res.body.rawStore).toEqual({ configured: false });
+  });
+
+  it('keeps rawStore on the degraded (500) response', async () => {
+    const app = build({
+      getBrowserPoolHealth: async () => { throw new Error('pool down'); },
+      getRawStore: () => ({ configured: true, stats: STATS }),
+    });
+    const res = await request(app).get('/health/detailed');
+    expect(res.status).toBe(500);
+    expect(res.body.rawStore).toEqual({ configured: true, stats: STATS });
   });
 });

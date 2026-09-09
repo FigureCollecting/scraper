@@ -1115,6 +1115,41 @@ File format — a JSON object keyed by host; keys are normalized (lower-cased, l
 - Stale semantics: the engine never refreshes or retries a cookie. When a host the jar has cookies for STILL serves a challenge — at any of the existing cooldown sites (ingest honesty gate / extraction-throw door, `/lookup` search, `/catalog` listing, on any lane) — the host is marked `stale` once (`[CF-COOKIE] STALE <host> via <lane>: …` naming cookie NAMES only) and `/health/detailed` → `cfCookies[].stale` flips true with `staleSince` / `staleReason`. The existing storm protection is unchanged: one probe fetch per host per cooldown window, then the host cooldown fast-fails everything else. A clean body for that host marks it fresh again. A host the jar knows nothing about is never marked — its challenge is an egress matter, not a cookie one.
 - Logs and the health view carry cookie NAMES only, never a value.
 
+**Raw capture store (`PERSIST_RAW_HTML`, `PERSIST_RAW_IMAGES`):**
+
+Captured bytes are written to a content-addressed S3-compatible bucket under the ratified `sha256-v1` key scheme — `<prefix>sha256/<aa>/<sha256hex><ext>`, where the digest is of the UNCOMPRESSED bytes and `aa` is its first two hex characters. Writes are HEAD-then-PUT and write-once; nothing is ever deleted, every op is timeout-bounded, and a store failure is swallowed-but-counted so a slow or broken bucket can never break or stall a scrape.
+
+Two lanes, two switches, two prefixes:
+
+| Lane | Switch | Prefix | Object |
+|---|---|---|---|
+| page bodies (`wire`, `dom`) | `PERSIST_RAW_HTML` | `RAW_STORE_S3_PREFIX` (`raw-html/`) | `gzip(body)`, `.html.gz`, `Content-Type: application/gzip` |
+| API responses (`api`) | `PERSIST_RAW_HTML` | `RAW_STORE_S3_JSON_PREFIX` (`raw-json/`) | `gzip(body)`, `.json.gz`, `Content-Type: application/gzip` |
+| images (`asset`) | `PERSIST_RAW_IMAGES` | `RAW_STORE_S3_IMAGE_PREFIX` (`raw-img/`) | the ORIGINAL bytes, unaltered — no gzip, real image `Content-Type`, extension from the magic bytes |
+
+- `PERSIST_RAW_HTML`: `true` enables page/API capture. Anything else (including unset) disables it silently. Enabled but incompletely configured is never a silent no-op — it logs one loud warning naming the missing variable and stays disabled.
+- `PERSIST_RAW_IMAGES`: **a separate kill switch for the asset lane**, `true` (exactly) to enable, default OFF. It is independent of `PERSIST_RAW_HTML` in both directions: images are a different corpus with different volume and different rights, so turning page capture on must never start pulling binaries, and an images-only wiring (`PERSIST_RAW_IMAGES=true` with page capture off) is a supported configuration — **either** switch alone builds the real sink, and only the lane whose switch is off is refused. The refusal is at the WRITE boundary, not by convention: a lane whose switch is off is a counted skip (`skippedDisabled` / `assetSkipped.disabled`) that reaches no bucket, so a caller that forgets to consult `isImagePersistenceEnabled()` still cannot store an image. With **both** switches off the loader returns null and the process gets a `NoopCaptureSink` (intended silence); with either on but the store config incomplete, one loud warning names the switch and every missing variable.
+- `RAW_STORE_S3_IMAGE_PREFIX`: bucket prefix for the asset lane. Default: `raw-img/`
+- `RAW_STORE_IMAGE_MAX_BYTES`: hard ceiling on ONE **stored** image. A larger body is skipped, not truncated and not stored. It does **not** bound what is *downloaded*: by the time the sink sees a capture the body is already a Buffer and already hashed, so the fetcher that pulls an image is the layer that must reject on `Content-Length` and abort the read — this ceiling is the last line, not the first. Unset/invalid → the default; clamped to 64 MiB so a typo cannot remove the ceiling. Default: `10485760` (10 MiB)
+- `RAW_STORE_S3_ENDPOINT` / `_REGION` / `_BUCKET` / `_PREFIX` / `_JSON_PREFIX` / `_PATH_STYLE`, `RAW_STORE_KEY_SCHEME` (only `sha256-v1` is understood — an unknown scheme fails fast at boot), `RAW_STORE_PUT_TIMEOUT_MS` (default `5000`, page lanes only), `RAW_STORE_IMAGE_PUT_TIMEOUT_MS` (default `30000` — the asset lane's own HEAD/PUT budget: an original image is up to 10 MiB against a page body's ~30 KB gzipped, so it cannot share the page budget), and the credential pair `RAW_STORE_S3_ACCESS_KEY_ID` / `RAW_STORE_S3_SECRET_ACCESS_KEY`.
+
+On the asset lane the store's declared `Content-Type` is **advisory only** — CDNs mislabel images as `application/octet-stream`, and a challenge or error page is routinely served under the image's own content type. The MAGIC BYTES decide: `jpg`, `png`, `webp`, `gif`, `avif` (AVIF is matched on its major brand *and* its compatible-brand list, since real AVIF is commonly emitted as `mif1`/`miaf`). Sniffing types the **prefix**, not the whole body: a polyglot that is a valid GIF/JPEG header *and* a valid script is stored — which is why originals are private, never served and never shown. Both types are recorded (the sniffed one as the object's `Content-Type`, the declared one as `x-amz-meta-declared-content-type`). Anything else is a typed SKIP — counted, never stored, never thrown:
+
+| Skip | When |
+|---|---|
+| `notImage` | the bytes are not one of the five formats (html, json, svg, text — an error or challenge page) |
+| `tooLarge` | over `RAW_STORE_IMAGE_MAX_BYTES` |
+| `empty` | a zero-length body |
+| `disabled` | `PERSIST_RAW_IMAGES` is not `true` — the lane refuses the write regardless of the caller |
+
+Asset objects carry their provenance as user metadata: `url` (the image URL), `fetched-at`, `site` (the DECLARING store, since the image usually lives on a CDN host that says nothing about whose catalogue it belongs to), `source-item` (`<site>/<itemId>`), `source-url` (the page that referenced it), `position` (its index in that page's image list), `lane`, `declared-content-type` and `bytes`. The set is BUDGETED as a whole (S3 caps user metadata at ~2 KB of header bytes for the whole set, not per value, and both the image URL and the declared Content-Type are store-controlled): over budget, `declared-content-type`, `source-url`, `position` and `bytes` are shed in that order and the longest survivor is truncated — a degraded tag, never a lost object. Originals are stored unaltered and are **never shown** — any surfaced image is a sanitized derivative produced downstream.
+
+Because the key is the content address, provenance metadata describes the **first** capture of those bytes only: the same press photo reused across items, variants or stores is stored once, and the second capture dedupes without rewriting the tags. The spine's capture event log — one row per *reference*, written by the caller that fetches the image — is the authoritative record of which items use an image; the bucket metadata is a convenience tag, not an index.
+
+Op timeouts are a race, not a cancellation (the minio client takes no `AbortSignal`): a timed-out PUT is counted as a failure but may still land in the bucket, after which the next capture of those bytes dedupes. Sizing the asset budget to the payload is what keeps that from being routine.
+
+The sink's counters (`stored` / `deduped` / `failed` / `skippedDisabled`, plus `assetStored` / `assetDeduped` / `assetSkipped` / `assetFailed`) are exposed by `ObjectStoreCaptureSink.stats()` and published on `GET /health/detailed` as `rawStore: { configured, stats? }`. `configured:false` means no sink was built at all (both switches off, or an incomplete store config) — the distinction an operator needs, since an asset lane whose every body is refused as `notImage` (a CDN answering image requests with a challenge page) otherwise looks exactly like an idle one.
+
 **MFC Cookie Security:**
 - `MFC_ALLOWED_COOKIES`: Whitelist of cookie names allowed during authenticated MFC scraping
   - **Default**: `PHPSESSID,sesUID,sesDID,cf_clearance`

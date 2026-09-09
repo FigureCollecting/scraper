@@ -12,6 +12,7 @@
  *     RESIDENTIAL_EGRESS_HEALTH_DETAIL, credentials always stripped),
  *     `browserLane: {launchMode, residentialTimezone, directTimezone, processTimezone, gatedBrowsers}`,
  *     `challengeCooldowns: [{host, remainingMs, reason}]` (the per-host CF cooldowns currently open)
+ *     `rawStore: {configured, stats?}` (the raw-capture sink's counters — page + asset lanes)
  *     and `cfCookies: [{host, cookieNames, userAgentPinned, loadedAt, mintedAt?, expiresAt?, stale,
  *     staleSince?, staleReason?}]` (the stored-cookie jar's per-host view — cookie NAMES only, never a
  *     value; `stale` = the host still served a challenge with its stored cookies → re-mint).
@@ -22,6 +23,7 @@ import { Router, type Request, type Response } from 'express';
 import type { CooldownView } from '../services/challengeCooldown.js';
 import type { CfCookieHostView } from '../services/cookieJar.js';
 import type { BrowserLaneView } from '../services/genericScraper.js';
+import type { RawStoreView } from '../services/s3ObjectStore.js';
 
 export interface HealthDeps {
   /** The service version (package.json). */
@@ -45,6 +47,13 @@ export interface HealthDeps {
    * of it, and the live per-egress challenge browsers. Pure config + counters — nothing secret.
    */
   getBrowserLane: () => BrowserLaneView;
+  /**
+   * The raw-capture sink's view (rawStoreView()): whether a sink was built at all and
+   * its counters. These are the only signal that the capture lanes are working — an
+   * asset lane whose every body is refused as notImage otherwise looks exactly like an
+   * idle one. Counters only, nothing secret; the reader never throws.
+   */
+  getRawStore: () => RawStoreView;
 }
 
 export function createHealthRoutes(deps: HealthDeps): Router {
@@ -73,6 +82,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         cfCookies: deps.listCfCookies(),
         residentialEgress: deps.getResidentialEgress(),
         browserLane: deps.getBrowserLane(),
+        rawStore: deps.getRawStore(),
         timestamp: new Date().toISOString(),
       });
     } catch (error) {
@@ -83,6 +93,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         cfCookies: deps.listCfCookies(),
         residentialEgress: deps.getResidentialEgress(),
         browserLane: deps.getBrowserLane(),
+        rawStore: deps.getRawStore(),
         error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
