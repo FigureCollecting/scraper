@@ -293,7 +293,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
    * which differs between the dev tier and prod and would split one store's failures across
    * environments.
    */
-  const listingTarget = (siteId: string, axis: 'listing' | 'range', where: Record<string, unknown>): string => {
+  const listingTarget = (siteId: string, axis: Phase, where: Record<string, unknown>): string => {
     const params = Object.entries(where)
       .map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`)
       .join('&');
@@ -432,7 +432,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
    * Both answer the same `{ items: [...] }` shape, so one parser serves both; `where` only labels the
    * logs and decides whether a 422 is a listing-axis gap (which leaves the id-range axis alive).
    */
-  const fetchCatalog = async (st: StoreState, url: string, where: Record<string, unknown>, axis: 'listing' | 'range'): Promise<PageOutcome> => {
+  const fetchCatalog = async (st: StoreState, url: string, where: Record<string, unknown>, axis: Phase): Promise<PageOutcome> => {
     const stop = (reason: StopReason): PageOutcome => {
       st.stopped = true;
       return { kind: 'stopped', reason };
@@ -464,18 +464,23 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       const body = await res.json().catch(() => ({}));
       st.summary.skipped++;
       logger.warn('[CRAWLER] catalog cooldown — store skipped this run', { siteId: st.siteId, ...where, remainingMs: body?.remainingMs });
-      // E7 — the SCRAPER reports the host cooling. Reported (the operator asked to see the hosts we
-      // are deliberately leaving alone), carrying the scraper's own window so the spine's backoff is
-      // delayed to it rather than pulled forward.
-      const remainingMs = Number(body?.remainingMs);
+      // E7 — the SCRAPER reports the host cooling, and it says so in its OWN envelope
+      // ({error:'cooldown', remainingMs}, routes/catalog.ts). A 503 WITHOUT that envelope is the
+      // ingress or a scaled-to-zero Deployment, not a Cloudflare window: claiming a cooldown there
+      // would fabricate an observation in the one surface built for the operator to read. The crawl
+      // behaviour is the same either way — the store is left alone this run.
+      const isCooldown = isPlainObject(body) && body.error === 'cooldown';
+      const remainingMs = isCooldown ? Number(body.remainingMs) : Number.NaN;
       emitFailure({
         site: st.siteId,
         target: listingTarget(st.siteId, axis, where),
         kind: 'listing',
         origin: 'crawler',
-        reasonClass: 'cooldown',
+        reasonClass: isCooldown ? 'cooldown' : 'http_5xx',
         httpStatus: 503,
-        message: 'the scraper reports this host cooling after a Cloudflare challenge',
+        message: isCooldown
+          ? 'the scraper reports this host cooling after a Cloudflare challenge'
+          : 'catalog GET answered 503 without the scraper\'s cooldown envelope',
         ...(Number.isFinite(remainingMs) && remainingMs > 0
           ? { nextRetryHint: new Date(now() + remainingMs).toISOString() }
           : {}),
@@ -486,7 +491,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       // The store does not serve THIS axis (no byListing / no extractListing; or no byRange / byId):
       // a configuration or coverage gap, NOT exhaustion. A listing gap leaves the id-range axis alive.
       st.summary.errors++;
-      if (axis === 'listing') st.listingUnsupported = true;
+      if (axis !== 'range') st.listingUnsupported = true;
       logger.warn('[CRAWLER] catalog unsupported — axis stopped', { siteId: st.siteId, ...where, axis });
       return stop('unsupported');
     }
@@ -542,8 +547,13 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     return { kind: 'page', items: sanitizeItems(body.items), hasMore: body.hasMore === true };
   };
 
-  const fetchPage = (st: StoreState, page: number): Promise<PageOutcome> =>
-    fetchCatalog(st, catalogUrl(st.siteId, page), { page }, 'listing');
+  /**
+   * `phase` is not decoration: recent and backfill can fetch the SAME page number in one run (raise
+   * recentMaxPages past a saved backfill cursor), and one shared axis label would collapse the two
+   * axes' failures onto one row — one attempts counter, and no way to see which axis is broken.
+   */
+  const fetchPage = (st: StoreState, page: number, phase: 'recent' | 'backfill'): Promise<PageOutcome> =>
+    fetchCatalog(st, catalogUrl(st.siteId, page), { page }, phase);
 
   const postOne = async (st: StoreState, collectUrl: string, itemId: string): Promise<PostOutcome> => {
     let r: GateResult<HttpResponseLike>;
@@ -566,6 +576,8 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     // template): terminal, and ours to fix, so it lands in the review queue as a RECORD row keyed on
     // the real store URL. A 5xx above is NOT reported — the scraper is unwell and the crawler
     // re-drives the id next run.
+    // NO httpStatus: the status is our own /ingest/scrape's, while the row's target is the STORE's
+    // url — recording it would assert a response that store never gave. It stays in the message.
     emitFailure({
       site: st.siteId,
       ...(itemId ? { itemId } : {}),
@@ -573,7 +585,6 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       kind: 'record',
       origin: 'crawler',
       reasonClass: 'ruleset',
-      httpStatus: res.status,
       message: `the scraper refused this url with ${res.status}`,
     });
     return 'rejected';
@@ -679,7 +690,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     if (!st.ledger || st.stopped) return;
     const ledger = st.ledger;
     for (let page = 1; page <= config.recentMaxPages; page++) {
-      const out = await fetchPage(st, page);
+      const out = await fetchPage(st, page, 'recent');
       if (out.kind !== 'page') return;
       st.summary.pagesFetched++;
       st.summary.recentPages++;
@@ -720,7 +731,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     // Resume the saved cursor; otherwise start just past the recent phase's deepest page (page 2 at minimum).
     let cursor = b.cursor ?? Math.max(2, st.deepestRecentPage + 1);
     for (let i = 0; i < config.backfillPagesPerRun; i++) {
-      const out = await fetchPage(st, cursor);
+      const out = await fetchPage(st, cursor, 'backfill');
       if (out.kind !== 'page') return;
       st.summary.pagesFetched++;
       st.summary.backfillPages++;
@@ -895,7 +906,9 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       // and they are never re-walked. Keep the cursor and let the error count say so.
       logger.warn('[CRAWLER] id-range window entirely rejected by ingest — cursor kept', { siteId: st.siteId, from: cursor, rejected });
       // E11 — every id in the window was deterministically refused: a property of the STORE (an
-      // engine/ruleset skew), not of these ids, so it is one row about the window, not N.
+      // engine/ruleset skew), not of these ids. This row names the WINDOW and the kept cursor; it
+      // ACCOMPANIES the per-id E10 rows postOne already wrote (it does not replace them), because a
+      // partly-rejected window still needs its individual ids on record.
       emitFailure({
         site: st.siteId,
         target: listingTarget(st.siteId, 'range', { from: cursor, count }),

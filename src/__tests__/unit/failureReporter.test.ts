@@ -77,10 +77,10 @@ describe('FailureReporter — the wire message', () => {
     const reporter = new FailureReporter({ client });
 
     await reporter.report(
-      baseReport({ kind: 'listing', origin: 'crawler', itemId: undefined, target: 'fc:listing/anitoysgk?axis=listing&page=3' }),
+      baseReport({ kind: 'listing', origin: 'crawler', itemId: undefined, target: 'fc:listing/anitoysgk?axis=recent&page=3' }),
     );
 
-    expect(calls[0].source.url).toBe('fc:listing/anitoysgk?axis=listing&page=3');
+    expect(calls[0].source.url).toBe('fc:listing/anitoysgk?axis=recent&page=3');
     expect(calls[0].source.itemId).toBe('');
     expect(calls[0].kind).toBe(2); // FETCH_KIND_LISTING
     expect(calls[0].origin).toBe(1); // FETCH_ORIGIN_CRAWLER

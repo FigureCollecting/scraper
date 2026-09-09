@@ -86,7 +86,7 @@ describe('runCrawlerPass × fetch-failure ledger', () => {
       kind: 'listing',
       origin: 'crawler',
       reasonClass: 'network',
-      target: 'fc:listing/orzgk?axis=listing&page=1',
+      target: 'fc:listing/orzgk?axis=recent&page=1',
     });
     expect(reports[0].target).not.toContain('scraper.test');
   });
@@ -109,6 +109,45 @@ describe('runCrawlerPass × fetch-failure ledger', () => {
     expect(reports).toHaveLength(1);
     expect(reports[0].reasonClass).toBe('cooldown');
     expect(Date.parse(reports[0].nextRetryHint!)).toBe(T0 + 900_000);
+  });
+
+  it('E7: a 503 that is NOT the engine cooldown envelope is http_5xx, never a phantom CF cooldown', async () => {
+    // A rollout or a scaled-to-zero Deployment answers 503 from the ingress with no envelope.
+    // Claiming the STORE is cooling after a Cloudflare challenge would fabricate an observation.
+    const { reports, deps } = harness({ catalog: async () => resp(503, { error: 'no healthy upstream' }) });
+
+    await runCrawlerPass(mkCfg(), deps);
+
+    expect(reports).toHaveLength(1);
+    expect(reports[0]).toMatchObject({ reasonClass: 'http_5xx', httpStatus: 503 });
+    expect(reports[0].nextRetryHint).toBeUndefined();
+  });
+
+  it('E7: a 503 whose body will not parse at all is http_5xx too', async () => {
+    const { reports, deps } = harness({
+      catalog: async () => ({ ok: false, status: 503, json: async () => { throw new SyntaxError('Unexpected token <'); }, text: async () => '<html>' }),
+    });
+
+    await runCrawlerPass(mkCfg(), deps);
+
+    expect(reports[0].reasonClass).toBe('http_5xx');
+  });
+
+  it('the listing target names the AXIS that failed — recent and backfill are distinct rows', async () => {
+    let page = 0;
+    const { reports, deps } = harness({
+      catalog: async () => {
+        page++;
+        // recent page 1 succeeds with more to come; every later fetch (recent p2, backfill p2) fails.
+        return page === 1
+          ? resp(200, { siteId: 'orzgk', items: [{ itemId: '1', collectUrl: collectUrl('1') }], hasMore: true })
+          : resp(502, { error: 'boom' });
+      },
+    });
+
+    await runCrawlerPass(mkCfg({ mode: 'both', recentMaxPages: 2, backfillPagesPerRun: 1 }), deps);
+
+    expect(reports.map((r) => r.target)).toContain('fc:listing/orzgk?axis=recent&page=2');
   });
 
   it('E8: a 5xx is reported as http_5xx with the status; a non-5xx !ok lands in the triage bucket', async () => {
@@ -146,9 +185,12 @@ describe('runCrawlerPass × fetch-failure ledger', () => {
       origin: 'crawler',
       reasonClass: 'ruleset',
       target: collectUrl('1'),
-      httpStatus: 400,
       itemId: '1',
     });
+    // The 400 came from OUR /ingest/scrape, not from the store the target names: recording it as
+    // the row's http_status would assert a response that store never gave.
+    expect(record[0].httpStatus).toBeUndefined();
+    expect(record[0].message).toContain('400');
   });
 
   it('does NOT report a 5xx from the ingest POST — the scraper is unwell, the item is re-driven next run', async () => {
