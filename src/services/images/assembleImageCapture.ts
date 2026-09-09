@@ -26,6 +26,8 @@ import type { ImageBytesFetcher } from './imageBytes.js';
 import {
   createImageBytesRouter,
   createImageCaptureHook,
+  DEFAULT_IMAGE_FETCH_CONCURRENCY,
+  DEFAULT_IMAGE_INFLIGHT_MAX,
   DEFAULT_IMAGE_MAX_PER_ITEM,
   DEFAULT_IMAGE_MEMO_SIZE,
   DEFAULT_RESIDENTIAL_BYTES_PER_DAY,
@@ -43,12 +45,21 @@ import {
  */
 export const MAX_CONFIGURABLE_IMAGES_PER_ITEM = 100;
 
+/**
+ * The most image fetches an operator may open at once. Same reasoning as the per-item ceiling, one
+ * level up: this is a BACKGROUND lane sharing a pod with live lookups and ingest, and a mistyped
+ * concurrency is exactly how it stops being background.
+ */
+export const MAX_CONFIGURABLE_IMAGE_CONCURRENCY = 32;
+
 /** The tunables, resolved from env with the owner's defaults. */
 export interface ImageCaptureSettings {
   enabled: boolean;
   maxPerItem: number;
   memoSize: number;
   residentialBytesPerDay: number;
+  concurrency: number;
+  inFlightMax: number;
 }
 
 /** A positive integer from env; undefined when absent, unparseable or non-positive. */
@@ -75,6 +86,11 @@ export function resolveImageCaptureSettings(env: NodeJS.ProcessEnv = process.env
     maxPerItem: Math.min(positiveInt(env.IMAGE_MAX_PER_ITEM) ?? DEFAULT_IMAGE_MAX_PER_ITEM, MAX_CONFIGURABLE_IMAGES_PER_ITEM),
     memoSize: positiveInt(env.IMAGE_MEMO_SIZE) ?? DEFAULT_IMAGE_MEMO_SIZE,
     residentialBytesPerDay: nonNegativeInt(env.IMAGE_RESIDENTIAL_BYTES_PER_DAY) ?? DEFAULT_RESIDENTIAL_BYTES_PER_DAY,
+    concurrency: Math.min(
+      positiveInt(env.IMAGE_FETCH_CONCURRENCY) ?? DEFAULT_IMAGE_FETCH_CONCURRENCY,
+      MAX_CONFIGURABLE_IMAGE_CONCURRENCY,
+    ),
+    inFlightMax: positiveInt(env.IMAGE_INFLIGHT_MAX) ?? DEFAULT_IMAGE_INFLIGHT_MAX,
   };
 }
 
@@ -145,6 +161,8 @@ export function createImageCaptureHookFromEnv(
     maxPerItem: settings.maxPerItem,
     memoSize: settings.memoSize,
     residentialBytesPerDay: settings.residentialBytesPerDay,
+    concurrency: settings.concurrency,
+    inFlightMax: settings.inFlightMax,
   });
 }
 
@@ -177,7 +195,7 @@ export function imageCaptureView(hook: ImageCaptureHook = getImageCaptureHook())
       attempted: 0,
       stored: 0,
       deduped: 0,
-      skipped: { policyDeny: 0, memo: 0, thumbnailRole: 0, userRole: 0, cap: 0, residentialBudget: 0, notImage: 0, tooLarge: 0 },
+      skipped: { policyDeny: 0, memo: 0, thumbnailRole: 0, userRole: 0, cap: 0, residentialBudget: 0, notImage: 0, tooLarge: 0, inFlight: 0 },
       failed: 0,
       residentialBytesToday: 0,
     };

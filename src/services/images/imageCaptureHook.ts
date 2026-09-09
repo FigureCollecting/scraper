@@ -39,7 +39,7 @@ import {
   type ImageLane,
 } from './imageHostPolicy.js';
 import { resolveImageUserAgent, type ImageBytesFailure, type ImageBytesFetcher, type ImageFetchOptions } from './imageBytes.js';
-import { normalizeImageRefs } from './imageRefs.js';
+import { normalizeImageRefs, type PlannedImageRef } from './imageRefs.js';
 import { createImageUrlMemo, createResidentialByteBudget } from './imageCaptureState.js';
 import type { GatedTabBytesFetcher } from './gatedTabBytesFetch.js';
 
@@ -49,8 +49,50 @@ export const DEFAULT_IMAGE_MAX_PER_ITEM = 12;
 export const DEFAULT_IMAGE_MEMO_SIZE = 50_000;
 /** 1 GiB. The ceiling is on the LINE — it is somebody's house, not a datacentre uplink. */
 export const DEFAULT_RESIDENTIAL_BYTES_PER_DAY = 1024 * 1024 * 1024;
+/**
+ * How many image fetches may be OPEN at once, across every item and every host.
+ *
+ * The lane's own design makes this necessary. Capture is fire-and-forget precisely so an item never
+ * waits on a CDN — which means NOTHING upstream applies backpressure to it, and a queue processing
+ * two hundred items concurrently would open two hundred image fetches. Per-host pacing does not
+ * bound that: its budget is per CDN, and a catalogue sweep spans many. Six is a background lane's
+ * share of a pod that is also serving lookups and ingest.
+ */
+export const DEFAULT_IMAGE_FETCH_CONCURRENCY = 6;
+/**
+ * How many ITEMS may be waiting for their turn before new ones are dropped.
+ *
+ * The concurrency bound alone only limits open sockets; the backlog behind it still grows without
+ * limit, one job per item, for as long as ingest outruns the image lane. Dropping is the right
+ * answer and not a loss: the item's own outcome is already decided, the store's plates are still
+ * there on the next pass, and the memo means the pass that does catch them pays for them once.
+ */
+export const DEFAULT_IMAGE_INFLIGHT_MAX = 500;
 /** At most one log line per image host per hour; the counters carry the volume. */
 const HOST_LOG_INTERVAL_MS = 60 * 60_000;
+
+/**
+ * A counting semaphore with a FIFO queue of waiters. A waiter is resumed HOLDING the permit (the
+ * count is never handed back to the pool in between), so a release cannot be won by a later arrival.
+ */
+function createSemaphore(permits: number): { acquire(): Promise<void>; release(): void } {
+  let free = Math.max(1, Math.floor(Number.isFinite(permits) ? permits : 1));
+  const waiters: Array<() => void> = [];
+  return {
+    acquire(): Promise<void> {
+      if (free > 0) {
+        free -= 1;
+        return Promise.resolve();
+      }
+      return new Promise<void>(resolve => waiters.push(resolve));
+    },
+    release(): void {
+      const next = waiters.shift();
+      if (next) next();
+      else free += 1;
+    },
+  };
+}
 
 /**
  * The fetch options PLUS the routing decision, carried on the same object.
@@ -112,6 +154,8 @@ export interface ImageCaptureSkipCounts {
   notImage: number;
   /** A body past the image size cap. */
   tooLarge: number;
+  /** Dropped un-attempted because too many items were already waiting for the lane. */
+  inFlight: number;
 }
 
 export interface ImageCaptureStats {
@@ -147,6 +191,22 @@ export interface ImageCaptureRequest {
   origin: FetchOriginName;
 }
 
+/**
+ * One item's capture work, AFTER the ruleset has been asked and the engine's capture rule applied.
+ *
+ * This is deliberately not the request: a request carries the whole extraction's `fields`, and a job
+ * that may sit in a backlog for minutes must not pin one. Planning happens synchronously, in the
+ * caller's own stack, and what is queued is a handful of urls.
+ */
+interface PlannedCapture {
+  site: string;
+  itemId: string;
+  pageUrl: string;
+  searchFetch: SearchFetch | undefined;
+  origin: FetchOriginName;
+  refs: PlannedImageRef[];
+}
+
 export interface ImageCaptureHookDeps {
   sink: CaptureSink;
   policy: ImageHostPolicy;
@@ -161,6 +221,10 @@ export interface ImageCaptureHookDeps {
   maxPerItem?: number;
   memoSize?: number;
   residentialBytesPerDay?: number;
+  /** Open image fetches allowed at once (default {@link DEFAULT_IMAGE_FETCH_CONCURRENCY}). */
+  concurrency?: number;
+  /** Items allowed to be waiting before new requests are dropped (default {@link DEFAULT_IMAGE_INFLIGHT_MAX}). */
+  inFlightMax?: number;
   now?: () => number;
   warn?: (message: string) => void;
 }
@@ -228,9 +292,12 @@ export function createImageCaptureHook(deps: ImageCaptureHookDeps): ImageCapture
     residentialBudget: 0,
     notImage: 0,
     tooLarge: 0,
+    inFlight: 0,
   };
   const lastLoggedByHost = new Map<string, number>();
   const inFlight = new Set<Promise<void>>();
+  const gate = createSemaphore(deps.concurrency ?? DEFAULT_IMAGE_FETCH_CONCURRENCY);
+  const inFlightMax = Math.max(1, Math.floor(deps.inFlightMax ?? DEFAULT_IMAGE_INFLIGHT_MAX));
 
   /**
    * One line per host per hour, whatever the volume. An image lane that has started failing does so
@@ -256,12 +323,12 @@ export function createImageCaptureHook(deps: ImageCaptureHookDeps): ImageCapture
     }
   };
 
-  const captureOne = async (request: ImageCaptureRequest, url: string, role: string, position: number): Promise<void> => {
+  const captureOne = async (job: PlannedCapture, url: string, role: string, position: number): Promise<void> => {
     if (memo.hasUrl(url)) {
       skipped.memo += 1;
       return;
     }
-    const decision = chooseImageLane(request.pageUrl, url, request.searchFetch, deps.policy);
+    const decision = chooseImageLane(job.pageUrl, url, job.searchFetch, deps.policy);
     if (!decision.ok) {
       skipped.policyDeny += 1;
       return;
@@ -285,9 +352,9 @@ export function createImageCaptureHook(deps: ImageCaptureHookDeps): ImageCapture
     const userAgent = resolveImageUserAgent(decision.ua);
     const plan: ImageFetchPlan = {
       lane: decision.lane,
-      storeHost: storeHostOf(request.pageUrl),
+      storeHost: storeHostOf(job.pageUrl),
       egress: decision.egress,
-      ...(request.searchFetch?.access === 'cloudflare' ? { challengeGated: true } : {}),
+      ...(job.searchFetch?.access === 'cloudflare' ? { challengeGated: true } : {}),
       ...(decision.referer !== undefined ? { referer: decision.referer } : {}),
       ...(userAgent !== undefined ? { userAgent } : {}),
       ...(proxyUrl !== undefined ? { proxyUrl } : {}),
@@ -295,12 +362,16 @@ export function createImageCaptureHook(deps: ImageCaptureHookDeps): ImageCapture
       // requested url, and a redirect can land on a banned host, or carry a residential fetch off
       // the store that declared the exit.
       allowFinalUrl: (finalUrl: string) =>
-        !isDeniedImageUrl(finalUrl) && (decision.egress !== 'residential' || isDeclaringStoreUrl(finalUrl, request.pageUrl)),
+        !isDeniedImageUrl(finalUrl) && (decision.egress !== 'residential' || isDeclaringStoreUrl(finalUrl, job.pageUrl)),
     };
 
     attempted += 1;
     const host = storeHostOf(url) || url;
     let result;
+    // The GATE, taken around the fetch alone: everything before it is a decision (pure, instant) and
+    // everything after is a hash and a write. Holding a permit across those would mean six images
+    // could be resident while none of them is on the wire.
+    await gate.acquire();
     try {
       result = await deps.fetchBytes(url, plan);
     } catch (err) {
@@ -308,15 +379,17 @@ export function createImageCaptureHook(deps: ImageCaptureHookDeps): ImageCapture
       const message = err instanceof Error ? err.message : String(err);
       logOncePerHost(host, `[IMAGE-CAPTURE] ${sanitizeForLog(host)} image fetch faulted: ${sanitizeForLog(message)}`);
       await report({
-        site: request.site,
-        itemId: request.itemId,
+        site: job.site,
+        itemId: job.itemId,
         target: url,
-        origin: request.origin,
+        origin: job.origin,
         reasonClass: 'network',
         message,
         transport: decision.lane,
       });
       return;
+    } finally {
+      gate.release();
     }
 
     if (!result.ok) {
@@ -340,10 +413,10 @@ export function createImageCaptureHook(deps: ImageCaptureHookDeps): ImageCapture
         })${failure.detail ? `: ${sanitizeForLog(failure.detail)}` : ''}`,
       );
       await report({
-        site: request.site,
-        itemId: request.itemId,
+        site: job.site,
+        itemId: job.itemId,
         target: url,
-        origin: request.origin,
+        origin: job.origin,
         reasonClass: reasonClassFor(failure),
         ...(failure.status !== undefined ? { httpStatus: failure.status } : {}),
         ...(failure.detail !== undefined ? { message: failure.detail } : {}),
@@ -361,8 +434,8 @@ export function createImageCaptureHook(deps: ImageCaptureHookDeps): ImageCapture
       bytes: result.bytes,
       statusCode: result.status,
       contentType: result.contentType,
-      sourceItem: { site: request.site, itemId: request.itemId },
-      sourceUrl: request.pageUrl,
+      sourceItem: { site: job.site, itemId: job.itemId },
+      sourceUrl: job.pageUrl,
       position,
       role,
     });
@@ -388,8 +461,13 @@ export function createImageCaptureHook(deps: ImageCaptureHookDeps): ImageCapture
     }
   };
 
-  const run = async (request: ImageCaptureRequest): Promise<void> => {
-    if (!enabled || typeof request.ruleset.describeImages !== 'function') return;
+  /**
+   * Ask the ruleset what the item's images are and apply the engine's capture rule — SYNCHRONOUSLY,
+   * in the caller's own stack, before anything is queued. That ordering is the point: a job that
+   * waits in the backlog then holds a handful of urls rather than a whole extraction's `fields`.
+   */
+  const planCapture = (request: ImageCaptureRequest): PlannedCapture | undefined => {
+    if (!enabled || typeof request.ruleset.describeImages !== 'function') return undefined;
     let described;
     try {
       described = request.ruleset.describeImages(request.fields);
@@ -401,23 +479,58 @@ export function createImageCaptureHook(deps: ImageCaptureHookDeps): ImageCapture
         `ruleset:${request.site}`,
         `[IMAGE-CAPTURE] ${sanitizeForLog(request.site)} describeImages threw: ${sanitizeForLog(err instanceof Error ? err.message : String(err))}`,
       );
-      return;
+      return undefined;
     }
     const normalized = normalizeImageRefs(described, request.pageUrl, maxPerItem);
     skipped.thumbnailRole += normalized.skipped.thumbnailRole;
     skipped.userRole += normalized.skipped.userRole;
     skipped.cap += normalized.skipped.cap;
     skipped.policyDeny += normalized.skipped.policyDeny;
-    // SEQUENTIAL on purpose. The per-host pacing would serialize a shared CDN anyway, and a gallery
-    // fired in parallel would hold a browser tab per image on the gated lane.
-    for (const ref of normalized.refs) {
-      await captureOne(request, ref.url, ref.role, ref.position);
+    if (normalized.refs.length === 0) return undefined;
+    return {
+      site: request.site,
+      itemId: request.itemId,
+      pageUrl: request.pageUrl,
+      searchFetch: request.searchFetch,
+      origin: request.origin,
+      refs: normalized.refs,
+    };
+  };
+
+  const run = async (job: PlannedCapture): Promise<void> => {
+    // SEQUENTIAL within one item on purpose, on top of the global gate: the per-host pacing would
+    // serialize a shared CDN anyway, and a gallery fired in parallel would hold a browser tab per
+    // image on the gated lane.
+    for (const ref of job.refs) {
+      await captureOne(job, ref.url, ref.role, ref.position);
     }
   };
 
   return {
     capture(request: ImageCaptureRequest): Promise<void> {
-      const task = run(request)
+      let job: PlannedCapture | undefined;
+      try {
+        job = planCapture(request);
+      } catch (err) {
+        // planCapture is total; this is the guard for a bug in it. A synchronous throw here would
+        // otherwise reach a caller that is not allowed to fail because of images.
+        failed += 1;
+        warn(`[IMAGE-CAPTURE] planning aborted: ${sanitizeForLog(err instanceof Error ? err.message : String(err))}`);
+        return Promise.resolve();
+      }
+      if (!job) return Promise.resolve();
+      // The CEILING. Dropping beats queueing: the item's outcome is already decided, the store's
+      // plates will still be there next pass, and an unbounded backlog is how a background lane
+      // takes a pod down instead of merely running behind.
+      if (inFlight.size >= inFlightMax) {
+        skipped.inFlight += job.refs.length;
+        logOncePerHost(
+          'inflight',
+          `[IMAGE-CAPTURE] ${inFlight.size} items already waiting — dropping ${job.refs.length} image(s) of ${sanitizeForLog(job.site)}/${sanitizeForLog(job.itemId)}`,
+        );
+        return Promise.resolve();
+      }
+      const task = run(job)
         .catch(err => {
           // The chain above is total, so this is the guard for a bug in it — never a path an item
           // can be failed through.

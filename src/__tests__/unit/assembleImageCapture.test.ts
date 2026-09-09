@@ -31,6 +31,8 @@ describe('resolveImageCaptureSettings', () => {
       maxPerItem: 12,
       memoSize: 50_000,
       residentialBytesPerDay: 1024 * 1024 * 1024,
+      concurrency: 6,
+      inFlightMax: 500,
     });
   });
 
@@ -46,6 +48,15 @@ describe('resolveImageCaptureSettings', () => {
 
   it('bounds a per-item ceiling a typo made enormous', () => {
     expect(resolveImageCaptureSettings(env({ IMAGE_MAX_PER_ITEM: '100000' })).maxPerItem).toBe(100);
+  });
+
+  it("takes the operator's bounds, and clamps a concurrency that would stop being background", () => {
+    expect(resolveImageCaptureSettings(env({ IMAGE_FETCH_CONCURRENCY: '4', IMAGE_INFLIGHT_MAX: '20' }))).toMatchObject({
+      concurrency: 4,
+      inFlightMax: 20,
+    });
+    expect(resolveImageCaptureSettings(env({ IMAGE_FETCH_CONCURRENCY: '5000' })).concurrency).toBe(32);
+    expect(resolveImageCaptureSettings(env({ IMAGE_FETCH_CONCURRENCY: '0' })).concurrency).toBe(6);
   });
 
   it('falls back to the default for a value that is not a usable number', () => {

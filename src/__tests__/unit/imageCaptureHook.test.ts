@@ -55,6 +55,8 @@ function harness(options: {
   memoSize?: number;
   residentialBytesPerDay?: number;
   enabled?: boolean;
+  concurrency?: number;
+  inFlightMax?: number;
 } = {}): HookHarness {
   const sink = new CollectingCaptureSink();
   const calls: Array<{ url: string; plan: ImageFetchPlan }> = [];
@@ -77,6 +79,8 @@ function harness(options: {
     maxPerItem: options.maxPerItem ?? 12,
     memoSize: options.memoSize ?? 50_000,
     residentialBytesPerDay: options.residentialBytesPerDay ?? 1024 * 1024 * 1024,
+    ...(options.concurrency !== undefined ? { concurrency: options.concurrency } : {}),
+    ...(options.inFlightMax !== undefined ? { inFlightMax: options.inFlightMax } : {}),
   });
   return { sink, calls, reports, warnings, hook, clock };
 }
@@ -412,5 +416,133 @@ describe('the image capture hook', () => {
       await h.hook.drain();
       expect(h.sink.captures).toHaveLength(1);
     });
+  });
+});
+
+/**
+ * BOUNDS. Everything above tests one item; these test what happens when the queue hands over two
+ * hundred at once — which is the shape live ingest actually has.
+ *
+ * Unbounded, the hook's own design works against it: capture is fire-and-forget precisely so an item
+ * never waits on a CDN, so nothing upstream applies backpressure, and 200 concurrent items become
+ * 200 concurrent image fetches. The per-host pacing does not save it — that budget is per CDN, and a
+ * catalogue's worth of items spans many. So the lane needs a bound of its own, in two places: how
+ * many fetches may be OPEN at once, and how many items may be waiting to have theirs.
+ */
+describe('the image capture hook under load', () => {
+  const flush = () => new Promise<void>(resolve => setImmediate(resolve));
+
+  const gatedFetch = () => {
+    const release: Array<() => void> = [];
+    let live = 0;
+    let peak = 0;
+    const fetch = async (url: string): Promise<ImageBytesResult> => {
+      live += 1;
+      peak = Math.max(peak, live);
+      await new Promise<void>(resolve => release.push(resolve));
+      live -= 1;
+      return okBytes(Buffer.from(url), url);
+    };
+    return {
+      fetch,
+      release,
+      peak: () => peak,
+      live: () => live,
+      async drain(): Promise<void> {
+        for (let i = 0; i < 500; i += 1) {
+          await flush();
+          const waiting = release.splice(0);
+          waiting.forEach(resolve => resolve());
+          if (waiting.length === 0 && live === 0) return;
+        }
+      },
+    };
+  };
+
+  /** `offset` keeps each burst's urls distinct, so a later burst is not answered by the memo. */
+  const fire = (h: HookHarness, count: number, offset = 0): Promise<void>[] =>
+    Array.from({ length: count }, (_, i) =>
+      h.hook.capture({
+        site: 'examplestore',
+        itemId: `item-${offset + i}`,
+        pageUrl: PAGE,
+        fields: {},
+        ruleset: rulesetDescribing([gallery(`https://cdn.test/${offset + i}.jpg`)]),
+        origin: 'ingest',
+      }),
+    );
+
+  it('holds the number of OPEN fetches at the configured concurrency, whatever the queue hands it', async () => {
+    const lane = gatedFetch();
+    const h = harness({ fetch: lane.fetch, concurrency: 6, inFlightMax: 1000 });
+
+    const tasks = fire(h, 200);
+    await flush();
+    expect(lane.live()).toBe(6);
+
+    await lane.drain();
+    await Promise.all(tasks);
+
+    expect(lane.peak()).toBe(6);
+    expect(h.hook.stats().stored).toBe(200);
+  });
+
+  it('drops a request rather than queueing it once too many items are already waiting', async () => {
+    const lane = gatedFetch();
+    const h = harness({ fetch: lane.fetch, concurrency: 2, inFlightMax: 3 });
+
+    const accepted = fire(h, 3);
+    await flush();
+    const dropped = fire(h, 4, 100);
+    await Promise.all(dropped);
+
+    // The four late arrivals never reach a fetch, and each one's images are counted as skipped.
+    expect(h.hook.stats().skipped.inFlight).toBe(4);
+    expect(h.calls).toHaveLength(2);
+
+    await lane.drain();
+    await Promise.all(accepted);
+    expect(h.hook.stats().stored).toBe(3);
+  });
+
+  it('accepts again once the backlog has drained', async () => {
+    const lane = gatedFetch();
+    const h = harness({ fetch: lane.fetch, concurrency: 1, inFlightMax: 1 });
+
+    const first = fire(h, 1);
+    await flush();
+    await Promise.all(fire(h, 1, 100));
+    expect(h.hook.stats().skipped.inFlight).toBe(1);
+
+    await lane.drain();
+    await Promise.all(first);
+
+    const third = fire(h, 1, 200);
+    await lane.drain();
+    await Promise.all(third);
+    expect(h.hook.stats().stored).toBe(2);
+  });
+
+  it('reads the images out of the fields SYNCHRONOUSLY, so a queued item holds no extraction', async () => {
+    // The whole extraction's `fields` can be large, and an item waiting its turn would otherwise pin
+    // one for as long as the backlog lasts. Describing up front means the queued job holds only urls.
+    const lane = gatedFetch();
+    const h = harness({ fetch: lane.fetch, concurrency: 1, inFlightMax: 100 });
+    const describeImages = jest.fn(() => [gallery('https://cdn.test/a.jpg')]);
+
+    const task = h.hook.capture({
+      site: 'examplestore',
+      itemId: 'lucy-1',
+      pageUrl: PAGE,
+      fields: { huge: 'x' },
+      ruleset: { describeImages },
+      origin: 'ingest',
+    });
+
+    // Called before the first await of the returned promise is ever reached.
+    expect(describeImages).toHaveBeenCalledTimes(1);
+
+    await lane.drain();
+    await task;
   });
 });

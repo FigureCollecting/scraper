@@ -1182,6 +1182,8 @@ See `.env.example` for complete configuration template.
 - `IMAGE_MAX_PER_ITEM`: Images captured per item (default `12`, clamped to 100) — see **Image capture** below
 - `IMAGE_MEMO_SIZE`: Urls the capture memo holds (default `50000`) — see **Image capture** below
 - `IMAGE_RESIDENTIAL_BYTES_PER_DAY`: Rolling-24-hour byte ceiling on the residential exit for images (default `1073741824`; `0` closes it) — see **Image capture** below
+- `IMAGE_FETCH_CONCURRENCY`: Image fetches open at once (default `6`, clamped to 32) — see **Image capture** below
+- `IMAGE_INFLIGHT_MAX`: Items allowed to be waiting for the image lane before new requests are dropped (default `500`) — see **Image capture** below
   - Unreadable → ignored with ONE warning; the default table stands
   - Example: `/etc/fc/image-host-policy.json`. The table is read ONCE, when the policy is loaded — unlike the cf-cookie store there is no mtime poll, so **an edit needs a pod restart**
 
@@ -1260,11 +1262,12 @@ The hook runs after a successful extraction and BESIDE the emit, on the ingest q
 
 A ref's `url` may be relative (it is resolved against the page it was found on) and a ref whose role is outside that vocabulary is refused before the network. The decisions run cheapest-first, and the two that protect something outside the process — the permaban and the home line's daily budget — sit BEFORE any request:
 
+0. **plan**, synchronously in the caller's own stack — the ruleset is asked and the capture rule applied before anything is queued, so a job waiting in the backlog holds a handful of urls rather than a whole extraction's `fields`. Past `IMAGE_INFLIGHT_MAX` waiting items the request is DROPPED here (`skipped.inFlight`) rather than queued
 1. **role filter → dedupe by url → cap** at `IMAGE_MAX_PER_ITEM`, in the store's own presentation order (so the cap keeps the first plates, which are the ones that matter)
 2. **memo** — a process-local LRU of url → content hash; a url already fetched and stored is skipped without a request. It also recognizes bytes arriving under a SECOND url (a store that versions its urls serves one file under many names), so those are deduped without a second write. A FAILED fetch is deliberately not memoized
 3. **lane + policy**, deny list first (see *Image bytes lanes* above)
 4. **residential budget** — a rolling 24-hour ceiling on bytes carried by the residential exit
-5. **fetch**, paced per image host, with the deny list and the on-store rule re-asserted on the url the bytes actually came from (a redirect can land somewhere the decision did not allow)
+5. **fetch**, under a global `IMAGE_FETCH_CONCURRENCY` gate and paced per image host, with the deny list and the on-store rule re-asserted on the url the bytes actually came from (a redirect can land somewhere the decision did not allow)
 6. **classify → content dedupe → sink** (`lane: 'asset'`)
 
 | Variable | Default | Meaning |
@@ -1272,6 +1275,8 @@ A ref's `url` may be relative (it is resolved against the page it was found on) 
 | `PERSIST_RAW_IMAGES` | off | The kill switch, shared with the sink's asset lane. Not `true` ⇒ the hook is inert and nothing is fetched |
 | `IMAGE_MAX_PER_ITEM` | `12` | Images captured per item, all roles counted after filtering. Clamped to 100: this multiplies against every item of every store, so a mistyped extra zero would turn a gallery walk into an undecided crawl |
 | `IMAGE_MEMO_SIZE` | `50000` | Urls the memo holds. Process-local and purely an optimization — a restart re-fetches a little and the content-addressed store dedups it |
+| `IMAGE_FETCH_CONCURRENCY` | `6` | Image fetches open at once, across every item and every host. Capture is fire-and-forget precisely so an item never waits on a CDN, which means nothing upstream applies backpressure — 200 concurrent items would otherwise open 200 fetches, and per-host pacing does not bound that (its budget is per CDN, and a catalogue sweep spans many). Clamped to 32 |
+| `IMAGE_INFLIGHT_MAX` | `500` | Items allowed to be WAITING for the lane before new requests are dropped. The concurrency bound limits open sockets; the backlog behind it would still grow one job per item for as long as ingest outruns the lane. A drop is counted as `skipped.inFlight` and is not a loss — the item's outcome is already decided, the plates are still there next pass, and the memo means the pass that catches them pays once |
 | `IMAGE_RESIDENTIAL_BYTES_PER_DAY` | `1073741824` (1 GiB) | Rolling-24-hour byte ceiling on the residential exit. The ceiling is on the LINE, not on any one store, because the line is somebody's house. `0` closes it to images entirely. A rolling window rather than a calendar day, so a run starting at 23:50 cannot spend the allowance twice in ten minutes. Checked before a fetch and booked after it, so the day's last image may overshoot by one body |
 
 The counters are published on `GET /health/detailed` as `imageCapture`.
