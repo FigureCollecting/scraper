@@ -359,6 +359,7 @@ describe('createHealthRoutes — rawStore counters', () => {
     inFlight: 4,
     dropped: 2,
     droppedBytes: 1,
+    assetRefusedReserve: 7,
     queuedBytes: 3145728,
     queueWaitP50: 40,
     queueWaitP95: 900,

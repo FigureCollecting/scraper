@@ -374,6 +374,7 @@ describe('ObjectStoreCaptureSink — the asset lane', () => {
       inFlight: 0,
       dropped: 0,
       droppedBytes: 0,
+      assetRefusedReserve: 0,
       queuedBytes: 0,
       // Latencies are wall clock, so the SHAPE is asserted and the values are not:
       // a real HEAD that happens to cross a millisecond boundary is not a defect.
@@ -1190,5 +1191,253 @@ describe('ObjectStoreCaptureSink — bounded admission queue', () => {
   it('flush() resolves immediately when nothing is queued', async () => {
     const sink = new ObjectStoreCaptureSink(new GatedObjectStore(), CONFIG);
     await expect(sink.flush()).resolves.toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The page reservation: one queue, two lanes with very different stakes. A page
+// body is provenance behind a claim already written to the spine and nothing
+// will ever fetch it again; an image is re-fetchable on the next crawl pass.
+// ---------------------------------------------------------------------------
+
+/** N asset captures with DISTINCT image bytes (so none dedups), each exactly `size` bytes. */
+const assets = (n: number, size = PNG.length + 1) =>
+  Array.from({ length: n }, (_, i) =>
+    asset(Buffer.concat([PNG, Buffer.alloc(Math.max(1, size - PNG.length), i + 1)])),
+  );
+
+/** N page captures with DISTINCT bodies, each exactly `size` bytes. */
+const pages = (n: number, size = 16) =>
+  Array.from({ length: n }, (_, i) => cap({ bytes: Buffer.alloc(size, 0x61 + i) }));
+
+/** A sink whose single worker is already parked on a store op, so everything else queues. */
+const parkedSink = async (
+  store: GatedObjectStore,
+  over: Partial<RawStoreConfig>,
+): Promise<ObjectStoreCaptureSink> => {
+  const sink = new ObjectStoreCaptureSink(store, {
+    ...CONFIG,
+    imagePrefix: 'raw-img/',
+    putTimeoutMs: 60_000,
+    imagePutTimeoutMs: 60_000,
+    concurrency: 1,
+    ...over,
+  });
+  await sink.capture(cap({ bytes: Buffer.from('<html>worker</html>', 'utf8') }));
+  await until(() => store.parked.length === 1);
+  return sink;
+};
+
+describe('ObjectStoreCaptureSink — the asset lane cannot evict the page lanes', () => {
+  const release = async (store: GatedObjectStore, sink: ObjectStoreCaptureSink): Promise<void> => {
+    store.open = true;
+    store.release();
+    await sink.flush();
+  };
+
+  it('stops admitting assets at their share of the DEPTH while pages keep the rest', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new GatedObjectStore();
+    const sink = await parkedSink(store, { queueMax: 4, assetQueueShare: 0.5 });
+
+    const [a1, a2, a3] = assets(3);
+    await expect(sink.capture(a1)).resolves.toEqual({ admitted: true });
+    await expect(sink.capture(a2)).resolves.toEqual({ admitted: true });
+    // Half of four slots is the asset share, and it is now spent — even though the
+    // queue is only half full. That other half is not first-come-first-served.
+    await expect(sink.capture(a3)).resolves.toEqual({ admitted: false, reason: 'assetReserve' });
+
+    // ...and a page walks straight into the space the reservation just held.
+    const [p1, p2, p3] = pages(3);
+    await expect(sink.capture(p1)).resolves.toEqual({ admitted: true });
+    await expect(sink.capture(p2)).resolves.toEqual({ admitted: true });
+    // Only now, with the whole depth spent, does a PAGE drop — and it is counted as one.
+    await expect(sink.capture(p3)).resolves.toEqual({ admitted: false, reason: 'queueFull' });
+
+    expect(sink.stats()).toMatchObject({ queued: 4, assetRefusedReserve: 1, dropped: 1, droppedBytes: 0 });
+
+    await release(store, sink);
+    warn.mockRestore();
+  });
+
+  it('stops admitting assets at their share of the BYTE budget while pages keep the rest', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new GatedObjectStore();
+    // Depth is nowhere near binding: only the byte share can decide this.
+    const sink = await parkedSink(store, { queueMax: 100, queueMaxBytes: 1000, assetQueueShare: 0.5 });
+
+    const [a1, a2] = assets(2, 300);
+    // Nothing is waiting yet, so the first asset displaces nobody and goes in.
+    await expect(sink.capture(a1)).resolves.toEqual({ admitted: true });
+    // The SECOND is refused, not the third: the share counts what the queue WOULD hold
+    // (300 + 300 > 500), because one asset is a variable and possibly enormous number of
+    // bytes where one slot is only ever one slot. Measured on occupancy alone this asset
+    // was admitted instead and the budget then stood at 600 of 1000, reserve gone.
+    await expect(sink.capture(a2)).resolves.toEqual({ admitted: false, reason: 'assetReserve' });
+
+    await expect(sink.capture(pages(1, 300)[0])).resolves.toEqual({ admitted: true });
+
+    expect(sink.stats()).toMatchObject({
+      queued: 2, queuedBytes: 600, assetRefusedReserve: 1, dropped: 0, droppedBytes: 0,
+    });
+
+    await release(store, sink);
+    warn.mockRestore();
+  });
+
+  it('never lets assets walk the byte budget past their share and refuse a PAGE', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new GatedObjectStore();
+    // A legal configuration: RAW_STORE_IMAGE_MAX_BYTES can be set as high as 64 MiB,
+    // which is EXACTLY the quarter of the 256 MiB default budget the reservation is
+    // meant to hold. Scaled down here by 1000, one asset is a quarter of the budget.
+    const sink = await parkedSink(store, { queueMax: 100, queueMaxBytes: 256_000, maxImageBytes: 64_000 });
+
+    // The walk that emptied the reserve at that configuration: 63999 + 64000 + 64000 all
+    // landed while the queue was still short of the 192000 share line.
+    await expect(sink.capture(assets(1, 63_999)[0])).resolves.toEqual({ admitted: true });
+    const [a2, a3, a4] = assets(3, 64_000);
+    for (const a of [a2, a3]) await expect(sink.capture(a)).resolves.toEqual({ admitted: true });
+    expect(sink.stats().queuedBytes).toBe(191_999); // a single byte under the share line
+
+    // Admitting on occupancy alone, this asset was let in BECAUSE the queue had not
+    // yet crossed the line — and it took the queue to 255999 of 256000, spending the
+    // pages' whole reserve on one image. The share has to be tested against what the
+    // queue WOULD hold, not what it holds.
+    await expect(sink.capture(a4)).resolves.toEqual({ admitted: false, reason: 'assetReserve' });
+
+    // The page the reserve exists for. This is the assertion the old rule failed:
+    // it was refused queueBytesFull with the byte budget spent entirely on images.
+    await expect(sink.capture(pages(1, 100)[0])).resolves.toEqual({ admitted: true });
+
+    expect(sink.stats()).toMatchObject({ droppedBytes: 0, assetRefusedReserve: 1, queuedBytes: 192_099 });
+
+    await release(store, sink);
+    warn.mockRestore();
+  });
+
+  it('reserves 3 of 4 slots for pages by default — the share defaults to 0.75', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new GatedObjectStore();
+    const sink = await parkedSink(store, { queueMax: 4 }); // no assetQueueShare configured
+
+    const [a1, a2, a3, a4] = assets(4);
+    for (const a of [a1, a2, a3]) await expect(sink.capture(a)).resolves.toEqual({ admitted: true });
+    await expect(sink.capture(a4)).resolves.toEqual({ admitted: false, reason: 'assetReserve' });
+    // The last slot is the pages', and it is still there.
+    await expect(sink.capture(pages(1)[0])).resolves.toEqual({ admitted: true });
+
+    expect(sink.stats()).toMatchObject({ queued: 4, assetRefusedReserve: 1, dropped: 0 });
+
+    await release(store, sink);
+    warn.mockRestore();
+  });
+
+  it('a share of 1 turns the reservation OFF — both lanes share the whole budget as before', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new GatedObjectStore();
+    const sink = await parkedSink(store, { queueMax: 2, assetQueueShare: 1 });
+
+    const [a1, a2, a3] = assets(3);
+    await expect(sink.capture(a1)).resolves.toEqual({ admitted: true });
+    await expect(sink.capture(a2)).resolves.toEqual({ admitted: true });
+    // First-come-first-served again: the asset is refused by the DEPTH ceiling, with
+    // the ceiling's own reason and the ceiling's own counter.
+    await expect(sink.capture(a3)).resolves.toEqual({ admitted: false, reason: 'queueFull' });
+
+    expect(sink.stats()).toMatchObject({ dropped: 1, assetRefusedReserve: 0 });
+
+    await release(store, sink);
+    warn.mockRestore();
+  });
+
+  it('clamps a nonsense share: above 1 is no reservation, at-or-below 0 is the default', async () => {
+    const store = new GatedObjectStore();
+    const wide = await parkedSink(store, { queueMax: 2, assetQueueShare: 5 });
+    for (const a of assets(2)) await expect(wide.capture(a)).resolves.toEqual({ admitted: true });
+    expect(wide.stats()).toMatchObject({ queued: 2, assetRefusedReserve: 0 });
+
+    const store2 = new GatedObjectStore();
+    const negative = await parkedSink(store2, { queueMax: 4, assetQueueShare: -1 });
+    for (const a of assets(3)) await expect(negative.capture(a)).resolves.toEqual({ admitted: true });
+    // Back to the 0.75 default: the fourth asset is held, not the fourth slot's page.
+    await expect(negative.capture(assets(4)[3])).resolves.toEqual({ admitted: false, reason: 'assetReserve' });
+
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    await release(store, wide);
+    await release(store2, negative);
+    warn.mockRestore();
+  });
+
+  it('reports held-back assets on their own line, apart from page drops, once a minute', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    let now = 1_700_000_000_000;
+    const clock = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    const store = new GatedObjectStore();
+    const sink = await parkedSink(store, { queueMax: 2, assetQueueShare: 0.5 });
+
+    const lines = (needle: string) => warn.mock.calls.filter(a => String(a[0]).includes(needle));
+    const heldLines = () => lines('held back for the page reservation');
+    const dropLines = () => lines('capture queue full');
+
+    await sink.capture(assets(1)[0]); // fills the assets' single slot
+    for (const a of assets(3)) await sink.capture(a); // all three held back
+    // The first refusal is reported at once; the rest of the burst is carried to the
+    // next report rather than becoming a log flood, exactly as a drop burst is.
+    expect(heldLines()).toHaveLength(1);
+    expect(String(heldLines()[0][0])).toContain('refused 1 asset capture(s) since the last report');
+    expect(dropLines()).toHaveLength(0); // nothing was DROPPED — the queue is not full
+
+    // A page drop is a different event with its own line and its own window.
+    await sink.capture(pages(1)[0]); // takes the last slot
+    await sink.capture(pages(2)[1]); // and now the queue really is full
+    expect(dropLines()).toHaveLength(1);
+    expect(String(dropLines()[0][0])).toContain('dropped 1 capture(s) since the last report');
+    expect(heldLines()).toHaveLength(1);
+
+    now += 61_000;
+    await sink.capture(assets(1)[0]);
+    expect(heldLines()).toHaveLength(2);
+    // The two suppressed refusals plus this one — the burst is reported, not lost.
+    expect(String(heldLines()[1][0])).toContain('refused 3 asset capture(s) since the last report');
+    expect(sink.stats().assetRefusedReserve).toBe(4);
+
+    clock.mockRestore();
+    await release(store, sink);
+    warn.mockRestore();
+  });
+
+  it('holds nothing back on an EMPTY queue — one asset can always get in', async () => {
+    const store = new GatedObjectStore();
+    store.open = true;
+    const sink = new ObjectStoreCaptureSink(store, {
+      ...CONFIG, imagePrefix: 'raw-img/', concurrency: 1, queueMax: 1, assetQueueShare: 0.1,
+    });
+
+    // 0.1 of a 1-deep queue rounds to nothing, but the queue is empty: the capture
+    // goes straight to a worker and displaces no page.
+    await expect(sink.capture(asset(PNG))).resolves.toEqual({ admitted: true });
+    await sink.flush();
+    expect(sink.stats()).toMatchObject({ assetStored: 1, assetRefusedReserve: 0 });
+  });
+
+  it('admits an asset that alone exceeds the BYTE share when nothing is waiting behind it', async () => {
+    const store = new GatedObjectStore();
+    const parked = await parkedSink(store, { queueMax: 100, queueMaxBytes: 1000, assetQueueShare: 0.1 });
+
+    // 300 bytes against a 100-byte share. The queue is empty, so this asset displaces
+    // no page — and only one can ever be held that way, because the next asset is
+    // measured against the bytes this one is holding.
+    await expect(parked.capture(assets(1, 300)[0])).resolves.toEqual({ admitted: true });
+    await expect(parked.capture(assets(2, 300)[1])).resolves.toEqual({ admitted: false, reason: 'assetReserve' });
+    // The hard ceiling is still the hard ceiling: a page can have the rest, no more.
+    await expect(parked.capture(pages(1, 300)[0])).resolves.toEqual({ admitted: true });
+    expect(parked.stats()).toMatchObject({ queuedBytes: 600, assetRefusedReserve: 1, droppedBytes: 0 });
+
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    store.open = true;
+    store.release();
+    await parked.flush();
+    warn.mockRestore();
   });
 });
