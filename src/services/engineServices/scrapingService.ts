@@ -16,6 +16,7 @@
  */
 import type { Browser, Page, HTTPResponse } from 'puppeteer';
 import { BrowserPool, isCleanHeadfulMode } from '../genericScraper.js';
+import { clampNavTimeoutMs, resolveNavTimeoutMs } from '../browserNavTimeout.js';
 import { ScrapingService, ScrapePageOptions, ScrapePageResult, PageOptions, BrowserFetchOptions, WaitForReadiness } from '@figurecollecting/scraper-plugin-contract';
 import { CaptureSink, NoopCaptureSink, buildRawCapture } from '../captureSink.js';
 import { sanitizeForLog } from '../../utils/security.js';
@@ -38,7 +39,22 @@ import {
 
 const DEFAULT_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36';
-const NAV_TIMEOUT_MS = 20000;
+/**
+ * The lane's navigation budget, resolved ONCE at module load (`BROWSER_NAV_TIMEOUT_MS`, default
+ * 20 s, clamped) — one warning here rather than one per navigation. A store's own `navTimeoutMs`
+ * overrides it per fetch; see resolveNavTimeout.
+ */
+const NAV_TIMEOUT_MS = resolveNavTimeoutMs(process.env);
+
+/**
+ * The budget for ONE navigation: a store's declared `navTimeoutMs` clamped to the same range as the
+ * environment value, or the process budget when it declares none (or declares something unusable —
+ * a bad declaration must not be sharper than the default it replaced).
+ */
+function resolveNavTimeout(override: number | undefined): number {
+  if (override === undefined) return NAV_TIMEOUT_MS;
+  return Number.isFinite(override) && override > 0 ? clampNavTimeoutMs(override) : NAV_TIMEOUT_MS;
+}
 const MAX_WAIT_TIME_MS = 10000;
 const CHALLENGE_RECHECK_DELAY_MS = 1500;
 
@@ -57,6 +73,8 @@ const MAX_WAIT_FOR_TIMEOUT_MS = 60000;
 export interface EngineScrapePageOptions extends ScrapePageOptions {
   proxyServer?: string;
   waitFor?: WaitForReadiness;
+  /** Per-store navigation budget (ms) — `SearchFetch.navTimeoutMs`, clamped to [5000, 120000]. */
+  navTimeoutMs?: number;
   challengeGated?: boolean;
   primeUrl?: string;
 }
@@ -64,6 +82,8 @@ export interface EngineScrapePageOptions extends ScrapePageOptions {
 export interface EngineBrowserFetchOptions extends BrowserFetchOptions {
   proxyServer?: string;
   waitFor?: WaitForReadiness;
+  /** Per-store navigation budget (ms) — `SearchFetch.navTimeoutMs`, clamped to [5000, 120000]. */
+  navTimeoutMs?: number;
   challengeGated?: boolean;
   primeUrl?: string;
 }
@@ -76,6 +96,8 @@ export interface EnginePageOptions extends PageOptions {
   challengeGated?: boolean;
   /** Session prime (`SearchFetch.sessionPrime`): navigate here first, once per gated browser. */
   primeUrl?: string;
+  /** Per-store navigation budget (ms) — applies to the PRIME navigation made inside `withPage`. */
+  navTimeoutMs?: number;
 }
 
 /** The contract ScrapingService, widened to accept the engine's egress/readiness wiring. */
@@ -271,7 +293,7 @@ export async function browserFetchBody(
 
   const documents = trackFinalDocumentResponse(page);
   try {
-    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
+    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: resolveNavTimeout(options.navTimeoutMs) });
     // CHALLENGE: `domcontentloaded` fires on the Cloudflare interstitial too. Wait (bounded) for the
     // clean-headful browser to clear it, so the body below is the store's document and not "Just a
     // moment" — and so the host is marked gated, moving its later fetches onto the gated browser.
@@ -392,7 +414,7 @@ async function navigateAndCapture(
 
   let response;
   try {
-    response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
+    response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: resolveNavTimeout(options.navTimeoutMs) });
 
     // CHALLENGE: wait out a Cloudflare interstitial before either lane is read (see browserChallenge).
     await awaitChallengeClearance(challengeAwarePage(page), response, url);
@@ -517,7 +539,7 @@ export function createScrapingService(
       // SESSION PRIME on a cold profile: anitoys' search results 404 without a same-session homepage
       // visit, so the origin root is navigated once per (browser instance, host), before the target.
       if (options.primeUrl && !entry.primedHosts.has(host)) {
-        const primed = await page.goto(options.primeUrl, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
+        const primed = await page.goto(options.primeUrl, { waitUntil: 'domcontentloaded', timeout: resolveNavTimeout(options.navTimeoutMs) });
         // The PRIME is the navigation that meets the challenge — `domcontentloaded` fires on the
         // interstitial, and navigating to the target without waiting CANCELS the challenge script:
         // the homepage never loads and the cookie the prime exists for is never set.
@@ -587,7 +609,7 @@ export function createScrapingService(
       if (options.primeUrl) {
         // Same rule as the gated prime above: wait the interstitial out, or the target navigation
         // cancels it and the priming visit never happened.
-        const primed = await page.goto(options.primeUrl, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
+        const primed = await page.goto(options.primeUrl, { waitUntil: 'domcontentloaded', timeout: resolveNavTimeout(options.navTimeoutMs) });
         await awaitChallengeClearance(challengeAwarePage(page), primed, options.primeUrl);
       }
       return await fn(page);
@@ -618,12 +640,15 @@ export function createScrapingService(
   /** The per-request page options every entry point derives from the caller's fetch options. */
   const laneOptions = (
     url: string,
-    fetchOptions: { proxyServer?: string; challengeGated?: boolean; primeUrl?: string } | undefined,
+    fetchOptions: { proxyServer?: string; challengeGated?: boolean; primeUrl?: string; navTimeoutMs?: number } | undefined,
   ): Omit<EnginePageOptions, 'stealth'> => ({
     targetUrl: url,
     ...(fetchOptions?.proxyServer ? { proxyServer: fetchOptions.proxyServer } : {}),
     ...(fetchOptions?.challengeGated ? { challengeGated: true } : {}),
     ...(fetchOptions?.primeUrl ? { primeUrl: fetchOptions.primeUrl } : {}),
+    // The PRIME navigation happens inside withPage, so the store's budget has to travel with the
+    // page options too — not only with the fetch options the target navigation reads.
+    ...(fetchOptions?.navTimeoutMs !== undefined ? { navTimeoutMs: fetchOptions.navTimeoutMs } : {}),
   });
 
   return {

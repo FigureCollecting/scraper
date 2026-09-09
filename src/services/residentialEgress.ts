@@ -237,6 +237,8 @@ export interface BrowserLaneEgressOptions {
   challengeGated?: boolean;
   /** Session prime (`sessionPrime`) resolved to the URL a FRESH browser context visits first. */
   primeUrl?: string;
+  /** Per-store navigation budget (`navTimeoutMs`) for this store's `page.goto` calls. */
+  navTimeoutMs?: number;
 }
 
 /**
@@ -267,6 +269,9 @@ export function resolveBrowserLaneOptions(
     ...(searchFetch?.waitFor ? { waitFor: searchFetch.waitFor } : {}),
     ...(challengeGated ? { challengeGated: true } : {}),
     ...(prime ? { primeUrl: prime.url } : {}),
+    // Carried for EVERY store that declares one, gated or not: the navigation budget is a property
+    // of how slow the store is, not of whether it sits behind a challenge.
+    ...(searchFetch?.navTimeoutMs !== undefined ? { navTimeoutMs: searchFetch.navTimeoutMs } : {}),
   };
   return Object.keys(options).length > 0 ? options : undefined;
 }

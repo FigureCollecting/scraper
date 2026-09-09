@@ -4,6 +4,23 @@ All notable changes to `@figurecollecting/scraper-plugin-contract` will be docum
 file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this
 package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-09-09
+
+Additive, backward-compatible: a store that declares nothing behaves exactly as before, and every
+existing ruleset compiles unchanged. This release carries ONE addition — a per-store browser
+NAVIGATION budget.
+
+### Added
+- `SearchFetch.navTimeoutMs?: number` — the ceiling (ms) on each `page.goto` the browser lane makes
+  for this store, the session prime's navigation included. Undeclared ⇒ the engine's own budget
+  (`BROWSER_NAV_TIMEOUT_MS`, default 20000); any declared value is clamped to `[5000, 120000]`.
+  It exists because a navigation on this lane is not a page load. A Cloudflare-fronted store reached
+  through a relayed residential exit spends most of its budget on the CHALLENGE rather than on
+  bytes, and the challenge's cost is a property of the STORE and its exit, not of the pod: production
+  2026-09-09 booked 65 `Navigation timeout of 20000 ms exceeded` against anitoys and sugotoys while
+  the path itself measured 1.4 MB/s with sub-second TTFB. Declaring it per store is what keeps one
+  slow store from forcing every other store's budget up.
+
 ## [0.10.0] - 2026-09-09
 
 Additive, backward-compatible: a ruleset that declares nothing behaves exactly as before, and every

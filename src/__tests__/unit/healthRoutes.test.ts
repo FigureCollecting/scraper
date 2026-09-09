@@ -29,7 +29,7 @@ const build = (over: Partial<HealthDeps> = {}) => {
     listChallengeCooldowns: () => [],
     listCfCookies: () => [],
     getResidentialEgress: () => ({ configured: false }),
-    getBrowserLane: () => ({ launchMode: 'headless', residentialTimezone: null, directTimezone: null, processTimezone: null, gatedBrowsers: [] }),
+    getBrowserLane: () => ({ launchMode: 'headless', residentialTimezone: null, directTimezone: null, processTimezone: null, navigationTimeoutMs: 20000, gatedBrowsers: [] }),
     getRawStore: () => ({ configured: false }),
     getFailureLedger: () => ({ enabled: false, reported: 0, failed: 0, suppressed: 0 }),
     getImageCapture: () => NO_IMAGE_CAPTURE,
@@ -244,6 +244,7 @@ describe('createHealthRoutes — browserLane', () => {
         residentialTimezone: null,
         directTimezone: null,
         processTimezone: 'America/Chicago',
+        navigationTimeoutMs: 20000,
         gatedBrowsers: [
           { egress: 'residential', launchedAt: '2026-09-07T12:00:00.000Z', pagesOpen: 1, primedHosts: 2 },
           { egress: 'direct', launchedAt: '2026-09-07T12:05:00.000Z', pagesOpen: 0, primedHosts: 0 },
@@ -259,6 +260,7 @@ describe('createHealthRoutes — browserLane', () => {
       residentialTimezone: null,
       directTimezone: null,
       processTimezone: 'America/Chicago',
+      navigationTimeoutMs: 20000,
       gatedBrowsers: [
         { egress: 'residential', launchedAt: '2026-09-07T12:00:00.000Z', pagesOpen: 1, primedHosts: 2 },
         { egress: 'direct', launchedAt: '2026-09-07T12:05:00.000Z', pagesOpen: 0, primedHosts: 0 },
@@ -274,6 +276,7 @@ describe('createHealthRoutes — browserLane', () => {
       residentialTimezone: null,
       directTimezone: null,
       processTimezone: null,
+      navigationTimeoutMs: 20000,
       gatedBrowsers: [],
     });
   });
@@ -286,6 +289,7 @@ describe('createHealthRoutes — browserLane', () => {
         residentialTimezone: 'America/Chicago',
         directTimezone: null,
         processTimezone: 'America/Chicago',
+        navigationTimeoutMs: 20000,
         gatedBrowsers: [{ egress: 'residential', launchedAt: '2026-09-07T12:00:00.000Z', pagesOpen: 0, primedHosts: 1 }],
       }),
     });
@@ -314,6 +318,7 @@ describe('browserLaneView', () => {
       residentialTimezone: 'America/Chicago',
       directTimezone: 'America/New_York',
       processTimezone: 'America/Chicago',
+      navigationTimeoutMs: 20000,
       gatedBrowsers: [],
     });
   });
@@ -329,6 +334,7 @@ describe('browserLaneView', () => {
       residentialTimezone: null,
       directTimezone: null,
       processTimezone: null,
+      navigationTimeoutMs: 20000,
       gatedBrowsers: [],
     });
   });

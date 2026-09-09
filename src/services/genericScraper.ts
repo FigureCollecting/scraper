@@ -39,6 +39,7 @@ import puppeteer, { Browser, BrowserContext, Page } from 'puppeteer';
 import zlib from 'zlib';
 import crypto from 'crypto';
 import { sanitizeForLog, sanitizeObjectForLog, capWaitTime, truncateString, MAX_STRING_LENGTH } from '../utils/security.js';
+import { resolveNavTimeoutMs } from './browserNavTimeout.js';
 import { applyEgressTimezone, selectEgressTimezone } from './browserTimezone.js';
 import {
   GATED_BROWSER_MAX_AGE_MS,
@@ -381,6 +382,11 @@ export interface BrowserLaneView {
    * is the silent failure: gated stores simply never clear and nothing errors.
    */
   processTimezone: string | null;
+  /**
+   * The effective `page.goto` budget (ms) for this process — `BROWSER_NAV_TIMEOUT_MS` clamped, or
+   * the 20 s default. A store may still declare its own `navTimeoutMs`, which overrides this one.
+   */
+  navigationTimeoutMs: number;
   /** The live per-egress challenge browsers, each holding its own clearances. */
   gatedBrowsers: GatedBrowserView[];
 }
@@ -397,6 +403,9 @@ export function browserLaneView(env: NodeJS.ProcessEnv = process.env): BrowserLa
     residentialTimezone: selectEgressTimezone(true, env) ?? null,
     directTimezone: selectEgressTimezone(false, env) ?? null,
     processTimezone: env.TZ ?? null,
+    // Silent sink: the scraping lane's module-load resolution already warned once for an unusable
+    // value, and this view is rebuilt on every /health/detailed hit.
+    navigationTimeoutMs: resolveNavTimeoutMs(env, () => {}),
     gatedBrowsers: BrowserPool.gatedBrowsers(),
   };
 }
