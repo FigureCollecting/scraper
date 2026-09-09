@@ -263,6 +263,79 @@ non-positive-integer `from`, non-positive-integer `count`) · `422 { error: "uns
 build item urls from) · `503 { error: "cooldown", siteId, host, remainingMs }` with `Retry-After` while the item host cools
 from a Cloudflare challenge · `502 { error: "catalog failed", siteId, reason }`.
 
+#### GET /catalog?seed= — the declared seed-list axis
+
+A **seed list** is one page a store publishes anyway — a shelf, a "what's new" panel, a featured
+rail — that its plugin DECLARES in `retrieval.seedLists` (plugin-contract 0.9.0):
+`[{ id, url, cadence: 'weekly' | 'daily', note? }]`. This axis fetches ONE of them by name and hands
+it to the ruleset's `extractSeedList(body, listId)` parser.
+
+It is not a cheaper way into a store and not a second enumeration axis. The lane is EXACTLY the
+listing axis's — the store's own declared search transport, its egress and session-prime
+declarations, the same per-host challenge cooldown, the same challenge detection and the same
+stored-cookie stale/fresh signals. What differs is only the size of the target: `byListing` walks a
+whole catalogue page after page, while the set of seed lists is finite, written down in advance, and
+therefore has a cost that is knowable before it runs. That is what makes the axis safe to point at a
+store which has to be treated gently.
+
+**Query:** `store=<siteId>` (required), `seed=<listId>` (required, non-blank — a seed list is
+addressed by NAME; there is no default list). `seed`, `seeds`, `page` and `range` are mutually
+exclusive.
+
+**Response (200):**
+```json
+{
+  "siteId": "examplestore",
+  "listId": "new-arrivals",
+  "url": "https://example.test/new",
+  "items": [{ "itemId": "11", "collectUrl": "https://example.test/item/11" }],
+  "collectUrls": ["https://example.test/item/11"],
+  "hasMore": false,
+  "count": 1
+}
+```
+`hasMore` is ALWAYS `false` and there is never a `nextPage`: a seed list is one whole page by
+construction, so there is nothing to walk. A parser that returns `hasMore: true` is ignored rather
+than believed — the engine has no second page it could fetch. `collectUrl` follows the same rule as
+the listing axis: the store's `byId` endpoint where declared, else the item's page link absolutized
+against the declared list url.
+
+**Errors:** `400` blank `seed`, or `seed` combined with `page`/`range`/`seeds` ·
+`422 { error: "unsupported", siteId, reason }` (unknown store, the store declares no seed lists, no
+list with that id, a malformed declared url, or no `extractSeedList` parser) ·
+`503 { error: "cooldown", siteId, host, remainingMs }` with `Retry-After` ·
+`502 { error: "catalog failed", siteId, reason }` (challenge page — which also opens the host
+cooldown — fetch error, timeout, or parser throw).
+
+#### GET /catalog?seeds=1 — seed-list discovery
+
+Which lists a store declares, in DECLARED order. Pure: it reads the store's profile and fetches
+nothing upstream. A poller has to learn WHICH lists exist before it can ask for one, and the
+declaration is the only place that is recorded — an operator env var naming them would be a second
+copy, free to diverge from the plugin.
+
+**Query:** `store=<siteId>` (required), `seeds=1` (required, exactly `1`; exclusive with `seed`,
+`page` and `range`).
+
+**Response (200):**
+```json
+{
+  "siteId": "examplestore",
+  "seedLists": [
+    { "id": "new-arrivals", "cadence": "daily", "note": "front shelf" },
+    { "id": "staff-picks", "cadence": "weekly" }
+  ],
+  "count": 2
+}
+```
+Deliberately WITHOUT the urls: discovery NAMES the lists, the seed axis is what fetches one.
+Malformed entries in an untrusted declaration (no id, no url, a cadence outside the contract's two,
+a repeated id) are dropped rather than reported as lists that would never yield anything.
+
+**Errors:** `400` `seeds` other than `1`, or combined with another axis ·
+`422 { error: "unsupported", siteId, reason }` (unknown store, or it declares no seed lists) ·
+`502 { error: "catalog failed", siteId, reason }`.
+
 ### Search query encoding (`retrieval.bySearch.queryEncoding`)
 `{q}` is url-encoded into the store's `bySearch.urlTemplate` by `encodeSearchQuery`
 (`src/driver/retrievalPlanner.ts`), which every search caller goes through (`/lookup` fan-out,
@@ -498,6 +571,8 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
 - **id-range backfill** — for the stores named in `CRAWLER_RANGE_STORES` only: walk the store's
   SEQUENTIAL id space downward through `GET /catalog?store=&range=1&from=&count=`, up to
   `CRAWLER_RANGE_IDS_PER_RUN` ids per run. See *Id-range backfill* below.
+- **seed** (`CRAWLER_MODE=seed`) — an EXCLUSIVE pass that runs the seed phase and nothing else. See
+  *Seed pass* below.
 - `both` (default) runs recent for every store, THEN backfill, THEN the id-range walk. Stores run in parallel under one
   global request gate (concurrency, total budget over catalog GETs + ingest POSTs, spacing);
   pages within a store are sequential; the ledger is saved after every page.
@@ -514,8 +589,9 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
   a discovery-only dry run for every unnamed store (pages fetched, nothing POSTed).
 - The run ends with a `[CRAWLER] pass complete` JSON summary (per store: pagesFetched,
   discovered, known, enqueued, deduplicated, reobserved, errors, skipped, backfillCursor,
-  exhaustCandidate, exhausted, capApplied, rangeWalked, rangeCursor, rangeFrontier, rangeSkipped;
-  plus totals, requestsIssued, budgetExhausted, enqueueCapOverrides, totalRangeWalked, durationMs).
+  exhaustCandidate, exhausted, capApplied, rangeWalked, rangeCursor, rangeFrontier, rangeSkipped,
+  seedLists, seedStopped; plus totals, requestsIssued, budgetExhausted, enqueueCapOverrides,
+  totalRangeWalked, durationMs). A `seed` pass logs `[CRAWLER] seed pass complete` instead.
 - A `CRAWLER_STORE_ENQUEUE_CAPS` entry or a `CRAWLER_RANGE_STORES` entry naming a store that is not
   in `CRAWLER_STORES` does nothing, and is WARNed about by siteId at the start of the run — a range
   store must be named in BOTH.
@@ -523,7 +599,7 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
 | Variable | Default | Meaning |
 |---|---|---|
 | `SCRAPER_SERVICE_URL` | `http://localhost:3050` | The scraper's HTTP surface (the only thing the crawler talks to) |
-| `CRAWLER_MODE` | `both` | `recent`, `backfill`, or `both` (recent then backfill) |
+| `CRAWLER_MODE` | `both` | `recent`, `backfill`, `both` (recent then backfill), or `seed` (the declared seed lists ONLY) |
 | `CRAWLER_STORES` | `orzgk` | csv of siteIds; explicitly empty = no work (kill switch) |
 | `CRAWLER_LEDGER_DIR` | `/var/lib/ingest-crawler` | Directory of per-store ledger files |
 | `CRAWLER_RECENT_MAX_PAGES` | `3` | Max listing pages walked from page 1 per store per run |
@@ -638,6 +714,37 @@ because the newest ids always outrank the deep id space for the run's budget.
   hourly CronJob that is at most 4,800 ids/day, so an id space the size of mfc's ~3.6M takes ~756
   days to walk once at the ceiling — and ~8 years at the `50`/run default. Size the knobs (and the
   expectations) accordingly: this axis is a slow continuous backfill, not a bulk import.
+
+**Seed pass** (`CRAWLER_MODE=seed`) — a slow, bounded poll of the pages a store DECLARES, and the
+only phase that runs in this mode.
+
+- **What it does** — for each store in `CRAWLER_STORES`: one `GET /catalog?store=&seeds=1` to learn
+  which seed lists the store declares, then one `GET /catalog?store=&seed=<listId>` per declared
+  list, in DECLARED order, enqueuing the ids the ledger has never seen. No cursor, no paging, no id
+  space: a seed list is one whole page by construction.
+- **Why it is worth a pass of its own** — the cost is knowable before it runs. A store's declared
+  set is finite, so one seed pass is `1 + <declared lists>` catalog GETs plus at most the store's
+  enqueue cap in ingest POSTs. That is what makes it defensible against a store whose catalogue must
+  not be walked, and it is exactly the property that would be lost by folding the phase into an
+  unbounded walk — which is why `seed` is EXCLUSIVE. A `seed` pass runs no recent, backfill or
+  id-range phase, and those modes run no seed phase.
+- **Same machinery** — the same durable ledger for dedup (a shelf shows the same items for weeks;
+  the ledger is what stops the poll from re-POSTing them), the same per-store enqueue cap, the same
+  global `CRAWLER_MAX_REQUESTS`, and the same request gate for `CRAWLER_REQUEST_SPACING_MS` and
+  concurrency. The engine applies the store's own declared rate floor on its side of each fetch, as
+  it does for the listing axis.
+- **Never re-observes** — a known id is skipped however old its ledger entry is, whatever
+  `CRAWLER_REOBSERVE_AFTER_MS` says. Re-observation belongs to the recent phase; here it would turn a
+  bounded poll into a periodic re-collection of a whole shelf.
+- **One list once** — a list id repeated in a declaration is polled once. The ledger is saved after
+  EVERY list, so a pass killed between two lists never re-POSTs what the first one enqueued.
+- **Stop on the first refusal** — a challenge, a cooldown or any 4xx on a list STOPS that store for
+  the run and the remaining lists are left alone; `seedStopped` on the store summary says why
+  (`cooldown`, `unsupported`, `failed`, `budget`). Pushing on to the next list after a challenge is
+  precisely what burns the egress IP's reputation for every other store sharing it.
+- **Reporting** — `seedLists` on the store summary carries `{ listId, discovered, known, enqueued }`
+  per list, in the order they were polled: the numbers an operator reads to decide whether a list
+  still earns its cadence. It is empty in every other mode.
 
 ## Testing
 
