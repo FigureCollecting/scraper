@@ -14,7 +14,11 @@
  *     `challengeCooldowns: [{host, remainingMs, reason}]` (the per-host CF cooldowns currently open),
  *     `rawStore: {configured, stats?}` (the raw-capture sink's counters — page + asset lanes),
  *     `failureLedger: {enabled, reported, failed, suppressed}` (the durable fetch-failure ledger's
- *     reporting counters — a ledger nobody is writing to is otherwise invisible)
+ *     reporting counters — a ledger nobody is writing to is otherwise invisible),
+ *     `sessionCanary: {site, configured, stale, staleSince?, staleReason?}` (the mfc scrape
+ *     session's entitlement flag — a session that lost its NSFW entitlement shows up ONLY as 404s
+ *     that look like missing items, so the operator needs it named; the canary item id is never
+ *     exposed)
  *     and `cfCookies: [{host, cookieNames, userAgentPinned, loadedAt, mintedAt?, expiresAt?, stale,
  *     staleSince?, staleReason?}]` (the stored-cookie jar's per-host view — cookie NAMES only, never a
  *     value; `stale` = the host still served a challenge with its stored cookies → re-mint).
@@ -27,6 +31,7 @@ import type { CfCookieHostView } from '../services/cookieJar.js';
 import type { BrowserLaneView } from '../services/genericScraper.js';
 import type { RawStoreView } from '../services/s3ObjectStore.js';
 import type { FetchFailureReportView } from '../services/failureReporter.js';
+import type { SessionCanaryView } from '../services/sessionCanary.js';
 
 export interface HealthDeps {
   /** The service version (package.json). */
@@ -64,6 +69,12 @@ export interface HealthDeps {
    * re-reported inside an open window. Pure counters — a silent ledger is otherwise invisible.
    */
   getFailureLedger: () => FetchFailureReportView;
+  /**
+   * The mfc session canary's flag (sessionCanaryView()): whether an entitlement canary is configured
+   * and whether the last conclusive round showed the session had lost its entitlement (→ re-mint the
+   * cookies). Flags and timestamps only — never the canary item id.
+   */
+  getSessionCanary: () => SessionCanaryView;
 }
 
 export function createHealthRoutes(deps: HealthDeps): Router {
@@ -94,6 +105,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         browserLane: deps.getBrowserLane(),
         rawStore: deps.getRawStore(),
         failureLedger: deps.getFailureLedger(),
+        sessionCanary: deps.getSessionCanary(),
         timestamp: new Date().toISOString(),
       });
     } catch (error) {
@@ -106,6 +118,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         browserLane: deps.getBrowserLane(),
         rawStore: deps.getRawStore(),
         failureLedger: deps.getFailureLedger(),
+        sessionCanary: deps.getSessionCanary(),
         error: error instanceof Error ? error.message : 'Unknown error',
       });
     }

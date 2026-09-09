@@ -230,3 +230,36 @@ describe('classifyFetchFailure — record-lane status failures', () => {
     expect(classifyFetchFailure({ error: statusError({ status: 404 }) }).reasonClass).toBe('gone_404');
   });
 });
+
+/**
+ * THE AMBIGUOUS 404 (owner rule, 2026-09-09). On myfigurecollection.net a 404 may be an unentitled
+ * NSFW item rather than a missing one, so the row must NOT be gone_404 — that class is what closes
+ * a target as removed. It is booked as http_403 instead: reviewable, re-mintable, never auto-closed.
+ */
+describe('classifyFetchFailure — denied-or-gone', () => {
+  it('books an ambiguous 404 as http_403 while still echoing the real status', () => {
+    expect(classifyFetchFailure({ httpStatus: 404, deniedOrGone: true })).toEqual({
+      reasonClass: 'http_403',
+      httpStatus: 404,
+    });
+  });
+
+  it('wins over the status reading that would have closed the target as gone', () => {
+    const error = new RecordFetchStatusError({
+      url: 'https://myfigurecollection.net/item/999999999',
+      transport: 'impersonate',
+      status: 404,
+      deniedOrGone: true,
+    });
+    expect(classifyFetchFailure({ error, errorType: 'auth_required', httpStatus: 404, deniedOrGone: true }).reasonClass)
+      .toBe('http_403');
+  });
+
+  it('leaves an UNAMBIGUOUS 404 as gone_404', () => {
+    expect(classifyFetchFailure({ httpStatus: 404, deniedOrGone: false }).reasonClass).toBe('gone_404');
+  });
+
+  it('never invents the class for a non-404 (the flag only ever rides a 404)', () => {
+    expect(classifyFetchFailure({ httpStatus: 503 }).reasonClass).toBe('http_5xx');
+  });
+});

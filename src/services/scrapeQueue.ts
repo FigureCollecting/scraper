@@ -357,6 +357,10 @@ function classifyError(error: Error | string): ErrorType {
   // they take 'auth_required' (also never retried). 429 rides the existing rate-limit backoff, a 5xx
   // is a transient upstream ('network'), and anything else keeps the bounded generic retry.
   if (error instanceof RecordFetchStatusError) {
+    // AMBIGUOUS 404 first: on a store where a 404 may be an entitlement denial (mfc's NSFW items),
+    // 'not_found' would close a live item as removed. It is an access failure — never retried,
+    // because no number of retries re-mints a session cookie — and the ledger books it http_403.
+    if (error.deniedOrGone) return 'auth_required';
     if (error.redirectedHome) return 'not_found';
     const status = error.status ?? 0;
     if (status === 404 || status === 410) return 'not_found';
@@ -1896,6 +1900,7 @@ export class ScrapeQueue {
         errorType,
         ...(statusFailure?.status !== undefined ? { httpStatus: statusFailure.status } : {}),
         ...(statusFailure?.redirectedHome ? { redirectedHome: true } : {}),
+        ...(statusFailure?.deniedOrGone ? { deniedOrGone: true } : {}),
       });
       // A cooldown fast-fail KNOWS when the host is next fetchable; the spine takes the later of this
       // hint and its own backoff (a hint may delay a retry, never pull one forward).

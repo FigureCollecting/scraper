@@ -97,3 +97,52 @@ describe('isRedirectHome', () => {
     expect(isRedirectHome(ITEM, 'not a url')).toBe(false);
   });
 });
+
+/**
+ * THE AMBIGUOUS-404 TABLE (owner rule, 2026-09-09). On myfigurecollection.net a 404 is not proof
+ * that anything is gone: NSFW and NSFW+ items answer 404 to a session that is not entitled (age
+ * gate, or stale scrape-account cookies), and the site gives no way to tell that apart from a
+ * genuinely missing item. A store in the table therefore produces a DENIED-OR-GONE failure, which
+ * the ledger books as http_403 (review, re-mintable) instead of gone_404 (auto-closed as removed).
+ */
+describe('evaluateRecordFetch — stores where a 404 is ambiguous', () => {
+  const MFC_ITEM = 'https://myfigurecollection.net/item/999999999';
+
+  it('marks an mfc 404 as denied-or-gone and says why in the message', () => {
+    const failure = evaluateRecordFetch(MFC_ITEM, { status: 404, finalUrl: MFC_ITEM }, 'impersonate')!;
+
+    expect(failure.deniedOrGone).toBe(true);
+    expect(failure.status).toBe(404);
+    expect(failure.message).toContain('denied-or-gone');
+    expect(failure.message).toContain('session may need re-minting');
+  });
+
+  it.each([
+    'https://www.myfigurecollection.net/item/1',
+    'https://myfigurecollection.net/item/1',
+  ])('applies to the store\'s own hosts (%s)', (url) => {
+    expect(evaluateRecordFetch(url, { status: 404 }, 'http')!.deniedOrGone).toBe(true);
+  });
+
+  it('does NOT apply to a look-alike host outside the store', () => {
+    expect(
+      evaluateRecordFetch('https://myfigurecollection.net.evil.test/item/1', { status: 404 }, 'http')!.deniedOrGone,
+    ).toBe(false);
+  });
+
+  it('leaves every other store\'s 404 unambiguous', () => {
+    expect(evaluateRecordFetch(ITEM, { status: 404 }, 'http')!.deniedOrGone).toBe(false);
+  });
+
+  it.each([410, 403, 503])('does not touch an mfc %s — only 404 is the ambiguous one', (status) => {
+    const failure = evaluateRecordFetch(MFC_ITEM, { status }, 'impersonate')!;
+    expect(failure.deniedOrGone).toBe(false);
+    expect(failure.message).not.toContain('denied-or-gone');
+  });
+
+  it('leaves an mfc bounce to the home page as a plain redirect (nothing to do with entitlement)', () => {
+    const failure = evaluateRecordFetch(MFC_ITEM, { status: 200, finalUrl: 'https://myfigurecollection.net/' }, 'browser')!;
+    expect(failure.redirectedHome).toBe(true);
+    expect(failure.deniedOrGone).toBe(false);
+  });
+});

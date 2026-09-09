@@ -20,6 +20,7 @@ const build = (over: Partial<HealthDeps> = {}) => {
     getBrowserLane: () => ({ launchMode: 'headless', residentialTimezone: null, directTimezone: null, processTimezone: null, gatedBrowsers: [] }),
     getRawStore: () => ({ configured: false }),
     getFailureLedger: () => ({ enabled: false, reported: 0, failed: 0, suppressed: 0 }),
+    getSessionCanary: () => ({ site: 'mfc', configured: false, stale: false }),
     ...over,
   }));
   return app;
@@ -388,5 +389,47 @@ describe('createHealthRoutes — failureLedger', () => {
 
     expect(res.status).toBe(500);
     expect(res.body.failureLedger).toEqual({ enabled: true, reported: 3, failed: 0, suppressed: 0 });
+  });
+
+  /**
+   * The mfc session canary (owner rule, 2026-09-09). A stale scrape session shows up ONLY as 404s
+   * that look like missing items, so the flag has to be visible somewhere an operator or the cookie
+   * runbook can read it. It carries flags and timestamps, never the canary item id.
+   */
+  it('GET /health/detailed carries sessionCanary {site, configured, stale}', async () => {
+    const app = build({ getSessionCanary: () => ({ site: 'mfc', configured: true, stale: false }) });
+    const res = await request(app).get('/health/detailed');
+
+    expect(res.status).toBe(200);
+    expect(res.body.sessionCanary).toEqual({ site: 'mfc', configured: true, stale: false });
+  });
+
+  it('surfaces a STALE session with its reason and timestamp', async () => {
+    const app = build({
+      getSessionCanary: () => ({
+        site: 'mfc',
+        configured: true,
+        stale: true,
+        staleSince: '2026-09-09T04:34:00.000Z',
+        staleReason: 'the NSFW canary item answered 404 while a SFW control was served',
+      }),
+    });
+    const res = await request(app).get('/health/detailed');
+
+    expect(res.body.sessionCanary.stale).toBe(true);
+    expect(res.body.sessionCanary.staleSince).toBe('2026-09-09T04:34:00.000Z');
+    expect(res.body.sessionCanary.staleReason).toContain('404');
+  });
+
+  it('keeps the session canary visible on the DEGRADED response (a stale session outlives a sick pool)', async () => {
+    const app = build({
+      getBrowserPoolHealth: async () => { throw new Error('pool down'); },
+      getSessionCanary: () => ({ site: 'mfc', configured: true, stale: true }),
+    });
+    const res = await request(app).get('/health/detailed');
+
+    expect(res.status).toBe(500);
+    expect(res.body.status).toBe('degraded');
+    expect(res.body.sessionCanary).toEqual({ site: 'mfc', configured: true, stale: true });
   });
 });

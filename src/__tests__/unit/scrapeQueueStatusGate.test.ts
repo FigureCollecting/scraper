@@ -68,13 +68,13 @@ function makeExtract(): jest.Mock {
   }));
 }
 
-function makeRegistry(ruleset: ExtractionRuleset, transport: 'http' | 'impersonate' = 'http'): ExtractionRegistryImpl {
+function makeRegistry(ruleset: ExtractionRuleset, transport: 'http' | 'impersonate' = 'http', domain = HOST): ExtractionRegistryImpl {
   const registry = createExtractionRegistry();
   const caps: StoreCapabilities = {
     siteId: ruleset.siteId,
     name: 'Status Store',
-    domains: [HOST],
-    rateLimit: { domain: HOST, baseDelayMs: 1000, minDelayMs: 500, maxDelayMs: 5000, backoffMultiplier: 1.5, recoveryDivisor: 1.5, successThreshold: 3 },
+    domains: [domain],
+    rateLimit: { domain, baseDelayMs: 1000, minDelayMs: 500, maxDelayMs: 5000, backoffMultiplier: 1.5, recoveryDivisor: 1.5, successThreshold: 3 },
     requiresBrowser: false,
     allowedCookies: [],
     searchFetch: { transport },
@@ -131,9 +131,9 @@ describe('ScrapeQueue × record-fetch status gate', () => {
     }
   }
 
-  function buildQueue(http: jest.Mock, send: jest.Mock, transport: 'http' | 'impersonate' = 'http'): ScrapeQueue {
+  function buildQueue(http: jest.Mock, send: jest.Mock, transport: 'http' | 'impersonate' = 'http', domain = HOST): ScrapeQueue {
     const q = new ScrapeQueue(false);
-    q.setPluginRegistry(makeRegistry(makeRuleset(extract), transport));
+    q.setPluginRegistry(makeRegistry(makeRuleset(extract), transport, domain));
     q.setIngestEmitter({ send });
     q.setScrapingService(makeScrapingStub());
     q.setIngestTransports(transport === 'http' ? { http } : { impersonate: http });
@@ -143,11 +143,15 @@ describe('ScrapeQueue × record-fetch status gate', () => {
   }
 
   /** Run one item to its terminal outcome and hand back the http mock for call-count assertions. */
-  async function runItem(body: unknown, opts: { maxRetries?: number; send?: jest.Mock; transport?: 'http' | 'impersonate' } = {}) {
+  async function runItem(
+    body: unknown,
+    opts: { maxRetries?: number; send?: jest.Mock; transport?: 'http' | 'impersonate'; domain?: string; url?: string } = {},
+  ) {
     const http = jest.fn().mockResolvedValue(body);
     const send = opts.send ?? jest.fn().mockResolvedValue(HEALTHY_STATS);
-    queue = buildQueue(http, send, opts.transport ?? 'http');
-    const result = queue.enqueue(ITEM_URL, { url: ITEM_URL, maxRetries: opts.maxRetries ?? 2 });
+    queue = buildQueue(http, send, opts.transport ?? 'http', opts.domain ?? HOST);
+    const url = opts.url ?? ITEM_URL;
+    const result = queue.enqueue(url, { url, maxRetries: opts.maxRetries ?? 2 });
     result.promise.catch(() => {});
     await advanceUntil(() => queue.getStats().failed === 1 || queue.getStats().completed === 1);
     return { http, send, result };
@@ -284,6 +288,49 @@ describe('ScrapeQueue × record-fetch status gate', () => {
       expect(extract).not.toHaveBeenCalled();
       expect(send).not.toHaveBeenCalled();
       expect(reports[0]).toMatchObject({ reasonClass: 'redirect_home', transport: 'impersonate' });
+    });
+  });
+
+  /**
+   * THE AMBIGUOUS 404 (owner rule, 2026-09-09). On myfigurecollection.net a 404 is served both for
+   * an item that never existed AND for an NSFW / NSFW+ item the session is not entitled to see —
+   * an age gate, or scrape-account cookies gone stale. Booking that as gone_404 would auto-close a
+   * live item as removed and hide a session that needs re-minting. The row is http_403 instead:
+   * reviewable, carrying the hint, and never retried (a retry cannot re-mint a cookie).
+   */
+  describe('myfigurecollection.net — a 404 that may be a denial', () => {
+    const MFC_HOST = 'myfigurecollection.net';
+    const MFC_ITEM = `https://${MFC_HOST}/item/999999999`;
+
+    it('books an mfc 404 as http_403 with the re-mint hint, never gone_404', async () => {
+      const { http, send } = await runItem(
+        { body: '<html>does not exist</html>', status: 404, finalUrl: MFC_ITEM },
+        { transport: 'impersonate', domain: MFC_HOST, url: MFC_ITEM },
+      );
+
+      expect(extract).not.toHaveBeenCalled();
+      expect(send).not.toHaveBeenCalled();
+      expect(http).toHaveBeenCalledTimes(1);          // never retried: a retry cannot re-mint a session
+      expect(reports).toHaveLength(1);
+      expect(reports[0].reasonClass).toBe('http_403');
+      expect(reports[0].reasonClass).not.toBe('gone_404');
+      expect(reports[0].httpStatus).toBe(404);        // the real status is still on the row
+      expect(reports[0].message).toContain('denied-or-gone');
+      expect(reports[0].message).toContain('session may need re-minting');
+    });
+
+    it('still books an mfc 410 as gone_410 — an explicit Gone is not ambiguous', async () => {
+      await runItem(
+        { body: 'gone', status: 410, finalUrl: MFC_ITEM },
+        { transport: 'impersonate', domain: MFC_HOST, url: MFC_ITEM },
+      );
+
+      expect(reports[0].reasonClass).toBe('gone_410');
+    });
+
+    it('keeps gone_404 for a store where a 404 IS unambiguous', async () => {
+      await runItem({ body: 'not found', status: 404, finalUrl: ITEM_URL });
+      expect(reports[0].reasonClass).toBe('gone_404');
     });
   });
 });

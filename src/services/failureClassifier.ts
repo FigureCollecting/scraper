@@ -13,11 +13,13 @@
  *   2. EXTRACTION. The record lane's own '[EXTRACT …]' family — ours to fix, never a store verdict.
  *   3. REDIRECT HOME. An item URL that bounced to a landing page is terminal-by-store even though
  *      it usually carries a 200.
- *   4. STATUS, when the transport surfaced one. Rare on the record lane today (the engine's http
- *      fetch is status-blind) — which is exactly why an absent status is honest, never fabricated.
- *   5. ErrorType — the queue's own classification, already load-bearing for retry/backoff.
- *   6. MESSAGE, for the untyped Errors the search fan-out and the crawler still throw.
- *   7. The challenge FLAG, else `other` — the operator's triage bucket.
+ *   4. DENIED-OR-GONE. A 404 from a store where 404 also means "not entitled" (mfc's NSFW items)
+ *      must never be read as gone — it outranks the status reading it would otherwise get.
+ *   5. STATUS, when the transport surfaced one. Every ingest lane surfaces it now; the search and
+ *      listing lanes still do not, which is why an absent status stays honest, never fabricated.
+ *   6. ErrorType — the queue's own classification, already load-bearing for retry/backoff.
+ *   7. MESSAGE, for the untyped Errors the search fan-out and the crawler still throw.
+ *   8. The challenge FLAG, else `other` — the operator's triage bucket.
  *
  * TERMINALITY is NOT modelled here, deliberately: it is a property of the CALL SITE, not of the
  * outcome. Every emit point sits at its producer's give-up seam (the queue's gave-up branch, the
@@ -73,6 +75,11 @@ export interface FetchOutcome {
   challenge?: boolean;
   /** The fetch ended on the store's home/landing page instead of the requested item. */
   redirectedHome?: boolean;
+  /**
+   * The status was a 404 from a store where a 404 does NOT prove the item is gone (an unentitled
+   * NSFW item on mfc answers exactly like a missing one). Set by the record gate's ambiguity table.
+   */
+  deniedOrGone?: boolean;
 }
 
 export interface FetchClassification {
@@ -124,7 +131,18 @@ function fromExtraction(error: unknown): FetchReasonClass | undefined {
   return messageOf(error).startsWith('[EXTRACT ') ? 'parse' : undefined;
 }
 
-/** Step 3 — an upstream status the transport actually surfaced. */
+/**
+ * Step 4 — the AMBIGUOUS 404. `gone_404` is the class that CLOSES a target as removed, so a 404 that
+ * might equally be an entitlement denial (mfc's NSFW / NSFW+ items answer 404 to an unentitled
+ * session, indistinguishably from a missing item) must not take it. It is booked as `http_403`: the
+ * class for a door that was closed to us — reviewable, re-mintable, never auto-closed. The real
+ * status is still echoed on the row, so the operator sees the 404 that was actually served.
+ */
+function fromDeniedOrGone(deniedOrGone: boolean | undefined): FetchReasonClass | undefined {
+  return deniedOrGone === true ? 'http_403' : undefined;
+}
+
+/** Step 5 — an upstream status the transport actually surfaced. */
 function fromStatus(status: number | undefined): FetchReasonClass | undefined {
   if (status === undefined) return undefined;
   if (status === 404) return 'gone_404';
@@ -135,7 +153,7 @@ function fromStatus(status: number | undefined): FetchReasonClass | undefined {
   return undefined;
 }
 
-/** Step 4 — the queue's ErrorType, the classification the retry/backoff logic already trusts. */
+/** Step 6 — the queue's ErrorType, the classification the retry/backoff logic already trusts. */
 function fromErrorType(
   errorType: ErrorType | undefined,
   message: string,
@@ -170,7 +188,7 @@ function fromErrorType(
 }
 
 /**
- * Step 5 — the untyped Errors. Ordered so a specific marker can never be swallowed by a broader
+ * Step 7 — the untyped Errors. Ordered so a specific marker can never be swallowed by a broader
  * one: the config shortfall's own token first, then the timeout spelling withTimeout() emits, then
  * the status-in-text spellings, then the transport faults.
  */
@@ -199,6 +217,7 @@ export function classifyFetchFailure(outcome: FetchOutcome): FetchClassification
     fromClass(outcome.error) ??
     fromExtraction(outcome.error) ??
     (outcome.redirectedHome === true ? 'redirect_home' : undefined) ??
+    fromDeniedOrGone(outcome.deniedOrGone) ??
     fromStatus(httpStatus) ??
     fromErrorType(outcome.errorType, message, outcome.challenge === true) ??
     fromMessage(message) ??
