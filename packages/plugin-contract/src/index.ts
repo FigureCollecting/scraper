@@ -461,6 +461,14 @@ export interface SearchFetch {
    */
   waitFor?: WaitForReadiness;
   /**
+   * Browser-lane NAVIGATION budget (ms) for this store: the ceiling on each `page.goto`, the
+   * session prime's included. A Cloudflare-fronted store reached through a relayed residential
+   * exit spends most of its navigation on the CHALLENGE rather than on bytes, so the stores that
+   * are slow BY CONSTRUCTION can say so instead of forcing the whole pod's budget up. Undeclared ⇒
+   * the engine's own budget (`BROWSER_NAV_TIMEOUT_MS`, default 20000). Clamped to [5000, 120000].
+   */
+  navTimeoutMs?: number;
+  /**
    * The store's edge gate (see {@link StoreAccess}). `cloudflare` tells the browser lane to keep
    * this host's context — and the Cloudflare clearance in it — alive between fetches, and makes
    * `sessionPrime` apply to the browser lane as well as impit. Undeclared (or `open`) ⇒ a fresh

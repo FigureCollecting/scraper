@@ -10,7 +10,8 @@
  *   - GET /health/detailed → the above + browserPool health + a timestamp, and ADDITIVELY
  *     `residentialEgress: {configured, proxy?}` (the residential proxy; its host:port only under
  *     RESIDENTIAL_EGRESS_HEALTH_DETAIL, credentials always stripped),
- *     `browserLane: {launchMode, residentialTimezone, directTimezone, processTimezone, gatedBrowsers}`,
+ *     `browserLane: {launchMode, residentialTimezone, directTimezone, processTimezone,
+ *     navigationTimeoutMs, gatedBrowsers}`,
  *     `challengeCooldowns: [{host, remainingMs, reason}]` (the per-host CF cooldowns currently open),
  *     `rawStore: {configured, stats?}` (the raw-capture sink's counters — page + asset lanes),
  *     `imageCapture: {enabled, attempted, stored, deduped, skipped{…}, failed, residentialBytesToday}`

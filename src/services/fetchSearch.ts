@@ -22,7 +22,7 @@ export interface FetchSearchTransports {
   /** impit TLS-impersonating GET (Cloudflare-fronted JSON APIs). `prime` primes a session-gated host; `proxyUrl` is residential egress. */
   impersonate: (url: string, opts: { browser?: string; headers?: Record<string, string>; userAgent?: string; prime?: { url: string }; proxyUrl?: string }) => Promise<string>;
   /** Pooled browser navigation (rendered-DOM / JS-challenge). Optional — degrades to http if absent. */
-  browser?: (url: string, opts?: { headers?: Record<string, string>; userAgent?: string; cookies?: Record<string, string>; proxyServer?: string; waitFor?: WaitForReadiness; challengeGated?: boolean; primeUrl?: string }) => Promise<string>;
+  browser?: (url: string, opts?: { headers?: Record<string, string>; userAgent?: string; cookies?: Record<string, string>; proxyServer?: string; waitFor?: WaitForReadiness; challengeGated?: boolean; primeUrl?: string; navTimeoutMs?: number }) => Promise<string>;
 }
 
 /** Injectable wiring for {@link makeFetchSearch} (tests drive the egress config deterministically). */
@@ -67,6 +67,7 @@ export function makeFetchSearch(t: FetchSearchTransports, deps: FetchSearchDeps 
           ...(searchFetch.waitFor ? { waitFor: searchFetch.waitFor } : {}),
           ...(challengeGated ? { challengeGated: true } : {}),
           ...(browserPrime ? { primeUrl: browserPrime.url } : {}),
+          ...(searchFetch.navTimeoutMs !== undefined ? { navTimeoutMs: searchFetch.navTimeoutMs } : {}),
         });
       }
       case 'http':
