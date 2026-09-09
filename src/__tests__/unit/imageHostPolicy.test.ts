@@ -69,7 +69,7 @@ describe('loadImageHostPolicy', () => {
     const warn = jest.fn();
     const policy = loadImageHostPolicy({
       IMAGE_HOST_POLICY_JSON: JSON.stringify({
-        'cdn.test': { lane: 'carrier-pigeon', egress: 'satellite', referer: 'yes', ua: 'firefox', deny: 'maybe', extra: 1 },
+        'cdn.test': { lane: 'carrier-pigeon', egress: 'satellite', referer: 'yes', ua: 'firefox', extra: 1 },
         'ok.test': { lane: 'impit' },
       }),
     } as NodeJS.ProcessEnv, { warn });
@@ -90,6 +90,37 @@ describe('loadImageHostPolicy', () => {
     expect(policy.ruleFor('ok.test')).toEqual({ lane: 'http' });
     expect(consoleWarn).toHaveBeenCalledTimes(2);
     consoleWarn.mockRestore();
+  });
+
+  it('does not let an unusable entry SHADOW the parent rule it sits under', () => {
+    const warn = jest.fn();
+    const policy = loadImageHostPolicy({
+      IMAGE_HOST_POLICY_JSON: JSON.stringify({ 'example.com': { lane: 'impit' }, 'cdn.example.com': 'browser' }),
+    } as NodeJS.ProcessEnv, { warn });
+
+    // The typo'd key is skipped entirely, so the subtree keeps falling through to its parent.
+    expect(policy.ruleFor('cdn.example.com')).toEqual({ lane: 'impit' });
+    expect(policy.ruleFor('img.cdn.example.com')).toEqual({ lane: 'impit' });
+    expect(warn).toHaveBeenCalled();
+  });
+
+  it('fails CLOSED on a wrongly-typed deny — a deny list must never be dropped on a typo', () => {
+    const warn = jest.fn();
+    const policy = loadImageHostPolicy({
+      IMAGE_HOST_POLICY_JSON: JSON.stringify({ 'blocked.test': { deny: 'true' } }),
+    } as NodeJS.ProcessEnv, { warn });
+    expect(policy.ruleFor('blocked.test')).toEqual({ deny: true });
+  });
+
+  it('falls through to IMAGE_HOST_POLICY_FILE when the inline JSON is unusable', () => {
+    const warn = jest.fn();
+    const readFile = jest.fn(() => JSON.stringify({ 'cdn.shopify.com': { lane: 'browser' } }));
+    const policy = loadImageHostPolicy(
+      { IMAGE_HOST_POLICY_JSON: 'not json', IMAGE_HOST_POLICY_FILE: '/etc/fc/image-policy.json' } as NodeJS.ProcessEnv,
+      { warn, readFile },
+    );
+    expect(readFile).toHaveBeenCalledWith('/etc/fc/image-policy.json');
+    expect(policy.ruleFor('cdn.shopify.com')).toEqual({ lane: 'browser' });
   });
 
   it('matches the LONGEST host suffix, and normalizes case and a leading dot or www.', () => {

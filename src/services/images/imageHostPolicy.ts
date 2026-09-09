@@ -101,20 +101,31 @@ export function buildImageHostPolicy(table: Record<string, ImageHostRule>): Imag
   };
 }
 
-/** Validate one entry; unknown or wrongly-typed fields are DROPPED (with a warning), not fatal. */
-function validateRule(host: string, raw: unknown, warn: (message: string) => void): ImageHostRule {
-  const rule: ImageHostRule = {};
+/**
+ * Validate one entry. Unknown or wrongly-typed fields are DROPPED (with a warning) rather than being
+ * fatal — with two exceptions, both of which fail CLOSED:
+ *   - an entry that is not an object at all yields `undefined`, and the KEY is then skipped: writing
+ *     an empty rule under it would register that host and let it win the longest-suffix match,
+ *     silently masking the valid parent rule the operator wrote for the whole subtree;
+ *   - a `deny` field that is present but not a boolean becomes `deny: true`. A deny list is the one
+ *     thing that must not evaporate on a typo.
+ */
+function validateRule(host: string, raw: unknown, warn: (message: string) => void): ImageHostRule | undefined {
   if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) {
     warn(`[IMAGE-POLICY] entry for ${sanitizeForLog(host)} is not an object — ignoring it.`);
-    return rule;
+    return undefined;
   }
+  const rule: ImageHostRule = {};
   for (const [field, value] of Object.entries(raw as Record<string, unknown>)) {
     if (field === 'lane' && typeof value === 'string' && LANES.includes(value)) rule.lane = value as ImageLane;
     else if (field === 'egress' && typeof value === 'string' && EGRESSES.includes(value)) rule.egress = value as ImageEgress;
     else if (field === 'ua' && typeof value === 'string' && UAS.includes(value)) rule.ua = value as 'chrome' | 'default';
     else if (field === 'referer' && typeof value === 'boolean') rule.referer = value;
     else if (field === 'deny' && typeof value === 'boolean') rule.deny = value;
-    else warn(`[IMAGE-POLICY] ignoring unknown or invalid field '${sanitizeForLog(field)}' on host ${sanitizeForLog(host)}.`);
+    else if (field === 'deny') {
+      rule.deny = true;
+      warn(`[IMAGE-POLICY] host ${sanitizeForLog(host)} has a non-boolean 'deny' — reading it as deny:true.`);
+    } else warn(`[IMAGE-POLICY] ignoring unknown or invalid field '${sanitizeForLog(field)}' on host ${sanitizeForLog(host)}.`);
   }
   return rule;
 }
@@ -134,7 +145,8 @@ function parseTable(source: string, raw: string, warn: (message: string) => void
   }
   const table: Record<string, ImageHostRule> = {};
   for (const [host, rule] of Object.entries(parsed as Record<string, unknown>)) {
-    table[host] = validateRule(host, rule, warn);
+    const validated = validateRule(host, rule, warn);
+    if (validated) table[host] = validated;
   }
   return table;
 }
@@ -148,8 +160,10 @@ export interface LoadImageHostPolicyDeps {
 /**
  * Resolve the image host policy from the environment. `IMAGE_HOST_POLICY_JSON` (an inline
  * `{host: rule}` object) is consulted first, then `IMAGE_HOST_POLICY_FILE` (a path to the same
- * shape). An unset, unparseable or unusable value leaves the DEFAULT table — which is the permaban
- * alone — in place, with exactly one warning naming the reason. The ban is never lost.
+ * shape) — including when the inline value was set but UNUSABLE, so a malformed ConfigMap edit does
+ * not stand in for the file the operator also mounted. When neither yields a table the DEFAULT —
+ * which is the permaban alone — stands, with exactly one warning naming the reason per source. The
+ * ban is never lost.
  */
 export function loadImageHostPolicy(
   env: NodeJS.ProcessEnv,
@@ -158,7 +172,13 @@ export function loadImageHostPolicy(
   // eslint-disable-next-line no-console
   const warn = deps.warn ?? ((message: string) => console.warn(message));
   const inline = (env.IMAGE_HOST_POLICY_JSON ?? '').trim();
-  if (inline !== '') return buildImageHostPolicy(parseTable('IMAGE_HOST_POLICY_JSON', inline, warn) ?? {});
+  if (inline !== '') {
+    // An UNUSABLE inline value falls THROUGH to the file rather than standing in for it: an operator
+    // who set both asked for a policy, and a trailing comma in a ConfigMap must not silently leave
+    // the engine with no table at all.
+    const parsed = parseTable('IMAGE_HOST_POLICY_JSON', inline, warn);
+    if (parsed) return buildImageHostPolicy(parsed);
+  }
   const path = (env.IMAGE_HOST_POLICY_FILE ?? '').trim();
   if (path === '') return buildImageHostPolicy({});
   let raw: string;
