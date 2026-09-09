@@ -359,7 +359,11 @@ describe('createHealthRoutes — rawStore counters', () => {
     inFlight: 4,
     dropped: 2,
     droppedBytes: 1,
+    // The reservation's refusals, split by the budget that held the asset: a depth
+    // problem and a payload problem want different settings raised.
     assetRefusedReserve: 7,
+    assetRefusedReserveDepth: 4,
+    assetRefusedReserveBytes: 3,
     queuedBytes: 3145728,
     queueWaitP50: 40,
     queueWaitP95: 900,

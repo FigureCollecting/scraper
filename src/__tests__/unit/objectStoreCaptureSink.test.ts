@@ -375,6 +375,8 @@ describe('ObjectStoreCaptureSink — the asset lane', () => {
       dropped: 0,
       droppedBytes: 0,
       assetRefusedReserve: 0,
+      assetRefusedReserveDepth: 0,
+      assetRefusedReserveBytes: 0,
       queuedBytes: 0,
       // Latencies are wall clock, so the SHAPE is asserted and the values are not:
       // a real HEAD that happens to cross a millisecond boundary is not a defect.
@@ -1254,7 +1256,9 @@ describe('ObjectStoreCaptureSink — the asset lane cannot evict the page lanes'
     // Only now, with the whole depth spent, does a PAGE drop — and it is counted as one.
     await expect(sink.capture(p3)).resolves.toEqual({ admitted: false, reason: 'queueFull' });
 
-    expect(sink.stats()).toMatchObject({ queued: 4, assetRefusedReserve: 1, dropped: 1, droppedBytes: 0 });
+    expect(sink.stats()).toMatchObject({
+      queued: 4, assetRefusedReserve: 1, assetRefusedReserveDepth: 1, assetRefusedReserveBytes: 0, dropped: 1, droppedBytes: 0,
+    });
 
     await release(store, sink);
     warn.mockRestore();
@@ -1278,7 +1282,8 @@ describe('ObjectStoreCaptureSink — the asset lane cannot evict the page lanes'
     await expect(sink.capture(pages(1, 300)[0])).resolves.toEqual({ admitted: true });
 
     expect(sink.stats()).toMatchObject({
-      queued: 2, queuedBytes: 600, assetRefusedReserve: 1, dropped: 0, droppedBytes: 0,
+      queued: 2, queuedBytes: 600, assetRefusedReserve: 1, assetRefusedReserveDepth: 0, assetRefusedReserveBytes: 1,
+      dropped: 0, droppedBytes: 0,
     });
 
     await release(store, sink);
@@ -1310,7 +1315,9 @@ describe('ObjectStoreCaptureSink — the asset lane cannot evict the page lanes'
     // it was refused queueBytesFull with the byte budget spent entirely on images.
     await expect(sink.capture(pages(1, 100)[0])).resolves.toEqual({ admitted: true });
 
-    expect(sink.stats()).toMatchObject({ droppedBytes: 0, assetRefusedReserve: 1, queuedBytes: 192_099 });
+    expect(sink.stats()).toMatchObject({
+      droppedBytes: 0, assetRefusedReserve: 1, assetRefusedReserveBytes: 1, queuedBytes: 192_099,
+    });
 
     await release(store, sink);
     warn.mockRestore();
@@ -1438,6 +1445,159 @@ describe('ObjectStoreCaptureSink — the asset lane cannot evict the page lanes'
     store.open = true;
     store.release();
     await parked.flush();
+    warn.mockRestore();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Page PRIORITY. The reservation buys a page ADMISSION; it says nothing about when
+// the page reaches the bucket. Drained first-come-first-served, a page admitted into
+// the reserved tail sat behind every asset queued before it — minutes of 10 MiB
+// uploads at prod scale — and at SIGTERM the bounded flush spent its whole budget
+// on re-fetchable images while the irreplaceable page was abandoned behind them.
+// ---------------------------------------------------------------------------
+
+const pageKey = (c: RawCapture) => `raw-html/sha256/${c.sha256.slice(0, 2)}/${c.sha256}.html.gz`;
+const assetKey = (c: RawCapture) => `raw-img/sha256/${c.sha256.slice(0, 2)}/${c.sha256}.png`;
+
+describe('ObjectStoreCaptureSink — pages reach a worker before assets', () => {
+  it('takes every waiting PAGE before any waiting asset, FIFO within each lane', async () => {
+    const store = new GatedObjectStore();
+    const sink = await parkedSink(store, { queueMax: 100 });
+
+    const [a1, a2, a3, a4] = assets(4);
+    const [p1, p2, p3] = pages(3);
+    // The shape of a crawl pass: an item's images queue up before the next item's page lands.
+    for (const c of [a1, a2, a3, p1, p2, a4, p3]) {
+      await expect(sink.capture(c)).resolves.toEqual({ admitted: true });
+    }
+    expect(sink.stats()).toMatchObject({ queued: 7, inFlight: 1 });
+
+    store.open = true;
+    store.release();
+    await sink.flush();
+
+    // After the parked worker's own page: the pages in arrival order, THEN the assets in
+    // theirs. p3 arrived last of all and still reaches the bucket before a1, which arrived first.
+    expect(store.keys.slice(1)).toEqual([...[p1, p2, p3].map(pageKey), ...[a1, a2, a3, a4].map(assetKey)]);
+  });
+
+  it('a page admitted behind a deep asset backlog is the NEXT thing a freed worker takes', async () => {
+    const store = new GatedObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, {
+      ...CONFIG, imagePrefix: 'raw-img/', putTimeoutMs: 60_000, imagePutTimeoutMs: 60_000, concurrency: 2, queueMax: 100,
+    });
+    const backlog = assets(10);
+    for (const a of backlog) await expect(sink.capture(a)).resolves.toEqual({ admitted: true });
+    await until(() => store.parked.length === 2);
+    const [p1] = pages(1);
+    await expect(sink.capture(p1)).resolves.toEqual({ admitted: true });
+    expect(sink.stats()).toMatchObject({ queued: 9, inFlight: 2 });
+
+    // One upload finishes. Eight assets have been waiting longer than the page; the
+    // worker takes the page. Its wait was ONE upload, not the backlog.
+    store.parked.splice(0, 1).forEach(r => r());
+    await until(() => store.keys.length === 3);
+    expect(store.keys[2]).toBe(pageKey(p1));
+    expect(store.keys.slice(0, 2)).toEqual(backlog.slice(0, 2).map(assetKey));
+
+    await drain(store, sink);
+    expect(sink.stats()).toMatchObject({ stored: 1, assetStored: 10 });
+  });
+
+  it('bounds the asset lane at its share of the WAITING queue plus one upload per worker — a page waits behind at most that one upload', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new GatedObjectStore();
+    // The share defaults to 0.75, so the line is six of eight slots. Eight workers.
+    const sink = new ObjectStoreCaptureSink(store, {
+      ...CONFIG, imagePrefix: 'raw-img/', putTimeoutMs: 60_000, imagePutTimeoutMs: 60_000, concurrency: 8, queueMax: 8,
+    });
+    const all = assets(16);
+
+    // Every worker is idle, so the first eight go straight to one and WAIT for nobody —
+    // the seventh and eighth included, offered with the line at six. The share is a share
+    // of the queue, and an upload that is running holds no slot in it: an empty queue
+    // admits an asset however many images are uploading. (Counting the uploads against
+    // the share instead refuses that seventh asset with the queue empty and two workers
+    // idle — the lane throttled by a knob that is not the concurrency knob.)
+    for (const a of all.slice(0, 8)) await expect(sink.capture(a)).resolves.toEqual({ admitted: true });
+    await until(() => store.parked.length === 8);
+    expect(sink.stats()).toMatchObject({ queued: 0, inFlight: 8 });
+
+    // Now the queue fills: six waiting is the share, the seventh is held.
+    for (const a of all.slice(8, 14)) await expect(sink.capture(a)).resolves.toEqual({ admitted: true });
+    await expect(sink.capture(all[14])).resolves.toEqual({ admitted: false, reason: 'assetReserve' });
+    // So the lane's whole footprint is share × queueMax WAITING plus concurrency RUNNING:
+    // fourteen of the sixteen offered, never six. That is the number an operator sizing
+    // memory has to use, and it is the number the header and the README state.
+    expect(sink.stats()).toMatchObject({ queued: 6, inFlight: 8, assetRefusedReserve: 1, assetRefusedReserveDepth: 1 });
+
+    // None of it touched the pages' two slots.
+    const [p1, p2, p3] = pages(3);
+    await expect(sink.capture(p1)).resolves.toEqual({ admitted: true });
+    await expect(sink.capture(p2)).resolves.toEqual({ admitted: true });
+    await expect(sink.capture(p3)).resolves.toEqual({ admitted: false, reason: 'queueFull' });
+
+    // And the running uploads are the ONLY thing a page ever waits behind: the moment one
+    // finishes, its worker takes the page — not one of the six assets queued ahead of it.
+    store.parked.splice(0, 1).forEach(r => r());
+    await until(() => store.keys.length === 9);
+    expect(store.keys[8]).toBe(pageKey(p1));
+
+    await drain(store, sink);
+    warn.mockRestore();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The hold report names its budget. `dropAndLog` already takes a `ceiling` and keeps
+// `dropped` apart from `droppedBytes` so an operator can see WHICH ceiling bound —
+// a depth problem and a payload problem want different settings raised. The hold
+// path applied neither half of that: one counter, one line that listed both budgets.
+// ---------------------------------------------------------------------------
+
+describe('ObjectStoreCaptureSink — a held-back asset is counted against the budget that held it', () => {
+  it('splits the reserve counter by budget and says which one bit in the report', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const held = () => warn.mock.calls.map(a => String(a[0])).filter(l => l.includes('held back for the page reservation'));
+
+    // DEPTH binds: two 100-byte assets fill half of four slots with the byte budget barely touched.
+    const storeA = new GatedObjectStore();
+    const byDepth = await parkedSink(storeA, { queueMax: 4, queueMaxBytes: 1000, assetQueueShare: 0.5 });
+    for (const a of assets(2, 100)) await expect(byDepth.capture(a)).resolves.toEqual({ admitted: true });
+    await expect(byDepth.capture(assets(3, 100)[2])).resolves.toEqual({ admitted: false, reason: 'assetReserve' });
+    expect(byDepth.stats()).toMatchObject({
+      assetRefusedReserve: 1, assetRefusedReserveDepth: 1, assetRefusedReserveBytes: 0,
+    });
+    expect(held()).toHaveLength(1);
+    // The line names the budget AND the knob that raises it.
+    expect(held()[0]).toContain('share of the queue DEPTH is spent');
+    expect(held()[0]).toContain('RAW_STORE_QUEUE_MAX 4');
+    expect(held()[0]).toContain('1 on depth and 0 on bytes in total');
+    expect(held()[0]).not.toContain('RAW_STORE_QUEUE_MAX_BYTES');
+
+    // BYTES bind: one 300-byte asset holds 300 of a 500-byte share; the next would take it to 600.
+    const storeB = new GatedObjectStore();
+    const byBytes = await parkedSink(storeB, { queueMax: 100, queueMaxBytes: 1000, assetQueueShare: 0.5 });
+    await expect(byBytes.capture(assets(1, 300)[0])).resolves.toEqual({ admitted: true });
+    await expect(byBytes.capture(assets(2, 300)[1])).resolves.toEqual({ admitted: false, reason: 'assetReserve' });
+    expect(byBytes.stats()).toMatchObject({
+      assetRefusedReserve: 1, assetRefusedReserveDepth: 0, assetRefusedReserveBytes: 1,
+    });
+    expect(held()).toHaveLength(2);
+    expect(held()[1]).toContain('share of the queue BYTES is spent');
+    expect(held()[1]).toContain('RAW_STORE_QUEUE_MAX_BYTES 1000');
+    expect(held()[1]).toContain('0 on depth and 1 on bytes in total');
+
+    // The compatibility counter is exactly the sum, and stays so as both climb.
+    await expect(byBytes.capture(assets(3, 300)[2])).resolves.toEqual({ admitted: false, reason: 'assetReserve' });
+    expect(byBytes.stats()).toMatchObject({ assetRefusedReserve: 2, assetRefusedReserveDepth: 0, assetRefusedReserveBytes: 2 });
+
+    for (const [store, sink] of [[storeA, byDepth], [storeB, byBytes]] as const) {
+      store.open = true;
+      store.release();
+      await sink.flush();
+    }
     warn.mockRestore();
   });
 });

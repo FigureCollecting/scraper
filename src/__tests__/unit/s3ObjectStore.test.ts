@@ -1,6 +1,6 @@
 import { jest } from '@jest/globals';
-import { NoopCaptureSink } from '../../services/captureSink';
-import { ObjectStoreCaptureSink } from '../../services/objectStoreCaptureSink';
+import { NoopCaptureSink, buildRawCapture } from '../../services/captureSink';
+import { ObjectStoreCaptureSink, type ObjectStore } from '../../services/objectStoreCaptureSink';
 import {
   MAX_CONFIGURABLE_IMAGE_BYTES,
   rawStoreView,
@@ -374,5 +374,66 @@ describe('flushRawCaptureSink', () => {
     await flushRawCaptureSink({ sink, env: { RAW_STORE_SHUTDOWN_FLUSH_MS: 'nope' } as NodeJS.ProcessEnv });
     expect(DEFAULT_RAW_STORE_SHUTDOWN_FLUSH_MS).toBe(8_000);
     expect(seen).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The shutdown drain, end to end through a real sink: the budget is spent on PAGES
+// first. Drained first-come-first-served, the flush spent its eight seconds on
+// re-fetchable images and abandoned the one capture nothing would ever fetch again.
+// ---------------------------------------------------------------------------
+describe('flushRawCaptureSink — pages first inside the budget', () => {
+  /** PUTs park until released, so the test decides exactly how far the drain gets. */
+  class ParkingStore implements ObjectStore {
+    readonly keys: string[] = [];
+    readonly parked: Array<() => void> = [];
+    async exists(): Promise<boolean> { return false; }
+    async put(key: string): Promise<void> {
+      this.keys.push(key);
+      await new Promise<void>(resolve => { this.parked.push(resolve); });
+    }
+    release(): void { this.parked.splice(0).forEach(r => r()); }
+  }
+  const tick = () => new Promise(r => setImmediate(r));
+  const until = async (cond: () => boolean): Promise<void> => {
+    for (let i = 0; i < 20_000 && !cond(); i += 1) await tick();
+  };
+  const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from('IHDR')]);
+  const image = (i: number) => buildRawCapture({
+    url: `https://cdn.test/${i}.png`, lane: 'asset', bytes: Buffer.concat([PNG, Buffer.alloc(4, i)]),
+  });
+
+  it('spends the budget on the PAGE first — what it abandons is the re-fetchable assets', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new ParkingStore();
+    const sink = new ObjectStoreCaptureSink(store, {
+      endpoint: 'https://hel1.your-objectstorage.com', region: 'hel1', bucket: 'mindsignals-raw',
+      prefix: 'raw-html/', imagePrefix: 'raw-img/', keyScheme: 'sha256-v1',
+      concurrency: 1, putTimeoutMs: 60_000, imagePutTimeoutMs: 60_000,
+    });
+    // SIGTERM arrives with one image uploading, three more waiting, and behind all of
+    // them the one capture nothing will ever fetch again.
+    for (let i = 1; i <= 4; i += 1) await expect(sink.capture(image(i))).resolves.toEqual({ admitted: true });
+    await until(() => store.parked.length === 1);
+    const page = buildRawCapture({ url: 'https://store.test/item/1', lane: 'wire', bytes: Buffer.from('<html>item 1</html>') });
+    await expect(sink.capture(page)).resolves.toEqual({ admitted: true });
+    expect(sink.stats()).toMatchObject({ queued: 4, inFlight: 1 });
+
+    const flushing = flushRawCaptureSink({ sink, timeoutMs: 1_000 });
+    store.release(); // the running upload finishes; from here the budget decides what lands
+    await until(() => store.keys.length === 2);
+    // The worker took the page — not image 2, which had been waiting far longer.
+    expect(store.keys[1]).toBe(`raw-html/sha256/${page.sha256.slice(0, 2)}/${page.sha256}.html.gz`);
+    store.release(); // the page lands; the worker moves on to image 2 and parks there until the budget runs out
+
+    await expect(flushing).resolves.toEqual({ drained: false, abandoned: 3 });
+    // Everything abandoned is an image the next pass re-fetches; the page is in the bucket.
+    expect(store.keys.filter(k => k.endsWith('.html.gz'))).toHaveLength(1);
+    expect(store.keys).toHaveLength(3);
+
+    const done = sink.flush();
+    for (let i = 0; i < 100 && sink.stats().queued + sink.stats().inFlight > 0; i += 1) { store.release(); await tick(); }
+    await done;
+    warn.mockRestore();
   });
 });

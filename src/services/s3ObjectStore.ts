@@ -272,6 +272,9 @@ export interface RawStoreFlushOutcome {
  * with nothing anywhere that would fetch them again. Draining cannot be unbounded
  * either — so we wait `RAW_STORE_SHUTDOWN_FLUSH_MS`, then say plainly how many
  * captures we are dropping on the floor. Never throws: shutdown continues regardless.
+ * The sink drains PAGES before assets, so the budget goes to the captures nothing
+ * will fetch again, and what the bound abandons is — as far as the backlog allows —
+ * images the next pass re-fetches.
  */
 export async function flushRawCaptureSink(
   opts: { sink?: CaptureSink; timeoutMs?: number; env?: NodeJS.ProcessEnv } = {},
