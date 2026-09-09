@@ -140,6 +140,25 @@ describe('the image capture hook', () => {
       expect(h.calls[0].plan.userAgent).toMatch(/Chrome\/\d+/);
     });
 
+    /**
+     * The OTHER half of the ua token, pinned HERE because this is where it is composed. The lanes
+     * each refuse to invent a browser identity, but that is worth nothing if the caller hands them
+     * one: the 2026-09-09 hobby-genki defect was exactly a `?? IMAGE_CHROME_UA` sitting between a
+     * correct policy and a correct lane, and a test that rebuilds this composition instead of
+     * calling it cannot see that. So the assertion is on the PLAN this hook actually emits, and it
+     * is on the KEY's absence — a `userAgent: undefined` property would still be a lane's `opts`
+     * carrying an answer the operator did not give.
+     */
+    it('emits NO user agent at all for a policy row with ua:default', async () => {
+      for (const lane of ['http', 'impit'] as const) {
+        const h = harness({ policy: { 'cdn.test': { lane, ua: 'default' } } });
+        await capture(h, rulesetDescribing([gallery('https://cdn.test/a.jpg')]));
+        expect(h.calls[0].plan.lane).toBe(lane);
+        expect(h.calls[0].plan.userAgent).toBeUndefined();
+        expect(Object.keys(h.calls[0].plan)).not.toContain('userAgent');
+      }
+    });
+
     it('hands the browser lane the STORE host and the store gate, not the CDN host', async () => {
       // The gated browser is keyed on the store whose clearance it holds; the image lives elsewhere.
       const h = harness({ policy: { 'cdn.test': { lane: 'browser' } } });
