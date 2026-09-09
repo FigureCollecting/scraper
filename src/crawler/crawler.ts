@@ -93,6 +93,17 @@ export interface CrawlerDeps {
   reportFailure?: ReportFetchFailure;
 }
 
+/** What one declared seed list yielded this run (mode `seed` only), in the order the lists were polled. */
+export interface SeedListStat {
+  listId: string;
+  /** Items with a usable itemId the list offered. */
+  discovered: number;
+  /** Of those, the ones the ledger had already enqueued (or this run had already handled). */
+  known: number;
+  /** POSTs the scraper accepted from this list. */
+  enqueued: number;
+}
+
 export interface CrawlerStoreSummary {
   siteId: string;
   /** Listing pages fetched with 200 (recent + backfill). */
@@ -131,6 +142,17 @@ export interface CrawlerStoreSummary {
    * (`cap`, `budget`) otherwise looks exactly like a store that was never armed for the axis.
    */
   rangeSkipped: RangeSkipReason | null;
+  /**
+   * Per-list stats for a `seed`-mode run, in the order the lists were polled. Empty in every other
+   * mode, and empty for a store whose seed pass never got a list (no declaration, or a stop).
+   */
+  seedLists: SeedListStat[];
+  /**
+   * Why the seed pass stopped this store early, `null` when it ran every declared list (or did not
+   * run at all). A seed pass is a handful of requests, so a store that quietly did three of its five
+   * lists must not look the same as one that did all five.
+   */
+  seedStopped: StopReason | null;
   /** The store's backfill cursor after this run (null until backfill first runs). */
   backfillCursor: number | null;
   /** An empty page was seen at the cursor once; awaiting confirmation next run. */
@@ -177,7 +199,7 @@ type PageOutcome = { kind: 'page'; items: CatalogItem[]; hasMore: boolean } | { 
 
 type PostOutcome = 'accepted' | 'accepted-dedup' | 'rejected' | 'transient' | 'budget';
 
-type Phase = 'recent' | 'backfill' | 'range';
+type Phase = 'recent' | 'backfill' | 'range' | 'seed';
 
 interface StoreState {
   siteId: string;
@@ -329,6 +351,8 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       rangeCursor: null,
       rangeFrontier: null,
       rangeSkipped: config.rangeStores.includes(siteId) ? 'not-run' : 'not-configured',
+      seedLists: [],
+      seedStopped: null,
       backfillCursor: null,
       exhaustCandidate: false,
       exhausted: false,
@@ -351,6 +375,9 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     `${config.scraperServiceUrl}/catalog?store=${encodeURIComponent(siteId)}&page=${page}`;
   const rangeUrl = (siteId: string, from: number, count: number): string =>
     `${config.scraperServiceUrl}/catalog?store=${encodeURIComponent(siteId)}&range=1&from=${from}&count=${count}`;
+  const seedsUrl = (siteId: string): string => `${config.scraperServiceUrl}/catalog?store=${encodeURIComponent(siteId)}&seeds=1`;
+  const seedUrl = (siteId: string, listId: string): string =>
+    `${config.scraperServiceUrl}/catalog?store=${encodeURIComponent(siteId)}&seed=${encodeURIComponent(listId)}`;
   const ingestUrl = `${config.scraperServiceUrl}/ingest/scrape`;
 
   const summarize = (): CrawlerSummary => {
@@ -435,8 +462,14 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
    * Both answer the same `{ items: [...] }` shape, so one parser serves both; `where` only labels the
    * logs and decides whether a 422 is a listing-axis gap (which leaves the id-range axis alive).
    */
-  const fetchCatalog = async (st: StoreState, url: string, where: Record<string, unknown>, axis: Phase): Promise<PageOutcome> => {
-    const stop = (reason: StopReason): PageOutcome => {
+  const fetchCatalogAs = async <T>(
+    st: StoreState,
+    url: string,
+    where: Record<string, unknown>,
+    axis: Phase,
+    shape: { label: string; parse: (body: Record<string, unknown>) => T | undefined },
+  ): Promise<{ kind: 'ok'; value: T } | { kind: 'stopped'; reason: StopReason }> => {
+    const stop = (reason: StopReason): { kind: 'stopped'; reason: StopReason } => {
       st.stopped = true;
       return { kind: 'stopped', reason };
     };
@@ -532,8 +565,10 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       });
       return stop('failed');
     }
-    if (!isPlainObject(body) || !Array.isArray(body.items)) {
-      // A 200 that is not a listing is a failure, never an exhaustion signal.
+    const value = isPlainObject(body) ? shape.parse(body) : undefined;
+    if (value === undefined) {
+      // A 200 that is not what this axis asked for is a failure, never an exhaustion signal — and,
+      // on the seed axis, never an empty poll (which would read as "the shelf has nothing new").
       st.summary.errors++;
       logger.warn('[CRAWLER] catalog body malformed', { siteId: st.siteId, ...where });
       emitFailure({
@@ -543,11 +578,20 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
         origin: 'crawler',
         reasonClass: 'parse',
         httpStatus: res.status,
-        message: 'catalog answered 200 with a body that is not a listing',
+        message: `catalog answered 200 with a body that is not ${shape.label}`,
       });
       return stop('failed');
     }
-    return { kind: 'page', items: sanitizeItems(body.items), hasMore: body.hasMore === true };
+    return { kind: 'ok', value };
+  };
+
+  /** One /catalog GET on an axis that answers `{ items: [...] }` — the listing and id-range axes. */
+  const fetchCatalog = async (st: StoreState, url: string, where: Record<string, unknown>, axis: Phase): Promise<PageOutcome> => {
+    const out = await fetchCatalogAs(st, url, where, axis, {
+      label: 'a listing',
+      parse: (body) => (Array.isArray(body.items) ? { items: sanitizeItems(body.items), hasMore: body.hasMore === true } : undefined),
+    });
+    return out.kind === 'ok' ? { kind: 'page', ...out.value } : out;
   };
 
   /**
@@ -787,6 +831,79 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     }
   };
 
+  /**
+   * SEED PHASE (CRAWLER_MODE=seed) — a slow, bounded poll of the pages a store DECLARES.
+   *
+   * Two steps, and no walk in either: ask the engine which seed lists the store declares
+   * (GET /catalog?store=&seeds=1 — pure, it fetches no store), then fetch each declared list in
+   * DECLARED order (GET /catalog?store=&seed=<listId>) and enqueue the ids the ledger has never
+   * seen. There is no cursor and no paging because a seed list is ONE page by construction: the
+   * cost of the whole phase is (1 + the number of declared lists) catalog GETs plus at most the
+   * store's enqueue cap in ingest POSTs, and that is knowable before the pass starts.
+   *
+   * Everything else is the crawler's existing machinery, unchanged: the same durable ledger for
+   * dedup (a seed list re-shows the same items for weeks — the ledger is what stops the poll from
+   * re-POSTing them), the same per-store enqueue cap, the same global budget and the same request
+   * gate for spacing and concurrency. A seed pass never re-observes a known id however old the
+   * ledger entry is: re-observation is the RECENT phase's job, and folding it in here would turn a
+   * bounded poll into a periodic re-collection of a whole shelf.
+   *
+   * The store STOPS at the first list that challenges, cools, or answers a 4xx, and the summary
+   * records why. A seed pass is a handful of requests against a store being treated gently; pushing
+   * on to the next list after a challenge is exactly the behaviour that burns the egress IP's
+   * reputation for every other store sharing it.
+   */
+  const seedPhase = async (st: StoreState): Promise<void> => {
+    if (!st.ledger || st.stopped) return;
+    const found = await fetchCatalogAs(st, seedsUrl(st.siteId), { seeds: 1 }, 'seed', {
+      label: 'a seed-list declaration',
+      parse: (body) => {
+        if (!Array.isArray(body.seedLists)) return undefined;
+        // UNTRUSTED: an entry without a usable id names no list this axis could ask for, and a
+        // REPEATED id would poll the same page twice in one run — the one thing a declared, bounded
+        // poll must never do. First occurrence wins, declared order is kept.
+        const ids: string[] = [];
+        for (const entry of body.seedLists) {
+          if (!isPlainObject(entry) || typeof entry.id !== 'string' || entry.id.length === 0) continue;
+          if (!ids.includes(entry.id)) ids.push(entry.id);
+        }
+        return ids;
+      },
+    });
+    if (found.kind !== 'ok') {
+      st.summary.seedStopped = found.reason;
+      return;
+    }
+
+    for (const listId of found.value) {
+      if (st.stopped) {
+        st.summary.seedStopped = 'budget';
+        return;
+      }
+      const out = await fetchCatalog(st, seedUrl(st.siteId, listId), { seed: listId }, 'seed');
+      if (out.kind !== 'page') {
+        st.summary.seedStopped = out.reason;
+        return;
+      }
+      // The per-list numbers are DELTAS of the store's own counters: one list's yield is what the
+      // operator reads to decide whether that list still earns its cadence.
+      const before = { discovered: st.summary.discovered, known: st.summary.known, enqueued: st.summary.enqueued };
+      await processPage(st, out.items, 'seed');
+      st.summary.seedLists.push({
+        listId,
+        discovered: st.summary.discovered - before.discovered,
+        known: st.summary.known - before.known,
+        enqueued: st.summary.enqueued - before.enqueued,
+      });
+      // Saved after EVERY list, like the listing axis saves after every page: a pass killed between
+      // two lists must not re-POST what the first one already enqueued.
+      if (!(await persist(st))) {
+        st.summary.seedStopped = 'failed';
+        return;
+      }
+    }
+  };
+
   /** The highest itemId the ledger has seen for this store that reads as a positive integer. */
   const highestNumericId = (ledger: Ledger): number | undefined => {
     let best: number | undefined;
@@ -931,6 +1048,19 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
   // --- run --------------------------------------------------------------------------------------
 
   await Promise.all(states.map((st) => loadLedger(st)));
+
+  // `seed` is an EXCLUSIVE mode, not a fourth phase: its justification is the bounded, declared cost
+  // of a small set of pages, and running it alongside an unbounded walk would hide that cost inside
+  // the walk's. The listing and id-range phases are therefore untouched by it, in both directions.
+  if (config.mode === 'seed') {
+    await Promise.all(states.map((st) => seedPhase(st)));
+    const summary = summarize();
+    logger.info('[CRAWLER] seed pass complete', summary as unknown as Record<string, unknown>);
+    for (const s of summary.stores) {
+      logger.info('[CRAWLER] store summary', s as unknown as Record<string, unknown>);
+    }
+    return summary;
+  }
 
   if (config.mode !== 'backfill') {
     await Promise.all(states.map((st) => recentPhase(st)));

@@ -27,9 +27,10 @@ describe('loadCrawlerConfig', () => {
     expect(c.exhaustedRecheckMs).toBe(WEEK_MS);
   });
 
-  it('accepts recent / backfill modes, defaulting anything else to both', () => {
+  it('accepts recent / backfill / seed modes, defaulting anything else to both', () => {
     expect(loadCrawlerConfig({ CRAWLER_MODE: 'recent' }).mode).toBe('recent');
     expect(loadCrawlerConfig({ CRAWLER_MODE: 'backfill' }).mode).toBe('backfill');
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'seed' }).mode).toBe('seed');
     expect(loadCrawlerConfig({ CRAWLER_MODE: 'both' }).mode).toBe('both');
     expect(loadCrawlerConfig({ CRAWLER_MODE: 'whatever' }).mode).toBe('both');
     expect(loadCrawlerConfig({ CRAWLER_MODE: '' }).mode).toBe('both');

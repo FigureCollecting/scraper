@@ -16,12 +16,18 @@
 
 import { logger } from '../utils/logger.js';
 
-export type CrawlerMode = 'recent' | 'backfill' | 'both';
+/**
+ * Which phases one pass runs. `recent` / `backfill` / `both` are the listing-and-id-space feeder.
+ * `seed` is a DIFFERENT, exclusive pass: ONLY the declared seed lists, and none of the other phases.
+ * It is not a fourth phase bolted onto `both` because its whole justification is the bounded cost of
+ * a small declared set — folding it into a walk would hide that cost inside an unbounded one.
+ */
+export type CrawlerMode = 'recent' | 'backfill' | 'both' | 'seed';
 
 export interface CrawlerConfig {
   /** Base URL of the scraper's HTTP surface — the ONLY thing the crawler talks to. */
   scraperServiceUrl: string;
-  /** Which phases run: `recent`, `backfill`, or `both` (recent THEN backfill, one process). */
+  /** Which phases run: `recent`, `backfill`, `both` (recent THEN backfill, one process), or `seed` (the declared seed lists ONLY). */
   mode: CrawlerMode;
   /** siteIds to crawl this pass. */
   stores: string[];
@@ -176,7 +182,8 @@ const clampedPosInt = (raw: string | undefined, fallback: number, max: number, e
   return max;
 };
 
-const parseMode = (raw: string | undefined): CrawlerMode => (raw === 'recent' || raw === 'backfill' ? raw : 'both');
+const parseMode = (raw: string | undefined): CrawlerMode =>
+  raw === 'recent' || raw === 'backfill' || raw === 'seed' ? raw : 'both';
 
 export function loadCrawlerConfig(env: Env = process.env): CrawlerConfig {
   // A csv var is defaulted ONLY when unset. An explicitly-set-but-empty value is
