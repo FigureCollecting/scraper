@@ -160,6 +160,7 @@ describe('createGatedTabBytesFetch', () => {
 
     await createGatedTabBytesFetch(lane)('residential', 'anitoysgk.com', 'https://cdn.anitoysgk.com/a.png', {
       proxyUrl: 'socks5://p.test:1055',
+      challengeGated: true,
     });
 
     expect(withPage.mock.calls[0][1]).toMatchObject({
@@ -168,6 +169,42 @@ describe('createGatedTabBytesFetch', () => {
       proxyServer: 'socks5://p.test:1055',
     });
     expect(off).toHaveBeenCalledTimes(1);
+  });
+
+  it('takes the gate from the STORE, not from the lane — an ungated store gets no challengeGated', async () => {
+    // Hardcoding it pinned every browser-lane image to the gated browser, and on a headless engine
+    // (the default) withPage refuses a DECLARED gate outright — so every ungated store's images came
+    // back refused with a message about a gate that store never declared.
+    const { page } = fakePage([resp()]);
+    const { lane, withPage } = laneFor(page);
+
+    await createGatedTabBytesFetch(lane)('direct', 'shop.example', 'https://shop.example/cdn/shop/files/x.jpg');
+
+    expect(withPage.mock.calls[0][1]).not.toHaveProperty('challengeGated');
+  });
+
+  it('seeds the host\'s stored cookies onto the tab and hands withPage the resolved user agent', async () => {
+    const { page } = fakePage([resp()]);
+    const setCookie = jest.fn(async (..._cookies: unknown[]) => undefined);
+    const { lane, withPage } = laneFor({ ...page, setCookie });
+    const store = { cookiesFor: jest.fn(() => ({ cf_clearance: 'abc' })), userAgentFor: jest.fn(() => 'MintUA/1') };
+
+    await createGatedTabBytesFetch(lane, { cookieStore: store })('direct', 'anitoysgk.com', 'https://cdn.anitoysgk.com/a.png');
+
+    expect(store.cookiesFor).toHaveBeenCalledWith('https://cdn.anitoysgk.com/a.png');
+    expect(setCookie).toHaveBeenCalledWith(expect.objectContaining({ name: 'cf_clearance', value: 'abc', domain: '.cdn.anitoysgk.com' }));
+    expect(withPage.mock.calls[0][1]).toMatchObject({ userAgent: 'MintUA/1' });
+  });
+
+  it('sets no cookie at all for a host the store knows nothing about', async () => {
+    const { page } = fakePage([resp()]);
+    const setCookie = jest.fn(async (..._cookies: unknown[]) => undefined);
+    const { lane } = laneFor({ ...page, setCookie });
+    const store = { cookiesFor: jest.fn(() => undefined), userAgentFor: jest.fn(() => undefined) };
+
+    await createGatedTabBytesFetch(lane, { cookieStore: store })('direct', 'shop.example', 'https://cdn.example/a.png');
+
+    expect(setCookie).not.toHaveBeenCalled();
   });
 
   it('sends the image Accept and the referer as extra headers on the tab', async () => {

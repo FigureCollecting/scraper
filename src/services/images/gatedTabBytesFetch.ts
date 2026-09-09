@@ -5,8 +5,10 @@
  * It exists for the cohort whose image host sits behind the same Cloudflare gate as its store: no
  * amount of TLS impersonation clears that, but the browser holding the store's clearance already
  * has. The lane does not restate the page lane's recipe — it goes through the very same door
- * (`withPage` with `challengeGated: true`), which is what puts the fetch on the long-lived browser's
- * DEFAULT context; a per-request context never clears the challenge (measured 2026-09-07).
+ * (`withPage`), and when the STORE declared a gate (`access: 'cloudflare'`, passed as
+ * `challengeGated`) that door puts the fetch on the long-lived browser's DEFAULT context; a
+ * per-request context never clears the challenge (measured 2026-09-07). An ungated store's image
+ * takes the ordinary ephemeral-context path, as its page does.
  *
  * The bytes are read with the SAME guard `navigateAndCapture` uses for its wire lane: only the MAIN
  * FRAME's DOCUMENT responses count, and the LAST one wins — after an interstitial or a redirect
@@ -24,6 +26,8 @@ import { ChallengeLaneUnavailableError, awaitChallengeClearance, type ChallengeA
 import { ResidentialEgressUnavailableError, getResidentialProxyUrl } from '../residentialEgress.js';
 import type { EgressKind } from '../gatedBrowsers.js';
 import { isDeniedImageUrl } from './imageHostPolicy.js';
+import { buildCookieParams, mergeStoredCookies, resolveUserAgent } from '../engineServices/scrapingService.js';
+import { getCfCookieStore, type CfCookieSource } from '../cookieJar.js';
 import {
   BLOCK_SIGNAL_HEADERS,
   CAPTURED_IMAGE_HEADERS,
@@ -62,6 +66,7 @@ export interface ImagePageLike {
   mainFrame(): unknown;
   goto(url: string, options?: { waitUntil?: string; timeout?: number }): Promise<ImageResponseLike | null>;
   setExtraHTTPHeaders?(headers: Record<string, string>): Promise<void>;
+  setCookie?(...cookies: never[]): Promise<void>;
   title?(): Promise<string>;
   evaluate?(pageFunction: () => unknown): Promise<unknown>;
   url?(): string;
@@ -105,6 +110,18 @@ export interface GatedTabOptions {
   challengeGated?: boolean;
   proxyServer?: string;
   stealth?: boolean;
+  userAgent?: string;
+}
+
+/** Per-request options for this lane: the shared image options plus the store's declared gate. */
+export interface GatedTabFetchOptions extends ImageFetchOptions {
+  /**
+   * The STORE declared a Cloudflare gate (`access: 'cloudflare'`). Only then is the fetch pinned to
+   * the long-lived gated browser — which `withPage` refuses outright on a non-clean-headful engine.
+   * Absent (the default) an ungated store's image rides the ordinary ephemeral-context path, exactly
+   * as its PAGE does; the engine's own LEARNED gate still applies underneath.
+   */
+  challengeGated?: boolean;
 }
 
 /** The engine's browser-lane door — `EngineScrapingService.withPage` satisfies this structurally. */
@@ -121,6 +138,8 @@ export interface GatedTabBytesFetchOptions {
   maxBytes?: number;
   /** Challenge-wait tuning, passed straight to `awaitChallengeClearance` (defaults are its own). */
   challenge?: { timeoutMs?: number; pollMs?: number };
+  /** Stored-cookie source (default: the process CfCookieStore singleton). */
+  cookieStore?: CfCookieSource;
 }
 
 /** An image fetch on the gated lane: the egress and STORE host it belongs to, plus the image URL. */
@@ -128,7 +147,7 @@ export type GatedTabBytesFetcher = (
   egress: EgressKind,
   host: string,
   url: string,
-  options?: ImageFetchOptions,
+  options?: GatedTabFetchOptions,
 ) => Promise<ImageBytesResult>;
 
 /** The named headers a response carried, lowercased. */
@@ -155,6 +174,12 @@ export function createGatedTabBytesFetch(
   const maxBytes = options.maxBytes ?? DEFAULT_MAX_IMAGE_BYTES;
 
   return async function fetchBytesViaGatedTab(egress, host, url, opts = {}): Promise<ImageBytesResult> {
+    // STORED COOKIES + UA, resolved by the page lane's OWN rules (which differ per launch profile:
+    // clean-headful deliberately replays no stored cf_clearance and pins no UA, because this browser
+    // earns its own clearance and a rewritten UA contradicts the client hints it sends).
+    const store = options.cookieStore ?? getCfCookieStore();
+    const userAgent = resolveUserAgent(store, url, opts.userAgent);
+    const cookies = mergeStoredCookies(store, url, undefined);
     // EGRESS first, before the browser is touched: a residential image with no proxy is REFUSED, the
     // same rule (and the same wording) every other residential door follows. It must never leave
     // through the node IP.
@@ -189,6 +214,10 @@ export function createGatedTabBytesFetch(
         page.on('response', onResponse);
         let navigated: ImageResponseLike | null;
         try {
+          if (cookies && page.setCookie) {
+            const params = buildCookieParams(url, cookies);
+            if (params.length > 0) await page.setCookie(...(params as never[]));
+          }
           if (page.setExtraHTTPHeaders) {
             await page.setExtraHTTPHeaders({
               accept: opts.accept ?? IMAGE_ACCEPT,
@@ -250,8 +279,12 @@ export function createGatedTabBytesFetch(
         // The gated key is the STORE's host — the session the clearance lives in — not the image
         // host, so the tab joins that store's gated browser and its per-host tab budget.
         targetUrl: `https://${host}/`,
-        challengeGated: true,
+        // The gate comes from the STORE's declaration, exactly as every other browser-lane caller
+        // resolves it. Forcing it on pinned an ungated store's images to the gated browser — and,
+        // on a headless engine, made withPage refuse every one of them.
+        ...(opts.challengeGated ? { challengeGated: true } : {}),
         stealth: false,
+        ...(userAgent ? { userAgent } : {}),
         ...(proxyServer ? { proxyServer } : {}),
       });
     } catch (err) {
