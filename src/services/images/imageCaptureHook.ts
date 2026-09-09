@@ -159,8 +159,13 @@ export interface ImageCaptureSkipCounts {
 }
 
 export interface ImageCaptureStats {
-  /** Whether the lane is switched on at all (PERSIST_RAW_IMAGES). */
+  /** Whether the lane is running at all. Needs BOTH the switch and a configured raw store. */
   enabled: boolean;
+  /**
+   * Why it is not, when it is not. An operator looking at `enabled: false` with `PERSIST_RAW_IMAGES`
+   * plainly set to `true` has no other way to find the missing half. Absent when the lane is on.
+   */
+  reason?: string;
   /** Images an actual request was issued for. */
   attempted: number;
   /** Captures handed to the asset lane. The sink's own counters say what LANDED. */
@@ -216,8 +221,10 @@ export interface ImageCaptureHookDeps {
   proxyUrlFor?: (egress: ImageEgress) => string | undefined;
   /** The durable fetch-failure ledger. Absent ⇒ failures are counted and logged but not persisted. */
   reportFailure?: ReportFetchFailure;
-  /** PERSIST_RAW_IMAGES. Default true — the composition root owns the switch. */
+  /** Whether the lane runs. Default true — the composition root owns both halves of that answer. */
   enabled?: boolean;
+  /** Why it does not, published on the health view. Ignored when `enabled` is not false. */
+  disabledReason?: string;
   maxPerItem?: number;
   memoSize?: number;
   residentialBytesPerDay?: number;
@@ -547,6 +554,7 @@ export function createImageCaptureHook(deps: ImageCaptureHookDeps): ImageCapture
     stats(): ImageCaptureStats {
       return {
         enabled,
+        ...(enabled || deps.disabledReason === undefined ? {} : { reason: deps.disabledReason }),
         attempted,
         stored,
         deduped,

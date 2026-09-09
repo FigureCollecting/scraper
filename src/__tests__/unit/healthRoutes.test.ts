@@ -12,6 +12,7 @@ import type { ImageCaptureStats } from '../../services/images/imageCaptureHook';
 
 const NO_IMAGE_CAPTURE: ImageCaptureStats = {
   enabled: false,
+  reason: 'PERSIST_RAW_IMAGES is not true',
   attempted: 0,
   stored: 0,
   deduped: 0,
@@ -472,10 +473,13 @@ describe('createHealthRoutes — imageCapture', () => {
     expect(res.body.imageCapture).toEqual(busy);
   });
 
-  it('shows the lane OFF when PERSIST_RAW_IMAGES was never set', async () => {
+  it('shows the lane OFF, and WHICH half of its configuration is missing', async () => {
     const res = await request(build()).get('/health/detailed');
 
     expect(res.body.imageCapture).toEqual(NO_IMAGE_CAPTURE);
+    // The half that is missing is the whole point: `enabled: false` next to a switch an operator
+    // can see is set to `true` is otherwise an hour of staring at a ConfigMap.
+    expect(res.body.imageCapture.reason).toBe('PERSIST_RAW_IMAGES is not true');
   });
 
   it('keeps the counters on the degraded (500) response too', async () => {

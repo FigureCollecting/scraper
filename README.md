@@ -1272,7 +1272,7 @@ A ref's `url` may be relative (it is resolved against the page it was found on) 
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `PERSIST_RAW_IMAGES` | off | The kill switch, shared with the sink's asset lane. Not `true` ⇒ the hook is inert and nothing is fetched |
+| `PERSIST_RAW_IMAGES` | off | The kill switch, shared with the sink's asset lane. Not `true` ⇒ the hook is inert and nothing is fetched. **It is only half the configuration**: with the switch on but the `RAW_STORE_S3_*` variables incomplete the sink loader returns a `NoopCaptureSink`, so capture would fetch every image of every item — at real cost to the store and to our egress reputation — and then drop the bytes. The lane therefore requires a REAL sink too, and stays off with one warning naming the missing half. `/health/detailed` carries that as `imageCapture.reason` |
 | `IMAGE_MAX_PER_ITEM` | `12` | Images captured per item, all roles counted after filtering. Clamped to 100: this multiplies against every item of every store, so a mistyped extra zero would turn a gallery walk into an undecided crawl |
 | `IMAGE_MEMO_SIZE` | `50000` | Urls the memo holds. Process-local and purely an optimization — a restart re-fetches a little and the content-addressed store dedups it |
 | `IMAGE_FETCH_CONCURRENCY` | `6` | Image fetches open at once, across every item and every host. Capture is fire-and-forget precisely so an item never waits on a CDN, which means nothing upstream applies backpressure — 200 concurrent items would otherwise open 200 fetches, and per-host pacing does not bound that (its budget is per CDN, and a catalogue sweep spans many). Clamped to 32 |

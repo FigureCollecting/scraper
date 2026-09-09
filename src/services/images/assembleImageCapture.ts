@@ -13,7 +13,8 @@
  */
 import type { ExtractedData, ExtractionRuleset, SearchFetch } from '@figurecollecting/scraper-plugin-contract';
 import { HostRateLimiter } from '../../driver/hostRateLimiter.js';
-import { getRawCaptureSink, isImagePersistenceEnabled } from '../s3ObjectStore.js';
+import { getRawCaptureSink, isImagePersistenceEnabled, rawStoreView } from '../s3ObjectStore.js';
+import type { CaptureSink } from '../captureSink.js';
 import { createFailureReporterFromEnv, type FetchOriginName } from '../failureReporter.js';
 import { getResidentialProxyUrl } from '../residentialEgress.js';
 import { createCapturingScrapingService } from '../engineServices/capturingScrapingService.js';
@@ -96,6 +97,8 @@ export function resolveImageCaptureSettings(env: NodeJS.ProcessEnv = process.env
 
 /** Overrides for the root — tests supply the transports; production supplies none. */
 export interface AssembleImageCaptureDeps {
+  /** The raw-capture sink (default: the process one). Whether it is REAL decides whether the lane runs. */
+  sink?: CaptureSink;
   /** A ready-made (already paced) bytes fetcher, replacing all three real lanes. */
   fetchBytes?: ImageBytesFetcher;
   /** The pooled browser surface for the gated lane (default: the shared capturing service, lazily). */
@@ -138,6 +141,22 @@ export function createImageCaptureHookFromEnv(
   deps: AssembleImageCaptureDeps = {},
 ): ImageCaptureHook {
   const settings = resolveImageCaptureSettings(env);
+  // BOTH halves, or the lane is off. With the switch on but no raw store configured, the sink loader
+  // hands back a NoopCaptureSink — and capture would then fetch every image of every item, at real
+  // cost to the store and to our egress reputation, only to drop the bytes. That is the traffic with
+  // none of the corpus, so it is refused, loudly and once, rather than run.
+  const sink = deps.sink ?? getRawCaptureSink();
+  const storeConfigured = rawStoreView(sink).configured;
+  const enabled = settings.enabled && storeConfigured;
+  const disabledReason = settings.enabled
+    ? storeConfigured
+      ? undefined
+      : 'the raw store is not configured (RAW_STORE_S3_ENDPOINT / _REGION / _BUCKET and the credential pair)'
+    : 'PERSIST_RAW_IMAGES is not true';
+  if (settings.enabled && !storeConfigured) {
+    // eslint-disable-next-line no-console
+    console.warn(`[IMAGE-CAPTURE] PERSIST_RAW_IMAGES is true but ${disabledReason} — image capture stays OFF.`);
+  }
   const fetchBytes =
     deps.fetchBytes ??
     paceImageBytesByHost(
@@ -152,12 +171,13 @@ export function createImageCaptureHookFromEnv(
     );
   const reporter = createFailureReporterFromEnv(env);
   return createImageCaptureHook({
-    sink: getRawCaptureSink(),
+    sink,
     policy: deps.policy ?? loadImageHostPolicy(env),
     fetchBytes,
     proxyUrlFor: egress => (egress === 'residential' ? getResidentialProxyUrl() : undefined),
     ...(reporter ? { reportFailure: report => reporter.report(report) } : {}),
-    enabled: settings.enabled,
+    enabled,
+    ...(disabledReason !== undefined ? { disabledReason } : {}),
     maxPerItem: settings.maxPerItem,
     memoSize: settings.memoSize,
     residentialBytesPerDay: settings.residentialBytesPerDay,

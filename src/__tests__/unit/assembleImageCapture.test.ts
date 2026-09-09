@@ -19,6 +19,25 @@ import type { ImageBytesResult } from '../../services/images/imageBytes';
 
 const env = (over: Record<string, string> = {}): NodeJS.ProcessEnv => ({ PERSIST_RAW_IMAGES: 'true', ...over }) as NodeJS.ProcessEnv;
 
+/**
+ * A sink that LOOKS like the real content-addressed one. `rawStoreView` duck-types on `stats()`, so
+ * carrying it is exactly what separates a configured store from the `NoopCaptureSink` the loader
+ * returns when the RAW_STORE_S3_* variables are missing.
+ */
+const configuredSink = () => ({
+  capture: jest.fn(async () => undefined),
+  stats: () => ({
+    stored: 0,
+    deduped: 0,
+    failed: 0,
+    skippedDisabled: 0,
+    assetStored: 0,
+    assetDeduped: 0,
+    assetSkipped: { notImage: 0, tooLarge: 0, empty: 0, disabled: 0 },
+    assetFailed: 0,
+  }),
+});
+
 describe('resolveImageCaptureSettings', () => {
   it('is off unless the switch is exactly true', () => {
     expect(resolveImageCaptureSettings({} as NodeJS.ProcessEnv).enabled).toBe(false);
@@ -83,7 +102,7 @@ describe('createImageCaptureHookFromEnv', () => {
   });
 
   it('carries the deny list even with no policy table configured', async () => {
-    const hook = createImageCaptureHookFromEnv(env(), { fetchBytes: async () => { throw new Error('must not be fetched'); } });
+    const hook = createImageCaptureHookFromEnv(env(), { sink: configuredSink(), fetchBytes: async () => { throw new Error('must not be fetched'); } });
     await hook.capture({
       site: 's',
       itemId: 'i',
@@ -98,7 +117,7 @@ describe('createImageCaptureHookFromEnv', () => {
 
 describe('imageCaptureView', () => {
   it("reports the hook's counters", () => {
-    const view = imageCaptureView(createImageCaptureHookFromEnv(env()));
+    const view = imageCaptureView(createImageCaptureHookFromEnv(env(), { sink: configuredSink() }));
     expect(view).toMatchObject({ enabled: true, attempted: 0, stored: 0, failed: 0 });
     expect(view.skipped).toMatchObject({ policyDeny: 0, memo: 0, cap: 0 });
   });
@@ -164,7 +183,7 @@ describe('the process hook', () => {
   it('builds the real three-lane router when no transport is injected', async () => {
     // Nothing is fetched: the deny list answers before any lane is reached, which is exactly the
     // assertion — the wiring is real, and the ban still sits above it.
-    const hook = createImageCaptureHookFromEnv(env());
+    const hook = createImageCaptureHookFromEnv(env(), { sink: configuredSink() });
     await hook.capture({
       site: 's',
       itemId: 'i',
@@ -179,7 +198,7 @@ describe('the process hook', () => {
   it('builds the pooled browser lane once and reuses it', async () => {
     // The gated lane refuses before it touches a browser when it is handed something that is not a
     // bare store hostname — which is how this exercises the real (default) wiring without Chrome.
-    const hook = createImageCaptureHookFromEnv(env({ IMAGE_HOST_POLICY_JSON: JSON.stringify({ 'cdn.test': { lane: 'browser' } }) }));
+    const hook = createImageCaptureHookFromEnv(env({ IMAGE_HOST_POLICY_JSON: JSON.stringify({ 'cdn.test': { lane: 'browser' } }) }), { sink: configuredSink() });
     const ruleset = { describeImages: () => [{ url: 'https://cdn.test/a.jpg', role: 'gallery' as const, position: 0 }] };
     await hook.capture({ site: 's', itemId: 'i1', pageUrl: 'not-a-url', fields: {}, ruleset, origin: 'ingest' });
     await hook.capture({ site: 's', itemId: 'i2', pageUrl: 'not-a-url', fields: {}, ruleset, origin: 'ingest' });
@@ -190,6 +209,7 @@ describe('the process hook', () => {
 
   it('wires the failure ledger when the spine is configured', async () => {
     const hook = createImageCaptureHookFromEnv(env({ INGEST_BASE_URL: 'http://spine.invalid:1' }), {
+      sink: configuredSink(),
       fetchBytes: async () => ({ ok: false, reason: 'http-status', status: 404 }),
     });
     await hook.capture({
@@ -208,6 +228,7 @@ describe('the process hook', () => {
     delete process.env.RESIDENTIAL_PROXY_URL;
     try {
       const hook = createImageCaptureHookFromEnv(env(), {
+        sink: configuredSink(),
         policy: buildImageHostPolicy({ 'cdn.test': { lane: 'impit', egress: 'residential' } }),
         fetchBytes: async () => { throw new Error('a residential image must never leave through the node'); },
       });
@@ -227,6 +248,7 @@ describe('the process hook', () => {
 
   it('refuses the browser lane rather than throwing when no browser can be built', async () => {
     const hook = createImageCaptureHookFromEnv(env({ IMAGE_HOST_POLICY_JSON: JSON.stringify({ 'cdn.test': { lane: 'browser' } }) }), {
+      sink: configuredSink(),
       browserLane: () => { throw new Error('no chrome in this image'); },
     });
     await hook.capture({
@@ -274,5 +296,65 @@ describe('createRecordImageCapture', () => {
     const hook = { capture: async () => { throw new Error('image lane down'); } } as unknown as ImageCaptureHook;
     expect(() => createRecordImageCapture('ingest', () => undefined, () => hook)(records, 'https://imgstore.test/i/1', ruleset)).not.toThrow();
     await Promise.resolve();
+  });
+});
+
+/**
+ * The lane needs BOTH halves of its configuration, and `PERSIST_RAW_IMAGES` is only one of them.
+ *
+ * With the switch on but the RAW_STORE_S3_* variables missing, the sink loader hands back a
+ * `NoopCaptureSink` — so every image would be fetched from a store, at real cost to that store and
+ * to our egress reputation, and then dropped on the floor. That is the worst of both: the traffic
+ * with none of the corpus. The lane must be OFF, and it must say which half is missing, because
+ * "enabled: false" with a switch that is plainly set to true is the kind of thing an operator stares
+ * at for an hour.
+ */
+describe('createImageCaptureHookFromEnv — a lane needs a real store, not just the switch', () => {
+  const describesOne = { describeImages: () => [{ url: 'https://cdn.test/a.jpg', role: 'gallery' as const, position: 0 }] };
+  const one = (hook: ReturnType<typeof createImageCaptureHookFromEnv>) =>
+    hook.capture({ site: 's', itemId: 'i', pageUrl: 'https://store.test/p', fields: {}, ruleset: describesOne, origin: 'ingest' });
+
+  it('stays OFF when the switch is on but no raw store is configured, and says so once', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const hook = createImageCaptureHookFromEnv(env(), {
+        // The loader's own answer when RAW_STORE_S3_* is incomplete: a sink with no stats().
+        sink: { capture: async () => undefined },
+        fetchBytes: async () => { throw new Error('nothing may be fetched into a bucket that is not there'); },
+      });
+
+      await one(hook);
+
+      expect(hook.stats().enabled).toBe(false);
+      expect(hook.stats().reason).toMatch(/raw store/i);
+      expect(hook.stats().attempted).toBe(0);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0][0]).toMatch(/PERSIST_RAW_IMAGES/);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('names the switch when THAT is the missing half', () => {
+    const hook = createImageCaptureHookFromEnv({} as NodeJS.ProcessEnv, { sink: configuredSink() });
+    expect(hook.stats().enabled).toBe(false);
+    expect(hook.stats().reason).toMatch(/PERSIST_RAW_IMAGES/);
+  });
+
+  it('is ON, and says nothing, once both halves are there', async () => {
+    const sink = configuredSink();
+    const hook = createImageCaptureHookFromEnv(env(), { sink, fetchBytes: async () => ({ ok: false, reason: 'timeout' }) });
+
+    await one(hook);
+
+    expect(hook.stats().enabled).toBe(true);
+    expect(hook.stats().reason).toBeUndefined();
+    expect(hook.stats().attempted).toBe(1);
+  });
+
+  it('publishes the reason on the health view', () => {
+    const view = imageCaptureView(createImageCaptureHookFromEnv(env(), { sink: { capture: async () => undefined } }));
+    expect(view).toMatchObject({ enabled: false });
+    expect(view.reason).toMatch(/raw store/i);
   });
 });
