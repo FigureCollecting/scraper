@@ -274,7 +274,7 @@ export function assembleLookup(services: LookupServices): Lookup {
     // reputation) and list it under the additive `cooldown` list (the store is fine, we are
     // deliberately leaving its host alone). A cooling byId host must be gated HERE too, so its detail
     // target is never handed to the caller as a /resolve confirm that would fetch the cooling host.
-    const skipCooling = (p: { host: string; url: string; siteId: string }, kind: 'search' | 'record'): boolean => {
+    const skipCooling = (p: { host: string; url: string; siteId: string }): boolean => {
       if (!cd.isOpen(p.host)) return false;
       const remainingMs = cd.remaining(p.host);
       const minsLeft = Math.max(1, Math.ceil(remainingMs / 60_000));
@@ -283,10 +283,14 @@ export function assembleLookup(services: LookupServices): Lookup {
       cooldown.push(p.siteId);
       // E3 — a cooldown SKIP is reported (the operator asked to see hosts we are deliberately
       // leaving alone), carrying the window's end so the spine's backoff is never pulled forward.
+      // ALWAYS a search row, byId detail plans included: /lookup is read-only (screen here, confirm
+      // via /resolve), and a record row would become durable retry work the sweep re-POSTs to
+      // /ingest/scrape — ingesting an item no user ever confirmed. The fact is about the (store,
+      // query) that was skipped, which is exactly what fc:search names.
       emitFailure({
         site: p.siteId,
-        target: kind === 'search' ? searchFailureTarget(p.siteId, query, mode) : p.url,
-        kind,
+        target: searchFailureTarget(p.siteId, query, mode),
+        kind: 'search',
         origin: 'lookup',
         reasonClass: 'cooldown',
         message: `host ${normalizeHost(p.host)} is cooling after a Cloudflare challenge; ${minsLeft} min remaining`,
@@ -301,7 +305,7 @@ export function assembleLookup(services: LookupServices): Lookup {
         // UNVERIFIED (we haven't fetched it), so segregate it into resolveTargets — never surface it
         // as a phantom candidate (no name=barcode into the matcher, no unfetched hit in orderable mode).
         if (p.kind === 'detail') {
-          if (skipCooling(p, 'record')) return null; // cooling host → cooldown list, never a resolveTarget
+          if (skipCooling(p)) return null; // cooling host → cooldown list, never a resolveTarget
           resolveTargets.push({ siteId: p.siteId, host: p.host, itemId: p.itemId ?? '', url: p.url });
           return null;
         }
@@ -311,7 +315,7 @@ export function assembleLookup(services: LookupServices): Lookup {
           unsupported.push(p.siteId); // has a bySearch URL but no parser yet
           return null;
         }
-        if (skipCooling(p, 'search')) return null;
+        if (skipCooling(p)) return null;
         const retrieval = services.profiles.retrievalFor(p.host);
         const scope = retrieval?.bySearch?.scope ?? 'listed';
         if (mode === 'listed' && scope === 'orderable') orderableOnly.push(p.siteId);

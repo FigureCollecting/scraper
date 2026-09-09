@@ -66,6 +66,33 @@ describe('assembleLookup × fetch-failure ledger', () => {
 
   afterEach(() => warn.mockRestore());
 
+  it('E3: a cooling BYID store is a SEARCH row, never a durable record retry of an unconfirmed item', async () => {
+    // /lookup is read-only (screen, then confirm via /resolve). A record row here would become
+    // durable retry work: the sweep re-POSTs it to /ingest/scrape and ingests an item no user ever
+    // confirmed. The cooldown fact belongs to the (store, query), which is what fc:search names.
+    const JAN = '4570232591424';
+    const byIdStore = caps('plazajapan', 'plazajapan.com', {
+      byId: { urlTemplate: 'https://plazajapan.com/{id}', idKind: 'barcode' },
+    });
+    let clock = 5_000_000;
+    const cd = new ChallengeCooldown({ now: () => clock, windowMs: 10 * 60_000 });
+    cd.open('plazajapan.com', 'challenge page');
+    const { reports, lookup } = build({ profiles: buildProfileRegistry([byIdStore]), challengeCooldown: cd });
+
+    const result = await lookup.lookupByIdentity({ gtin14: JAN });
+
+    expect(result.cooldown).toEqual(['plazajapan']);
+    expect(result.resolveTargets).toHaveLength(0);
+    expect(reports).toHaveLength(1);
+    expect(reports[0]).toMatchObject({
+      site: 'plazajapan',
+      kind: 'search',
+      origin: 'lookup',
+      reasonClass: 'cooldown',
+      target: `fc:search/plazajapan?q=${JAN}&mode=listed`,
+    });
+  });
+
   it('E3: a cooling store is reported as cooldown with the remaining window as the hint', async () => {
     let clock = 5_000_000;
     const cd = new ChallengeCooldown({ now: () => clock, windowMs: 10 * 60_000 });
