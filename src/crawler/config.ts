@@ -16,12 +16,18 @@
 
 import { logger } from '../utils/logger.js';
 
-export type CrawlerMode = 'recent' | 'backfill' | 'both';
+/**
+ * Which phases one pass runs. `recent` / `backfill` / `both` are the listing-and-id-space feeder.
+ * `seed` is a DIFFERENT, exclusive pass: ONLY the declared seed lists, and none of the other phases.
+ * It is not a fourth phase bolted onto `both` because its whole justification is the bounded cost of
+ * a small declared set — folding it into a walk would hide that cost inside an unbounded one.
+ */
+export type CrawlerMode = 'recent' | 'backfill' | 'both' | 'seed';
 
 export interface CrawlerConfig {
   /** Base URL of the scraper's HTTP surface — the ONLY thing the crawler talks to. */
   scraperServiceUrl: string;
-  /** Which phases run: `recent`, `backfill`, or `both` (recent THEN backfill, one process). */
+  /** Which phases run: `recent`, `backfill`, `both` (recent THEN backfill, one process), or `seed` (the declared seed lists ONLY). */
   mode: CrawlerMode;
   /** siteIds to crawl this pass. */
   stores: string[];
@@ -46,6 +52,16 @@ export interface CrawlerConfig {
   maxConcurrency: number;
   /** Minimum spacing, in ms, between consecutive request dispatches (global). */
   requestSpacingMs: number;
+  /**
+   * SEED axis only: minimum wait, in ms, between one store's consecutive seed-list fetches. INDEPENDENT
+   * of `requestSpacingMs`, which is a global dispatch spacing shared by every store and every axis.
+   *
+   * It exists because the engine applies NO per-host floor on the catalog/seed lane — a store's
+   * declared `rateLimit` governs the ingest/record queue, not this one — so without this knob a
+   * store's whole declared set would be fetched back to back at whatever the global gate allows.
+   * The seed axis is a deliberately slow poll, so its floor is generous by default. `0` disables it.
+   */
+  seedSpacingMs: number;
   /** Per-request timeout, in ms (must exceed the engine's CATALOG_STORE_TIMEOUT_MS). */
   requestTimeoutMs: number;
   /** RECENT only: re-POST a known item once its ledger entry is at least this old. 0 = never. */
@@ -94,6 +110,7 @@ const DEFAULTS = {
   maxConcurrency: 2,
   requestSpacingMs: 1000,
   requestTimeoutMs: 45000,
+  seedSpacingMs: 10000,
   reobserveAfterMs: WEEK_MS,
   exhaustedRecheckMs: WEEK_MS,
   rangeIdsPerRun: 50,
@@ -176,7 +193,8 @@ const clampedPosInt = (raw: string | undefined, fallback: number, max: number, e
   return max;
 };
 
-const parseMode = (raw: string | undefined): CrawlerMode => (raw === 'recent' || raw === 'backfill' ? raw : 'both');
+const parseMode = (raw: string | undefined): CrawlerMode =>
+  raw === 'recent' || raw === 'backfill' || raw === 'seed' ? raw : 'both';
 
 export function loadCrawlerConfig(env: Env = process.env): CrawlerConfig {
   // A csv var is defaulted ONLY when unset. An explicitly-set-but-empty value is
@@ -199,6 +217,9 @@ export function loadCrawlerConfig(env: Env = process.env): CrawlerConfig {
     maxConcurrency: posInt(env.CRAWLER_MAX_CONCURRENCY, DEFAULTS.maxConcurrency),
     requestSpacingMs: posInt(env.CRAWLER_REQUEST_SPACING_MS, DEFAULTS.requestSpacingMs),
     requestTimeoutMs: posInt(env.CRAWLER_REQUEST_TIMEOUT_MS, DEFAULTS.requestTimeoutMs),
+    // nonNegInt, not posInt: an explicit 0 is the operator DISABLING the seed floor, and a pacing
+    // knob must not fail open by reverting to its default at its most permissive setting.
+    seedSpacingMs: nonNegInt(env.CRAWLER_SEED_SPACING_MS, DEFAULTS.seedSpacingMs),
     reobserveAfterMs: nonNegInt(env.CRAWLER_REOBSERVE_AFTER_MS, DEFAULTS.reobserveAfterMs),
     exhaustedRecheckMs: posInt(env.CRAWLER_EXHAUSTED_RECHECK_MS, DEFAULTS.exhaustedRecheckMs),
     rangeStores: csv(env.CRAWLER_RANGE_STORES ?? ''),

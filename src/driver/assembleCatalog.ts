@@ -27,7 +27,7 @@ import { sanitizeForLog } from '../utils/security.js';
 import { isCloudflareChallenge } from '../services/engineServices/challengeDetect.js';
 import { getChallengeCooldown, normalizeHost } from '../services/challengeCooldown.js';
 import { getCfCookieStore, markStaleIfStored, markFreshIfStored } from '../services/cookieJar.js';
-import type { ListingPage } from '@figurecollecting/scraper-plugin-contract';
+import type { ListingPage, RetrievalCapability, SeedList } from '@figurecollecting/scraper-plugin-contract';
 
 /** The catalog runtime takes exactly the lookup's injected services (registry, ruleset lookup, fetch, cooldown). */
 export type CatalogServices = LookupServices;
@@ -73,6 +73,66 @@ export type IdRangeResult =
   | { status: 'failed'; siteId: string; reason: string };
 
 /**
+ * One declared seed list as DISCOVERY reports it: the id it is addressed by, the url it resolves to,
+ * and the operator-facing metadata. The url is reported (rather than kept engine-side) because a
+ * poller has to be able to tell that TWO declared ids resolve to the SAME page — an authoring slip
+ * that would otherwise cost a store one wholly redundant fetch per pass, on the one axis whose whole
+ * justification is that its cost is knowable in advance. Fetching a list is still the seed axis's
+ * job, never the caller's.
+ */
+export type SeedListSummary = { id: string; url: string; cadence: SeedList['cadence']; note?: string };
+
+export type SeedListsResult =
+  | { status: 'ok'; siteId: string; seedLists: SeedListSummary[]; count: number }
+  | { status: 'unsupported'; siteId: string; reason: string };
+
+/**
+ * One fetched seed list. Shaped like the listing result so a caller consumes both with one parser —
+ * except that `hasMore` is the literal `false`: a seed list is ONE declared page, so there is no
+ * next page to signal and no `nextPage` to walk.
+ */
+export type SeedResult =
+  | {
+      status: 'ok';
+      siteId: string;
+      listId: string;
+      url: string;
+      items: CatalogItem[];
+      collectUrls: string[];
+      hasMore: false;
+      count: number;
+    }
+  | { status: 'unsupported'; siteId: string; reason: string }
+  | { status: 'cooldown'; siteId: string; host: string; remainingMs: number }
+  | { status: 'failed'; siteId: string; reason: string };
+
+/**
+ * The store's WELL-FORMED declared seed lists, in declared order. A store profile is plugin-supplied
+ * and therefore untrusted at runtime: an entry that is not an object, carries a blank id or url, or
+ * declares a cadence outside the contract's two is DROPPED rather than trusted — an unusable entry
+ * would otherwise reach the operator's summary as a list that simply never yields anything. A
+ * REPEATED id keeps its first entry: the id is how the axis is addressed, so a second one is
+ * unreachable by construction and its presence must not make the run poll the same name twice.
+ */
+function declaredSeedLists(retrieval: RetrievalCapability | undefined): SeedList[] {
+  const raw: unknown = retrieval?.seedLists;
+  if (!Array.isArray(raw)) return [];
+  const out: SeedList[] = [];
+  const seen = new Set<string>();
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') continue;
+    const { id, url, cadence, note } = entry as Partial<SeedList>;
+    if (typeof id !== 'string' || id.length === 0) continue;
+    if (typeof url !== 'string' || url.length === 0) continue;
+    if (cadence !== 'weekly' && cadence !== 'daily') continue;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push({ id, url, cadence, ...(typeof note === 'string' && note.length > 0 ? { note } : {}) });
+  }
+  return out;
+}
+
+/**
  * Default and clamp for an id-range window's size (ids per call). The crawler clamps its own
  * CRAWLER_RANGE_IDS_PER_RUN to the same ceiling (MAX_RANGE_IDS_PER_RUN in src/crawler/config.ts) so
  * an operator asking for more is warned there instead of silently receiving a shorter window here.
@@ -95,6 +155,21 @@ export interface Catalog {
    * probes them. `count` defaults to 50 and is clamped to [1, 200].
    */
   idRange(siteId: string, from: number, count?: number): IdRangeResult;
+  /**
+   * The seed lists `siteId` DECLARES, in declared order — the discovery half of the seed axis. Pure:
+   * it reads the store's profile and fetches nothing. A caller polling a store's seed lists has to
+   * learn WHICH lists exist and in what order before it can ask for one, and the declaration is the
+   * only place that is recorded; an operator env var naming them would be a second, divergable copy.
+   */
+  seedLists(siteId: string): SeedListsResult;
+  /**
+   * ONE declared seed list, fetched and parsed. The lane is EXACTLY the listing axis's — the store's
+   * own declared search transport (and with it its egress, session prime and access declarations),
+   * under the same per-host challenge cooldown, with the same challenge detection and the same
+   * stored-cookie stale/fresh signals. A seed list is not a cheaper way into a store; it is a
+   * smaller, declared set of pages reached down the identical path.
+   */
+  seed(siteId: string, listId: string): Promise<SeedResult>;
 }
 
 /** Listing-fetch timeout (ms) used when CATALOG_STORE_TIMEOUT_MS is unset/invalid, and the clamp any override rides within. */
@@ -129,6 +204,76 @@ export function assembleCatalog(services: CatalogServices): Catalog {
   const cfStore = services.cfCookieStore ?? getCfCookieStore();
 
   return {
+    seedLists(siteId) {
+      const caps = services.profiles.forSite(siteId);
+      if (!caps) return { status: 'unsupported', siteId, reason: 'unknown store' };
+      const lists = declaredSeedLists(caps.retrieval);
+      if (lists.length === 0) return { status: 'unsupported', siteId, reason: 'store declares no seed lists' };
+      const seedLists: SeedListSummary[] = lists.map((l) => ({ id: l.id, url: l.url, cadence: l.cadence, ...(l.note ? { note: l.note } : {}) }));
+      return { status: 'ok', siteId, seedLists, count: seedLists.length };
+    },
+
+    async seed(siteId, listId) {
+      const caps = services.profiles.forSite(siteId);
+      if (!caps) return { status: 'unsupported', siteId, reason: 'unknown store' };
+      const lists = declaredSeedLists(caps.retrieval);
+      if (lists.length === 0) return { status: 'unsupported', siteId, reason: 'store declares no seed lists' };
+      const list = lists.find((l) => l.id === listId);
+      // An UNDECLARED id is a coverage gap, never a fetch: the whole point of the axis is that the
+      // set of pages it may reach was written down in advance.
+      if (!list) return { status: 'unsupported', siteId, reason: `store declares no seed list ${JSON.stringify(listId)}` };
+      const url = list.url;
+      let host: string;
+      try {
+        host = normalizeHost(new URL(url).hostname);
+      } catch {
+        return { status: 'unsupported', siteId, reason: 'malformed seed list url' };
+      }
+      const ruleset = services.getRulesetForUrl(url);
+      if (!ruleset?.extractSeedList) return { status: 'unsupported', siteId, reason: 'ruleset has no extractSeedList parser' };
+
+      // The listing axis's cooldown gate, unchanged: a cooling host is skipped WITHOUT fetching,
+      // because a challenge fetch degrades the egress IP's reputation for every other store on it.
+      if (cd.isOpen(host)) {
+        const remainingMs = cd.remaining(host);
+        const minsLeft = Math.max(1, Math.ceil(remainingMs / 60_000));
+        // eslint-disable-next-line no-console
+        console.warn(`[COOLDOWN] skipped ${sanitizeForLog(url)} (${host} cooling, ${minsLeft} min left)`);
+        return { status: 'cooldown', siteId, host, remainingMs };
+      }
+
+      try {
+        const transport = services.profiles.searchTransportFor(caps.domains[0] ?? host);
+        const body = await withTimeout(services.fetchSearch(url, transport), timeoutMs, 'seed list fetch');
+        // A challenge body is NOT an empty shelf: parsing it would report the list as yielding
+        // nothing, which on a SLOW-cadence axis is a silence nobody would question for a week.
+        if (isCloudflareChallenge(body)) {
+          // eslint-disable-next-line no-console
+          console.warn(`[catalog] ${sanitizeForLog(siteId)} seed ${sanitizeForLog(listId)} failed: challenge page`);
+          cd.open(host, 'seed list challenge page');
+          markStaleIfStored(cfStore, url, host, transport.transport ?? 'http', 'seed list challenge page');
+          return { status: 'failed', siteId, reason: 'challenge page' };
+        }
+        markFreshIfStored(cfStore, url, host);
+        // UNTRUSTED plugin output, guarded exactly as the listing axis guards it. `hasMore` and
+        // `nextPage` are NOT read at all: a seed list is one declared page, so a parser claiming a
+        // further page is claiming something this axis has no way to fetch.
+        const parsed: unknown = await ruleset.extractSeedList(body, listId);
+        const raw = parsed && typeof parsed === 'object' ? (parsed as Partial<ListingPage>) : {};
+        const items = Array.isArray(raw.items)
+          ? raw.items.map(normalizeItem).filter((it): it is ListingPage['items'][number] => it !== undefined)
+          : [];
+        const decorated: CatalogItem[] = items.map((it) => withCollectUrl(it, caps.retrieval, url));
+        const collectUrls = decorated.map((it) => it.collectUrl).filter((u): u is string => typeof u === 'string' && u.length > 0);
+        return { status: 'ok', siteId, listId, url, items: decorated, collectUrls, hasMore: false, count: decorated.length };
+      } catch (err) {
+        const reason = sanitizeForLog(err instanceof Error ? err.message : String(err));
+        // eslint-disable-next-line no-console
+        console.warn(`[catalog] ${sanitizeForLog(siteId)} seed ${sanitizeForLog(listId)} failed: ${reason}`);
+        return { status: 'failed', siteId, reason };
+      }
+    },
+
     idRange(siteId, from, count) {
       const caps = services.profiles.forSite(siteId);
       if (!caps) return { status: 'unsupported', siteId, reason: 'unknown store' };

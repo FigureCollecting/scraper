@@ -270,6 +270,40 @@ export interface RetrievalCapability {
    * desc, so page 1 is the freshest). Each page body is parsed by `ExtractionRuleset.extractListing`.
    */
   byListing?: { urlTemplate: string; pageStart?: number; maxPerPage?: number; order: 'newest' };
+  /**
+   * DECLARED SEED LISTS — the finite, named set of URL-addressable pages this store may be POLLED
+   * from on a SLOW cadence. Each entry is one whole page (no paging, no cursor, no walk): the
+   * engine fetches its `url` and the ruleset's {@link ExtractionRuleset.extractSeedList} parses it
+   * into a {@link ListingPage}. Declared ONCE, in the order the operator wants them polled.
+   *
+   * This is deliberately NOT a second enumeration axis. `byListing` walks a store's whole catalogue
+   * page after page; a seed list is a HANDFUL of curated pages a store publishes anyway — a shelf,
+   * a "what's new" panel, a featured rail — polled at most daily to catch what a deep walk would
+   * only reach much later. Because the set is finite and declared, the cost of the axis is knowable
+   * before it runs, which is what makes it safe to point at a store that must be treated gently.
+   *
+   * `cadence` is the store's own answer to "how often is polling this list defensible" — `weekly`
+   * or `daily`, never faster. `note` is free text for whoever reads the declaration later.
+   */
+  seedLists?: SeedList[];
+}
+
+/**
+ * One declared seed list (see {@link RetrievalCapability.seedLists}). `id` names it — it is the
+ * value the engine's seed axis is addressed by and the key its statistics are reported under, so it
+ * must be unique within the store and stable across releases. `url` is the whole, fully-resolved
+ * page to fetch: a seed list carries no `{page}` placeholder and no cursor, because a seed list is
+ * ONE page by construction.
+ */
+export interface SeedList {
+  /** Stable, store-unique name for this list — how the seed axis addresses it and reports on it. */
+  id: string;
+  /** The exact page to fetch. Fully resolved: no placeholder, no paging. */
+  url: string;
+  /** How often polling this list is defensible. A seed list is a slow poll — never faster than daily. */
+  cadence: 'weekly' | 'daily';
+  /** Free text for the reader: what this list is, why it earns a poll. */
+  note?: string;
 }
 
 /**
@@ -526,6 +560,21 @@ export interface ExtractionRuleset {
    * the rest omit it. Async-capable like `extractCandidates()` — the engine always awaits the result.
    */
   extractListing?(body: string, url: string, ctx?: ExtractContext): ListingPage | Promise<ListingPage>;
+  /**
+   * OPTIONAL: parse one DECLARED SEED LIST body (fetched from the entry in the store's
+   * `retrieval.seedLists` whose `id` is `listId`) into the item ids that page shows. Same
+   * `ListingPage` shape as `extractListing`, and the parser is handed the LIST ID rather than a url
+   * because the url is already declared — one parser can therefore serve every list the store
+   * declares and switch on which one it was asked for.
+   *
+   * `hasMore` is ALWAYS FALSE here, whatever the parser returns: a seed list is one whole page by
+   * construction, so there is no next page to signal and nothing for a caller to walk. Returning
+   * `true` cannot make the engine fetch more — it is ignored. `nextPage` is likewise meaningless.
+   *
+   * Stores that declare `seedLists` implement it; the rest omit it. Async-capable like
+   * `extractListing` — the engine always awaits the result.
+   */
+  extractSeedList?(body: string, listId: string): ListingPage | Promise<ListingPage>;
   /**
    * OPTIONAL: when `true`, this ruleset declares that a ZERO-RECORD extraction is a VALID outcome
    * — the page was well-formed and the ruleset successfully determined there is genuinely nothing
