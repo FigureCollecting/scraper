@@ -9,6 +9,7 @@
  *   PERSIST_RAW_HTML=true                                        (the se-09 kill-switch)
  *   PERSIST_RAW_IMAGES=true                                      (the SEPARATE asset-lane switch)
  *   RAW_STORE_S3_ENDPOINT / _REGION / _BUCKET / _PREFIX / _KEY_SCHEME   (ConfigMap, envFrom)
+ *   RAW_STORE_CONCURRENCY / RAW_STORE_QUEUE_MAX / _QUEUE_MAX_BYTES (the sink's admission bounds)
  *   RAW_STORE_S3_ACCESS_KEY_ID / RAW_STORE_S3_SECRET_ACCESS_KEY   (Secret raw-store-s3-creds,
  *       whose internal keys are ACCESS_KEY_ID/SECRET_ACCESS_KEY, mapped to these
  *       prefixed env-var names via secretKeyRef — the process sees the prefixed names)
@@ -183,6 +184,9 @@ export function loadRawStoreConfigFromEnv(
     assetsEnabled,
     putTimeoutMs: parsePositive(env.RAW_STORE_PUT_TIMEOUT_MS),
     imagePutTimeoutMs: parsePositive(env.RAW_STORE_IMAGE_PUT_TIMEOUT_MS),
+    concurrency: parsePositive(env.RAW_STORE_CONCURRENCY),
+    queueMax: parsePositive(env.RAW_STORE_QUEUE_MAX),
+    queueMaxBytes: parsePositive(env.RAW_STORE_QUEUE_MAX_BYTES),
     maxImageBytes: parseImageMaxBytes(env.RAW_STORE_IMAGE_MAX_BYTES),
     pathStyle: env.RAW_STORE_S3_PATH_STYLE !== undefined ? env.RAW_STORE_S3_PATH_STYLE === 'true' : undefined,
   };
@@ -229,4 +233,66 @@ let sharedSink: CaptureSink | undefined;
 export function getRawCaptureSink(): CaptureSink {
   if (!sharedSink) sharedSink = createRawCaptureSink();
   return sharedSink;
+}
+
+
+/**
+ * How long shutdown waits for the capture queue to reach the store. Bounded on
+ * purpose: raw capture is insurance, and a pod that will not exit is a worse outcome
+ * than the handful of captures it is still holding.
+ */
+export const DEFAULT_RAW_STORE_SHUTDOWN_FLUSH_MS = 8_000;
+
+/** What the shutdown drain achieved — `abandoned` is the count that will be lost. */
+export interface RawStoreFlushOutcome {
+  drained: boolean;
+  abandoned: number;
+}
+
+/**
+ * Drain the capture queue at shutdown, inside a budget.
+ *
+ * Without this, SIGTERM discards whatever the queue is holding in silence: the sink
+ * accepted those captures, the callers were told so, and the bytes are write-once
+ * with nothing anywhere that would fetch them again. Draining cannot be unbounded
+ * either — so we wait `RAW_STORE_SHUTDOWN_FLUSH_MS`, then say plainly how many
+ * captures we are dropping on the floor. Never throws: shutdown continues regardless.
+ */
+export async function flushRawCaptureSink(
+  opts: { sink?: CaptureSink; timeoutMs?: number; env?: NodeJS.ProcessEnv } = {},
+): Promise<RawStoreFlushOutcome> {
+  const sink = opts.sink ?? getRawCaptureSink();
+  const budgetMs = opts.timeoutMs ?? parsePositive((opts.env ?? process.env).RAW_STORE_SHUTDOWN_FLUSH_MS)
+    ?? DEFAULT_RAW_STORE_SHUTDOWN_FLUSH_MS;
+  if (typeof sink.flush !== 'function') return { drained: true, abandoned: 0 };
+
+  const pending = () => {
+    const s = rawStoreView(sink).stats;
+    return s ? s.queued + s.inFlight : 0;
+  };
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = Symbol('expired');
+  try {
+    const timeout = new Promise<typeof expired>(resolve => {
+      timer = setTimeout(() => resolve(expired), budgetMs);
+    });
+    const result = await Promise.race([sink.flush().then(() => undefined), timeout]);
+    if (result !== expired) return { drained: true, abandoned: 0 };
+    const abandoned = pending();
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[RAW-STORE] shutdown flush gave up after ${budgetMs}ms — ${abandoned} capture(s) abandoned, ` +
+        'their bytes are not in the bucket and nothing will re-fetch them',
+    );
+    return { drained: false, abandoned };
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[RAW-STORE] shutdown flush failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return { drained: false, abandoned: pending() };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }

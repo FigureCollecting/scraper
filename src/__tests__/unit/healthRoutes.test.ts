@@ -16,7 +16,7 @@ const NO_IMAGE_CAPTURE: ImageCaptureStats = {
   attempted: 0,
   stored: 0,
   deduped: 0,
-  skipped: { policyDeny: 0, memo: 0, thumbnailRole: 0, userRole: 0, cap: 0, residentialBudget: 0, notImage: 0, tooLarge: 0, refused: 0, unsupported: 0, inFlight: 0 },
+  skipped: { policyDeny: 0, memo: 0, thumbnailRole: 0, userRole: 0, cap: 0, residentialBudget: 0, notImage: 0, tooLarge: 0, refused: 0, unsupported: 0, inFlight: 0, sinkQueueFull: 0 },
   failed: 0,
   residentialBytesToday: 0,
 };
@@ -353,6 +353,19 @@ describe('createHealthRoutes — rawStore counters', () => {
     assetDeduped: 7,
     assetSkipped: { notImage: 118, tooLarge: 1, empty: 0, disabled: 0 },
     assetFailed: 2,
+    // The admission queue's view: a backlog and a drop count are what separate
+    // "the bucket is slow" from "we are dropping captures on the floor".
+    queued: 9,
+    inFlight: 4,
+    dropped: 2,
+    droppedBytes: 1,
+    queuedBytes: 3145728,
+    queueWaitP50: 40,
+    queueWaitP95: 900,
+    putP50: 310,
+    putP95: 1200,
+    headP50: 90,
+    headP95: 400,
   };
 
   it('publishes the sink counters on GET /health/detailed', async () => {
@@ -467,7 +480,7 @@ describe('createHealthRoutes — imageCapture', () => {
     attempted: 40,
     stored: 31,
     deduped: 4,
-    skipped: { policyDeny: 2, memo: 9, thumbnailRole: 12, userRole: 3, cap: 1, residentialBudget: 5, notImage: 2, tooLarge: 1, refused: 4, unsupported: 1, inFlight: 7 },
+    skipped: { policyDeny: 2, memo: 9, thumbnailRole: 12, userRole: 3, cap: 1, residentialBudget: 5, notImage: 2, tooLarge: 1, refused: 4, unsupported: 1, inFlight: 7, sinkQueueFull: 6 },
     failed: 3,
     residentialBytesToday: 12_345,
   };

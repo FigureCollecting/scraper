@@ -1,6 +1,6 @@
 import { jest } from '@jest/globals';
-import { gunzipSync } from 'node:zlib';
-import { buildRawCapture } from '../../services/captureSink';
+import { gunzipSync, gzipSync } from 'node:zlib';
+import { buildRawCapture, type RawCapture } from '../../services/captureSink';
 import {
   ObjectStoreCaptureSink,
   DEFAULT_IMAGE_PUT_TIMEOUT_MS,
@@ -17,6 +17,7 @@ class FakeObjectStore implements ObjectStore {
   readonly existing = new Set<string>();
   headCalls = 0;
   putDelayMs = 0;
+  existsDelayMs = 0;
   failPut = false;
   hangPut = false;
   hangExists = false;
@@ -24,6 +25,7 @@ class FakeObjectStore implements ObjectStore {
   async exists(key: string): Promise<boolean> {
     this.headCalls += 1;
     if (this.hangExists) return new Promise<boolean>(() => {}); // never resolves
+    if (this.existsDelayMs) await new Promise(r => setTimeout(r, this.existsDelayMs));
     return this.existing.has(key);
   }
 
@@ -58,6 +60,16 @@ const cap = (over: Partial<Parameters<typeof buildRawCapture>[0]> = {}) =>
     ...over,
   });
 
+/**
+ * capture() ADMITS a capture to the sink's internal queue and returns — the HEAD/PUT
+ * runs on a worker, so the fetch path is never held behind the object store. Every
+ * assertion about what actually reached the store therefore drains the queue first.
+ */
+const send = async (s: ObjectStoreCaptureSink, c: RawCapture): Promise<void> => {
+  await s.capture(c);
+  await s.flush();
+};
+
 describe('ObjectStoreCaptureSink — sha256-v1 contract', () => {
   let store: FakeObjectStore;
   let sink: ObjectStoreCaptureSink;
@@ -74,7 +86,7 @@ describe('ObjectStoreCaptureSink — sha256-v1 contract', () => {
 
   it('writes to the content-addressed key: <prefix>sha256/<aa>/<hex>.html.gz', async () => {
     const c = cap();
-    await sink.capture(c);
+    await send(sink, c);
 
     expect(store.puts).toHaveLength(1);
     const expectedKey = `raw-html/sha256/${c.sha256.slice(0, 2)}/${c.sha256}.html.gz`;
@@ -83,7 +95,7 @@ describe('ObjectStoreCaptureSink — sha256-v1 contract', () => {
 
   it('stores gzip(content) with Content-Type application/gzip and no content-encoding', async () => {
     const c = cap();
-    await sink.capture(c);
+    await send(sink, c);
 
     const { body, opts } = store.puts[0];
     // Object bytes are gzip of the EXACT uncompressed bytes (hash-before-compress).
@@ -95,7 +107,7 @@ describe('ObjectStoreCaptureSink — sha256-v1 contract', () => {
   });
 
   it('attaches convenience metadata (url + fetched-at + site) on the first PUT', async () => {
-    await sink.capture(cap({ url: 'https://x.test/a', finalUrl: 'https://x.test/a?', fetchedAt: '2026-07-31T00:00:00.000Z' }));
+    await send(sink, cap({ url: 'https://x.test/a', finalUrl: 'https://x.test/a?', fetchedAt: '2026-07-31T00:00:00.000Z' }));
     const md = store.puts[0].opts.metadata ?? {};
     expect(md['url']).toBe('https://x.test/a?'); // finalUrl preferred when present
     expect(md['fetched-at']).toBe('2026-07-31T00:00:00.000Z');
@@ -103,14 +115,14 @@ describe('ObjectStoreCaptureSink — sha256-v1 contract', () => {
   });
 
   it('header-safes a non-ASCII / hostile URL in metadata so it cannot fail the PUT', async () => {
-    await sink.capture(cap({ url: 'https://x.test/日本\r\ninject', finalUrl: undefined }));
+    await send(sink, cap({ url: 'https://x.test/日本\r\ninject', finalUrl: undefined }));
     const urlTag = store.puts[0].opts.metadata?.['url'] ?? '';
     expect(urlTag).not.toMatch(/[\r\n]/); // no CRLF header injection
     expect(urlTag).toMatch(/^[\x20-\x7e]*$/); // pure printable ASCII
   });
 
   it('omits the site tag when the URL is malformed (best-effort metadata)', async () => {
-    await sink.capture(cap({ url: 'not a valid url', finalUrl: undefined }));
+    await send(sink, cap({ url: 'not a valid url', finalUrl: undefined }));
     const md = store.puts[0].opts.metadata ?? {};
     expect(md['site']).toBeUndefined();
     expect(md['url']).toBeDefined();
@@ -121,7 +133,7 @@ describe('ObjectStoreCaptureSink — sha256-v1 contract', () => {
     const key = `raw-html/sha256/${c.sha256.slice(0, 2)}/${c.sha256}.html.gz`;
     store.existing.add(key); // corpus already holds this content
 
-    await sink.capture(c);
+    await send(sink, c);
 
     expect(store.headCalls).toBe(1);
     expect(store.puts).toHaveLength(0); // dedup hit — no PUT
@@ -129,43 +141,43 @@ describe('ObjectStoreCaptureSink — sha256-v1 contract', () => {
   });
 
   it('writes exactly once across repeated captures of identical content', async () => {
-    await sink.capture(cap());
-    await sink.capture(cap());
-    await sink.capture(cap());
+    await send(sink, cap());
+    await send(sink, cap());
+    await send(sink, cap());
     expect(store.puts).toHaveLength(1);
     expect(sink.stats()).toMatchObject({ stored: 1, deduped: 2 });
   });
 
   it('routes the api lane to a json object (raw-json/…json.gz)', async () => {
     const c = cap({ lane: 'api', contentType: 'application/json', bytes: Buffer.from('{"ok":true}', 'utf8') });
-    await sink.capture(c);
+    await send(sink, c);
     expect(store.puts[0].key).toBe(`raw-json/sha256/${c.sha256.slice(0, 2)}/${c.sha256}.json.gz`);
   });
 
   it('uses an explicit jsonPrefix for the api lane when configured', async () => {
     const s = new ObjectStoreCaptureSink(store, { ...CONFIG, jsonPrefix: 'api-raw/' });
     const c = cap({ lane: 'api', contentType: 'application/json', bytes: Buffer.from('{}', 'utf8') });
-    await s.capture(c);
+    await send(s, c);
     expect(store.puts[0].key).toBe(`api-raw/sha256/${c.sha256.slice(0, 2)}/${c.sha256}.json.gz`);
   });
 
   it('does not corrupt a non-raw-html prefix when deriving the json sibling', async () => {
     const s = new ObjectStoreCaptureSink(store, { ...CONFIG, prefix: 'custom/', jsonPrefix: undefined });
     const c = cap({ lane: 'api', contentType: 'application/json', bytes: Buffer.from('{}', 'utf8') });
-    await s.capture(c);
+    await send(s, c);
     expect(store.puts[0].key).toBe(`custom/sha256/${c.sha256.slice(0, 2)}/${c.sha256}.json.gz`);
   });
 
   it('never throws when the store fails — it swallows and counts the failure', async () => {
     store.failPut = true;
-    await expect(sink.capture(cap())).resolves.toBeUndefined();
+    await expect(send(sink, cap())).resolves.toBeUndefined();
     expect(sink.stats().failed).toBe(1);
   });
 
   it('bounds a hung PUT by putTimeoutMs instead of stalling the scrape', async () => {
     store.hangPut = true;
     const start = Date.now();
-    await expect(sink.capture(cap())).resolves.toBeUndefined();
+    await expect(send(sink, cap())).resolves.toBeUndefined();
     expect(Date.now() - start).toBeLessThan(1000); // resolved via the 100ms bound, not hung
     expect(sink.stats().failed).toBe(1);
   });
@@ -173,7 +185,7 @@ describe('ObjectStoreCaptureSink — sha256-v1 contract', () => {
   it('bounds a hung HEAD by putTimeoutMs (not only the PUT)', async () => {
     store.hangExists = true;
     const start = Date.now();
-    await expect(sink.capture(cap())).resolves.toBeUndefined();
+    await expect(send(sink, cap())).resolves.toBeUndefined();
     expect(Date.now() - start).toBeLessThan(1000);
     expect(sink.stats().failed).toBe(1);
   });
@@ -181,7 +193,7 @@ describe('ObjectStoreCaptureSink — sha256-v1 contract', () => {
   it('falls back to the default timeout when putTimeoutMs is invalid (NaN/0)', async () => {
     // A 0/NaN bound must NOT make every op time out immediately.
     const s = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 0 });
-    await expect(s.capture(cap())).resolves.toBeUndefined();
+    await expect(send(s, cap())).resolves.toBeUndefined();
     expect(s.stats().stored).toBe(1);
   });
 });
@@ -229,7 +241,7 @@ describe('ObjectStoreCaptureSink — the asset lane', () => {
     ['avif', AVIF, 'avif', 'image/avif'],
   ])('stores a %s unaltered at raw-img/sha256/<aa>/<hex>.%s with its real Content-Type', async (_n, bytes, ext, ct) => {
     const c = asset(bytes as Buffer);
-    await sink.capture(c);
+    await send(sink, c);
 
     expect(store.puts).toHaveLength(1);
     const { key, body, opts } = store.puts[0];
@@ -242,7 +254,7 @@ describe('ObjectStoreCaptureSink — the asset lane', () => {
 
   it('sniffs the bytes rather than trusting the declared Content-Type, and records both', async () => {
     const c = asset(PNG, { contentType: 'application/octet-stream' });
-    await sink.capture(c);
+    await send(sink, c);
 
     const { key, opts } = store.puts[0];
     expect(key.endsWith('.png')).toBe(true);
@@ -251,7 +263,7 @@ describe('ObjectStoreCaptureSink — the asset lane', () => {
   });
 
   it('tags the asset with its item provenance', async () => {
-    await sink.capture(asset(JPEG));
+    await send(sink, asset(JPEG));
     const md = store.puts[0].opts.metadata ?? {};
     expect(md['url']).toBe('https://cdn.x.test/img/9.jpg');
     expect(md['fetched-at']).toBe('2026-09-08T00:00:00.000Z');
@@ -269,7 +281,7 @@ describe('ObjectStoreCaptureSink — the asset lane', () => {
     // rendition. `vary: Accept` says the response was chosen from the request header and
     // `content-encoding` says the wire body was not the stored one — neither is readable from the
     // bytes afterwards, so both are kept beside the type the store declared.
-    await sink.capture(asset(JPEG, { contentType: 'image/webp', contentEncoding: 'br', vary: 'Accept' }));
+    await send(sink, asset(JPEG, { contentType: 'image/webp', contentEncoding: 'br', vary: 'Accept' }));
     const md = store.puts[0].opts.metadata ?? {};
     expect(md['declared-content-type']).toBe('image/webp');
     expect(md['content-encoding']).toBe('br');
@@ -277,14 +289,14 @@ describe('ObjectStoreCaptureSink — the asset lane', () => {
   });
 
   it('omits both witnesses when the server sent neither', async () => {
-    await sink.capture(asset(JPEG));
+    await send(sink, asset(JPEG));
     const md = store.puts[0].opts.metadata ?? {};
     expect(md).not.toHaveProperty('content-encoding');
     expect(md).not.toHaveProperty('vary');
   });
 
   it('falls back to the image host for site when no source item is carried', async () => {
-    await sink.capture(asset(JPEG, { sourceItem: undefined, sourceUrl: undefined, position: undefined }));
+    await send(sink, asset(JPEG, { sourceItem: undefined, sourceUrl: undefined, position: undefined }));
     const md = store.puts[0].opts.metadata ?? {};
     expect(md['site']).toBe('cdn.x.test');
     expect(md['source-item']).toBeUndefined();
@@ -295,13 +307,13 @@ describe('ObjectStoreCaptureSink — the asset lane', () => {
   it('uses a configured imagePrefix', async () => {
     const s = new ObjectStoreCaptureSink(store, { ...CONFIG, imagePrefix: 'img/' });
     const c = asset(PNG);
-    await s.capture(c);
+    await send(s, c);
     expect(store.puts[0].key).toBe(`img/sha256/${c.sha256.slice(0, 2)}/${c.sha256}.png`);
   });
 
   it('writes once and dedupes identical asset bytes', async () => {
-    await sink.capture(asset(JPEG));
-    await sink.capture(asset(JPEG));
+    await send(sink, asset(JPEG));
+    await send(sink, asset(JPEG));
     expect(store.puts).toHaveLength(1);
     expect(sink.stats()).toMatchObject({ assetStored: 1, assetDeduped: 1 });
   });
@@ -312,7 +324,7 @@ describe('ObjectStoreCaptureSink — the asset lane', () => {
     ['svg', SVG],
     ['plain text', Buffer.from('not an image at all', 'utf8')],
   ])('SKIPS a %s body as notImage instead of storing or throwing', async (_n, bytes) => {
-    await expect(sink.capture(asset(bytes as Buffer))).resolves.toBeUndefined();
+    await expect(send(sink, asset(bytes as Buffer))).resolves.toBeUndefined();
     expect(store.puts).toHaveLength(0);
     expect(store.headCalls).toBe(0); // skipped before any store op
     expect(sink.stats().assetSkipped).toEqual({ notImage: 1, tooLarge: 0, empty: 0, disabled: 0 });
@@ -321,33 +333,33 @@ describe('ObjectStoreCaptureSink — the asset lane', () => {
 
   it('SKIPS an oversized image as tooLarge (RAW_STORE_IMAGE_MAX_BYTES, default 10 MiB)', async () => {
     const big = Buffer.concat([JPEG, Buffer.alloc(11 * 1024 * 1024)]);
-    await expect(sink.capture(asset(big))).resolves.toBeUndefined();
+    await expect(send(sink, asset(big))).resolves.toBeUndefined();
     expect(store.puts).toHaveLength(0);
     expect(sink.stats().assetSkipped).toEqual({ notImage: 0, tooLarge: 1, empty: 0, disabled: 0 });
   });
 
   it('honours a configured maxImageBytes', async () => {
     const s = new ObjectStoreCaptureSink(store, { ...CONFIG, maxImageBytes: 4 });
-    await s.capture(asset(JPEG));
+    await send(s, asset(JPEG));
     expect(store.puts).toHaveLength(0);
     expect(s.stats().assetSkipped.tooLarge).toBe(1);
   });
 
   it('SKIPS an empty body as empty', async () => {
-    await expect(sink.capture(asset(Buffer.alloc(0)))).resolves.toBeUndefined();
+    await expect(send(sink, asset(Buffer.alloc(0)))).resolves.toBeUndefined();
     expect(store.puts).toHaveLength(0);
     expect(sink.stats().assetSkipped).toEqual({ notImage: 0, tooLarge: 0, empty: 1, disabled: 0 });
   });
 
   it('counts an asset store failure as assetFailed, never throwing', async () => {
     store.failPut = true;
-    await expect(sink.capture(asset(JPEG))).resolves.toBeUndefined();
+    await expect(send(sink, asset(JPEG))).resolves.toBeUndefined();
     expect(sink.stats()).toMatchObject({ assetFailed: 1, failed: 0 });
   });
 
   it('keeps the asset counters separate from the page-body counters', async () => {
-    await sink.capture(asset(JPEG));
-    await sink.capture(cap());
+    await send(sink, asset(JPEG));
+    await send(sink, cap());
     expect(sink.stats()).toEqual({
       stored: 1,
       deduped: 0,
@@ -357,14 +369,28 @@ describe('ObjectStoreCaptureSink — the asset lane', () => {
       assetDeduped: 0,
       assetFailed: 0,
       assetSkipped: { notImage: 0, tooLarge: 0, empty: 0, disabled: 0 },
+      // The queue's own view, drained: nothing waiting, nothing running, nothing lost.
+      queued: 0,
+      inFlight: 0,
+      dropped: 0,
+      droppedBytes: 0,
+      queuedBytes: 0,
+      // Latencies are wall clock, so the SHAPE is asserted and the values are not:
+      // a real HEAD that happens to cross a millisecond boundary is not a defect.
+      queueWaitP50: expect.any(Number),
+      queueWaitP95: expect.any(Number),
+      putP50: expect.any(Number),
+      putP95: expect.any(Number),
+      headP50: expect.any(Number),
+      headP95: expect.any(Number),
     });
   });
 
   it('leaves the wire/dom/api lanes byte-identical: still gzip, still .html.gz/.json.gz', async () => {
     const w = cap();
     const a = cap({ lane: 'api', contentType: 'application/json', bytes: Buffer.from('{"ok":true}', 'utf8') });
-    await sink.capture(w);
-    await sink.capture(a);
+    await send(sink, w);
+    await send(sink, a);
 
     const html = store.puts.find(p => p.key.endsWith('.html.gz'))!;
     const json = store.puts.find(p => p.key.endsWith('.json.gz'))!;
@@ -377,7 +403,7 @@ describe('ObjectStoreCaptureSink — the asset lane', () => {
   });
 
   it('never lets an image content-type on a PAGE lane divert it to the image prefix', async () => {
-    await sink.capture(cap({ contentType: 'image/png' }));
+    await send(sink, cap({ contentType: 'image/png' }));
     expect(store.puts[0].key.startsWith('raw-html/')).toBe(true);
     expect(store.puts[0].key.endsWith('.html.gz')).toBe(true);
   });
@@ -396,7 +422,7 @@ describe('ObjectStoreCaptureSink — per-lane enable flags', () => {
 
   it('refuses the asset lane when assetsEnabled is false — counted as a disabled skip, no store op', async () => {
     const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, assetsEnabled: false });
-    await sink.capture(asset(JPEG));
+    await send(sink, asset(JPEG));
 
     expect(store.puts).toHaveLength(0);
     expect(store.headCalls).toBe(0);
@@ -406,8 +432,8 @@ describe('ObjectStoreCaptureSink — per-lane enable flags', () => {
 
   it('refuses the page lanes when pagesEnabled is false — counted, no store op', async () => {
     const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, pagesEnabled: false });
-    await sink.capture(cap());
-    await sink.capture(cap({ lane: 'api', bytes: Buffer.from('{"a":1}', 'utf8') }));
+    await send(sink, cap());
+    await send(sink, cap({ lane: 'api', bytes: Buffer.from('{"a":1}', 'utf8') }));
 
     expect(store.puts).toHaveLength(0);
     expect(store.headCalls).toBe(0);
@@ -417,8 +443,8 @@ describe('ObjectStoreCaptureSink — per-lane enable flags', () => {
 
   it('runs one lane while the other is off (images-only wiring stores images, never pages)', async () => {
     const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, pagesEnabled: false, assetsEnabled: true });
-    await sink.capture(cap());
-    await sink.capture(asset(PNG));
+    await send(sink, cap());
+    await send(sink, asset(PNG));
 
     expect(store.puts).toHaveLength(1);
     expect(store.puts[0].key.startsWith('raw-img/')).toBe(true);
@@ -428,8 +454,8 @@ describe('ObjectStoreCaptureSink — per-lane enable flags', () => {
 
   it('defaults both lanes ON when the flags are absent (existing construction is unchanged)', async () => {
     const sink = new ObjectStoreCaptureSink(store, CONFIG);
-    await sink.capture(cap());
-    await sink.capture(asset(JPEG));
+    await send(sink, cap());
+    await send(sink, asset(JPEG));
     expect(sink.stats().stored).toBe(1);
     expect(sink.stats().assetStored).toBe(1);
     expect(sink.stats().skippedDisabled).toBe(0);
@@ -464,7 +490,7 @@ describe('ObjectStoreCaptureSink — user-metadata is budgeted as a whole', () =
   const LONG_PAGE = `https://x.test/item/${'b'.repeat(2000)}`;
 
   it('keeps a hostile asset metadata set under the S3 ceiling instead of failing the PUT', async () => {
-    await sink.capture(
+    await send(sink, 
       asset(JPEG, {
         url: LONG_IMG,
         sourceUrl: LONG_PAGE,
@@ -478,7 +504,7 @@ describe('ObjectStoreCaptureSink — user-metadata is budgeted as a whole', () =
   });
 
   it('sheds the least valuable provenance first: the negotiation witnesses, then declared-content-type, then source-url', async () => {
-    await sink.capture(
+    await send(sink, 
       asset(JPEG, {
         url: LONG_IMG,
         sourceUrl: LONG_PAGE,
@@ -496,19 +522,19 @@ describe('ObjectStoreCaptureSink — user-metadata is budgeted as a whole', () =
   });
 
   it('budgets the page lanes too — a hostile URL cannot blow their metadata either', async () => {
-    await sink.capture(cap({ url: `https://${'d'.repeat(1200)}.test/${'e'.repeat(1200)}` }));
+    await send(sink, cap({ url: `https://${'d'.repeat(1200)}.test/${'e'.repeat(1200)}` }));
     expect(metadataBytes(store.puts[0].opts.metadata)).toBeLessThan(2048);
   });
 
   it('leaves an ordinary asset metadata set completely intact', async () => {
-    await sink.capture(asset(JPEG));
+    await send(sink, asset(JPEG));
     expect(Object.keys(store.puts[0].opts.metadata!).sort()).toEqual([
       'bytes', 'declared-content-type', 'fetched-at', 'lane', 'position', 'site', 'source-item', 'source-url', 'url',
     ]);
   });
 
   it('header-safes every metadata value, including fetched-at and position', async () => {
-    await sink.capture(
+    await send(sink, 
       asset(JPEG, {
         fetchedAt: '2026-09-08T00:00:00.000Z\r\nx-amz-acl: public-read',
         position: '3\r\nx-amz-acl: public-read' as unknown as number,
@@ -537,7 +563,7 @@ describe('ObjectStoreCaptureSink — the asset lane has its own op budget', () =
     const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 50, imagePutTimeoutMs: 300 });
 
     let settled = false;
-    const done = sink.capture(asset(JPEG)).then(() => { settled = true; });
+    const done = send(sink, asset(JPEG)).then(() => { settled = true; });
     await new Promise(r => setTimeout(r, 150));
     expect(settled).toBe(false); // the page lane's 50ms did NOT apply
     await done;
@@ -548,7 +574,7 @@ describe('ObjectStoreCaptureSink — the asset lane has its own op budget', () =
     const store = new FakeObjectStore();
     store.hangPut = true;
     const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 50, imagePutTimeoutMs: 5_000 });
-    await sink.capture(cap());
+    await send(sink, cap());
     expect(sink.stats().failed).toBe(1);
   });
 });
@@ -573,21 +599,21 @@ describe('ObjectStoreCaptureSink — sniffing is total and never throws', () => 
       Buffer.from([0, 0, 0, 0]), // minor version
       Buffer.from('mif1avifmiaf'), // the compatible-brand list
     ]);
-    await sink.capture(asset(bytes));
+    await send(sink, asset(bytes));
     expect(store.puts[0].key.endsWith('.avif')).toBe(true);
     expect(store.puts[0].opts.contentType).toBe('image/avif');
   });
 
   it('still refuses a non-AVIF ISO-BMFF container (an mp4 is not an image)', async () => {
     const mp4 = Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from('ftypisomisomiso2')]);
-    await sink.capture(asset(mp4));
+    await send(sink, asset(mp4));
     expect(store.puts).toHaveLength(0);
     expect(sink.stats().assetSkipped.notImage).toBe(1);
   });
 
   it('handles a plain Uint8Array body (what `new Uint8Array(await res.arrayBuffer())` yields)', async () => {
     const view = new Uint8Array(PNG) as unknown as Buffer;
-    await expect(sink.capture(asset(view))).resolves.toBeUndefined();
+    await expect(send(sink, asset(view))).resolves.toBeUndefined();
     expect(store.puts).toHaveLength(1);
     expect(store.puts[0].key.endsWith('.png')).toBe(true);
     expect(sink.stats().assetFailed).toBe(0);
@@ -596,7 +622,7 @@ describe('ObjectStoreCaptureSink — sniffing is total and never throws', () => 
   it('COUNTS a malformed capture instead of rejecting out of capture()', async () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
     const broken = { ...asset(JPEG), bytes: undefined as unknown as Buffer };
-    await expect(sink.capture(broken)).resolves.toBeUndefined();
+    await expect(send(sink, broken)).resolves.toBeUndefined();
     expect(sink.stats().assetFailed).toBe(1);
     expect(store.puts).toHaveLength(0);
     warn.mockRestore();
@@ -604,8 +630,565 @@ describe('ObjectStoreCaptureSink — sniffing is total and never throws', () => 
 
   it('types the PREFIX only: a GIF89a polyglot is stored as a gif (documented, not accidental)', async () => {
     const polyglot = Buffer.from('GIF89a/*<script>alert(1)</script>*/', 'binary');
-    await sink.capture(asset(polyglot));
+    await send(sink, asset(polyglot));
     expect(store.puts[0].opts.contentType).toBe('image/gif');
     expect(store.puts[0].key.endsWith('.gif')).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The admission queue: the sink owns a bounded worker pool so a crawl wave can
+// never put an unbounded number of store ops in flight, and so the op budget
+// measures the UPLOAD rather than the wait for a slot.
+// ---------------------------------------------------------------------------
+
+/**
+ * A store whose PUTs PARK until the test releases them. Parking (rather than
+ * delaying) is what makes the concurrency bound observable: the number of open
+ * PUTs at any instant is exactly the number of workers the sink is running.
+ */
+class GatedObjectStore implements ObjectStore {
+  readonly keys: string[] = [];
+  readonly bodies: Buffer[] = [];
+  readonly parked: Array<() => void> = [];
+  maxParked = 0;
+  existing = new Set<string>();
+  /** When set, a PUT resolves after this many ms instead of parking. */
+  putMs = 0;
+  /** When true a PUT stops parking and resolves at once — the cheap way to drain deep queues. */
+  open = false;
+
+  async exists(key: string): Promise<boolean> {
+    return this.existing.has(key);
+  }
+
+  async put(key: string, body: Buffer): Promise<void> {
+    this.keys.push(key);
+    this.bodies.push(body);
+    // The real bucket is write-once and content-addressed: once written, the key
+    // exists and a later HEAD for the same content is a dedup hit.
+    this.existing.add(key);
+    if (this.open) return;
+    if (this.putMs) {
+      await new Promise(r => setTimeout(r, this.putMs));
+      return;
+    }
+    await new Promise<void>(resolve => {
+      this.parked.push(resolve);
+      this.maxParked = Math.max(this.maxParked, this.parked.length);
+    });
+  }
+
+  /** Let every currently-parked PUT complete. */
+  release(): void {
+    this.parked.splice(0).forEach(r => r());
+  }
+}
+
+/** One turn of the event loop, including the threadpool work async gzip does. */
+const tick = () => new Promise(r => setImmediate(r));
+
+/**
+ * Spin the loop until `cond` holds (or we give up), without a fixed sleep. The budget
+ * is generous because gzip runs on libuv's 4-thread pool: filling a 64-deep worker
+ * set means 64 compressions, and on a contended CI runner those need far more than a
+ * few hundred turns. The loop exits the moment the condition holds, so a large budget
+ * costs a passing test nothing.
+ */
+const until = async (cond: () => boolean, turns = 20_000): Promise<void> => {
+  for (let i = 0; i < turns; i += 1) {
+    if (cond()) return;
+    await tick();
+  }
+};
+
+/** Release parked PUTs until the sink's queue is empty. */
+const drain = async (store: GatedObjectStore, sink: ObjectStoreCaptureSink): Promise<void> => {
+  const done = sink.flush();
+  for (let i = 0; i < 5000; i += 1) {
+    const s = sink.stats();
+    if (s.queued === 0 && s.inFlight === 0) break;
+    store.release();
+    await tick();
+  }
+  await done;
+};
+
+/** N captures with DISTINCT bytes, so none of them dedups against another. */
+const distinct = (n: number) =>
+  Array.from({ length: n }, (_, i) => cap({ bytes: Buffer.from(`<html>${i}</html>`, 'utf8') }));
+
+describe('ObjectStoreCaptureSink — bounded admission queue', () => {
+  it('never runs more store ops at once than RAW_STORE_CONCURRENCY', async () => {
+    const store = new GatedObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 60_000, concurrency: 2 });
+
+    for (const c of distinct(10)) await sink.capture(c);
+    await until(() => store.parked.length === 2);
+
+    expect(store.parked.length).toBe(2);
+    expect(sink.stats().inFlight).toBe(2);
+    expect(sink.stats().queued).toBe(8);
+
+    await drain(store, sink);
+    expect(store.maxParked).toBe(2);
+    expect(sink.stats().stored).toBe(10);
+  });
+
+  it('defaults the bound to 4 when concurrency is unset or nonsense', async () => {
+    const store = new GatedObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 60_000, concurrency: 0 });
+
+    for (const c of distinct(10)) await sink.capture(c);
+    await until(() => store.parked.length === 4);
+
+    expect(store.parked.length).toBe(4);
+    await drain(store, sink);
+    expect(store.maxParked).toBe(4);
+  });
+
+  it('drops — and counts — a capture offered when the queue is already at queueMax', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new GatedObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, {
+      ...CONFIG, putTimeoutMs: 60_000, concurrency: 1, queueMax: 3,
+    });
+
+    // One capture is taken straight to a worker; three fill the queue; the rest drop.
+    for (const c of distinct(10)) await sink.capture(c);
+
+    expect(sink.stats().queued).toBe(3);
+    expect(sink.stats().dropped).toBe(6);
+    // Dropping is loud, but only once a minute — a wave must not become a log flood.
+    const dropLogs = warn.mock.calls.filter(a => String(a[0]).includes('capture queue full'));
+    expect(dropLogs).toHaveLength(1);
+
+    await drain(store, sink);
+    expect(sink.stats().stored).toBe(4); // exactly what was admitted
+    warn.mockRestore();
+  });
+
+  it('logs a queue-full drop at most once a minute', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    let now = 1_700_000_000_000;
+    const clock = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    const store = new GatedObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, {
+      ...CONFIG, putTimeoutMs: 60_000, concurrency: 1, queueMax: 1,
+    });
+    const dropLogs = () => warn.mock.calls.filter(a => String(a[0]).includes('capture queue full')).length;
+
+    for (const c of distinct(4)) await sink.capture(c); // 1 running + 1 queued + 2 dropped
+    expect(dropLogs()).toBe(1);
+
+    now += 30_000;
+    for (const c of distinct(2)) await sink.capture(c);
+    expect(dropLogs()).toBe(1); // still inside the same minute
+
+    now += 31_000;
+    for (const c of distinct(2)) await sink.capture(c);
+    expect(dropLogs()).toBe(2);
+
+    clock.mockRestore();
+    await drain(store, sink);
+    warn.mockRestore();
+  });
+
+  it('times only the upload: a long queue wait never trips the op budget', async () => {
+    const store = new GatedObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, {
+      ...CONFIG, putTimeoutMs: 60, concurrency: 1, queueMax: 100,
+    });
+    let now = 1_700_000_000_000;
+    const clock = jest.spyOn(Date, 'now').mockImplementation(() => now);
+
+    // Park the worker so the rest genuinely queue behind it, then advance the clock
+    // by five minutes: five thousand times the op budget, spent entirely in the
+    // queue. Under the old timer — armed when the capture was offered — every one of
+    // these would have been abandoned as a store timeout and silently lost.
+    await sink.capture(cap({ bytes: Buffer.from('first', 'utf8') }));
+    await until(() => store.parked.length === 1);
+    for (const c of distinct(5)) await sink.capture(c);
+    now += 5 * 60_000;
+
+    store.open = true;
+    store.release();
+    await sink.flush();
+
+    expect(sink.stats().queueWaitP95).toBeGreaterThan(60);
+    expect(sink.stats().failed).toBe(0);
+    expect(sink.stats().stored).toBe(6);
+    clock.mockRestore();
+  });
+
+  it('samples a PUT that TIMED OUT, so a failing lane cannot hide behind a fast p95', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new FakeObjectStore();
+    store.hangPut = true;
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 60 });
+
+    await sink.capture(cap());
+    await sink.flush();
+
+    expect(sink.stats().failed).toBe(1);
+    // The op that consumed the whole budget is the one an operator most needs in
+    // the percentile; sampling successes only makes a dying lane look healthy.
+    expect(sink.stats().putP95).toBeGreaterThanOrEqual(50);
+    warn.mockRestore();
+  });
+
+  it('times the HEAD as well as the PUT', async () => {
+    const store = new FakeObjectStore();
+    store.existsDelayMs = 25;
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 5_000 });
+
+    await sink.capture(cap());
+    await sink.flush();
+
+    // HEAD is half the round trips this sink makes; leaving it untimed hid half the
+    // latency, and a dedup hit is nothing BUT a HEAD.
+    expect(sink.stats().headP95).toBeGreaterThanOrEqual(20);
+    expect(sink.stats().headP50).toBeGreaterThanOrEqual(20);
+  });
+
+  it('samples the HEAD on a dedup hit, where there is no PUT to measure', async () => {
+    const store = new FakeObjectStore();
+    store.existsDelayMs = 25;
+    const c = cap();
+    store.existing.add(`raw-html/sha256/${c.sha256.slice(0, 2)}/${c.sha256}.html.gz`);
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 5_000 });
+
+    await sink.capture(c);
+    await sink.flush();
+
+    expect(sink.stats().deduped).toBe(1);
+    expect(sink.stats().headP95).toBeGreaterThanOrEqual(20);
+    expect(sink.stats().putP95).toBe(0); // no upload happened, so nothing to report
+  });
+
+  it('reports queue wait and upload time separately on the stats', async () => {
+    const store = new GatedObjectStore();
+    store.putMs = 5;
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 5_000, concurrency: 1 });
+
+    for (const c of distinct(4)) await sink.capture(c);
+    await sink.flush();
+
+    const s = sink.stats();
+    expect(s).toMatchObject({ queued: 0, inFlight: 0, dropped: 0, stored: 4 });
+    expect(s.putP50).toBeGreaterThanOrEqual(0);
+    expect(s.putP95).toBeGreaterThanOrEqual(s.putP50);
+    expect(s.queueWaitP95).toBeGreaterThanOrEqual(s.queueWaitP50);
+  });
+
+  it('admits without blocking the caller: capture() resolves while the PUT is still open', async () => {
+    const store = new GatedObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 60_000, concurrency: 1 });
+
+    await expect(sink.capture(cap())).resolves.toEqual({ admitted: true });
+    await until(() => store.parked.length === 1);
+
+    expect(store.parked.length).toBe(1); // the upload is still in flight…
+    expect(sink.stats().stored).toBe(0); // …and nothing has been counted yet
+
+    await drain(store, sink);
+    expect(sink.stats().stored).toBe(1);
+  });
+
+  it('keeps the best-effort contract: a failing store never rejects out of capture()', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const boom: ObjectStore = {
+      async exists() { return false; },
+      async put() { throw new Error('simulated store failure'); },
+    };
+    const sink = new ObjectStoreCaptureSink(boom, { ...CONFIG, concurrency: 2 });
+
+    // Admitted, then the store blew up on the worker: the failure is counted, never thrown.
+    await expect(sink.capture(cap())).resolves.toEqual({ admitted: true });
+    await sink.flush();
+
+    expect(sink.stats().failed).toBe(1);
+    warn.mockRestore();
+  });
+
+  it('gzips off the event loop and stores exactly the bytes gzipSync would have', async () => {
+    const store = new GatedObjectStore();
+    store.putMs = 1;
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 5_000 });
+
+    await sink.capture(cap());
+    await sink.flush();
+
+    const body = store.bodies[0];
+    expect(body.subarray(0, 2)).toEqual(Buffer.from([0x1f, 0x8b])); // a real gzip member
+    expect(gunzipSync(body).equals(HTML)).toBe(true);
+    // Same content the synchronous path produced — the only permitted difference
+    // is in the header (mtime/OS), so the comparison is on the decompressed bytes.
+    expect(gunzipSync(body).equals(gunzipSync(gzipSync(HTML)))).toBe(true);
+  });
+
+  it('shares one queue and one bound across the page and asset lanes', async () => {
+    const store = new GatedObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, {
+      ...CONFIG, imagePrefix: 'raw-img/', putTimeoutMs: 60_000, imagePutTimeoutMs: 60_000, concurrency: 2,
+    });
+
+    for (const c of distinct(3)) await sink.capture(c);
+    for (let i = 0; i < 3; i += 1) {
+      await sink.capture(asset(Buffer.concat([PNG, Buffer.from([i])])));
+    }
+
+    await until(() => store.parked.length === 2);
+    expect(sink.stats().inFlight).toBe(2);
+    expect(sink.stats().queued).toBe(4); // both lanes waiting in the SAME queue
+
+    await drain(store, sink);
+    expect(store.maxParked).toBe(2);
+    expect(sink.stats().stored).toBe(3);
+    expect(sink.stats().assetStored).toBe(3);
+    expect(store.keys.filter(k => k.startsWith('raw-img/'))).toHaveLength(3);
+  });
+
+  it('counts asset-lane skips at admission — a skip costs no queue slot', async () => {
+    const store = new GatedObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, concurrency: 1 });
+
+    await sink.capture(asset(Buffer.from('<!doctype html>not an image', 'utf8')));
+    await sink.capture(asset(Buffer.alloc(0)));
+
+    // Synchronously true, with no drain: these decisions need no store round trip.
+    expect(sink.stats().assetSkipped.notImage).toBe(1);
+    expect(sink.stats().assetSkipped.empty).toBe(1);
+    expect(sink.stats().queued).toBe(0);
+    expect(sink.stats().inFlight).toBe(0);
+  });
+
+  it('counts a disabled lane at admission without queueing anything', async () => {
+    const store = new GatedObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, {
+      ...CONFIG, pagesEnabled: false, assetsEnabled: false, concurrency: 1,
+    });
+
+    await sink.capture(cap());
+    await sink.capture(asset(PNG));
+
+    expect(sink.stats()).toMatchObject({ skippedDisabled: 1, queued: 0, inFlight: 0 });
+    expect(sink.stats().assetSkipped.disabled).toBe(1);
+    expect(store.keys).toHaveLength(0);
+  });
+
+  it('clamps a runaway concurrency so a typo cannot restore the unbounded fan-out', async () => {
+    const store = new GatedObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 60_000, concurrency: 1000 });
+
+    for (const c of distinct(70)) await sink.capture(c);
+    await until(() => store.parked.length === 64);
+
+    expect(store.parked.length).toBe(64);
+    await drain(store, sink);
+    expect(store.maxParked).toBe(64);
+  });
+
+  it('drops on the BYTE ceiling long before the count ceiling is reached', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new GatedObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, {
+      ...CONFIG, putTimeoutMs: 60_000, concurrency: 1, queueMax: 100, queueMaxBytes: 1000,
+    });
+
+    // 400-byte bodies: one goes straight to the worker, two fit the 1000-byte
+    // budget, the fourth would put the queue over it. The count ceiling (100) is
+    // nowhere near — a queue of 10 MiB assets exhausts memory at a depth the
+    // count alone calls healthy.
+    for (let i = 0; i < 4; i += 1) await sink.capture(cap({ bytes: Buffer.alloc(400, i) }));
+
+    expect(sink.stats().queued).toBe(2);
+    expect(sink.stats().queuedBytes).toBe(800);
+    expect(sink.stats().droppedBytes).toBe(1);
+    expect(sink.stats().dropped).toBe(0); // the COUNT ceiling was never the binding one
+
+    await drain(store, sink);
+    warn.mockRestore();
+  });
+
+  it('counts the two ceilings separately so an operator knows which one bound', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new GatedObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, {
+      ...CONFIG, putTimeoutMs: 60_000, concurrency: 1, queueMax: 2, queueMaxBytes: 10_000,
+    });
+
+    // Small bodies, so only the count ceiling can bind: 1 running + 2 queued + 2 dropped.
+    for (let i = 0; i < 5; i += 1) await sink.capture(cap({ bytes: Buffer.alloc(10, i) }));
+
+    expect(sink.stats().dropped).toBe(2);
+    expect(sink.stats().droppedBytes).toBe(0);
+
+    await drain(store, sink);
+    warn.mockRestore();
+  });
+
+  it('releases the byte budget as the queue drains', async () => {
+    const store = new GatedObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, {
+      ...CONFIG, putTimeoutMs: 60_000, concurrency: 1, queueMax: 100, queueMaxBytes: 1000,
+    });
+
+    for (let i = 0; i < 3; i += 1) await sink.capture(cap({ bytes: Buffer.alloc(400, i) }));
+    expect(sink.stats().queuedBytes).toBe(800);
+
+    await drain(store, sink);
+    expect(sink.stats().queuedBytes).toBe(0);
+
+    // The budget is a live ceiling, not a lifetime one: capture works again.
+    await sink.capture(cap({ bytes: Buffer.alloc(400, 9) }));
+    expect(sink.stats().droppedBytes).toBe(0);
+    await drain(store, sink);
+    expect(sink.stats().stored).toBe(4);
+  });
+
+  it('defaults the byte ceiling to 256 MiB when unset or nonsense', async () => {
+    const store = new GatedObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 60_000, queueMaxBytes: 0 });
+    // 1 MiB queued against the default budget is nowhere near it.
+    await sink.capture(cap({ bytes: Buffer.alloc(1024 * 1024, 1) }));
+    expect(sink.stats().droppedBytes).toBe(0);
+    await drain(store, sink);
+  });
+
+  it('clamps a runaway queueMax so the count ceiling stays a real bound', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new GatedObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, {
+      ...CONFIG, putTimeoutMs: 60_000, concurrency: 1, queueMax: 10_000, queueMaxBytes: 1024 * 1024 * 1024,
+    });
+
+    // 1 running + 5000 queued (the clamp) + 1 dropped.
+    for (let i = 0; i < 5002; i += 1) await sink.capture(cap({ bytes: Buffer.from(`b${i}`) }));
+
+    expect(sink.stats().queued).toBe(5000);
+    expect(sink.stats().dropped).toBe(1);
+
+    // Drain by opening the store rather than releasing 5000 parked PUTs one tick at
+    // a time — a backlog left running would starve the next test's event loop.
+    store.open = true;
+    store.release();
+    await sink.flush();
+    expect(sink.stats().queued).toBe(0);
+    warn.mockRestore();
+  });
+
+  it('tells the caller a dropped capture was NOT admitted, and why', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new GatedObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, {
+      ...CONFIG, putTimeoutMs: 60_000, concurrency: 1, queueMax: 1,
+    });
+
+    await expect(sink.capture(cap({ bytes: Buffer.from('a') }))).resolves.toEqual({ admitted: true });
+    await expect(sink.capture(cap({ bytes: Buffer.from('b') }))).resolves.toEqual({ admitted: true });
+    // Third one: the queue is full. Silence here is what let the image hook count a
+    // dropped capture as stored and memoize the url, suppressing its own retry.
+    await expect(sink.capture(cap({ bytes: Buffer.from('c') }))).resolves.toEqual({
+      admitted: false, reason: 'queueFull',
+    });
+
+    store.open = true;
+    store.release();
+    await sink.flush();
+    warn.mockRestore();
+  });
+
+  it('names the BYTE ceiling as the reason when that is the one that bound', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new GatedObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, {
+      ...CONFIG, putTimeoutMs: 60_000, concurrency: 1, queueMax: 100, queueMaxBytes: 500,
+    });
+
+    await sink.capture(cap({ bytes: Buffer.alloc(400, 1) })); // straight to the worker
+    await sink.capture(cap({ bytes: Buffer.alloc(400, 2) })); // queued, 400 of 500
+    await expect(sink.capture(cap({ bytes: Buffer.alloc(400, 3) }))).resolves.toEqual({
+      admitted: false, reason: 'queueBytesFull',
+    });
+
+    store.open = true;
+    store.release();
+    await sink.flush();
+    warn.mockRestore();
+  });
+
+  it('treats a typed skip and a disabled lane as ADMITTED — decisions, not refusals', async () => {
+    const store = new GatedObjectStore();
+    store.open = true;
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, concurrency: 1 });
+
+    // The sink resolved these captures. Re-offering them changes nothing, so they
+    // must NOT read as "try again" — only a full queue means that.
+    await expect(sink.capture(asset(Buffer.from('<html>nope</html>')))).resolves.toEqual({ admitted: true });
+    const off = new ObjectStoreCaptureSink(store, { ...CONFIG, pagesEnabled: false, assetsEnabled: false });
+    await expect(off.capture(cap())).resolves.toEqual({ admitted: true });
+    await expect(off.capture(asset(PNG))).resolves.toEqual({ admitted: true });
+    await sink.flush();
+  });
+
+  it('does not race the same content address into two PUTs', async () => {
+    const store = new GatedObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 60_000, concurrency: 2 });
+
+    // Identical bytes → identical key. The HEAD-then-PUT dedup is blind to a sibling
+    // op: both workers HEAD before either PUT lands, both miss, and the "write-once"
+    // contract becomes two uploads of the same object.
+    await sink.capture(cap());
+    await sink.capture(cap());
+    await until(() => store.parked.length === 1);
+
+    expect(store.keys).toHaveLength(1);
+    expect(sink.stats().deduped).toBe(1);
+
+    store.open = true;
+    store.release();
+    await sink.flush();
+    expect(sink.stats().stored).toBe(1);
+    expect(store.keys).toHaveLength(1);
+  });
+
+  it('applies the in-flight guard to the asset lane on the same key space', async () => {
+    const store = new GatedObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, {
+      ...CONFIG, imagePrefix: 'raw-img/', imagePutTimeoutMs: 60_000, concurrency: 2,
+    });
+
+    await sink.capture(asset(PNG));
+    await sink.capture(asset(PNG));
+    await until(() => store.parked.length === 1);
+
+    expect(store.keys).toHaveLength(1);
+    expect(sink.stats().assetDeduped).toBe(1);
+
+    store.open = true;
+    store.release();
+    await sink.flush();
+    expect(sink.stats().assetStored).toBe(1);
+  });
+
+  it('releases the in-flight key when the op finishes, so a later capture still dedups', async () => {
+    const store = new GatedObjectStore();
+    store.open = true;
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 5_000, concurrency: 2 });
+
+    await sink.capture(cap());
+    await sink.flush();
+    // The guard is for CONCURRENT ops only; the store's own HEAD answers the rest.
+    await sink.capture(cap());
+    await sink.flush();
+
+    expect(sink.stats()).toMatchObject({ stored: 1, deduped: 1 });
+    expect(store.keys).toHaveLength(1);
+  });
+
+  it('flush() resolves immediately when nothing is queued', async () => {
+    const sink = new ObjectStoreCaptureSink(new GatedObjectStore(), CONFIG);
+    await expect(sink.flush()).resolves.toBeUndefined();
   });
 });
