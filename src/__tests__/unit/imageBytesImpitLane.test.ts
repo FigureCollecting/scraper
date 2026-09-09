@@ -85,7 +85,7 @@ describe('createImpitBytesFetch', () => {
 
     const headers = fetch.mock.calls[0][1].headers as Record<string, string>;
     expect(headers.accept).toBe(ARCHIVAL_IMAGE_ACCEPT);
-    expect(headers.accept).not.toMatch(/webp|avif/);
+    expect(headers.accept).toBe('*/*');
     expect(headers.referer).toBe('https://www.anitoysgk.com/p/1');
     expect(headers['user-agent']).toBe('UA/2');
   });

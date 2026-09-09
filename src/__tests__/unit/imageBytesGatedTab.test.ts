@@ -220,7 +220,7 @@ describe('createGatedTabBytesFetch', () => {
       accept: ARCHIVAL_IMAGE_ACCEPT,
       referer: 'https://www.anitoysgk.com/p/1',
     });
-    expect(setExtraHTTPHeaders.mock.calls[0][0].accept).not.toMatch(/webp|avif/);
+    expect(setExtraHTTPHeaders.mock.calls[0][0].accept).toBe('*/*');
   });
 
   it('confines the image Accept to the IMAGE TAB — the page lane\'s own fetches never see it', async () => {

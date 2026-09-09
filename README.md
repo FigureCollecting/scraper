@@ -1179,7 +1179,7 @@ See `.env.example` for complete configuration template.
   - Unset/blank (default): the built-in table, which is the permaban alone
   - Unparseable or not an object → ONE warning, and `IMAGE_HOST_POLICY_FILE` is consulted instead (a malformed inline edit never stands in for the file an operator also mounted)
 - `IMAGE_HOST_POLICY_FILE`: Path to a file holding that same table (consulted when `IMAGE_HOST_POLICY_JSON` is unset **or unusable**)
-- `IMAGE_ACCEPT`: The `Accept` all three image lanes send (default `image/jpeg, image/png, image/gif, image/*;q=0.9, */*;q=0.8` — the ARCHIVAL header, which names no webp and no avif). Must be a plain header value; anything with CR/LF or outside printable ASCII is refused with one warning and the default stands — see **Image bytes lanes** below
+- `IMAGE_ACCEPT`: The `Accept` all three image lanes send (default `*/*` — the ARCHIVAL header, which expresses no preference at all). Must be a plain header value; anything with CR/LF or outside printable ASCII is refused with one warning and the default stands — see **Image bytes lanes** below
 - `IMAGE_MAX_PER_ITEM`: Images captured per item (default `12`, clamped to 100) — see **Image capture** below
 - `IMAGE_MEMO_SIZE`: Urls the capture memo holds (default `50000`) — see **Image capture** below
 - `IMAGE_RESIDENTIAL_BYTES_PER_DAY`: Rolling-24-hour byte ceiling on the residential exit for images (default `1073741824`; `0` closes it) — see **Image capture** below
@@ -1222,13 +1222,13 @@ Every transport described above returns a STRING — `res.text()`, impit's `.tex
 
 On the `impit` lane the body is read through a feature-detected binary capability (`bytes()`, else `arrayBuffer()`). An impit build exposing only `text()` returns `unsupported` and the body is left unread — a silently corrupted image is worse than a visible refusal.
 
-**The `Accept` these lanes send is ARCHIVAL, and it is the single highest-impact setting in the image policy.** A browser's image `Accept` (`image/avif,image/webp,image/apng,…`) is a downgrade switch: eight of the nineteen image hosts in the 2026-09-08 lane matrix content-negotiate off it — Cloudflare Polish, Shopify, BigCommerce, hpoi and the rest — and on one of them it turned a 1 227 923-byte PNG master into a 111 240-byte webp at identical pixels. What comes back then is a DERIVATIVE the CDN re-encoded, and an archive of derivatives answers none of the questions the originals were kept for. So the default names the lossless/original families first and mentions neither webp nor avif:
+**The `Accept` these lanes send is ARCHIVAL, and it is the single highest-impact setting in the image policy.** A browser's image `Accept` (`image/avif,image/webp,image/apng,…`) is a downgrade switch: eight of the nineteen image hosts in the 2026-09-08 lane matrix content-negotiate off it — Cloudflare Polish, Shopify, BigCommerce, hpoi and the rest — and on one of them it turned a 1 227 923-byte PNG master into a 111 240-byte webp at identical pixels. What comes back then is a DERIVATIVE the CDN re-encoded, and an archive of derivatives answers none of the questions the originals were kept for. So the default expresses no preference at all:
 
 ```
-image/jpeg, image/png, image/gif, image/*;q=0.9, */*;q=0.8
+*/*
 ```
 
-It is deliberately not `*/*`: a few hotlink guards check that an image request looks like one, and the trailing `image/*;q=0.9` still takes a webp-only host's bytes rather than refusing them. `IMAGE_ACCEPT` replaces it process-wide; a policy row's `accept` replaces it for one host and beats the env. On the browser lane the header is set on the IMAGE TAB alone (`setExtraHTTPHeaders` inside that navigation) — never on the gated browser's defaults, which would put an image `Accept` on every storefront document the same session fetches.
+Naming the lossless families first with a trailing `image/*;q=0.9` would NOT be equivalent: `image/*` still matches webp and avif, so an origin negotiating strictly on q-values may answer a header meant to forbid a re-encode with exactly one. `*/*` has nothing in it to prefer, so the origin falls back to the representation it stores — and that is what was measured: 18 of the 19 hosts served their originals to a plain `*/*` request, and the one exception (mfc) fails on its TLS fingerprint, not on this header. `IMAGE_ACCEPT` replaces it process-wide; a policy row's `accept` replaces it for one host and beats the env. On the browser lane the header is set on the IMAGE TAB alone (`setExtraHTTPHeaders` inside that navigation) — never on the gated browser's defaults, which would put an image `Accept` on every storefront document the same session fetches.
 
 A negotiated response is RECORDED rather than refused: the asset's object metadata carries `declared-content-type` (what the server said) beside `content-encoding` and `vary` (present only when the server sent them), so an object that turned out to be a rendition says so.
 

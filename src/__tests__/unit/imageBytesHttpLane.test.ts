@@ -67,10 +67,9 @@ describe('createHttpBytesFetch', () => {
     const fetchBytes = createHttpBytesFetch({ fetchImpl: fetchImpl as never });
 
     await fetchBytes('https://cdn.example.com/a.png');
-    expect(fetchImpl.mock.calls[0][1].headers.accept).toBe(ARCHIVAL_IMAGE_ACCEPT);
-    // The point of the whole header: no webp and no avif, so a Polish/Shopify/BigCommerce host
-    // cannot negotiate the master down to a re-encode and hand the archive a derivative.
-    expect(fetchImpl.mock.calls[0][1].headers.accept).not.toMatch(/webp|avif/);
+    // The point of the whole header: NO preference is expressed, so a Polish/Shopify/BigCommerce
+    // host has nothing to negotiate on and serves the format it actually stores.
+    expect(fetchImpl.mock.calls[0][1].headers.accept).toBe('*/*');
     expect(fetchImpl.mock.calls[0][1].headers['user-agent']).toMatch(/Mozilla/);
     expect(fetchImpl.mock.calls[0][1].headers.referer).toBeUndefined();
 
@@ -318,7 +317,10 @@ describe('resolveImageAccept', () => {
   it('is the archival header when the operator set nothing, or set only whitespace', () => {
     expect(withEnv(undefined, () => resolveImageAccept())).toBe(ARCHIVAL_IMAGE_ACCEPT);
     expect(withEnv('   ', () => resolveImageAccept())).toBe(ARCHIVAL_IMAGE_ACCEPT);
-    expect(ARCHIVAL_IMAGE_ACCEPT).not.toMatch(/webp|avif/);
+    // Pinned to the exact string, because the VALUE is the behavior. Anything that names a media
+    // range — `image/*` included — can be read as a preference by a strict q-value negotiator and
+    // answered with a re-encode; `*/*` has nothing in it to prefer.
+    expect(ARCHIVAL_IMAGE_ACCEPT).toBe('*/*');
   });
 
   it('names an unusable value through the console when no warn sink was injected', () => {

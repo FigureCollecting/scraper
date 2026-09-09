@@ -194,12 +194,18 @@ export function resolveImageTimeout(requested: number | undefined, fallback: num
  * CDN re-encoded, not the merchant's original bytes, and an archive of derivatives answers none of
  * the questions the originals were kept for.
  *
- * So this Accept names the lossless/original families FIRST and never mentions webp or avif. It is
- * not `* / *`: a few hotlink guards check that an image request looks like one, and `image/*;q=0.9`
- * still takes a webp-only host's bytes rather than refusing them — a negotiated response is
- * RECORDED (see the `content-encoding` / `vary` provenance headers) rather than rejected.
+ * So this Accept EXPRESSES NO PREFERENCE AT ALL. Naming the lossless families first and leaving a
+ * trailing `image/*;q=0.9` would not do: `image/*` still MATCHES webp and avif, so an origin that
+ * negotiates strictly on q-values may serve a re-encode from a header meant to forbid one. `* / *`
+ * cannot be read that way by anyone — there is nothing in it to prefer — so the origin falls back to
+ * the representation it actually stores, which is the one this lane exists to keep.
+ *
+ * It is also what was MEASURED: in the 2026-09-08 matrix, 18 of the 19 image hosts served their
+ * originals to a plain `* / *` request, and the one exception (mfc) fails on its TLS fingerprint
+ * rather than on this header. A negotiated response is still RECORDED, never rejected — see the
+ * `content-encoding` / `vary` provenance headers.
  */
-export const ARCHIVAL_IMAGE_ACCEPT = 'image/jpeg, image/png, image/gif, image/*;q=0.9, */*;q=0.8';
+export const ARCHIVAL_IMAGE_ACCEPT = '*/*';
 
 /** The env var an operator overrides {@link ARCHIVAL_IMAGE_ACCEPT} with, for all three lanes. */
 export const IMAGE_ACCEPT_ENV = 'IMAGE_ACCEPT';
