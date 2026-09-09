@@ -12,7 +12,7 @@ import { getCfCookieStore, type CfCookieSource } from './cookieJar.js';
 import { normalizeHost } from './challengeCooldown.js';
 
 /** Default impersonation profile. A LIVE TUNABLE — chrome110 already went stale to Cloudflare; keep recent. */
-const DEFAULT_PROFILE = 'chrome142';
+export const DEFAULT_PROFILE = 'chrome142';
 
 /** Per-request timeout (ms) used when IMPIT_TIMEOUT_MS is unset/invalid, and the clamp any override rides within. */
 const DEFAULT_TIMEOUT_MS = 30000;
@@ -42,9 +42,31 @@ const TIMEOUT_MS = resolveImpitTimeoutMs(process.env);
  */
 const PRIME_TTL_MS = 20 * 60 * 1000;
 
+/**
+ * The impit RESPONSE surface we depend on. `text()` is the only member every impit build is
+ * guaranteed to have and the only one the string lanes use. The rest are OPTIONAL and
+ * feature-detected by the image BYTES lane: `bytes()`/`arrayBuffer()` are the binary capability
+ * (without one, an image cannot be fetched on this lane at all — decoding it through `text()` would
+ * corrupt it, so the lane returns a typed 'unsupported' instead), and `status`/`headers`/`url` are
+ * read defensively when present. Declaring them optional keeps every existing fake — a bare
+ * `{ text() }` — assignable, so nothing on the string path changes.
+ */
+export interface ImpitResponseLike {
+  text(): Promise<string>;
+  /** Binary body (impit's fetch-shaped response). Preferred by the image bytes lane. */
+  bytes?(): Promise<Uint8Array>;
+  /** Binary body, the WHATWG spelling — used when `bytes()` is absent. */
+  arrayBuffer?(): Promise<ArrayBuffer>;
+  readonly status?: number;
+  /** A `Headers`-like bag (`get(name)`) or a plain record; read defensively, never assumed. */
+  readonly headers?: unknown;
+  /** The URL the body came from, after redirects. */
+  readonly url?: string;
+}
+
 /** Minimal impit surface we depend on — lets tests inject a fake without the native module. */
 export interface ImpitLike {
-  fetch(url: string, init: { method: string; headers?: Record<string, string> }): Promise<{ text(): Promise<string> }>;
+  fetch(url: string, init: { method: string; headers?: Record<string, string> }): Promise<ImpitResponseLike>;
 }
 
 /**
@@ -87,7 +109,7 @@ export interface ImpitFetchOptions {
  * The per-profile cookie jar is threaded in so cf_clearance from the prime GET persists onto the
  * target fetch (impit is stateless without a jar).
  */
-async function defaultMakeImpit(
+export async function defaultMakeImpit(
   browser: string,
   cookieJar: CookieJarLike,
   timeoutMs: number,
@@ -191,7 +213,7 @@ function ensurePrimed(
  * (CF cannot be re-solved from the pod's IP, so the hand-minted value is the only one that can work).
  * A cookie the jar rejects is skipped with one warn naming the cookie NAME only — never a value.
  */
-async function seedJar(jar: CookieJarLike, url: string, cookies: Record<string, string>): Promise<void> {
+export async function seedJar(jar: CookieJarLike, url: string, cookies: Record<string, string>): Promise<void> {
   let target: URL;
   try {
     target = new URL(url);

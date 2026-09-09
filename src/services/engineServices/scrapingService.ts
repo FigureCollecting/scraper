@@ -164,7 +164,7 @@ function capWaitTime(waitTime?: number): number {
  * origin — the page's own scripts must not see them) and `secure` iff the url is https (a Secure
  * cookie is never sent over plain http, so flagging it there would silently drop it).
  */
-function buildCookieParams(url: string, cookies: Record<string, string>): Parameters<Page['setCookie']> {
+export function buildCookieParams(url: string, cookies: Record<string, string>): Parameters<Page['setCookie']> {
   const target = new URL(url);
   const secure = target.protocol === 'https:';
   return Object.entries(cookies)
@@ -205,7 +205,7 @@ function usableStoredCookies(stored: Record<string, string> | undefined): Record
  * MFC user-sync path — carries its own coherent set). Neither ⇒ undefined (no setCookie call at all,
  * byte-identical to the pre-store behavior).
  */
-function mergeStoredCookies(
+export function mergeStoredCookies(
   store: CfCookieSource,
   url: string,
   requestCookies: Record<string, string> | undefined,
@@ -226,7 +226,7 @@ function mergeStoredCookies(
  *                             152's UA contradicts the client hints the same browser sends, and
  *                             Cloudflare binds the clearance it issues to the UA that earned it.
  */
-function resolveUserAgent(store: CfCookieSource, url: string, requestUa: string | undefined): string | undefined {
+export function resolveUserAgent(store: CfCookieSource, url: string, requestUa: string | undefined): string | undefined {
   if (requestUa) return requestUa;
   if (isCleanHeadfulMode()) return undefined;
   return store.userAgentFor(url) || DEFAULT_USER_AGENT;

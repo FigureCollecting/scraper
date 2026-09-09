@@ -13,6 +13,7 @@
  */
 import {
   ResidentialEgressUnavailableError,
+  httpLaneResidentialRefusal,
   isSocksProxy,
   redactProxyUrl,
   refuseHttpLaneResidentialEgress,
@@ -234,6 +235,28 @@ describe('refuseHttpLaneResidentialEgress (the plain-HTTP lane rule)', () => {
       expect(e.message).toContain('no proxy support');
       expect(e.message).not.toContain('SOCKS');
     }
+  });
+});
+
+describe('httpLaneResidentialRefusal (the same refusal as a VALUE, for the bytes lanes)', () => {
+  const URL_ = 'https://cdn.anitoysgk.com/img/1.jpg';
+
+  /**
+   * The image BYTES lanes answer every expected outcome with a typed result instead of an exception,
+   * so they need the refusal as a value — but they must NOT restate its wording, or the two copies
+   * drift. One factory builds it; `refuseHttpLaneResidentialEgress` is that factory plus a throw.
+   */
+  it('RETURNS the identical error the throwing door raises, without throwing', () => {
+    const returned = httpLaneResidentialRefusal(URL_, 'socks5://p.test:1055');
+    expect(returned).toBeInstanceOf(ResidentialEgressUnavailableError);
+    expect(returned.reason).toBe('unsupported-lane');
+    let thrownMessage = '';
+    try {
+      refuseHttpLaneResidentialEgress(URL_, 'socks5://p.test:1055');
+    } catch (err) {
+      thrownMessage = (err as Error).message;
+    }
+    expect(returned.message).toBe(thrownMessage);
   });
 });
 
