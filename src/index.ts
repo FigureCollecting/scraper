@@ -13,7 +13,7 @@ import { createHealthRoutes } from './routes/health.js';
 import { getChallengeCooldown } from './services/challengeCooldown.js';
 import { getCfCookieStore } from './services/cookieJar.js';
 import { residentialEgressView } from './services/residentialEgress.js';
-import { rawStoreView } from './services/s3ObjectStore.js';
+import { rawStoreView, flushRawCaptureSink } from './services/s3ObjectStore.js';
 import { imageCaptureView } from './services/images/assembleImageCapture.js';
 import { fetchFailureReportView } from './services/failureReporter.js';
 import { sessionCanaryView } from './services/sessionCanary.js';
@@ -154,6 +154,14 @@ async function gracefulShutdown(signal: string): Promise<void> {
 
   // Stop the stored-cookie file poller (an unref'd timer — this is hygiene, not a shutdown blocker).
   getCfCookieStore().stop();
+
+  // Drain whatever the raw-capture queue is still holding. Those captures were
+  // ACCEPTED, and they are write-once bytes with nothing anywhere that would fetch
+  // them again — but the wait is bounded, and what we cannot flush is named.
+  const flushed = await flushRawCaptureSink();
+  if (!flushed.drained) {
+    console.warn(`[PAGE-SCRAPER] Raw-capture queue not fully drained — ${flushed.abandoned} capture(s) abandoned`);
+  }
 
   try {
     console.log('[PAGE-SCRAPER] Closing browser pool...');

@@ -8,6 +8,8 @@ import {
   createRawCaptureSink,
   isImagePersistenceEnabled,
   toS3MetaData,
+  flushRawCaptureSink,
+  DEFAULT_RAW_STORE_SHUTDOWN_FLUSH_MS,
 } from '../../services/s3ObjectStore';
 
 // Mirrors the ratified "1.B scraper Deployment wiring" fragment: PERSIST_RAW_HTML
@@ -275,5 +277,77 @@ describe('RAW_STORE_IMAGE_MAX_BYTES is bounded from above too', () => {
       RAW_STORE_IMAGE_MAX_BYTES: '2048',
     } as unknown as NodeJS.ProcessEnv)!;
     expect(loaded.config.maxImageBytes).toBe(2048);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Shutdown flush: SIGTERM arrives with a queue that has not been written yet, and
+// those bytes are write-once with no retry anywhere. Draining is bounded, because a
+// pod that will not exit is a worse outcome than a handful of lost captures.
+// ---------------------------------------------------------------------------
+describe('flushRawCaptureSink', () => {
+  const stats = (queued: number, inFlight: number) => ({
+    stored: 0, deduped: 0, failed: 0, skippedDisabled: 0,
+    assetStored: 0, assetDeduped: 0, assetFailed: 0,
+    assetSkipped: { notImage: 0, tooLarge: 0, empty: 0, disabled: 0 },
+    queued, inFlight, dropped: 0, droppedBytes: 0, queuedBytes: 0,
+    queueWaitP50: 0, queueWaitP95: 0, putP50: 0, putP95: 0, headP50: 0, headP95: 0,
+  });
+
+  it('drains the queue and reports nothing abandoned', async () => {
+    const sink = {
+      capture: async () => undefined,
+      flush: jest.fn(async () => undefined),
+      stats: () => stats(0, 0),
+    };
+    await expect(flushRawCaptureSink({ sink, timeoutMs: 1_000 })).resolves.toEqual({
+      drained: true, abandoned: 0,
+    });
+    expect(sink.flush).toHaveBeenCalledTimes(1);
+  });
+
+  it('gives up at the budget and NAMES how many captures it abandoned', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const sink = {
+      capture: async () => undefined,
+      flush: () => new Promise<void>(() => {}), // a store that will not answer
+      stats: () => stats(7, 2),
+    };
+    const outcome = await flushRawCaptureSink({ sink, timeoutMs: 20 });
+
+    // Bounded: a pod that refuses to exit is worse than the captures it is holding.
+    expect(outcome).toEqual({ drained: false, abandoned: 9 });
+    expect(warn.mock.calls.some(a => String(a[0]).includes('9'))).toBe(true);
+    warn.mockRestore();
+  });
+
+  it('is a no-op for a sink that has no flush at all (the Noop sink)', async () => {
+    await expect(flushRawCaptureSink({ sink: new NoopCaptureSink(), timeoutMs: 10 })).resolves.toEqual({
+      drained: true, abandoned: 0,
+    });
+  });
+
+  it('never throws when the flush itself fails — shutdown continues', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const sink = {
+      capture: async () => undefined,
+      flush: async () => { throw new Error('store exploded'); },
+    };
+    await expect(flushRawCaptureSink({ sink, timeoutMs: 100 })).resolves.toEqual({
+      drained: false, abandoned: 0,
+    });
+    warn.mockRestore();
+  });
+
+  it('reads the budget from RAW_STORE_SHUTDOWN_FLUSH_MS, defaulting to 8s', async () => {
+    const seen: number[] = [];
+    const sink = {
+      capture: async () => undefined,
+      flush: async () => { seen.push(Date.now()); },
+    };
+    await flushRawCaptureSink({ sink, env: { RAW_STORE_SHUTDOWN_FLUSH_MS: 'nope' } as NodeJS.ProcessEnv });
+    expect(DEFAULT_RAW_STORE_SHUTDOWN_FLUSH_MS).toBe(8_000);
+    expect(seen).toHaveLength(1);
   });
 });

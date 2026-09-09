@@ -116,6 +116,12 @@ export interface CaptureAdmission {
  */
 export interface CaptureSink {
   capture(c: RawCapture): Promise<void | CaptureAdmission>;
+  /**
+   * Wait for everything already accepted to reach the store. Optional, because a
+   * sink that writes synchronously has nothing to drain — but a QUEUEING sink does,
+   * and at SIGTERM that queue is write-once bytes with no retry anywhere behind it.
+   */
+  flush?(): Promise<void>;
 }
 
 /** The shared "the sink took it" answer — no allocation per capture. */
