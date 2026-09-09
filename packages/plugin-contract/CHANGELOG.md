@@ -4,6 +4,32 @@ All notable changes to `@figurecollecting/scraper-plugin-contract` will be docum
 file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this
 package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-09-09
+
+Additive, backward-compatible: every existing store profile and ruleset compiles unchanged, and a
+store that declares nothing behaves exactly as before. Built for stores that publish a handful of
+curated pages (a shelf, a "what's new" panel, a featured rail) which are worth polling slowly even
+where a full catalogue walk is not available or not defensible.
+
+### Added
+- `RetrievalCapability.seedLists?: SeedList[]` (and the `SeedList` export) — a DECLARED, finite set
+  of URL-addressable pages a store may be POLLED from on a slow cadence. Each entry is
+  `{ id, url, cadence: 'weekly' | 'daily', note? }`: `id` names the list (store-unique and stable —
+  it is how the axis is addressed and how its statistics are reported), `url` is the whole
+  fully-resolved page (no `{page}` placeholder, no cursor — a seed list is ONE page by
+  construction), `cadence` is the store's own answer to how often polling it is defensible, and
+  `note` is free text for whoever reads the declaration later.
+  This is NOT a second enumeration axis. `byListing` walks a catalogue page after page; a seed list
+  is a handful of pages the store publishes anyway. Because the set is finite and declared, the cost
+  of the axis is knowable before it runs — which is what makes it safe to point at a store that has
+  to be treated gently.
+- `ExtractionRuleset.extractSeedList?(body, listId)` — parse one declared seed list body into the
+  same `ListingPage` shape `extractListing` returns. The parser is handed the LIST ID rather than a
+  url because the url is already declared, so one parser serves every list a store declares.
+  `hasMore` is ALWAYS FALSE on this axis whatever the parser returns: a seed list is one whole page,
+  so there is no next page to signal and nothing to walk. A `true` is ignored, and `nextPage` is
+  meaningless here.
+
 ## [0.8.0] - 2026-09-07
 
 Additive, backward-compatible: every existing `bySearch` still compiles unchanged, and a store that
