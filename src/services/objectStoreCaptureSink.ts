@@ -396,6 +396,13 @@ export class ObjectStoreCaptureSink implements CaptureSink {
   private readonly putDurations: number[] = [];
   private readonly headDurations: number[] = [];
   private readonly drainWaiters: Array<() => void> = [];
+  /**
+   * Content addresses with an op already running. HEAD-then-PUT is blind to a sibling:
+   * two captures of the same bytes both HEAD before either PUT lands, both miss, and
+   * "write-once" becomes two uploads of the same object. Both lanes share this set —
+   * their prefixes keep the key spaces apart, so one guard covers both.
+   */
+  private readonly inFlightKeys = new Set<string>();
   private stored = 0;
   private deduped = 0;
   private failed = 0;
@@ -493,25 +500,36 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     try {
       const key = this.objectKey(c);
 
-      // HEAD-then-PUT: content-addressed, so an existing key means identical bytes.
-      if (await this.timed(this.headDurations, () => this.withTimeout(this.store.exists(key)))) {
+      // A sibling op already owns this address. Its bytes are ours by definition —
+      // the key IS the content hash — so this capture is a dedup, not a second write.
+      if (this.inFlightKeys.has(key)) {
         this.deduped += 1;
         return;
       }
+      this.inFlightKeys.add(key);
+      try {
+        // HEAD-then-PUT: content-addressed, so an existing key means identical bytes.
+        if (await this.timed(this.headDurations, () => this.withTimeout(this.store.exists(key)))) {
+          this.deduped += 1;
+          return;
+        }
 
-      // Off the event loop, and deliberately OUTSIDE the op budget: compression is
-      // our own cost, not the store's, and charging it to the upload's timeout is
-      // how a busy process ends up calling a healthy bucket slow.
-      const body = await gzipAsync(c.bytes);
-      await this.timed(this.putDurations, () =>
-        this.withTimeout(
-          this.store.put(key, body, {
-            contentType: 'application/gzip',
-            metadata: this.metadata(c),
-          }),
-        ),
-      );
-      this.stored += 1;
+        // Off the event loop, and deliberately OUTSIDE the op budget: compression is
+        // our own cost, not the store's, and charging it to the upload's timeout is
+        // how a busy process ends up calling a healthy bucket slow.
+        const body = await gzipAsync(c.bytes);
+        await this.timed(this.putDurations, () =>
+          this.withTimeout(
+            this.store.put(key, body, {
+              contentType: 'application/gzip',
+              metadata: this.metadata(c),
+            }),
+          ),
+        );
+        this.stored += 1;
+      } finally {
+        this.inFlightKeys.delete(key);
+      }
     } catch (err) {
       // Raw capture is best-effort insurance; a store failure must never break or
       // stall a scrape. Count it so the failure is observable in prod.
@@ -574,25 +592,34 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       const prefix = this.config.imagePrefix ?? DEFAULT_IMAGE_PREFIX;
       const key = `${prefix}sha256/${c.sha256.slice(0, 2)}/${c.sha256}.${type.ext}`;
 
-      if (
-        await this.timed(this.headDurations, () => this.withTimeout(this.store.exists(key), this.imagePutTimeoutMs))
-      ) {
+      if (this.inFlightKeys.has(key)) {
         this.assetDeduped += 1;
         return;
       }
+      this.inFlightKeys.add(key);
+      try {
+        if (
+          await this.timed(this.headDurations, () => this.withTimeout(this.store.exists(key), this.imagePutTimeoutMs))
+        ) {
+          this.assetDeduped += 1;
+          return;
+        }
 
-      // No gzip and no Content-Encoding: an image is already compressed, and the
-      // original must be readable as itself straight out of the bucket.
-      await this.timed(this.putDurations, () =>
-        this.withTimeout(
-          this.store.put(key, bytes, {
-            contentType: type.contentType,
-            metadata: this.assetMetadata(c),
-          }),
-          this.imagePutTimeoutMs,
-        ),
-      );
-      this.assetStored += 1;
+        // No gzip and no Content-Encoding: an image is already compressed, and the
+        // original must be readable as itself straight out of the bucket.
+        await this.timed(this.putDurations, () =>
+          this.withTimeout(
+            this.store.put(key, bytes, {
+              contentType: type.contentType,
+              metadata: this.assetMetadata(c),
+            }),
+            this.imagePutTimeoutMs,
+          ),
+        );
+        this.assetStored += 1;
+      } finally {
+        this.inFlightKeys.delete(key);
+      }
     } catch (err) {
       this.assetFailed += 1;
       this.warnAssetFailure(c, err);

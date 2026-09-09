@@ -665,6 +665,9 @@ class GatedObjectStore implements ObjectStore {
   async put(key: string, body: Buffer): Promise<void> {
     this.keys.push(key);
     this.bodies.push(body);
+    // The real bucket is write-once and content-addressed: once written, the key
+    // exists and a later HEAD for the same content is a dedup hit.
+    this.existing.add(key);
     if (this.open) return;
     if (this.putMs) {
       await new Promise(r => setTimeout(r, this.putMs));
@@ -1121,6 +1124,61 @@ describe('ObjectStoreCaptureSink — bounded admission queue', () => {
     await expect(off.capture(cap())).resolves.toEqual({ admitted: true });
     await expect(off.capture(asset(PNG))).resolves.toEqual({ admitted: true });
     await sink.flush();
+  });
+
+  it('does not race the same content address into two PUTs', async () => {
+    const store = new GatedObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 60_000, concurrency: 2 });
+
+    // Identical bytes → identical key. The HEAD-then-PUT dedup is blind to a sibling
+    // op: both workers HEAD before either PUT lands, both miss, and the "write-once"
+    // contract becomes two uploads of the same object.
+    await sink.capture(cap());
+    await sink.capture(cap());
+    await until(() => store.parked.length === 1);
+
+    expect(store.keys).toHaveLength(1);
+    expect(sink.stats().deduped).toBe(1);
+
+    store.open = true;
+    store.release();
+    await sink.flush();
+    expect(sink.stats().stored).toBe(1);
+    expect(store.keys).toHaveLength(1);
+  });
+
+  it('applies the in-flight guard to the asset lane on the same key space', async () => {
+    const store = new GatedObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, {
+      ...CONFIG, imagePrefix: 'raw-img/', imagePutTimeoutMs: 60_000, concurrency: 2,
+    });
+
+    await sink.capture(asset(PNG));
+    await sink.capture(asset(PNG));
+    await until(() => store.parked.length === 1);
+
+    expect(store.keys).toHaveLength(1);
+    expect(sink.stats().assetDeduped).toBe(1);
+
+    store.open = true;
+    store.release();
+    await sink.flush();
+    expect(sink.stats().assetStored).toBe(1);
+  });
+
+  it('releases the in-flight key when the op finishes, so a later capture still dedups', async () => {
+    const store = new GatedObjectStore();
+    store.open = true;
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 5_000, concurrency: 2 });
+
+    await sink.capture(cap());
+    await sink.flush();
+    // The guard is for CONCURRENT ops only; the store's own HEAD answers the rest.
+    await sink.capture(cap());
+    await sink.flush();
+
+    expect(sink.stats()).toMatchObject({ stored: 1, deduped: 1 });
+    expect(store.keys).toHaveLength(1);
   });
 
   it('flush() resolves immediately when nothing is queued', async () => {
