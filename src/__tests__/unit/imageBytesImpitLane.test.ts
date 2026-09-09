@@ -7,6 +7,7 @@
  * a silently corrupted JPEG is far worse than a refusal.
  */
 import { createImpitBytesFetch, createImpitSessionProvider } from '../../services/images/impitBytesFetch';
+import { ARCHIVAL_IMAGE_ACCEPT } from '../../services/images/imageBytes';
 import type { CookieJarLike, ImpitLike } from '../../services/impitFetch';
 
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);
@@ -76,16 +77,35 @@ describe('createImpitBytesFetch', () => {
     expect(text).not.toHaveBeenCalled();
   });
 
-  it('sends the image Accept, the chrome UA profile, and a referer when asked', async () => {
+  it('sends the ARCHIVAL Accept, the chrome UA profile, and a referer when asked', async () => {
     const { impit, fetch } = fakeImpit(() => impitResponse());
     const fetchBytes = createImpitBytesFetch({ getImpit: async () => impit });
 
     await fetchBytes('https://cdn.anitoysgk.com/a.png', { referer: 'https://www.anitoysgk.com/p/1', userAgent: 'UA/2' });
 
     const headers = fetch.mock.calls[0][1].headers as Record<string, string>;
-    expect(headers.accept).toContain('image/webp');
+    expect(headers.accept).toBe(ARCHIVAL_IMAGE_ACCEPT);
+    expect(headers.accept).toBe('*/*');
     expect(headers.referer).toBe('https://www.anitoysgk.com/p/1');
     expect(headers['user-agent']).toBe('UA/2');
+  });
+
+  it('takes the operator\'s IMAGE_ACCEPT, and a per-request Accept beats even that', async () => {
+    const previous = process.env.IMAGE_ACCEPT;
+    try {
+      process.env.IMAGE_ACCEPT = 'image/jpeg';
+      const { impit, fetch } = fakeImpit(() => impitResponse());
+      const fetchBytes = createImpitBytesFetch({ getImpit: async () => impit });
+
+      await fetchBytes('https://cdn.anitoysgk.com/a.png');
+      expect((fetch.mock.calls[0][1].headers as Record<string, string>).accept).toBe('image/jpeg');
+
+      await fetchBytes('https://cdn.anitoysgk.com/a.png', { accept: 'image/png' });
+      expect((fetch.mock.calls[1][1].headers as Record<string, string>).accept).toBe('image/png');
+    } finally {
+      if (previous === undefined) delete process.env.IMAGE_ACCEPT;
+      else process.env.IMAGE_ACCEPT = previous;
+    }
   });
 
   it('asks for the chrome impersonation profile, and a SEPARATE session per residential proxy', async () => {

@@ -15,19 +15,19 @@ import {
   BLOCK_SIGNAL_HEADERS,
   CAPTURED_IMAGE_HEADERS,
   DEFAULT_MAX_IMAGE_BYTES,
-  IMAGE_ACCEPT,
   IMAGE_CHROME_UA,
   classifyImageBytes,
   imageTooLarge,
   isTimeoutError,
   overImageSizeCap,
   refusedFinalUrl,
+  resolveImageAccept,
   resolveImageTimeout,
   type ImageBytesFetcher,
   type ImageBytesResult,
 } from './imageBytes.js';
 
-export { IMAGE_ACCEPT } from './imageBytes.js';
+export { ARCHIVAL_IMAGE_ACCEPT } from './imageBytes.js';
 
 /** Abort ceiling (ms) for one image GET. An image is a small body; it does not get the listing budget. */
 export const DEFAULT_IMAGE_FETCH_TIMEOUT_MS = 15_000;
@@ -52,6 +52,10 @@ export interface HttpBytesFetchOptions {
   timeoutMs?: number;
   /** Body ceiling (default {@link DEFAULT_MAX_IMAGE_BYTES}). */
   maxBytes?: number;
+  /** The Accept every request sends (default: `IMAGE_ACCEPT`, else the archival header). */
+  accept?: string;
+  /** Where an unusable `IMAGE_ACCEPT` is named (default: the console). */
+  warn?: (message: string) => void;
 }
 
 /** The named headers the response actually carried, lowercased. */
@@ -71,6 +75,9 @@ function headerSubset(res: BytesResponseLike, names: readonly string[] = CAPTURE
 export function createHttpBytesFetch(options: HttpBytesFetchOptions = {}): ImageBytesFetcher {
   const timeoutMs = options.timeoutMs ?? DEFAULT_IMAGE_FETCH_TIMEOUT_MS;
   const maxBytes = options.maxBytes ?? DEFAULT_MAX_IMAGE_BYTES;
+  // Resolved ONCE per lane, not per request: an unusable IMAGE_ACCEPT is then named once at build
+  // rather than on every image of every item.
+  const accept = options.accept ?? resolveImageAccept(process.env, options.warn);
   return async function httpBytesFetch(url, opts = {}): Promise<ImageBytesResult> {
     // EGRESS, before the network: this lane cannot proxy, so a residential image is refused here
     // rather than fetched from the node IP (the string lane's rule, same wording).
@@ -79,7 +86,7 @@ export function createHttpBytesFetch(options: HttpBytesFetchOptions = {}): Image
     }
     const headers: Record<string, string> = {
       'user-agent': opts.userAgent ?? IMAGE_CHROME_UA,
-      accept: opts.accept ?? IMAGE_ACCEPT,
+      accept: opts.accept ?? accept,
       ...(opts.referer ? { referer: opts.referer } : {}),
     };
     const fetchImpl = options.fetchImpl ?? (globalThis.fetch as unknown as BytesFetchImpl);

@@ -11,6 +11,7 @@
  * clearance lives in.
  */
 import { asImageBytesFetcher, createGatedTabBytesFetch } from '../../services/images/gatedTabBytesFetch';
+import { ARCHIVAL_IMAGE_ACCEPT } from '../../services/images/imageBytes';
 import { ChallengeLaneUnavailableError } from '../../services/browserChallenge';
 
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 9, 9, 9, 9]);
@@ -207,7 +208,7 @@ describe('createGatedTabBytesFetch', () => {
     expect(setCookie).not.toHaveBeenCalled();
   });
 
-  it('sends the image Accept and the referer as extra headers on the tab', async () => {
+  it('sends the ARCHIVAL Accept and the referer as extra headers on the tab', async () => {
     const { page, setExtraHTTPHeaders } = fakePage([resp()]);
     const { lane } = laneFor(page);
 
@@ -215,10 +216,48 @@ describe('createGatedTabBytesFetch', () => {
       referer: 'https://www.anitoysgk.com/p/1',
     });
 
-    expect(setExtraHTTPHeaders).toHaveBeenCalledWith(expect.objectContaining({
-      accept: expect.stringContaining('image/webp'),
+    expect(setExtraHTTPHeaders).toHaveBeenCalledWith({
+      accept: ARCHIVAL_IMAGE_ACCEPT,
       referer: 'https://www.anitoysgk.com/p/1',
-    }));
+    });
+    expect(setExtraHTTPHeaders.mock.calls[0][0].accept).toBe('*/*');
+  });
+
+  it('confines the image Accept to the IMAGE TAB — the page lane\'s own fetches never see it', async () => {
+    // The header is set on the tab this navigation runs in, and NOWHERE else. Handing it to
+    // `withPage` (or to any browser-level default) would put an image Accept on every storefront
+    // document the same browser fetches — a header no page request should ever carry, on the one
+    // browser whose Cloudflare clearance is worth the most.
+    const { page, setExtraHTTPHeaders } = fakePage([resp()]);
+    const { lane, withPage } = laneFor(page);
+
+    await createGatedTabBytesFetch(lane)('direct', 'anitoysgk.com', 'https://cdn.anitoysgk.com/a.png');
+
+    expect(setExtraHTTPHeaders).toHaveBeenCalledTimes(1);
+    expect(setExtraHTTPHeaders).toHaveBeenCalledWith({ accept: ARCHIVAL_IMAGE_ACCEPT });
+    const withPageOptions = withPage.mock.calls[0][1] as Record<string, unknown>;
+    expect(withPageOptions).not.toHaveProperty('accept');
+    expect(withPageOptions).not.toHaveProperty('extraHTTPHeaders');
+    expect(withPageOptions).not.toHaveProperty('headers');
+  });
+
+  it('takes the operator\'s IMAGE_ACCEPT, and a per-request Accept beats even that', async () => {
+    const previous = process.env.IMAGE_ACCEPT;
+    try {
+      process.env.IMAGE_ACCEPT = 'image/jpeg';
+      const first = fakePage([resp()]);
+      await createGatedTabBytesFetch(laneFor(first.page).lane)('direct', 'anitoysgk.com', 'https://cdn.anitoysgk.com/a.png');
+      expect(first.setExtraHTTPHeaders).toHaveBeenCalledWith({ accept: 'image/jpeg' });
+
+      const second = fakePage([resp()]);
+      await createGatedTabBytesFetch(laneFor(second.page).lane)('direct', 'anitoysgk.com', 'https://cdn.anitoysgk.com/a.png', {
+        accept: 'image/png',
+      });
+      expect(second.setExtraHTTPHeaders).toHaveBeenCalledWith({ accept: 'image/png' });
+    } finally {
+      if (previous === undefined) delete process.env.IMAGE_ACCEPT;
+      else process.env.IMAGE_ACCEPT = previous;
+    }
   });
 
   it('reports a non-2xx document as http-status and a non-image document as not-image', async () => {

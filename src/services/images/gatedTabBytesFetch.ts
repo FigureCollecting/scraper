@@ -32,12 +32,12 @@ import {
   BLOCK_SIGNAL_HEADERS,
   CAPTURED_IMAGE_HEADERS,
   DEFAULT_MAX_IMAGE_BYTES,
-  IMAGE_ACCEPT,
   classifyImageBytes,
   imageTooLarge,
   isTimeoutError,
   overImageSizeCap,
   refusedFinalUrl,
+  resolveImageAccept,
   resolveImageTimeout,
   type ImageBytesFetcher,
   type ImageBytesResult,
@@ -142,6 +142,10 @@ export interface GatedTabBytesFetchOptions {
   challenge?: { timeoutMs?: number; pollMs?: number };
   /** Stored-cookie source (default: the process CfCookieStore singleton). */
   cookieStore?: CfCookieSource;
+  /** The Accept every image navigation sends (default: `IMAGE_ACCEPT`, else the archival header). */
+  accept?: string;
+  /** Where an unusable `IMAGE_ACCEPT` is named (default: the console). */
+  warn?: (message: string) => void;
 }
 
 /** An image fetch on the gated lane: the egress and STORE host it belongs to, plus the image URL. */
@@ -247,6 +251,7 @@ export function createGatedTabBytesFetch(
   const proxyUrlFor = options.proxyUrlFor ?? ((egress: EgressKind) => (egress === 'residential' ? getResidentialProxyUrl() : undefined));
   const timeout = options.timeoutMs ?? GATED_IMAGE_NAV_TIMEOUT_MS;
   const maxBytes = options.maxBytes ?? DEFAULT_MAX_IMAGE_BYTES;
+  const accept = options.accept ?? resolveImageAccept(process.env, options.warn);
   const tabGate = createImageTabGate();
 
   return async function fetchBytesViaGatedTab(egress, host, url, opts = {}): Promise<ImageBytesResult> {
@@ -302,9 +307,13 @@ export function createGatedTabBytesFetch(
             const params = buildCookieParams(url, cookies);
             if (params.length > 0) await page.setCookie(...(params as never[]));
           }
+          // On THIS TAB and nowhere else. The image Accept belongs to an image request; put on the
+          // gated browser's own defaults (or handed to `withPage`) it would ride every storefront
+          // DOCUMENT that browser fetches — an implausible header on the one session whose
+          // Cloudflare clearance is worth the most.
           if (page.setExtraHTTPHeaders) {
             await page.setExtraHTTPHeaders({
-              accept: opts.accept ?? IMAGE_ACCEPT,
+              accept: opts.accept ?? accept,
               ...(opts.referer ? { referer: opts.referer } : {}),
             });
           }

@@ -40,7 +40,23 @@ export interface RawCapture {
   /** Lowercase hex sha256 of the UNCOMPRESSED bytes — the content address. */
   sha256: string;
   statusCode?: number;
+  /** The type the server DECLARED, when it declared one; else the type that was sniffed. */
   contentType?: string;
+  /**
+   * `Content-Encoding` the response carried, when it carried one.
+   *
+   * A witness that the body on the wire was not the body on disk. Kept because the stored bytes
+   * cannot say it afterwards — and on the asset lane, where the whole point is holding the
+   * merchant's ORIGINAL, "is this the original or a rendition of it" is the question the archive
+   * exists to answer.
+   */
+  contentEncoding?: string;
+  /**
+   * `Vary` the response carried, when it carried one. `Vary: Accept` is a server saying in as many
+   * words that it CHOSE this representation from the request header — the negotiation these lanes'
+   * archival Accept exists to avoid, recorded when it happened anyway.
+   */
+  vary?: string;
   /** ISO-8601 instant the fetch was observed. */
   fetchedAt: string;
   /** Asset lane: the item whose page referenced these bytes. */
@@ -66,6 +82,8 @@ export interface RawCaptureInput {
   bytes: Buffer;
   statusCode?: number;
   contentType?: string;
+  contentEncoding?: string;
+  vary?: string;
   /** Defaults to now (ISO) when omitted. */
   fetchedAt?: string;
   sourceItem?: CaptureSourceItem;
@@ -92,6 +110,8 @@ export function buildRawCapture(input: RawCaptureInput): RawCapture {
   if (input.finalUrl !== undefined && input.finalUrl !== input.url) capture.finalUrl = input.finalUrl;
   if (input.statusCode !== undefined) capture.statusCode = input.statusCode;
   if (input.contentType !== undefined) capture.contentType = input.contentType;
+  if (input.contentEncoding !== undefined) capture.contentEncoding = input.contentEncoding;
+  if (input.vary !== undefined) capture.vary = input.vary;
   if (input.sourceItem !== undefined) capture.sourceItem = input.sourceItem;
   if (input.sourceUrl !== undefined) capture.sourceUrl = input.sourceUrl;
   if (input.position !== undefined) capture.position = input.position;
