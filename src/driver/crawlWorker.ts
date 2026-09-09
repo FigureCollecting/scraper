@@ -68,6 +68,17 @@ export interface CrawlWorkerDeps {
   resolveContext?: (task: CrawlTask, url: string) => ExtractContext | undefined;
   /** HTTP statuses meaning "throttled, back off" (default 429, 503). */
   throttleStatuses?: number[];
+  /**
+   * OPTIONAL image capture seam — the crawl leg's mirror of the ingest queue's own (scrapeQueue's
+   * `captureRecordImages`). Offered the WHOLE extraction plus the url it came from, once the
+   * extraction has succeeded; the wiring layer hands it the process image hook.
+   *
+   * An injected callback rather than the hook itself, for the same reason everything else here is
+   * injected: this worker owns no services, and importing one would put a browser and an object
+   * store behind a unit test. It is called SYNCHRONOUSLY and its result is ignored — capture is
+   * best-effort and asynchronous to the item, and this leg's outcome was decided by the emit.
+   */
+  captureImages?: (records: ExtractedData[], url: string, ruleset: ExtractionRuleset) => void;
 }
 
 const DEFAULT_THROTTLE_STATUSES = [429, 503];
@@ -104,6 +115,17 @@ export function makeCrawlWorker(deps: CrawlWorkerDeps): (task: CrawlTask) => Pro
     } catch {
       deps.ledger.markFailed(task.id); // page came back fine; content/coverage failed — not a throttle
       return 'success';
+    }
+
+    // IMAGE CAPTURE: the page came back clean and parsed, so the store's own plates are nameable.
+    // Guarded because a broken image lane must not turn a covered item into a failed one — the
+    // ledger fate below is decided by the emit, and nothing here may reach it.
+    if (deps.captureImages) {
+      try {
+        deps.captureImages(records, url, ruleset);
+      } catch {
+        /* best-effort: an image lane that cannot start never changes an item's coverage */
+      }
     }
 
     try {

@@ -179,6 +179,7 @@ Detailed health check with browser pool status plus two operator views (additive
 - `challengeCooldowns`: `[{host, remainingMs, reason}]` — the per-host Cloudflare-challenge cooldowns currently open
 - `cfCookies`: `[{host, cookieNames, userAgentPinned, loadedAt, mintedAt?, expiresAt?, stale, staleSince?, staleReason?}]` — the stored-cookie jar (`CF_COOKIE_FILE`) per host. `stale: true` means the host still served a challenge WITH its stored cookies: re-mint (see *Stored Cloudflare cookies* under Environment Variables). `[]` when the jar is disabled.
 - `browserLane`: `{launchMode, residentialTimezone, directTimezone, processTimezone, gatedBrowsers}` — the lane's live configuration. `processTimezone` is the one that decides a Cloudflare challenge (`null` = a UTC container = gated stores silently never clear); `gatedBrowsers` is `[{egress, launchedAt, pagesOpen, primedHosts}]`, the live per-egress challenge browsers.
+- `imageCapture`: `{enabled, attempted, stored, deduped, skipped{policyDeny, memo, thumbnailRole, userRole, cap, residentialBudget, notImage, tooLarge}, failed, residentialBytesToday}` — the image capture hook's counters. The lane never fails an item, so these are the ONLY signal it gives: the named skips are what separates "no store here publishes images" from "every plate is being denied", "the home line is spent", or "this CDN answers every image with a block page". `stored` counts captures handed to the asset lane; `rawStore.stats` says what actually landed.
 - `residentialEgress`: `{configured, proxy?}` — whether a residential egress proxy (`RESIDENTIAL_PROXY_URL`) is wired. `proxy` (its `scheme://host:port`) appears only under `RESIDENTIAL_EGRESS_HEALTH_DETAIL=true`, since this endpoint is unauthenticated; credentials are stripped at the source either way, so a `user:password@` proxy never appears here. `{configured: false}` ⇒ every store declaring `egress: 'residential'` is refused (see *Residential egress* under Environment Variables).
 
 ### GET /version
@@ -1178,6 +1179,9 @@ See `.env.example` for complete configuration template.
   - Unset/blank (default): the built-in table, which is the permaban alone
   - Unparseable or not an object → ONE warning, and `IMAGE_HOST_POLICY_FILE` is consulted instead (a malformed inline edit never stands in for the file an operator also mounted)
 - `IMAGE_HOST_POLICY_FILE`: Path to a file holding that same table (consulted when `IMAGE_HOST_POLICY_JSON` is unset **or unusable**)
+- `IMAGE_MAX_PER_ITEM`: Images captured per item (default `12`, clamped to 100) — see **Image capture** below
+- `IMAGE_MEMO_SIZE`: Urls the capture memo holds (default `50000`) — see **Image capture** below
+- `IMAGE_RESIDENTIAL_BYTES_PER_DAY`: Rolling-24-hour byte ceiling on the residential exit for images (default `1073741824`; `0` closes it) — see **Image capture** below
   - Unreadable → ignored with ONE warning; the default table stands
   - Example: `/etc/fc/image-host-policy.json`. The table is read ONCE, when the policy is loaded — unlike the cf-cookie store there is no mtime poll, so **an edit needs a pod restart**
 
@@ -1205,7 +1209,7 @@ The refusal is deliberate and load-bearing: **a residential store is never silen
 
 **Image bytes lanes (`IMAGE_HOST_POLICY_JSON` / `IMAGE_HOST_POLICY_FILE`):**
 
-Every transport described above returns a STRING — `res.text()`, impit's `.text()`, the rendered DOM. That is right for a document and destructive for an image: JPEG/PNG bytes decoded as utf-8 are gone. The image lanes are SIBLINGS of those transports, identical in egress rules and pacing, differing in that they hand back a `Buffer` and answer every expected outcome with a typed result (`{ ok: true, bytes, contentType, status, finalUrl, headers }`, or `{ ok: false, reason }` where reason is `http-status` | `not-image` | `timeout` | `too-large` | `unsupported` | `refused`). Nothing on the page path changes; nothing is stored yet (the ingest hook lands separately).
+Every transport described above returns a STRING — `res.text()`, impit's `.text()`, the rendered DOM. That is right for a document and destructive for an image: JPEG/PNG bytes decoded as utf-8 are gone. The image lanes are SIBLINGS of those transports, identical in egress rules and pacing, differing in that they hand back a `Buffer` and answer every expected outcome with a typed result (`{ ok: true, bytes, contentType, status, finalUrl, headers }`, or `{ ok: false, reason }` where reason is `http-status` | `not-image` | `timeout` | `too-large` | `unsupported` | `refused`). Nothing on the page path changes. What decides to fetch an image at all, and hands the bytes to the raw store, is the **image capture hook** documented below.
 
 | Lane | Used for | Residential egress |
 |---|---|---|
@@ -1238,6 +1242,39 @@ The table is `{ host: rule }`, matched by LONGEST host suffix (`cdn.example.com`
 An unknown or wrongly-typed field is dropped with a warning and the rest of the rule stands — with two exceptions, both of which fail CLOSED: an entry that is not an object at all is SKIPPED entirely (so it cannot mask the valid parent rule its subtree would otherwise inherit), and a `deny` that is present but not a boolean reads as `deny: true`. Host keys are canonicalized, including the root-anchored trailing dot: `otakumode.com.` is the same host as `otakumode.com` and is denied identically. A URL whose scheme is not `http(s)` is refused outright. **otakumode.com and every host under it are permanently DENIED**, and that is answered before the table is consulted at all — no entry can re-enable it, not even one naming a subdomain (which would otherwise win the longest-suffix match).
 
 **Pacing** is keyed on the IMAGE host, not the store's: a shared CDN (`cdn.shopify.com`, `cdn11.bigcommerce.com`) serves many of these stores, so it gets ONE budget that every store draws from, on the same `HostRateLimiter` the driver uses. The wait and the dispatch record are serialized per host, so N concurrent images off one PDP are spread across N budgets rather than arriving in one burst. What backs a host off is what actually signals a throttle: `429`/`503`, a timeout, and a 2xx body that is not an image (the shape of a managed challenge). A bare `403` does NOT — it is normally a per-URL hotlink or signed-URL verdict, and booking it on a shared CDN would spend every other store's budget on one store's misconfiguration; a `403` carrying `cf-mitigated` or `retry-after` does. A host with an open **challenge cooldown** is not fetched at all.
+
+**Image capture (`PERSIST_RAW_IMAGES`, `IMAGE_MAX_PER_ITEM`, `IMAGE_MEMO_SIZE`, `IMAGE_RESIDENTIAL_BYTES_PER_DAY`):**
+
+The hook runs after a successful extraction and BESIDE the emit, on the ingest queue, the crawl worker and the byId confirm alike. It is best-effort in the strict sense: the item's fate was already decided by the extraction and the emit, so a CDN that 403s, a lane that times out, a bucket that is unreachable and a ruleset whose `describeImages` throws are each **counted, logged at most once per host per hour, and reported to the fetch-failure ledger under `kind: image`** — and none of them can fail, delay or retry the item. It is not awaited.
+
+**This first landing is capture-only: it writes no spine rows.** The bytes land in the content-addressed bucket with the provenance that says which item page referenced them and where in that page's list they sat (`source-item`, `source-url`, `position`, `role`); the rows that turn them into a queryable gallery are a later step. Separating them means the corpus can accumulate while that shape is still being decided, and nothing is lost if it changes — the objects are addressed by their content.
+
+**The engine never learns a store's image fields.** The ruleset implements the contract's `describeImages(fields): ImageRef[]` (contract 0.10.0) and translates its own private field shapes into `{ url, role, position }`, where `role` is `gallery` | `thumbnail` | `user` | `other`. The engine applies ONE capture rule to the result:
+
+| Role | Captured | Why |
+|---|---|---|
+| `gallery` | yes | a product plate the store published — the corpus worth keeping |
+| `other` | yes | a store image that is none of the others (a box shot, a scale diagram); still the store's own |
+| `thumbnail` | **no** | a downscaled derivative of a plate available at full size — storing it spends a fetch on a worse copy of something already held |
+| `user` | **no** | a community upload: a rights question about someone else's photograph, which this lane declines rather than answers |
+
+A ref's `url` may be relative (it is resolved against the page it was found on) and a ref whose role is outside that vocabulary is refused before the network. The decisions run cheapest-first, and the two that protect something outside the process — the permaban and the home line's daily budget — sit BEFORE any request:
+
+1. **role filter → dedupe by url → cap** at `IMAGE_MAX_PER_ITEM`, in the store's own presentation order (so the cap keeps the first plates, which are the ones that matter)
+2. **memo** — a process-local LRU of url → content hash; a url already fetched and stored is skipped without a request. It also recognizes bytes arriving under a SECOND url (a store that versions its urls serves one file under many names), so those are deduped without a second write. A FAILED fetch is deliberately not memoized
+3. **lane + policy**, deny list first (see *Image bytes lanes* above)
+4. **residential budget** — a rolling 24-hour ceiling on bytes carried by the residential exit
+5. **fetch**, paced per image host, with the deny list and the on-store rule re-asserted on the url the bytes actually came from (a redirect can land somewhere the decision did not allow)
+6. **classify → content dedupe → sink** (`lane: 'asset'`)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PERSIST_RAW_IMAGES` | off | The kill switch, shared with the sink's asset lane. Not `true` ⇒ the hook is inert and nothing is fetched |
+| `IMAGE_MAX_PER_ITEM` | `12` | Images captured per item, all roles counted after filtering. Clamped to 100: this multiplies against every item of every store, so a mistyped extra zero would turn a gallery walk into an undecided crawl |
+| `IMAGE_MEMO_SIZE` | `50000` | Urls the memo holds. Process-local and purely an optimization — a restart re-fetches a little and the content-addressed store dedups it |
+| `IMAGE_RESIDENTIAL_BYTES_PER_DAY` | `1073741824` (1 GiB) | Rolling-24-hour byte ceiling on the residential exit. The ceiling is on the LINE, not on any one store, because the line is somebody's house. `0` closes it to images entirely. A rolling window rather than a calendar day, so a run starting at 23:50 cannot spend the allowance twice in ten minutes. Checked before a fetch and booked after it, so the day's last image may overshoot by one body |
+
+The counters are published on `GET /health/detailed` as `imageCapture`.
 
 Every lane refuses a body past a size cap (32 MB), re-checks the deny list against the URL the bytes actually came from (all three follow redirects), and rejects `image/svg+xml` — an `image/*` type whose body is active content. The gated browser lane holds at most one image tab per store host, so a burst of images can never take both of that store's page-lane tab slots; curry it through `asImageBytesFetcher` to pace it like the other two.
 
@@ -1339,7 +1376,7 @@ On the asset lane the store's declared `Content-Type` is **advisory only** — C
 | `empty` | a zero-length body |
 | `disabled` | `PERSIST_RAW_IMAGES` is not `true` — the lane refuses the write regardless of the caller |
 
-Asset objects carry their provenance as user metadata: `url` (the image URL), `fetched-at`, `site` (the DECLARING store, since the image usually lives on a CDN host that says nothing about whose catalogue it belongs to), `source-item` (`<site>/<itemId>`), `source-url` (the page that referenced it), `position` (its index in that page's image list), `lane`, `declared-content-type` and `bytes`. The set is BUDGETED as a whole (S3 caps user metadata at ~2 KB of header bytes for the whole set, not per value, and both the image URL and the declared Content-Type are store-controlled): over budget, `declared-content-type`, `source-url`, `position` and `bytes` are shed in that order and the longest survivor is truncated — a degraded tag, never a lost object. Originals are stored unaltered and are **never shown** — any surfaced image is a sanitized derivative produced downstream.
+Asset objects carry their provenance as user metadata: `url` (the image URL), `fetched-at`, `site` (the DECLARING store, since the image usually lives on a CDN host that says nothing about whose catalogue it belongs to), `source-item` (`<site>/<itemId>`), `source-url` (the page that referenced it), `position` (its index in that page's image list), `role` (what the referencing page said the image IS, in the contract's vocabulary — the bytes cannot say whether a JPEG is a product plate or a box shot), `lane`, `declared-content-type` and `bytes`. The set is BUDGETED as a whole (S3 caps user metadata at ~2 KB of header bytes for the whole set, not per value, and both the image URL and the declared Content-Type are store-controlled): over budget, `declared-content-type`, `source-url`, `position` and `bytes` are shed in that order and the longest survivor is truncated — a degraded tag, never a lost object. Originals are stored unaltered and are **never shown** — any surfaced image is a sanitized derivative produced downstream.
 
 Because the key is the content address, provenance metadata describes the **first** capture of those bytes only: the same press photo reused across items, variants or stores is stored once, and the second capture dedupes without rewriting the tags. The spine's capture event log — one row per *reference*, written by the caller that fetches the image — is the authoritative record of which items use an image; the bucket metadata is a convenience tag, not an index.
 

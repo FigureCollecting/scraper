@@ -67,6 +67,17 @@ export interface ResolveServices {
    * other lanes leave it alone. This is the CONFIRM leg's equivalent of the queue's fast-fail gate.
    */
   challengeCooldown?: ChallengeCooldown;
+  /**
+   * OPTIONAL image capture seam — the confirm leg's mirror of the ingest queue's and the crawl
+   * worker's. Offered one id's whole extraction plus the detail url it came from, once that id has
+   * confirmed. Injected rather than imported so this unit still owns no services.
+   *
+   * A confirm is a READ, and capture rides the same PERSIST_RAW_IMAGES switch as everywhere else:
+   * the memo means a re-confirmed item costs nothing after its first pass, and the store's plates
+   * are worth having whichever leg happened to fetch the page. Its result is ignored and a throw is
+   * swallowed — this leg answers a caller, and an image lane cannot be allowed to fail that answer.
+   */
+  captureImages?: (records: ExtractedData[], url: string, ruleset: ExtractionRuleset) => void;
 }
 
 export interface ResolveItem {
@@ -193,6 +204,13 @@ export function assembleResolve(services: ResolveServices): Resolve {
             url,
             services.resolveContext?.(ruleset, url, primaryFetchedAt, lastFetchedAt),
           );
+          if (services.captureImages) {
+            try {
+              services.captureImages(records, url, ruleset);
+            } catch {
+              /* best-effort: an image lane that cannot start never fails a confirm */
+            }
+          }
           const data = records[0];
           const gtin14 = typeof data.fields.gtin14 === 'string' ? data.fields.gtin14 : undefined;
           results.push({ itemId, url, data, ...(records.length > 1 ? { records: records.slice(1) } : {}), gtin14 });

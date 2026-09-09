@@ -49,6 +49,14 @@ export interface RawCapture {
   sourceUrl?: string;
   /** Asset lane: 0-based index of this asset in the referencing page's list. */
   position?: number;
+  /**
+   * Asset lane: what the referencing page said this image IS, in the contract's
+   * store-agnostic vocabulary (`ImageRole`). Kept because the bytes alone cannot
+   * say it: a product plate and a box shot are the same JPEG to an object store,
+   * and a later renderer choosing a hero image needs the distinction the ruleset
+   * already made.
+   */
+  role?: string;
 }
 
 export interface RawCaptureInput {
@@ -63,6 +71,7 @@ export interface RawCaptureInput {
   sourceItem?: CaptureSourceItem;
   sourceUrl?: string;
   position?: number;
+  role?: string;
 }
 
 /** A destination for raw captures. Implementations store bytes + emit metadata. */
@@ -86,6 +95,7 @@ export function buildRawCapture(input: RawCaptureInput): RawCapture {
   if (input.sourceItem !== undefined) capture.sourceItem = input.sourceItem;
   if (input.sourceUrl !== undefined) capture.sourceUrl = input.sourceUrl;
   if (input.position !== undefined) capture.position = input.position;
+  if (input.role !== undefined) capture.role = input.role;
   return capture;
 }
 

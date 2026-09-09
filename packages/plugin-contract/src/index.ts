@@ -514,6 +514,41 @@ export interface ExtractContext {
   logger: PluginLogger;
 }
 
+/**
+ * What an image found on a store page IS — the only thing the engine needs in order to decide
+ * whether to fetch it, and the reason this vocabulary is small and closed.
+ *
+ * A store's own field names carry the meaning ("the big plates", "the little one in the grid", "the
+ * ones collectors uploaded"), and those names differ per store and are private to its ruleset. The
+ * engine must not learn them: an engine that keys on a field name has one store's schema compiled
+ * into it. So the ruleset translates its fields into these four roles, and the engine's capture rule
+ * is written against the roles alone.
+ *
+ *   `gallery`   — a product plate the store itself published for the item. The corpus worth keeping.
+ *   `thumbnail` — a downscaled derivative of a plate the store also publishes at full size. Storing
+ *                 it duplicates the plate at a worse resolution, so it is DELIBERATELY not captured.
+ *   `user`      — uploaded by a member of the store's community. Not the store's to redistribute,
+ *                 and not ours: a separate rights question that this lane does not answer.
+ *   `other`     — a store image that is genuinely none of the above (a box shot on its own page, a
+ *                 scale diagram). Captured with the gallery, because it is still the store's own.
+ */
+export type ImageRole = 'gallery' | 'thumbnail' | 'user' | 'other';
+
+/**
+ * ONE image a ruleset found on an item, normalized out of that store's private field shapes.
+ *
+ * `url` may be relative — the engine resolves it against the page it came from, so a ruleset never
+ * has to reconstruct a base. `position` is the image's index on the referencing page in the order
+ * the store presents it (the first plate is 0); it is stored beside the bytes, so a later renderer
+ * can put a gallery back in the store's own order without re-fetching the page. Positions are
+ * per-role-blind and need not be contiguous — the engine only ever compares them.
+ */
+export interface ImageRef {
+  url: string;
+  role: ImageRole;
+  position: number;
+}
+
 export interface ExtractionRuleset {
   siteId: string;
   version: string;
@@ -575,6 +610,20 @@ export interface ExtractionRuleset {
    * `extractListing` — the engine always awaits the result.
    */
   extractSeedList?(body: string, listId: string): ListingPage | Promise<ListingPage>;
+  /**
+   * OPTIONAL: name the images this extraction found, as store-agnostic {@link ImageRef}s.
+   *
+   * Handed the SAME `fields` the ruleset just produced (never the html — this hook does no parsing
+   * and no I/O of its own, which is why it is synchronous), it answers one question the engine
+   * cannot: which of this store's field shapes hold image urls, and what each one MEANS. A store
+   * that publishes full plates under one field, a grid thumbnail under another and member uploads
+   * under a third maps all three here, each under its {@link ImageRole}, and the engine then applies
+   * ONE capture rule to the result — it never learns a field name.
+   *
+   * Relative urls are fine; the engine resolves them against the page. Return `[]` for an item with
+   * no images. Rulesets that omit the hook simply have no images captured — nothing else changes.
+   */
+  describeImages?(fields: Record<string, unknown>): ImageRef[];
   /**
    * OPTIONAL: when `true`, this ruleset declares that a ZERO-RECORD extraction is a VALID outcome
    * — the page was well-formed and the ruleset successfully determined there is genuinely nothing

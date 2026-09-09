@@ -13,6 +13,10 @@
  *     `browserLane: {launchMode, residentialTimezone, directTimezone, processTimezone, gatedBrowsers}`,
  *     `challengeCooldowns: [{host, remainingMs, reason}]` (the per-host CF cooldowns currently open),
  *     `rawStore: {configured, stats?}` (the raw-capture sink's counters — page + asset lanes),
+ *     `imageCapture: {enabled, attempted, stored, deduped, skipped{…}, failed, residentialBytesToday}`
+ *     (the image capture hook's counters — a best-effort lane that stores nothing looks exactly like
+ *     an idle one from outside, so the NAMED skips are the signal: a deny list, an exhausted home
+ *     line, or a CDN answering every plate with a block page each read differently here),
  *     `failureLedger: {enabled, reported, failed, suppressed}` (the durable fetch-failure ledger's
  *     reporting counters — a ledger nobody is writing to is otherwise invisible),
  *     `sessionCanary: {site, configured, stale, staleSince?, staleReason?}` plus the flat
@@ -32,6 +36,7 @@ import type { CfCookieHostView } from '../services/cookieJar.js';
 import type { BrowserLaneView } from '../services/genericScraper.js';
 import type { RawStoreView } from '../services/s3ObjectStore.js';
 import type { FetchFailureReportView } from '../services/failureReporter.js';
+import type { ImageCaptureStats } from '../services/images/imageCaptureHook.js';
 import type { SessionCanaryView } from '../services/sessionCanary.js';
 
 export interface HealthDeps {
@@ -71,6 +76,14 @@ export interface HealthDeps {
    */
   getFailureLedger: () => FetchFailureReportView;
   /**
+   * The image capture hook's counters (imageCaptureView()): whether the lane is switched on at all
+   * (PERSIST_RAW_IMAGES), how many originals it stored, and — the part that matters — WHY the rest
+   * were not fetched. Image capture is deliberately best-effort and never fails an item, so an
+   * operator has no other way to tell "no store publishes images" from "every image is being denied".
+   * Counters only, nothing secret; the reader never throws.
+   */
+  getImageCapture: () => ImageCaptureStats;
+  /**
    * The mfc session canary's flag (sessionCanaryView()): whether an entitlement canary is configured
    * and whether the last conclusive round showed the session had lost its entitlement (→ re-mint the
    * cookies). Flags and timestamps only — never the canary item id.
@@ -105,6 +118,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         residentialEgress: deps.getResidentialEgress(),
         browserLane: deps.getBrowserLane(),
         rawStore: deps.getRawStore(),
+        imageCapture: deps.getImageCapture(),
         failureLedger: deps.getFailureLedger(),
         sessionCanary: deps.getSessionCanary(),
         mfcSessionStale: deps.getSessionCanary().stale,
@@ -119,6 +133,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         residentialEgress: deps.getResidentialEgress(),
         browserLane: deps.getBrowserLane(),
         rawStore: deps.getRawStore(),
+        imageCapture: deps.getImageCapture(),
         failureLedger: deps.getFailureLedger(),
         sessionCanary: deps.getSessionCanary(),
         mfcSessionStale: deps.getSessionCanary().stale,
