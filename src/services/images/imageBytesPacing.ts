@@ -8,10 +8,13 @@
  * the image host, that CDN gets ONE budget and every store draws from it.
  *
  * This is the bytes-lane counterpart of the driver's `wrapFetchBodyWithLimiter` — the same
- * HostRateLimiter, the same dispatch-time recording — differing only in what it keys on (the image
- * URL) and in that it also books the OUTCOME: a 429/403 from a CDN is exactly the signal the
- * limiter's backoff exists for.
+ * HostRateLimiter, the same dispatch-time recording — differing in what it keys on (the image URL),
+ * in that it also books the OUTCOME against that host's budget, and in that it honours the shared
+ * CHALLENGE COOLDOWN: a host that has just served a challenge is not fetched at all. (The cooldown
+ * on the STORE's host is the caller's gate, exactly as it is for the page lanes; this one covers the
+ * image host, which for many stores is the store host itself.)
  */
+import { getChallengeCooldown } from '../challengeCooldown.js';
 import type { HostRateLimiter } from '../../driver/hostRateLimiter.js';
 import type { ImageBytesFailure, ImageBytesFetcher, ImageFetchOptions, ImageBytesResult } from './imageBytes.js';
 
@@ -39,10 +42,17 @@ function saysHostIsThrottling(failure: ImageBytesFailure): boolean {
   return failure.status === 403 && Object.keys(failure.signals ?? {}).length > 0;
 }
 
-/** Injectable clock and sleeper — tests drive pacing deterministically, with no real timers. */
+/** The cooldown surface this wrapper reads — the shared register satisfies it structurally. */
+export interface ChallengeCooldownLike {
+  remaining(host: string): number;
+}
+
+/** Injectable clock, sleeper and cooldown register — tests drive pacing with no real timers. */
 export interface ImageBytesPacingDeps {
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
+  /** Default: the process-wide challenge cooldown register the queue and the lookup fan-out share. */
+  cooldown?: ChallengeCooldownLike;
 }
 
 /**
@@ -74,6 +84,7 @@ export function paceImageBytesByHost(
 ): ImageBytesFetcher {
   const now = deps.now ?? Date.now;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
+  const cooldown = deps.cooldown ?? getChallengeCooldown();
   // One PROLOGUE at a time per host. The wait and the dispatch record are separated by an await, so
   // without this every concurrent caller reads the same msUntilReady before any of them records and
   // they all wake together — a PDP's dozen images arriving at a shared CDN in one burst, which is
@@ -99,6 +110,13 @@ export function paceImageBytesByHost(
   return async function pacedImageBytesFetch(url: string, options?: ImageFetchOptions): Promise<ImageBytesResult> {
     const host = imageHostOf(url);
     if (host === undefined) return fetcher(url, options);
+    // COOLDOWN before anything else: a host that just served a challenge is left alone entirely —
+    // the register's contract is that every subsequent request skips WITHOUT fetching, and an image
+    // GET spends the same egress-IP reputation the cooldown was opened to preserve.
+    const cooling = cooldown.remaining(host);
+    if (cooling > 0) {
+      return { ok: false, reason: 'refused', detail: `${host} is cooling from a Cloudflare challenge for another ${Math.ceil(cooling / 1000)}s` };
+    }
     await awaitTurn(host);
     const result = await fetcher(url, options);
     // Cast rather than narrow on `ok`: this module is also compiled under the tests' non-strict

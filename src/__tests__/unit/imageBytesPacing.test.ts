@@ -5,6 +5,7 @@
  * store that happens to point at that CDN. Pacing the store instead would let a dozen stores hammer
  * one CDN at their own individual rates.
  */
+import { ChallengeCooldown } from '../../services/challengeCooldown';
 import { HostRateLimiter } from '../../driver/hostRateLimiter';
 import { paceImageBytesByHost } from '../../services/images/imageBytesPacing';
 import type { ImageBytesResult } from '../../services/images/imageBytes';
@@ -157,6 +158,27 @@ describe('paceImageBytesByHost', () => {
       // Timer slop is one-sided (a timer never fires early), so the floor is the assertion.
       expect(dispatchedAt[i] - dispatchedAt[i - 1]).toBeGreaterThanOrEqual(paced6.baseDelayMs - 5);
     }
+  });
+
+  it('REFUSES a host that is cooling from a challenge, without fetching it', async () => {
+    let clock = 0;
+    const cooldown = new ChallengeCooldown({ now: () => clock, windowMs: 60_000 });
+    jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    cooldown.open('cdn.shopify.com', 'challenge page');
+    const limiter = new HostRateLimiter(() => config, config);
+    const fetcher = jest.fn(async (_url: string) => ok());
+    const paced = paceImageBytesByHost(fetcher, limiter, { now: () => clock, sleep: async (ms: number) => { clock += ms; }, cooldown });
+
+    const result = await paced('https://cdn.shopify.com/i/1.png');
+    expect(result).toMatchObject({ ok: false, reason: 'refused' });
+    expect((result as { detail?: string }).detail).toMatch(/cooling/);
+    expect(fetcher).not.toHaveBeenCalled();
+
+    // Once the window has passed the host is fetched again.
+    clock += 60_001;
+    await expect(paced('https://cdn.shopify.com/i/1.png')).resolves.toMatchObject({ ok: true });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    (console.warn as jest.Mock).mockRestore();
   });
 
   it('passes the options through and fetches an unparseable URL without pacing it', async () => {
