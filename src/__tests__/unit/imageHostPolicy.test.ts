@@ -179,10 +179,13 @@ describe('loadImageHostPolicy', () => {
 
   /**
    * A browser tab always carries the browser's identity, so `ua: 'default'` — "claim no browser" —
-   * is not something the browser lane can deliver. Before this the row passed the loader silently
-   * and the tab resolved it to Chrome: the one decision the operator made, quietly inverted, which
-   * is the same shape as the 2026-09-09 hobby-genki defect on the http lane. The other contradictory
-   * pairings this table knows (http+residential, off-store+residential) are TYPED refusals, so this
+   * is not something the browser lane can deliver. Before this the row passed the loader silently.
+   * It did NOT resolve to Chrome: it reached the gated tab with no request UA, so the tab's own
+   * rules stood (clean-headful: the real Chrome's UA; headless: the host's mint UA, else the engine
+   * default) — the 2026-09-09 hobby-genki inversion was the http lane's `?? IMAGE_CHROME_UA`, not
+   * this pairing. It is refused anyway so the token means ONE thing on every lane. The other
+   * contradictory pairings this table knows (http+residential, off-store+residential) are TYPED
+   * refusals, so this
    * one is too — named at boot, where the operator reads the [IMAGE-POLICY] warnings, and refused at
    * the decision. The row is KEPT rather than dropped: dropping it would let the host fall through
    * to a parent rule and be fetched under an identity the operator never wrote.
@@ -218,6 +221,27 @@ describe('loadImageHostPolicy', () => {
       }),
     } as NodeJS.ProcessEnv, { warn });
     expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('does not warn on a deny:true row that also pairs lane:browser with ua:default — its images are refused as denied, not as the pairing', () => {
+    const warn = jest.fn();
+    const policy = loadImageHostPolicy({
+      IMAGE_HOST_POLICY_JSON: JSON.stringify({
+        // The deny is answered at the decision BEFORE the lane is even resolved, so a boot line
+        // blaming the pairing would send the operator to fix a row whose refusal is the deny they
+        // wrote. The lane/ua fields still survive the load, unchanged, for the day the deny is lifted.
+        'shut.example.test': { deny: true, lane: 'browser', ua: 'default' },
+        // A non-boolean deny reads as deny:true (fail closed) and earns ONE warning — that one, not
+        // the pairing's.
+        'typo.example.test': { lane: 'browser', ua: 'default', deny: 'yes' },
+      }),
+    } as NodeJS.ProcessEnv, { warn });
+
+    expect(policy.ruleFor('shut.example.test')).toEqual({ deny: true, lane: 'browser', ua: 'default' });
+    expect(policy.ruleFor('typo.example.test')).toEqual({ deny: true, lane: 'browser', ua: 'default' });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toMatch(/non-boolean 'deny'/);
+    expect(warn.mock.calls.map(c => c[0]).join('\n')).not.toMatch(/browser-lane-default-ua/);
   });
 });
 
@@ -298,6 +322,15 @@ describe('chooseImageLane', () => {
     const policy = buildImageHostPolicy({ 'cdn11.bigcommerce.com': { lane: 'browser', egress: 'residential' } });
     expect(chooseImageLane(PAGE, 'https://cdn11.bigcommerce.com/s-x/images/1.jpg', { transport: 'http' }, policy))
       .toMatchObject({ ok: false, reason: 'off-store-residential' });
+  });
+
+  it('answers a row contradictory BOTH ways with browser-lane-default-ua first — one reason per deploy', () => {
+    // The refusals are ORDERED (http-lane-residential, then browser-lane-default-ua, then
+    // off-store-residential): this row surfaces the ua pairing now and the off-store egress only
+    // once that is fixed. Pinned so the module header's account of the order stays true.
+    const policy = buildImageHostPolicy({ 'cdn11.bigcommerce.com': { lane: 'browser', ua: 'default', egress: 'residential' } });
+    expect(chooseImageLane(PAGE, 'https://cdn11.bigcommerce.com/s-x/images/1.jpg', { transport: 'http' }, policy))
+      .toMatchObject({ ok: false, reason: 'browser-lane-default-ua' });
   });
 
   it('still allows an ON-STORE host on the residential exit, which is what the exit is for', () => {

@@ -139,7 +139,10 @@ export function createImageBytesRouter(lanes: ImageBytesLanes): ImageBytesFetche
 export interface ImageCaptureSkipCounts {
   /**
    * Refused before the network: the deny list, a url that is not fetchable, a role outside the
-   * capture rule, a lane/egress pairing that has no transport, or residential egress with no proxy.
+   * capture rule, one of the table's three contradictory pairings — a lane that cannot proxy
+   * (`http-lane-residential`), a residential exit pointed at an off-store host
+   * (`off-store-residential`), a browser lane asked to claim no browser (`browser-lane-default-ua`)
+   * — or residential egress with no proxy.
    */
   policyDeny: number;
   /** This exact url was already fetched and handed on. */

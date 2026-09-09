@@ -19,7 +19,9 @@
  * declaring store's (the exit is scoped to that store, so the bytes would be fetched and then thrown
  * away), and the browser lane with `ua: 'default'` (a tab always carries the browser's own identity,
  * so "claim no browser" has no way onto that wire). None is silently downgraded — a downgrade
- * answers a misconfiguration with a different symptom somewhere else.
+ * answers a misconfiguration with a different symptom somewhere else. The checks are ORDERED —
+ * `http-lane-residential`, then `browser-lane-default-ua`, then `off-store-residential` — so a row
+ * contradictory more than one way surfaces ONE reason per deploy, the next only once that is fixed.
  *
  * Above both sits the DENY list, which nothing overrides. otakumode.com is permanently banned — not
  * crawled, not fetched, not emitted — so the ban is answered BEFORE the table is consulted at all,
@@ -186,8 +188,10 @@ function validateRule(host: string, raw: unknown, warn: (message: string) => voi
   // decision (`browser-lane-default-ua`). The row is KEPT, not dropped: an unregistered host falls
   // through to whatever rule sits above it and is fetched under an identity the operator never
   // wrote — the "different symptom somewhere else" this table refuses to answer with. Only a row
-  // that WRITES the browser lane can be caught here; one that inherits it is the decision's.
-  if (rule.lane === 'browser' && rule.ua === 'default') {
+  // that WRITES the browser lane can be caught here; one that inherits it is the decision's. A row
+  // that also carries `deny` is not named: the decision answers `denied` before it resolves a lane,
+  // so blaming the pairing would send the operator to fix a refusal that is the deny they wrote.
+  if (rule.lane === 'browser' && rule.ua === 'default' && !rule.deny) {
     warn(
       `[IMAGE-POLICY] host ${sanitizeForLog(host)} pairs lane:'browser' with ua:'default' — a browser tab always carries ` +
         "the browser's identity, so its images are refused (browser-lane-default-ua); put the host on 'http' or 'impit' to send no browser claim.",
