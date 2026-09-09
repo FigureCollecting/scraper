@@ -6,10 +6,11 @@ package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.9.0] - 2026-09-09
 
-Additive, backward-compatible: every existing store profile and ruleset compiles unchanged, and a
-store that declares nothing behaves exactly as before. Built for stores that publish a handful of
-curated pages (a shelf, a "what's new" panel, a featured rail) which are worth polling slowly even
-where a full catalogue walk is not available or not defensible.
+Additive, backward-compatible: every existing store profile, ruleset and `ScrapePageResult` consumer
+compiles unchanged, and a store that declares nothing behaves exactly as before. This release carries
+TWO independent additions — declared seed lists (for stores that publish a handful of curated pages
+worth polling slowly, even where a full catalogue walk is not available or not defensible) and the
+post-redirect `finalUrl` on a scraped page.
 
 ### Added
 - `RetrievalCapability.seedLists?: SeedList[]` (and the `SeedList` export) — a DECLARED, finite set
@@ -29,6 +30,11 @@ where a full catalogue walk is not available or not defensible.
   `hasMore` is ALWAYS FALSE on this axis whatever the parser returns: a seed list is one whole page,
   so there is no next page to signal and nothing to walk. A `true` is ignored, and `nextPage` is
   meaningless here.
+- `ScrapePageResult.finalUrl?: string` — the url the navigation actually ENDED on, when the served
+  response reported one. Distinct from `url` (which stays the REQUESTED url, echoed verbatim)
+  precisely because a redirect makes the two differ: an item url that lands on a store's front page
+  is how a dead item presents itself on a rendered store. ABSENT when the response reported nothing,
+  with no fallback to `url` — a caller must never read a fabricated final url.
 
 ## [0.8.0] - 2026-09-07
 
