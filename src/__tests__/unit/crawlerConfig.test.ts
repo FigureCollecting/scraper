@@ -27,6 +27,14 @@ describe('loadCrawlerConfig', () => {
     expect(c.exhaustedRecheckMs).toBe(WEEK_MS);
   });
 
+  it('CRAWLER_SEED_SPACING_MS defaults to 10s, honours an explicit 0, and ignores junk', () => {
+    expect(loadCrawlerConfig({}).seedSpacingMs).toBe(10000);
+    expect(loadCrawlerConfig({ CRAWLER_SEED_SPACING_MS: '30000' }).seedSpacingMs).toBe(30000);
+    expect(loadCrawlerConfig({ CRAWLER_SEED_SPACING_MS: '0' }).seedSpacingMs).toBe(0);
+    expect(loadCrawlerConfig({ CRAWLER_SEED_SPACING_MS: 'abc' }).seedSpacingMs).toBe(10000);
+    expect(loadCrawlerConfig({ CRAWLER_SEED_SPACING_MS: '-5' }).seedSpacingMs).toBe(10000);
+  });
+
   it('accepts recent / backfill / seed modes, defaulting anything else to both', () => {
     expect(loadCrawlerConfig({ CRAWLER_MODE: 'recent' }).mode).toBe('recent');
     expect(loadCrawlerConfig({ CRAWLER_MODE: 'backfill' }).mode).toBe('backfill');

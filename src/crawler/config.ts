@@ -52,6 +52,16 @@ export interface CrawlerConfig {
   maxConcurrency: number;
   /** Minimum spacing, in ms, between consecutive request dispatches (global). */
   requestSpacingMs: number;
+  /**
+   * SEED axis only: minimum wait, in ms, between one store's consecutive seed-list fetches. INDEPENDENT
+   * of `requestSpacingMs`, which is a global dispatch spacing shared by every store and every axis.
+   *
+   * It exists because the engine applies NO per-host floor on the catalog/seed lane — a store's
+   * declared `rateLimit` governs the ingest/record queue, not this one — so without this knob a
+   * store's whole declared set would be fetched back to back at whatever the global gate allows.
+   * The seed axis is a deliberately slow poll, so its floor is generous by default. `0` disables it.
+   */
+  seedSpacingMs: number;
   /** Per-request timeout, in ms (must exceed the engine's CATALOG_STORE_TIMEOUT_MS). */
   requestTimeoutMs: number;
   /** RECENT only: re-POST a known item once its ledger entry is at least this old. 0 = never. */
@@ -100,6 +110,7 @@ const DEFAULTS = {
   maxConcurrency: 2,
   requestSpacingMs: 1000,
   requestTimeoutMs: 45000,
+  seedSpacingMs: 10000,
   reobserveAfterMs: WEEK_MS,
   exhaustedRecheckMs: WEEK_MS,
   rangeIdsPerRun: 50,
@@ -206,6 +217,9 @@ export function loadCrawlerConfig(env: Env = process.env): CrawlerConfig {
     maxConcurrency: posInt(env.CRAWLER_MAX_CONCURRENCY, DEFAULTS.maxConcurrency),
     requestSpacingMs: posInt(env.CRAWLER_REQUEST_SPACING_MS, DEFAULTS.requestSpacingMs),
     requestTimeoutMs: posInt(env.CRAWLER_REQUEST_TIMEOUT_MS, DEFAULTS.requestTimeoutMs),
+    // nonNegInt, not posInt: an explicit 0 is the operator DISABLING the seed floor, and a pacing
+    // knob must not fail open by reverting to its default at its most permissive setting.
+    seedSpacingMs: nonNegInt(env.CRAWLER_SEED_SPACING_MS, DEFAULTS.seedSpacingMs),
     reobserveAfterMs: nonNegInt(env.CRAWLER_REOBSERVE_AFTER_MS, DEFAULTS.reobserveAfterMs),
     exhaustedRecheckMs: posInt(env.CRAWLER_EXHAUSTED_RECHECK_MS, DEFAULTS.exhaustedRecheckMs),
     rangeStores: csv(env.CRAWLER_RANGE_STORES ?? ''),
