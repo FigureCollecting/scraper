@@ -77,9 +77,11 @@ describe('loadRawStoreConfigFromEnv', () => {
       ...FULL_ENV,
       RAW_STORE_CONCURRENCY: '8',
       RAW_STORE_QUEUE_MAX: '1200',
+      RAW_STORE_QUEUE_MAX_BYTES: '67108864',
     } as unknown as NodeJS.ProcessEnv)!;
     expect(loaded.config.concurrency).toBe(8);
     expect(loaded.config.queueMax).toBe(1200);
+    expect(loaded.config.queueMaxBytes).toBe(67108864);
   });
 
   it('drops nonsense admission bounds so the sink falls back to 4 / 500', () => {
@@ -87,9 +89,11 @@ describe('loadRawStoreConfigFromEnv', () => {
       ...FULL_ENV,
       RAW_STORE_CONCURRENCY: 'lots',
       RAW_STORE_QUEUE_MAX: '-1',
+      RAW_STORE_QUEUE_MAX_BYTES: 'huge',
     } as unknown as NodeJS.ProcessEnv)!;
     expect(loaded.config.concurrency).toBeUndefined();
     expect(loaded.config.queueMax).toBeUndefined();
+    expect(loaded.config.queueMaxBytes).toBeUndefined();
   });
 
   it('defaults the asset lane: imagePrefix raw-img/ and no explicit byte ceiling', () => {

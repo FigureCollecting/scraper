@@ -371,6 +371,8 @@ describe('ObjectStoreCaptureSink — the asset lane', () => {
       queued: 0,
       inFlight: 0,
       dropped: 0,
+      droppedBytes: 0,
+      queuedBytes: 0,
       queueWaitP50: 0,
       queueWaitP95: 0,
       putP50: 0,
@@ -647,6 +649,8 @@ class GatedObjectStore implements ObjectStore {
   existing = new Set<string>();
   /** When set, a PUT resolves after this many ms instead of parking. */
   putMs = 0;
+  /** When true a PUT stops parking and resolves at once — the cheap way to drain deep queues. */
+  open = false;
 
   async exists(key: string): Promise<boolean> {
     return this.existing.has(key);
@@ -655,6 +659,7 @@ class GatedObjectStore implements ObjectStore {
   async put(key: string, body: Buffer): Promise<void> {
     this.keys.push(key);
     this.bodies.push(body);
+    if (this.open) return;
     if (this.putMs) {
       await new Promise(r => setTimeout(r, this.putMs));
       return;
@@ -685,7 +690,7 @@ const until = async (cond: () => boolean, turns = 500): Promise<void> => {
 /** Release parked PUTs until the sink's queue is empty. */
 const drain = async (store: GatedObjectStore, sink: ObjectStoreCaptureSink): Promise<void> => {
   const done = sink.flush();
-  for (let i = 0; i < 500; i += 1) {
+  for (let i = 0; i < 5000; i += 1) {
     const s = sink.stats();
     if (s.queued === 0 && s.inFlight === 0) break;
     store.release();
@@ -913,6 +918,95 @@ describe('ObjectStoreCaptureSink — bounded admission queue', () => {
     expect(store.parked.length).toBe(64);
     await drain(store, sink);
     expect(store.maxParked).toBe(64);
+  });
+
+  it('drops on the BYTE ceiling long before the count ceiling is reached', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new GatedObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, {
+      ...CONFIG, putTimeoutMs: 60_000, concurrency: 1, queueMax: 100, queueMaxBytes: 1000,
+    });
+
+    // 400-byte bodies: one goes straight to the worker, two fit the 1000-byte
+    // budget, the fourth would put the queue over it. The count ceiling (100) is
+    // nowhere near — a queue of 10 MiB assets exhausts memory at a depth the
+    // count alone calls healthy.
+    for (let i = 0; i < 4; i += 1) await sink.capture(cap({ bytes: Buffer.alloc(400, i) }));
+
+    expect(sink.stats().queued).toBe(2);
+    expect(sink.stats().queuedBytes).toBe(800);
+    expect(sink.stats().droppedBytes).toBe(1);
+    expect(sink.stats().dropped).toBe(0); // the COUNT ceiling was never the binding one
+
+    await drain(store, sink);
+    warn.mockRestore();
+  });
+
+  it('counts the two ceilings separately so an operator knows which one bound', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new GatedObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, {
+      ...CONFIG, putTimeoutMs: 60_000, concurrency: 1, queueMax: 2, queueMaxBytes: 10_000,
+    });
+
+    // Small bodies, so only the count ceiling can bind: 1 running + 2 queued + 2 dropped.
+    for (let i = 0; i < 5; i += 1) await sink.capture(cap({ bytes: Buffer.alloc(10, i) }));
+
+    expect(sink.stats().dropped).toBe(2);
+    expect(sink.stats().droppedBytes).toBe(0);
+
+    await drain(store, sink);
+    warn.mockRestore();
+  });
+
+  it('releases the byte budget as the queue drains', async () => {
+    const store = new GatedObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, {
+      ...CONFIG, putTimeoutMs: 60_000, concurrency: 1, queueMax: 100, queueMaxBytes: 1000,
+    });
+
+    for (let i = 0; i < 3; i += 1) await sink.capture(cap({ bytes: Buffer.alloc(400, i) }));
+    expect(sink.stats().queuedBytes).toBe(800);
+
+    await drain(store, sink);
+    expect(sink.stats().queuedBytes).toBe(0);
+
+    // The budget is a live ceiling, not a lifetime one: capture works again.
+    await sink.capture(cap({ bytes: Buffer.alloc(400, 9) }));
+    expect(sink.stats().droppedBytes).toBe(0);
+    await drain(store, sink);
+    expect(sink.stats().stored).toBe(4);
+  });
+
+  it('defaults the byte ceiling to 256 MiB when unset or nonsense', async () => {
+    const store = new GatedObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 60_000, queueMaxBytes: 0 });
+    // 1 MiB queued against the default budget is nowhere near it.
+    await sink.capture(cap({ bytes: Buffer.alloc(1024 * 1024, 1) }));
+    expect(sink.stats().droppedBytes).toBe(0);
+    await drain(store, sink);
+  });
+
+  it('clamps a runaway queueMax so the count ceiling stays a real bound', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new GatedObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, {
+      ...CONFIG, putTimeoutMs: 60_000, concurrency: 1, queueMax: 10_000, queueMaxBytes: 1024 * 1024 * 1024,
+    });
+
+    // 1 running + 5000 queued (the clamp) + 1 dropped.
+    for (let i = 0; i < 5002; i += 1) await sink.capture(cap({ bytes: Buffer.from(`b${i}`) }));
+
+    expect(sink.stats().queued).toBe(5000);
+    expect(sink.stats().dropped).toBe(1);
+
+    // Drain by opening the store rather than releasing 5000 parked PUTs one tick at
+    // a time — a backlog left running would starve the next test's event loop.
+    store.open = true;
+    store.release();
+    await sink.flush();
+    expect(sink.stats().queued).toBe(0);
+    warn.mockRestore();
   });
 
   it('flush() resolves immediately when nothing is queued', async () => {

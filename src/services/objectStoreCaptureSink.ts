@@ -121,6 +121,13 @@ export interface RawStoreConfig {
    */
   queueMax?: number;
   /**
+   * Hard ceiling on the BYTES those waiting captures hold. A count alone is not a
+   * memory bound: the same 500-deep queue is ~15 MB of page bodies or ~5 GB of
+   * 10 MiB originals, and the pod has 3Gi with 2Gi of it spoken for by /dev/shm.
+   * Whichever ceiling binds first drops the capture.
+   */
+  queueMaxBytes?: number;
+  /**
    * S3 addressing style for the adapter. Hetzner uses virtual-hosted style, so
    * the adapter defaults to `false` (path-style off). Unused by the sink logic.
    */
@@ -151,6 +158,12 @@ export interface SinkStats {
   inFlight: number;
   /** Captures refused because the queue was already at queueMax. Irrecoverable. */
   dropped: number;
+  /** Captures refused because the queue's BYTE budget was full. Counted apart from
+   * `dropped` so an operator can see WHICH ceiling bound: a depth problem and a
+   * payload problem want different settings. */
+  droppedBytes: number;
+  /** Bytes currently held by queued captures — the live reading of that budget. */
+  queuedBytes: number;
   /** Milliseconds a capture waited for a slot. Deliberately OUTSIDE the op budget. */
   queueWaitP50: number;
   queueWaitP95: number;
@@ -171,6 +184,19 @@ export const DEFAULT_RAW_STORE_CONCURRENCY = 4;
 export const MAX_RAW_STORE_CONCURRENCY = 64;
 /** Backlog ceiling. Page bodies are buffered, so the queue is memory we are holding. */
 export const DEFAULT_RAW_STORE_QUEUE_MAX = 500;
+/**
+ * Bounds on the configured depth. A depth of 0 is a sink that stores nothing, and a
+ * depth in the tens of thousands is the unbounded backlog wearing a number — the same
+ * reason the concurrency and the image byte ceiling are clamped.
+ */
+export const MIN_RAW_STORE_QUEUE_MAX = 1;
+export const MAX_RAW_STORE_QUEUE_MAX = 5000;
+/**
+ * 256 MiB of queued bodies. Sized against the container (3Gi, 2Gi of it /dev/shm for
+ * Chrome) rather than against a capture count, because the count says nothing about
+ * what is being held: 500 page bodies is ~15 MB and 500 originals is up to ~5 GB.
+ */
+export const DEFAULT_RAW_STORE_QUEUE_MAX_BYTES = 256 * 1024 * 1024;
 /** Drops are loud, but once a minute — a wave must not turn into a log flood. */
 const DROP_LOG_INTERVAL_MS = 60_000;
 /** Rolling latency window. Percentiles over the recent past, at a fixed memory cost. */
@@ -334,6 +360,13 @@ interface QueuedOp {
   /** Owns its own try/catch — a worker's `await` on this must never reject. */
   readonly run: () => Promise<void>;
   readonly enqueuedAt: number;
+  /** What this capture is holding, charged against the queue's byte budget. */
+  readonly bytes: number;
+}
+
+/** A body's length, or 0 for a malformed capture (the worker will count that). */
+function byteLengthOf(bytes: Buffer | Uint8Array | undefined): number {
+  return ArrayBuffer.isView(bytes) ? bytes.byteLength : 0;
 }
 
 export class ObjectStoreCaptureSink implements CaptureSink {
@@ -344,9 +377,12 @@ export class ObjectStoreCaptureSink implements CaptureSink {
   private readonly assetsEnabled: boolean;
   private readonly concurrency: number;
   private readonly queueMax: number;
+  private readonly queueMaxBytes: number;
   private readonly queue: QueuedOp[] = [];
+  private queuedBytes = 0;
   private inFlight = 0;
   private dropped = 0;
+  private droppedBytes = 0;
   private droppedSinceLog = 0;
   private lastDropLogAt = 0;
   private readonly queueWaits: number[] = [];
@@ -385,7 +421,13 @@ export class ObjectStoreCaptureSink implements CaptureSink {
         ? Math.min(Math.floor(c), MAX_RAW_STORE_CONCURRENCY)
         : DEFAULT_RAW_STORE_CONCURRENCY;
     const q = config.queueMax;
-    this.queueMax = typeof q === 'number' && Number.isFinite(q) && q > 0 ? Math.floor(q) : DEFAULT_RAW_STORE_QUEUE_MAX;
+    this.queueMax =
+      typeof q === 'number' && Number.isFinite(q) && q > 0
+        ? Math.min(Math.max(Math.floor(q), MIN_RAW_STORE_QUEUE_MAX), MAX_RAW_STORE_QUEUE_MAX)
+        : DEFAULT_RAW_STORE_QUEUE_MAX;
+    const qb = config.queueMaxBytes;
+    this.queueMaxBytes =
+      typeof qb === 'number' && Number.isFinite(qb) && qb > 0 ? Math.floor(qb) : DEFAULT_RAW_STORE_QUEUE_MAX_BYTES;
   }
 
   stats(): SinkStats {
@@ -401,6 +443,8 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       queued: this.queue.length,
       inFlight: this.inFlight,
       dropped: this.dropped,
+      droppedBytes: this.droppedBytes,
+      queuedBytes: this.queuedBytes,
       queueWaitP50: percentile(this.queueWaits, 50),
       queueWaitP95: percentile(this.queueWaits, 95),
       putP50: percentile(this.putDurations, 50),
@@ -428,7 +472,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
   async capture(c: RawCapture): Promise<void> {
     if (c.lane === 'asset') return this.admitAsset(c);
     if (!this.pagesEnabled) return void (this.skippedDisabled += 1);
-    this.enqueue(() => this.storePage(c));
+    this.enqueue(() => this.storePage(c), byteLengthOf(c.bytes));
   }
 
   /** The page/api lanes' store round trip, on a worker. Swallows-but-counts. */
@@ -496,7 +540,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     }
     const stored = bytes;
     const imageType = type;
-    this.enqueue(() => this.storeAsset(c, stored, imageType));
+    this.enqueue(() => this.storeAsset(c, stored, imageType), stored.byteLength);
   }
 
   /** The asset lane's store round trip, on a worker — the SAME queue as the pages. */
@@ -544,14 +588,22 @@ export class ObjectStoreCaptureSink implements CaptureSink {
    * memory we are holding on a scrape's behalf, and the capture it is holding is
    * already stale by the time it would be written.
    */
-  private enqueue(run: () => Promise<void>): void {
+  private enqueue(run: () => Promise<void>, bytes: number): void {
     if (this.queue.length >= this.queueMax) {
       this.dropped += 1;
-      this.droppedSinceLog += 1;
-      this.logDrops();
+      this.dropAndLog('depth');
       return;
     }
-    this.queue.push({ run, enqueuedAt: Date.now() });
+    // The byte budget, checked against what the queue would hold AFTER this capture.
+    // A count ceiling is not a memory bound: the depth that is 15 MB of page bodies
+    // is gigabytes of 10 MiB originals, and both arrive on the same queue.
+    if (this.queuedBytes + bytes > this.queueMaxBytes) {
+      this.droppedBytes += 1;
+      this.dropAndLog('bytes');
+      return;
+    }
+    this.queuedBytes += bytes;
+    this.queue.push({ run, enqueuedAt: Date.now(), bytes });
     // `.catch` for the same reason the queue's other fire-and-forget call sites have
     // one: an unhandled rejection out here would take the process with it, and this
     // lane is insurance — it is never allowed to be the thing that kills a scraper.
@@ -565,6 +617,9 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       for (;;) {
         const job = this.queue.shift();
         if (!job) break;
+        // The budget bounds what is WAITING; what is running is already bounded by
+        // the concurrency, so a dequeued capture gives its bytes back immediately.
+        this.queuedBytes -= job.bytes;
         this.record(this.queueWaits, Date.now() - job.enqueuedAt);
         await job.run(); // storePage/storeAsset own their try/catch — this cannot reject
       }
@@ -581,16 +636,20 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     if (into.length > LATENCY_SAMPLE_MAX) into.shift();
   }
 
-  private logDrops(): void {
+  /** Tally one drop and report the burst, at most once a minute. */
+  private dropAndLog(ceiling: 'depth' | 'bytes'): void {
+    this.droppedSinceLog += 1;
     const now = Date.now();
     if (now - this.lastDropLogAt < DROP_LOG_INTERVAL_MS) return;
     this.lastDropLogAt = now;
     const since = this.droppedSinceLog;
     this.droppedSinceLog = 0;
+    const bound = ceiling === 'depth' ? `depth ${this.queueMax}` : `${this.queueMaxBytes} bytes`;
     // eslint-disable-next-line no-console
     console.warn(
-      `[RAW-STORE] capture queue full (max ${this.queueMax}, concurrency ${this.concurrency}) — ` +
-        `dropped ${since} capture(s) since the last report, ${this.dropped} in total`,
+      `[RAW-STORE] capture queue full (${bound} reached, concurrency ${this.concurrency}) — ` +
+        `dropped ${since} capture(s) since the last report, ${this.dropped} on depth and ` +
+        `${this.droppedBytes} on bytes in total`,
     );
   }
 
