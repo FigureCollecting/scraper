@@ -79,6 +79,12 @@ export interface ImageFetchOptions {
   userAgent?: string;
   /** Residential egress for this fetch. The plain-HTTP lane REFUSES it (it cannot proxy). */
   proxyUrl?: string;
+  /**
+   * The exit this fetch MUST leave through, carried alongside `proxyUrl` so a lane can tell "direct
+   * by decision" from "residential whose proxy never got resolved". `residential` with no usable
+   * proxy is refused by every lane — a residential store is never silently fetched from the node IP.
+   */
+  egress?: 'direct' | 'residential';
   /** Per-request budget (ms); the lane clamps/defaults it. */
   timeoutMs?: number;
   /**

@@ -5,7 +5,9 @@
  * of its own) with two differences that matter for an image: the body is read as an ARRAY BUFFER,
  * never `text()`, and residential egress is REFUSED here rather than silently ignored — Node's
  * global fetch cannot proxy, so a residential image rides impit or the gated tab. The refusal
- * carries the very wording `refuseHttpLaneResidentialEgress` throws for the string lane.
+ * carries the very wording `refuseHttpLaneResidentialEgress` throws for the string lane, and it is
+ * raised on the DECLARED egress as well as on a resolved proxy URL: a residential fetch whose proxy
+ * never resolved must not degrade into a direct one.
  */
 import { httpLaneResidentialRefusal } from '../residentialEgress.js';
 import { isDeniedImageUrl } from './imageHostPolicy.js';
@@ -73,8 +75,8 @@ export function createHttpBytesFetch(options: HttpBytesFetchOptions = {}): Image
   return async function httpBytesFetch(url, opts = {}): Promise<ImageBytesResult> {
     // EGRESS, before the network: this lane cannot proxy, so a residential image is refused here
     // rather than fetched from the node IP (the string lane's rule, same wording).
-    if (opts.proxyUrl) {
-      return { ok: false, reason: 'refused', detail: httpLaneResidentialRefusal(url, opts.proxyUrl).message };
+    if (opts.proxyUrl || opts.egress === 'residential') {
+      return { ok: false, reason: 'refused', detail: httpLaneResidentialRefusal(url, opts.proxyUrl ?? '(unresolved)').message };
     }
     const headers: Record<string, string> = {
       'user-agent': opts.userAgent ?? DESKTOP_UA,

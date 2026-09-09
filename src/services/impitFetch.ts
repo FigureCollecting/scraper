@@ -213,7 +213,7 @@ function ensurePrimed(
  * (CF cannot be re-solved from the pod's IP, so the hand-minted value is the only one that can work).
  * A cookie the jar rejects is skipped with one warn naming the cookie NAME only — never a value.
  */
-async function seedJar(jar: CookieJarLike, url: string, cookies: Record<string, string>): Promise<void> {
+export async function seedJar(jar: CookieJarLike, url: string, cookies: Record<string, string>): Promise<void> {
   let target: URL;
   try {
     target = new URL(url);

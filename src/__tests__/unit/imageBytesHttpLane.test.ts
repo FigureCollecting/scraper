@@ -152,6 +152,13 @@ describe('createHttpBytesFetch', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
+  it('REFUSES a fetch declared residential even when no proxy URL was handed down', async () => {
+    const fetchImpl = jest.fn(async (_url: string, _init: FakeInit) => response());
+    const result = await createHttpBytesFetch({ fetchImpl: fetchImpl as never })('https://cdn.example.com/a.png', { egress: 'residential' });
+    expect(result).toMatchObject({ ok: false, reason: 'refused' });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it('reports a body that aborts mid-read as timeout, and rethrows a fault mid-read', async () => {
     const res = response();
     const aborted = Object.assign(new Error('aborted'), { name: 'AbortError' });

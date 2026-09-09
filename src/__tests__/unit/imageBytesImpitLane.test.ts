@@ -7,7 +7,7 @@
  * a silently corrupted JPEG is far worse than a refusal.
  */
 import { createImpitBytesFetch, createImpitSessionProvider } from '../../services/images/impitBytesFetch';
-import type { ImpitLike } from '../../services/impitFetch';
+import type { CookieJarLike, ImpitLike } from '../../services/impitFetch';
 
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);
 
@@ -37,10 +37,12 @@ const impitResponse = (init: FakeResponseInit = {}) => {
   return { ...base, bytes: async () => new Uint8Array(body) };
 };
 
-/** A fake Impit that records what it was asked for. */
+/** A fake Impit and its jar, recording what it was asked for and what was seeded into it. */
 const fakeImpit = (respond: (url: string) => unknown) => {
   const fetch = jest.fn(async (url: string, _init: { method: string; headers?: Record<string, string> }) => respond(url) as never);
-  return { impit: { fetch } as unknown as ImpitLike, fetch };
+  const seeded: string[] = [];
+  const jar = { setCookie: jest.fn(async (cookie: string, _url: string) => { seeded.push(cookie); }) } as unknown as CookieJarLike;
+  return { impit: { fetch } as unknown as ImpitLike, fetch, jar, seeded };
 };
 
 describe('createImpitBytesFetch', () => {
@@ -96,6 +98,45 @@ describe('createImpitBytesFetch', () => {
 
     expect(getImpit).toHaveBeenNthCalledWith(1, expect.stringMatching(/^chrome/), undefined);
     expect(getImpit).toHaveBeenNthCalledWith(2, expect.stringMatching(/^chrome/), 'socks5://p.test:1055');
+  });
+
+  it('REFUSES residential egress with no proxy — never falling back to the node IP', async () => {
+    const { impit, fetch } = fakeImpit(() => impitResponse());
+    const result = await createImpitBytesFetch({ getImpit: async () => impit })('https://cdn.anitoysgk.com/a.png', { egress: 'residential' });
+    expect(result).toMatchObject({ ok: false, reason: 'refused' });
+    expect((result as { detail?: string }).detail).toMatch(/RESIDENTIAL_PROXY_URL/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('SEEDS the stored cf cookies into the session jar and lets the pinned mint UA win', async () => {
+    const { impit, fetch, jar, seeded } = fakeImpit(() => impitResponse());
+    const store = {
+      cookiesFor: jest.fn(() => ({ cf_clearance: 'abc', tfaTrust: 'xyz' })),
+      userAgentFor: jest.fn(() => 'MintUA/1'),
+    };
+    const fetchBytes = createImpitBytesFetch({ getImpit: async () => ({ impit, jar }), cookieStore: store });
+
+    await fetchBytes('https://cdn.anitoysgk.com/a.png', { userAgent: 'CallerUA/9' });
+
+    expect(store.cookiesFor).toHaveBeenCalledWith('https://cdn.anitoysgk.com/a.png');
+    expect(seeded.join(' ')).toContain('cf_clearance=abc');
+    expect(seeded.join(' ')).toContain('tfaTrust=xyz');
+    // cf_clearance is bound to IP + UA, so the mint UA must beat whatever the caller asked for.
+    expect((fetch.mock.calls[0][1].headers as Record<string, string>)['user-agent']).toBe('MintUA/1');
+  });
+
+  it('seeds nothing and pins no UA for a host the cookie store knows nothing about', async () => {
+    const { impit, fetch, jar, seeded } = fakeImpit(() => impitResponse());
+    const store = { cookiesFor: jest.fn(() => undefined), userAgentFor: jest.fn(() => undefined) };
+    await createImpitBytesFetch({ getImpit: async () => ({ impit, jar }), cookieStore: store })('https://cdn.example.com/a.png', { userAgent: 'CallerUA/9' });
+    expect(seeded).toEqual([]);
+    expect((fetch.mock.calls[0][1].headers as Record<string, string>)['user-agent']).toBe('CallerUA/9');
+  });
+
+  it('bounds the call with the per-request timeoutMs rather than the session-wide budget', async () => {
+    const stalled = { fetch: jest.fn(() => new Promise(() => undefined)) } as unknown as ImpitLike;
+    const result = await createImpitBytesFetch({ getImpit: async () => stalled })('https://cdn.anitoysgk.com/a.png', { timeoutMs: 20 });
+    expect(result).toMatchObject({ ok: false, reason: 'timeout' });
   });
 
   it('reports a non-2xx as http-status and a non-image body as not-image', async () => {
@@ -216,10 +257,20 @@ describe('createImpitSessionProvider (the default session cache)', () => {
     const b = await provider('chrome142', undefined);
     const proxied = await provider('chrome142', 'socks5://p.test:1055');
 
-    expect(a).toBe(b);
-    expect(proxied).not.toBe(a);
+    expect(a.impit).toBe(b.impit);
+    expect(a.jar).toBe(b.jar);
+    expect(proxied.impit).not.toBe(a.impit);
     expect(makeImpit).toHaveBeenCalledTimes(2);
     expect(makeImpit.mock.calls[1][3]).toBe('socks5://p.test:1055');
+  });
+
+  it('keys the cache on an UNAMBIGUOUS (profile, proxy) pair, as the string lane does', async () => {
+    const makeImpit = jest.fn((browser: string, _jar: unknown, _timeoutMs: number, proxyUrl?: string) => impitFor(`${browser}|${proxyUrl ?? 'direct'}`));
+    const provider = createImpitSessionProvider(makeImpit as never);
+    // A space separator would collapse these two onto ONE session — one jar across two egresses.
+    const a = await provider('chrome142 socks5://p.test:1055', undefined);
+    const b = await provider('chrome142', 'socks5://p.test:1055');
+    expect(a.impit).not.toBe(b.impit);
   });
 
   it('evicts a failed build so the next call retries instead of caching the failure', async () => {
