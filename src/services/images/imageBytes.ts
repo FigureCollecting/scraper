@@ -187,11 +187,13 @@ export const IMAGE_CHROME_UA =
  * version — including the engine's own page-lane UA. The token exists to keep that claim off the
  * wire, so a lane that adds one back has inverted the only decision the operator made.
  *
- * That contract binds the HTTP and IMPIT lanes, which is where `default` can be delivered. The gated
- * tab cannot honour it and does not pretend to: a browser tab carries the browser's identity, always
- * a Chrome string, and `gatedTabBytesFetch` resolving one through the page lane's own rules is the
- * transport being consistent with itself, not a lane substituting an identity. A host that needs
- * `default` needs `http` or `impit` — see `ImageHostRule.ua`.
+ * That contract is the lanes' whole story, because `default` only ever reaches the two that can
+ * honour it: the http lane sends no user agent, the impit lane sends its impersonation profile's.
+ * The browser lane cannot — a tab carries the browser's own identity, always a Chrome string, and
+ * rewriting it contradicts the client hints the same browser sends — so `chooseImageLane` never
+ * emits `default` for it: the pairing is a typed refusal (`browser-lane-default-ua`), and the table
+ * loader names a row that writes it at boot. The gated tab keeping its Chrome identity is the
+ * transport being itself, never this token resolved to Chrome — see `ImageHostRule.ua`.
  */
 export function resolveImageUserAgent(ua: 'chrome' | 'default' | undefined): string | undefined {
   return ua === 'chrome' ? IMAGE_CHROME_UA : undefined;

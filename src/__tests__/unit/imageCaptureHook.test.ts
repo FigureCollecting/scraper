@@ -222,6 +222,18 @@ describe('the image capture hook', () => {
       expect(h.hook.stats()).toMatchObject({ failed: 0, skipped: expect.objectContaining({ policyDeny: 1 }) });
       expect(h.warnings[0]).toMatch(/http-lane-residential/);
     });
+
+    it('SAYS SO for a browser-lane row that asks to claim no browser, instead of fetching as Chrome', async () => {
+      // The third self-contradiction: a tab carries the browser's identity, so `ua: default` on the
+      // browser lane cannot be delivered — and resolving it to Chrome would invert the operator's
+      // only decision. Refused at the decision, counted as a refusal, said once.
+      const h = harness({ policy: { 'cdn.test': { lane: 'browser', ua: 'default' } } });
+      await capture(h, rulesetDescribing([gallery('https://cdn.test/a.jpg')]), { transport: 'browser', access: 'cloudflare' });
+      expect(h.calls).toHaveLength(0);
+      expect(h.hook.stats()).toMatchObject({ failed: 0, skipped: expect.objectContaining({ policyDeny: 1 }) });
+      expect(h.warnings).toHaveLength(1);
+      expect(h.warnings[0]).toMatch(/browser-lane-default-ua/);
+    });
   });
 
   describe('the Accept and the negotiation witnesses', () => {

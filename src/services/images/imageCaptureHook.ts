@@ -360,10 +360,11 @@ export function createImageCaptureHook(deps: ImageCaptureHookDeps): ImageCapture
     const decision = chooseImageLane(job.pageUrl, url, job.searchFetch, deps.policy);
     if (!decision.ok) {
       skipped.policyDeny += 1;
-      // A deny-list hit is the table doing exactly its job and needs no log. The other two refusals
-      // are the operator's table CONTRADICTING ITSELF — a lane that cannot proxy, or a residential
-      // exit pointed at a host it may not carry — and they are invisible in the counters, which fold
-      // all three into one number. Said once per host, they are a line an operator can act on.
+      // A deny-list hit is the table doing exactly its job and needs no log. The other refusals are
+      // the operator's table CONTRADICTING ITSELF — a lane that cannot proxy, a residential exit
+      // pointed at a host it may not carry, a browser lane asked to claim no browser — and they are
+      // invisible in the counters, which fold them all into one number. Said once per host, they
+      // are a line an operator can act on.
       if (decision.reason !== 'denied') {
         logOncePerHost(
           `policy:${storeHostOf(url) || url}`,
