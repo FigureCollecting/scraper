@@ -44,17 +44,20 @@ export interface ImageHostRule {
   referer?: boolean;
   /**
    * Which identity the fetch claims. `chrome` sends the lanes' Chrome string; `default` sends NO
-   * browser claim and lets the transport's own identity stand (undici's `node`, impit's
-   * impersonation profile). `default` is the row an operator writes for a host with an INVERTED
-   * gate — hobby-genki.com answers 200 to a request claiming no browser and 403
-   * cf-mitigated:challenge to one claiming Chrome, on any Chrome version — so no lane may quietly
-   * put a browser string back (see `resolveImageUserAgent`).
+   * browser claim and lets the transport's own identity stand (undici's `node`; on `impit` the
+   * impersonation profile's UA — or, for a host with hand-minted cookies, the mint UA those cookies
+   * are bound to, which that lane always sends). `default` is the row an operator writes for a
+   * host with an INVERTED gate — hobby-genki.com answers 200 to a request claiming no browser and
+   * 403 cf-mitigated:challenge to one claiming Chrome, on any Chrome version — so no lane may
+   * quietly put a browser string back (see `resolveImageUserAgent`).
    *
    * On `lane: 'browser'` the token cannot be delivered — the transport IS a browser and its UA is a
    * Chrome string whichever value is written here — so the pairing is REFUSED rather than resolved
    * to Chrome: the loader warns on a row that writes it, and `chooseImageLane` refuses every image
    * that would ride it (`browser-lane-default-ua`), including when the browser lane is inherited
    * from the store rather than written. A host that needs `default` needs `http` or `impit`.
+   * Every browser-lane row therefore resolves to `chrome`, and that string is pinned onto the tab
+   * over its own UA rules — see `resolveImageUserAgent` for what that costs.
    */
   ua?: 'chrome' | 'default';
   /**
@@ -303,11 +306,15 @@ export function chooseImageLane(
   }
   // `ua: 'default'` is "claim no browser", and a browser TAB cannot deliver it: its user agent is
   // the browser's own Chrome string whatever the row says, and rewriting it contradicts the client
-  // hints the same browser sends. Resolving the token to Chrome instead — which is what happened
-  // before — inverts the only decision the operator made, the shape of the 2026-09-09 hobby-genki
-  // defect on the http lane. So it is refused, typed, like the two pairings around it. The loader
-  // already named a row that WRITES the browser lane; this also catches the row that names no lane
-  // and INHERITS the browser one from the store's declaration, which no table can know.
+  // hints the same browser sends. Before this refusal the pairing did NOT resolve to Chrome: it
+  // reached the gated tab with no request UA, so the tab's own rules stood (clean-headful: the real
+  // Chrome's UA; headless: the host's mint UA, else the engine default). It is refused anyway so
+  // the token means ONE thing on every lane — and the cost is named: browser + `default` was the
+  // only row that meant "pin no image UA on this tab", and the lane's remaining value, `chrome`,
+  // pins `IMAGE_CHROME_UA` over those rules (`resolveUserAgent` lets a request UA win). A token for
+  // "inherit the tab's" is its own unit. Typed, like the two pairings around it: the loader already
+  // named a row that WRITES the browser lane; this also catches the row that names no lane and
+  // INHERITS the browser one from the store's declaration, which no table can know.
   if (lane === 'browser' && rule.ua === 'default') {
     return {
       ok: false,

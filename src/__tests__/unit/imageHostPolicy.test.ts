@@ -360,10 +360,12 @@ describe('chooseImageLane', () => {
 
   /**
    * `ua: 'default'` means "claim no browser". The http lane delivers it by sending no user agent and
-   * the impit lane by sending its impersonation profile's; a browser TAB cannot deliver it at all —
-   * its user agent is the browser's own Chrome string whatever the row says. So the pairing is a
-   * refusal, in the same shape as http+residential: typed, named, and never a silent downgrade to
-   * Chrome (which is exactly what inverted the operator's only decision before).
+   * the impit lane by sending whatever it already sends (its impersonation profile's, or a pinned
+   * mint UA); a browser TAB cannot deliver it at all — its user agent is the browser's own Chrome
+   * string whatever the row says. So the pairing is a refusal, in the same shape as
+   * http+residential: typed, named, and never a silent resolution to Chrome. (Before, it reached
+   * the tab with no request UA and the tab's own rules stood; the inversion was the http lane's
+   * `?? IMAGE_CHROME_UA`.)
    */
   it('refuses a row pairing the browser lane with ua:default — a tab cannot claim no browser', () => {
     const policy = buildImageHostPolicy({ 'cdn11.bigcommerce.com': { lane: 'browser', ua: 'default' } });
