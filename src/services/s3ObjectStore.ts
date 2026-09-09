@@ -7,6 +7,7 @@
  * (fc-infra nodes/fc-app-01/raw-store/README.md — the "1.B scraper Deployment
  * wiring" fragment):
  *   PERSIST_RAW_HTML=true                                        (the se-09 kill-switch)
+ *   PERSIST_RAW_IMAGES=true                                      (the SEPARATE asset-lane switch)
  *   RAW_STORE_S3_ENDPOINT / _REGION / _BUCKET / _PREFIX / _KEY_SCHEME   (ConfigMap, envFrom)
  *   RAW_STORE_S3_ACCESS_KEY_ID / RAW_STORE_S3_SECRET_ACCESS_KEY   (Secret raw-store-s3-creds,
  *       whose internal keys are ACCESS_KEY_ID/SECRET_ACCESS_KEY, mapped to these
@@ -26,6 +27,7 @@ import {
   type ObjectStore,
   type PutOptions,
   type RawStoreConfig,
+  type SinkStats,
 } from './objectStoreCaptureSink.js';
 
 export interface S3Credentials {
@@ -88,16 +90,53 @@ export function toS3MetaData(opts: PutOptions): Record<string, string> {
   return metaData;
 }
 
-/** A finite, positive millisecond value from env, or undefined (sink uses its default). */
-function parsePositiveMs(raw: string | undefined): number | undefined {
+/** A finite, positive number from env, or undefined (the sink uses its default). */
+function parsePositive(raw: string | undefined): number | undefined {
   if (raw === undefined) return undefined;
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
 /**
+ * The largest ceiling RAW_STORE_IMAGE_MAX_BYTES may set. Without an upper bound a
+ * typo (`1e30`) silently removes the ceiling, and the ceiling is what stops a body
+ * that is already fully buffered and hashed from also being stored.
+ */
+export const MAX_CONFIGURABLE_IMAGE_BYTES = 64 * 1024 * 1024;
+
+/** A positive byte ceiling from env, clamped so a typo cannot disable the ceiling. */
+function parseImageMaxBytes(raw: string | undefined): number | undefined {
+  const n = parsePositive(raw);
+  return n === undefined ? undefined : Math.min(n, MAX_CONFIGURABLE_IMAGE_BYTES);
+}
+
+/**
+ * The asset lane's own kill switch, deliberately SEPARATE from PERSIST_RAW_HTML:
+ * images are a different corpus with different volume and different rights, so
+ * turning page capture on must not start pulling binaries. Off unless the value is
+ * exactly `true`, and consulted by the caller that decides to fetch an image at all
+ * — the sink itself stores whatever it is handed.
+ */
+export function isImagePersistenceEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.PERSIST_RAW_IMAGES === 'true';
+}
+
+/** Names the switch(es) that were turned on, for the enabled-but-incomplete warning. */
+function enabledSwitches(pages: boolean, assets: boolean): string {
+  const on = [pages ? 'PERSIST_RAW_HTML=true' : '', assets ? 'PERSIST_RAW_IMAGES=true' : ''].filter(Boolean);
+  return on.join(' + ');
+}
+
+/**
  * Reads the raw-store contract + credential from the environment. Returns null
- * when capture is off (PERSIST_RAW_HTML !== 'true') or the config is incomplete.
+ * when BOTH capture switches are off, or the config is incomplete.
+ *
+ * Either switch on its own builds the sink: the asset lane is genuinely independent
+ * of page capture (a different corpus, different volume, different rights), so an
+ * images-only wiring must not silently collapse to a Noop. Which LANES may then
+ * write is carried into the config as pagesEnabled/assetsEnabled and enforced at
+ * the sink's write boundary.
+ *
  * An ENABLED-but-incomplete state is logged loudly — never a silent Noop — because
  * a name/wiring mismatch would otherwise disable the (irrecoverable) insurance
  * corpus with no signal.
@@ -105,8 +144,10 @@ function parsePositiveMs(raw: string | undefined): number | undefined {
 export function loadRawStoreConfigFromEnv(
   env: NodeJS.ProcessEnv = process.env,
 ): { config: RawStoreConfig; creds: S3Credentials } | null {
-  // se-09 kill-switch: capture is off by default; absence here is intended silence.
-  if (env.PERSIST_RAW_HTML !== 'true') return null;
+  // se-09 kill-switches: capture is off by default; absence here is intended silence.
+  const pagesEnabled = env.PERSIST_RAW_HTML === 'true';
+  const assetsEnabled = isImagePersistenceEnabled(env);
+  if (!pagesEnabled && !assetsEnabled) return null;
 
   const endpoint = env.RAW_STORE_S3_ENDPOINT;
   const bucket = env.RAW_STORE_S3_BUCKET;
@@ -114,10 +155,18 @@ export function loadRawStoreConfigFromEnv(
   const secretAccessKey = env.RAW_STORE_S3_SECRET_ACCESS_KEY;
 
   if (!endpoint || !bucket || !accessKeyId || !secretAccessKey) {
+    const missing = [
+      ['RAW_STORE_S3_ENDPOINT', endpoint],
+      ['RAW_STORE_S3_BUCKET', bucket],
+      ['RAW_STORE_S3_ACCESS_KEY_ID', accessKeyId],
+      ['RAW_STORE_S3_SECRET_ACCESS_KEY', secretAccessKey],
+    ]
+      .filter(([, v]) => !v)
+      .map(([k]) => k as string);
     // eslint-disable-next-line no-console
     console.warn(
-      '[RAW-STORE] PERSIST_RAW_HTML=true but required config/credentials are missing — capture DISABLED ' +
-        '(needs RAW_STORE_S3_ENDPOINT, RAW_STORE_S3_BUCKET, RAW_STORE_S3_ACCESS_KEY_ID, RAW_STORE_S3_SECRET_ACCESS_KEY)',
+      `[RAW-STORE] ${enabledSwitches(pagesEnabled, assetsEnabled)} but required config/credentials are missing — capture DISABLED ` +
+        `(needs RAW_STORE_S3_ENDPOINT, RAW_STORE_S3_BUCKET, RAW_STORE_S3_ACCESS_KEY_ID, RAW_STORE_S3_SECRET_ACCESS_KEY; missing: ${missing.join(', ')})`,
     );
     return null;
   }
@@ -128,8 +177,13 @@ export function loadRawStoreConfigFromEnv(
     bucket,
     prefix: env.RAW_STORE_S3_PREFIX ?? 'raw-html/',
     jsonPrefix: env.RAW_STORE_S3_JSON_PREFIX ?? 'raw-json/',
+    imagePrefix: env.RAW_STORE_S3_IMAGE_PREFIX ?? 'raw-img/',
     keyScheme: env.RAW_STORE_KEY_SCHEME ?? 'sha256-v1',
-    putTimeoutMs: parsePositiveMs(env.RAW_STORE_PUT_TIMEOUT_MS),
+    pagesEnabled,
+    assetsEnabled,
+    putTimeoutMs: parsePositive(env.RAW_STORE_PUT_TIMEOUT_MS),
+    imagePutTimeoutMs: parsePositive(env.RAW_STORE_IMAGE_PUT_TIMEOUT_MS),
+    maxImageBytes: parseImageMaxBytes(env.RAW_STORE_IMAGE_MAX_BYTES),
     pathStyle: env.RAW_STORE_S3_PATH_STYLE !== undefined ? env.RAW_STORE_S3_PATH_STYLE === 'true' : undefined,
   };
   return { config, creds: { accessKeyId, secretAccessKey } };
@@ -145,6 +199,28 @@ export function createRawCaptureSink(env: NodeJS.ProcessEnv = process.env): Capt
   if (!loaded) return new NoopCaptureSink();
   const store = new S3ObjectStore(loaded.config.bucket, loaded.config, loaded.creds);
   return new ObjectStoreCaptureSink(store, loaded.config);
+}
+
+/**
+ * The ops-readable view of whichever sink the composition root built. `configured`
+ * separates "no sink at all" (both switches off / incomplete config) from a live
+ * one, and the counters make an all-skipping asset lane — every image answered with
+ * a challenge page, say — visible instead of looking exactly like an idle one.
+ */
+export interface RawStoreView {
+  configured: boolean;
+  stats?: SinkStats;
+}
+
+/** Duck-typed: only a real sink carries stats(). Never throws — health reads this. */
+export function rawStoreView(sink: CaptureSink = getRawCaptureSink()): RawStoreView {
+  const s = sink as { stats?: () => SinkStats };
+  if (typeof s.stats !== 'function') return { configured: false };
+  try {
+    return { configured: true, stats: s.stats() };
+  } catch {
+    return { configured: false };
+  }
 }
 
 // Process-wide singleton so every fetch path shares one client + one set of

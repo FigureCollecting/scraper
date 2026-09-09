@@ -1,7 +1,9 @@
+import { jest } from '@jest/globals';
 import { gunzipSync } from 'node:zlib';
 import { buildRawCapture } from '../../services/captureSink';
 import {
   ObjectStoreCaptureSink,
+  DEFAULT_IMAGE_PUT_TIMEOUT_MS,
   type ObjectStore,
   type PutOptions,
   type RawStoreConfig,
@@ -181,5 +183,402 @@ describe('ObjectStoreCaptureSink — sha256-v1 contract', () => {
     const s = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 0 });
     await expect(s.capture(cap())).resolves.toBeUndefined();
     expect(s.stats().stored).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The asset lane: originals stored UNALTERED (no gzip), typed by magic bytes.
+// ---------------------------------------------------------------------------
+
+/** Minimal, magic-byte-correct heads for each format the lane accepts. */
+const JPEG = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.from('\0\x10JFIF\0', 'binary')]);
+const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from('IHDR')]);
+const WEBP = Buffer.concat([Buffer.from('RIFF'), Buffer.from([0x1a, 0, 0, 0]), Buffer.from('WEBPVP8 ')]);
+const GIF = Buffer.from('GIF89a\x01\x00\x01\x00', 'binary');
+const AVIF = Buffer.concat([Buffer.from([0, 0, 0, 0x20]), Buffer.from('ftypavifavif')]);
+const SVG = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><rect/></svg>', 'utf8');
+
+const asset = (bytes: Buffer, over: Partial<Parameters<typeof buildRawCapture>[0]> = {}) =>
+  buildRawCapture({
+    url: 'https://cdn.x.test/img/9.jpg',
+    lane: 'asset',
+    bytes,
+    statusCode: 200,
+    contentType: 'image/jpeg',
+    fetchedAt: '2026-09-08T00:00:00.000Z',
+    sourceItem: { site: 'x.test', itemId: '12345' },
+    sourceUrl: 'https://x.test/item/12345',
+    position: 2,
+    ...over,
+  });
+
+describe('ObjectStoreCaptureSink — the asset lane', () => {
+  let store: FakeObjectStore;
+  let sink: ObjectStoreCaptureSink;
+
+  beforeEach(() => {
+    store = new FakeObjectStore();
+    sink = new ObjectStoreCaptureSink(store, CONFIG);
+  });
+
+  it.each([
+    ['jpeg', JPEG, 'jpg', 'image/jpeg'],
+    ['png', PNG, 'png', 'image/png'],
+    ['webp', WEBP, 'webp', 'image/webp'],
+    ['gif', GIF, 'gif', 'image/gif'],
+    ['avif', AVIF, 'avif', 'image/avif'],
+  ])('stores a %s unaltered at raw-img/sha256/<aa>/<hex>.%s with its real Content-Type', async (_n, bytes, ext, ct) => {
+    const c = asset(bytes as Buffer);
+    await sink.capture(c);
+
+    expect(store.puts).toHaveLength(1);
+    const { key, body, opts } = store.puts[0];
+    expect(key).toBe(`raw-img/sha256/${c.sha256.slice(0, 2)}/${c.sha256}.${ext}`);
+    expect(body.equals(bytes as Buffer)).toBe(true); // NOT gzipped — the original, byte for byte
+    expect(opts.contentType).toBe(ct);
+    expect(opts.contentEncoding).toBeUndefined();
+    expect(sink.stats().assetStored).toBe(1);
+  });
+
+  it('sniffs the bytes rather than trusting the declared Content-Type, and records both', async () => {
+    const c = asset(PNG, { contentType: 'application/octet-stream' });
+    await sink.capture(c);
+
+    const { key, opts } = store.puts[0];
+    expect(key.endsWith('.png')).toBe(true);
+    expect(opts.contentType).toBe('image/png'); // sniffed wins
+    expect(opts.metadata?.['declared-content-type']).toBe('application/octet-stream');
+  });
+
+  it('tags the asset with its item provenance', async () => {
+    await sink.capture(asset(JPEG));
+    const md = store.puts[0].opts.metadata ?? {};
+    expect(md['url']).toBe('https://cdn.x.test/img/9.jpg');
+    expect(md['fetched-at']).toBe('2026-09-08T00:00:00.000Z');
+    expect(md['site']).toBe('x.test'); // the DECLARING store, not the CDN host
+    expect(md['source-item']).toBe('x.test/12345');
+    expect(md['source-url']).toBe('https://x.test/item/12345');
+    expect(md['position']).toBe('2');
+    expect(md['lane']).toBe('asset');
+    expect(md['declared-content-type']).toBe('image/jpeg');
+    expect(md['bytes']).toBe(String(JPEG.length));
+  });
+
+  it('falls back to the image host for site when no source item is carried', async () => {
+    await sink.capture(asset(JPEG, { sourceItem: undefined, sourceUrl: undefined, position: undefined }));
+    const md = store.puts[0].opts.metadata ?? {};
+    expect(md['site']).toBe('cdn.x.test');
+    expect(md['source-item']).toBeUndefined();
+    expect(md['source-url']).toBeUndefined();
+    expect(md['position']).toBeUndefined();
+  });
+
+  it('uses a configured imagePrefix', async () => {
+    const s = new ObjectStoreCaptureSink(store, { ...CONFIG, imagePrefix: 'img/' });
+    const c = asset(PNG);
+    await s.capture(c);
+    expect(store.puts[0].key).toBe(`img/sha256/${c.sha256.slice(0, 2)}/${c.sha256}.png`);
+  });
+
+  it('writes once and dedupes identical asset bytes', async () => {
+    await sink.capture(asset(JPEG));
+    await sink.capture(asset(JPEG));
+    expect(store.puts).toHaveLength(1);
+    expect(sink.stats()).toMatchObject({ assetStored: 1, assetDeduped: 1 });
+  });
+
+  it.each([
+    ['html', Buffer.from('<!doctype html><html></html>', 'utf8')],
+    ['json', Buffer.from('{"a":1}', 'utf8')],
+    ['svg', SVG],
+    ['plain text', Buffer.from('not an image at all', 'utf8')],
+  ])('SKIPS a %s body as notImage instead of storing or throwing', async (_n, bytes) => {
+    await expect(sink.capture(asset(bytes as Buffer))).resolves.toBeUndefined();
+    expect(store.puts).toHaveLength(0);
+    expect(store.headCalls).toBe(0); // skipped before any store op
+    expect(sink.stats().assetSkipped).toEqual({ notImage: 1, tooLarge: 0, empty: 0, disabled: 0 });
+    expect(sink.stats().assetFailed).toBe(0);
+  });
+
+  it('SKIPS an oversized image as tooLarge (RAW_STORE_IMAGE_MAX_BYTES, default 10 MiB)', async () => {
+    const big = Buffer.concat([JPEG, Buffer.alloc(11 * 1024 * 1024)]);
+    await expect(sink.capture(asset(big))).resolves.toBeUndefined();
+    expect(store.puts).toHaveLength(0);
+    expect(sink.stats().assetSkipped).toEqual({ notImage: 0, tooLarge: 1, empty: 0, disabled: 0 });
+  });
+
+  it('honours a configured maxImageBytes', async () => {
+    const s = new ObjectStoreCaptureSink(store, { ...CONFIG, maxImageBytes: 4 });
+    await s.capture(asset(JPEG));
+    expect(store.puts).toHaveLength(0);
+    expect(s.stats().assetSkipped.tooLarge).toBe(1);
+  });
+
+  it('SKIPS an empty body as empty', async () => {
+    await expect(sink.capture(asset(Buffer.alloc(0)))).resolves.toBeUndefined();
+    expect(store.puts).toHaveLength(0);
+    expect(sink.stats().assetSkipped).toEqual({ notImage: 0, tooLarge: 0, empty: 1, disabled: 0 });
+  });
+
+  it('counts an asset store failure as assetFailed, never throwing', async () => {
+    store.failPut = true;
+    await expect(sink.capture(asset(JPEG))).resolves.toBeUndefined();
+    expect(sink.stats()).toMatchObject({ assetFailed: 1, failed: 0 });
+  });
+
+  it('keeps the asset counters separate from the page-body counters', async () => {
+    await sink.capture(asset(JPEG));
+    await sink.capture(cap());
+    expect(sink.stats()).toEqual({
+      stored: 1,
+      deduped: 0,
+      failed: 0,
+      skippedDisabled: 0,
+      assetStored: 1,
+      assetDeduped: 0,
+      assetFailed: 0,
+      assetSkipped: { notImage: 0, tooLarge: 0, empty: 0, disabled: 0 },
+    });
+  });
+
+  it('leaves the wire/dom/api lanes byte-identical: still gzip, still .html.gz/.json.gz', async () => {
+    const w = cap();
+    const a = cap({ lane: 'api', contentType: 'application/json', bytes: Buffer.from('{"ok":true}', 'utf8') });
+    await sink.capture(w);
+    await sink.capture(a);
+
+    const html = store.puts.find(p => p.key.endsWith('.html.gz'))!;
+    const json = store.puts.find(p => p.key.endsWith('.json.gz'))!;
+    expect(html.key).toBe(`raw-html/sha256/${w.sha256.slice(0, 2)}/${w.sha256}.html.gz`);
+    expect(gunzipSync(html.body).equals(HTML)).toBe(true);
+    expect(html.opts.contentType).toBe('application/gzip');
+    expect(Object.keys(html.opts.metadata ?? {}).sort()).toEqual(['fetched-at', 'site', 'url']);
+    expect(json.key).toBe(`raw-json/sha256/${a.sha256.slice(0, 2)}/${a.sha256}.json.gz`);
+    expect(json.opts.contentType).toBe('application/gzip');
+  });
+
+  it('never lets an image content-type on a PAGE lane divert it to the image prefix', async () => {
+    await sink.capture(cap({ contentType: 'image/png' }));
+    expect(store.puts[0].key.startsWith('raw-html/')).toBe(true);
+    expect(store.puts[0].key.endsWith('.html.gz')).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The kill switches are enforced at the WRITE boundary, not only by convention:
+// a caller that ignores PERSIST_RAW_IMAGES must still not put bytes in the bucket.
+// ---------------------------------------------------------------------------
+describe('ObjectStoreCaptureSink — per-lane enable flags', () => {
+  let store: FakeObjectStore;
+
+  beforeEach(() => {
+    store = new FakeObjectStore();
+  });
+
+  it('refuses the asset lane when assetsEnabled is false — counted as a disabled skip, no store op', async () => {
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, assetsEnabled: false });
+    await sink.capture(asset(JPEG));
+
+    expect(store.puts).toHaveLength(0);
+    expect(store.headCalls).toBe(0);
+    expect(sink.stats().assetSkipped.disabled).toBe(1);
+    expect(sink.stats().assetStored).toBe(0);
+  });
+
+  it('refuses the page lanes when pagesEnabled is false — counted, no store op', async () => {
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, pagesEnabled: false });
+    await sink.capture(cap());
+    await sink.capture(cap({ lane: 'api', bytes: Buffer.from('{"a":1}', 'utf8') }));
+
+    expect(store.puts).toHaveLength(0);
+    expect(store.headCalls).toBe(0);
+    expect(sink.stats().skippedDisabled).toBe(2);
+    expect(sink.stats().stored).toBe(0);
+  });
+
+  it('runs one lane while the other is off (images-only wiring stores images, never pages)', async () => {
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, pagesEnabled: false, assetsEnabled: true });
+    await sink.capture(cap());
+    await sink.capture(asset(PNG));
+
+    expect(store.puts).toHaveLength(1);
+    expect(store.puts[0].key.startsWith('raw-img/')).toBe(true);
+    expect(sink.stats().skippedDisabled).toBe(1);
+    expect(sink.stats().assetStored).toBe(1);
+  });
+
+  it('defaults both lanes ON when the flags are absent (existing construction is unchanged)', async () => {
+    const sink = new ObjectStoreCaptureSink(store, CONFIG);
+    await sink.capture(cap());
+    await sink.capture(asset(JPEG));
+    expect(sink.stats().stored).toBe(1);
+    expect(sink.stats().assetStored).toBe(1);
+    expect(sink.stats().skippedDisabled).toBe(0);
+    expect(sink.stats().assetSkipped.disabled).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S3 caps USER METADATA as a SET (~2 KB of header bytes), not per value. Two of
+// the asset lane's inputs are wholly store-controlled (the image URL it serves and
+// the Content-Type header it returns), so an unbudgeted set is a way for a hostile
+// store to 400 every one of its own images out of the corpus.
+// ---------------------------------------------------------------------------
+
+/** The header bytes S3 actually counts: `x-amz-meta-<key>` + value, summed. */
+const metadataBytes = (md: Record<string, string> = {}) =>
+  Object.entries(md).reduce(
+    (n, [k, v]) => n + Buffer.byteLength(`x-amz-meta-${k}`, 'utf8') + Buffer.byteLength(v, 'utf8'),
+    0,
+  );
+
+describe('ObjectStoreCaptureSink — user-metadata is budgeted as a whole', () => {
+  let store: FakeObjectStore;
+  let sink: ObjectStoreCaptureSink;
+
+  beforeEach(() => {
+    store = new FakeObjectStore();
+    sink = new ObjectStoreCaptureSink(store, CONFIG);
+  });
+
+  const LONG_IMG = `https://cdn.x.test/i/${'a'.repeat(2000)}.jpg`;
+  const LONG_PAGE = `https://x.test/item/${'b'.repeat(2000)}`;
+
+  it('keeps a hostile asset metadata set under the S3 ceiling instead of failing the PUT', async () => {
+    await sink.capture(
+      asset(JPEG, {
+        url: LONG_IMG,
+        sourceUrl: LONG_PAGE,
+        contentType: `image/jpeg;${'c'.repeat(1500)}`,
+      }),
+    );
+
+    expect(store.puts).toHaveLength(1);
+    expect(metadataBytes(store.puts[0].opts.metadata)).toBeLessThan(2048);
+    expect(sink.stats().assetStored).toBe(1);
+  });
+
+  it('sheds the least valuable provenance first: declared-content-type, then source-url', async () => {
+    await sink.capture(
+      asset(JPEG, { url: LONG_IMG, sourceUrl: LONG_PAGE, contentType: `image/jpeg;${'c'.repeat(1500)}` }),
+    );
+    const md = store.puts[0].opts.metadata!;
+    expect(md['declared-content-type']).toBeUndefined();
+    expect(md['source-item']).toBe('x.test/12345'); // the identity survives
+    expect(md.url).toBeDefined();
+  });
+
+  it('budgets the page lanes too — a hostile URL cannot blow their metadata either', async () => {
+    await sink.capture(cap({ url: `https://${'d'.repeat(1200)}.test/${'e'.repeat(1200)}` }));
+    expect(metadataBytes(store.puts[0].opts.metadata)).toBeLessThan(2048);
+  });
+
+  it('leaves an ordinary asset metadata set completely intact', async () => {
+    await sink.capture(asset(JPEG));
+    expect(Object.keys(store.puts[0].opts.metadata!).sort()).toEqual([
+      'bytes', 'declared-content-type', 'fetched-at', 'lane', 'position', 'site', 'source-item', 'source-url', 'url',
+    ]);
+  });
+
+  it('header-safes every metadata value, including fetched-at and position', async () => {
+    await sink.capture(
+      asset(JPEG, {
+        fetchedAt: '2026-09-08T00:00:00.000Z\r\nx-amz-acl: public-read',
+        position: '3\r\nx-amz-acl: public-read' as unknown as number,
+      }),
+    );
+    const md = store.puts[0].opts.metadata!;
+    expect(md['fetched-at']).not.toMatch(/[\r\n]/);
+    expect(md.position).not.toMatch(/[\r\n]/);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// A 10 MiB image needs ~2 MiB/s to fit the page lanes' 5 s budget. The asset lane
+// gets its OWN budget so a large original is not counted as a failure that in fact
+// completed behind the sink's back.
+// ---------------------------------------------------------------------------
+describe('ObjectStoreCaptureSink — the asset lane has its own op budget', () => {
+  it('defaults the asset budget well above the page budget', () => {
+    expect(DEFAULT_IMAGE_PUT_TIMEOUT_MS).toBeGreaterThan(5_000);
+  });
+
+  it('bounds a hung asset PUT by imagePutTimeoutMs, not by the page putTimeoutMs', async () => {
+    const store = new FakeObjectStore();
+    store.hangPut = true;
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 50, imagePutTimeoutMs: 300 });
+
+    let settled = false;
+    const done = sink.capture(asset(JPEG)).then(() => { settled = true; });
+    await new Promise(r => setTimeout(r, 150));
+    expect(settled).toBe(false); // the page lane's 50ms did NOT apply
+    await done;
+    expect(sink.stats().assetFailed).toBe(1);
+  });
+
+  it('leaves the page lanes on their own putTimeoutMs', async () => {
+    const store = new FakeObjectStore();
+    store.hangPut = true;
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 50, imagePutTimeoutMs: 5_000 });
+    await sink.capture(cap());
+    expect(sink.stats().failed).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// What the sniffer must and must not promise. It types the PREFIX; it does not
+// validate the tail, and it must never be the thing that throws out of capture().
+// ---------------------------------------------------------------------------
+describe('ObjectStoreCaptureSink — sniffing is total and never throws', () => {
+  let store: FakeObjectStore;
+  let sink: ObjectStoreCaptureSink;
+
+  beforeEach(() => {
+    store = new FakeObjectStore();
+    sink = new ObjectStoreCaptureSink(store, CONFIG);
+  });
+
+  it('accepts AVIF whose MAJOR brand is mif1 with avif among the compatible brands', async () => {
+    const bytes = Buffer.concat([
+      Buffer.from([0, 0, 0, 0x1c]),
+      Buffer.from('ftypmif1'),
+      Buffer.from([0, 0, 0, 0]), // minor version
+      Buffer.from('mif1avifmiaf'), // the compatible-brand list
+    ]);
+    await sink.capture(asset(bytes));
+    expect(store.puts[0].key.endsWith('.avif')).toBe(true);
+    expect(store.puts[0].opts.contentType).toBe('image/avif');
+  });
+
+  it('still refuses a non-AVIF ISO-BMFF container (an mp4 is not an image)', async () => {
+    const mp4 = Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from('ftypisomisomiso2')]);
+    await sink.capture(asset(mp4));
+    expect(store.puts).toHaveLength(0);
+    expect(sink.stats().assetSkipped.notImage).toBe(1);
+  });
+
+  it('handles a plain Uint8Array body (what `new Uint8Array(await res.arrayBuffer())` yields)', async () => {
+    const view = new Uint8Array(PNG) as unknown as Buffer;
+    await expect(sink.capture(asset(view))).resolves.toBeUndefined();
+    expect(store.puts).toHaveLength(1);
+    expect(store.puts[0].key.endsWith('.png')).toBe(true);
+    expect(sink.stats().assetFailed).toBe(0);
+  });
+
+  it('COUNTS a malformed capture instead of rejecting out of capture()', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const broken = { ...asset(JPEG), bytes: undefined as unknown as Buffer };
+    await expect(sink.capture(broken)).resolves.toBeUndefined();
+    expect(sink.stats().assetFailed).toBe(1);
+    expect(store.puts).toHaveLength(0);
+    warn.mockRestore();
+  });
+
+  it('types the PREFIX only: a GIF89a polyglot is stored as a gif (documented, not accidental)', async () => {
+    const polyglot = Buffer.from('GIF89a/*<script>alert(1)</script>*/', 'binary');
+    await sink.capture(asset(polyglot));
+    expect(store.puts[0].opts.contentType).toBe('image/gif');
+    expect(store.puts[0].key.endsWith('.gif')).toBe(true);
   });
 });

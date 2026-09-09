@@ -6,6 +6,9 @@
  *     `response` listener BEFORE JS runs (the pre-render bytes);
  *   - the DOM lane: `page.content()` AFTER load (the post-JS serialized DOM).
  * API-based rulesets emit an 'api' lane from services.http.
+ * The ASSET lane carries a referenced binary (a product image) rather than a page
+ * body: same content-addressing, plus the provenance that says which item page
+ * referenced it and where in that page's image list it sat.
  *
  * A RawCapture carries the bytes + their content hash + minimal provenance; the
  * downstream sink writes the bytes to object storage (content-addressed by
@@ -16,7 +19,15 @@
  */
 import { createHash } from 'node:crypto';
 
-export type CaptureLane = 'wire' | 'dom' | 'api';
+export type CaptureLane = 'wire' | 'dom' | 'api' | 'asset';
+
+/** The item a captured asset belongs to (asset lane only). */
+export interface CaptureSourceItem {
+  /** The DECLARING store's site key (e.g. `myfigurecollection.net`). */
+  site: string;
+  /** That store's own id for the item. */
+  itemId: string;
+}
 
 export interface RawCapture {
   /** The URL as requested (entry URL, pre-redirect). */
@@ -32,6 +43,12 @@ export interface RawCapture {
   contentType?: string;
   /** ISO-8601 instant the fetch was observed. */
   fetchedAt: string;
+  /** Asset lane: the item whose page referenced these bytes. */
+  sourceItem?: CaptureSourceItem;
+  /** Asset lane: the page URL that referenced these bytes. */
+  sourceUrl?: string;
+  /** Asset lane: 0-based index of this asset in the referencing page's list. */
+  position?: number;
 }
 
 export interface RawCaptureInput {
@@ -43,6 +60,9 @@ export interface RawCaptureInput {
   contentType?: string;
   /** Defaults to now (ISO) when omitted. */
   fetchedAt?: string;
+  sourceItem?: CaptureSourceItem;
+  sourceUrl?: string;
+  position?: number;
 }
 
 /** A destination for raw captures. Implementations store bytes + emit metadata. */
@@ -63,6 +83,9 @@ export function buildRawCapture(input: RawCaptureInput): RawCapture {
   if (input.finalUrl !== undefined && input.finalUrl !== input.url) capture.finalUrl = input.finalUrl;
   if (input.statusCode !== undefined) capture.statusCode = input.statusCode;
   if (input.contentType !== undefined) capture.contentType = input.contentType;
+  if (input.sourceItem !== undefined) capture.sourceItem = input.sourceItem;
+  if (input.sourceUrl !== undefined) capture.sourceUrl = input.sourceUrl;
+  if (input.position !== undefined) capture.position = input.position;
   return capture;
 }
 
