@@ -73,6 +73,15 @@ describe('paceImageBytesByHost', () => {
     expect(slept).toEqual([1000]);
   });
 
+  it('collapses the trailing-dot FQDN spelling onto the same budget', async () => {
+    const { paced, slept } = harness();
+
+    await paced('https://cdn.shopify.com./i/1.png');
+    await paced('https://cdn.shopify.com/i/2.png');
+
+    expect(slept).toEqual([1000]);
+  });
+
   it('needs no wait once the budget has elapsed on its own', async () => {
     const { paced, slept, advance } = harness();
 

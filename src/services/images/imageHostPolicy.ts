@@ -51,18 +51,31 @@ const LANES: readonly string[] = ['http', 'impit', 'browser'];
 const EGRESSES: readonly string[] = ['direct', 'residential'];
 const UAS: readonly string[] = ['chrome', 'default'];
 
-/** Table key / lookup form of a host: lowercased, trimmed, leading dot and `www.` removed. */
+/**
+ * Table key / lookup form of a host: lowercased, trimmed, leading dot and `www.` removed, and the
+ * ROOT-ANCHORED trailing dot(s) stripped. That last one is not cosmetic: `otakumode.com.` is the
+ * absolute-FQDN spelling of the same host and resolves identically, so without this the permaban —
+ * and every operator rule — is evaded by one character. Node's URL parser preserves the dot, and
+ * IDN-normalizes the fullwidth `\u3002` into it, so both spellings land here.
+ */
 function normalizeHost(host: string): string {
-  return host.trim().toLowerCase().replace(/^\./, '').replace(/^www\./, '');
+  return host.trim().toLowerCase().replace(/^\./, '').replace(/^www\./, '').replace(/\.+$/, '');
 }
 
-/** A URL's hostname in table form; undefined when it does not parse. */
+/**
+ * A URL's hostname in table form; undefined when it does not parse OR is not an http(s) URL. The
+ * scheme check is a refusal, not pedantry: `file:`/`data:`/`blob:` have no host to match a rule (or
+ * the deny list) against, and undici's fetch would happily serve a `data:` body as if a store had.
+ */
 function hostOf(url: string): string | undefined {
+  let parsed: URL;
   try {
-    return normalizeHost(new URL(url).hostname);
+    parsed = new URL(url);
   } catch {
     return undefined;
   }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return undefined;
+  return normalizeHost(parsed.hostname);
 }
 
 /** Build a policy over an already-validated table, with the permaban re-imposed on top. */
@@ -187,7 +200,7 @@ export function chooseImageLane(
 ): ImageLaneDecision {
   const imageHost = hostOf(imageUrl);
   if (imageHost === undefined) {
-    return { ok: false, reason: 'denied', detail: 'the image URL does not parse' };
+    return { ok: false, reason: 'denied', detail: 'the image URL is not a fetchable http(s) URL' };
   }
   const rule = policy.ruleFor(imageHost);
   if (rule.deny) return { ok: false, reason: 'denied', detail: `${sanitizeForLog(imageHost)} is on the image deny list` };

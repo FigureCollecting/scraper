@@ -24,10 +24,14 @@ export interface ImageBytesPacingDeps {
   sleep?: (ms: number) => Promise<void>;
 }
 
-/** The image URL's host (lowercased); undefined when the URL does not parse — then nothing is paced. */
+/**
+ * The image URL's host (lowercased, trailing root dot stripped); undefined when the URL does not
+ * parse — then nothing is paced. The trailing dot is stripped for the same reason the policy table
+ * strips it: `cdn.shopify.com.` is the same CDN, and left alone it would draw a SECOND budget.
+ */
 function imageHostOf(url: string): string | undefined {
   try {
-    return new URL(url).hostname.trim().toLowerCase();
+    return new URL(url).hostname.trim().toLowerCase().replace(/\.+$/, '');
   } catch {
     return undefined;
   }

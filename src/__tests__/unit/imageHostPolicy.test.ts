@@ -108,6 +108,15 @@ describe('loadImageHostPolicy', () => {
     expect(policy.ruleFor('www.shop.test')).toEqual({ lane: 'impit' });
   });
 
+  it('canonicalizes a trailing-dot FQDN, so the permaban cannot be evaded by the absolute spelling', () => {
+    const policy = loadImageHostPolicy({} as NodeJS.ProcessEnv);
+    // `otakumode.com.` is the root-anchored spelling of the SAME host — DNS resolves it identically.
+    expect(policy.ruleFor('otakumode.com.')).toEqual({ deny: true });
+    expect(policy.ruleFor('cdn.otakumode.com.')).toEqual({ deny: true });
+    // An operator rule must match the dotted spelling too, or the table silently stops applying.
+    expect(buildImageHostPolicy({ 'cdn.shopify.com': { lane: 'impit' } }).ruleFor('cdn.shopify.com.')).toEqual({ lane: 'impit' });
+  });
+
   it('cannot be talked out of the permaban — a table entry for a banned host stays denied', () => {
     const policy = loadImageHostPolicy({
       IMAGE_HOST_POLICY_JSON: JSON.stringify({
@@ -172,6 +181,21 @@ describe('chooseImageLane', () => {
     const policy = buildImageHostPolicy({ 'cdn.example.com': { lane: 'http', egress: 'residential' } });
     expect(chooseImageLane(PAGE, 'https://cdn.example.com/i/1.jpg', { transport: 'http' }, policy))
       .toMatchObject({ ok: false, reason: 'http-lane-residential' });
+  });
+
+  it('DENIES the trailing-dot and fullwidth-dot spellings of a banned host', () => {
+    const policy = loadImageHostPolicy({} as NodeJS.ProcessEnv);
+    expect(chooseImageLane(PAGE, 'https://cdn.otakumode.com./i/1.jpg', { transport: 'http' }, policy))
+      .toMatchObject({ ok: false, reason: 'denied' });
+    // The fullwidth ideographic full stop IDN-normalizes to the same trailing dot.
+    expect(chooseImageLane(PAGE, 'https://otakumode.com\u3002/i/1.jpg', { transport: 'http' }, policy))
+      .toMatchObject({ ok: false, reason: 'denied' });
+  });
+
+  it('refuses a URL whose scheme is not http(s) — file:, data: and blob: are not fetchable images', () => {
+    expect(chooseImageLane(PAGE, 'file:///etc/passwd', { transport: 'http' }, empty)).toMatchObject({ ok: false, reason: 'denied' });
+    expect(chooseImageLane(PAGE, 'data:image/png;base64,iVBORw0KGgo=', { transport: 'http' }, empty)).toMatchObject({ ok: false, reason: 'denied' });
+    expect(chooseImageLane(PAGE, 'blob:https://shop.test/abc', { transport: 'http' }, empty)).toMatchObject({ ok: false, reason: 'denied' });
   });
 
   it('refuses a URL that does not parse rather than guessing a lane for it', () => {
