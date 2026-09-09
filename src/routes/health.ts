@@ -11,8 +11,10 @@
  *     `residentialEgress: {configured, proxy?}` (the residential proxy; its host:port only under
  *     RESIDENTIAL_EGRESS_HEALTH_DETAIL, credentials always stripped),
  *     `browserLane: {launchMode, residentialTimezone, directTimezone, processTimezone, gatedBrowsers}`,
- *     `challengeCooldowns: [{host, remainingMs, reason}]` (the per-host CF cooldowns currently open)
- *     `rawStore: {configured, stats?}` (the raw-capture sink's counters — page + asset lanes)
+ *     `challengeCooldowns: [{host, remainingMs, reason}]` (the per-host CF cooldowns currently open),
+ *     `rawStore: {configured, stats?}` (the raw-capture sink's counters — page + asset lanes),
+ *     `failureLedger: {enabled, reported, failed, suppressed}` (the durable fetch-failure ledger's
+ *     reporting counters — a ledger nobody is writing to is otherwise invisible)
  *     and `cfCookies: [{host, cookieNames, userAgentPinned, loadedAt, mintedAt?, expiresAt?, stale,
  *     staleSince?, staleReason?}]` (the stored-cookie jar's per-host view — cookie NAMES only, never a
  *     value; `stale` = the host still served a challenge with its stored cookies → re-mint).
@@ -24,6 +26,7 @@ import type { CooldownView } from '../services/challengeCooldown.js';
 import type { CfCookieHostView } from '../services/cookieJar.js';
 import type { BrowserLaneView } from '../services/genericScraper.js';
 import type { RawStoreView } from '../services/s3ObjectStore.js';
+import type { FetchFailureReportView } from '../services/failureReporter.js';
 
 export interface HealthDeps {
   /** The service version (package.json). */
@@ -54,6 +57,13 @@ export interface HealthDeps {
    * idle one. Counters only, nothing secret; the reader never throws.
    */
   getRawStore: () => RawStoreView;
+  /**
+   * The fetch-failure ledger's reporting counters (fetchFailureReportView()): whether reporting is
+   * wired at all (INGEST_BASE_URL + the REPORT_FETCH_FAILURES kill switch), how many rows the spine
+   * took, how many reports it never took, and how many cooldown skips were deliberately not
+   * re-reported inside an open window. Pure counters — a silent ledger is otherwise invisible.
+   */
+  getFailureLedger: () => FetchFailureReportView;
 }
 
 export function createHealthRoutes(deps: HealthDeps): Router {
@@ -83,6 +93,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         residentialEgress: deps.getResidentialEgress(),
         browserLane: deps.getBrowserLane(),
         rawStore: deps.getRawStore(),
+        failureLedger: deps.getFailureLedger(),
         timestamp: new Date().toISOString(),
       });
     } catch (error) {
@@ -94,6 +105,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         residentialEgress: deps.getResidentialEgress(),
         browserLane: deps.getBrowserLane(),
         rawStore: deps.getRawStore(),
+        failureLedger: deps.getFailureLedger(),
         error: error instanceof Error ? error.message : 'Unknown error',
       });
     }

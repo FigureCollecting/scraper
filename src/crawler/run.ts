@@ -12,6 +12,7 @@ import { loadCrawlerConfig } from './config.js';
 import { runCrawlerPass, type FetchLike } from './crawler.js';
 import { createFileLedgerStore } from './ledger.js';
 import { logger } from '../utils/logger.js';
+import { createFailureReporterFromEnv } from '../services/failureReporter.js';
 
 dotenv.config();
 
@@ -38,7 +39,17 @@ async function main(): Promise<void> {
     rangeIdsPerRun: config.rangeIdsPerRun,
     rangeFrontiers: config.rangeFrontiers,
   });
-  await runCrawlerPass(config, { fetch: httpFetch, ledgerStore: createFileLedgerStore(config.ledgerDir) });
+  // The durable fetch-failure ledger (INGEST_BASE_URL + REPORT_FETCH_FAILURES). Null = off, and
+  // every emit point in the pass is a no-op.
+  const reporter = createFailureReporterFromEnv();
+  await runCrawlerPass(config, {
+    fetch: httpFetch,
+    ledgerStore: createFileLedgerStore(config.ledgerDir),
+    ...(reporter ? { reportFailure: (report) => reporter.report(report) } : {}),
+  });
+  // Every emit point is fire-and-forget and the process exits the instant this resolves, which
+  // aborts an open socket: drain before returning or the pass's last report never lands.
+  if (reporter) await reporter.drain();
 }
 
 main()

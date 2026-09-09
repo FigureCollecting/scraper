@@ -46,6 +46,8 @@
  */
 import { createRequestGate, type RequestGate } from './requestGate.js';
 import { logger } from '../utils/logger.js';
+import { classifyFetchFailure } from '../services/failureClassifier.js';
+import type { FetchFailureReport, ReportFetchFailure } from '../services/failureReporter.js';
 import type { InitiatorConfig } from './config.js';
 
 export type { InitiatorConfig } from './config.js';
@@ -72,6 +74,12 @@ export interface InitiatorDeps {
   sleep?: (ms: number) => Promise<void>;
   /** Injectable clock for the pass deadline (tests); defaults to Date.now. */
   now?: () => number;
+  /**
+   * The durable fetch-failure ledger seam (createFailureReporterFromEnv). Optional — absent means
+   * reporting is OFF and every emit point is a no-op. Only the pass's TERMINAL branches report: the
+   * one retry a store gets stays silent, because the producer has not stopped trying yet.
+   */
+  reportFailure?: ReportFetchFailure;
 }
 
 export interface StoreSummary {
@@ -279,6 +287,64 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
   const ingestUrl = `${config.scraperServiceUrl}/ingest/scrape`;
 
   /**
+   * Fire ONE ledger row. Best effort: no reporter is a no-op, and neither a synchronous throw nor a
+   * rejected report may change the pass — the summary counters stay the caller's contract.
+   */
+  const emitFailure = (report: FetchFailureReport): void => {
+    if (!deps.reportFailure) return;
+    try {
+      void Promise.resolve(deps.reportFailure(report)).catch(() => {});
+    } catch {
+      // bookkeeping never breaks a pass
+    }
+  };
+
+  /**
+   * The CANONICAL ledger target for one store's search of one term — the SAME identity the engine's
+   * own fan-out reports, so the two views of one failing store search land on ONE row. Never the
+   * real /lookup URL: that is the scraper's own address, which differs between environments.
+   */
+  const searchTarget = (term: string, siteId: string): string =>
+    `fc:search/${siteId}?q=${encodeURIComponent(term)}&mode=${config.mode}`;
+
+  /**
+   * The reason class for a status THE SCRAPER ITSELF answered. /lookup is our own endpoint (it emits
+   * 400, 502 or 200 — never 404), so a 404/403/410 there is route drift, a rolled-back deploy, or a
+   * mis-pointed SCRAPER_SERVICE_URL. Routing it through the store-verdict table would file it as
+   * gone_404, which the spine closes as 'gone': never retried, never in the review queue — a whole
+   * discovery outage recording itself as "the stores removed these searches". Only a 5xx names a
+   * fault we can attribute; the two genuinely transient 4xx keep their classes; everything else is
+   * triage. Same rule the crawler applies to /catalog (E8).
+   */
+  const ourOwnStatusClass = (status: number): FetchFailureReport['reasonClass'] => {
+    if (status >= 500) return 'http_5xx';
+    if (status === 429) return 'http_429';
+    if (status === 408) return 'timeout';
+    return 'other';
+  };
+
+  /** One terminal lookup failure → one row. `parseFailure` is a 2xx we could not read: ours to fix. */
+  const reportLookupFailure = (term: string, siteId: string, outcome: { reason: string; status?: number; parseFailure?: boolean }): void => {
+    const reasonClass: FetchFailureReport['reasonClass'] = outcome.parseFailure
+      ? 'parse'
+      : outcome.status !== undefined
+        ? ourOwnStatusClass(outcome.status)
+        // No status at all: the transport threw, and the message is the only signal there is.
+        : classifyFetchFailure({ error: outcome.reason }).reasonClass;
+    emitFailure({
+      site: siteId,
+      target: searchTarget(term, siteId),
+      kind: 'search',
+      origin: 'initiator',
+      reasonClass,
+      // The status IS honest here: the target of a `fc:search` row is the lookup we issued, and the
+      // status is the answer that lookup got. Only the CLASS must not pose as a store verdict.
+      ...(outcome.status !== undefined && !outcome.parseFailure ? { httpStatus: outcome.status } : {}),
+      message: outcome.reason,
+    });
+  };
+
+  /**
    * Consume ONE store-scoped lookup body. Returns `candidates` (usable URLs the store
    * actually returned) and `kept` (how many the per-store cap let through) — a capped
    * store returning results must not look, in the log, like a store returning nothing.
@@ -318,7 +384,10 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
    * rejected the same way — or a 2xx body that will not parse); `budget-exhausted` = never
    * dispatched, so it is neither an attempt nor a failure.
    */
-  type AttemptOutcome = { kind: 'ok' } | { kind: 'retryable' | 'fatal'; reason: string } | { kind: 'budget-exhausted' };
+  type AttemptOutcome =
+    | { kind: 'ok' }
+    | { kind: 'retryable' | 'fatal'; reason: string; status?: number; parseFailure?: boolean }
+    | { kind: 'budget-exhausted' };
 
   const attemptLookup = async (term: string, siteId: string, ss: StoreSummary): Promise<AttemptOutcome> => {
     const startedMs = Date.now();
@@ -339,7 +408,7 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
       // 5xx is the engine/upstream faulting; 429 and 408 are the two 4xx a second call after a
       // delay genuinely survives. Every other 4xx is a fault the same request would repeat.
       const transient = res.status >= 500 || res.status === 429 || res.status === 408;
-      return { kind: transient ? 'retryable' : 'fatal', reason: `status ${res.status}` };
+      return { kind: transient ? 'retryable' : 'fatal', reason: `status ${res.status}`, status: res.status };
     }
     try {
       const { candidates, kept } = consume(siteId, (await res.json()) as LookupResponseBody);
@@ -348,7 +417,8 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       logger.info(`[INITIATOR] lookup store=${siteId} term=${term} status=${res.status} ms=${Date.now() - startedMs} candidates=0 kept=0 error=${reason}`);
-      return { kind: 'fatal', reason };
+      // A 2xx whose body will not parse (or whose consumption threw): OURS, not the store's.
+      return { kind: 'fatal', reason, status: res.status, parseFailure: true };
     }
   };
 
@@ -369,6 +439,7 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
       ss.lookupFailures++;
       ss.errors++;
       logger.warn(`[INITIATOR] lookup store=${siteId} term=${term} failed (not retried): ${first.reason}`);
+      reportLookupFailure(term, siteId, first);
       return;
     }
     // Transient — but a store gets ONE retry for the whole pass, not one per term: a store
@@ -377,6 +448,7 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
       ss.lookupFailures++;
       ss.errors++;
       logger.warn(`[INITIATOR] lookup store=${siteId} term=${term} failed (store retry already spent): ${first.reason}`);
+      reportLookupFailure(term, siteId, first);
       return;
     }
 
@@ -396,6 +468,8 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
     ss.lookupFailures++;
     ss.errors++;
     logger.warn(`[INITIATOR] lookup store=${siteId} term=${term} failed after retry: ${second.reason}`);
+    // ONE row for the whole cycle: the retry itself above is deliberately silent.
+    reportLookupFailure(term, siteId, second);
   };
 
   const discoverStore = async (siteId: string): Promise<void> => {
@@ -448,6 +522,19 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
       if (!res.ok) {
         ss.errors++;
         logger.warn(`[INITIATOR] ingest rejected store=${siteId} status=${res.status} url=${url}`);
+        // E13 — a 4xx is a DETERMINISTIC refusal of this url (typically no ruleset matches): ours,
+        // and terminal. A 5xx is the scraper faulting, which the ledger retries on its own schedule.
+        // NO httpStatus: the status is our own /ingest/scrape's, while the row's target is the
+        // STORE's url — recording it would assert a response that store never gave. It stays in the
+        // message, where it reads as what it is.
+        emitFailure({
+          site: siteId,
+          target: url,
+          kind: 'record',
+          origin: 'initiator',
+          reasonClass: res.status >= 500 ? 'http_5xx' : 'ruleset',
+          message: `the scraper refused this url with ${res.status}`,
+        });
         return;
       }
       const body = (await res.json().catch(() => ({}))) as IngestResponseBody;
@@ -456,6 +543,14 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
     } catch (error) {
       ss.errors++;
       logger.warn(`[INITIATOR] ingest errored store=${siteId} url=${url}: ${error instanceof Error ? error.message : String(error)}`);
+      emitFailure({
+        site: siteId,
+        target: url,
+        kind: 'record',
+        origin: 'initiator',
+        reasonClass: classifyFetchFailure({ error }).reasonClass === 'timeout' ? 'timeout' : 'network',
+        message: error instanceof Error ? error.message : String(error),
+      });
     }
   };
   await Promise.all(flat.map((item) => enqueueOne(item)));

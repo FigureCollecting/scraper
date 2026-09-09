@@ -52,6 +52,8 @@
  */
 import { createRequestGate, type GateResult, type RequestGate } from '../initiator/requestGate.js';
 import { logger } from '../utils/logger.js';
+import { classifyFetchFailure } from '../services/failureClassifier.js';
+import type { FetchFailureReport, ReportFetchFailure } from '../services/failureReporter.js';
 import type { CrawlerConfig, CrawlerMode } from './config.js';
 import type { Ledger, LedgerRange, LedgerStore } from './ledger.js';
 
@@ -80,6 +82,12 @@ export interface CrawlerDeps {
   sleep?: (ms: number) => Promise<void>;
   /** Override the gate (tests); defaults to one built from the config. */
   gate?: RequestGate;
+  /**
+   * The durable fetch-failure ledger seam (createFailureReporterFromEnv). Optional — absent means
+   * reporting is OFF and every emit point is a no-op. A crawler failure is terminal per store/axis
+   * (a failed catalog GET stops that axis for the run), so each exit reports exactly one row.
+   */
+  reportFailure?: ReportFetchFailure;
 }
 
 export interface CrawlerStoreSummary {
@@ -266,6 +274,32 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     if (!stores.includes(siteId)) logger.warn('[CRAWLER] CRAWLER_RANGE_STORES names a store that is not in CRAWLER_STORES — no id-range walk', { siteId });
   }
 
+  /**
+   * Fire ONE ledger row. Best effort: no reporter is a no-op, and neither a synchronous throw nor a
+   * rejected report may change the pass — the summary counters stay the caller's contract.
+   */
+  const emitFailure = (report: FetchFailureReport): void => {
+    if (!deps.reportFailure) return;
+    try {
+      void Promise.resolve(deps.reportFailure(report)).catch(() => {});
+    } catch {
+      // bookkeeping never breaks a crawl
+    }
+  };
+
+  /**
+   * The CANONICAL, environment-free ledger target for one listing fetch (spec §1.1). Deliberately
+   * NOT the fetched URL: that is `${SCRAPER_SERVICE_URL}/catalog?…`, the scraper's OWN address,
+   * which differs between the dev tier and prod and would split one store's failures across
+   * environments.
+   */
+  const listingTarget = (siteId: string, axis: Phase, where: Record<string, unknown>): string => {
+    const params = Object.entries(where)
+      .map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`)
+      .join('&');
+    return `fc:listing/${siteId}?axis=${axis}${params ? `&${params}` : ''}`;
+  };
+
   const capFor = (siteId: string): number =>
     Object.prototype.hasOwnProperty.call(capOverrides, siteId) ? capOverrides[siteId] : config.maxEnqueuePerStore;
 
@@ -398,7 +432,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
    * Both answer the same `{ items: [...] }` shape, so one parser serves both; `where` only labels the
    * logs and decides whether a 422 is a listing-axis gap (which leaves the id-range axis alive).
    */
-  const fetchCatalog = async (st: StoreState, url: string, where: Record<string, unknown>, axis: 'listing' | 'range'): Promise<PageOutcome> => {
+  const fetchCatalog = async (st: StoreState, url: string, where: Record<string, unknown>, axis: Phase): Promise<PageOutcome> => {
     const stop = (reason: StopReason): PageOutcome => {
       st.stopped = true;
       return { kind: 'stopped', reason };
@@ -409,6 +443,15 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     } catch (error) {
       st.summary.errors++;
       logger.warn('[CRAWLER] catalog errored', { siteId: st.siteId, ...where, error: errMsg(error) });
+      // E6 — the transport itself failed (DNS / reset / the abort timer). Terminal for this axis.
+      emitFailure({
+        site: st.siteId,
+        target: listingTarget(st.siteId, axis, where),
+        kind: 'listing',
+        origin: 'crawler',
+        reasonClass: classifyFetchFailure({ error }).reasonClass === 'timeout' ? 'timeout' : 'network',
+        message: errMsg(error),
+      });
       return stop('failed');
     }
     if (r.status === 'budget-exhausted') {
@@ -421,19 +464,51 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       const body = await res.json().catch(() => ({}));
       st.summary.skipped++;
       logger.warn('[CRAWLER] catalog cooldown — store skipped this run', { siteId: st.siteId, ...where, remainingMs: body?.remainingMs });
+      // E7 — the SCRAPER reports the host cooling, and it says so in its OWN envelope
+      // ({error:'cooldown', remainingMs}, routes/catalog.ts). A 503 WITHOUT that envelope is the
+      // ingress or a scaled-to-zero Deployment, not a Cloudflare window: claiming a cooldown there
+      // would fabricate an observation in the one surface built for the operator to read. The crawl
+      // behaviour is the same either way — the store is left alone this run.
+      const isCooldown = isPlainObject(body) && body.error === 'cooldown';
+      const remainingMs = isCooldown ? Number(body.remainingMs) : Number.NaN;
+      emitFailure({
+        site: st.siteId,
+        target: listingTarget(st.siteId, axis, where),
+        kind: 'listing',
+        origin: 'crawler',
+        reasonClass: isCooldown ? 'cooldown' : 'http_5xx',
+        httpStatus: 503,
+        message: isCooldown
+          ? 'the scraper reports this host cooling after a Cloudflare challenge'
+          : 'catalog GET answered 503 without the scraper\'s cooldown envelope',
+        ...(Number.isFinite(remainingMs) && remainingMs > 0
+          ? { nextRetryHint: new Date(now() + remainingMs).toISOString() }
+          : {}),
+      });
       return stop('cooldown');
     }
     if (res.status === 422) {
       // The store does not serve THIS axis (no byListing / no extractListing; or no byRange / byId):
       // a configuration or coverage gap, NOT exhaustion. A listing gap leaves the id-range axis alive.
       st.summary.errors++;
-      if (axis === 'listing') st.listingUnsupported = true;
+      if (axis !== 'range') st.listingUnsupported = true;
       logger.warn('[CRAWLER] catalog unsupported — axis stopped', { siteId: st.siteId, ...where, axis });
       return stop('unsupported');
     }
     if (!res.ok) {
       st.summary.errors++;
       logger.warn('[CRAWLER] catalog failed', { siteId: st.siteId, ...where, status: res.status });
+      // E8 — the status here is the SCRAPER's, not the store's: 5xx = our own engine faulting,
+      // anything else lands in the operator's triage bucket rather than posing as a store verdict.
+      emitFailure({
+        site: st.siteId,
+        target: listingTarget(st.siteId, axis, where),
+        kind: 'listing',
+        origin: 'crawler',
+        reasonClass: res.status >= 500 ? 'http_5xx' : 'other',
+        httpStatus: res.status,
+        message: `catalog GET answered ${res.status}`,
+      });
       return stop('failed');
     }
     let body: unknown;
@@ -442,21 +517,45 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     } catch (error) {
       st.summary.errors++;
       logger.warn('[CRAWLER] catalog body unparseable', { siteId: st.siteId, ...where, error: errMsg(error) });
+      // E9 — a 200 whose body is not JSON. OURS to fix, so it goes to the review queue as `parse`.
+      emitFailure({
+        site: st.siteId,
+        target: listingTarget(st.siteId, axis, where),
+        kind: 'listing',
+        origin: 'crawler',
+        reasonClass: 'parse',
+        httpStatus: res.status,
+        message: `catalog body unparseable: ${errMsg(error)}`,
+      });
       return stop('failed');
     }
     if (!isPlainObject(body) || !Array.isArray(body.items)) {
       // A 200 that is not a listing is a failure, never an exhaustion signal.
       st.summary.errors++;
       logger.warn('[CRAWLER] catalog body malformed', { siteId: st.siteId, ...where });
+      emitFailure({
+        site: st.siteId,
+        target: listingTarget(st.siteId, axis, where),
+        kind: 'listing',
+        origin: 'crawler',
+        reasonClass: 'parse',
+        httpStatus: res.status,
+        message: 'catalog answered 200 with a body that is not a listing',
+      });
       return stop('failed');
     }
     return { kind: 'page', items: sanitizeItems(body.items), hasMore: body.hasMore === true };
   };
 
-  const fetchPage = (st: StoreState, page: number): Promise<PageOutcome> =>
-    fetchCatalog(st, catalogUrl(st.siteId, page), { page }, 'listing');
+  /**
+   * `phase` is not decoration: recent and backfill can fetch the SAME page number in one run (raise
+   * recentMaxPages past a saved backfill cursor), and one shared axis label would collapse the two
+   * axes' failures onto one row — one attempts counter, and no way to see which axis is broken.
+   */
+  const fetchPage = (st: StoreState, page: number, phase: 'recent' | 'backfill'): Promise<PageOutcome> =>
+    fetchCatalog(st, catalogUrl(st.siteId, page), { page }, phase);
 
-  const postOne = async (st: StoreState, collectUrl: string): Promise<PostOutcome> => {
+  const postOne = async (st: StoreState, collectUrl: string, itemId: string): Promise<PostOutcome> => {
     let r: GateResult<HttpResponseLike>;
     try {
       r = await gate.run(() => httpPostJson(deps.fetch, ingestUrl, { url: collectUrl }, config.requestTimeoutMs));
@@ -472,7 +571,23 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     }
     logger.warn('[CRAWLER] ingest rejected', { siteId: st.siteId, status: res.status });
     // 4xx = the scraper deterministically rejected THIS url (retrying cannot help); 5xx = the scraper is unwell.
-    return res.status >= 500 ? 'transient' : 'rejected';
+    if (res.status >= 500) return 'transient';
+    // E10 — a DETERMINISTIC refusal of this url (typically no ruleset matches the store's byId
+    // template): terminal, and ours to fix, so it lands in the review queue as a RECORD row keyed on
+    // the real store URL. A 5xx above is NOT reported — the scraper is unwell and the crawler
+    // re-drives the id next run.
+    // NO httpStatus: the status is our own /ingest/scrape's, while the row's target is the STORE's
+    // url — recording it would assert a response that store never gave. It stays in the message.
+    emitFailure({
+      site: st.siteId,
+      ...(itemId ? { itemId } : {}),
+      target: collectUrl,
+      kind: 'record',
+      origin: 'crawler',
+      reasonClass: 'ruleset',
+      message: `the scraper refused this url with ${res.status}`,
+    });
+    return 'rejected';
   };
 
   // --- page processing --------------------------------------------------------------------------
@@ -535,7 +650,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       }
       st.posts++;
       st.attempted.add(item.itemId);
-      const outcome = await postOne(st, item.collectUrl);
+      const outcome = await postOne(st, item.collectUrl, item.itemId);
       switch (outcome) {
         case 'accepted':
         case 'accepted-dedup':
@@ -575,7 +690,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     if (!st.ledger || st.stopped) return;
     const ledger = st.ledger;
     for (let page = 1; page <= config.recentMaxPages; page++) {
-      const out = await fetchPage(st, page);
+      const out = await fetchPage(st, page, 'recent');
       if (out.kind !== 'page') return;
       st.summary.pagesFetched++;
       st.summary.recentPages++;
@@ -616,7 +731,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     // Resume the saved cursor; otherwise start just past the recent phase's deepest page (page 2 at minimum).
     let cursor = b.cursor ?? Math.max(2, st.deepestRecentPage + 1);
     for (let i = 0; i < config.backfillPagesPerRun; i++) {
-      const out = await fetchPage(st, cursor);
+      const out = await fetchPage(st, cursor, 'backfill');
       if (out.kind !== 'page') return;
       st.summary.pagesFetched++;
       st.summary.backfillPages++;
@@ -764,6 +879,16 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
         received: out.items.length,
         firstId: out.items[0]?.itemId,
       });
+      // E11 — the engine served a window that is not the requested descending run. Walking it would
+      // silently strand ids, so the walk stops here and the ledger records WHY.
+      emitFailure({
+        site: st.siteId,
+        target: listingTarget(st.siteId, 'range', { from: cursor, count }),
+        kind: 'listing',
+        origin: 'crawler',
+        reasonClass: 'ruleset',
+        message: `id-range window is not the requested descending run from ${cursor} (received ${out.items.length}, first ${out.items[0]?.itemId ?? 'none'})`,
+      });
       return skip('window-malformed');
     }
     const { handled, accepted, rejected } = await processPage(st, out.items, 'range');
@@ -780,6 +905,18 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       // the STORE, not of these ids: walking past them would spend the id space collecting nothing
       // and they are never re-walked. Keep the cursor and let the error count say so.
       logger.warn('[CRAWLER] id-range window entirely rejected by ingest — cursor kept', { siteId: st.siteId, from: cursor, rejected });
+      // E11 — every id in the window was deterministically refused: a property of the STORE (an
+      // engine/ruleset skew), not of these ids. This row names the WINDOW and the kept cursor; it
+      // ACCOMPANIES the per-id E10 rows postOne already wrote (it does not replace them), because a
+      // partly-rejected window still needs its individual ids on record.
+      emitFailure({
+        site: st.siteId,
+        target: listingTarget(st.siteId, 'range', { from: cursor, count }),
+        kind: 'listing',
+        origin: 'crawler',
+        reasonClass: 'ruleset',
+        message: `every id in the window from ${cursor} was refused by /ingest/scrape (${rejected} rejected)`,
+      });
       return;
     }
     range.cursor = Math.max(0, cursor - handled);

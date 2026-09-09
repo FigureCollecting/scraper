@@ -27,6 +27,8 @@ import { enrichmentLogger } from '../utils/logger.js';
 import { createScrapingService } from './engineServices/scrapingService.js';
 import { createCapturingFetch, ChallengePageError, type CapturingFetch, type CapturingFetchTransports } from './engineServices/capturingFetch.js';
 import { getChallengeCooldown, ChallengeCooldownError, type ChallengeCooldown } from './challengeCooldown.js';
+import { classifyFetchFailure } from './failureClassifier.js';
+import { createFailureReporterFromEnv, type FetchFailureReport } from './failureReporter.js';
 import { ResidentialEgressUnavailableError } from './residentialEgress.js';
 import { ChallengeLaneUnavailableError } from './browserChallenge.js';
 import { getCfCookieStore, markStaleIfStored, markFreshIfStored, type CfCookieStoreLike } from './cookieJar.js';
@@ -159,6 +161,14 @@ export interface RulesetResolver {
  */
 export interface IngestSender {
   send(extracted: PluginExtractedData): Promise<unknown>;
+}
+
+/**
+ * The fetch-failure ledger seam (engine plumbing, injected like the ingest emitter). The queue only
+ * ever calls it from its terminal give-up branch, and never lets it affect the item's outcome.
+ */
+export interface FailureLedgerReporter {
+  report(report: FetchFailureReport): Promise<void>;
 }
 
 /**
@@ -385,6 +395,17 @@ function classifyError(error: Error | string): ErrorType {
   return 'unknown';
 }
 
+/**
+ * The ledger `site` for a URL NO ruleset claims. Deliberately a single reserved key, never the URL's
+ * hostname: the spine registers an unseen site on first sight, so a hostname here would mint
+ * host-shaped rows in the shared `source` vocabulary that the claim lanes and the per-site config
+ * key off — and a ruleset skew that comes and goes would split one store's ledger in two
+ * ('mfc' rows before it, 'myfigurecollection.net' rows during), with no join between them and no
+ * chance of the record row resolving when the re-drive later succeeds under the real siteId. The
+ * host is not lost: the row's target IS the url.
+ */
+const UNMATCHED_SITE = 'unmatched';
+
 function shouldRetry(error: Error | string, errorType: ErrorType, retryCount: number, maxRetries: number): boolean {
   // Never retry auth errors without new cookies
   if (errorType === 'auth_required') {
@@ -482,6 +503,10 @@ export class ScrapeQueue {
   private ingestEmitter: IngestSender | null = null;
   private rawPageFetcher: RawPageFetcher | null = null;
 
+  // Durable fetch-failure ledger (INGEST_BASE_URL + REPORT_FETCH_FAILURES). Null = reporting OFF,
+  // and every emit point is a no-op — the queue's behavior is byte-identical to before.
+  private failureReporter: FailureLedgerReporter | null = null;
+
   // Store-capability index (searchFetch/rateLimit/etc.), rebuilt alongside pluginRegistry — the
   // ingest path's transport lookup (getSearchFetchFor) reads a store's declared searchFetch from
   // here, same as the /lookup path's ProfileRegistry.
@@ -513,6 +538,9 @@ export class ScrapeQueue {
     // New ingest path is enabled by INGEST_BASE_URL; unset = null = disabled.
     this.ingestEmitter = createIngestEmitterFromEnv();
 
+    // Failure reporting rides the same spine hop; unset / REPORT_FETCH_FAILURES=false = null = off.
+    this.failureReporter = createFailureReporterFromEnv();
+
     // Get or create session manager
     this.sessionManager = getSessionManager();
 
@@ -542,6 +570,14 @@ export class ScrapeQueue {
    */
   setIngestEmitter(emitter: IngestSender | null): void {
     this.ingestEmitter = emitter;
+  }
+
+  /**
+   * Override the fetch-failure ledger reporter (tests / DI). The constructor default comes from
+   * INGEST_BASE_URL + REPORT_FETCH_FAILURES via createFailureReporterFromEnv().
+   */
+  setFailureReporter(reporter: FailureLedgerReporter | null): void {
+    this.failureReporter = reporter;
   }
 
   /**
@@ -1779,6 +1815,12 @@ export class ScrapeQueue {
       const itemStatus = item.status || 'wished';
       this.statusFailed[itemStatus]++;
 
+      // E1/E2 — THE terminal seam of the record lane: every non-retryable class and every exhausted
+      // retry funnels through this branch, so ONE report here is exactly one ledger row per cycle.
+      // Reporting from the retry branch above would inflate the row's `attempts` (which drives the
+      // spine's backoff) once per internal attempt.
+      this.reportTerminalFailure(item, error, errorType);
+
       // Notify backend of permanent failure via webhook (non-blocking)
       if (item.sessionId) {
         notifyItemFailed(item.sessionId, item.mfcId, `${errorType}: ${error.message}`).catch(() => {
@@ -1791,6 +1833,50 @@ export class ScrapeQueue {
       item.resolvers.forEach(({ reject }) => reject(finalError));
 
       console.log(`[SCRAPE QUEUE] Gave up on ${item.mfcId} after ${item.retryCount} attempts`);
+    }
+  }
+
+  /**
+   * Put ONE terminal record failure into the durable ledger. Best effort in every direction: no
+   * reporter is a no-op, a synchronous throw is swallowed, and a rejected report is swallowed — the
+   * item's own outcome (webhook, waiting promises, counters) is already decided and must not move
+   * because bookkeeping failed.
+   *
+   * `site` prefers the matched ruleset's siteId; with no ruleset (the EXTRACTION_UNAVAILABLE case)
+   * it falls back to the reserved UNMATCHED_SITE, whose row still names the url as its target.
+   */
+  private reportTerminalFailure(item: QueueItem, error: Error, errorType: ErrorType): void {
+    const reporter = this.failureReporter;
+    if (!reporter) return;
+    try {
+      const ruleset = this.lookupRuleset(item.url);
+      const { reasonClass, httpStatus } = classifyFetchFailure({ error, errorType });
+      // A cooldown fast-fail KNOWS when the host is next fetchable; the spine takes the later of this
+      // hint and its own backoff (a hint may delay a retry, never pull one forward).
+      const nextRetryHint =
+        error instanceof ChallengeCooldownError ? new Date(Date.now() + error.remainingMs).toISOString() : undefined;
+      const transport = error instanceof ChallengePageError ? error.transport : undefined;
+      // mfcId doubles as the dedup key — the trigger routes pass the URL itself, which is not a
+      // native id and must not be recorded as one.
+      const itemId = item.mfcId && item.mfcId !== item.url ? item.mfcId : undefined;
+
+      void reporter
+        .report({
+          site: ruleset?.siteId ?? UNMATCHED_SITE,
+          ...(itemId !== undefined ? { itemId } : {}),
+          target: item.url,
+          kind: 'record',
+          origin: 'ingest',
+          reasonClass,
+          ...(httpStatus !== undefined ? { httpStatus } : {}),
+          message: `${errorType}: ${error.message} (gave up after ${item.retryCount} attempts)`,
+          ...(transport !== undefined ? { transport } : {}),
+          ...(ruleset?.version !== undefined ? { rulesetVersion: ruleset.version } : {}),
+          ...(nextRetryHint !== undefined ? { nextRetryHint } : {}),
+        })
+        .catch(() => {});
+    } catch {
+      // The ledger is bookkeeping. A reporter fault never becomes an item fault.
     }
   }
 

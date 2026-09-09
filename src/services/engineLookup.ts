@@ -15,6 +15,7 @@ import { assembleCatalog, type Catalog } from '../driver/assembleCatalog.js';
 import { makeFetchSearch, type FetchSearchTransports } from './fetchSearch.js';
 import { impitFetchBody } from './impitFetch.js';
 import { getCfCookieStore, type CfCookieSource } from './cookieJar.js';
+import { createFailureReporterFromEnv } from './failureReporter.js';
 import type { ExtractionRuleset, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
 
 /** The slice of the engine ExtractionRegistry the lookup needs. */
@@ -116,9 +117,13 @@ function wireServices(registry: LookupRegistry, transports: Partial<FetchSearchT
     impersonate: transports.impersonate ?? impitFetchBody,
     browser: transports.browser,
   });
+  // The durable fetch-failure ledger. Built ONCE per wiring from INGEST_BASE_URL +
+  // REPORT_FETCH_FAILURES; null (unset / killed) leaves every emit point in the fan-out a no-op.
+  const reporter = createFailureReporterFromEnv();
   return {
     profiles,
     getRulesetForUrl: (url) => registry.getRulesetForUrl(url),
     fetchSearch,
+    ...(reporter ? { reportFailure: (report) => reporter.report(report) } : {}),
   };
 }
