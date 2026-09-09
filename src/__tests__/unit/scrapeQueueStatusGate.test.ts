@@ -68,7 +68,7 @@ function makeExtract(): jest.Mock {
   }));
 }
 
-function makeRegistry(ruleset: ExtractionRuleset): ExtractionRegistryImpl {
+function makeRegistry(ruleset: ExtractionRuleset, transport: 'http' | 'impersonate' = 'http'): ExtractionRegistryImpl {
   const registry = createExtractionRegistry();
   const caps: StoreCapabilities = {
     siteId: ruleset.siteId,
@@ -77,7 +77,7 @@ function makeRegistry(ruleset: ExtractionRuleset): ExtractionRegistryImpl {
     rateLimit: { domain: HOST, baseDelayMs: 1000, minDelayMs: 500, maxDelayMs: 5000, backoffMultiplier: 1.5, recoveryDivisor: 1.5, successThreshold: 3 },
     requiresBrowser: false,
     allowedCookies: [],
-    searchFetch: { transport: 'http' },
+    searchFetch: { transport },
   };
   registry.registerSite(caps);
   registry.registerRuleset(ruleset);
@@ -131,22 +131,22 @@ describe('ScrapeQueue × record-fetch status gate', () => {
     }
   }
 
-  function buildQueue(http: jest.Mock, send: jest.Mock): ScrapeQueue {
+  function buildQueue(http: jest.Mock, send: jest.Mock, transport: 'http' | 'impersonate' = 'http'): ScrapeQueue {
     const q = new ScrapeQueue(false);
-    q.setPluginRegistry(makeRegistry(makeRuleset(extract)));
+    q.setPluginRegistry(makeRegistry(makeRuleset(extract), transport));
     q.setIngestEmitter({ send });
     q.setScrapingService(makeScrapingStub());
-    q.setIngestTransports({ http });
+    q.setIngestTransports(transport === 'http' ? { http } : { impersonate: http });
     q.setChallengeCooldown(cd);
     q.setFailureReporter({ report: async (r: FetchFailureReport) => { reports.push(r); } });
     return q;
   }
 
   /** Run one item to its terminal outcome and hand back the http mock for call-count assertions. */
-  async function runItem(body: unknown, opts: { maxRetries?: number; send?: jest.Mock } = {}) {
+  async function runItem(body: unknown, opts: { maxRetries?: number; send?: jest.Mock; transport?: 'http' | 'impersonate' } = {}) {
     const http = jest.fn().mockResolvedValue(body);
     const send = opts.send ?? jest.fn().mockResolvedValue(HEALTHY_STATS);
-    queue = buildQueue(http, send);
+    queue = buildQueue(http, send, opts.transport ?? 'http');
     const result = queue.enqueue(ITEM_URL, { url: ITEM_URL, maxRetries: opts.maxRetries ?? 2 });
     result.promise.catch(() => {});
     await advanceUntil(() => queue.getStats().failed === 1 || queue.getStats().completed === 1);
@@ -231,5 +231,59 @@ describe('ScrapeQueue × record-fetch status gate', () => {
     expect(queue.getStats().completed).toBe(1);
     expect(send).toHaveBeenCalledTimes(1);
     expect(reports).toHaveLength(0);
+  });
+
+  /**
+   * THE LIVE CASE (prod 2026-09-09 04:34Z, engine f8e8ebba): POST /ingest/scrape for
+   * myfigurecollection.net/item/999999999 — an item that does not exist — completed as an INGEST
+   * SUCCESS with `claims=3/0/0/0 ... persisted=3 emitted=1/1` and no ledger row, because the lane
+   * handed the store's not-found page to the ruleset, which lifted three claims off its chrome.
+   *
+   * These cases pin the gate AHEAD of extraction and persistence, on the lane mfc actually rides
+   * (impersonate / impit residential — impit 0.14.4 exposes `status` and `url` on every response):
+   * a ruleset that WOULD have produced a full record never gets the chance, the emitter is never
+   * called, and the ledger gets the terminal row instead.
+   */
+  describe('a not-found page the ruleset would happily lift claims from', () => {
+    it('rejects a 404 BEFORE extraction and BEFORE any emit, on the impersonate lane', async () => {
+      const { http, send } = await runItem(
+        { body: '<html><body>The item you are looking for does not exist</body></html>', status: 404, finalUrl: ITEM_URL },
+        { transport: 'impersonate' },
+      );
+
+      expect(extract).not.toHaveBeenCalled();   // the ruleset never saw the not-found page
+      expect(send).not.toHaveBeenCalled();      // ZERO claims reached the spine
+      expect(http).toHaveBeenCalledTimes(1);    // terminal: not retried
+      expect(queue.getStats().completed).toBe(0);
+      expect(queue.getStats().failed).toBe(1);
+      expect(reports).toHaveLength(1);
+      expect(reports[0]).toMatchObject({
+        reasonClass: 'gone_404',
+        httpStatus: 404,
+        kind: 'record',
+        origin: 'ingest',
+        target: ITEM_URL,
+        transport: 'impersonate',
+      });
+    });
+
+    it('rejects a 410 on the impersonate lane the same way', async () => {
+      const { send } = await runItem({ body: 'gone', status: 410, finalUrl: ITEM_URL }, { transport: 'impersonate' });
+
+      expect(extract).not.toHaveBeenCalled();
+      expect(send).not.toHaveBeenCalled();
+      expect(reports[0]).toMatchObject({ reasonClass: 'gone_410', httpStatus: 410, transport: 'impersonate' });
+    });
+
+    it('rejects a bounce to the store root on the impersonate lane before anything is written', async () => {
+      const { send } = await runItem(
+        { body: '<html>front page</html>', status: 200, finalUrl: `https://${HOST}/` },
+        { transport: 'impersonate' },
+      );
+
+      expect(extract).not.toHaveBeenCalled();
+      expect(send).not.toHaveBeenCalled();
+      expect(reports[0]).toMatchObject({ reasonClass: 'redirect_home', transport: 'impersonate' });
+    });
   });
 });
