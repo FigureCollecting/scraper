@@ -1266,17 +1266,46 @@ describe('ObjectStoreCaptureSink — the asset lane cannot evict the page lanes'
     // Depth is nowhere near binding: only the byte share can decide this.
     const sink = await parkedSink(store, { queueMax: 100, queueMaxBytes: 1000, assetQueueShare: 0.5 });
 
-    const [a1, a2, a3] = assets(3, 300);
+    const [a1, a2, a3] = assets(3, 200);
     await expect(sink.capture(a1)).resolves.toEqual({ admitted: true });
     await expect(sink.capture(a2)).resolves.toEqual({ admitted: true });
-    // 600 of the 1000-byte budget is held, past the assets' 500-byte share.
+    // A third would take the queue to 600, past the assets' 500-byte share — and the
+    // share counts the capture's own size, so it is refused BEFORE it crosses.
     await expect(sink.capture(a3)).resolves.toEqual({ admitted: false, reason: 'assetReserve' });
 
     await expect(sink.capture(pages(1, 300)[0])).resolves.toEqual({ admitted: true });
 
     expect(sink.stats()).toMatchObject({
-      queued: 3, queuedBytes: 900, assetRefusedReserve: 1, dropped: 0, droppedBytes: 0,
+      queued: 3, queuedBytes: 700, assetRefusedReserve: 1, dropped: 0, droppedBytes: 0,
     });
+
+    await release(store, sink);
+    warn.mockRestore();
+  });
+
+  it('never lets assets walk the byte budget past their share and refuse a PAGE', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new GatedObjectStore();
+    // A legal configuration: RAW_STORE_IMAGE_MAX_BYTES can be set as high as 64 MiB,
+    // which is EXACTLY the quarter of the 256 MiB default budget the reservation is
+    // meant to hold. Scaled down here by 1000, one asset is a quarter of the budget.
+    const sink = await parkedSink(store, { queueMax: 100, queueMaxBytes: 256_000 });
+
+    const [a1, a2, a3, a4] = assets(4, 63_999);
+    for (const a of [a1, a2, a3]) await expect(sink.capture(a)).resolves.toEqual({ admitted: true });
+    expect(sink.stats().queuedBytes).toBe(191_997); // a hair under the 192000 share line
+
+    // Admitting on occupancy alone, this asset was let in BECAUSE the queue had not
+    // yet crossed the line — and it took the queue to 255996, spending the pages'
+    // whole reserve on one image. The share has to be tested against what the queue
+    // WOULD hold, not what it holds.
+    await expect(sink.capture(a4)).resolves.toEqual({ admitted: false, reason: 'assetReserve' });
+
+    // The page the reserve exists for. This is the assertion the old rule failed:
+    // it was refused queueBytesFull with the byte budget spent entirely on images.
+    await expect(sink.capture(pages(1, 100)[0])).resolves.toEqual({ admitted: true });
+
+    expect(sink.stats()).toMatchObject({ droppedBytes: 0, assetRefusedReserve: 1, queuedBytes: 192_097 });
 
     await release(store, sink);
     warn.mockRestore();
@@ -1385,5 +1414,25 @@ describe('ObjectStoreCaptureSink — the asset lane cannot evict the page lanes'
     await expect(sink.capture(asset(PNG))).resolves.toEqual({ admitted: true });
     await sink.flush();
     expect(sink.stats()).toMatchObject({ assetStored: 1, assetRefusedReserve: 0 });
+  });
+
+  it('admits an asset that alone exceeds the BYTE share when nothing is waiting behind it', async () => {
+    const store = new GatedObjectStore();
+    const parked = await parkedSink(store, { queueMax: 100, queueMaxBytes: 1000, assetQueueShare: 0.1 });
+
+    // 300 bytes against a 100-byte share. The queue is empty, so this asset displaces
+    // no page — and only one can ever be held that way, because the next asset is
+    // measured against the bytes this one is holding.
+    await expect(parked.capture(assets(1, 300)[0])).resolves.toEqual({ admitted: true });
+    await expect(parked.capture(assets(2, 300)[1])).resolves.toEqual({ admitted: false, reason: 'assetReserve' });
+    // The hard ceiling is still the hard ceiling: a page can have the rest, no more.
+    await expect(parked.capture(pages(1, 300)[0])).resolves.toEqual({ admitted: true });
+    expect(parked.stats()).toMatchObject({ queuedBytes: 600, assetRefusedReserve: 1, droppedBytes: 0 });
+
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    store.open = true;
+    store.release();
+    await parked.flush();
+    warn.mockRestore();
   });
 });

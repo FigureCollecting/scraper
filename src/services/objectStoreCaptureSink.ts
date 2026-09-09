@@ -47,7 +47,10 @@
  * pages: a permanent provenance gap bought with re-fetchable bytes. So the asset lane
  * is admitted only while the queue sits BELOW `assetQueueShare` of BOTH budgets
  * (RAW_STORE_ASSET_QUEUE_SHARE, default 0.75; 1 = no reservation), and the remaining
- * share is there for pages. An asset refused that way is told `assetReserve` — a
+ * share is there for pages. The BYTE half of that test counts the capture's own size,
+ * because one asset can be a quarter of the whole budget where a slot is only ever a
+ * slot — measured on occupancy alone, four assets could walk the queue from under the
+ * line to the hard ceiling and refuse the next page. An asset refused that way is told `assetReserve` — a
  * refusal like any other, so its caller still retries, and counted apart
  * (`assetRefusedReserve`) so "the store is behind" stays distinguishable from "the
  * reservation is working".
@@ -695,16 +698,27 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     // The PAGE RESERVATION. Both lanes share this queue, but not the consequences of
     // losing a slot: a refused page body is provenance gone for good behind a claim
     // already written, a refused image is one the next crawl pass re-fetches. So the
-    // asset lane may enter only while the queue is BELOW its share of both budgets,
-    // and the remainder stays there for pages. The test is on what the queue holds
-    // NOW rather than on what this capture would add, which is deliberate: an empty
-    // queue always admits an asset (no page is displaced by a capture that waits for
-    // nobody), one asset may straddle the line, and the full ceilings below still
-    // bound the memory either way.
+    // asset lane may enter only while the queue is below its share of both budgets,
+    // and the remainder stays there for pages.
+    //
+    // The two budgets are tested differently BECAUSE the two lanes' units are: one
+    // slot is one slot, but one asset is up to RAW_STORE_IMAGE_MAX_BYTES — settable
+    // as high as 64 MiB, which is exactly the quarter of the 256 MiB default budget
+    // this reservation holds. So DEPTH is tested on what the queue holds now (a
+    // one-slot overshoot is one slot), while BYTES are tested on what the queue WOULD
+    // hold: admitting an asset because the queue had not yet crossed the line let four
+    // of them walk a 256 KB budget from 191997 to 255996 and refuse the next PAGE
+    // `queueBytesFull` — the reserve spent entirely on images, which is the outcome
+    // the reservation exists to prevent.
+    //
+    // The empty queue is the one exemption, and only for the bytes: a capture that
+    // waits behind nobody displaces nobody, so it is admitted even when it alone
+    // exceeds the share. That holds at most ONE such asset (the next one is measured
+    // against it), and the hard ceilings below still bound the memory either way.
     if (lane === 'asset' && this.assetQueueShare < 1) {
       if (
         this.queue.length >= this.assetQueueShare * this.queueMax ||
-        this.queuedBytes >= this.assetQueueShare * this.queueMaxBytes
+        (this.queue.length > 0 && this.queuedBytes + bytes > this.assetQueueShare * this.queueMaxBytes)
       ) {
         this.assetRefusedReserve += 1;
         this.holdAndLog();
