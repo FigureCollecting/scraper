@@ -3,6 +3,7 @@ import { gunzipSync, gzipSync } from 'node:zlib';
 import { buildRawCapture, type RawCapture } from '../../services/captureSink';
 import {
   ObjectStoreCaptureSink,
+  DEFAULT_PUT_TIMEOUT_MS,
   DEFAULT_IMAGE_PUT_TIMEOUT_MS,
   DEFAULT_RAW_STORE_ASSET_MAX_WAIT_MS,
   MIN_RAW_STORE_ASSET_MAX_WAIT_MS,
@@ -1880,3 +1881,90 @@ describe('the sink reports its own scheduling delay beside the store latencies',
     expect((sink as unknown as { lagTimer?: unknown }).lagTimer).toBeUndefined();
   });
 });
+
+/**
+ * The default budget has to sit ABOVE what the store actually costs, because the budget
+ * now DESTROYS the body rather than merely mis-counting a PUT that still landed.
+ *
+ * At 5 s it sat below the measured PUT p50 (3.5–5.7 s on the slow path measured
+ * 2026-09-10), so a deployment that forgot RAW_STORE_PUT_TIMEOUT_MS would abort roughly
+ * half its uploads and lose those bodies — page bodies being the ones nothing re-fetches.
+ * The default now matches the deployed value instead of being one missing manifest key
+ * away from an outage.
+ */
+describe('the default store-op budget', () => {
+  it('is 30 s — above the measured cost of a PUT, not below it', () => {
+    expect(DEFAULT_PUT_TIMEOUT_MS).toBe(30_000);
+  });
+
+  it('lets an op that outlasts the OLD 5 s default finish and be stored', async () => {
+    jest.useFakeTimers();
+    try {
+      const store = new FakeObjectStore();
+      store.putDelayMs = 8_000; // over the old default, under the new one
+      const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: undefined });
+      const done = send(sink, cap());
+      await jest.advanceTimersByTimeAsync(20_000);
+      await done;
+      expect(sink.stats()).toMatchObject({ stored: 1, failed: 0, timedOut: 0 });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+});
+
+/**
+ * ONE budget for the whole op, not one per store call.
+ *
+ * `RAW_STORE_PUT_TIMEOUT_MS=30000` told an operator that a capture may spend 30 s on the
+ * store. It actually bought a 60 s worst case, because the HEAD and the PUT each got the
+ * full budget — and the asset lane's 60 s was really 120 s. That gap mattered little
+ * while a timeout only mis-counted; now that it destroys the body, the number an
+ * operator sets has to be the number the op can spend.
+ */
+describe('the budget bounds the whole op, HEAD and PUT together', () => {
+  it('ends the op when the HEAD and the PUT TOGETHER outlast the budget', async () => {
+    const store = new FakeObjectStore();
+    store.existsDelayMs = 80; // each half fits the budget on its own …
+    store.putDelayMs = 80; // … and together they cannot
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 120 });
+    await send(sink, cap());
+    expect(sink.stats()).toMatchObject({ stored: 0, failed: 1, timedOut: 1 });
+    expect(store.puts).toHaveLength(0); // and the PUT the budget cannot afford is never sent
+  });
+
+  it('still stores when the two together fit inside the budget', async () => {
+    const store = new FakeObjectStore();
+    store.existsDelayMs = 20;
+    store.putDelayMs = 20;
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 400 });
+    await send(sink, cap());
+    expect(sink.stats()).toMatchObject({ stored: 1, failed: 0, timedOut: 0 });
+  });
+
+  it('spends the ASSET budget the same way, across that lane’s HEAD and PUT', async () => {
+    const store = new FakeObjectStore();
+    store.existsDelayMs = 80;
+    store.putDelayMs = 80;
+    const sink = new ObjectStoreCaptureSink(store, {
+      ...CONFIG,
+      assetsEnabled: true,
+      putTimeoutMs: 5_000,
+      imagePutTimeoutMs: 120,
+    });
+    await send(sink, cap({ lane: 'asset', bytes: PNG, contentType: 'image/png' }));
+    expect(sink.stats()).toMatchObject({ assetStored: 0, assetFailed: 1, timedOut: 1 });
+  });
+
+  it('a dedup hit costs only its HEAD and is never charged a PUT', async () => {
+    const store = new FakeObjectStore();
+    store.existsDelayMs = 80;
+    store.putDelayMs = 10_000; // would blow any budget if it were ever reached
+    const c = cap();
+    store.existing.add(`raw-html/sha256/${c.sha256.slice(0, 2)}/${c.sha256}.html.gz`);
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 400 });
+    await send(sink, c);
+    expect(sink.stats()).toMatchObject({ deduped: 1, stored: 0, failed: 0, timedOut: 0 });
+  });
+});
+

@@ -32,8 +32,9 @@
  * captured page, so hundreds of ops contended for DNS-lookup slots on the 4-thread
  * libuv pool, for TLS handshakes, and for an event loop that synchronous gzip was
  * blocking — and each op's WALL CLOCK ran past a budget sized for the upload alone.
- * The op budget now starts when the store call is made, and the wait for a worker
- * slot is reported separately (queueWaitP50/P95) instead of being charged to it.
+ * The op budget now starts when the store round trip begins and covers the WHOLE
+ * capture (HEAD + gzip + PUT under one bound, see withTimeout), while the wait for a
+ * worker slot is reported separately (queueWaitP50/P95) instead of being charged to it.
  * A capture offered when the queue is already full is DROPPED and counted rather
  * than making the backlog unbounded — and capture() SAYS SO, so a caller keeping a
  * per-url memo does not record a lost capture as done and suppress its own retry.
@@ -117,6 +118,23 @@ import { sanitizeForLog } from '../utils/security.js';
  */
 const gzipAsync = promisify(gzip);
 
+/** The signal's own reason where it is an Error, so an ended op reports why. */
+function abortReasonOf(signal: AbortSignal): Error {
+  const reason: unknown = signal.reason;
+  return reason instanceof Error ? reason : new Error('raw-store op aborted');
+}
+
+/** A promise that rejects when the op's budget ends it, and otherwise never settles. */
+function rejectOnAbort(signal: AbortSignal): Promise<never> {
+  return new Promise<never>((_, reject) => {
+    if (signal.aborted) {
+      reject(abortReasonOf(signal));
+      return;
+    }
+    signal.addEventListener('abort', () => reject(abortReasonOf(signal)), { once: true });
+  });
+}
+
 /** Options for a single object write. */
 export interface PutOptions {
   /** `application/gzip` for page bodies; the sniffed image type on the asset lane. */
@@ -176,12 +194,20 @@ export interface RawStoreConfig {
   assetsEnabled?: boolean;
   /** Key-scheme contract version; this writer only knows `sha256-v1`. */
   keyScheme: string;
-  /** Hard bound on each HEAD/PUT so a slow store can't stall the fetch path. */
+  /**
+   * Hard bound on ONE page/api capture's whole trip to the store — the HEAD, the gzip
+   * and the PUT together, not each of them (RAW_STORE_PUT_TIMEOUT_MS). Set 30000 and a
+   * capture may spend 30 s, where the per-call reading of the same number bought a 60 s
+   * worst case. Reaching it CANCELS the op and loses the body, so it belongs above the
+   * store's measured cost, not near it.
+   */
   putTimeoutMs?: number;
   /**
-   * The asset lane's own HEAD/PUT bound. An original image is up to maxImageBytes
-   * (10 MiB by default) against a page body's ~30 KB gzipped, so it cannot share
-   * the page budget without timing out on payload size alone.
+   * The asset lane's own whole-op bound (RAW_STORE_IMAGE_PUT_TIMEOUT_MS), read exactly
+   * the same way. An original image is up to maxImageBytes (10 MiB by default) against a
+   * page body's ~30 KB gzipped, so it cannot share the page budget without timing out on
+   * payload size alone. It is the longer of the two even though an image is the
+   * RE-FETCHABLE capture: the asymmetry pays for payload, not for importance.
    */
   imagePutTimeoutMs?: number;
   /**
@@ -313,7 +339,16 @@ export interface SinkStats {
 }
 
 const SUPPORTED_KEY_SCHEME = 'sha256-v1';
-const DEFAULT_PUT_TIMEOUT_MS = 5_000;
+/**
+ * The page/api lanes' default budget for ONE store op.
+ *
+ * 30 s, matching the deployed RAW_STORE_PUT_TIMEOUT_MS, because the budget now ends the
+ * op for real: it was 5 s while a timeout merely mis-counted a PUT that still landed,
+ * and 5 s sits BELOW the measured cost of a PUT (p50 3.5-5.7 s on the slow path measured
+ * 2026-09-10). A default under the real cost would abort about half of all uploads and
+ * destroy those bodies — and a page body is the one nothing will fetch again.
+ */
+export const DEFAULT_PUT_TIMEOUT_MS = 30_000;
 /** Four concurrent ops: enough to keep the link busy, few enough to stay off the cliff. */
 export const DEFAULT_RAW_STORE_CONCURRENCY = 4;
 /**
@@ -732,27 +767,32 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       }
       this.inFlightKeys.add(key);
       try {
-        // HEAD-then-PUT: content-addressed, so an existing key means identical bytes.
-        if (await this.timed(this.headDurations, () => this.withTimeout(signal => this.store.exists(key, signal)))) {
-          this.deduped += 1;
-          return;
-        }
+        // ONE budget across both round trips (see withTimeout): what the operator sets
+        // is what the capture may spend, rather than what EACH half may spend.
+        const outcome = await this.withTimeout(async signal => {
+          // HEAD-then-PUT: content-addressed, so an existing key means identical bytes.
+          if (await this.timed(this.headDurations, signal, () => this.store.exists(key, signal))) {
+            return 'deduped' as const;
+          }
 
-        // Off the event loop, and deliberately OUTSIDE the op budget: compression is
-        // our own cost, not the store's, and charging it to the upload's timeout is
-        // how a busy process ends up calling a healthy bucket slow.
-        const body = await gzipAsync(c.bytes);
-        await this.timed(this.putDurations, () =>
-          this.withTimeout(signal =>
-            this.store.put(
-              key,
-              body,
-              { contentType: 'application/gzip', metadata: this.metadata(c) },
-              signal,
-            ),
-          ),
-        );
-        this.stored += 1;
+          // Off the event loop, and INSIDE the budget: it is our own cost rather than
+          // the store's, but it is time the capture holds a worker, and the budget is
+          // what bounds that. The per-phase split stays honest either way — headP50 and
+          // putP50 time the store CALLS only — and eventLoopLagP95 beside them says
+          // whether our own CPU, not the bucket, is what ran the clock down.
+          const body = await gzipAsync(c.bytes);
+          // Never open a round trip the budget has already spent: it would reach the
+          // store for an op nobody is waiting for, and record a phantom 0 ms sample.
+          signal.throwIfAborted();
+          await this.timed(this.putDurations, signal, () =>
+            this.store.put(key, body, { contentType: 'application/gzip', metadata: this.metadata(c) }, signal),
+          );
+          return 'stored' as const;
+        });
+        // Counted out here, on the value the RACE resolved with: an op the budget ended
+        // keeps running in the background, and must never book itself as stored.
+        if (outcome === 'deduped') this.deduped += 1;
+        else this.stored += 1;
       } finally {
         this.inFlightKeys.delete(key);
       }
@@ -824,30 +864,22 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       }
       this.inFlightKeys.add(key);
       try {
-        if (
-          await this.timed(this.headDurations, () =>
-            this.withTimeout(signal => this.store.exists(key, signal), this.imagePutTimeoutMs),
-          )
-        ) {
-          this.assetDeduped += 1;
-          return;
-        }
+        // One budget across this lane's two round trips, exactly as the page lanes.
+        const outcome = await this.withTimeout(async signal => {
+          if (await this.timed(this.headDurations, signal, () => this.store.exists(key, signal))) {
+            return 'deduped' as const;
+          }
 
-        // No gzip and no Content-Encoding: an image is already compressed, and the
-        // original must be readable as itself straight out of the bucket.
-        await this.timed(this.putDurations, () =>
-          this.withTimeout(
-            signal =>
-              this.store.put(
-                key,
-                bytes,
-                { contentType: type.contentType, metadata: this.assetMetadata(c) },
-                signal,
-              ),
-            this.imagePutTimeoutMs,
-          ),
-        );
-        this.assetStored += 1;
+          // No gzip and no Content-Encoding: an image is already compressed, and the
+          // original must be readable as itself straight out of the bucket.
+          signal.throwIfAborted();
+          await this.timed(this.putDurations, signal, () =>
+            this.store.put(key, bytes, { contentType: type.contentType, metadata: this.assetMetadata(c) }, signal),
+          );
+          return 'stored' as const;
+        }, this.imagePutTimeoutMs);
+        if (outcome === 'deduped') this.assetDeduped += 1;
+        else this.assetStored += 1;
       } finally {
         this.inFlightKeys.delete(key);
       }
@@ -995,10 +1027,14 @@ export class ObjectStoreCaptureSink implements CaptureSink {
    * that consume the whole budget are exactly the ones being dropped from it, so a
    * lane timing out on every upload reports the same fast p95 as a healthy one.
    */
-  private async timed<T>(into: number[], op: () => Promise<T>): Promise<T> {
+  private async timed<T>(into: number[], signal: AbortSignal, op: () => Promise<T>): Promise<T> {
     const startedAt = Date.now();
     try {
-      return await op();
+      // Raced against the budget as well as awaited, so the PHASE ends when the op does.
+      // The port makes the signal optional, so a store may simply ignore it — and one
+      // that does would otherwise hold this sample open forever and leave the very op
+      // that consumed the whole budget out of the percentile built to show it.
+      return await Promise.race([op(), rejectOnAbort(signal)]);
     } finally {
       this.record(into, Date.now() - startedAt);
     }
@@ -1151,7 +1187,15 @@ export class ObjectStoreCaptureSink implements CaptureSink {
   }
 
   /**
-   * Bounds one store op, and CANCELS it when the bound is reached.
+   * Bounds ONE CAPTURE'S whole trip to the store — the HEAD, the gzip and the PUT under
+   * a single budget — and CANCELS it when the bound is reached.
+   *
+   * One budget, not one per call: `RAW_STORE_PUT_TIMEOUT_MS=30000` promises an operator
+   * that a capture may spend 30 s on the store, and giving each half its own budget
+   * quietly made that a 60 s worst case (and the asset lane's 60 s a 120 s one). That
+   * gap was survivable while a timeout only mis-counted a PUT that still landed; now
+   * that reaching the bound destroys the body, the number an operator sets has to be the
+   * number the op can spend.
    *
    * This was a bare race for as long as the adapter had no way to stop a request, and
    * the race is the part that bites: the sink stopped waiting, counted a failure and
