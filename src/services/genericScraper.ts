@@ -276,22 +276,32 @@ const CLEAN_HEADFUL_ARGS = [
   '--disable-setuid-sandbox',
   '--disable-dev-shm-usage',
   // TLS 1.3 0-RTT off. The one exception to "NOTHING else" above, and it is not a stealth flag: it
-  // closes a Chromium livelock that took the residential gated browser down on 2026-09-10. Chrome
-  // for Testing enables `EnableTLS13EarlyData` through the compiled-in field-trial testing config
-  // (net/base/features.cc has it FEATURE_DISABLED_BY_DEFAULT, so branded Chrome does not), so this
-  // browser offered early data on every RESUMED connection. hobby-genki.com and www.suruga-ya.jp
-  // both advertise `max_early_data_size` and then reject the early data; BoringSSL answers
-  // SSL_ERROR_EARLY_DATA_REJECTED (15) and net maps it to ERR_EARLY_DATA_REJECTED (-178), whose
-  // retry in HttpNetworkTransaction::HandleIOError is the ONE retry branch with no attempt counter.
-  // Measured in prod: the network service logged that handshake failure ~10,700 times a second,
-  // burning 40-100% of the pod's 1-CPU limit (79% of cgroup periods throttled) and leaking one
-  // proxy connection per iteration, so every navigation past the browser's FIRST one timed out.
+  // closes a Chromium livelock that took the residential gated browser down on 2026-09-10.
   //
-  // Costs one round trip on resumed connections and nothing else. It is fingerprint-SAFE at the
-  // command-line level because puppeteer already passes a `--disable-features=` switch of its own
-  // and MERGES this token into it (verified against Chrome 152.0.7977.54: Chrome receives exactly
-  // one such switch either way), and at the TLS level it only drops the `early_data` extension from
-  // resumption ClientHellos — the direction of stock branded Chrome, not away from it.
+  // PROVEN. Chrome for Testing enables `EnableTLS13EarlyData` through the compiled-in field-trial
+  // testing config (net/base/features.cc has it FEATURE_DISABLED_BY_DEFAULT, so branded Chrome does
+  // not), so this browser offered early data on every RESUMED connection. hobby-genki.com and
+  // www.suruga-ya.jp both advertise `max_early_data_size` (14336) and then reject the early data;
+  // BoringSSL answers SSL_ERROR_EARLY_DATA_REJECTED (15) and net maps it to ERR_EARLY_DATA_REJECTED
+  // (-178). Measured in prod: the network service logged that handshake failure ~10,700 times a
+  // second, burned 40-100% of the pod's 1-CPU limit (86.3% of cgroup periods throttled —
+  // nr_throttled 45,132 of nr_periods 52,289) and leaked one proxy connection per iteration, so
+  // every navigation past the browser's FIRST one timed out.
+  //
+  // WHICH LAYER SPINS IS UNCONFIRMED — do not cite one. The retry in
+  // HttpNetworkTransaction::HandleIOError is the obvious suspect and does lack an attempt counter,
+  // but it clears `can_send_early_data_` before resending and that field is set only in Start(), so
+  // it can fire at most once per transaction and cannot by itself be a 10,700/s loop. This flag
+  // does not depend on the answer: it removes the PRECONDITION. With early data off, BoringSSL is
+  // never asked to offer 0-RTT, so the reject is unreachable at EVERY layer, whichever one looped.
+  //
+  // Costs one round trip on resumed connections and nothing else. Fingerprint-SAFE, measured on
+  // Chrome 152.0.7977.54 rather than argued: puppeteer already passes a `--disable-features=`
+  // switch of its own and MERGES this token into it, so Chrome receives exactly ONE such switch
+  // either way; and the INITIAL ClientHello — the one a Cloudflare challenge is served and scored
+  // on — is byte-identical with and without the flag, because with no PSK there is no `early_data`
+  // extension (0x002a) to drop. Only a resumption ClientHello to an origin advertising 0-RTT loses
+  // that extension, which is the direction of stock branded Chrome, not away from it.
   '--disable-features=EnableTLS13EarlyData',
 ];
 
