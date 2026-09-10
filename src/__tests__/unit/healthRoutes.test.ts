@@ -377,9 +377,11 @@ describe('createHealthRoutes — rawStore counters', () => {
     putP95: 1200,
     headP50: 90,
     headP95: 400,
-    // What ENDED the slow ops: a store answering with an error and a store not
-    // answering at all are different faults wanting different responses.
+    // What ENDED the slow ops, and whether this process was even on the CPU while it
+    // timed them: a fat putP95 over a flat lag is the bucket, over a fat lag it is us.
     timedOut: 5,
+    eventLoopLagP50: 2,
+    eventLoopLagP95: 180,
   };
 
   it('publishes the sink counters on GET /health/detailed', async () => {
@@ -387,8 +389,8 @@ describe('createHealthRoutes — rawStore counters', () => {
     expect(res.status).toBe(200);
     expect(res.body.rawStore).toEqual({ configured: true, stats: STATS });
     expect(res.body.rawStore.stats).toMatchObject({ queued: 9, queuedPages: 6, queuedAssets: 3 });
-    // What ended the slow ops, not merely that some failed.
-    expect(res.body.rawStore.stats).toMatchObject({ timedOut: 5 });
+    // The two readings that make a slow putP95 diagnosable rather than merely visible.
+    expect(res.body.rawStore.stats).toMatchObject({ timedOut: 5, eventLoopLagP50: 2, eventLoopLagP95: 180 });
   });
 
   it('reports the unconfigured sink rather than omitting the block', async () => {

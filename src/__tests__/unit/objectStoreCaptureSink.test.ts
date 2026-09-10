@@ -390,8 +390,12 @@ describe('ObjectStoreCaptureSink — the asset lane', () => {
       putP95: expect.any(Number),
       headP50: expect.any(Number),
       headP95: expect.any(Number),
-      // Nothing overran its budget.
+      // Nothing overran its budget, and the lag reading is this process's own
+      // scheduling delay — the number that says whether a slow putP95 is the store
+      // or this pod.
       timedOut: 0,
+      eventLoopLagP50: expect.any(Number),
+      eventLoopLagP95: expect.any(Number),
     });
   });
 
@@ -1834,5 +1838,45 @@ describe('the op budget CANCELS the request instead of abandoning it', () => {
     await send(sink, cap({ lane: 'asset', bytes: PNG, contentType: 'image/png' }));
     expect(store.putSignal!.aborted).toBe(true);
     expect(sink.stats()).toMatchObject({ assetFailed: 1, timedOut: 1 });
+  });
+});
+
+/**
+ * Every latency this sink reports is wall clock read inside this process, so a pod
+ * that is not being SCHEDULED reports a slow bucket. That is the reading prod was
+ * missing: putP95 16–29 s against a bucket a curl in the same pod answered in 0.6 s
+ * is either a slow store or a starved process, and the counters could not tell them
+ * apart. Measured 2026-09-10 from WSL, an idle process shows lag p50/p95 of 0–1 ms
+ * while the very same PUTs take seconds — so a fat lag beside a fat putP95 points at
+ * the process, and a flat one points at the store.
+ */
+describe('the sink reports its own scheduling delay beside the store latencies', () => {
+  it('reads ~zero lag when nothing is holding the event loop', async () => {
+    const store = new FakeObjectStore();
+    store.putDelayMs = 320; // an await, not a block: the loop stays free
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 5_000 });
+    await send(sink, cap());
+    expect(sink.stats().eventLoopLagP95).toBeLessThan(100);
+  });
+
+  it('reports the delay when something BLOCKS the loop through the op', async () => {
+    class BlockingStore extends FakeObjectStore {
+      override async put(key: string, body: Buffer, opts: PutOptions): Promise<void> {
+        const until = Date.now() + 600;
+        while (Date.now() < until) {
+          /* hold the loop, exactly as a long synchronous parse would */
+        }
+        await super.put(key, body, opts);
+      }
+    }
+    const sink = new ObjectStoreCaptureSink(new BlockingStore(), { ...CONFIG, putTimeoutMs: 5_000 });
+    await send(sink, cap());
+    expect(sink.stats().eventLoopLagP95).toBeGreaterThan(100);
+  });
+
+  it('holds no sampling timer once the queue has drained', async () => {
+    const sink = new ObjectStoreCaptureSink(new FakeObjectStore(), CONFIG);
+    await send(sink, cap());
+    expect((sink as unknown as { lagTimer?: unknown }).lagTimer).toBeUndefined();
   });
 });

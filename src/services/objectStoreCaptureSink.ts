@@ -298,6 +298,18 @@ export interface SinkStats {
    * they arrived on the health page as the same number.
    */
   timedOut: number;
+  /**
+   * Milliseconds between when a zero-delay callback was due and when it ran — this
+   * PROCESS's scheduling delay, sampled continuously.
+   *
+   * It is here because every duration above is wall clock measured inside this
+   * process, so anything that keeps the process off the CPU — a cgroup CPU quota,
+   * a co-tenant Chrome, a long synchronous parse — inflates them without the store
+   * having slowed down at all. Read the two together: a fat putP95 over a flat lag is
+   * the store, and a fat putP95 over a fat lag is this pod.
+   */
+  eventLoopLagP50: number;
+  eventLoopLagP95: number;
 }
 
 const SUPPORTED_KEY_SCHEME = 'sha256-v1';
@@ -356,6 +368,12 @@ export const MIN_RAW_STORE_ASSET_MAX_WAIT_MS = 1_000;
 const DROP_LOG_INTERVAL_MS = 60_000;
 /** Rolling latency window. Percentiles over the recent past, at a fixed memory cost. */
 const LATENCY_SAMPLE_MAX = 512;
+
+/**
+ * How often the sink samples its own scheduling delay while it has work. Frequent
+ * enough to catch a CPU quota's 100 ms slices, cheap enough to leave running.
+ */
+const LOOP_LAG_SAMPLE_INTERVAL_MS = 250;
 /** 30 s — 10 MiB at a pessimistic ~350 KB/s, so payload size alone never times out. */
 export const DEFAULT_IMAGE_PUT_TIMEOUT_MS = 30_000;
 const MAX_METADATA_VALUE_LEN = 1024;
@@ -557,6 +575,13 @@ export class ObjectStoreCaptureSink implements CaptureSink {
   private assetRefusedReserveBytes = 0;
   private assetHeldSinceLog = 0;
   private lastAssetHoldLogAt = 0;
+  /**
+   * This process's scheduling delay, sampled only while the sink has work — lag while
+   * idle says nothing, and a sink nobody uses should hold no timer.
+   */
+  private readonly loopLags: number[] = [];
+  private lagTimer: ReturnType<typeof setInterval> | undefined;
+  private lagDueAt = 0;
   private readonly queueWaits: number[] = [];
   private readonly putDurations: number[] = [];
   private readonly headDurations: number[] = [];
@@ -652,6 +677,8 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       headP50: percentile(this.headDurations, 50),
       headP95: percentile(this.headDurations, 95),
       timedOut: this.timedOut,
+      eventLoopLagP50: percentile(this.loopLags, 50),
+      eventLoopLagP95: percentile(this.loopLags, 95),
     };
   }
 
@@ -900,6 +927,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       this.dropAndLog('bytes');
       return { admitted: false, reason: 'queueBytesFull' };
     }
+    this.startLagSampling();
     this.queuedBytes += bytes;
     (lane === 'page' ? this.pageQueue : this.assetQueue).push({ run, enqueuedAt: Date.now(), bytes });
     // `.catch` for the same reason the queue's other fire-and-forget call sites have
@@ -925,6 +953,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     } finally {
       this.inFlight -= 1;
       if (this.queueDepth() === 0 && this.inFlight === 0) {
+        this.stopLagSampling();
         for (const resolve of this.drainWaiters.splice(0)) resolve();
       }
     }
@@ -978,6 +1007,36 @@ export class ObjectStoreCaptureSink implements CaptureSink {
   private record(into: number[], ms: number): void {
     into.push(ms);
     if (into.length > LATENCY_SAMPLE_MAX) into.shift();
+  }
+
+  /**
+   * Sample how late a due timer runs — the delay this PROCESS is suffering, whatever
+   * its cause (a synchronous parse on the loop, a cgroup CPU quota, a noisy co-tenant).
+   * Every other duration this sink reports is wall clock measured from inside the
+   * process, so without this reading a throttled pod and a slow bucket are the same
+   * number, and the two want opposite remedies.
+   */
+  private startLagSampling(): void {
+    if (this.lagTimer) return;
+    this.lagDueAt = Date.now() + LOOP_LAG_SAMPLE_INTERVAL_MS;
+    this.lagTimer = setInterval(() => {
+      const now = Date.now();
+      this.record(this.loopLags, Math.max(0, now - this.lagDueAt));
+      this.lagDueAt = now + LOOP_LAG_SAMPLE_INTERVAL_MS;
+    }, LOOP_LAG_SAMPLE_INTERVAL_MS);
+    // Never a reason for the process to stay alive: this is instrumentation.
+    this.lagTimer.unref?.();
+  }
+
+  private stopLagSampling(): void {
+    if (!this.lagTimer) return;
+    // Take the reading the interval never got to. A block that runs right through the
+    // last op ends in microtasks — the worker finishes, the queue empties and this
+    // clears the timer before the loop ever reaches its timers phase — so the one
+    // sample that would have shown the stall is exactly the one that gets thrown away.
+    this.record(this.loopLags, Math.max(0, Date.now() - this.lagDueAt));
+    clearInterval(this.lagTimer);
+    this.lagTimer = undefined;
   }
 
   /** Tally one drop and report the burst, at most once a minute. */
