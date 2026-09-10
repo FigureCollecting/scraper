@@ -165,11 +165,23 @@ function makePool(secure: boolean, maxSockets: number): http.Agent | https.Agent
  * first attempt is still holding.
  *
  * Draining them here returns the connection to the pool instead, so a 5xx costs a round
- * trip and nothing else. The list is duplicated rather than imported because minio does
- * not export it; drifting from it degrades gracefully — an unlisted code is simply not
- * drained, and the failure-path reap in withAbort still frees the slot.
+ * trip and nothing else.
+ *
+ * The list is a hand-maintained duplicate: minio's package exports block deep imports, so
+ * it cannot be read at runtime. DRIFTING FROM IT IS NOT GRACEFUL — an earlier version of
+ * this comment claimed it was, and measurement says otherwise. Drop one status and that
+ * status re-arms the original failure: with as many concurrently failing ops as the pool
+ * has slots, every first attempt strands a socket, every retry queues behind one that will
+ * never be released, and NO op ever fails — so the failure-path reap in withAbort never
+ * runs at all. What keeps it survivable in the sink is that every op carries a budget,
+ * which degrades that from permanent death to a budget-length stall per op.
+ *
+ * So the list is guarded rather than trusted: a unit test reads minio's own retryHttpCodes
+ * out of the installed package and fails when the two disagree, and another drives a real
+ * request per status and asserts the connection comes back. A minio bump that changes the
+ * set breaks CI instead of prod.
  */
-const MINIO_RETRYABLE_STATUSES = new Set([408, 429, 499, 500, 502, 503, 504, 520]);
+export const MINIO_RETRYABLE_STATUSES = new Set([408, 429, 499, 500, 502, 503, 504, 520]);
 
 /** minio's one request seam, filing each request under the op that made it. */
 function abortableTransport(secure: boolean): Pick<typeof https, 'request'> {

@@ -3,6 +3,8 @@ import http from 'node:http';
 import https from 'node:https';
 import type { Agent } from 'node:https';
 import type { AddressInfo } from 'node:net';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { NoopCaptureSink, buildRawCapture } from '../../services/captureSink';
 import {
   ObjectStoreCaptureSink,
@@ -20,6 +22,7 @@ import {
   toS3MetaData,
   S3ObjectStore,
   getRawCaptureSink,
+  MINIO_RETRYABLE_STATUSES,
   flushRawCaptureSink,
   DEFAULT_RAW_STORE_SHUTDOWN_FLUSH_MS,
 } from '../../services/s3ObjectStore';
@@ -992,5 +995,143 @@ describe('getRawCaptureSink — the process-wide singleton', () => {
     // One client and one set of counters for the whole process: a per-caller sink would
     // report a fraction of the traffic on /health/detailed and pool connections apart.
     expect(getRawCaptureSink()).toBe(getRawCaptureSink());
+  });
+});
+
+/**
+ * The drain list is a hand-maintained copy of an unexported minio constant, and drifting
+ * from it is NOT graceful: a status minio retries on but we do not drain strands its
+ * socket, and with as many concurrently failing ops as the pool has slots every retry
+ * queues behind one that is never released — no op fails, so no failure path runs. In the
+ * sink the op budgets degrade that to a stall rather than a death, but the protection is
+ * gone. These are the guards that make a minio bump break CI instead of prod.
+ */
+describe('S3ObjectStore — the drain list is pinned to minio’s retry set', () => {
+  const servers: http.Server[] = [];
+
+  const statusServer = async (
+    status: number | null,
+  ): Promise<{ port: number; hits: () => number; connections: () => number }> => {
+    let hits = 0;
+    let conns = 0;
+    const server = http.createServer((req, res) => {
+      hits += 1;
+      req.resume();
+      req.once('end', () => {
+        if (status === null) {
+          res.writeHead(200, { ETag: '"x"' });
+          res.end();
+          return;
+        }
+        res.writeHead(status, { 'Content-Type': 'application/xml' });
+        res.end('<Error><Code>Boom</Code></Error>');
+      });
+    });
+    server.on('connection', () => {
+      conns += 1;
+    });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    return { port: (server.address() as AddressInfo).port, hits: () => hits, connections: () => conns };
+  };
+
+  const storeAt = (port: number): S3ObjectStore =>
+    new S3ObjectStore(
+      'mindsignals-raw',
+      {
+        endpoint: `http://127.0.0.1:${port}`,
+        region: 'hel1',
+        bucket: 'mindsignals-raw',
+        prefix: 'raw-html/',
+        keyScheme: 'sha256-v1',
+        pathStyle: true,
+        concurrency: 2,
+      },
+      { accessKeyId: 'AKIAEXAMPLE', secretAccessKey: 'secret-example' },
+    );
+
+  const assignedOf = (store: S3ObjectStore): number =>
+    Object.values((store as unknown as { client: { transportAgent: Agent } }).client.transportAgent.sockets).flat().length;
+  const freeOf = (store: S3ObjectStore): number =>
+    Object.values((store as unknown as { client: { transportAgent: Agent } }).client.transportAgent.freeSockets).flat().length;
+  const settle = (): Promise<void> => new Promise(resolve => setTimeout(resolve, 60));
+
+  afterEach(async () => {
+    await Promise.all(
+      servers.splice(0).map(s => {
+        s.closeAllConnections?.();
+        return new Promise<void>(resolve => s.close(() => resolve()));
+      }),
+    );
+  });
+
+  // The behavioural guard, one case per status minio retries on. If a future minio adds a
+  // status to its set and this list is updated to match, the new case must pass here too —
+  // and if the set is updated WITHOUT the drain working, this is where it shows.
+  for (const status of [...MINIO_RETRYABLE_STATUSES]) {
+    it(`returns the connection to the pool after a ${status}`, async () => {
+      const { port, hits, connections } = await statusServer(status);
+      const store = storeAt(port);
+      await expect(
+        store.put('raw-html/x', Buffer.from('body'), { contentType: 'application/gzip' }).then(() => 'ok', () => 'rej'),
+      ).resolves.toBe('rej');
+      expect(hits()).toBe(2); // the attempt plus minio's one retry
+      expect(connections()).toBe(1); // …both served by ONE connection, because it comes back
+      await settle();
+      expect(assignedOf(store)).toBe(0);
+      expect(freeOf(store)).toBe(1);
+    });
+  }
+
+  it('control: a 200 keeps its connection warm, as it always did', async () => {
+    const { port, connections } = await statusServer(null);
+    const store = storeAt(port);
+    await expect(
+      store.put('raw-html/x', Buffer.from('body'), { contentType: 'application/gzip' }).then(() => 'ok', () => 'rej'),
+    ).resolves.toBe('ok');
+    expect(connections()).toBe(1);
+    await settle();
+    expect(assignedOf(store)).toBe(0);
+    expect(freeOf(store)).toBe(1);
+  });
+
+  it('control: a 403 is NOT drained — minio reads that body itself to build its S3Error', async () => {
+    const { port, hits } = await statusServer(403);
+    const store = storeAt(port);
+    // The proof it was NOT drained: minio parsed the body and carried its Code out.
+    await expect(
+      store.put('raw-html/x', Buffer.from('body'), { contentType: 'application/gzip' }),
+    ).rejects.toMatchObject({ code: 'Boom' });
+    expect(hits()).toBe(1); // not retryable, so no second attempt
+    await settle();
+    expect(assignedOf(store)).toBe(0);
+  });
+
+  it('control: a 404 HEAD still reads as absence, and holds no slot', async () => {
+    // Its connection is NOT reused — that is minio's own error path and predates this
+    // adapter (identical on upstream/develop); asserted here only as "holds nothing".
+    const { port } = await statusServer(404);
+    const store = storeAt(port);
+    await expect(store.exists('raw-html/x')).resolves.toBe(false);
+    await settle();
+    expect(assignedOf(store)).toBe(0);
+  });
+
+  it('is exactly minio’s own retryHttpCodes — a bump that changes the set fails HERE', () => {
+    // Read out of the installed package: minio's exports map blocks deep imports, so the
+    // list cannot be pinned at runtime and is pinned in CI instead.
+    const candidates = [
+      join(process.cwd(), 'node_modules/minio/dist/main/internal/request.js'),
+      join(process.cwd(), '../node_modules/minio/dist/main/internal/request.js'),
+    ];
+    const found = candidates.find(p => existsSync(p));
+    expect(found).toBeDefined();
+    const src = readFileSync(found as string, 'utf8');
+    const block = /retryHttpCodes\s*(?::[^=]*)?=\s*\{([\s\S]*?)\}/.exec(src);
+    // A shape change is itself a signal: look before assuming the set is unchanged.
+    expect(block).not.toBeNull();
+    const theirs = new Set((block as RegExpExecArray)[1].match(/\d+/g)?.map(Number) ?? []);
+    expect(theirs.size).toBeGreaterThan(0);
+    expect([...theirs].sort((a, b) => a - b)).toEqual([...MINIO_RETRYABLE_STATUSES].sort((a, b) => a - b));
   });
 });
