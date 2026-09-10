@@ -336,6 +336,13 @@ export interface SinkStats {
    */
   eventLoopLagP50: number;
   eventLoopLagP95: number;
+  /**
+   * The worst single stall since the process started, kept apart from the percentiles
+   * above because they cannot see it: one block leaves one sample, and one sample does
+   * not move a p95 over a 512-reading window. This is the number that answers "was this
+   * pod stalled while that 29 s PUT was outstanding?".
+   */
+  eventLoopLagMax: number;
 }
 
 const SUPPORTED_KEY_SCHEME = 'sha256-v1';
@@ -615,6 +622,13 @@ export class ObjectStoreCaptureSink implements CaptureSink {
    * idle says nothing, and a sink nobody uses should hold no timer.
    */
   private readonly loopLags: number[] = [];
+  /**
+   * The worst stall since this process started, kept OUTSIDE the sample window. The
+   * sampler resets its due time after each reading, so one block of duration D leaves
+   * exactly one sample of ~D — which in a full 512-sample window sits below p95. A high
+   * -water mark is the only form in which a single long stall survives to be read.
+   */
+  private loopLagMax = 0;
   private lagTimer: ReturnType<typeof setInterval> | undefined;
   private lagDueAt = 0;
   private readonly queueWaits: number[] = [];
@@ -714,6 +728,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       timedOut: this.timedOut,
       eventLoopLagP50: percentile(this.loopLags, 50),
       eventLoopLagP95: percentile(this.loopLags, 95),
+      eventLoopLagMax: this.loopLagMax,
     };
   }
 
@@ -1057,11 +1072,17 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     this.lagDueAt = Date.now() + LOOP_LAG_SAMPLE_INTERVAL_MS;
     this.lagTimer = setInterval(() => {
       const now = Date.now();
-      this.record(this.loopLags, Math.max(0, now - this.lagDueAt));
+      this.recordLag(Math.max(0, now - this.lagDueAt));
       this.lagDueAt = now + LOOP_LAG_SAMPLE_INTERVAL_MS;
     }, LOOP_LAG_SAMPLE_INTERVAL_MS);
     // Never a reason for the process to stay alive: this is instrumentation.
     this.lagTimer.unref?.();
+  }
+
+  /** One lag reading: into the window for the percentiles, and past the high-water mark. */
+  private recordLag(ms: number): void {
+    this.record(this.loopLags, ms);
+    if (ms > this.loopLagMax) this.loopLagMax = ms;
   }
 
   private stopLagSampling(): void {
@@ -1070,7 +1091,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     // last op ends in microtasks — the worker finishes, the queue empties and this
     // clears the timer before the loop ever reaches its timers phase — so the one
     // sample that would have shown the stall is exactly the one that gets thrown away.
-    this.record(this.loopLags, Math.max(0, Date.now() - this.lagDueAt));
+    this.recordLag(Math.max(0, Date.now() - this.lagDueAt));
     clearInterval(this.lagTimer);
     this.lagTimer = undefined;
   }

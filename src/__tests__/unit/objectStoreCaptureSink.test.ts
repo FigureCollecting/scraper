@@ -397,6 +397,7 @@ describe('ObjectStoreCaptureSink — the asset lane', () => {
       timedOut: 0,
       eventLoopLagP50: expect.any(Number),
       eventLoopLagP95: expect.any(Number),
+      eventLoopLagMax: expect.any(Number),
     });
   });
 
@@ -1968,3 +1969,48 @@ describe('the budget bounds the whole op, HEAD and PUT together', () => {
   });
 });
 
+/**
+ * A percentile cannot see a single long stall, and a single long stall is the question.
+ *
+ * The sampler resets its due time after each reading, so a block of duration D yields
+ * exactly ONE sample of ~D rather than D/250 of them. In a full 512-sample window that
+ * lone outlier sits below p95 — so a 3 s stall reports `eventLoopLagP95: 0`. The number
+ * that answers "was this pod stalled while that 29 s PUT was outstanding?" therefore has
+ * to be a high-water mark, and one that does not fall out of a window.
+ */
+describe('the worst event-loop stall stays visible', () => {
+  class BlocksOnceStore extends FakeObjectStore {
+    private blocked = false;
+    override async put(key: string, body: Buffer, opts: PutOptions): Promise<void> {
+      if (!this.blocked) {
+        this.blocked = true;
+        const until = Date.now() + 600;
+        while (Date.now() < until) {
+          /* hold the loop, exactly as a long synchronous parse would */
+        }
+      }
+      await super.put(key, body, opts);
+    }
+  }
+
+  it('records the stall as a high-water mark, not only in the percentiles', async () => {
+    const sink = new ObjectStoreCaptureSink(new BlocksOnceStore(), { ...CONFIG, putTimeoutMs: 5_000 });
+    await send(sink, cap({ bytes: Buffer.from('first') }));
+    expect(sink.stats().eventLoopLagMax).toBeGreaterThan(100);
+  });
+
+  it('keeps it after the quiet captures that follow, where a window would drop it', async () => {
+    const sink = new ObjectStoreCaptureSink(new BlocksOnceStore(), { ...CONFIG, putTimeoutMs: 5_000 });
+    await send(sink, cap({ bytes: Buffer.from('first') }));
+    const worst = sink.stats().eventLoopLagMax;
+    expect(worst).toBeGreaterThan(100);
+    for (let i = 0; i < 6; i++) await send(sink, cap({ bytes: Buffer.from(`quiet-${i}`) }));
+    expect(sink.stats().eventLoopLagMax).toBe(worst);
+  });
+
+  it('reads zero on a sink that has never been held up', async () => {
+    const sink = new ObjectStoreCaptureSink(new FakeObjectStore(), CONFIG);
+    await send(sink, cap());
+    expect(sink.stats().eventLoopLagMax).toBeLessThan(100);
+  });
+});

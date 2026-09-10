@@ -35,6 +35,7 @@ const build = (over: Partial<HealthDeps> = {}) => {
     getFailureLedger: () => ({ enabled: false, reported: 0, failed: 0, suppressed: 0 }),
     getImageCapture: () => NO_IMAGE_CAPTURE,
     getSessionCanary: () => ({ site: 'mfc', configured: false, stale: false }),
+    getCpuThrottling: () => ({ available: false }),
     ...over,
   }));
   return app;
@@ -382,6 +383,7 @@ describe('createHealthRoutes — rawStore counters', () => {
     timedOut: 5,
     eventLoopLagP50: 2,
     eventLoopLagP95: 180,
+    eventLoopLagMax: 3100,
   };
 
   it('publishes the sink counters on GET /health/detailed', async () => {
@@ -391,6 +393,8 @@ describe('createHealthRoutes — rawStore counters', () => {
     expect(res.body.rawStore.stats).toMatchObject({ queued: 9, queuedPages: 6, queuedAssets: 3 });
     // The two readings that make a slow putP95 diagnosable rather than merely visible.
     expect(res.body.rawStore.stats).toMatchObject({ timedOut: 5, eventLoopLagP50: 2, eventLoopLagP95: 180 });
+    // The high-water mark specifically: a single 3.1 s stall that no percentile can show.
+    expect(res.body.rawStore.stats).toMatchObject({ eventLoopLagMax: 3100 });
   });
 
   it('reports the unconfigured sink rather than omitting the block', async () => {
@@ -530,5 +534,42 @@ describe('createHealthRoutes — imageCapture', () => {
 
     expect(res.status).toBe(500);
     expect(res.body.imageCapture).toEqual(busy);
+  });
+});
+
+
+/**
+ * `cpuThrottling` — the kernel's own answer to "is this pod being given the CPU?".
+ *
+ * The sink's event-loop lag says this PROCESS was slow; only the cgroup counters say
+ * whether that was the process's own doing or a quota stopping it. The two are read
+ * together, so both have to reach the same surface.
+ */
+describe('createHealthRoutes — cpuThrottling', () => {
+  const THROTTLED = { available: true, nrPeriods: 8102, nrThrottled: 941, throttledUsec: 20719353, readAt: '2026-09-10T18:00:00.000Z' };
+
+  it('publishes the cgroup counters on GET /health/detailed', async () => {
+    const res = await request(build({ getCpuThrottling: () => THROTTLED })).get('/health/detailed');
+    expect(res.status).toBe(200);
+    expect(res.body.cpuThrottling).toEqual(THROTTLED);
+  });
+
+  it('reports the absence of a cgroup rather than omitting the block', async () => {
+    const res = await request(build()).get('/health/detailed');
+    expect(res.body.cpuThrottling).toEqual({ available: false });
+  });
+
+  it('keeps cpuThrottling on the degraded (500) response', async () => {
+    const app = build({
+      getBrowserPoolHealth: async () => {
+        throw new Error('pool down');
+      },
+      getCpuThrottling: () => THROTTLED,
+    });
+    const res = await request(app).get('/health/detailed');
+    expect(res.status).toBe(500);
+    // A pod that is being throttled is exactly the pod whose browser pool is failing,
+    // so this reading has to survive the degraded response that reports it.
+    expect(res.body.cpuThrottling).toEqual(THROTTLED);
   });
 });
