@@ -44,10 +44,11 @@ export interface S3Credentials {
   secretAccessKey: string;
 }
 
-/** One op's live requests, and the budget signal that may end them. */
+/** One op's live requests, and the budget signal — if any — that may end them. */
 interface OpContext {
   reqs: Set<ClientRequest>;
-  signal: AbortSignal;
+  /** Optional exactly as the port makes it: tracking does not depend on a budget. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -154,19 +155,40 @@ function makePool(secure: boolean, maxSockets: number): http.Agent | https.Agent
   return secure ? new https.Agent(options) : new http.Agent(options);
 }
 
+/**
+ * The statuses minio treats as retryable, and therefore throws on WITHOUT reading the
+ * response body (`minio/dist/main/internal/request.js`, pinned ^8.0.7 — the list is
+ * minio-go's). Nothing else will ever consume those bodies, and an unread response holds
+ * its socket ASSIGNED forever: the pool's keep-alive timeout reaps idle sockets, not
+ * these. On a pool capped at the sink's concurrency that is fatal — at a concurrency of
+ * one an op even deadlocks against ITSELF, its retry queued behind the socket its own
+ * first attempt is still holding.
+ *
+ * Draining them here returns the connection to the pool instead, so a 5xx costs a round
+ * trip and nothing else. The list is duplicated rather than imported because minio does
+ * not export it; drifting from it degrades gracefully — an unlisted code is simply not
+ * drained, and the failure-path reap in withAbort still frees the slot.
+ */
+const MINIO_RETRYABLE_STATUSES = new Set([408, 429, 499, 500, 502, 503, 504, 520]);
+
 /** minio's one request seam, filing each request under the op that made it. */
 function abortableTransport(secure: boolean): Pick<typeof https, 'request'> {
   const transport = secure ? https : http;
   return {
     request(options: https.RequestOptions, callback?: (res: http.IncomingMessage) => void): ClientRequest {
-      const req = transport.request(options, callback as never);
+      const req = transport.request(options, res => {
+        // Only these: minio DOES read the body of any other error status, to build the
+        // S3Error, and draining one it wants would break that.
+        if (res.statusCode !== undefined && MINIO_RETRYABLE_STATUSES.has(res.statusCode)) res.resume();
+        callback?.(res);
+      });
       const ctx = opRequests.getStore();
       if (ctx) {
         // The op is already over — a retry minio started during its backoff, say. Ending
         // it HERE is the whole point: untracked it would hold one of the pool's sockets
         // until the store answered, and the capture that took this one's place would wait
         // out its budget on a socket rather than on the store.
-        if (ctx.signal.aborted) {
+        if (ctx.signal?.aborted) {
           req.destroy(abortReason(ctx.signal));
           return req;
         }
@@ -193,21 +215,41 @@ function abortReason(signal: AbortSignal): Error {
  * An already-aborted signal never dials at all.
  */
 async function withAbort<T>(signal: AbortSignal | undefined, run: () => Promise<T>): Promise<T> {
-  if (!signal) return run();
-  signal.throwIfAborted();
+  signal?.throwIfAborted();
+  // Tracked whether or not there is a budget. The port makes the signal optional, and the
+  // reap below is about the POOL rather than the budget — a caller that passes no signal
+  // must not silently forfeit it and strand sockets the sink can never get back.
   const ctx: OpContext = { reqs: new Set(), signal };
   // Reaps what is in flight NOW; the transport's own check on ctx.signal reaps whatever
   // is filed after this has fired. Both are needed — this one alone leaves minio's
   // retry running, and that one alone never touches a request already on the wire.
-  const onAbort = (): void => {
-    for (const req of ctx.reqs) req.destroy(abortReason(signal));
-    ctx.reqs.clear();
-  };
-  signal.addEventListener('abort', onAbort, { once: true });
+  let detach: (() => void) | undefined;
+  if (signal) {
+    const onAbort = (): void => {
+      for (const req of ctx.reqs) req.destroy(abortReason(signal));
+      ctx.reqs.clear();
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    detach = () => signal.removeEventListener('abort', onAbort);
+  }
   try {
     return await opRequests.run(ctx, run);
+  } catch (err) {
+    // The FAILURE path needs its own reap, because most failures never reach the budget.
+    // minio throws a retryable status (408/429/499/500/502/503/504/520) after its one
+    // retry — usually inside a second, far inside a 30 s budget — WITHOUT draining the
+    // error body, so both requests are dropped still holding their sockets and no abort
+    // is ever raised to collect them. Nothing else will: the pool's keep-alive timeout
+    // reaps IDLE sockets, and these are assigned. On a pool capped at the sink's
+    // concurrency that is permanent, two slots per failing op, until raw capture has no
+    // pool left and every later op waits out its budget on a socket instead of the store.
+    // Only this arm: a SUCCESSFUL op leaves nothing tracked, and reaping there would
+    // throw away the warm connection keep-alive exists for.
+    for (const req of ctx.reqs) req.destroy();
+    ctx.reqs.clear();
+    throw err;
   } finally {
-    signal.removeEventListener('abort', onAbort);
+    detach?.();
   }
 }
 

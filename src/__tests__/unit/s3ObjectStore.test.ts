@@ -19,6 +19,7 @@ import {
   isImagePersistenceEnabled,
   toS3MetaData,
   S3ObjectStore,
+  getRawCaptureSink,
   flushRawCaptureSink,
   DEFAULT_RAW_STORE_SHUTDOWN_FLUSH_MS,
 } from '../../services/s3ObjectStore';
@@ -766,5 +767,230 @@ describe('S3ObjectStore — an abort reaps the retry minio starts during its bac
     const replacement = store.put('raw-html/replacement', Buffer.from('body'), { contentType: 'application/gzip' });
     await expect(outcomeOf(replacement)).resolves.toBe('resolved');
     expect(Date.now() - startedAt).toBeLessThan(2_000);
+  });
+});
+
+/**
+ * A request must not outlive its op when the op ends in FAILURE either.
+ *
+ * The abort path reaps what it tracked; the ordinary failure path did not, and a
+ * retryable 5xx takes that path. minio throws such a status after its one retry —
+ * typically within a second, far inside a 30 s budget — so the budget never fires, no
+ * abort is raised, and the two requests it made are dropped still holding their sockets.
+ * minio never drains the error body, so nothing releases them: the agent's keep-alive
+ * timeout reaps IDLE pooled sockets, and these are assigned.
+ *
+ * That was harmless while the adapter used the process-wide agent with maxSockets
+ * Infinity — a strand wasted a connection and blocked nobody. Capping the pool at
+ * RAW_STORE_CONCURRENCY made it permanent: each 5xx-failing op burns two of the
+ * twenty-four slots for good, so a dozen of them across a pod's life stop raw capture
+ * outright, and near-silently — timedOut climbs, stored flatlines, and every new
+ * diagnostic in this PR reads clean because the wait is for a socket, not for the store.
+ */
+describe('S3ObjectStore — a failed op leaves nothing holding a pool slot', () => {
+  const servers: http.Server[] = [];
+
+  /** Answers every request with `status` and an undrained body, or 200 when null. */
+  const statusServer = async (
+    status: number | null,
+  ): Promise<{ port: number; hits: () => number; connections: () => number }> => {
+    let hits = 0;
+    let conns = 0;
+    const server = http.createServer((req, res) => {
+      hits += 1;
+      req.resume();
+      req.once('end', () => {
+        if (status === null) {
+          res.writeHead(200, { ETag: '"x"' });
+          res.end();
+          return;
+        }
+        res.writeHead(status, { 'Content-Type': 'application/xml' });
+        res.end('<Error><Code>Boom</Code></Error>');
+      });
+    });
+    server.on('connection', () => {
+      conns += 1;
+    });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    return { port: (server.address() as AddressInfo).port, hits: () => hits, connections: () => conns };
+  };
+
+  const storeAt = (port: number, concurrency: number): S3ObjectStore =>
+    new S3ObjectStore(
+      'mindsignals-raw',
+      {
+        endpoint: `http://127.0.0.1:${port}`,
+        region: 'hel1',
+        bucket: 'mindsignals-raw',
+        prefix: 'raw-html/',
+        keyScheme: 'sha256-v1',
+        pathStyle: true,
+        concurrency,
+      },
+      { accessKeyId: 'AKIAEXAMPLE', secretAccessKey: 'secret-example' },
+    );
+
+  const poolOf = (store: S3ObjectStore): Agent =>
+    (store as unknown as { client: { transportAgent: Agent } }).client.transportAgent;
+  const assigned = (store: S3ObjectStore): number => Object.values(poolOf(store).sockets).flat().length;
+  const free = (store: S3ObjectStore): number => Object.values(poolOf(store).freeSockets).flat().length;
+
+  /** One turn for the agent's bookkeeping to catch up with a just-destroyed socket. */
+  const settleSockets = (): Promise<void> => new Promise(resolve => setTimeout(resolve, 50));
+
+  /** Four ops in sequence; a hang is a RESULT here, never a suite that never ends. */
+  const runFour = async (store: S3ObjectStore): Promise<string[]> => {
+    const out: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      out.push(
+        await Promise.race([
+          store
+            .put(`raw-html/op-${i}`, Buffer.from('body'), { contentType: 'application/gzip' })
+            .then(() => 'ok', () => 'rej'),
+          new Promise<string>(resolve => setTimeout(() => resolve('HUNG'), 2_500)),
+        ]),
+      );
+    }
+    return out;
+  };
+
+  afterEach(async () => {
+    await Promise.all(
+      servers.splice(0).map(s => {
+        s.closeAllConnections?.();
+        return new Promise<void>(resolve => s.close(() => resolve()));
+      }),
+    );
+  });
+
+  it('keeps serving after a retryable 5xx, instead of eating the pool two slots at a time', async () => {
+    // maxSockets 2 is the whole pool: op0's attempt and its retry take one slot each, so
+    // if neither is released op1 waits on a socket that will never come back.
+    const { port, hits, connections } = await statusServer(503);
+    const store = storeAt(port, 2);
+    expect(await runFour(store)).toEqual(['rej', 'rej', 'rej', 'rej']);
+    expect(hits()).toBe(8); // four ops, each an attempt plus minio's one retry
+    // And the connection is REUSED throughout rather than burned per failure: draining
+    // the body minio throws away is what returns the socket, so a 5xx costs a round trip
+    // and nothing more.
+    expect(connections()).toBe(1);
+    await settleSockets();
+    expect(assigned(store)).toBe(0);
+    expect(free(store)).toBe(1);
+  });
+
+  it('does not deadlock an op against its OWN retry at a concurrency of one', async () => {
+    // The sharpest case: with a single socket, op0's retry queues behind the socket op0's
+    // own first attempt is still holding, and the op can never reach its failure path.
+    const { port, connections } = await statusServer(503);
+    const store = storeAt(port, 1);
+    expect(await runFour(store)).toEqual(['rej', 'rej', 'rej', 'rej']);
+    expect(connections()).toBe(1);
+    await settleSockets();
+    expect(assigned(store)).toBe(0);
+  });
+
+  // The controls. A non-retryable status and a success must be untouched by the reap —
+  // in particular the success path must still hand its connection back to the pool, or
+  // the cure has cost keep-alive.
+  it('control: a NON-retryable 4xx reuses its one connection, as it always did', async () => {
+    const { port, hits, connections } = await statusServer(403);
+    const store = storeAt(port, 2);
+    expect(await runFour(store)).toEqual(['rej', 'rej', 'rej', 'rej']);
+    expect(hits()).toBe(4); // no retry
+    expect(connections()).toBe(1); // one socket, reused throughout
+    await settleSockets();
+    expect(assigned(store)).toBe(0);
+    expect(free(store)).toBe(1);
+  });
+
+  it('control: success still leaves its connection WARM in the pool', async () => {
+    const { port, hits, connections } = await statusServer(null);
+    const store = storeAt(port, 2);
+    expect(await runFour(store)).toEqual(['ok', 'ok', 'ok', 'ok']);
+    expect(hits()).toBe(4);
+    expect(connections()).toBe(1);
+    await settleSockets();
+    expect(assigned(store)).toBe(0);
+    expect(free(store)).toBe(1);
+  });
+});
+
+/**
+ * `exists` is the HEAD half of every capture, and its catch is an ALLOW LIST: a 404 means
+ * "not stored yet", and anything else is a real fault that must reach the sink as one.
+ * Swallowing an aborted or failing HEAD as "absent" would turn a broken store into a
+ * silent re-upload of everything.
+ */
+describe('S3ObjectStore — exists, against a real server', () => {
+  const servers: http.Server[] = [];
+
+  const headServer = async (present: string): Promise<number> => {
+    const server = http.createServer((req, res) => {
+      req.resume();
+      if ((req.url ?? '').includes(present)) {
+        res.writeHead(200, { 'Content-Length': '4', ETag: '"x"', 'Last-Modified': new Date().toUTCString() });
+        res.end();
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    return (server.address() as AddressInfo).port;
+  };
+
+  const storeAt = (port: number): S3ObjectStore =>
+    new S3ObjectStore(
+      'mindsignals-raw',
+      {
+        endpoint: `http://127.0.0.1:${port}`,
+        region: 'hel1',
+        bucket: 'mindsignals-raw',
+        prefix: 'raw-html/',
+        keyScheme: 'sha256-v1',
+        pathStyle: true,
+      },
+      { accessKeyId: 'AKIAEXAMPLE', secretAccessKey: 'secret-example' },
+    );
+
+  afterEach(async () => {
+    await Promise.all(
+      servers.splice(0).map(s => {
+        s.closeAllConnections?.();
+        return new Promise<void>(resolve => s.close(() => resolve()));
+      }),
+    );
+  });
+
+  it('is true for an object the store already holds', async () => {
+    await expect(storeAt(await headServer('kept')).exists('raw-html/kept')).resolves.toBe(true);
+  });
+
+  it('is false for a 404 — "not stored yet" is not a failure', async () => {
+    await expect(storeAt(await headServer('kept')).exists('raw-html/missing')).resolves.toBe(false);
+  });
+
+  it('RETHROWS anything that is not a 404, rather than reporting absence', async () => {
+    // A 403 read as "absent" would send the sink off to re-upload a corpus it cannot write.
+    const server = http.createServer((req, res) => {
+      req.resume();
+      res.writeHead(403, { 'Content-Type': 'application/xml' });
+      res.end('<Error><Code>AccessDenied</Code></Error>');
+    });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    await expect(storeAt((server.address() as AddressInfo).port).exists('raw-html/x')).rejects.toThrow();
+  });
+});
+
+describe('getRawCaptureSink — the process-wide singleton', () => {
+  it('builds the sink once and hands the same one to every fetch path', () => {
+    // One client and one set of counters for the whole process: a per-caller sink would
+    // report a fraction of the traffic on /health/detailed and pool connections apart.
+    expect(getRawCaptureSink()).toBe(getRawCaptureSink());
   });
 });
