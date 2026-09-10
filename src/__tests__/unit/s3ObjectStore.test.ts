@@ -1,6 +1,16 @@
 import { jest } from '@jest/globals';
+import http from 'node:http';
+import https from 'node:https';
+import type { Agent } from 'node:https';
+import type { AddressInfo } from 'node:net';
 import { NoopCaptureSink, buildRawCapture } from '../../services/captureSink';
-import { ObjectStoreCaptureSink, MIN_RAW_STORE_ASSET_MAX_WAIT_MS, type ObjectStore } from '../../services/objectStoreCaptureSink';
+import {
+  ObjectStoreCaptureSink,
+  MIN_RAW_STORE_ASSET_MAX_WAIT_MS,
+  resolveRawStoreConcurrency,
+  type ObjectStore,
+  type RawStoreConfig,
+} from '../../services/objectStoreCaptureSink';
 import {
   MAX_CONFIGURABLE_IMAGE_BYTES,
   rawStoreView,
@@ -8,6 +18,7 @@ import {
   createRawCaptureSink,
   isImagePersistenceEnabled,
   toS3MetaData,
+  S3ObjectStore,
   flushRawCaptureSink,
   DEFAULT_RAW_STORE_SHUTDOWN_FLUSH_MS,
 } from '../../services/s3ObjectStore';
@@ -462,5 +473,140 @@ describe('flushRawCaptureSink — pages first inside the budget', () => {
     for (let i = 0; i < 100 && sink.stats().queued + sink.stats().inFlight > 0; i += 1) { store.release(); await tick(); }
     await done;
     warn.mockRestore();
+  });
+});
+
+/**
+ * The adapter's half of the cancellation contract, proven on a REAL socket.
+ *
+ * The sink can only bound an op if the bound reaches the connection: minio takes no
+ * AbortSignal, so a budget that merely stops waiting leaves the request running,
+ * holding a socket and consuming the store's request rate long after the sink has
+ * written the op off. These tests drive the actual minio client against a local
+ * server that accepts and never answers — the exact shape of the prod tail.
+ */
+describe('S3ObjectStore — an aborted op is torn down at the socket', () => {
+  const servers: http.Server[] = [];
+
+  const silentServer = async (): Promise<{ port: number; closedSockets: () => number; seen: () => number }> => {
+    let closed = 0;
+    let seen = 0;
+    const server = http.createServer(() => {
+      seen += 1; // accept the request and never answer it
+    });
+    server.on('connection', socket => {
+      socket.once('close', () => {
+        closed += 1;
+      });
+    });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    return { port: (server.address() as AddressInfo).port, closedSockets: () => closed, seen: () => seen };
+  };
+
+  const storeAt = (port: number): S3ObjectStore =>
+    new S3ObjectStore(
+      'mindsignals-raw',
+      {
+        endpoint: `http://127.0.0.1:${port}`,
+        region: 'hel1',
+        bucket: 'mindsignals-raw',
+        prefix: 'raw-html/',
+        keyScheme: 'sha256-v1',
+        pathStyle: true,
+      },
+      { accessKeyId: 'AKIAEXAMPLE', secretAccessKey: 'secret-example' },
+    );
+
+  const settle = async (): Promise<void> => {
+    await new Promise(resolve => setTimeout(resolve, 50));
+  };
+
+  afterEach(async () => {
+    await Promise.all(servers.splice(0).map(s => new Promise<void>(resolve => s.close(() => resolve()))));
+  });
+
+  it('destroys the in-flight PUT when the signal aborts, and rejects', async () => {
+    const { port, closedSockets, seen } = await silentServer();
+    const controller = new AbortController();
+    const put = storeAt(port).put('raw-html/x', Buffer.from('body'), { contentType: 'application/gzip' }, controller.signal);
+    const settled = put.then(
+      () => 'resolved',
+      () => 'rejected',
+    );
+    await settle();
+    expect(seen()).toBe(1); // the request really is on the wire and unanswered
+    controller.abort();
+    await expect(settled).resolves.toBe('rejected');
+    await settle();
+    expect(closedSockets()).toBe(1); // the socket is GONE, not parked in the agent
+  });
+
+  it('destroys the in-flight HEAD when the signal aborts, and rejects', async () => {
+    const { port, closedSockets } = await silentServer();
+    const controller = new AbortController();
+    const exists = storeAt(port).exists('raw-html/x', controller.signal);
+    const settled = exists.then(
+      () => 'resolved',
+      () => 'rejected',
+    );
+    await settle();
+    controller.abort();
+    await expect(settled).resolves.toBe('rejected');
+    await settle();
+    expect(closedSockets()).toBe(1);
+  });
+
+  it('rejects immediately when handed a signal that is already aborted', async () => {
+    const { port, seen } = await silentServer();
+    await expect(
+      storeAt(port).put('raw-html/x', Buffer.from('body'), { contentType: 'application/gzip' }, AbortSignal.abort()),
+    ).rejects.toThrow();
+    expect(seen()).toBe(0); // never dialled at all
+  });
+});
+
+/**
+ * The raw-store client gets its OWN connection pool.
+ *
+ * minio defaults to `https.globalAgent`, which the whole process shares and which
+ * Node ships with maxSockets Infinity: uploads compete with every other https call
+ * the scraper makes, and nothing at the transport caps connections at the sink's
+ * concurrency — so an op the sink has written off can still hold a socket beside the
+ * replacement op the freed worker started.
+ */
+describe('S3ObjectStore — a dedicated, bounded keep-alive pool', () => {
+  const agentOf = (store: S3ObjectStore): Agent =>
+    (store as unknown as { client: { transportAgent: Agent } }).client.transportAgent;
+
+  const build = (over: Partial<RawStoreConfig> = {}): S3ObjectStore =>
+    new S3ObjectStore(
+      'mindsignals-raw',
+      {
+        endpoint: 'https://hel1.your-objectstorage.com',
+        region: 'hel1',
+        bucket: 'mindsignals-raw',
+        prefix: 'raw-html/',
+        keyScheme: 'sha256-v1',
+        ...over,
+      },
+      { accessKeyId: 'AKIAEXAMPLE', secretAccessKey: 'secret-example' },
+    );
+
+  it('never uses the process-wide global agent', () => {
+    expect(agentOf(build())).not.toBe(https.globalAgent);
+  });
+
+  it('keeps connections alive so a burst does not re-handshake per object', () => {
+    expect(agentOf(build()).options.keepAlive).toBe(true);
+  });
+
+  it('caps sockets at the sink concurrency the same config asks for', () => {
+    expect(agentOf(build({ concurrency: 12 })).options.maxSockets).toBe(12);
+    expect(agentOf(build({ concurrency: 24 })).options.maxSockets).toBe(24);
+  });
+
+  it('falls back to the sink default concurrency when the config names none', () => {
+    expect(agentOf(build()).options.maxSockets).toBe(resolveRawStoreConcurrency(undefined));
   });
 });

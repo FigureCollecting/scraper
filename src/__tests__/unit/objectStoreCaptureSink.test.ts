@@ -390,6 +390,8 @@ describe('ObjectStoreCaptureSink — the asset lane', () => {
       putP95: expect.any(Number),
       headP50: expect.any(Number),
       headP95: expect.any(Number),
+      // Nothing overran its budget.
+      timedOut: 0,
     });
   });
 
@@ -1744,5 +1746,93 @@ describe('ObjectStoreCaptureSink — the queue depth is reported by lane', () =>
     store.release();
     await sink.flush();
     warn.mockRestore();
+  });
+});
+
+/**
+ * The op budget must CANCEL, not merely stop waiting.
+ *
+ * Measured against the live bucket (2026-09-10, WSL → Hetzner hel1): the store is
+ * request-rate limited, not bandwidth limited — a 40 KB PUT and a 3 MB PUT cost the
+ * same seconds, and per-op latency grows with how many ops are in flight while
+ * throughput stays flat. Under that regime an abandoned-but-still-running request is
+ * not free: it keeps its socket and keeps consuming the store's scarce request rate
+ * while the freed worker starts ANOTHER op beside it. The concurrency bound then
+ * bounds only what the sink is WATCHING, in-flight requests climb above it, latency
+ * climbs with them, and more ops blow the budget — the timeout feeds itself.
+ */
+describe('the op budget CANCELS the request instead of abandoning it', () => {
+  class SignalStore implements ObjectStore {
+    existsSignal: AbortSignal | undefined;
+    putSignal: AbortSignal | undefined;
+    hangPut = false;
+    hangExists = false;
+
+    async exists(key: string, signal?: AbortSignal): Promise<boolean> {
+      this.existsSignal = signal;
+      if (this.hangExists) return new Promise<boolean>(() => {});
+      return false;
+    }
+
+    async put(key: string, body: Buffer, opts: PutOptions, signal?: AbortSignal): Promise<void> {
+      this.putSignal = signal;
+      if (this.hangPut) return new Promise<void>(() => {});
+    }
+  }
+
+  it('hands put() a signal and ABORTS it when the budget expires', async () => {
+    const store = new SignalStore();
+    store.hangPut = true;
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 20 });
+    await send(sink, cap());
+    expect(store.putSignal).toBeDefined();
+    expect(store.putSignal!.aborted).toBe(true);
+  });
+
+  it('hands exists() a signal and ABORTS it when the budget expires', async () => {
+    const store = new SignalStore();
+    store.hangExists = true;
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 20 });
+    await send(sink, cap());
+    expect(store.existsSignal).toBeDefined();
+    expect(store.existsSignal!.aborted).toBe(true);
+  });
+
+  it('leaves the signal UNaborted when the op finishes inside its budget', async () => {
+    const store = new SignalStore();
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 5_000 });
+    await send(sink, cap());
+    expect(store.putSignal!.aborted).toBe(false);
+    expect(store.existsSignal!.aborted).toBe(false);
+  });
+
+  it('counts a timed-out op apart from a store that answered with an error', async () => {
+    const hung = new SignalStore();
+    hung.hangPut = true;
+    const timing = new ObjectStoreCaptureSink(hung, { ...CONFIG, putTimeoutMs: 20 });
+    await send(timing, cap());
+    expect(timing.stats()).toMatchObject({ failed: 1, timedOut: 1 });
+
+    // A store that FAILS fast is a different fault with a different remedy: it is not
+    // the budget that ended the op, so it must not read as one on the health page.
+    const erroring = new FakeObjectStore();
+    erroring.failPut = true;
+    const failing = new ObjectStoreCaptureSink(erroring, { ...CONFIG, putTimeoutMs: 5_000 });
+    await send(failing, cap());
+    expect(failing.stats()).toMatchObject({ failed: 1, timedOut: 0 });
+  });
+
+  it('times the asset lane out on ITS budget and aborts that op too', async () => {
+    const store = new SignalStore();
+    store.hangPut = true;
+    const sink = new ObjectStoreCaptureSink(store, {
+      ...CONFIG,
+      assetsEnabled: true,
+      putTimeoutMs: 5_000,
+      imagePutTimeoutMs: 20,
+    });
+    await send(sink, cap({ lane: 'asset', bytes: PNG, contentType: 'image/png' }));
+    expect(store.putSignal!.aborted).toBe(true);
+    expect(sink.stats()).toMatchObject({ assetFailed: 1, timedOut: 1 });
   });
 });

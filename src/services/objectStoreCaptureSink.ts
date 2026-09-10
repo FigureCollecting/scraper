@@ -135,12 +135,21 @@ export interface PutOptions {
   metadata?: Record<string, string>;
 }
 
-/** Minimal S3-compatible port. Concrete adapter (Hetzner) lives separately. */
+/**
+ * Minimal S3-compatible port. Concrete adapter (Hetzner) lives separately.
+ *
+ * Both ops take the op budget's AbortSignal, and an adapter is expected to tear the
+ * request down when it fires. Abandoning the promise is not enough: measured against
+ * the live bucket, cost per object is dominated by the REQUEST, not its bytes (a
+ * 40 KB and a 3 MB PUT cost the same seconds), so a request nobody is waiting for
+ * still holds a socket and still spends the store's request budget — beside the
+ * replacement op the freed worker has already started.
+ */
 export interface ObjectStore {
   /** HEAD — does this content address already exist? */
-  exists(key: string): Promise<boolean>;
+  exists(key: string, signal?: AbortSignal): Promise<boolean>;
   /** PUT — write the object. Callers guarantee write-once by content address. */
-  put(key: string, body: Buffer, opts: PutOptions): Promise<void>;
+  put(key: string, body: Buffer, opts: PutOptions, signal?: AbortSignal): Promise<void>;
 }
 
 /** Non-secret store contract (from raw-store-config.yaml) + operational bounds. */
@@ -283,6 +292,12 @@ export interface SinkStats {
    * dedup hit makes, so leaving it untimed hid half the latency. */
   headP50: number;
   headP95: number;
+  /**
+   * Ops the budget ended, a SUBSET of failed + assetFailed. A store answering slowly
+   * and a store answering wrongly are different faults, and until this counter existed
+   * they arrived on the health page as the same number.
+   */
+  timedOut: number;
 }
 
 const SUPPORTED_KEY_SCHEME = 'sha256-v1';
@@ -295,6 +310,19 @@ export const DEFAULT_RAW_STORE_CONCURRENCY = 4;
  * the image byte ceiling is clamped.
  */
 export const MAX_RAW_STORE_CONCURRENCY = 64;
+
+/**
+ * The concurrency the sink will actually run at, from a raw config value. Exported
+ * because the S3 adapter sizes its connection pool from the SAME number: a pool
+ * larger than the op bound lets an op the sink has written off keep a socket beside
+ * its replacement, and a smaller one would queue ops inside the transport where the
+ * sink cannot see the wait.
+ */
+export function resolveRawStoreConcurrency(raw: number | undefined): number {
+  return typeof raw === 'number' && Number.isFinite(raw) && raw > 0
+    ? Math.min(Math.floor(raw), MAX_RAW_STORE_CONCURRENCY)
+    : DEFAULT_RAW_STORE_CONCURRENCY;
+}
 /** Backlog ceiling. Page bodies are buffered, so the queue is memory we are holding. */
 export const DEFAULT_RAW_STORE_QUEUE_MAX = 500;
 /**
@@ -540,6 +568,12 @@ export class ObjectStoreCaptureSink implements CaptureSink {
    * their prefixes keep the key spaces apart, so one guard covers both.
    */
   private readonly inFlightKeys = new Set<string>();
+  /**
+   * Ops the BUDGET ended, counted inside `failed`/`assetFailed` rather than beside
+   * them. "The store answered with an error" and "the store never answered" are
+   * different faults wanting different responses, and one counter cannot say which.
+   */
+  private timedOut = 0;
   private stored = 0;
   private deduped = 0;
   private failed = 0;
@@ -567,11 +601,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     this.maxImageBytes = typeof m === 'number' && Number.isFinite(m) && m > 0 ? m : DEFAULT_MAX_IMAGE_BYTES;
     this.pagesEnabled = config.pagesEnabled !== false;
     this.assetsEnabled = config.assetsEnabled !== false;
-    const c = config.concurrency;
-    this.concurrency =
-      typeof c === 'number' && Number.isFinite(c) && c > 0
-        ? Math.min(Math.floor(c), MAX_RAW_STORE_CONCURRENCY)
-        : DEFAULT_RAW_STORE_CONCURRENCY;
+    this.concurrency = resolveRawStoreConcurrency(config.concurrency);
     const q = config.queueMax;
     this.queueMax =
       typeof q === 'number' && Number.isFinite(q) && q > 0
@@ -621,6 +651,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       putP95: percentile(this.putDurations, 95),
       headP50: percentile(this.headDurations, 50),
       headP95: percentile(this.headDurations, 95),
+      timedOut: this.timedOut,
     };
   }
 
@@ -675,7 +706,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       this.inFlightKeys.add(key);
       try {
         // HEAD-then-PUT: content-addressed, so an existing key means identical bytes.
-        if (await this.timed(this.headDurations, () => this.withTimeout(this.store.exists(key)))) {
+        if (await this.timed(this.headDurations, () => this.withTimeout(signal => this.store.exists(key, signal)))) {
           this.deduped += 1;
           return;
         }
@@ -685,11 +716,13 @@ export class ObjectStoreCaptureSink implements CaptureSink {
         // how a busy process ends up calling a healthy bucket slow.
         const body = await gzipAsync(c.bytes);
         await this.timed(this.putDurations, () =>
-          this.withTimeout(
-            this.store.put(key, body, {
-              contentType: 'application/gzip',
-              metadata: this.metadata(c),
-            }),
+          this.withTimeout(signal =>
+            this.store.put(
+              key,
+              body,
+              { contentType: 'application/gzip', metadata: this.metadata(c) },
+              signal,
+            ),
           ),
         );
         this.stored += 1;
@@ -765,7 +798,9 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       this.inFlightKeys.add(key);
       try {
         if (
-          await this.timed(this.headDurations, () => this.withTimeout(this.store.exists(key), this.imagePutTimeoutMs))
+          await this.timed(this.headDurations, () =>
+            this.withTimeout(signal => this.store.exists(key, signal), this.imagePutTimeoutMs),
+          )
         ) {
           this.assetDeduped += 1;
           return;
@@ -775,10 +810,13 @@ export class ObjectStoreCaptureSink implements CaptureSink {
         // original must be readable as itself straight out of the bucket.
         await this.timed(this.putDurations, () =>
           this.withTimeout(
-            this.store.put(key, bytes, {
-              contentType: type.contentType,
-              metadata: this.assetMetadata(c),
-            }),
+            signal =>
+              this.store.put(
+                key,
+                bytes,
+                { contentType: type.contentType, metadata: this.assetMetadata(c) },
+                signal,
+              ),
             this.imagePutTimeoutMs,
           ),
         );
@@ -1054,18 +1092,40 @@ export class ObjectStoreCaptureSink implements CaptureSink {
   }
 
   /**
-   * Bounds one store op. NOTE: this is a race, not a cancellation — the underlying
-   * request is abandoned, not aborted (the minio client takes no AbortSignal), so a
-   * timed-out PUT may still complete into the bucket after it has been counted as a
-   * failure. That is why the asset lane gets a budget sized to its payload rather
-   * than sharing the page lanes'.
+   * Bounds one store op, and CANCELS it when the bound is reached.
+   *
+   * This was a bare race for as long as the adapter had no way to stop a request, and
+   * the race is the part that bites: the sink stopped waiting, counted a failure and
+   * freed the worker, while the request carried on holding its socket. Because cost
+   * per object here is the round trip and not the payload, that abandoned request goes
+   * on spending the store's request budget beside the replacement the freed worker
+   * started — so `concurrency` bounded what the sink was WATCHING, not what was in
+   * flight, and every op that overran made the next one likelier to overrun too.
+   *
+   * The signal is handed to the op, and the adapter destroys the underlying request on
+   * abort. The race stays: it is what makes the budget observable to the caller even if
+   * an adapter ignores the signal. A cancelled PUT may still have landed server-side —
+   * the key is a content address and PUT is idempotent, so the next capture of those
+   * bytes simply finds them.
    */
-  private withTimeout<T>(p: Promise<T>, budgetMs: number = this.putTimeoutMs): Promise<T> {
+  private withTimeout<T>(
+    run: (signal: AbortSignal) => Promise<T>,
+    budgetMs: number = this.putTimeoutMs,
+  ): Promise<T> {
+    const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`raw-store op exceeded ${budgetMs}ms`)), budgetMs);
+      timer = setTimeout(() => {
+        this.timedOut += 1;
+        const err = new Error(`raw-store op exceeded ${budgetMs}ms`);
+        controller.abort(err);
+        reject(err);
+      }, budgetMs);
     });
-    return Promise.race([p, timeout]).finally(() => {
+    // Promise.race subscribes to BOTH, so the op's own late rejection (the abort
+    // arriving back through the adapter) is handled and never reaches the process as
+    // an unhandled rejection.
+    return Promise.race([run(controller.signal), timeout]).finally(() => {
       if (timer) clearTimeout(timer);
     });
   }

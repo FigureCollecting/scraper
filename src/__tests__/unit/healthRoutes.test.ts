@@ -377,6 +377,9 @@ describe('createHealthRoutes — rawStore counters', () => {
     putP95: 1200,
     headP50: 90,
     headP95: 400,
+    // What ENDED the slow ops: a store answering with an error and a store not
+    // answering at all are different faults wanting different responses.
+    timedOut: 5,
   };
 
   it('publishes the sink counters on GET /health/detailed', async () => {
@@ -384,6 +387,8 @@ describe('createHealthRoutes — rawStore counters', () => {
     expect(res.status).toBe(200);
     expect(res.body.rawStore).toEqual({ configured: true, stats: STATS });
     expect(res.body.rawStore.stats).toMatchObject({ queued: 9, queuedPages: 6, queuedAssets: 3 });
+    // What ended the slow ops, not merely that some failed.
+    expect(res.body.rawStore.stats).toMatchObject({ timedOut: 5 });
   });
 
   it('reports the unconfigured sink rather than omitting the block', async () => {

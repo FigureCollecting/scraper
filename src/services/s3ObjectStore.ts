@@ -22,12 +22,17 @@
  * against the bucket), not in unit tests — the sink logic is exercised against a
  * fake ObjectStore in objectStoreCaptureSink.test.ts.
  */
+import { AsyncLocalStorage } from 'node:async_hooks';
+import http from 'node:http';
+import https from 'node:https';
+import type { ClientRequest } from 'node:http';
 import { Client as MinioClient } from 'minio';
 import type { CaptureSink } from './captureSink.js';
 import { NoopCaptureSink } from './captureSink.js';
 import {
   ObjectStoreCaptureSink,
   MIN_RAW_STORE_ASSET_MAX_WAIT_MS,
+  resolveRawStoreConcurrency,
   type ObjectStore,
   type PutOptions,
   type RawStoreConfig,
@@ -39,6 +44,26 @@ export interface S3Credentials {
   secretAccessKey: string;
 }
 
+/**
+ * The requests belonging to the op running in the current async context.
+ *
+ * minio takes no AbortSignal, but it does take a `transport`, and it routes every
+ * single request through that one seam. So each op runs inside its own context with a
+ * set the transport files its ClientRequests into, and an abort destroys exactly those
+ * — including the second attempt minio's own retry may have started.
+ */
+const opRequests = new AsyncLocalStorage<Set<ClientRequest>>();
+
+/**
+ * How long an idle pooled connection is kept. Node's global agent keeps one for 5 s,
+ * which is shorter than the gap between crawl bursts: every burst then re-pays DNS
+ * plus a TLS handshake on all its sockets at once (measured 2026-09-10 from WSL:
+ * DNS p50 338 ms, TLS-ready p50 641 ms, twelve of them concurrently). Kept well under
+ * a typical S3 front-end's own idle timeout so it is the CLIENT that retires a
+ * connection, not the server closing one we are about to reuse.
+ */
+const POOL_KEEPALIVE_MS = 30_000;
+
 /** Maps the minimal ObjectStore port onto the minio client (statObject / putObject). */
 export class S3ObjectStore implements ObjectStore {
   private readonly client: MinioClient;
@@ -49,20 +74,28 @@ export class S3ObjectStore implements ObjectStore {
     creds: S3Credentials,
   ) {
     const url = new URL(config.endpoint);
+    const secure = url.protocol === 'https:';
     this.client = new MinioClient({
       endPoint: url.hostname,
       port: url.port ? Number(url.port) : undefined,
-      useSSL: url.protocol === 'https:',
+      useSSL: secure,
       region: config.region,
       accessKey: creds.accessKeyId,
       secretKey: creds.secretAccessKey,
       pathStyle: config.pathStyle ?? false, // Hetzner = virtual-hosted style
+      // Both defaults minio would otherwise take are wrong for this sink, and for the
+      // same reason: they are process-wide. Its transport is `node:https` itself, so
+      // there is no seam to cancel a request through; its agent is `https.globalAgent`,
+      // which every other https caller in the process shares and which Node ships with
+      // maxSockets Infinity — nothing there holds uploads to the sink's own bound.
+      transport: abortableTransport(secure),
+      transportAgent: makePool(secure, resolveRawStoreConcurrency(config.concurrency)),
     });
   }
 
-  async exists(key: string): Promise<boolean> {
+  async exists(key: string, signal?: AbortSignal): Promise<boolean> {
     try {
-      await this.client.statObject(this.bucket, key);
+      await withAbort(signal, () => this.client.statObject(this.bucket, key));
       return true;
     } catch (err) {
       // A genuine 404 means "not stored yet" — NOT a failure. Any other error
@@ -76,8 +109,74 @@ export class S3ObjectStore implements ObjectStore {
     }
   }
 
-  async put(key: string, body: Buffer, opts: PutOptions): Promise<void> {
-    await this.client.putObject(this.bucket, key, body, body.length, toS3MetaData(opts));
+  async put(key: string, body: Buffer, opts: PutOptions, signal?: AbortSignal): Promise<void> {
+    // `body.length` is passed for the port's sake, not minio's: given a Buffer it takes
+    // the length from the buffer itself and uploads in ONE request whenever that fits a
+    // part, so nothing here is ever a multipart or a chunked upload of unknown size.
+    await withAbort(signal, () =>
+      this.client.putObject(this.bucket, key, body, body.length, toS3MetaData(opts)),
+    );
+  }
+}
+
+/**
+ * The raw store's OWN connection pool: keep-alive, and capped at the sink's op bound.
+ *
+ * The cap is the part that matters. An op the sink has given up on is meant to stop
+ * costing the store a request; capping the pool means that even if one somehow lingers,
+ * it cannot be joined by a 25th connection — the transport enforces the same bound the
+ * sink does, instead of the global agent's Infinity.
+ */
+function makePool(secure: boolean, maxSockets: number): http.Agent | https.Agent {
+  const options = {
+    keepAlive: true,
+    keepAliveMsecs: POOL_KEEPALIVE_MS,
+    timeout: POOL_KEEPALIVE_MS,
+    maxSockets,
+    maxFreeSockets: maxSockets,
+    scheduling: 'fifo' as const,
+  };
+  return secure ? new https.Agent(options) : new http.Agent(options);
+}
+
+/** minio's one request seam, filing each request under the op that made it. */
+function abortableTransport(secure: boolean): Pick<typeof https, 'request'> {
+  const transport = secure ? https : http;
+  return {
+    request(options: https.RequestOptions, callback?: (res: http.IncomingMessage) => void): ClientRequest {
+      const req = transport.request(options, callback as never);
+      const tracked = opRequests.getStore();
+      if (tracked) {
+        tracked.add(req);
+        req.once('close', () => tracked.delete(req));
+      }
+      return req;
+    },
+  } as Pick<typeof https, 'request'>;
+}
+
+/**
+ * Run one store op so that aborting the signal tears its request down at the socket.
+ *
+ * Without this the sink's budget was a race it could not enforce: it stopped waiting
+ * while the request kept its connection and kept spending the store's request budget.
+ * An already-aborted signal never dials at all.
+ */
+async function withAbort<T>(signal: AbortSignal | undefined, run: () => Promise<T>): Promise<T> {
+  if (!signal) return run();
+  signal.throwIfAborted();
+  const tracked = new Set<ClientRequest>();
+  const onAbort = (): void => {
+    const reason = signal.reason;
+    const err = reason instanceof Error ? reason : new Error('raw-store op aborted');
+    for (const req of tracked) req.destroy(err);
+    tracked.clear();
+  };
+  signal.addEventListener('abort', onAbort, { once: true });
+  try {
+    return await opRequests.run(tracked, run);
+  } finally {
+    signal.removeEventListener('abort', onAbort);
   }
 }
 
