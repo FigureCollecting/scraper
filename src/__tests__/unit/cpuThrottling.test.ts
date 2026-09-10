@@ -1,7 +1,7 @@
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readCpuThrottling } from '../../services/cpuThrottling';
+import { cpuThrottlingView, readCpuThrottling } from '../../services/cpuThrottling';
 
 /**
  * Whether the KERNEL is holding this process off the CPU.
@@ -64,5 +64,42 @@ describe('readCpuThrottling — cgroup v2 cpu.stat', () => {
     expect(view.nrPeriods).toBe(10);
     expect(view.nrThrottled).toBeUndefined();
     expect(view.throttledUsec).toBe(5);
+  });
+});
+
+/**
+ * `cpuThrottlingView` is what `index.ts` wires into the health route, so it is the path
+ * that actually runs in prod — testing only `readCpuThrottling` beneath it leaves the
+ * production entry point unexercised, which is how it fell under the coverage gate.
+ */
+describe('cpuThrottlingView — the health route’s entry point', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'cpustat-view-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('reports the counters for a cgroup that publishes them', () => {
+    const p = join(dir, 'cpu.stat');
+    writeFileSync(p, 'nr_periods 12\nnr_throttled 3\nthrottled_usec 4567\n');
+    expect(cpuThrottlingView(p)).toMatchObject({
+      available: true,
+      nrPeriods: 12,
+      nrThrottled: 3,
+      throttledUsec: 4567,
+    });
+  });
+
+  it('reports absence rather than throwing where there is no cgroup', () => {
+    expect(cpuThrottlingView(join(dir, 'absent'))).toEqual({ available: false });
+  });
+
+  it('never throws when called the way the health route calls it — with no argument', () => {
+    // Whatever this host is (cgroup v2, cgroup v1, macOS, CI), the health endpoint must
+    // get an answer rather than a 500.
+    const view = cpuThrottlingView();
+    expect(typeof view.available).toBe('boolean');
   });
 });

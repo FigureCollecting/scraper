@@ -71,7 +71,12 @@ export function readCpuThrottling(path: string = CGROUP_V2_CPU_STAT): CpuThrottl
   };
 }
 
-/** The ops-readable view for /health/detailed. Never throws. */
+/**
+ * The ops-readable view for /health/detailed, and the function the composition root
+ * wires in. The guard is belt-and-braces rather than a reachable path — readCpuThrottling
+ * already swallows everything — but this is the health endpoint's boundary, and it should
+ * not be one refactor of the reader away from 500ing on an optional diagnostic.
+ */
 export function cpuThrottlingView(path?: string): CpuThrottlingView {
   try {
     return readCpuThrottling(path);
