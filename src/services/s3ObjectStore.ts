@@ -32,6 +32,8 @@ import { NoopCaptureSink } from './captureSink.js';
 import {
   ObjectStoreCaptureSink,
   MIN_RAW_STORE_ASSET_MAX_WAIT_MS,
+  DEFAULT_PUT_TIMEOUT_MS,
+  DEFAULT_IMAGE_PUT_TIMEOUT_MS,
   resolveRawStoreConcurrency,
   type ObjectStore,
   type PutOptions,
@@ -99,7 +101,7 @@ export class S3ObjectStore implements ObjectStore {
       // there is no seam to cancel a request through; its agent is `https.globalAgent`,
       // which every other https caller in the process shares and which Node ships with
       // maxSockets Infinity — nothing there holds uploads to the sink's own bound.
-      transport: abortableTransport(secure),
+      transport: abortableTransport(secure, socketBackstopMs(config)),
       transportAgent: makePool(secure, resolveRawStoreConcurrency(config.concurrency)),
     });
   }
@@ -184,7 +186,7 @@ function makePool(secure: boolean, maxSockets: number): http.Agent | https.Agent
 export const MINIO_RETRYABLE_STATUSES = new Set([408, 429, 499, 500, 502, 503, 504, 520]);
 
 /** minio's one request seam, filing each request under the op that made it. */
-function abortableTransport(secure: boolean): Pick<typeof https, 'request'> {
+function abortableTransport(secure: boolean, backstopMs: number): Pick<typeof https, 'request'> {
   const transport = secure ? https : http;
   return {
     request(options: https.RequestOptions, callback?: (res: http.IncomingMessage) => void): ClientRequest {
@@ -194,6 +196,7 @@ function abortableTransport(secure: boolean): Pick<typeof https, 'request'> {
         if (res.statusCode !== undefined && MINIO_RETRYABLE_STATUSES.has(res.statusCode)) res.resume();
         callback?.(res);
       });
+      armSocketBackstop(req, backstopMs);
       const ctx = opRequests.getStore();
       if (ctx) {
         // The op is already over — a retry minio started during its backoff, say. Ending
@@ -210,6 +213,52 @@ function abortableTransport(secure: boolean): Pick<typeof https, 'request'> {
       return req;
     },
   } as Pick<typeof https, 'request'>;
+}
+
+/**
+ * How far above the longest op budget the pool's own backstop sits. A MULTIPLE rather
+ * than a fixed margin so it scales with whatever the budgets are set to, and so a test
+ * can exercise it in milliseconds instead of minutes.
+ */
+const SOCKET_BACKSTOP_FACTOR = 2;
+
+/**
+ * The inactivity bound on an ASSIGNED socket — the pool's own floor, above every op budget.
+ *
+ * Draining an unread body (see abortableTransport) discards it without buffering, but it
+ * never COMPLETES if the body never does, and a socket draining forever is assigned
+ * forever. Node EMITS `'timeout'` on a socket and destroys nothing, minio adds no
+ * listener, and the agent's own `timeout` reaps IDLE pooled sockets — so without this
+ * nothing in the stack ends it, and at a pool size of one the op's retry queues behind the
+ * socket its own first attempt is still draining. The op then never fails, so no failure
+ * path runs either.
+ *
+ * Derived from the budgets and set ABOVE the largest, because it is a floor under the pool
+ * and NOT a second budget: the asset lane legitimately runs to 60 s on a 10 MiB original,
+ * and a backstop at or under that would cap it silently. A live op is always ended by its
+ * own budget first; this only ever catches an op that has none.
+ */
+export function socketBackstopMs(config: RawStoreConfig): number {
+  const budget = (raw: number | undefined, fallback: number): number =>
+    typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : fallback;
+  const longest = Math.max(
+    budget(config.putTimeoutMs, DEFAULT_PUT_TIMEOUT_MS),
+    budget(config.imagePutTimeoutMs, DEFAULT_IMAGE_PUT_TIMEOUT_MS),
+  );
+  return longest * SOCKET_BACKSTOP_FACTOR;
+}
+
+/** Arm the backstop on whichever socket the agent gives this request, and disarm on close. */
+function armSocketBackstop(req: ClientRequest, backstopMs: number): void {
+  req.once('socket', socket => {
+    const onTimeout = (): void => {
+      socket.destroy(new Error(`raw-store socket idle beyond ${backstopMs}ms`));
+    };
+    socket.setTimeout(backstopMs);
+    socket.once('timeout', onTimeout);
+    // Sockets are REUSED, so an un-disarmed listener would accumulate one per request.
+    req.once('close', () => socket.removeListener('timeout', onTimeout));
+  });
 }
 
 /** The signal's own reason where it is an Error, so the op reports why it ended. */

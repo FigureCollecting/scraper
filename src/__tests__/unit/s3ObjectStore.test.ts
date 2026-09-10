@@ -9,6 +9,7 @@ import { NoopCaptureSink, buildRawCapture } from '../../services/captureSink';
 import {
   ObjectStoreCaptureSink,
   MIN_RAW_STORE_ASSET_MAX_WAIT_MS,
+  DEFAULT_IMAGE_PUT_TIMEOUT_MS,
   resolveRawStoreConcurrency,
   type ObjectStore,
   type RawStoreConfig,
@@ -22,6 +23,7 @@ import {
   toS3MetaData,
   S3ObjectStore,
   getRawCaptureSink,
+  socketBackstopMs,
   MINIO_RETRYABLE_STATUSES,
   flushRawCaptureSink,
   DEFAULT_RAW_STORE_SHUTDOWN_FLUSH_MS,
@@ -995,6 +997,98 @@ describe('getRawCaptureSink — the process-wide singleton', () => {
     // One client and one set of counters for the whole process: a per-caller sink would
     // report a fraction of the traffic on /health/detailed and pool connections apart.
     expect(getRawCaptureSink()).toBe(getRawCaptureSink());
+  });
+});
+
+/**
+ * The pool must recover on its own, not only when a caller happens to carry a budget.
+ *
+ * `res.resume()` discards the body without buffering, but it never COMPLETES if the body
+ * never does — and a socket draining forever is assigned forever. Node emits `'timeout'`
+ * on a socket and destroys nothing, minio adds no listener, and the agent's own timeout
+ * reaps IDLE pooled sockets, so nothing in the stack ends it. At pool size 1 that is
+ * terminal: the op's retry queues behind the socket its first attempt is still draining,
+ * so the op never fails and no failure path ever runs.
+ *
+ * The backstop is deliberately derived from the op budgets and set ABOVE the largest of
+ * them. It must never cut a live op short — the asset lane legitimately runs to 60 s on a
+ * 10 MiB original — so it is a floor under the pool, not a second budget.
+ */
+describe('S3ObjectStore — a socket cannot outlive its op', () => {
+  const servers: http.Server[] = [];
+
+  /** 503 headers, then a body that is never finished. */
+  const neverEndingBodyServer = async (): Promise<{ port: number; connections: () => number }> => {
+    let conns = 0;
+    const server = http.createServer((req, res) => {
+      req.resume();
+      res.writeHead(503, { 'Content-Type': 'application/xml' });
+      res.write('<Error>'); // …and never `end()`
+    });
+    server.on('connection', () => {
+      conns += 1;
+    });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    return { port: (server.address() as AddressInfo).port, connections: () => conns };
+  };
+
+  const storeAt = (port: number, over: Partial<RawStoreConfig> = {}): S3ObjectStore =>
+    new S3ObjectStore(
+      'mindsignals-raw',
+      {
+        endpoint: `http://127.0.0.1:${port}`,
+        region: 'hel1',
+        bucket: 'mindsignals-raw',
+        prefix: 'raw-html/',
+        keyScheme: 'sha256-v1',
+        pathStyle: true,
+        concurrency: 1,
+        // Tiny budgets so the backstop derived from them is testable in milliseconds.
+        putTimeoutMs: 80,
+        imagePutTimeoutMs: 80,
+        ...over,
+      },
+      { accessKeyId: 'AKIAEXAMPLE', secretAccessKey: 'secret-example' },
+    );
+
+  const poolOf = (store: S3ObjectStore): Agent =>
+    (store as unknown as { client: { transportAgent: Agent } }).client.transportAgent;
+
+  afterEach(async () => {
+    await Promise.all(
+      servers.splice(0).map(s => {
+        s.closeAllConnections?.();
+        return new Promise<void>(resolve => s.close(() => resolve()));
+      }),
+    );
+  });
+
+  it('frees the slot when a drained body never ends, with NO budget on the op at all', async () => {
+    const { port } = await neverEndingBodyServer();
+    const store = storeAt(port);
+    // No signal: this is the caller the optional-signal port allows, and the one that
+    // has nothing else to end the op.
+    const outcome = await Promise.race([
+      store.put('raw-html/x', Buffer.from('body'), { contentType: 'application/gzip' }).then(() => 'resolved', () => 'rejected'),
+      new Promise<string>(resolve => setTimeout(() => resolve('HUNG'), 4_000)),
+    ]);
+    expect(outcome).toBe('rejected');
+    await new Promise(resolve => setTimeout(resolve, 100));
+    expect(Object.values(poolOf(store).sockets).flat()).toHaveLength(0);
+  });
+
+  it('sets the backstop ABOVE the longest op budget, so it never ends a live upload', () => {
+    // The asset lane legitimately runs to 60 s on a 10 MiB original; a backstop at or
+    // under that would silently cap it, which is the opposite of the bug being fixed.
+    const base = { endpoint: 'https://x', region: 'r', bucket: 'b', prefix: 'p', keyScheme: 'sha256-v1' };
+    expect(socketBackstopMs({ ...base, putTimeoutMs: 30_000, imagePutTimeoutMs: 60_000 })).toBeGreaterThan(60_000);
+    expect(socketBackstopMs({ ...base, putTimeoutMs: 90_000, imagePutTimeoutMs: 10_000 })).toBeGreaterThan(90_000);
+  });
+
+  it('derives the backstop from the DEFAULTS when the config names no budgets', () => {
+    expect(socketBackstopMs({ endpoint: 'https://x', region: 'r', bucket: 'b', prefix: 'p', keyScheme: 'sha256-v1' }))
+      .toBeGreaterThan(DEFAULT_IMAGE_PUT_TIMEOUT_MS);
   });
 });
 
