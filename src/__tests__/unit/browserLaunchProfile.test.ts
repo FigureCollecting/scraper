@@ -20,6 +20,7 @@ describe('browser launch profile (BROWSER_LAUNCH_MODE)', () => {
     '--no-sandbox',
     '--disable-setuid-sandbox',
     '--disable-dev-shm-usage',
+    '--disable-features=EnableTLS13EarlyData',
   ];
 
   // Every flag the headless profile carries that the proven recipe does NOT: each one is an extra
@@ -64,6 +65,20 @@ describe('browser launch profile (BROWSER_LAUNCH_MODE)', () => {
     // No device-metrics override at all: puppeteer's 800x600 default would contradict the 1280x900
     // window the launch flag asks for (measured: outer 1280x900 vs inner 800x600).
     expect(config.defaultViewport).toBeNull();
+  });
+
+  /**
+   * PROD INCIDENT 2026-09-10: the residential gated browser's network service burned 40-100% of the
+   * pod's 1-CPU limit in an unbounded loop logging
+   * `ssl_client_socket_impl.cc: handshake failed; ... SSL error code 15, net_error -178`
+   * (SSL_ERROR_EARLY_DATA_REJECTED / ERR_EARLY_DATA_REJECTED) ~10,700 times a second, leaking one
+   * TCP connection to the egress proxy per iteration, until every navigation timed out. TLS 1.3
+   * 0-RTT is what makes that state reachable: without early data the reject cannot occur.
+   */
+  it('disables TLS 1.3 early data in clean-headful mode (0-RTT reject spin, 2026-09-10)', () => {
+    const config = buildBrowserConfig({ BROWSER_LAUNCH_MODE: 'clean-headful' } as NodeJS.ProcessEnv);
+
+    expect(config.args).toContain('--disable-features=EnableTLS13EarlyData');
   });
 
   it('carries none of the headless profile\'s extra flags in clean-headful mode', () => {
