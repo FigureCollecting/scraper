@@ -1,6 +1,19 @@
 import { jest } from '@jest/globals';
+import http from 'node:http';
+import https from 'node:https';
+import type { Agent } from 'node:https';
+import type { AddressInfo } from 'node:net';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { NoopCaptureSink, buildRawCapture } from '../../services/captureSink';
-import { ObjectStoreCaptureSink, MIN_RAW_STORE_ASSET_MAX_WAIT_MS, type ObjectStore } from '../../services/objectStoreCaptureSink';
+import {
+  ObjectStoreCaptureSink,
+  MIN_RAW_STORE_ASSET_MAX_WAIT_MS,
+  DEFAULT_IMAGE_PUT_TIMEOUT_MS,
+  resolveRawStoreConcurrency,
+  type ObjectStore,
+  type RawStoreConfig,
+} from '../../services/objectStoreCaptureSink';
 import {
   MAX_CONFIGURABLE_IMAGE_BYTES,
   rawStoreView,
@@ -8,6 +21,10 @@ import {
   createRawCaptureSink,
   isImagePersistenceEnabled,
   toS3MetaData,
+  S3ObjectStore,
+  getRawCaptureSink,
+  socketBackstopMs,
+  MINIO_RETRYABLE_STATUSES,
   flushRawCaptureSink,
   DEFAULT_RAW_STORE_SHUTDOWN_FLUSH_MS,
 } from '../../services/s3ObjectStore';
@@ -462,5 +479,753 @@ describe('flushRawCaptureSink — pages first inside the budget', () => {
     for (let i = 0; i < 100 && sink.stats().queued + sink.stats().inFlight > 0; i += 1) { store.release(); await tick(); }
     await done;
     warn.mockRestore();
+  });
+});
+
+/**
+ * The adapter's half of the cancellation contract, proven on a REAL socket.
+ *
+ * The sink can only bound an op if the bound reaches the connection: minio takes no
+ * AbortSignal, so a budget that merely stops waiting leaves the request running,
+ * holding a socket and consuming the store's request rate long after the sink has
+ * written the op off. These tests drive the actual minio client against a local
+ * server that accepts and never answers — the exact shape of the prod tail.
+ */
+describe('S3ObjectStore — an aborted op is torn down at the socket', () => {
+  const servers: http.Server[] = [];
+
+  const silentServer = async (): Promise<{ port: number; closedSockets: () => number; seen: () => number }> => {
+    let closed = 0;
+    let seen = 0;
+    const server = http.createServer(() => {
+      seen += 1; // accept the request and never answer it
+    });
+    server.on('connection', socket => {
+      socket.once('close', () => {
+        closed += 1;
+      });
+    });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    return { port: (server.address() as AddressInfo).port, closedSockets: () => closed, seen: () => seen };
+  };
+
+  const storeAt = (port: number): S3ObjectStore =>
+    new S3ObjectStore(
+      'mindsignals-raw',
+      {
+        endpoint: `http://127.0.0.1:${port}`,
+        region: 'hel1',
+        bucket: 'mindsignals-raw',
+        prefix: 'raw-html/',
+        keyScheme: 'sha256-v1',
+        pathStyle: true,
+      },
+      { accessKeyId: 'AKIAEXAMPLE', secretAccessKey: 'secret-example' },
+    );
+
+  const settle = async (): Promise<void> => {
+    await new Promise(resolve => setTimeout(resolve, 50));
+  };
+
+  afterEach(async () => {
+    await Promise.all(servers.splice(0).map(s => new Promise<void>(resolve => s.close(() => resolve()))));
+  });
+
+  it('destroys the in-flight PUT when the signal aborts, and rejects', async () => {
+    const { port, closedSockets, seen } = await silentServer();
+    const controller = new AbortController();
+    const put = storeAt(port).put('raw-html/x', Buffer.from('body'), { contentType: 'application/gzip' }, controller.signal);
+    const settled = put.then(
+      () => 'resolved',
+      () => 'rejected',
+    );
+    await settle();
+    expect(seen()).toBe(1); // the request really is on the wire and unanswered
+    controller.abort();
+    await expect(settled).resolves.toBe('rejected');
+    await settle();
+    expect(closedSockets()).toBe(1); // the socket is GONE, not parked in the agent
+  });
+
+  it('destroys the in-flight HEAD when the signal aborts, and rejects', async () => {
+    const { port, closedSockets } = await silentServer();
+    const controller = new AbortController();
+    const exists = storeAt(port).exists('raw-html/x', controller.signal);
+    const settled = exists.then(
+      () => 'resolved',
+      () => 'rejected',
+    );
+    await settle();
+    controller.abort();
+    await expect(settled).resolves.toBe('rejected');
+    await settle();
+    expect(closedSockets()).toBe(1);
+  });
+
+  it('rejects immediately when handed a signal that is already aborted', async () => {
+    const { port, seen } = await silentServer();
+    await expect(
+      storeAt(port).put('raw-html/x', Buffer.from('body'), { contentType: 'application/gzip' }, AbortSignal.abort()),
+    ).rejects.toThrow();
+    expect(seen()).toBe(0); // never dialled at all
+  });
+});
+
+/**
+ * The raw-store client gets its OWN connection pool.
+ *
+ * minio defaults to `https.globalAgent`, which the whole process shares and which
+ * Node ships with maxSockets Infinity: uploads compete with every other https call
+ * the scraper makes, and nothing at the transport caps connections at the sink's
+ * concurrency — so an op the sink has written off can still hold a socket beside the
+ * replacement op the freed worker started.
+ */
+describe('S3ObjectStore — a dedicated, bounded keep-alive pool', () => {
+  const agentOf = (store: S3ObjectStore): Agent =>
+    (store as unknown as { client: { transportAgent: Agent } }).client.transportAgent;
+
+  const build = (over: Partial<RawStoreConfig> = {}): S3ObjectStore =>
+    new S3ObjectStore(
+      'mindsignals-raw',
+      {
+        endpoint: 'https://hel1.your-objectstorage.com',
+        region: 'hel1',
+        bucket: 'mindsignals-raw',
+        prefix: 'raw-html/',
+        keyScheme: 'sha256-v1',
+        ...over,
+      },
+      { accessKeyId: 'AKIAEXAMPLE', secretAccessKey: 'secret-example' },
+    );
+
+  it('never uses the process-wide global agent', () => {
+    expect(agentOf(build())).not.toBe(https.globalAgent);
+  });
+
+  it('keeps connections alive so a burst does not re-handshake per object', () => {
+    expect(agentOf(build()).options.keepAlive).toBe(true);
+  });
+
+  it('caps sockets at the sink concurrency the same config asks for', () => {
+    expect(agentOf(build({ concurrency: 12 })).options.maxSockets).toBe(12);
+    expect(agentOf(build({ concurrency: 24 })).options.maxSockets).toBe(24);
+  });
+
+  it('falls back to the sink default concurrency when the config names none', () => {
+    expect(agentOf(build()).options.maxSockets).toBe(resolveRawStoreConcurrency(undefined));
+  });
+});
+
+/**
+ * The abort must also reap a request that starts AFTER it fired.
+ *
+ * minio retries a retryable status (408/429/499/500/502/503/504/520) ONCE, after a
+ * 200–400 ms backoff sleep. So the store answers 503, minio sleeps, the budget expires
+ * during that sleep — and the retry is dialled into an op whose abort has already been
+ * consumed. Left untracked it is worse than the bug this all fixes: on the capped pool
+ * it holds one of RAW_STORE_CONCURRENCY's sockets for as long as the store takes to
+ * answer, and the REPLACEMENT capture the freed worker started burns its whole budget
+ * waiting for a socket rather than for the store — the same invisible wait, moved one
+ * layer down. Before the pool was capped that orphan merely wasted a request.
+ */
+describe('S3ObjectStore — an abort reaps the retry minio starts during its backoff', () => {
+  const servers: http.Server[] = [];
+
+  /**
+   * `doomed` keys get one 503 (which minio will retry) and then silence; `replacement`
+   * keys are answered at once. Keyed on the PATH, not on a call counter, so the
+   * assertions do not depend on whether the doomed retry ever reaches the wire.
+   */
+  const retryThenHangServer = async (): Promise<{
+    port: number;
+    doomedHits: () => number;
+    openSockets: () => number;
+    connectionsOpened: () => number;
+  }> => {
+    let doomedHits = 0;
+    let open = 0;
+    let opened = 0;
+    const server = http.createServer((req, res) => {
+      if ((req.url ?? '').includes('doomed')) {
+        doomedHits += 1;
+        req.resume();
+        if (doomedHits === 1) {
+          res.writeHead(503);
+          res.end();
+        }
+        return; // every later attempt: accepted and never answered
+      }
+      req.resume();
+      req.once('end', () => {
+        res.writeHead(200, { ETag: '"x"' });
+        res.end();
+      });
+    });
+    server.on('connection', socket => {
+      open += 1;
+      opened += 1;
+      socket.once('close', () => {
+        open -= 1;
+      });
+    });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    return {
+      port: (server.address() as AddressInfo).port,
+      doomedHits: () => doomedHits,
+      openSockets: () => open,
+      connectionsOpened: () => opened,
+    };
+  };
+
+  const storeAt = (port: number, concurrency?: number): S3ObjectStore =>
+    new S3ObjectStore(
+      'mindsignals-raw',
+      {
+        endpoint: `http://127.0.0.1:${port}`,
+        region: 'hel1',
+        bucket: 'mindsignals-raw',
+        prefix: 'raw-html/',
+        keyScheme: 'sha256-v1',
+        pathStyle: true,
+        concurrency,
+      },
+      { accessKeyId: 'AKIAEXAMPLE', secretAccessKey: 'secret-example' },
+    );
+
+  const poolOf = (store: S3ObjectStore): Agent =>
+    (store as unknown as { client: { transportAgent: Agent } }).client.transportAgent;
+
+  const wait = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
+  const until = async (cond: () => boolean, budgetMs = 3_000): Promise<void> => {
+    const deadline = Date.now() + budgetMs;
+    while (!cond() && Date.now() < deadline) await wait(10);
+  };
+  /** Never hang the suite on the very defect under test: an unsettled op is a RESULT. */
+  const outcomeOf = (p: Promise<unknown>, budgetMs = 2_500): Promise<string> =>
+    Promise.race([
+      p.then(() => 'resolved', () => 'rejected'),
+      wait(budgetMs).then(() => 'STILL-PENDING'),
+    ]);
+
+  afterEach(async () => {
+    await Promise.all(
+      servers.splice(0).map(s => {
+        s.closeAllConnections?.();
+        return new Promise<void>(resolve => s.close(() => resolve()));
+      }),
+    );
+  });
+
+  it('settles the op, and the retry never reaches the store or holds a pool slot', async () => {
+    const { port, doomedHits } = await retryThenHangServer();
+    const store = storeAt(port);
+    const controller = new AbortController();
+    const put = store.put('raw-html/doomed', Buffer.from('body'), { contentType: 'application/gzip' }, controller.signal);
+    const outcome = outcomeOf(put);
+    await until(() => doomedHits() >= 1); // the 503 has landed; minio is now sleeping
+    controller.abort(new Error('raw-store op exceeded its budget'));
+    // Without the transport's own check this never settles at all: the retry is filed
+    // into a context whose abort has already been consumed, and nothing ends it.
+    await expect(outcome).resolves.toBe('rejected');
+
+    await wait(900); // long enough for the 200-400 ms backoff to fire the retry
+    // The two properties the budget is FOR: the store does no further work for an op
+    // that is over, and no slot of the capped pool is held by it.
+    expect(doomedHits()).toBe(1);
+    expect(Object.values(poolOf(store).sockets).flat()).toHaveLength(0);
+  });
+
+  it('leaves the pool a REUSABLE connection, not a strand', async () => {
+    const { port, doomedHits, connectionsOpened } = await retryThenHangServer();
+    const store = storeAt(port);
+    const controller = new AbortController();
+    const put = store.put('raw-html/doomed', Buffer.from('body'), { contentType: 'application/gzip' }, controller.signal);
+    const outcome = outcomeOf(put);
+    await until(() => doomedHits() >= 1);
+    controller.abort(new Error('raw-store op exceeded its budget'));
+    await expect(outcome).resolves.toBe('rejected');
+    await wait(900);
+
+    // A pooled connection left behind is only a fault if it is unusable. The next op
+    // must be served BY it — otherwise the abort has quietly cost the pool a socket.
+    const before = connectionsOpened();
+    await expect(outcomeOf(store.put('raw-html/replacement', Buffer.from('body'), { contentType: 'application/gzip' })))
+      .resolves.toBe('resolved');
+    expect(connectionsOpened()).toBe(before);
+  });
+
+  it('does not starve the replacement op of the one socket a capped pool has', async () => {
+    const { port, doomedHits } = await retryThenHangServer();
+    const store = storeAt(port, 1); // maxSockets = 1: the escaped retry would own the pool
+    const controller = new AbortController();
+    const doomed = store.put('raw-html/doomed', Buffer.from('body'), { contentType: 'application/gzip' }, controller.signal);
+    const doomedOutcome = outcomeOf(doomed);
+    await until(() => doomedHits() >= 1);
+    controller.abort(new Error('raw-store op exceeded its budget'));
+    await expect(doomedOutcome).resolves.toBe('rejected');
+
+    // The capture the freed worker starts next must wait for the STORE, not for a socket.
+    await wait(500); // let the retry fire into the now-aborted op
+    const startedAt = Date.now();
+    const replacement = store.put('raw-html/replacement', Buffer.from('body'), { contentType: 'application/gzip' });
+    await expect(outcomeOf(replacement)).resolves.toBe('resolved');
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+  });
+});
+
+/**
+ * A request must not outlive its op when the op ends in FAILURE either.
+ *
+ * The abort path reaps what it tracked; the ordinary failure path did not, and a
+ * retryable 5xx takes that path. minio throws such a status after its one retry —
+ * typically within a second, far inside a 30 s budget — so the budget never fires, no
+ * abort is raised, and the two requests it made are dropped still holding their sockets.
+ * minio never drains the error body, so nothing releases them: the agent's keep-alive
+ * timeout reaps IDLE pooled sockets, and these are assigned.
+ *
+ * That was harmless while the adapter used the process-wide agent with maxSockets
+ * Infinity — a strand wasted a connection and blocked nobody. Capping the pool at
+ * RAW_STORE_CONCURRENCY made it permanent: each 5xx-failing op burns two of the
+ * twenty-four slots for good, so a dozen of them across a pod's life stop raw capture
+ * outright, and near-silently — timedOut climbs, stored flatlines, and every new
+ * diagnostic in this PR reads clean because the wait is for a socket, not for the store.
+ */
+describe('S3ObjectStore — a failed op leaves nothing holding a pool slot', () => {
+  const servers: http.Server[] = [];
+
+  /** Answers every request with `status` and an undrained body, or 200 when null. */
+  const statusServer = async (
+    status: number | null,
+  ): Promise<{ port: number; hits: () => number; connections: () => number }> => {
+    let hits = 0;
+    let conns = 0;
+    const server = http.createServer((req, res) => {
+      hits += 1;
+      req.resume();
+      req.once('end', () => {
+        if (status === null) {
+          res.writeHead(200, { ETag: '"x"' });
+          res.end();
+          return;
+        }
+        res.writeHead(status, { 'Content-Type': 'application/xml' });
+        res.end('<Error><Code>Boom</Code></Error>');
+      });
+    });
+    server.on('connection', () => {
+      conns += 1;
+    });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    return { port: (server.address() as AddressInfo).port, hits: () => hits, connections: () => conns };
+  };
+
+  const storeAt = (port: number, concurrency: number): S3ObjectStore =>
+    new S3ObjectStore(
+      'mindsignals-raw',
+      {
+        endpoint: `http://127.0.0.1:${port}`,
+        region: 'hel1',
+        bucket: 'mindsignals-raw',
+        prefix: 'raw-html/',
+        keyScheme: 'sha256-v1',
+        pathStyle: true,
+        concurrency,
+      },
+      { accessKeyId: 'AKIAEXAMPLE', secretAccessKey: 'secret-example' },
+    );
+
+  const poolOf = (store: S3ObjectStore): Agent =>
+    (store as unknown as { client: { transportAgent: Agent } }).client.transportAgent;
+  const assigned = (store: S3ObjectStore): number => Object.values(poolOf(store).sockets).flat().length;
+  const free = (store: S3ObjectStore): number => Object.values(poolOf(store).freeSockets).flat().length;
+
+  /** One turn for the agent's bookkeeping to catch up with a just-destroyed socket. */
+  const settleSockets = (): Promise<void> => new Promise(resolve => setTimeout(resolve, 50));
+
+  /** Four ops in sequence; a hang is a RESULT here, never a suite that never ends. */
+  const runFour = async (store: S3ObjectStore): Promise<string[]> => {
+    const out: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      out.push(
+        await Promise.race([
+          store
+            .put(`raw-html/op-${i}`, Buffer.from('body'), { contentType: 'application/gzip' })
+            .then(() => 'ok', () => 'rej'),
+          new Promise<string>(resolve => setTimeout(() => resolve('HUNG'), 2_500)),
+        ]),
+      );
+    }
+    return out;
+  };
+
+  afterEach(async () => {
+    await Promise.all(
+      servers.splice(0).map(s => {
+        s.closeAllConnections?.();
+        return new Promise<void>(resolve => s.close(() => resolve()));
+      }),
+    );
+  });
+
+  it('keeps serving after a retryable 5xx, instead of eating the pool two slots at a time', async () => {
+    // maxSockets 2 is the whole pool: op0's attempt and its retry take one slot each, so
+    // if neither is released op1 waits on a socket that will never come back.
+    const { port, hits, connections } = await statusServer(503);
+    const store = storeAt(port, 2);
+    expect(await runFour(store)).toEqual(['rej', 'rej', 'rej', 'rej']);
+    expect(hits()).toBe(8); // four ops, each an attempt plus minio's one retry
+    // And the connection is REUSED throughout rather than burned per failure: draining
+    // the body minio throws away is what returns the socket, so a 5xx costs a round trip
+    // and nothing more.
+    expect(connections()).toBe(1);
+    await settleSockets();
+    expect(assigned(store)).toBe(0);
+    expect(free(store)).toBe(1);
+  });
+
+  it('does not deadlock an op against its OWN retry at a concurrency of one', async () => {
+    // The sharpest case: with a single socket, op0's retry queues behind the socket op0's
+    // own first attempt is still holding, and the op can never reach its failure path.
+    const { port, connections } = await statusServer(503);
+    const store = storeAt(port, 1);
+    expect(await runFour(store)).toEqual(['rej', 'rej', 'rej', 'rej']);
+    expect(connections()).toBe(1);
+    await settleSockets();
+    expect(assigned(store)).toBe(0);
+  });
+
+  // The controls. A non-retryable status and a success must be untouched by the reap —
+  // in particular the success path must still hand its connection back to the pool, or
+  // the cure has cost keep-alive.
+  it('control: a NON-retryable 4xx reuses its one connection, as it always did', async () => {
+    const { port, hits, connections } = await statusServer(403);
+    const store = storeAt(port, 2);
+    expect(await runFour(store)).toEqual(['rej', 'rej', 'rej', 'rej']);
+    expect(hits()).toBe(4); // no retry
+    expect(connections()).toBe(1); // one socket, reused throughout
+    await settleSockets();
+    expect(assigned(store)).toBe(0);
+    expect(free(store)).toBe(1);
+  });
+
+  it('control: success still leaves its connection WARM in the pool', async () => {
+    const { port, hits, connections } = await statusServer(null);
+    const store = storeAt(port, 2);
+    expect(await runFour(store)).toEqual(['ok', 'ok', 'ok', 'ok']);
+    expect(hits()).toBe(4);
+    expect(connections()).toBe(1);
+    await settleSockets();
+    expect(assigned(store)).toBe(0);
+    expect(free(store)).toBe(1);
+  });
+});
+
+/**
+ * `exists` is the HEAD half of every capture, and its catch is an ALLOW LIST: a 404 means
+ * "not stored yet", and anything else is a real fault that must reach the sink as one.
+ * Swallowing an aborted or failing HEAD as "absent" would turn a broken store into a
+ * silent re-upload of everything.
+ */
+describe('S3ObjectStore — exists, against a real server', () => {
+  const servers: http.Server[] = [];
+
+  const headServer = async (present: string): Promise<number> => {
+    const server = http.createServer((req, res) => {
+      req.resume();
+      if ((req.url ?? '').includes(present)) {
+        res.writeHead(200, { 'Content-Length': '4', ETag: '"x"', 'Last-Modified': new Date().toUTCString() });
+        res.end();
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    return (server.address() as AddressInfo).port;
+  };
+
+  const storeAt = (port: number): S3ObjectStore =>
+    new S3ObjectStore(
+      'mindsignals-raw',
+      {
+        endpoint: `http://127.0.0.1:${port}`,
+        region: 'hel1',
+        bucket: 'mindsignals-raw',
+        prefix: 'raw-html/',
+        keyScheme: 'sha256-v1',
+        pathStyle: true,
+      },
+      { accessKeyId: 'AKIAEXAMPLE', secretAccessKey: 'secret-example' },
+    );
+
+  afterEach(async () => {
+    await Promise.all(
+      servers.splice(0).map(s => {
+        s.closeAllConnections?.();
+        return new Promise<void>(resolve => s.close(() => resolve()));
+      }),
+    );
+  });
+
+  it('is true for an object the store already holds', async () => {
+    await expect(storeAt(await headServer('kept')).exists('raw-html/kept')).resolves.toBe(true);
+  });
+
+  it('is false for a 404 — "not stored yet" is not a failure', async () => {
+    await expect(storeAt(await headServer('kept')).exists('raw-html/missing')).resolves.toBe(false);
+  });
+
+  it('RETHROWS anything that is not a 404, rather than reporting absence', async () => {
+    // A 403 read as "absent" would send the sink off to re-upload a corpus it cannot write.
+    const server = http.createServer((req, res) => {
+      req.resume();
+      res.writeHead(403, { 'Content-Type': 'application/xml' });
+      res.end('<Error><Code>AccessDenied</Code></Error>');
+    });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    await expect(storeAt((server.address() as AddressInfo).port).exists('raw-html/x')).rejects.toThrow();
+  });
+});
+
+describe('getRawCaptureSink — the process-wide singleton', () => {
+  it('builds the sink once and hands the same one to every fetch path', () => {
+    // One client and one set of counters for the whole process: a per-caller sink would
+    // report a fraction of the traffic on /health/detailed and pool connections apart.
+    expect(getRawCaptureSink()).toBe(getRawCaptureSink());
+  });
+});
+
+/**
+ * The pool must recover on its own, not only when a caller happens to carry a budget.
+ *
+ * `res.resume()` discards the body without buffering, but it never COMPLETES if the body
+ * never does — and a socket draining forever is assigned forever. Node emits `'timeout'`
+ * on a socket and destroys nothing, minio adds no listener, and the agent's own timeout
+ * reaps IDLE pooled sockets, so nothing in the stack ends it. At pool size 1 that is
+ * terminal: the op's retry queues behind the socket its first attempt is still draining,
+ * so the op never fails and no failure path ever runs.
+ *
+ * The backstop is deliberately derived from the op budgets and set ABOVE the largest of
+ * them. It must never cut a live op short — the asset lane legitimately runs to 60 s on a
+ * 10 MiB original — so it is a floor under the pool, not a second budget.
+ */
+describe('S3ObjectStore — a socket cannot outlive its op', () => {
+  const servers: http.Server[] = [];
+
+  /** 503 headers, then a body that is never finished. */
+  const neverEndingBodyServer = async (): Promise<{ port: number; connections: () => number }> => {
+    let conns = 0;
+    const server = http.createServer((req, res) => {
+      req.resume();
+      res.writeHead(503, { 'Content-Type': 'application/xml' });
+      res.write('<Error>'); // …and never `end()`
+    });
+    server.on('connection', () => {
+      conns += 1;
+    });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    return { port: (server.address() as AddressInfo).port, connections: () => conns };
+  };
+
+  const storeAt = (port: number, over: Partial<RawStoreConfig> = {}): S3ObjectStore =>
+    new S3ObjectStore(
+      'mindsignals-raw',
+      {
+        endpoint: `http://127.0.0.1:${port}`,
+        region: 'hel1',
+        bucket: 'mindsignals-raw',
+        prefix: 'raw-html/',
+        keyScheme: 'sha256-v1',
+        pathStyle: true,
+        concurrency: 1,
+        // Tiny budgets so the backstop derived from them is testable in milliseconds.
+        putTimeoutMs: 80,
+        imagePutTimeoutMs: 80,
+        ...over,
+      },
+      { accessKeyId: 'AKIAEXAMPLE', secretAccessKey: 'secret-example' },
+    );
+
+  const poolOf = (store: S3ObjectStore): Agent =>
+    (store as unknown as { client: { transportAgent: Agent } }).client.transportAgent;
+
+  afterEach(async () => {
+    await Promise.all(
+      servers.splice(0).map(s => {
+        s.closeAllConnections?.();
+        return new Promise<void>(resolve => s.close(() => resolve()));
+      }),
+    );
+  });
+
+  it('frees the slot when a drained body never ends, with NO budget on the op at all', async () => {
+    const { port } = await neverEndingBodyServer();
+    const store = storeAt(port);
+    // No signal: this is the caller the optional-signal port allows, and the one that
+    // has nothing else to end the op.
+    const outcome = await Promise.race([
+      store.put('raw-html/x', Buffer.from('body'), { contentType: 'application/gzip' }).then(() => 'resolved', () => 'rejected'),
+      new Promise<string>(resolve => setTimeout(() => resolve('HUNG'), 4_000)),
+    ]);
+    expect(outcome).toBe('rejected');
+    await new Promise(resolve => setTimeout(resolve, 100));
+    expect(Object.values(poolOf(store).sockets).flat()).toHaveLength(0);
+  });
+
+  it('sets the backstop ABOVE the longest op budget, so it never ends a live upload', () => {
+    // The asset lane legitimately runs to 60 s on a 10 MiB original; a backstop at or
+    // under that would silently cap it, which is the opposite of the bug being fixed.
+    const base = { endpoint: 'https://x', region: 'r', bucket: 'b', prefix: 'p', keyScheme: 'sha256-v1' };
+    expect(socketBackstopMs({ ...base, putTimeoutMs: 30_000, imagePutTimeoutMs: 60_000 })).toBeGreaterThan(60_000);
+    expect(socketBackstopMs({ ...base, putTimeoutMs: 90_000, imagePutTimeoutMs: 10_000 })).toBeGreaterThan(90_000);
+  });
+
+  it('derives the backstop from the DEFAULTS when the config names no budgets', () => {
+    expect(socketBackstopMs({ endpoint: 'https://x', region: 'r', bucket: 'b', prefix: 'p', keyScheme: 'sha256-v1' }))
+      .toBeGreaterThan(DEFAULT_IMAGE_PUT_TIMEOUT_MS);
+  });
+});
+
+/**
+ * The drain list is a hand-maintained copy of an unexported minio constant, and drifting
+ * from it is NOT graceful: a status minio retries on but we do not drain strands its
+ * socket, and with as many concurrently failing ops as the pool has slots every retry
+ * queues behind one that is never released — no op fails, so no failure path runs. In the
+ * sink the op budgets degrade that to a stall rather than a death, but the protection is
+ * gone. These are the guards that make a minio bump break CI instead of prod.
+ */
+describe('S3ObjectStore — the drain list is pinned to minio’s retry set', () => {
+  const servers: http.Server[] = [];
+
+  const statusServer = async (
+    status: number | null,
+  ): Promise<{ port: number; hits: () => number; connections: () => number }> => {
+    let hits = 0;
+    let conns = 0;
+    const server = http.createServer((req, res) => {
+      hits += 1;
+      req.resume();
+      req.once('end', () => {
+        if (status === null) {
+          res.writeHead(200, { ETag: '"x"' });
+          res.end();
+          return;
+        }
+        res.writeHead(status, { 'Content-Type': 'application/xml' });
+        res.end('<Error><Code>Boom</Code></Error>');
+      });
+    });
+    server.on('connection', () => {
+      conns += 1;
+    });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    return { port: (server.address() as AddressInfo).port, hits: () => hits, connections: () => conns };
+  };
+
+  const storeAt = (port: number): S3ObjectStore =>
+    new S3ObjectStore(
+      'mindsignals-raw',
+      {
+        endpoint: `http://127.0.0.1:${port}`,
+        region: 'hel1',
+        bucket: 'mindsignals-raw',
+        prefix: 'raw-html/',
+        keyScheme: 'sha256-v1',
+        pathStyle: true,
+        concurrency: 2,
+      },
+      { accessKeyId: 'AKIAEXAMPLE', secretAccessKey: 'secret-example' },
+    );
+
+  const assignedOf = (store: S3ObjectStore): number =>
+    Object.values((store as unknown as { client: { transportAgent: Agent } }).client.transportAgent.sockets).flat().length;
+  const freeOf = (store: S3ObjectStore): number =>
+    Object.values((store as unknown as { client: { transportAgent: Agent } }).client.transportAgent.freeSockets).flat().length;
+  const settle = (): Promise<void> => new Promise(resolve => setTimeout(resolve, 60));
+
+  afterEach(async () => {
+    await Promise.all(
+      servers.splice(0).map(s => {
+        s.closeAllConnections?.();
+        return new Promise<void>(resolve => s.close(() => resolve()));
+      }),
+    );
+  });
+
+  // The behavioural guard, one case per status minio retries on. If a future minio adds a
+  // status to its set and this list is updated to match, the new case must pass here too —
+  // and if the set is updated WITHOUT the drain working, this is where it shows.
+  for (const status of [...MINIO_RETRYABLE_STATUSES]) {
+    it(`returns the connection to the pool after a ${status}`, async () => {
+      const { port, hits, connections } = await statusServer(status);
+      const store = storeAt(port);
+      await expect(
+        store.put('raw-html/x', Buffer.from('body'), { contentType: 'application/gzip' }).then(() => 'ok', () => 'rej'),
+      ).resolves.toBe('rej');
+      expect(hits()).toBe(2); // the attempt plus minio's one retry
+      expect(connections()).toBe(1); // …both served by ONE connection, because it comes back
+      await settle();
+      expect(assignedOf(store)).toBe(0);
+      expect(freeOf(store)).toBe(1);
+    });
+  }
+
+  it('control: a 200 keeps its connection warm, as it always did', async () => {
+    const { port, connections } = await statusServer(null);
+    const store = storeAt(port);
+    await expect(
+      store.put('raw-html/x', Buffer.from('body'), { contentType: 'application/gzip' }).then(() => 'ok', () => 'rej'),
+    ).resolves.toBe('ok');
+    expect(connections()).toBe(1);
+    await settle();
+    expect(assignedOf(store)).toBe(0);
+    expect(freeOf(store)).toBe(1);
+  });
+
+  it('control: a 403 is NOT drained — minio reads that body itself to build its S3Error', async () => {
+    const { port, hits } = await statusServer(403);
+    const store = storeAt(port);
+    // The proof it was NOT drained: minio parsed the body and carried its Code out.
+    await expect(
+      store.put('raw-html/x', Buffer.from('body'), { contentType: 'application/gzip' }),
+    ).rejects.toMatchObject({ code: 'Boom' });
+    expect(hits()).toBe(1); // not retryable, so no second attempt
+    await settle();
+    expect(assignedOf(store)).toBe(0);
+  });
+
+  it('control: a 404 HEAD still reads as absence, and holds no slot', async () => {
+    // Its connection is NOT reused — that is minio's own error path and predates this
+    // adapter (identical on upstream/develop); asserted here only as "holds nothing".
+    const { port } = await statusServer(404);
+    const store = storeAt(port);
+    await expect(store.exists('raw-html/x')).resolves.toBe(false);
+    await settle();
+    expect(assignedOf(store)).toBe(0);
+  });
+
+  it('is exactly minio’s own retryHttpCodes — a bump that changes the set fails HERE', () => {
+    // Read out of the installed package: minio's exports map blocks deep imports, so the
+    // list cannot be pinned at runtime and is pinned in CI instead.
+    const candidates = [
+      join(process.cwd(), 'node_modules/minio/dist/main/internal/request.js'),
+      join(process.cwd(), '../node_modules/minio/dist/main/internal/request.js'),
+    ];
+    const found = candidates.find(p => existsSync(p));
+    expect(found).toBeDefined();
+    const src = readFileSync(found as string, 'utf8');
+    const block = /retryHttpCodes\s*(?::[^=]*)?=\s*\{([\s\S]*?)\}/.exec(src);
+    // A shape change is itself a signal: look before assuming the set is unchanged.
+    expect(block).not.toBeNull();
+    const theirs = new Set((block as RegExpExecArray)[1].match(/\d+/g)?.map(Number) ?? []);
+    expect(theirs.size).toBeGreaterThan(0);
+    expect([...theirs].sort((a, b) => a - b)).toEqual([...MINIO_RETRYABLE_STATUSES].sort((a, b) => a - b));
   });
 });

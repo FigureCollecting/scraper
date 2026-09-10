@@ -3,6 +3,7 @@ import { gunzipSync, gzipSync } from 'node:zlib';
 import { buildRawCapture, type RawCapture } from '../../services/captureSink';
 import {
   ObjectStoreCaptureSink,
+  DEFAULT_PUT_TIMEOUT_MS,
   DEFAULT_IMAGE_PUT_TIMEOUT_MS,
   DEFAULT_RAW_STORE_ASSET_MAX_WAIT_MS,
   MIN_RAW_STORE_ASSET_MAX_WAIT_MS,
@@ -390,6 +391,13 @@ describe('ObjectStoreCaptureSink — the asset lane', () => {
       putP95: expect.any(Number),
       headP50: expect.any(Number),
       headP95: expect.any(Number),
+      // Nothing overran its budget, and the lag reading is this process's own
+      // scheduling delay — the number that says whether a slow putP95 is the store
+      // or this pod.
+      timedOut: 0,
+      eventLoopLagP50: expect.any(Number),
+      eventLoopLagP95: expect.any(Number),
+      eventLoopLagMax: expect.any(Number),
     });
   });
 
@@ -1744,5 +1752,265 @@ describe('ObjectStoreCaptureSink — the queue depth is reported by lane', () =>
     store.release();
     await sink.flush();
     warn.mockRestore();
+  });
+});
+
+/**
+ * The op budget must CANCEL, not merely stop waiting.
+ *
+ * Measured against the live bucket (2026-09-10, WSL → Hetzner hel1): the store is
+ * request-rate limited, not bandwidth limited — a 40 KB PUT and a 3 MB PUT cost the
+ * same seconds, and per-op latency grows with how many ops are in flight while
+ * throughput stays flat. Under that regime an abandoned-but-still-running request is
+ * not free: it keeps its socket and keeps consuming the store's scarce request rate
+ * while the freed worker starts ANOTHER op beside it. The concurrency bound then
+ * bounds only what the sink is WATCHING, in-flight requests climb above it, latency
+ * climbs with them, and more ops blow the budget — the timeout feeds itself.
+ */
+describe('the op budget CANCELS the request instead of abandoning it', () => {
+  class SignalStore implements ObjectStore {
+    existsSignal: AbortSignal | undefined;
+    putSignal: AbortSignal | undefined;
+    hangPut = false;
+    hangExists = false;
+
+    async exists(key: string, signal?: AbortSignal): Promise<boolean> {
+      this.existsSignal = signal;
+      if (this.hangExists) return new Promise<boolean>(() => {});
+      return false;
+    }
+
+    async put(key: string, body: Buffer, opts: PutOptions, signal?: AbortSignal): Promise<void> {
+      this.putSignal = signal;
+      if (this.hangPut) return new Promise<void>(() => {});
+    }
+  }
+
+  it('hands put() a signal and ABORTS it when the budget expires', async () => {
+    const store = new SignalStore();
+    store.hangPut = true;
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 20 });
+    await send(sink, cap());
+    expect(store.putSignal).toBeDefined();
+    expect(store.putSignal!.aborted).toBe(true);
+  });
+
+  it('hands exists() a signal and ABORTS it when the budget expires', async () => {
+    const store = new SignalStore();
+    store.hangExists = true;
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 20 });
+    await send(sink, cap());
+    expect(store.existsSignal).toBeDefined();
+    expect(store.existsSignal!.aborted).toBe(true);
+  });
+
+  it('leaves the signal UNaborted when the op finishes inside its budget', async () => {
+    const store = new SignalStore();
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 5_000 });
+    await send(sink, cap());
+    expect(store.putSignal!.aborted).toBe(false);
+    expect(store.existsSignal!.aborted).toBe(false);
+  });
+
+  it('counts a timed-out op apart from a store that answered with an error', async () => {
+    const hung = new SignalStore();
+    hung.hangPut = true;
+    const timing = new ObjectStoreCaptureSink(hung, { ...CONFIG, putTimeoutMs: 20 });
+    await send(timing, cap());
+    expect(timing.stats()).toMatchObject({ failed: 1, timedOut: 1 });
+
+    // A store that FAILS fast is a different fault with a different remedy: it is not
+    // the budget that ended the op, so it must not read as one on the health page.
+    const erroring = new FakeObjectStore();
+    erroring.failPut = true;
+    const failing = new ObjectStoreCaptureSink(erroring, { ...CONFIG, putTimeoutMs: 5_000 });
+    await send(failing, cap());
+    expect(failing.stats()).toMatchObject({ failed: 1, timedOut: 0 });
+  });
+
+  it('times the asset lane out on ITS budget and aborts that op too', async () => {
+    const store = new SignalStore();
+    store.hangPut = true;
+    const sink = new ObjectStoreCaptureSink(store, {
+      ...CONFIG,
+      assetsEnabled: true,
+      putTimeoutMs: 5_000,
+      imagePutTimeoutMs: 20,
+    });
+    await send(sink, cap({ lane: 'asset', bytes: PNG, contentType: 'image/png' }));
+    expect(store.putSignal!.aborted).toBe(true);
+    expect(sink.stats()).toMatchObject({ assetFailed: 1, timedOut: 1 });
+  });
+});
+
+/**
+ * Every latency this sink reports is wall clock read inside this process, so a pod
+ * that is not being SCHEDULED reports a slow bucket. That is the reading prod was
+ * missing: putP95 16–29 s against a bucket a curl in the same pod answered in 0.6 s
+ * is either a slow store or a starved process, and the counters could not tell them
+ * apart. Measured 2026-09-10 from WSL, an idle process shows lag p50/p95 of 0–1 ms
+ * while the very same PUTs take seconds — so a fat lag beside a fat putP95 points at
+ * the process, and a flat one points at the store.
+ */
+describe('the sink reports its own scheduling delay beside the store latencies', () => {
+  it('reads ~zero lag when nothing is holding the event loop', async () => {
+    const store = new FakeObjectStore();
+    store.putDelayMs = 320; // an await, not a block: the loop stays free
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 5_000 });
+    await send(sink, cap());
+    expect(sink.stats().eventLoopLagP95).toBeLessThan(100);
+  });
+
+  it('reports the delay when something BLOCKS the loop through the op', async () => {
+    class BlockingStore extends FakeObjectStore {
+      override async put(key: string, body: Buffer, opts: PutOptions): Promise<void> {
+        const until = Date.now() + 600;
+        while (Date.now() < until) {
+          /* hold the loop, exactly as a long synchronous parse would */
+        }
+        await super.put(key, body, opts);
+      }
+    }
+    const sink = new ObjectStoreCaptureSink(new BlockingStore(), { ...CONFIG, putTimeoutMs: 5_000 });
+    await send(sink, cap());
+    expect(sink.stats().eventLoopLagP95).toBeGreaterThan(100);
+  });
+
+  it('holds no sampling timer once the queue has drained', async () => {
+    const sink = new ObjectStoreCaptureSink(new FakeObjectStore(), CONFIG);
+    await send(sink, cap());
+    expect((sink as unknown as { lagTimer?: unknown }).lagTimer).toBeUndefined();
+  });
+});
+
+/**
+ * The default budget has to sit ABOVE what the store actually costs, because the budget
+ * now DESTROYS the body rather than merely mis-counting a PUT that still landed.
+ *
+ * At 5 s it sat below the measured PUT p50 (3.5–5.7 s on the slow path measured
+ * 2026-09-10), so a deployment that forgot RAW_STORE_PUT_TIMEOUT_MS would abort roughly
+ * half its uploads and lose those bodies — page bodies being the ones nothing re-fetches.
+ * The default now matches the deployed value instead of being one missing manifest key
+ * away from an outage.
+ */
+describe('the default store-op budget', () => {
+  it('is 30 s — above the measured cost of a PUT, not below it', () => {
+    expect(DEFAULT_PUT_TIMEOUT_MS).toBe(30_000);
+  });
+
+  it('lets an op that outlasts the OLD 5 s default finish and be stored', async () => {
+    jest.useFakeTimers();
+    try {
+      const store = new FakeObjectStore();
+      store.putDelayMs = 8_000; // over the old default, under the new one
+      const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: undefined });
+      const done = send(sink, cap());
+      await jest.advanceTimersByTimeAsync(20_000);
+      await done;
+      expect(sink.stats()).toMatchObject({ stored: 1, failed: 0, timedOut: 0 });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+});
+
+/**
+ * ONE budget for the whole op, not one per store call.
+ *
+ * `RAW_STORE_PUT_TIMEOUT_MS=30000` told an operator that a capture may spend 30 s on the
+ * store. It actually bought a 60 s worst case, because the HEAD and the PUT each got the
+ * full budget — and the asset lane's 60 s was really 120 s. That gap mattered little
+ * while a timeout only mis-counted; now that it destroys the body, the number an
+ * operator sets has to be the number the op can spend.
+ */
+describe('the budget bounds the whole op, HEAD and PUT together', () => {
+  it('ends the op when the HEAD and the PUT TOGETHER outlast the budget', async () => {
+    const store = new FakeObjectStore();
+    store.existsDelayMs = 80; // each half fits the budget on its own …
+    store.putDelayMs = 80; // … and together they cannot
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 120 });
+    await send(sink, cap());
+    expect(sink.stats()).toMatchObject({ stored: 0, failed: 1, timedOut: 1 });
+    expect(store.puts).toHaveLength(0); // and the PUT the budget cannot afford is never sent
+  });
+
+  it('still stores when the two together fit inside the budget', async () => {
+    const store = new FakeObjectStore();
+    store.existsDelayMs = 20;
+    store.putDelayMs = 20;
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 400 });
+    await send(sink, cap());
+    expect(sink.stats()).toMatchObject({ stored: 1, failed: 0, timedOut: 0 });
+  });
+
+  it('spends the ASSET budget the same way, across that lane’s HEAD and PUT', async () => {
+    const store = new FakeObjectStore();
+    store.existsDelayMs = 80;
+    store.putDelayMs = 80;
+    const sink = new ObjectStoreCaptureSink(store, {
+      ...CONFIG,
+      assetsEnabled: true,
+      putTimeoutMs: 5_000,
+      imagePutTimeoutMs: 120,
+    });
+    await send(sink, cap({ lane: 'asset', bytes: PNG, contentType: 'image/png' }));
+    expect(sink.stats()).toMatchObject({ assetStored: 0, assetFailed: 1, timedOut: 1 });
+  });
+
+  it('a dedup hit costs only its HEAD and is never charged a PUT', async () => {
+    const store = new FakeObjectStore();
+    store.existsDelayMs = 80;
+    store.putDelayMs = 10_000; // would blow any budget if it were ever reached
+    const c = cap();
+    store.existing.add(`raw-html/sha256/${c.sha256.slice(0, 2)}/${c.sha256}.html.gz`);
+    const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 400 });
+    await send(sink, c);
+    expect(sink.stats()).toMatchObject({ deduped: 1, stored: 0, failed: 0, timedOut: 0 });
+  });
+});
+
+/**
+ * A percentile cannot see a single long stall, and a single long stall is the question.
+ *
+ * The sampler resets its due time after each reading, so a block of duration D yields
+ * exactly ONE sample of ~D rather than D/250 of them. In a full 512-sample window that
+ * lone outlier sits below p95 — so a 3 s stall reports `eventLoopLagP95: 0`. The number
+ * that answers "was this pod stalled while that 29 s PUT was outstanding?" therefore has
+ * to be a high-water mark, and one that does not fall out of a window.
+ */
+describe('the worst event-loop stall stays visible', () => {
+  class BlocksOnceStore extends FakeObjectStore {
+    private blocked = false;
+    override async put(key: string, body: Buffer, opts: PutOptions): Promise<void> {
+      if (!this.blocked) {
+        this.blocked = true;
+        const until = Date.now() + 600;
+        while (Date.now() < until) {
+          /* hold the loop, exactly as a long synchronous parse would */
+        }
+      }
+      await super.put(key, body, opts);
+    }
+  }
+
+  it('records the stall as a high-water mark, not only in the percentiles', async () => {
+    const sink = new ObjectStoreCaptureSink(new BlocksOnceStore(), { ...CONFIG, putTimeoutMs: 5_000 });
+    await send(sink, cap({ bytes: Buffer.from('first') }));
+    expect(sink.stats().eventLoopLagMax).toBeGreaterThan(100);
+  });
+
+  it('keeps it after the quiet captures that follow, where a window would drop it', async () => {
+    const sink = new ObjectStoreCaptureSink(new BlocksOnceStore(), { ...CONFIG, putTimeoutMs: 5_000 });
+    await send(sink, cap({ bytes: Buffer.from('first') }));
+    const worst = sink.stats().eventLoopLagMax;
+    expect(worst).toBeGreaterThan(100);
+    for (let i = 0; i < 6; i++) await send(sink, cap({ bytes: Buffer.from(`quiet-${i}`) }));
+    expect(sink.stats().eventLoopLagMax).toBe(worst);
+  });
+
+  it('reads zero on a sink that has never been held up', async () => {
+    const sink = new ObjectStoreCaptureSink(new FakeObjectStore(), CONFIG);
+    await send(sink, cap());
+    expect(sink.stats().eventLoopLagMax).toBeLessThan(100);
   });
 });

@@ -48,6 +48,7 @@ import type { RawStoreView } from '../services/s3ObjectStore.js';
 import type { FetchFailureReportView } from '../services/failureReporter.js';
 import type { ImageCaptureStats } from '../services/images/imageCaptureHook.js';
 import type { SessionCanaryView } from '../services/sessionCanary.js';
+import type { CpuThrottlingView } from '../services/cpuThrottling.js';
 
 export interface HealthDeps {
   /** The service version (package.json). */
@@ -99,6 +100,14 @@ export interface HealthDeps {
    * cookies). Flags and timestamps only — never the canary item id.
    */
   getSessionCanary: () => SessionCanaryView;
+  /**
+   * The cgroup's CPU throttling counters (cpuThrottlingView()): whether the KERNEL is
+   * holding this process off the CPU. Read beside the sink's `eventLoopLagMax`, it is
+   * what separates "this process is doing too much work" from "this process is not being
+   * given the CPU to do it" — the two look identical in every latency the pod reports,
+   * and they want opposite remedies. Kernel counters only, nothing secret; never throws.
+   */
+  getCpuThrottling: () => CpuThrottlingView;
 }
 
 export function createHealthRoutes(deps: HealthDeps): Router {
@@ -132,6 +141,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         failureLedger: deps.getFailureLedger(),
         sessionCanary: deps.getSessionCanary(),
         mfcSessionStale: deps.getSessionCanary().stale,
+        cpuThrottling: deps.getCpuThrottling(),
         timestamp: new Date().toISOString(),
       });
     } catch (error) {
@@ -147,6 +157,9 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         failureLedger: deps.getFailureLedger(),
         sessionCanary: deps.getSessionCanary(),
         mfcSessionStale: deps.getSessionCanary().stale,
+        // A throttled pod is exactly the pod whose browser pool is failing, so this
+        // reading must survive the degraded response that reports it.
+        cpuThrottling: deps.getCpuThrottling(),
         error: error instanceof Error ? error.message : 'Unknown error',
       });
     }

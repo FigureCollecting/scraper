@@ -22,12 +22,19 @@
  * against the bucket), not in unit tests — the sink logic is exercised against a
  * fake ObjectStore in objectStoreCaptureSink.test.ts.
  */
+import { AsyncLocalStorage } from 'node:async_hooks';
+import http from 'node:http';
+import https from 'node:https';
+import type { ClientRequest } from 'node:http';
 import { Client as MinioClient } from 'minio';
 import type { CaptureSink } from './captureSink.js';
 import { NoopCaptureSink } from './captureSink.js';
 import {
   ObjectStoreCaptureSink,
   MIN_RAW_STORE_ASSET_MAX_WAIT_MS,
+  DEFAULT_PUT_TIMEOUT_MS,
+  DEFAULT_IMAGE_PUT_TIMEOUT_MS,
+  resolveRawStoreConcurrency,
   type ObjectStore,
   type PutOptions,
   type RawStoreConfig,
@@ -39,6 +46,37 @@ export interface S3Credentials {
   secretAccessKey: string;
 }
 
+/** One op's live requests, and the budget signal — if any — that may end them. */
+interface OpContext {
+  reqs: Set<ClientRequest>;
+  /** Optional exactly as the port makes it: tracking does not depend on a budget. */
+  signal?: AbortSignal;
+}
+
+/**
+ * The op running in the current async context, so its requests can be found and torn
+ * down. minio takes no AbortSignal, but it does take a `transport`, and it routes every
+ * single request through that one seam.
+ *
+ * The SIGNAL travels with the set, not just a listener over it, because the listener
+ * alone reaps only what is already in flight. minio retries a retryable status
+ * (408/429/499/500/502/503/504/520) once, after a 200–400 ms backoff sleep — so a
+ * budget that expires during that sleep sees the retry dial afterwards, into a context
+ * whose abort has already fired. Consulting the signal at request time catches those
+ * too: an op that is over is over, however late the request is filed.
+ */
+const opRequests = new AsyncLocalStorage<OpContext>();
+
+/**
+ * How long an idle pooled connection is kept. Node's global agent keeps one for 5 s,
+ * which is shorter than the gap between crawl bursts: every burst then re-pays DNS
+ * plus a TLS handshake on all its sockets at once (measured 2026-09-10 from WSL:
+ * DNS p50 338 ms, TLS-ready p50 641 ms, twelve of them concurrently). Kept well under
+ * a typical S3 front-end's own idle timeout so it is the CLIENT that retires a
+ * connection, not the server closing one we are about to reuse.
+ */
+const POOL_KEEPALIVE_MS = 30_000;
+
 /** Maps the minimal ObjectStore port onto the minio client (statObject / putObject). */
 export class S3ObjectStore implements ObjectStore {
   private readonly client: MinioClient;
@@ -49,20 +87,28 @@ export class S3ObjectStore implements ObjectStore {
     creds: S3Credentials,
   ) {
     const url = new URL(config.endpoint);
+    const secure = url.protocol === 'https:';
     this.client = new MinioClient({
       endPoint: url.hostname,
       port: url.port ? Number(url.port) : undefined,
-      useSSL: url.protocol === 'https:',
+      useSSL: secure,
       region: config.region,
       accessKey: creds.accessKeyId,
       secretKey: creds.secretAccessKey,
       pathStyle: config.pathStyle ?? false, // Hetzner = virtual-hosted style
+      // Both defaults minio would otherwise take are wrong for this sink, and for the
+      // same reason: they are process-wide. Its transport is `node:https` itself, so
+      // there is no seam to cancel a request through; its agent is `https.globalAgent`,
+      // which every other https caller in the process shares and which Node ships with
+      // maxSockets Infinity — nothing there holds uploads to the sink's own bound.
+      transport: abortableTransport(secure, socketBackstopMs(config)),
+      transportAgent: makePool(secure, resolveRawStoreConcurrency(config.concurrency)),
     });
   }
 
-  async exists(key: string): Promise<boolean> {
+  async exists(key: string, signal?: AbortSignal): Promise<boolean> {
     try {
-      await this.client.statObject(this.bucket, key);
+      await withAbort(signal, () => this.client.statObject(this.bucket, key));
       return true;
     } catch (err) {
       // A genuine 404 means "not stored yet" — NOT a failure. Any other error
@@ -76,8 +122,195 @@ export class S3ObjectStore implements ObjectStore {
     }
   }
 
-  async put(key: string, body: Buffer, opts: PutOptions): Promise<void> {
-    await this.client.putObject(this.bucket, key, body, body.length, toS3MetaData(opts));
+  async put(key: string, body: Buffer, opts: PutOptions, signal?: AbortSignal): Promise<void> {
+    // `body.length` is passed for the port's sake, not minio's: given a Buffer it takes
+    // the length from the buffer itself and uploads in ONE request whenever that fits a
+    // part, so nothing here is ever a multipart or a chunked upload of unknown size.
+    await withAbort(signal, () =>
+      this.client.putObject(this.bucket, key, body, body.length, toS3MetaData(opts)),
+    );
+  }
+}
+
+/**
+ * The raw store's OWN connection pool: keep-alive, and capped at the sink's op bound.
+ *
+ * The cap is the part that matters. An op the sink has given up on is meant to stop
+ * costing the store a request; capping the pool holds concurrent REQUESTS to the same
+ * bound the sink holds ops to, instead of the global agent's Infinity. (It bounds
+ * requests, not TCP connections exactly: Node counts assigned and free sockets apart, so
+ * the total can transiently sit one above the cap while a freed socket is retired.)
+ *
+ * A cap is only safe because nothing escapes tracking — see abortableTransport. A single
+ * orphaned request would otherwise hold a slot the sink cannot see, which is the wait
+ * this whole change exists to remove.
+ */
+function makePool(secure: boolean, maxSockets: number): http.Agent | https.Agent {
+  const options = {
+    keepAlive: true,
+    keepAliveMsecs: POOL_KEEPALIVE_MS,
+    timeout: POOL_KEEPALIVE_MS,
+    maxSockets,
+    maxFreeSockets: maxSockets,
+    scheduling: 'fifo' as const,
+  };
+  return secure ? new https.Agent(options) : new http.Agent(options);
+}
+
+/**
+ * The statuses minio treats as retryable, and therefore throws on WITHOUT reading the
+ * response body (`minio/dist/main/internal/request.js`, pinned ^8.0.7 — the list is
+ * minio-go's). Nothing else will ever consume those bodies, and an unread response holds
+ * its socket ASSIGNED forever: the pool's keep-alive timeout reaps idle sockets, not
+ * these. On a pool capped at the sink's concurrency that is fatal — at a concurrency of
+ * one an op even deadlocks against ITSELF, its retry queued behind the socket its own
+ * first attempt is still holding.
+ *
+ * Draining them here returns the connection to the pool instead, so a 5xx costs a round
+ * trip and nothing else.
+ *
+ * The list is a hand-maintained duplicate: minio's package exports block deep imports, so
+ * it cannot be read at runtime. DRIFTING FROM IT IS NOT GRACEFUL — an earlier version of
+ * this comment claimed it was, and measurement says otherwise. Drop one status and that
+ * status re-arms the original failure: with as many concurrently failing ops as the pool
+ * has slots, every first attempt strands a socket, every retry queues behind one that will
+ * never be released, and NO op ever fails — so the failure-path reap in withAbort never
+ * runs at all. What keeps it survivable in the sink is that every op carries a budget,
+ * which degrades that from permanent death to a budget-length stall per op.
+ *
+ * So the list is guarded rather than trusted: a unit test reads minio's own retryHttpCodes
+ * out of the installed package and fails when the two disagree, and another drives a real
+ * request per status and asserts the connection comes back. A minio bump that changes the
+ * set breaks CI instead of prod.
+ */
+export const MINIO_RETRYABLE_STATUSES = new Set([408, 429, 499, 500, 502, 503, 504, 520]);
+
+/** minio's one request seam, filing each request under the op that made it. */
+function abortableTransport(secure: boolean, backstopMs: number): Pick<typeof https, 'request'> {
+  const transport = secure ? https : http;
+  return {
+    request(options: https.RequestOptions, callback?: (res: http.IncomingMessage) => void): ClientRequest {
+      const req = transport.request(options, res => {
+        // Only these: minio DOES read the body of any other error status, to build the
+        // S3Error, and draining one it wants would break that.
+        if (res.statusCode !== undefined && MINIO_RETRYABLE_STATUSES.has(res.statusCode)) res.resume();
+        callback?.(res);
+      });
+      armSocketBackstop(req, backstopMs);
+      const ctx = opRequests.getStore();
+      if (ctx) {
+        // The op is already over — a retry minio started during its backoff, say. Ending
+        // it HERE is the whole point: untracked it would hold one of the pool's sockets
+        // until the store answered, and the capture that took this one's place would wait
+        // out its budget on a socket rather than on the store.
+        if (ctx.signal?.aborted) {
+          req.destroy(abortReason(ctx.signal));
+          return req;
+        }
+        ctx.reqs.add(req);
+        req.once('close', () => ctx.reqs.delete(req));
+      }
+      return req;
+    },
+  } as Pick<typeof https, 'request'>;
+}
+
+/**
+ * How far above the longest op budget the pool's own backstop sits. A MULTIPLE rather
+ * than a fixed margin so it scales with whatever the budgets are set to, and so a test
+ * can exercise it in milliseconds instead of minutes.
+ */
+const SOCKET_BACKSTOP_FACTOR = 2;
+
+/**
+ * The inactivity bound on an ASSIGNED socket — the pool's own floor, above every op budget.
+ *
+ * Draining an unread body (see abortableTransport) discards it without buffering, but it
+ * never COMPLETES if the body never does, and a socket draining forever is assigned
+ * forever. Node EMITS `'timeout'` on a socket and destroys nothing, minio adds no
+ * listener, and the agent's own `timeout` reaps IDLE pooled sockets — so without this
+ * nothing in the stack ends it, and at a pool size of one the op's retry queues behind the
+ * socket its own first attempt is still draining. The op then never fails, so no failure
+ * path runs either.
+ *
+ * Derived from the budgets and set ABOVE the largest, because it is a floor under the pool
+ * and NOT a second budget: the asset lane legitimately runs to 60 s on a 10 MiB original,
+ * and a backstop at or under that would cap it silently. A live op is always ended by its
+ * own budget first; this only ever catches an op that has none.
+ */
+export function socketBackstopMs(config: RawStoreConfig): number {
+  const budget = (raw: number | undefined, fallback: number): number =>
+    typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : fallback;
+  const longest = Math.max(
+    budget(config.putTimeoutMs, DEFAULT_PUT_TIMEOUT_MS),
+    budget(config.imagePutTimeoutMs, DEFAULT_IMAGE_PUT_TIMEOUT_MS),
+  );
+  return longest * SOCKET_BACKSTOP_FACTOR;
+}
+
+/** Arm the backstop on whichever socket the agent gives this request, and disarm on close. */
+function armSocketBackstop(req: ClientRequest, backstopMs: number): void {
+  req.once('socket', socket => {
+    const onTimeout = (): void => {
+      socket.destroy(new Error(`raw-store socket idle beyond ${backstopMs}ms`));
+    };
+    socket.setTimeout(backstopMs);
+    socket.once('timeout', onTimeout);
+    // Sockets are REUSED, so an un-disarmed listener would accumulate one per request.
+    req.once('close', () => socket.removeListener('timeout', onTimeout));
+  });
+}
+
+/** The signal's own reason where it is an Error, so the op reports why it ended. */
+function abortReason(signal: AbortSignal): Error {
+  const reason: unknown = signal.reason;
+  return reason instanceof Error ? reason : new Error('raw-store op aborted');
+}
+
+
+/**
+ * Run one store op so that aborting the signal tears its request down at the socket.
+ *
+ * Without this the sink's budget was a race it could not enforce: it stopped waiting
+ * while the request kept its connection and kept spending the store's request budget.
+ * An already-aborted signal never dials at all.
+ */
+async function withAbort<T>(signal: AbortSignal | undefined, run: () => Promise<T>): Promise<T> {
+  signal?.throwIfAborted();
+  // Tracked whether or not there is a budget. The port makes the signal optional, and the
+  // reap below is about the POOL rather than the budget — a caller that passes no signal
+  // must not silently forfeit it and strand sockets the sink can never get back.
+  const ctx: OpContext = { reqs: new Set(), signal };
+  // Reaps what is in flight NOW; the transport's own check on ctx.signal reaps whatever
+  // is filed after this has fired. Both are needed — this one alone leaves minio's
+  // retry running, and that one alone never touches a request already on the wire.
+  let detach: (() => void) | undefined;
+  if (signal) {
+    const onAbort = (): void => {
+      for (const req of ctx.reqs) req.destroy(abortReason(signal));
+      ctx.reqs.clear();
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    detach = () => signal.removeEventListener('abort', onAbort);
+  }
+  try {
+    return await opRequests.run(ctx, run);
+  } catch (err) {
+    // The FAILURE path needs its own reap, because most failures never reach the budget.
+    // minio throws a retryable status (408/429/499/500/502/503/504/520) after its one
+    // retry — usually inside a second, far inside a 30 s budget — WITHOUT draining the
+    // error body, so both requests are dropped still holding their sockets and no abort
+    // is ever raised to collect them. Nothing else will: the pool's keep-alive timeout
+    // reaps IDLE sockets, and these are assigned. On a pool capped at the sink's
+    // concurrency that is permanent, two slots per failing op, until raw capture has no
+    // pool left and every later op waits out its budget on a socket instead of the store.
+    // Only this arm: a SUCCESSFUL op leaves nothing tracked, and reaping there would
+    // throw away the warm connection keep-alive exists for.
+    for (const req of ctx.reqs) req.destroy();
+    ctx.reqs.clear();
+    throw err;
+  } finally {
+    detach?.();
   }
 }
 

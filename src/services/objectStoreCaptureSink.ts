@@ -32,8 +32,9 @@
  * captured page, so hundreds of ops contended for DNS-lookup slots on the 4-thread
  * libuv pool, for TLS handshakes, and for an event loop that synchronous gzip was
  * blocking — and each op's WALL CLOCK ran past a budget sized for the upload alone.
- * The op budget now starts when the store call is made, and the wait for a worker
- * slot is reported separately (queueWaitP50/P95) instead of being charged to it.
+ * The op budget now starts when the store round trip begins and covers the WHOLE
+ * capture (HEAD + gzip + PUT under one bound, see withTimeout), while the wait for a
+ * worker slot is reported separately (queueWaitP50/P95) instead of being charged to it.
  * A capture offered when the queue is already full is DROPPED and counted rather
  * than making the backlog unbounded — and capture() SAYS SO, so a caller keeping a
  * per-url memo does not record a lost capture as done and suppress its own retry.
@@ -117,6 +118,23 @@ import { sanitizeForLog } from '../utils/security.js';
  */
 const gzipAsync = promisify(gzip);
 
+/** The signal's own reason where it is an Error, so an ended op reports why. */
+function abortReasonOf(signal: AbortSignal): Error {
+  const reason: unknown = signal.reason;
+  return reason instanceof Error ? reason : new Error('raw-store op aborted');
+}
+
+/** A promise that rejects when the op's budget ends it, and otherwise never settles. */
+function rejectOnAbort(signal: AbortSignal): Promise<never> {
+  return new Promise<never>((_, reject) => {
+    if (signal.aborted) {
+      reject(abortReasonOf(signal));
+      return;
+    }
+    signal.addEventListener('abort', () => reject(abortReasonOf(signal)), { once: true });
+  });
+}
+
 /** Options for a single object write. */
 export interface PutOptions {
   /** `application/gzip` for page bodies; the sniffed image type on the asset lane. */
@@ -135,12 +153,21 @@ export interface PutOptions {
   metadata?: Record<string, string>;
 }
 
-/** Minimal S3-compatible port. Concrete adapter (Hetzner) lives separately. */
+/**
+ * Minimal S3-compatible port. Concrete adapter (Hetzner) lives separately.
+ *
+ * Both ops take the op budget's AbortSignal, and an adapter is expected to tear the
+ * request down when it fires. Abandoning the promise is not enough: measured against
+ * the live bucket, cost per object is dominated by the REQUEST, not its bytes (a
+ * 40 KB and a 3 MB PUT cost the same seconds), so a request nobody is waiting for
+ * still holds a socket and still spends the store's request budget — beside the
+ * replacement op the freed worker has already started.
+ */
 export interface ObjectStore {
   /** HEAD — does this content address already exist? */
-  exists(key: string): Promise<boolean>;
+  exists(key: string, signal?: AbortSignal): Promise<boolean>;
   /** PUT — write the object. Callers guarantee write-once by content address. */
-  put(key: string, body: Buffer, opts: PutOptions): Promise<void>;
+  put(key: string, body: Buffer, opts: PutOptions, signal?: AbortSignal): Promise<void>;
 }
 
 /** Non-secret store contract (from raw-store-config.yaml) + operational bounds. */
@@ -167,12 +194,20 @@ export interface RawStoreConfig {
   assetsEnabled?: boolean;
   /** Key-scheme contract version; this writer only knows `sha256-v1`. */
   keyScheme: string;
-  /** Hard bound on each HEAD/PUT so a slow store can't stall the fetch path. */
+  /**
+   * Hard bound on ONE page/api capture's whole trip to the store — the HEAD, the gzip
+   * and the PUT together, not each of them (RAW_STORE_PUT_TIMEOUT_MS). Set 30000 and a
+   * capture may spend 30 s, where the per-call reading of the same number bought a 60 s
+   * worst case. Reaching it CANCELS the op and loses the body, so it belongs above the
+   * store's measured cost, not near it.
+   */
   putTimeoutMs?: number;
   /**
-   * The asset lane's own HEAD/PUT bound. An original image is up to maxImageBytes
-   * (10 MiB by default) against a page body's ~30 KB gzipped, so it cannot share
-   * the page budget without timing out on payload size alone.
+   * The asset lane's own whole-op bound (RAW_STORE_IMAGE_PUT_TIMEOUT_MS), read exactly
+   * the same way. An original image is up to maxImageBytes (10 MiB by default) against a
+   * page body's ~30 KB gzipped, so it cannot share the page budget without timing out on
+   * payload size alone. It is the longer of the two even though an image is the
+   * RE-FETCHABLE capture: the asymmetry pays for payload, not for importance.
    */
   imagePutTimeoutMs?: number;
   /**
@@ -283,10 +318,44 @@ export interface SinkStats {
    * dedup hit makes, so leaving it untimed hid half the latency. */
   headP50: number;
   headP95: number;
+  /**
+   * Ops the budget ended, a SUBSET of failed + assetFailed. A store answering slowly
+   * and a store answering wrongly are different faults, and until this counter existed
+   * they arrived on the health page as the same number.
+   */
+  timedOut: number;
+  /**
+   * Milliseconds between when a zero-delay callback was due and when it ran — this
+   * PROCESS's scheduling delay, sampled continuously.
+   *
+   * It is here because every duration above is wall clock measured inside this
+   * process, so anything that keeps the process off the CPU — a cgroup CPU quota,
+   * a co-tenant Chrome, a long synchronous parse — inflates them without the store
+   * having slowed down at all. Read the two together: a fat putP95 over a flat lag is
+   * the store, and a fat putP95 over a fat lag is this pod.
+   */
+  eventLoopLagP50: number;
+  eventLoopLagP95: number;
+  /**
+   * The worst single stall since the process started, kept apart from the percentiles
+   * above because they cannot see it: one block leaves one sample, and one sample does
+   * not move a p95 over a 512-reading window. This is the number that answers "was this
+   * pod stalled while that 29 s PUT was outstanding?".
+   */
+  eventLoopLagMax: number;
 }
 
 const SUPPORTED_KEY_SCHEME = 'sha256-v1';
-const DEFAULT_PUT_TIMEOUT_MS = 5_000;
+/**
+ * The page/api lanes' default budget for ONE store op.
+ *
+ * 30 s, matching the deployed RAW_STORE_PUT_TIMEOUT_MS, because the budget now ends the
+ * op for real: it was 5 s while a timeout merely mis-counted a PUT that still landed,
+ * and 5 s sits BELOW the measured cost of a PUT (p50 3.5-5.7 s on the slow path measured
+ * 2026-09-10). A default under the real cost would abort about half of all uploads and
+ * destroy those bodies — and a page body is the one nothing will fetch again.
+ */
+export const DEFAULT_PUT_TIMEOUT_MS = 30_000;
 /** Four concurrent ops: enough to keep the link busy, few enough to stay off the cliff. */
 export const DEFAULT_RAW_STORE_CONCURRENCY = 4;
 /**
@@ -295,6 +364,19 @@ export const DEFAULT_RAW_STORE_CONCURRENCY = 4;
  * the image byte ceiling is clamped.
  */
 export const MAX_RAW_STORE_CONCURRENCY = 64;
+
+/**
+ * The concurrency the sink will actually run at, from a raw config value. Exported
+ * because the S3 adapter sizes its connection pool from the SAME number: a pool
+ * larger than the op bound lets an op the sink has written off keep a socket beside
+ * its replacement, and a smaller one would queue ops inside the transport where the
+ * sink cannot see the wait.
+ */
+export function resolveRawStoreConcurrency(raw: number | undefined): number {
+  return typeof raw === 'number' && Number.isFinite(raw) && raw > 0
+    ? Math.min(Math.floor(raw), MAX_RAW_STORE_CONCURRENCY)
+    : DEFAULT_RAW_STORE_CONCURRENCY;
+}
 /** Backlog ceiling. Page bodies are buffered, so the queue is memory we are holding. */
 export const DEFAULT_RAW_STORE_QUEUE_MAX = 500;
 /**
@@ -328,6 +410,12 @@ export const MIN_RAW_STORE_ASSET_MAX_WAIT_MS = 1_000;
 const DROP_LOG_INTERVAL_MS = 60_000;
 /** Rolling latency window. Percentiles over the recent past, at a fixed memory cost. */
 const LATENCY_SAMPLE_MAX = 512;
+
+/**
+ * How often the sink samples its own scheduling delay while it has work. Frequent
+ * enough to catch a CPU quota's 100 ms slices, cheap enough to leave running.
+ */
+const LOOP_LAG_SAMPLE_INTERVAL_MS = 250;
 /** 30 s — 10 MiB at a pessimistic ~350 KB/s, so payload size alone never times out. */
 export const DEFAULT_IMAGE_PUT_TIMEOUT_MS = 30_000;
 const MAX_METADATA_VALUE_LEN = 1024;
@@ -529,6 +617,20 @@ export class ObjectStoreCaptureSink implements CaptureSink {
   private assetRefusedReserveBytes = 0;
   private assetHeldSinceLog = 0;
   private lastAssetHoldLogAt = 0;
+  /**
+   * This process's scheduling delay, sampled only while the sink has work — lag while
+   * idle says nothing, and a sink nobody uses should hold no timer.
+   */
+  private readonly loopLags: number[] = [];
+  /**
+   * The worst stall since this process started, kept OUTSIDE the sample window. The
+   * sampler resets its due time after each reading, so one block of duration D leaves
+   * exactly one sample of ~D — which in a full 512-sample window sits below p95. A high
+   * -water mark is the only form in which a single long stall survives to be read.
+   */
+  private loopLagMax = 0;
+  private lagTimer: ReturnType<typeof setInterval> | undefined;
+  private lagDueAt = 0;
   private readonly queueWaits: number[] = [];
   private readonly putDurations: number[] = [];
   private readonly headDurations: number[] = [];
@@ -540,6 +642,12 @@ export class ObjectStoreCaptureSink implements CaptureSink {
    * their prefixes keep the key spaces apart, so one guard covers both.
    */
   private readonly inFlightKeys = new Set<string>();
+  /**
+   * Ops the BUDGET ended, counted inside `failed`/`assetFailed` rather than beside
+   * them. "The store answered with an error" and "the store never answered" are
+   * different faults wanting different responses, and one counter cannot say which.
+   */
+  private timedOut = 0;
   private stored = 0;
   private deduped = 0;
   private failed = 0;
@@ -567,11 +675,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     this.maxImageBytes = typeof m === 'number' && Number.isFinite(m) && m > 0 ? m : DEFAULT_MAX_IMAGE_BYTES;
     this.pagesEnabled = config.pagesEnabled !== false;
     this.assetsEnabled = config.assetsEnabled !== false;
-    const c = config.concurrency;
-    this.concurrency =
-      typeof c === 'number' && Number.isFinite(c) && c > 0
-        ? Math.min(Math.floor(c), MAX_RAW_STORE_CONCURRENCY)
-        : DEFAULT_RAW_STORE_CONCURRENCY;
+    this.concurrency = resolveRawStoreConcurrency(config.concurrency);
     const q = config.queueMax;
     this.queueMax =
       typeof q === 'number' && Number.isFinite(q) && q > 0
@@ -621,6 +725,10 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       putP95: percentile(this.putDurations, 95),
       headP50: percentile(this.headDurations, 50),
       headP95: percentile(this.headDurations, 95),
+      timedOut: this.timedOut,
+      eventLoopLagP50: percentile(this.loopLags, 50),
+      eventLoopLagP95: percentile(this.loopLags, 95),
+      eventLoopLagMax: this.loopLagMax,
     };
   }
 
@@ -674,25 +782,32 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       }
       this.inFlightKeys.add(key);
       try {
-        // HEAD-then-PUT: content-addressed, so an existing key means identical bytes.
-        if (await this.timed(this.headDurations, () => this.withTimeout(this.store.exists(key)))) {
-          this.deduped += 1;
-          return;
-        }
+        // ONE budget across both round trips (see withTimeout): what the operator sets
+        // is what the capture may spend, rather than what EACH half may spend.
+        const outcome = await this.withTimeout(async signal => {
+          // HEAD-then-PUT: content-addressed, so an existing key means identical bytes.
+          if (await this.timed(this.headDurations, signal, () => this.store.exists(key, signal))) {
+            return 'deduped' as const;
+          }
 
-        // Off the event loop, and deliberately OUTSIDE the op budget: compression is
-        // our own cost, not the store's, and charging it to the upload's timeout is
-        // how a busy process ends up calling a healthy bucket slow.
-        const body = await gzipAsync(c.bytes);
-        await this.timed(this.putDurations, () =>
-          this.withTimeout(
-            this.store.put(key, body, {
-              contentType: 'application/gzip',
-              metadata: this.metadata(c),
-            }),
-          ),
-        );
-        this.stored += 1;
+          // Off the event loop, and INSIDE the budget: it is our own cost rather than
+          // the store's, but it is time the capture holds a worker, and the budget is
+          // what bounds that. The per-phase split stays honest either way — headP50 and
+          // putP50 time the store CALLS only — and eventLoopLagP95 beside them says
+          // whether our own CPU, not the bucket, is what ran the clock down.
+          const body = await gzipAsync(c.bytes);
+          // Never open a round trip the budget has already spent: it would reach the
+          // store for an op nobody is waiting for, and record a phantom 0 ms sample.
+          signal.throwIfAborted();
+          await this.timed(this.putDurations, signal, () =>
+            this.store.put(key, body, { contentType: 'application/gzip', metadata: this.metadata(c) }, signal),
+          );
+          return 'stored' as const;
+        });
+        // Counted out here, on the value the RACE resolved with: an op the budget ended
+        // keeps running in the background, and must never book itself as stored.
+        if (outcome === 'deduped') this.deduped += 1;
+        else this.stored += 1;
       } finally {
         this.inFlightKeys.delete(key);
       }
@@ -764,25 +879,22 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       }
       this.inFlightKeys.add(key);
       try {
-        if (
-          await this.timed(this.headDurations, () => this.withTimeout(this.store.exists(key), this.imagePutTimeoutMs))
-        ) {
-          this.assetDeduped += 1;
-          return;
-        }
+        // One budget across this lane's two round trips, exactly as the page lanes.
+        const outcome = await this.withTimeout(async signal => {
+          if (await this.timed(this.headDurations, signal, () => this.store.exists(key, signal))) {
+            return 'deduped' as const;
+          }
 
-        // No gzip and no Content-Encoding: an image is already compressed, and the
-        // original must be readable as itself straight out of the bucket.
-        await this.timed(this.putDurations, () =>
-          this.withTimeout(
-            this.store.put(key, bytes, {
-              contentType: type.contentType,
-              metadata: this.assetMetadata(c),
-            }),
-            this.imagePutTimeoutMs,
-          ),
-        );
-        this.assetStored += 1;
+          // No gzip and no Content-Encoding: an image is already compressed, and the
+          // original must be readable as itself straight out of the bucket.
+          signal.throwIfAborted();
+          await this.timed(this.putDurations, signal, () =>
+            this.store.put(key, bytes, { contentType: type.contentType, metadata: this.assetMetadata(c) }, signal),
+          );
+          return 'stored' as const;
+        }, this.imagePutTimeoutMs);
+        if (outcome === 'deduped') this.assetDeduped += 1;
+        else this.assetStored += 1;
       } finally {
         this.inFlightKeys.delete(key);
       }
@@ -862,6 +974,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       this.dropAndLog('bytes');
       return { admitted: false, reason: 'queueBytesFull' };
     }
+    this.startLagSampling();
     this.queuedBytes += bytes;
     (lane === 'page' ? this.pageQueue : this.assetQueue).push({ run, enqueuedAt: Date.now(), bytes });
     // `.catch` for the same reason the queue's other fire-and-forget call sites have
@@ -887,6 +1000,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     } finally {
       this.inFlight -= 1;
       if (this.queueDepth() === 0 && this.inFlight === 0) {
+        this.stopLagSampling();
         for (const resolve of this.drainWaiters.splice(0)) resolve();
       }
     }
@@ -928,10 +1042,14 @@ export class ObjectStoreCaptureSink implements CaptureSink {
    * that consume the whole budget are exactly the ones being dropped from it, so a
    * lane timing out on every upload reports the same fast p95 as a healthy one.
    */
-  private async timed<T>(into: number[], op: () => Promise<T>): Promise<T> {
+  private async timed<T>(into: number[], signal: AbortSignal, op: () => Promise<T>): Promise<T> {
     const startedAt = Date.now();
     try {
-      return await op();
+      // Raced against the budget as well as awaited, so the PHASE ends when the op does.
+      // The port makes the signal optional, so a store may simply ignore it — and one
+      // that does would otherwise hold this sample open forever and leave the very op
+      // that consumed the whole budget out of the percentile built to show it.
+      return await Promise.race([op(), rejectOnAbort(signal)]);
     } finally {
       this.record(into, Date.now() - startedAt);
     }
@@ -940,6 +1058,42 @@ export class ObjectStoreCaptureSink implements CaptureSink {
   private record(into: number[], ms: number): void {
     into.push(ms);
     if (into.length > LATENCY_SAMPLE_MAX) into.shift();
+  }
+
+  /**
+   * Sample how late a due timer runs — the delay this PROCESS is suffering, whatever
+   * its cause (a synchronous parse on the loop, a cgroup CPU quota, a noisy co-tenant).
+   * Every other duration this sink reports is wall clock measured from inside the
+   * process, so without this reading a throttled pod and a slow bucket are the same
+   * number, and the two want opposite remedies.
+   */
+  private startLagSampling(): void {
+    if (this.lagTimer) return;
+    this.lagDueAt = Date.now() + LOOP_LAG_SAMPLE_INTERVAL_MS;
+    this.lagTimer = setInterval(() => {
+      const now = Date.now();
+      this.recordLag(Math.max(0, now - this.lagDueAt));
+      this.lagDueAt = now + LOOP_LAG_SAMPLE_INTERVAL_MS;
+    }, LOOP_LAG_SAMPLE_INTERVAL_MS);
+    // Never a reason for the process to stay alive: this is instrumentation.
+    this.lagTimer.unref?.();
+  }
+
+  /** One lag reading: into the window for the percentiles, and past the high-water mark. */
+  private recordLag(ms: number): void {
+    this.record(this.loopLags, ms);
+    if (ms > this.loopLagMax) this.loopLagMax = ms;
+  }
+
+  private stopLagSampling(): void {
+    if (!this.lagTimer) return;
+    // Take the reading the interval never got to. A block that runs right through the
+    // last op ends in microtasks — the worker finishes, the queue empties and this
+    // clears the timer before the loop ever reaches its timers phase — so the one
+    // sample that would have shown the stall is exactly the one that gets thrown away.
+    this.recordLag(Math.max(0, Date.now() - this.lagDueAt));
+    clearInterval(this.lagTimer);
+    this.lagTimer = undefined;
   }
 
   /** Tally one drop and report the burst, at most once a minute. */
@@ -1054,18 +1208,48 @@ export class ObjectStoreCaptureSink implements CaptureSink {
   }
 
   /**
-   * Bounds one store op. NOTE: this is a race, not a cancellation — the underlying
-   * request is abandoned, not aborted (the minio client takes no AbortSignal), so a
-   * timed-out PUT may still complete into the bucket after it has been counted as a
-   * failure. That is why the asset lane gets a budget sized to its payload rather
-   * than sharing the page lanes'.
+   * Bounds ONE CAPTURE'S whole trip to the store — the HEAD, the gzip and the PUT under
+   * a single budget — and CANCELS it when the bound is reached.
+   *
+   * One budget, not one per call: `RAW_STORE_PUT_TIMEOUT_MS=30000` promises an operator
+   * that a capture may spend 30 s on the store, and giving each half its own budget
+   * quietly made that a 60 s worst case (and the asset lane's 60 s a 120 s one). That
+   * gap was survivable while a timeout only mis-counted a PUT that still landed; now
+   * that reaching the bound destroys the body, the number an operator sets has to be the
+   * number the op can spend.
+   *
+   * This was a bare race for as long as the adapter had no way to stop a request, and
+   * the race is the part that bites: the sink stopped waiting, counted a failure and
+   * freed the worker, while the request carried on holding its socket. Because cost
+   * per object here is the round trip and not the payload, that abandoned request goes
+   * on spending the store's request budget beside the replacement the freed worker
+   * started — so `concurrency` bounded what the sink was WATCHING, not what was in
+   * flight, and every op that overran made the next one likelier to overrun too.
+   *
+   * The signal is handed to the op, and the adapter destroys the underlying request on
+   * abort. The race stays: it is what makes the budget observable to the caller even if
+   * an adapter ignores the signal. A cancelled PUT may still have landed server-side —
+   * the key is a content address and PUT is idempotent, so the next capture of those
+   * bytes simply finds them.
    */
-  private withTimeout<T>(p: Promise<T>, budgetMs: number = this.putTimeoutMs): Promise<T> {
+  private withTimeout<T>(
+    run: (signal: AbortSignal) => Promise<T>,
+    budgetMs: number = this.putTimeoutMs,
+  ): Promise<T> {
+    const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`raw-store op exceeded ${budgetMs}ms`)), budgetMs);
+      timer = setTimeout(() => {
+        this.timedOut += 1;
+        const err = new Error(`raw-store op exceeded ${budgetMs}ms`);
+        controller.abort(err);
+        reject(err);
+      }, budgetMs);
     });
-    return Promise.race([p, timeout]).finally(() => {
+    // Promise.race subscribes to BOTH, so the op's own late rejection (the abort
+    // arriving back through the adapter) is handled and never reaches the process as
+    // an unhandled rejection.
+    return Promise.race([run(controller.signal), timeout]).finally(() => {
       if (timer) clearTimeout(timer);
     });
   }
