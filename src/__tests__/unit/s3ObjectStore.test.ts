@@ -610,3 +610,161 @@ describe('S3ObjectStore — a dedicated, bounded keep-alive pool', () => {
     expect(agentOf(build()).options.maxSockets).toBe(resolveRawStoreConcurrency(undefined));
   });
 });
+
+/**
+ * The abort must also reap a request that starts AFTER it fired.
+ *
+ * minio retries a retryable status (408/429/499/500/502/503/504/520) ONCE, after a
+ * 200–400 ms backoff sleep. So the store answers 503, minio sleeps, the budget expires
+ * during that sleep — and the retry is dialled into an op whose abort has already been
+ * consumed. Left untracked it is worse than the bug this all fixes: on the capped pool
+ * it holds one of RAW_STORE_CONCURRENCY's sockets for as long as the store takes to
+ * answer, and the REPLACEMENT capture the freed worker started burns its whole budget
+ * waiting for a socket rather than for the store — the same invisible wait, moved one
+ * layer down. Before the pool was capped that orphan merely wasted a request.
+ */
+describe('S3ObjectStore — an abort reaps the retry minio starts during its backoff', () => {
+  const servers: http.Server[] = [];
+
+  /**
+   * `doomed` keys get one 503 (which minio will retry) and then silence; `replacement`
+   * keys are answered at once. Keyed on the PATH, not on a call counter, so the
+   * assertions do not depend on whether the doomed retry ever reaches the wire.
+   */
+  const retryThenHangServer = async (): Promise<{
+    port: number;
+    doomedHits: () => number;
+    openSockets: () => number;
+    connectionsOpened: () => number;
+  }> => {
+    let doomedHits = 0;
+    let open = 0;
+    let opened = 0;
+    const server = http.createServer((req, res) => {
+      if ((req.url ?? '').includes('doomed')) {
+        doomedHits += 1;
+        req.resume();
+        if (doomedHits === 1) {
+          res.writeHead(503);
+          res.end();
+        }
+        return; // every later attempt: accepted and never answered
+      }
+      req.resume();
+      req.once('end', () => {
+        res.writeHead(200, { ETag: '"x"' });
+        res.end();
+      });
+    });
+    server.on('connection', socket => {
+      open += 1;
+      opened += 1;
+      socket.once('close', () => {
+        open -= 1;
+      });
+    });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    return {
+      port: (server.address() as AddressInfo).port,
+      doomedHits: () => doomedHits,
+      openSockets: () => open,
+      connectionsOpened: () => opened,
+    };
+  };
+
+  const storeAt = (port: number, concurrency?: number): S3ObjectStore =>
+    new S3ObjectStore(
+      'mindsignals-raw',
+      {
+        endpoint: `http://127.0.0.1:${port}`,
+        region: 'hel1',
+        bucket: 'mindsignals-raw',
+        prefix: 'raw-html/',
+        keyScheme: 'sha256-v1',
+        pathStyle: true,
+        concurrency,
+      },
+      { accessKeyId: 'AKIAEXAMPLE', secretAccessKey: 'secret-example' },
+    );
+
+  const poolOf = (store: S3ObjectStore): Agent =>
+    (store as unknown as { client: { transportAgent: Agent } }).client.transportAgent;
+
+  const wait = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
+  const until = async (cond: () => boolean, budgetMs = 3_000): Promise<void> => {
+    const deadline = Date.now() + budgetMs;
+    while (!cond() && Date.now() < deadline) await wait(10);
+  };
+  /** Never hang the suite on the very defect under test: an unsettled op is a RESULT. */
+  const outcomeOf = (p: Promise<unknown>, budgetMs = 2_500): Promise<string> =>
+    Promise.race([
+      p.then(() => 'resolved', () => 'rejected'),
+      wait(budgetMs).then(() => 'STILL-PENDING'),
+    ]);
+
+  afterEach(async () => {
+    await Promise.all(
+      servers.splice(0).map(s => {
+        s.closeAllConnections?.();
+        return new Promise<void>(resolve => s.close(() => resolve()));
+      }),
+    );
+  });
+
+  it('settles the op, and the retry never reaches the store or holds a pool slot', async () => {
+    const { port, doomedHits } = await retryThenHangServer();
+    const store = storeAt(port);
+    const controller = new AbortController();
+    const put = store.put('raw-html/doomed', Buffer.from('body'), { contentType: 'application/gzip' }, controller.signal);
+    const outcome = outcomeOf(put);
+    await until(() => doomedHits() >= 1); // the 503 has landed; minio is now sleeping
+    controller.abort(new Error('raw-store op exceeded its budget'));
+    // Without the transport's own check this never settles at all: the retry is filed
+    // into a context whose abort has already been consumed, and nothing ends it.
+    await expect(outcome).resolves.toBe('rejected');
+
+    await wait(900); // long enough for the 200-400 ms backoff to fire the retry
+    // The two properties the budget is FOR: the store does no further work for an op
+    // that is over, and no slot of the capped pool is held by it.
+    expect(doomedHits()).toBe(1);
+    expect(Object.values(poolOf(store).sockets).flat()).toHaveLength(0);
+  });
+
+  it('leaves the pool a REUSABLE connection, not a strand', async () => {
+    const { port, doomedHits, connectionsOpened } = await retryThenHangServer();
+    const store = storeAt(port);
+    const controller = new AbortController();
+    const put = store.put('raw-html/doomed', Buffer.from('body'), { contentType: 'application/gzip' }, controller.signal);
+    const outcome = outcomeOf(put);
+    await until(() => doomedHits() >= 1);
+    controller.abort(new Error('raw-store op exceeded its budget'));
+    await expect(outcome).resolves.toBe('rejected');
+    await wait(900);
+
+    // A pooled connection left behind is only a fault if it is unusable. The next op
+    // must be served BY it — otherwise the abort has quietly cost the pool a socket.
+    const before = connectionsOpened();
+    await expect(outcomeOf(store.put('raw-html/replacement', Buffer.from('body'), { contentType: 'application/gzip' })))
+      .resolves.toBe('resolved');
+    expect(connectionsOpened()).toBe(before);
+  });
+
+  it('does not starve the replacement op of the one socket a capped pool has', async () => {
+    const { port, doomedHits } = await retryThenHangServer();
+    const store = storeAt(port, 1); // maxSockets = 1: the escaped retry would own the pool
+    const controller = new AbortController();
+    const doomed = store.put('raw-html/doomed', Buffer.from('body'), { contentType: 'application/gzip' }, controller.signal);
+    const doomedOutcome = outcomeOf(doomed);
+    await until(() => doomedHits() >= 1);
+    controller.abort(new Error('raw-store op exceeded its budget'));
+    await expect(doomedOutcome).resolves.toBe('rejected');
+
+    // The capture the freed worker starts next must wait for the STORE, not for a socket.
+    await wait(500); // let the retry fire into the now-aborted op
+    const startedAt = Date.now();
+    const replacement = store.put('raw-html/replacement', Buffer.from('body'), { contentType: 'application/gzip' });
+    await expect(outcomeOf(replacement)).resolves.toBe('resolved');
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+  });
+});

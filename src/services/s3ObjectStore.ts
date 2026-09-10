@@ -44,15 +44,25 @@ export interface S3Credentials {
   secretAccessKey: string;
 }
 
+/** One op's live requests, and the budget signal that may end them. */
+interface OpContext {
+  reqs: Set<ClientRequest>;
+  signal: AbortSignal;
+}
+
 /**
- * The requests belonging to the op running in the current async context.
+ * The op running in the current async context, so its requests can be found and torn
+ * down. minio takes no AbortSignal, but it does take a `transport`, and it routes every
+ * single request through that one seam.
  *
- * minio takes no AbortSignal, but it does take a `transport`, and it routes every
- * single request through that one seam. So each op runs inside its own context with a
- * set the transport files its ClientRequests into, and an abort destroys exactly those
- * — including the second attempt minio's own retry may have started.
+ * The SIGNAL travels with the set, not just a listener over it, because the listener
+ * alone reaps only what is already in flight. minio retries a retryable status
+ * (408/429/499/500/502/503/504/520) once, after a 200–400 ms backoff sleep — so a
+ * budget that expires during that sleep sees the retry dial afterwards, into a context
+ * whose abort has already fired. Consulting the signal at request time catches those
+ * too: an op that is over is over, however late the request is filed.
  */
-const opRequests = new AsyncLocalStorage<Set<ClientRequest>>();
+const opRequests = new AsyncLocalStorage<OpContext>();
 
 /**
  * How long an idle pooled connection is kept. Node's global agent keeps one for 5 s,
@@ -123,9 +133,14 @@ export class S3ObjectStore implements ObjectStore {
  * The raw store's OWN connection pool: keep-alive, and capped at the sink's op bound.
  *
  * The cap is the part that matters. An op the sink has given up on is meant to stop
- * costing the store a request; capping the pool means that even if one somehow lingers,
- * it cannot be joined by a 25th connection — the transport enforces the same bound the
- * sink does, instead of the global agent's Infinity.
+ * costing the store a request; capping the pool holds concurrent REQUESTS to the same
+ * bound the sink holds ops to, instead of the global agent's Infinity. (It bounds
+ * requests, not TCP connections exactly: Node counts assigned and free sockets apart, so
+ * the total can transiently sit one above the cap while a freed socket is retired.)
+ *
+ * A cap is only safe because nothing escapes tracking — see abortableTransport. A single
+ * orphaned request would otherwise hold a slot the sink cannot see, which is the wait
+ * this whole change exists to remove.
  */
 function makePool(secure: boolean, maxSockets: number): http.Agent | https.Agent {
   const options = {
@@ -145,15 +160,30 @@ function abortableTransport(secure: boolean): Pick<typeof https, 'request'> {
   return {
     request(options: https.RequestOptions, callback?: (res: http.IncomingMessage) => void): ClientRequest {
       const req = transport.request(options, callback as never);
-      const tracked = opRequests.getStore();
-      if (tracked) {
-        tracked.add(req);
-        req.once('close', () => tracked.delete(req));
+      const ctx = opRequests.getStore();
+      if (ctx) {
+        // The op is already over — a retry minio started during its backoff, say. Ending
+        // it HERE is the whole point: untracked it would hold one of the pool's sockets
+        // until the store answered, and the capture that took this one's place would wait
+        // out its budget on a socket rather than on the store.
+        if (ctx.signal.aborted) {
+          req.destroy(abortReason(ctx.signal));
+          return req;
+        }
+        ctx.reqs.add(req);
+        req.once('close', () => ctx.reqs.delete(req));
       }
       return req;
     },
   } as Pick<typeof https, 'request'>;
 }
+
+/** The signal's own reason where it is an Error, so the op reports why it ended. */
+function abortReason(signal: AbortSignal): Error {
+  const reason: unknown = signal.reason;
+  return reason instanceof Error ? reason : new Error('raw-store op aborted');
+}
+
 
 /**
  * Run one store op so that aborting the signal tears its request down at the socket.
@@ -165,16 +195,17 @@ function abortableTransport(secure: boolean): Pick<typeof https, 'request'> {
 async function withAbort<T>(signal: AbortSignal | undefined, run: () => Promise<T>): Promise<T> {
   if (!signal) return run();
   signal.throwIfAborted();
-  const tracked = new Set<ClientRequest>();
+  const ctx: OpContext = { reqs: new Set(), signal };
+  // Reaps what is in flight NOW; the transport's own check on ctx.signal reaps whatever
+  // is filed after this has fired. Both are needed — this one alone leaves minio's
+  // retry running, and that one alone never touches a request already on the wire.
   const onAbort = (): void => {
-    const reason = signal.reason;
-    const err = reason instanceof Error ? reason : new Error('raw-store op aborted');
-    for (const req of tracked) req.destroy(err);
-    tracked.clear();
+    for (const req of ctx.reqs) req.destroy(abortReason(signal));
+    ctx.reqs.clear();
   };
   signal.addEventListener('abort', onAbort, { once: true });
   try {
-    return await opRequests.run(tracked, run);
+    return await opRequests.run(ctx, run);
   } finally {
     signal.removeEventListener('abort', onAbort);
   }
