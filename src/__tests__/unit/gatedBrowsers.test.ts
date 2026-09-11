@@ -1,11 +1,16 @@
 import { jest } from '@jest/globals';
 import {
   GATED_BROWSER_MAX_AGE_MS,
+  GATED_BROWSER_MAX_RSS_BYTES,
+  GATED_NAV_FAILURE_STREAK,
   HostConcurrencyLimiter,
   MAX_CONCURRENT_PAGES_PER_HOST,
   gatedHostKey,
   getHostConcurrency,
   resetHostConcurrency,
+  resolveGatedMaxAgeMs,
+  resolveGatedMaxRssBytes,
+  resolveGatedNavFailureStreak,
 } from '../../services/gatedBrowsers';
 
 /**
@@ -123,13 +128,73 @@ describe('the process-wide limiter', () => {
   });
 });
 
-describe('the gated browser bound', () => {
+describe('the gated browser bounds', () => {
+  const withEnv = (vars: Record<string, string | undefined>, run: () => void): void => {
+    const saved: Record<string, string | undefined> = {};
+    for (const [key, value] of Object.entries(vars)) {
+      saved[key] = process.env[key];
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    try {
+      run();
+    } finally {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  };
+
   /**
-   * A gated browser is deliberately immortal between relaunches — it is the profile holding every
-   * gated host's clearance — so the only thing bounding it is age. Two hours is far past the ~30 min
-   * clearance window (nothing is lost by recycling) and far short of a leak that matters.
+   * THE CLOCK IS NOW A BACKSTOP, not the policy. A cleared Cloudflare session is an asset bound to
+   * the egress IP, the TLS fingerprint and the user agent; recycling a healthy one buys nothing and
+   * spends that IP's reputation earning the challenge again. What the old two-hour timer was FOR —
+   * memory growth and a wedged instance — is measured directly by the two bounds below, so the clock
+   * only catches whatever they miss.
    */
-  it('recycles a gated browser after two hours', () => {
-    expect(GATED_BROWSER_MAX_AGE_MS).toBe(2 * 60 * 60 * 1000);
+  it('keeps a healthy gated browser for twelve hours', () => {
+    expect(GATED_BROWSER_MAX_AGE_MS).toBe(12 * 60 * 60 * 1000);
+    expect(resolveGatedMaxAgeMs({} as NodeJS.ProcessEnv)).toBe(GATED_BROWSER_MAX_AGE_MS);
+  });
+
+  /** The pod's limit is 3 GiB across four Chromes, so a gigabyte in one gated browser is a leak. */
+  it('recycles a gated browser whose process tree passes a gigabyte', () => {
+    expect(GATED_BROWSER_MAX_RSS_BYTES).toBe(1024 * 1024 * 1024);
+    expect(resolveGatedMaxRssBytes({} as NodeJS.ProcessEnv)).toBe(GATED_BROWSER_MAX_RSS_BYTES);
+  });
+
+  it('treats three consecutive navigation failures as a wedged lane', () => {
+    expect(GATED_NAV_FAILURE_STREAK).toBe(3);
+    expect(resolveGatedNavFailureStreak({} as NodeJS.ProcessEnv)).toBe(3);
+  });
+
+  it('takes each bound from the environment when it is set', () => {
+    withEnv({ GATED_BROWSER_MAX_AGE_MS: '1000', GATED_BROWSER_MAX_RSS_MB: '512', GATED_NAV_FAILURE_STREAK: '5' }, () => {
+      expect(resolveGatedMaxAgeMs()).toBe(1000);
+      expect(resolveGatedMaxRssBytes()).toBe(512 * 1024 * 1024);
+      expect(resolveGatedNavFailureStreak()).toBe(5);
+    });
+  });
+
+  /**
+   * A garbage override must degrade to the default, never to zero — a zero age would relaunch on
+   * every fetch, which is the failure this whole change exists to stop.
+   */
+  it('falls back to the default for an empty, zero, negative or non-numeric override', () => {
+    for (const bad of ['', '   ', '0', '-1', 'soon']) {
+      withEnv({ GATED_BROWSER_MAX_AGE_MS: bad, GATED_BROWSER_MAX_RSS_MB: bad, GATED_NAV_FAILURE_STREAK: bad }, () => {
+        expect(resolveGatedMaxAgeMs()).toBe(GATED_BROWSER_MAX_AGE_MS);
+        expect(resolveGatedMaxRssBytes()).toBe(GATED_BROWSER_MAX_RSS_BYTES);
+        expect(resolveGatedNavFailureStreak()).toBe(GATED_NAV_FAILURE_STREAK);
+      });
+    }
+  });
+
+  /** A streak bound below one would relaunch on the first blip; it is clamped, not trusted. */
+  it('never lets the failure streak fall below one', () => {
+    withEnv({ GATED_NAV_FAILURE_STREAK: '0.2' }, () => {
+      expect(resolveGatedNavFailureStreak()).toBe(1);
+    });
   });
 });
