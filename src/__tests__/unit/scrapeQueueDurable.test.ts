@@ -701,3 +701,56 @@ describe('ScrapeQueue — working-set caps with resident items', () => {
     await settled;
   });
 });
+
+/**
+ * END-TO-END for the cooldown leg. The unit tests in challengeCooldownPersistence.test.ts construct
+ * a register with an explicit sink, so they pass whether or not anything WIRES one in production.
+ * This closes that gap: opening a cooldown through the register the queue actually consults must
+ * reach the store, or "cooldowns survive a restart" is true only in tests.
+ */
+describe('ScrapeQueue — cooldowns are written through, not just read back', () => {
+  it('a cooldown opened after the store is wired lands on disk and comes back next boot', () => {
+    const dir = tmpDir();
+    const first = openStore(dir);
+    const cooldown = new ChallengeCooldown({ now: () => 1_000, windowMs: 600_000 });
+    queue = new ScrapeQueue(true);
+    queue.setChallengeCooldown(cooldown);
+    queue.setQueueStore(first);
+
+    cooldown.open('anitoysgk.com', 'challenge page');
+    first.close();
+
+    // A fresh process: the window is still open, so the host must NOT be fetched.
+    const second = openStore(dir);
+    const restored = second.restore(300_000);
+    expect(restored.cooldowns.map((c) => c.host)).toEqual(['anitoysgk.com']);
+    expect(restored.cooldowns[0].until).toBe(601_000);
+  });
+
+  it('clearing a cooldown removes it from the store too', () => {
+    const dir = tmpDir();
+    const store = openStore(dir);
+    const cooldown = new ChallengeCooldown({ now: () => 1_000, windowMs: 600_000 });
+    queue = new ScrapeQueue(true);
+    queue.setChallengeCooldown(cooldown);
+    queue.setQueueStore(store);
+
+    cooldown.open('a.example', 'challenge page');
+    cooldown.clear('a.example');
+
+    // A host that has since served a clean fetch must not be held off after a restart.
+    expect(store.restore(300_000).cooldowns).toEqual([]);
+  });
+
+  it('does not attach a non-durable store as the cooldown sink', () => {
+    const cooldown = new ChallengeCooldown({ now: () => 1_000 });
+    queue = new ScrapeQueue(true);
+    queue.setChallengeCooldown(cooldown);
+    queue.setQueueStore(null);
+
+    // No disk behind it: writing through would be a no-op anyway, and attaching one would leave the
+    // register holding a reference to a store the queue no longer uses.
+    expect(() => cooldown.open('a.example', 'challenge page')).not.toThrow();
+    expect(cooldown.isOpen('a.example')).toBe(true);
+  });
+});

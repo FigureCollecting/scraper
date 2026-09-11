@@ -705,6 +705,12 @@ export class ScrapeQueue {
   setQueueStore(store: ScrapeQueueStore | null): void {
     this.store = store ?? createMemoryQueueStore();
     this.parkedCount = this.store.counts().parked;
+    // WRITE-THROUGH for per-host cooldowns. Without this the register would be read back at boot and
+    // never written, so "a restart honours an open cooldown" would hold only in tests — and the very
+    // restart that re-drives the crawler's batch would walk straight back into the challenge the
+    // previous process had just backed off from. Only a DURABLE store is attached: a no-op sink adds
+    // nothing, and detaching keeps the register from holding a store the queue no longer uses.
+    this.getChallengeCooldownStore().setPersistence(this.store.durable ? this.store : null);
   }
 
   /** Close the backing store (process shutdown / test teardown). Safe on the fallback. */
