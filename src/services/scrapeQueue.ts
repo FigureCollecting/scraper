@@ -1058,14 +1058,27 @@ export class ScrapeQueue {
     // Caller-supplied URL wins; otherwise build the MFC item URL from the key
     const url = options.url ?? `https://myfigurecollection.net/item/${mfcId}`;
 
-    // A PARKED item is queued but not resident, so `pendingItems` does not know it. Promote it
-    // first: the caller then joins it through the ordinary dedup path below and gets a real promise
-    // instead of a second row for work that is already on disk.
-    if (this.parkedCount > 0 && !this.pendingItems.has(mfcId) && this.store.hasKey(mfcId)) {
-      const parked = this.store.pageInKey(mfcId);
-      if (parked !== null) {
-        this.adoptPersisted(parked, false);
+    // A row on disk that `pendingItems` does not know about belongs to THIS queue and must be
+    // CLAIMED, not duplicated. Two ways that happens: the item is parked (over the working-set cap),
+    // or a previous process died holding its lease — and nothing else notices the second case,
+    // because the expired-lease reaper only runs inside the dispatch scan and an idle queue never
+    // scans. Minting a new row instead would fetch the item again inside the live lease and hand the
+    // resident copy a fresh retry budget.
+    //
+    // The lookup is UNCONDITIONAL: gating it on `parkedCount > 0` skipped the stale-lease case
+    // entirely, which is the normal case. One indexed SELECT at ~600 enqueues/hour is free, and it
+    // only runs when the key is not already resident — an item being processed RIGHT NOW is still in
+    // `pendingItems`, so this never reclaims work that is on the wire.
+    if (!this.pendingItems.has(mfcId) && this.store.hasKey(mfcId)) {
+      const orphan = this.store.claimKey(mfcId);
+      if (orphan !== null) {
+        this.adoptPersisted(orphan, false);
         this.parkedCount = this.store.counts().parked;
+        // A claimed orphan lands in `pendingItems`, so the caller below takes the DEDUP path — which
+        // deliberately never starts the loop, because an ordinary dedup joins an item something else
+        // already set running. Nothing set this one running: it came off disk. Kick the loop, or the
+        // row we just reclaimed sits resident and undispatched until some unrelated enqueue arrives.
+        if (!this.testMode) this.startProcessing();
       }
     }
 

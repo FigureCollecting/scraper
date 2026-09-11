@@ -1166,8 +1166,15 @@ See `.env.example` for complete configuration template.
   - **Unset** → the default below (a manifest that has not caught up should still try the standard mount). **Explicitly blank, or `off`/`none`/`false`/`0`** → durability is switched off deliberately, with no warning
   - Any failure → ONE greppable warning (`[SCRAPE QUEUE] queue store NOT durable: <reason> (<path>)`) and the engine runs in-memory exactly as it did before. Losing durability never blocks ingest and never crashes the process; `/health/detailed` names the `reason` (see **GET /health/detailed** above)
   - A file SQLite cannot open is **moved aside** with a timestamp suffix, never deleted, and a fresh store is opened; readable rows are salvaged out of the quarantined copy. The engine stays durable through this
-  - A write that fails at runtime (full disk, revoked mount) degrades the store to in-memory for the rest of the process and reports `write_failed`. Rows already on disk are not lost — the next start reconciles them
+  - A write that fails at runtime degrades the store to in-memory for the rest of the process and reports `write_failed`. Rows already on disk are not lost — the next start reconciles them. Only a **storage** fault does this (full disk, I/O error, the mount gone read-only); a constraint or statement fault is an engine bug, is reported once, and does **not** cost the process its durability
+  - The queue holds **one row per dedup key**, enforced by a unique index. A row left `leased` by a process that died is CLAIMED by the next enqueue of that key rather than duplicated, so a hard kill cannot cause a second fetch inside the live lease or reset the item's attempt budget
   - Default: `/var/lib/scraper`
+- `SCRAPE_QUEUE_MAX_MB`: Hard ceiling on the queue file, in MiB (`PRAGMA max_page_count`)
+  - The queue must never be the thing that fills the volume it lives on: a full volume takes the write-ahead log down with it, which is far worse than a refused write
+  - Past the ceiling the store reports `write_failed`, degrades to in-memory for the rest of the process, and keeps serving. Rows already on disk are not lost — the next start reconciles them
+  - The default is roughly a million rows at a few hundred bytes each, orders of magnitude beyond any depth this queue holds, and leaves the 1Gi PVC three quarters free
+  - Unset/blank/invalid/zero/negative → the default, never "no ceiling" and never a ceiling of zero pages
+  - Default: `256`
 - `SCRAPE_QUEUE_LEASE_MS`: How long a dispatched item's lease is held before a restart treats it as abandoned
   - Bounds the worst case of a `kill -9` MID-navigation: nothing releases that lease but its own expiry. A PLANNED shutdown (SIGTERM) releases every lease, so this only governs hard kills
   - Unset/invalid → default

@@ -754,3 +754,133 @@ describe('ScrapeQueue — cooldowns are written through, not just read back', ()
     expect(cooldown.isOpen('a.example')).toBe(true);
   });
 });
+
+/**
+ * F1 (reviewer finding) — a STALE LEASE plus the crawler's hourly re-post of the same URL.
+ *
+ * After a `kill -9`, restoreFromStore deliberately leaves an unexpired lease alone: the row is
+ * counted in `stillLeased`, is not in `pendingItems`, and is in no tier. Nothing else notices it
+ * either — the expired-lease reaper only runs inside `getNextProcessableItem`, so an idle queue
+ * never sweeps at all. When the crawler re-posts that URL, `enqueue` must recognise the row and
+ * CLAIM it. Minting a second row under a new id double-processes the item inside the live lease
+ * TTL and hands the resident copy a fresh retry budget.
+ */
+describe('ScrapeQueue — a stale lease is claimed, never duplicated', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.useFakeTimers({ advanceTimers: true });
+    resetScrapeQueue();
+  });
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  function seedLeasedRow(dir: string, attempts: number) {
+    const first = openStore(dir);
+    first.put({
+      id: 'a1-orig', mfcId: 'a1', url: urlFor('a1'), priority: 'WARM',
+      attempts, maxRetries: 3, enqueuedAt: 1_000, state: 'pending', lastErrorClass: 'network',
+    });
+    first.lease('a1-orig', Date.now() + 600_000); // a live lease no process holds any more
+    first.close();
+  }
+
+  it('re-enqueueing a key whose row is still LEASED leaves exactly one row, attempts intact', () => {
+    const dir = tmpDir();
+    seedLeasedRow(dir, 2);
+
+    const store = openStore(dir);
+    queue = new ScrapeQueue(true);
+    queue.setQueueStore(store);
+    expect(queue.restoreFromStore(Date.now())).toMatchObject({ pending: 0, stillLeased: 1 });
+    expect(queue.getStats().total).toBe(0);
+
+    const again = queue.enqueue('a1', { url: urlFor('a1') });
+
+    // ONE row for one dedup key — never {pending: 1, leased: 1}.
+    expect(store.counts()).toEqual({ pending: 1, leased: 0, parked: 0 });
+    expect(again.deduplicated).toBe(true);
+    // The claimed row keeps its id AND its spent attempts: the budget is not handed back.
+    const restored = store.restore(Date.now());
+    expect(restored.pending[0].id).toBe('a1-orig');
+    expect(restored.pending[0].attempts).toBe(2);
+  });
+
+  it('does not fetch the item twice while the stale lease is live', async () => {
+    const dir = tmpDir();
+    seedLeasedRow(dir, 0);
+
+    const store = openStore(dir);
+    const scraping = scrapingStub();
+    queue = new ScrapeQueue(false);
+    queue.setQueueStore(store);
+    queue.setPluginRegistry(makeRegistry());
+    queue.setIngestEmitter({ send: jest.fn().mockResolvedValue(okWriteStats()) });
+    queue.setScrapingService(scraping);
+    queue.restoreFromStore(Date.now());
+
+    queue.enqueue('a1', { url: urlFor('a1') });
+    queue.enqueue('a1', { url: urlFor('a1') }); // the crawler's next hourly pass
+    for (let i = 0; i < 4; i++) {
+      jest.advanceTimersByTime(200);
+      await jest.advanceTimersByTimeAsync(50);
+    }
+
+    // The claimed row is ONE item: one fetch, not one per re-post.
+    expect(scraping.scrapePage).toHaveBeenCalledTimes(1);
+    expect(store.counts()).toEqual({ pending: 0, leased: 0, parked: 0 });
+  });
+
+  it('claims a stale lease even with nothing parked (the guard must not gate on parkedCount)', () => {
+    const dir = tmpDir();
+    seedLeasedRow(dir, 1);
+
+    const store = openStore(dir);
+    queue = new ScrapeQueue(true);
+    queue.setQueueStore(store);
+    queue.restoreFromStore(Date.now());
+    // The normal case: nothing is parked, so a parkedCount-gated lookup would never run.
+    expect(queue.getStats().parked).toBe(0);
+
+    queue.enqueue('a1', { url: urlFor('a1') });
+
+    expect(store.counts().leased).toBe(0);
+    expect(queue.isPending('a1')).toBe(true);
+  });
+
+  it('still claims a PARKED row (the original promotion path is not lost)', () => {
+    process.env.SCRAPE_QUEUE_MAX_RESIDENT = '1';
+    const store = openStore(tmpDir());
+    queue = new ScrapeQueue(true);
+    queue.setQueueStore(store);
+    queue.enqueue('a0', { url: urlFor('a0') });
+    queue.enqueue('a1', { url: urlFor('a1') }); // parked
+    expect(store.counts().parked).toBe(1);
+
+    const again = queue.enqueue('a1', { url: urlFor('a1') });
+
+    expect(again.deduplicated).toBe(true);
+    expect(store.counts()).toMatchObject({ parked: 0 });
+    expect(queue.isPending('a1')).toBe(true);
+  });
+
+  it('an in-flight item is NOT re-claimed from under the process holding it', async () => {
+    const store = openStore(tmpDir());
+    const scraping = scrapingStub(() => new Promise(() => {})); // hangs: the lease stays live
+    queue = new ScrapeQueue(false);
+    queue.setQueueStore(store);
+    queue.setPluginRegistry(makeRegistry());
+    queue.setIngestEmitter({ send: jest.fn().mockResolvedValue(okWriteStats()) });
+    queue.setScrapingService(scraping);
+
+    queue.enqueue('a1', { url: urlFor('a1') });
+    expect(store.counts().leased).toBe(1);
+
+    queue.enqueue('a1', { url: urlFor('a1') });
+
+    // `pendingItems` still holds an item that is being processed, so the dedup path wins and the
+    // row stays LEASED — claiming it back would re-queue work that is on the wire right now.
+    expect(store.counts()).toEqual({ pending: 0, leased: 1, parked: 0 });
+    expect(scraping.scrapePage).toHaveBeenCalledTimes(1);
+  });
+});

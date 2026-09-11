@@ -53,6 +53,18 @@ export const DEFAULT_QUEUE_DIR = '/var/lib/scraper';
 export const QUEUE_DB_FILE = 'scrape-queue.db';
 /** Env var naming the directory. Absent/empty ⇒ DEFAULT_QUEUE_DIR. */
 export const QUEUE_DIR_ENV = 'SCRAPE_QUEUE_DIR';
+/** Env naming the queue file's size ceiling in MiB. Absent/invalid ⇒ DEFAULT_QUEUE_MAX_MB. */
+export const QUEUE_MAX_MB_ENV = 'SCRAPE_QUEUE_MAX_MB';
+/**
+ * The default size ceiling for the queue file, in MiB.
+ *
+ * The PVC is 1Gi and the queue SHARES it with nothing — but the queue must not be the thing that
+ * fills the volume it lives on, and a full volume is far worse than a refused write: it takes the
+ * WAL down with it. 256 MiB is roughly a million rows at a few hundred bytes each, orders of
+ * magnitude beyond any depth this queue will hold, while leaving the volume three quarters free for
+ * the WAL and for whatever else the mount ever carries.
+ */
+export const DEFAULT_QUEUE_MAX_MB = 256;
 
 /** Where a row sits in its lifecycle. See the state machine in the file header. */
 export type QueueItemState = 'pending' | 'leased' | 'parked';
@@ -156,6 +168,12 @@ export interface ScrapeQueueStore {
   readonly lostAtStartup: number;
   /** Where an unusable file was moved aside to. Null unless reason is `open_failed_recovered`. */
   readonly quarantinedPath: string | null;
+  /**
+   * The size ceiling actually in force, in SQLite pages (`PRAGMA max_page_count`). The queue must
+   * never be the thing that fills the volume it lives on, so this is always set — never SQLite's
+   * 4294967294-page default, which is no ceiling at all.
+   */
+  readonly maxPages: number;
   /** Run `fn` inside ONE transaction — the crawler's 50-per-store burst costs one commit, not 50. */
   batch<T>(fn: () => T): T;
   /** Insert a row. Idempotent on `id`: a re-put is a no-op, never an overwrite. */
@@ -176,8 +194,17 @@ export interface ScrapeQueueStore {
    * disk, so the answer must live there too.
    */
   hasKey(mfcId: string): boolean;
-  /** Promote exactly the parked row with this dedup key, so a caller can be handed a real promise. */
-  pageInKey(mfcId: string): PersistedQueueItem | null;
+  /**
+   * CLAIM the row for this dedup key into this process, whatever state it was left in — parked, or
+   * LEASED by a process that no longer exists. Returns it as pending, or null if there is no row.
+   *
+   * The leased case is the one that matters. A `kill -9` leaves a lease nobody holds, and the only
+   * thing that would otherwise notice is the reaper inside the dispatch scan — which does not run at
+   * all while the queue is idle. Without this, the crawler's next hourly re-post of the same URL
+   * mints a SECOND row, fetching the item again inside the live lease and handing the resident copy
+   * a fresh retry budget.
+   */
+  claimKey(mfcId: string): PersistedQueueItem | null;
   /** Record a priority upgrade, so a restored item comes back at the priority it was raised to. */
   setPriority(id: string, priority: QueuePriority): void;
   /** Release EVERY lease back to pending. Called on SIGTERM so a planned rollout loses nothing. */
@@ -215,7 +242,6 @@ CREATE TABLE IF NOT EXISTS queue_items (
   last_error_class TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_queue_state ON queue_items(state, enqueued_at);
-CREATE INDEX IF NOT EXISTS idx_queue_mfc   ON queue_items(mfc_id);
 CREATE TABLE IF NOT EXISTS host_cooldowns (
   host      TEXT PRIMARY KEY,
   until     INTEGER NOT NULL,
@@ -223,6 +249,47 @@ CREATE TABLE IF NOT EXISTS host_cooldowns (
   opened_at INTEGER NOT NULL
 );
 `;
+
+/**
+ * ONE ROW PER DEDUP KEY, enforced by the schema rather than by every caller remembering to look
+ * first. Applied separately from SCHEMA because a file written by an earlier build may already hold
+ * duplicates: the sweep collapses them to the EARLIEST row (the one carrying the real attempt count)
+ * before the index is built, so a readable queue is never quarantined merely because the constraint
+ * cannot be laid over it as-is.
+ *
+ * SQLite's bare-column rule makes `SELECT id, MIN(enqueued_at) … GROUP BY mfc_id` yield the id of the
+ * row holding that minimum, which is exactly the survivor we want.
+ */
+const DEDUP_KEY_CONSTRAINT = `
+DELETE FROM queue_items WHERE id NOT IN (
+  SELECT id FROM (SELECT id, MIN(enqueued_at) FROM queue_items GROUP BY mfc_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_mfc_unique ON queue_items(mfc_id);
+`;
+
+/**
+ * SQLite result codes that mean THE STORAGE is the problem, not this code: the volume is full, the
+ * device erred, the file went read-only or vanished, the database is not a database. Only these cost
+ * the process its durability. A constraint violation or a malformed statement is a bug here, and
+ * throwing away durability for the rest of the process because of one is the wrong trade — it would
+ * convert a logic error into the very item loss this whole store exists to prevent.
+ *
+ *   13 SQLITE_FULL · 10 SQLITE_IOERR · 8 SQLITE_READONLY · 14 SQLITE_CANTOPEN
+ *   11 SQLITE_CORRUPT · 26 SQLITE_NOTADB · 7 SQLITE_NOMEM
+ */
+const STORAGE_FAULT_ERRCODES = new Set([7, 8, 10, 11, 13, 14, 26]);
+/** Node-level equivalents, for a write that fails before SQLite sees it. */
+const STORAGE_FAULT_CODES = new Set(['ENOSPC', 'EIO', 'EROFS', 'EDQUOT', 'ENOENT', 'EACCES']);
+
+/** Whether this error means the disk is the problem (⇒ degrade) rather than this code (⇒ report). */
+function isStorageFault(error: unknown): boolean {
+  const e = error as { errcode?: number; code?: string; message?: string } | null;
+  if (e === null || typeof e !== 'object') return false;
+  if (typeof e.errcode === 'number' && STORAGE_FAULT_ERRCODES.has(e.errcode)) return true;
+  if (typeof e.code === 'string' && STORAGE_FAULT_CODES.has(e.code)) return true;
+  // Last resort for a driver that surfaces neither: the canonical full-disk wording.
+  return typeof e.message === 'string' && /disk is full|disk I\/O error|readonly database/i.test(e.message);
+}
 
 /** The zero reading — what a closed or non-durable store reports. */
 const NO_COUNTS: QueueCounts = { pending: 0, leased: 0, parked: 0 };
@@ -301,6 +368,7 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
   const dir = opts.dir ?? resolveQueueDir() ?? DEFAULT_QUEUE_DIR;
   const file = path.join(dir, QUEUE_DB_FILE);
   const db = new DatabaseSync(file);
+  let maxPages = 0;
 
   try {
     // WAL so a reader (a future ops query) never blocks the writer, and a crash mid-write recovers
@@ -312,6 +380,7 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
     db.exec('PRAGMA synchronous = FULL');
     db.exec('PRAGMA foreign_keys = ON');
     db.exec(SCHEMA);
+    db.exec(DEDUP_KEY_CONSTRAINT);
     // Any handle that survived the SCHEMA exec has a real, readable database behind it.
     db.prepare('SELECT COUNT(*) AS n FROM queue_items').get();
     // PROVE IT IS WRITABLE, not merely openable. A database that has lost its write permission opens
@@ -321,7 +390,8 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
     // (`BEGIN IMMEDIATE` is not enough: SQLite defers the readonly error until a page is touched.)
     db.exec('PRAGMA user_version = 1');
     // Applied AFTER the schema so creating the tables is never itself refused by the ceiling.
-    if (opts.maxPageCount !== undefined) db.exec(`PRAGMA max_page_count = ${Number(opts.maxPageCount)}`);
+    maxPages = Math.max(1, Math.floor(opts.maxPageCount ?? pagesForMb(resolveMaxMb(), db)));
+    db.exec(`PRAGMA max_page_count = ${maxPages}`);
   } catch (error) {
     // NEVER leak the handle: it holds the -wal/-shm sidecars open, and a caller that goes on to move
     // the file aside would leave a live mapping pointing at the old inode — the fresh database then
@@ -339,7 +409,7 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
       `INSERT INTO queue_items
          (id, mfc_id, url, host, priority, status, session_id, attempts, max_retries, enqueued_at, state, lease_until, last_error_class)
        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-       ON CONFLICT(id) DO NOTHING`
+       ON CONFLICT DO NOTHING`
     ),
     lease: db.prepare(`UPDATE queue_items SET state = 'leased', lease_until = ? WHERE id = ?`),
     fail: db.prepare(
@@ -359,14 +429,6 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
     ),
     releaseAll: db.prepare(`UPDATE queue_items SET state = 'pending', lease_until = NULL WHERE state = 'leased'`),
     countByState: db.prepare('SELECT state, COUNT(*) AS n FROM queue_items GROUP BY state'),
-    dupKeys: db.prepare(
-      'SELECT mfc_id FROM queue_items GROUP BY mfc_id HAVING COUNT(*) > 1'
-    ),
-    dupLosers: db.prepare(
-      `SELECT id FROM queue_items WHERE mfc_id = ?
-       ORDER BY enqueued_at ASC, id ASC
-       LIMIT -1 OFFSET 1`
-    ),
     saveCooldown: db.prepare(
       `INSERT INTO host_cooldowns (host, until, reason, opened_at) VALUES (?,?,?,?)
        ON CONFLICT(host) DO UPDATE SET until = excluded.until, reason = excluded.reason, opened_at = excluded.opened_at`
@@ -375,7 +437,7 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
     selCooldowns: db.prepare('SELECT * FROM host_cooldowns WHERE until > ? ORDER BY until ASC'),
     dropExpiredCooldowns: db.prepare('DELETE FROM host_cooldowns WHERE until <= ?'),
     hasKey: db.prepare('SELECT 1 AS hit FROM queue_items WHERE mfc_id = ? LIMIT 1'),
-    selParkedKey: db.prepare(`SELECT * FROM queue_items WHERE mfc_id = ? AND state = 'parked' ORDER BY enqueued_at ASC LIMIT 1`),
+    selKey: db.prepare('SELECT * FROM queue_items WHERE mfc_id = ? ORDER BY enqueued_at ASC LIMIT 1'),
     setPriority: db.prepare('UPDATE queue_items SET priority = ? WHERE id = ?'),
     clearItems: db.prepare('DELETE FROM queue_items'),
   } satisfies Record<string, StatementSync>;
@@ -400,6 +462,7 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
    */
   let degraded = false;
   let reason: QueueStoreReason = opts.reason ?? 'ok';
+  let loggedLogicFault = false;
   const degrade = (error: unknown): void => {
     if (degraded) return;
     degraded = true;
@@ -410,13 +473,29 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
         `${sanitizeForLog(detail)}; continuing in-memory for the rest of this process`
     );
   };
-  /** Run a write; a store fault degrades instead of escaping into the queue. Never throws. */
+  /**
+   * Run a write. Never throws into the queue. A STORAGE fault (full disk, I/O error, the mount gone
+   * read-only) degrades the store; anything else is a bug in this code and is reported ONCE and
+   * swallowed, because surrendering durability over a logic error would cause exactly the item loss
+   * this store exists to prevent.
+   */
   const write = (fn: () => void): void => {
     if (closed || degraded) return;
     try {
       fn();
     } catch (error) {
-      degrade(error);
+      if (isStorageFault(error)) {
+        degrade(error);
+        return;
+      }
+      if (!loggedLogicFault) {
+        loggedLogicFault = true;
+        const detail = error instanceof Error ? error.message : String(error);
+        console.warn(
+          `[SCRAPE QUEUE] queue store write refused (${sanitizeForLog(detail)}) — ` +
+            'the store stays durable; this is an engine fault, not a disk fault'
+        );
+      }
     }
   };
   /** Run a read; a fault yields the caller's fallback rather than throwing mid-dispatch. */
@@ -503,6 +582,7 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
     },
     path: file,
     quarantinedPath: opts.quarantinedPath ?? null,
+    maxPages,
     lostAtStartup: opts.lostAtStartup ?? 0,
     batch,
 
@@ -550,11 +630,12 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
       return read(() => stmt.hasKey.get(mfcId) !== undefined, false);
     },
 
-    pageInKey(mfcId: string): PersistedQueueItem | null {
-      const row = read(() => stmt.selParkedKey.get(mfcId) as unknown as ItemRow | undefined, undefined);
+    claimKey(mfcId: string): PersistedQueueItem | null {
+      const row = read(() => stmt.selKey.get(mfcId) as unknown as ItemRow | undefined, undefined);
       if (row === undefined) return null;
+      // `fail` is exactly the transition wanted: back to pending, lease cleared, attempts preserved.
       write(() => stmt.fail.run(row.attempts, row.last_error_class, row.id));
-      return { ...rowToItem(row), state: 'pending' as const };
+      return { ...rowToItem(row), state: 'pending' as const, leaseUntil: undefined };
     },
 
     setPriority(id: string, priority: QueuePriority): void {
@@ -590,14 +671,9 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
     restore(now: number): RestoredQueue {
       if (closed || degraded) return { pending: [], leasedExpired: [], stillLeased: 0, parked: 0, cooldowns: [] };
       return batch(() => {
-        // A restart can only ever hold ONE live item per dedup key, so a second row for the same key
-        // is debris from a crash that raced a re-enqueue. Keep the earliest and DELETE the rest —
-        // filtering alone would leave the loser as a pending row nothing will ever dispatch.
-        for (const dup of stmt.dupKeys.all() as unknown as Array<{ mfc_id: string }>) {
-          for (const loser of stmt.dupLosers.all(dup.mfc_id) as unknown as Array<{ id: string }>) {
-            write(() => stmt.remove.run(loser.id));
-          }
-        }
+        // No dedup pass here: DEDUP_KEY_CONSTRAINT collapses any legacy duplicates and builds the
+        // unique index at OPEN, which is before every restore, and nothing can insert a second row
+        // for a key afterwards. One enforcement point, not two that can disagree.
         const leasedExpiredRows = stmt.selLeasedExpired.all(now) as unknown as ItemRow[];
         write(() => stmt.freeLeasedExpired.run(now));
         // Read pending AFTER freeing expired leases would double-count them, so read it first and
@@ -685,6 +761,7 @@ export function createMemoryQueueStore(
     reason,
     path: attemptedPath,
     quarantinedPath: null,
+    maxPages: 0,
     lostAtStartup: 0,
     batch: <T>(fn: () => T): T => fn(),
     put: () => {},
@@ -694,7 +771,7 @@ export function createMemoryQueueStore(
     park: () => {},
     pageIn: () => [],
     hasKey: () => false,
-    pageInKey: () => null,
+    claimKey: () => null,
     setPriority: () => {},
     releaseLeases: () => 0,
     reapExpiredLeases: () => [],
@@ -705,6 +782,23 @@ export function createMemoryQueueStore(
     clearAll: () => {},
     close: () => {},
   };
+}
+
+/** The configured size ceiling in MiB: the env when valid and positive, else the safe default. */
+function resolveMaxMb(): number {
+  const raw = process.env[QUEUE_MAX_MB_ENV];
+  if (raw === undefined || raw.trim() === '') return DEFAULT_QUEUE_MAX_MB;
+  const n = Number(raw);
+  // Fail-safe in the same shape as every other knob here: garbage, zero and negatives degrade to the
+  // default, never to "no ceiling" and never to a ceiling of zero pages (which refuses every write).
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_QUEUE_MAX_MB;
+}
+
+/** MiB → SQLite pages, using the database's OWN page size rather than an assumed 4096. */
+function pagesForMb(mb: number, db: DatabaseSync): number {
+  const row = db.prepare('PRAGMA page_size').get() as unknown as { page_size?: number } | undefined;
+  const pageSize = typeof row?.page_size === 'number' && row.page_size > 0 ? row.page_size : 4096;
+  return Math.max(1, Math.floor((mb * 1024 * 1024) / pageSize));
 }
 
 /** Values that switch the store OFF outright (dev / CI), case-insensitive. */

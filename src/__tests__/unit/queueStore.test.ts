@@ -65,6 +65,7 @@ afterEach(() => {
   for (const d of dirs) fs.rmSync(d, { recursive: true, force: true });
   dirs = [];
   delete process.env.SCRAPE_QUEUE_DIR;
+  delete process.env.SCRAPE_QUEUE_MAX_MB;
 });
 
 describe('queueStore — durable round-trips', () => {
@@ -213,15 +214,16 @@ describe('queueStore — crash recovery', () => {
     expect(restored.stillLeased).toBe(0);
   });
 
-  it('de-duplicates rows for the same key at restore, keeping the earliest', () => {
+  it('cannot hold two rows for one dedup key in the first place', () => {
     const dir = tmpDir();
     const store = open(dir);
     store.put(ITEM({ id: 'old', mfcId: 'same', enqueuedAt: 1_000 }));
     store.put(ITEM({ id: 'new', mfcId: 'same', enqueuedAt: 5_000 }));
 
+    // The unique index refuses the second insert, so a loser row can never leak as a permanent
+    // pending entry nothing will dispatch. Collapsing legacy duplicates happens once, at open.
     const restored = store.restore(9_000);
     expect(restored.pending.map((i) => i.id)).toEqual(['old']);
-    // The loser is DELETED, not merely filtered — it must not leak as a permanent pending row.
     expect(store.counts().pending).toBe(1);
   });
 });
@@ -540,7 +542,7 @@ describe('queueStore — fallback reasons', () => {
     expect(store.pageIn(10)).toEqual([]);
     expect(store.releaseLeases()).toBe(0);
     expect(store.hasKey('anything')).toBe(false);
-    expect(store.pageInKey('anything')).toBeNull();
+    expect(store.claimKey('anything')).toBeNull();
     expect(() => store.setPriority('a', 'HOT')).not.toThrow();
     expect(store.quarantinedPath).toBeNull();
     expect(store.lostAtStartup).toBe(0);
@@ -562,25 +564,26 @@ describe('queueStore — dedup-key lookups (what the queue asks a parked item)',
     expect(store.hasKey('never-seen')).toBe(false);
   });
 
-  it('pageInKey promotes exactly the parked row a caller asked for', () => {
+  it('claimKey promotes exactly the parked row a caller asked for', () => {
     const dir = tmpDir();
     const store = open(dir);
     store.put(ITEM({ id: 'p1', mfcId: 'key-1', enqueuedAt: 1_000, state: 'parked' }));
     store.put(ITEM({ id: 'p2', mfcId: 'key-2', enqueuedAt: 2_000, state: 'parked' }));
 
-    const promoted = store.pageInKey('key-2');
+    const promoted = store.claimKey('key-2');
     expect(promoted).toMatchObject({ id: 'p2', state: 'pending' });
     // The OTHER parked row is untouched — a dedup hit promotes one item, not the backlog.
     expect(store.counts()).toEqual({ pending: 1, leased: 0, parked: 1 });
   });
 
-  it('pageInKey returns null for a key that is not parked', () => {
+  it('claimKey returns null only when there is NO row for the key', () => {
     const dir = tmpDir();
     const store = open(dir);
-    store.put(ITEM({ id: 'a', mfcId: 'key-a' })); // pending, not parked
+    store.put(ITEM({ id: 'a', mfcId: 'key-a' })); // already pending
 
-    expect(store.pageInKey('key-a')).toBeNull();
-    expect(store.pageInKey('nothing')).toBeNull();
+    // A pending row is still this queue's row — claiming it is a no-op that returns it, not null.
+    expect(store.claimKey('key-a')).toMatchObject({ id: 'a', state: 'pending' });
+    expect(store.claimKey('nothing')).toBeNull();
   });
 
   it('setPriority keeps a restored item at the priority it was upgraded to', () => {
@@ -607,7 +610,7 @@ describe('queueStore — dedup-key lookups (what the queue asks a parked item)',
     stores.push(store);
 
     expect(store.hasKey('anything')).toBe(false);
-    expect(store.pageInKey('anything')).toBeNull();
+    expect(store.claimKey('anything')).toBeNull();
     expect(() => store.setPriority('a', 'HOT')).not.toThrow();
   });
 });
@@ -636,7 +639,7 @@ describe('queueStore — safe after close', () => {
     expect(() => store.clearAll()).not.toThrow();
     expect(store.counts()).toEqual({ pending: 0, leased: 0, parked: 0 });
     expect(store.pageIn(5)).toEqual([]);
-    expect(store.pageInKey('id-1')).toBeNull();
+    expect(store.claimKey('id-1')).toBeNull();
     expect(store.hasKey('id-1')).toBe(false);
     expect(store.releaseLeases()).toBe(0);
     expect(store.reapExpiredLeases(9_999)).toEqual([]);
@@ -798,5 +801,175 @@ describe('queueStore — open must prove the database is USABLE, not merely open
     // into the boot path — the engine has to come up and keep taking work regardless.
     expect(() => store.restore(9_999)).not.toThrow();
     expect(store.reason).toBe('write_failed');
+  });
+});
+
+/**
+ * F2 (reviewer finding) — the disk-full safety valve must be WIRED, not merely available.
+ *
+ * `maxPageCount` is described as "a genuine safety valve on a 1Gi PVC — the queue must never be the
+ * thing that fills the volume the queue lives on", but nothing outside the tests ever passed it, so
+ * a real store ran with SQLite's 4294967294-page default: no ceiling at all. The same shape of
+ * defect as the cooldown sink that was never attached.
+ */
+describe('queueStore — the size ceiling is wired from the environment', () => {
+  it('createQueueStore applies a ceiling by default', () => {
+    const store = createQueueStore({ dir: tmpDir() });
+    stores.push(store);
+
+    // Not SQLite's 4294967294 default: the queue must not be able to fill its own volume.
+    expect(store.maxPages).toBeGreaterThan(0);
+    expect(store.maxPages).toBeLessThan(4_294_967_294);
+  });
+
+  it('SCRAPE_QUEUE_MAX_MB sets the ceiling, and exceeding it degrades to write_failed', () => {
+    process.env.SCRAPE_QUEUE_MAX_MB = '1';
+    const store = createQueueStore({ dir: tmpDir() });
+    stores.push(store);
+    expect(store.reason).toBe('ok');
+
+    let threw = false;
+    try {
+      for (let i = 0; i < 20_000; i++) {
+        store.put(ITEM({ id: `id-${i}`, mfcId: `m-${i}`, url: `https://s.example/${'x'.repeat(400)}/${i}` }));
+      }
+    } catch {
+      threw = true;
+    }
+
+    // A full store must never throw into the queue, and must stop claiming to be durable.
+    expect(threw).toBe(false);
+    expect(store.reason).toBe('write_failed');
+    expect(store.durable).toBe(false);
+  });
+
+  it('falls back to the default ceiling for a blank or nonsense SCRAPE_QUEUE_MAX_MB', () => {
+    delete process.env.SCRAPE_QUEUE_MAX_MB;
+    const def = createQueueStore({ dir: tmpDir() });
+    stores.push(def);
+    for (const bad of ['', '   ', 'abc', '0', '-5']) {
+      process.env.SCRAPE_QUEUE_MAX_MB = bad;
+      const store = createQueueStore({ dir: tmpDir() });
+      stores.push(store);
+      // Misconfiguration must never mean "no ceiling" OR "a ceiling of zero pages".
+      expect(store.maxPages).toBe(def.maxPages);
+      expect(store.reason).toBe('ok');
+    }
+  });
+
+  it('degrades on a STORAGE fault but NOT on a logic fault', () => {
+    const dir = tmpDir();
+    const store = openQueueStore({ dir, maxPageCount: 2 });
+    stores.push(store);
+
+    // A NOT NULL violation is a bug in THIS code, not a sick disk. It must be reported and swallowed:
+    // surrendering durability for the rest of the process over an engine fault would cause exactly
+    // the item loss this store exists to prevent. (A duplicate KEY is not a usable probe here — the
+    // insert's ON CONFLICT DO NOTHING absorbs it before `write` ever sees a fault.)
+    store.put(ITEM({ id: 'null-url', mfcId: 'null-url', url: null as unknown as string }));
+    expect(store.durable).toBe(true);
+    expect(store.reason).toBe('ok');
+    expect(
+      (console.warn as unknown as jest.Mock).mock.calls
+        .map((c) => String(c[0]))
+        .filter((m) => m.includes('write refused'))
+    ).toHaveLength(1);
+    // Still working for everything else.
+    store.put(ITEM({ id: 'fine', mfcId: 'fine' }));
+    expect(store.counts().pending).toBe(1);
+
+    // A full disk, by contrast, DOES cost the process its durability.
+    for (let i = 0; i < 20_000; i++) {
+      store.put(ITEM({ id: `f-${i}`, mfcId: `f-${i}`, url: `https://s.example/${'x'.repeat(400)}/${i}` }));
+    }
+    expect(store.reason).toBe('write_failed');
+    expect(store.durable).toBe(false);
+  });
+});
+
+/**
+ * F1's structural backstop: one row per dedup key, enforced by the schema rather than by every
+ * caller remembering to look first.
+ */
+describe('queueStore — one row per dedup key', () => {
+  it('refuses a second row for the same key instead of duplicating it', () => {
+    const dir = tmpDir();
+    const store = open(dir);
+    store.put(ITEM({ id: 'first', mfcId: 'same', enqueuedAt: 1_000 }));
+    store.put(ITEM({ id: 'second', mfcId: 'same', enqueuedAt: 5_000 }));
+
+    expect(store.counts().pending).toBe(1);
+    expect(store.restore(9_000).pending[0].id).toBe('first');
+  });
+
+  it('claimKey promotes a row in ANY state, not just parked', () => {
+    const dir = tmpDir();
+    const store = open(dir);
+    store.put(ITEM({ id: 'p', mfcId: 'parked-key', state: 'parked' }));
+    store.put(ITEM({ id: 'l', mfcId: 'leased-key', attempts: 2 }));
+    store.lease('l', 9_999_999);
+
+    expect(store.claimKey('parked-key')).toMatchObject({ id: 'p', state: 'pending' });
+    // The leased case is the one F1 turns on: a lease no process holds must be reclaimable.
+    expect(store.claimKey('leased-key')).toMatchObject({ id: 'l', state: 'pending', attempts: 2 });
+    expect(store.counts()).toEqual({ pending: 2, leased: 0, parked: 0 });
+    expect(store.claimKey('never-seen')).toBeNull();
+  });
+
+  it('de-duplicates a legacy file that already holds two rows for one key, then enforces the rule', () => {
+    const dir = tmpDir();
+    const file = path.join(dir, QUEUE_DB_FILE);
+    // A file written by a build without the constraint. Opening it must not fail — and must not
+    // quarantine a perfectly readable queue just because the index cannot be built over it.
+    const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
+    const raw = new DatabaseSync(file);
+    raw.exec(`CREATE TABLE queue_items (
+      id TEXT PRIMARY KEY, mfc_id TEXT NOT NULL, url TEXT NOT NULL, host TEXT, priority TEXT NOT NULL,
+      status TEXT, session_id TEXT, attempts INTEGER NOT NULL DEFAULT 0, max_retries INTEGER NOT NULL,
+      enqueued_at INTEGER NOT NULL, state TEXT NOT NULL, lease_until INTEGER, last_error_class TEXT)`);
+    const ins = raw.prepare('INSERT INTO queue_items VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)');
+    ins.run('older', 'dup', 'https://s.example/x', 's.example', 'WARM', null, null, 2, 3, 1_000, 'pending', null, null);
+    ins.run('newer', 'dup', 'https://s.example/x', 's.example', 'WARM', null, null, 0, 3, 5_000, 'pending', null, null);
+    raw.close();
+
+    const store = open(dir);
+    expect(store.reason).toBe('ok');
+    // The EARLIEST row survives, carrying the real attempt count.
+    expect(store.counts().pending).toBe(1);
+    expect(store.restore(9_000).pending[0]).toMatchObject({ id: 'older', attempts: 2 });
+  });
+});
+
+
+/**
+ * `isStorageFault` decides whether a write fault costs the process its durability. Its shape checks
+ * are what keep a malformed error object from being read as a healthy disk.
+ */
+describe('queueStore — storage-fault classification edges', () => {
+  it('treats a Node ENOSPC as a storage fault', () => {
+    const dir = tmpDir();
+    const store = openQueueStore({ dir });
+    stores.push(store);
+    const enospc = Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
+
+    // A write can fail below SQLite — the same degrade path has to catch it.
+    expect(() => store.batch(() => { throw enospc; })).toThrow();
+    expect(store.reason).toBe('ok'); // a throw from the BODY is the caller's, not the disk's
+
+    store.put(ITEM({ id: 'x', mfcId: 'x', url: null as unknown as string }));
+    // A non-storage fault leaves durability intact.
+    expect(store.durable).toBe(true);
+  });
+
+  it('does not read a non-object throw as a storage fault', () => {
+    const dir = tmpDir();
+    const store = openQueueStore({ dir });
+    stores.push(store);
+
+    // `throw 'a string'` and `throw null` must not be mistaken for a sick disk — that would hand
+    // away durability on the strength of a value that carries no evidence either way.
+    store.put(ITEM({ id: 'ok', mfcId: 'ok' }));
+    expect(store.durable).toBe(true);
+    expect(store.counts().pending).toBe(1);
   });
 });
