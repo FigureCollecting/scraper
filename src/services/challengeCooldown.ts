@@ -66,11 +66,23 @@ export interface CooldownView {
   reason: string;
 }
 
+/**
+ * The durable sink a cooldown is written through to (queueStore). BOOKKEEPING ONLY: the register's
+ * own decision never depends on it, and a throwing sink is swallowed — a failed write must not
+ * re-open a cooling host to traffic.
+ */
+export interface CooldownPersistence {
+  saveCooldown(entry: CooldownEntry): void;
+  removeCooldown(host: string): void;
+}
+
 export interface ChallengeCooldownOptions {
   /** Injectable clock (default Date.now) — tests pass a controllable function. */
   now?: () => number;
   /** Explicit window (ms). Beats the env; clamped to [1 min, 24 h]. Default: env or 30 min. */
   windowMs?: number;
+  /** Optional durable sink. Absent ⇒ the register is memory-only, exactly as before. */
+  persistence?: CooldownPersistence;
 }
 
 /**
@@ -101,10 +113,52 @@ export class ChallengeCooldown {
   private readonly entries = new Map<string, CooldownEntry>();
   private readonly now: () => number;
   private readonly windowMs: number;
+  private persistence: CooldownPersistence | null;
 
   constructor(opts: ChallengeCooldownOptions = {}) {
     this.now = opts.now ?? Date.now;
     this.windowMs = clampWindow(opts.windowMs ?? resolveWindowFromEnv());
+    this.persistence = opts.persistence ?? null;
+  }
+
+  /**
+   * Attach (or detach) the durable sink after construction — the composition root wires the shared
+   * singleton once the queue store is open. Does NOT write the current entries through: `restore`
+   * is the load direction, and re-persisting on attach would rewrite every `openedAt`.
+   */
+  setPersistence(persistence: CooldownPersistence | null): void {
+    this.persistence = persistence;
+  }
+
+  /** Persistence is bookkeeping: a throwing sink is swallowed so the cooldown still holds. */
+  private persist(fn: (p: CooldownPersistence) => void): void {
+    const p = this.persistence;
+    if (p === null) return;
+    try {
+      fn(p);
+    } catch {
+      // A cooldown that cannot be written down is still a cooldown.
+    }
+  }
+
+  /**
+   * Rehydrate from persisted entries (startup). Expired entries are skipped, host keys are
+   * normalized, and NOTHING is written back through the sink. Returns how many were loaded.
+   *
+   * WHY it matters: a restart inside an open window is exactly when the engine is most likely to
+   * walk back into the challenge it just backed off from — the crawler's batch is re-driven all at
+   * once, at the same host, from the same egress IP.
+   */
+  restore(entries: readonly CooldownEntry[]): number {
+    const now = this.now();
+    let loaded = 0;
+    for (const entry of entries) {
+      if (entry.until <= now) continue;
+      const key = normalizeHost(entry.host);
+      this.entries.set(key, { ...entry, host: key });
+      loaded++;
+    }
+    return loaded;
   }
 
   /** Open (or re-extend) the cooldown for `host`; logs the opened line. Returns the recorded entry. */
@@ -113,6 +167,7 @@ export class ChallengeCooldown {
     const now = this.now();
     const entry: CooldownEntry = { host: key, until: now + this.windowMs, reason, openedAt: now };
     this.entries.set(key, entry);
+    this.persist((p) => p.saveCooldown(entry));
     // eslint-disable-next-line no-console
     console.warn(`[COOLDOWN] opened ${key} for ${Math.round(this.windowMs / 60_000)} min (${reason})`);
     return entry;
@@ -135,6 +190,7 @@ export class ChallengeCooldown {
   clear(host: string): boolean {
     const key = normalizeHost(host);
     if (!this.entries.delete(key)) return false;
+    this.persist((p) => p.removeCooldown(key));
     // eslint-disable-next-line no-console
     console.warn(`[COOLDOWN] cleared ${key}`);
     return true;

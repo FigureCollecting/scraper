@@ -180,6 +180,25 @@ Detailed health check with browser pool status plus two operator views (additive
 - `cfCookies`: `[{host, cookieNames, userAgentPinned, loadedAt, mintedAt?, expiresAt?, stale, staleSince?, staleReason?}]` — the stored-cookie jar (`CF_COOKIE_FILE`) per host. `stale: true` means the host still served a challenge WITH its stored cookies: re-mint (see *Stored Cloudflare cookies* under Environment Variables). `[]` when the jar is disabled.
 - `browserLane`: `{launchMode, residentialTimezone, directTimezone, processTimezone, navigationTimeoutMs, gatedBrowsers}` — the lane's live configuration. `processTimezone` is the one that decides a Cloudflare challenge (`null` = a UTC container = gated stores silently never clear); `gatedBrowsers` is `[{egress, launchedAt, pagesOpen, primedHosts}]`, the live per-egress challenge browsers.
 - `imageCapture`: `{enabled, attempted, stored, deduped, skipped{policyDeny, memo, thumbnailRole, userRole, cap, residentialBudget, notImage, tooLarge}, failed, residentialBytesToday}` — the image capture hook's counters. The lane never fails an item, so these are the ONLY signal it gives: the named skips are what separates "no store here publishes images" from "every plate is being denied", "the home line is spent", or "this CDN answers every image with a block page". `stored` counts captures handed to the asset lane; `rawStore.stats` says what actually landed.
+- `queueStore`: `{durable, reason, path, quarantinedPath, lostAtStartup, restoredAt, pending, leased, parked}` — the scrape queue's durable backing store. `durable: false` means the queue is memory-only and **a restart will drop every queued item**, which is invisible from every other reading until the next repin. `reason` is what makes that actionable — see the table below. `pending` + `leased` are the TRUE depth: the in-memory `hot`/`warm`/`cold` counts stop at the working-set cap (`SCRAPE_QUEUE_MAX_RESIDENT`) while the rest sits on disk as `parked`, and they stay readable even after a runtime write degradation, because those rows are still there for the next process to reconcile. `lostAtStartup` should always be `0`; anything else means that many queued items now exist only in `quarantinedPath`.
+
+  | `reason` | `durable` | Meaning |
+  |---|---|---|
+  | `ok` | true | Healthy and persisting |
+  | `disabled` | false | `SCRAPE_QUEUE_DIR` is blank or `off` — deliberate (dev/CI) |
+  | `dir_missing` | false | The directory is not there. **The intended intermediate state** while the engine ships ahead of its PVC |
+  | `not_writable` | false | The mount exists but this uid/gid cannot write it — an `fsGroup` that was dropped or never applied |
+  | `open_failed` | false | SQLite refused the file and the retry failed too |
+  | `open_failed_recovered` | **true** | The file was unusable, was moved aside to `quarantinedPath` (never deleted), and a fresh store opened; readable rows were salvaged into it |
+  | `write_failed` | false | A write failed at runtime (full disk, revoked mount). The store degraded to in-memory for the rest of the process life and kept serving |
+
+  Startup emits exactly one greppable line whenever the store is not durable:
+
+  ```
+  [SCRAPE QUEUE] queue store NOT durable: <reason> (<path>)
+  ```
+
+  **A pod that cannot attach its volume never reaches this code at all.** If a local-path claim cannot bind on the node the pod is scheduled to, the pod stays `Pending` and the container never starts — a scheduling signal visible in `kubectl describe pod`, not a `durable: false` reading.
 - `residentialEgress`: `{configured, proxy?}` — whether a residential egress proxy (`RESIDENTIAL_PROXY_URL`) is wired. `proxy` (its `scheme://host:port`) appears only under `RESIDENTIAL_EGRESS_HEALTH_DETAIL=true`, since this endpoint is unauthenticated; credentials are stripped at the source either way, so a `user:password@` proxy never appears here. `{configured: false}` ⇒ every store declaring `egress: 'residential'` is refused (see *Residential egress* under Environment Variables).
 
 ### GET /version
@@ -1140,8 +1159,38 @@ See `.env.example` for complete configuration template.
   - Raise for large listings (the orzgk 100-item catalog page takes ~15 s; ops set `30000`)
   - Unset/invalid → default; any value is clamped to `[5000, 120000]`
   - Default: `15000`
+- `SCRAPE_QUEUE_DIR`: Directory holding the scrape queue's durable store (`scrape-queue.db`, a `node:sqlite` WAL file)
+  - The queue was heap-only, so every restart dropped it. That is not a delay: the crawler advances its backfill cursor AFTER enqueueing, so a dropped item is a **coverage hole** nothing ever asks for again
+  - What survives a restart: queued items with their attempt counts, items the dead process had in flight (via an expiring lease), and open per-host challenge cooldowns
+  - What NEVER reaches disk: cookies. A cookie-bearing item is bound to a live user session and stays memory-only, by construction — the row has no column for one
+  - **Unset** → the default below (a manifest that has not caught up should still try the standard mount). **Explicitly blank, or `off`/`none`/`false`/`0`** → durability is switched off deliberately, with no warning
+  - Any failure → ONE greppable warning (`[SCRAPE QUEUE] queue store NOT durable: <reason> (<path>)`) and the engine runs in-memory exactly as it did before. Losing durability never blocks ingest and never crashes the process; `/health/detailed` names the `reason` (see **GET /health/detailed** above)
+  - A file SQLite cannot open is **moved aside** with a timestamp suffix, never deleted, and a fresh store is opened; readable rows are salvaged out of the quarantined copy. The engine stays durable through this
+  - A write that fails at runtime degrades the store to in-memory for the rest of the process and reports `write_failed`. Rows already on disk are not lost — the next start reconciles them. Only a **storage** fault does this (full disk, I/O error, the mount gone read-only); a constraint or statement fault is an engine bug, is reported once, and does **not** cost the process its durability
+  - The queue holds **one row per dedup key**, enforced by a unique index. A row left `leased` by a process that died is CLAIMED by the next enqueue of that key rather than duplicated, so a hard kill cannot cause a second fetch inside the live lease or reset the item's attempt budget
+  - Default: `/var/lib/scraper`
+- `SCRAPE_QUEUE_MAX_MB`: Hard ceiling on the queue file, in MiB (`PRAGMA max_page_count`)
+  - The queue must never be the thing that fills the volume it lives on: a full volume takes the write-ahead log down with it, which is far worse than a refused write
+  - Past the ceiling the store reports `write_failed`, degrades to in-memory for the rest of the process, and keeps serving. Rows already on disk are not lost — the next start reconciles them
+  - The default is roughly a million rows at a few hundred bytes each, orders of magnitude beyond any depth this queue holds, and leaves the 1Gi PVC three quarters free
+  - Unset/blank/invalid/zero/negative → the default, never "no ceiling" and never a ceiling of zero pages
+  - Default: `256`
+- `SCRAPE_QUEUE_LEASE_MS`: How long a dispatched item's lease is held before a restart treats it as abandoned
+  - Bounds the worst case of a `kill -9` MID-navigation: nothing releases that lease but its own expiry. A PLANNED shutdown (SIGTERM) releases every lease, so this only governs hard kills
+  - Unset/invalid → default
+  - Default: `600000` (10 min)
+- `SCRAPE_QUEUE_MAX_RESIDENT`: Cap on items held in the in-memory priority tiers; the overflow is written to disk as `parked` and paged back in as the tiers drain
+  - Bounds both heap and the queue's O(n) work — `addToQueue` scores every item in a lane to place one, and the dispatch scan walks the lanes each time
+  - The default sits ABOVE today's observed depth (normally < 500 at ~520–620 enqueues/hour against a ~600/hour drain), so on today's traffic nothing parks and behaviour is unchanged. It is a ceiling, not a new normal
+  - Unset/invalid → default
+  - Default: `1000`
+- `SCRAPE_QUEUE_MAX_RESIDENT_PER_HOST`: Cap on RESIDENT items for one host
+  - Without it, one store's burst (the crawler enqueues 50 per store) could fill the working set and leave every other store's items on disk behind a host that is itself paced to one request every few seconds
+  - Unset/invalid → default
+  - Default: `250`
 - `CHALLENGE_COOLDOWN_MS`: Per-host cooldown window (ms) after a store serves a Cloudflare challenge/block
   - While a host is cooling, the scrape queue and lookup fan-out skip it without fetching, so repeat challenges don't degrade the egress IP's CF reputation
+  - Open cooldowns are persisted with the queue (`SCRAPE_QUEUE_DIR`) and rehydrated at boot: a restart inside an open window is exactly when the engine is most likely to walk straight back into the challenge it just backed off from
   - Unset/invalid → default; any finite value is clamped to `[60000 (1 min), 86400000 (24 h)]`
   - Default: `1800000` (30 min)
 - `CF_COOKIE_FILE`: Path to the stored-cookie file (hand-minted Cloudflare clearance / session cookies, keyed by host) — see **Stored Cloudflare cookies** below

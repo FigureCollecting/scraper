@@ -28,6 +28,7 @@ import { scraperDebug } from './utils/logger.js';
 import { browserLaneView, initializeBrowserPool, BrowserPool } from './services/genericScraper.js';
 import { bootstrapPlugins, shutdownPlugins } from './services/pluginBootstrap.js';
 import { getScrapeQueue } from './services/scrapeQueue.js';
+import { createQueueStore } from './services/queueStore.js';
 import { ScraperPlugin } from '@figurecollecting/scraper-plugin-contract';
 
 dotenv.config();
@@ -62,6 +63,7 @@ app.use('/', createHealthRoutes({
   getFailureLedger: () => fetchFailureReportView(),
   getSessionCanary: () => sessionCanaryView(),
   getCpuThrottling: () => cpuThrottlingView(),
+  getQueueStore: () => getScrapeQueue().getQueueStoreView(),
 }));
 
 // Scraper routes (no /api prefix for consistency)
@@ -77,6 +79,14 @@ let loadedPlugins: ScraperPlugin[] = [];
 // Discover + register plugins (mounting their routes) before accepting
 // connections, then start the server and initialize the browser pool.
 async function startServer(): Promise<void> {
+  // DURABLE SCRAPE QUEUE (SCRAPE_QUEUE_DIR, default /var/lib/scraper): open the backing store first,
+  // so nothing can be enqueued before there is somewhere to write it. The RECONCILE deliberately
+  // happens later — see the comment at restoreFromStore() below.
+  // Without a writable directory createQueueStore logs one warning and returns the in-memory
+  // fallback: the engine then runs exactly as it did before, minus the durability.
+  const queue = getScrapeQueue();
+  queue.setQueueStore(createQueueStore());
+
   // STORED COOKIES (CF_COOKIE_FILE): load the hand-minted per-host cookie jar BEFORE any fetch can
   // run, and start its mtime poller so a re-minted file (a refreshed Secret) goes live without a
   // restart. Unset env ⇒ the store is disabled and this is a no-op. Never throws.
@@ -88,7 +98,13 @@ async function startServer(): Promise<void> {
     // resolve to a plugin ruleset take the ingest path (when INGEST_BASE_URL
     // is configured). The engine carries no extraction fallback — items with
     // no matching ruleset fail cleanly through the queue's failure handling.
-    getScrapeQueue().setPluginRegistry(registry);
+    queue.setPluginRegistry(registry);
+    // RECONCILE ONLY NOW, and only on a successful bootstrap. A restored item is dispatched as soon
+    // as it lands in a tier, and with no ruleset registry every one would fail EXTRACTION_UNAVAILABLE
+    // — which is TERMINAL, not retryable — so restoring ahead of the registry would delete the very
+    // batch it had just recovered. If bootstrapPlugins threw, we leave the rows on disk for the next
+    // start rather than burning them against an engine that cannot extract anything.
+    queue.restoreFromStore();
     // Mount the cross-store buy-decision search (GET /lookup) now that the registry is populated.
     // Each store fetches via the transport its `searchFetch` declares (http / impersonate / browser);
     // http + impersonate use the engine defaults, and the `browser` transport is backed here by the
@@ -152,6 +168,18 @@ async function gracefulShutdown(signal: string): Promise<void> {
     console.log('[PAGE-SCRAPER] Plugins shut down successfully');
   } catch (error) {
     console.error('[PAGE-SCRAPER] Error shutting down plugins:', error);
+  }
+
+  // Stop the queue and hand every LEASED row back as pending, so a PLANNED rollout loses nothing:
+  // the next process finds the in-flight items ready and re-drives them immediately instead of
+  // waiting out a lease whose holder no longer exists. Then close the store.
+  try {
+    const queue = getScrapeQueue();
+    queue.stop();
+    queue.releaseLeasesForShutdown();
+    queue.closeQueueStore();
+  } catch (error) {
+    console.error('[PAGE-SCRAPER] Error closing the durable scrape queue:', error);
   }
 
   // Stop the stored-cookie file poller (an unref'd timer — this is hygiene, not a shutdown blocker).

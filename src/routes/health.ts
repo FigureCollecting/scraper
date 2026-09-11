@@ -29,6 +29,14 @@
  *     line, or a CDN answering every plate with a block page each read differently here),
  *     `failureLedger: {enabled, reported, failed, suppressed}` (the durable fetch-failure ledger's
  *     reporting counters — a ledger nobody is writing to is otherwise invisible),
+ *     `queueStore: {durable, reason, path, quarantinedPath, lostAtStartup, restoredAt, pending,
+ *     leased, parked}` (the scrape queue's durable backing store — `durable:false` means a restart
+ *     WILL drop queued items, which is invisible from every other reading, and `reason` is what
+ *     separates a deliberate state from a silent failure: `dir_missing` is the INTENDED intermediate
+ *     while the engine ships ahead of its PVC, while `not_writable` / `open_failed` / `write_failed`
+ *     are faults. `pending`/`leased` are the TRUE depth: the in-memory `hot/warm/cold` counts stop at
+ *     the working-set cap while the rest sits on disk, and they stay readable even after a runtime
+ *     write degradation because those rows are still there for the next process),
  *     `sessionCanary: {site, configured, stale, staleSince?, staleReason?}` plus the flat
  *     `mfcSessionStale` boolean it mirrors (the mfc scrape session's entitlement flag — a session
  *     that lost its NSFW entitlement shows up ONLY as 404s that look like missing items, so the
@@ -49,6 +57,7 @@ import type { FetchFailureReportView } from '../services/failureReporter.js';
 import type { ImageCaptureStats } from '../services/images/imageCaptureHook.js';
 import type { SessionCanaryView } from '../services/sessionCanary.js';
 import type { CpuThrottlingView } from '../services/cpuThrottling.js';
+import type { QueueStoreView } from '../services/scrapeQueue.js';
 
 export interface HealthDeps {
   /** The service version (package.json). */
@@ -108,6 +117,14 @@ export interface HealthDeps {
    * and they want opposite remedies. Kernel counters only, nothing secret; never throws.
    */
   getCpuThrottling: () => CpuThrottlingView;
+  /**
+   * The scrape queue's durable backing store (getScrapeQueue().getQueueStoreView()): whether the
+   * queue survives a restart at all, where it is written, when it was last reconciled, and the TRUE
+   * depth (`pending` + `leased`) rather than the in-memory tiers' bounded view. A queue that has
+   * silently fallen back to memory-only looks identical to a durable one from every other reading —
+   * right up to the next repin, which drops the crawler's batch as a coverage hole. Never throws.
+   */
+  getQueueStore: () => QueueStoreView;
 }
 
 export function createHealthRoutes(deps: HealthDeps): Router {
@@ -139,6 +156,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         rawStore: deps.getRawStore(),
         imageCapture: deps.getImageCapture(),
         failureLedger: deps.getFailureLedger(),
+        queueStore: deps.getQueueStore(),
         sessionCanary: deps.getSessionCanary(),
         mfcSessionStale: deps.getSessionCanary().stale,
         cpuThrottling: deps.getCpuThrottling(),
@@ -155,6 +173,9 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         rawStore: deps.getRawStore(),
         imageCapture: deps.getImageCapture(),
         failureLedger: deps.getFailureLedger(),
+        // A queue that is not durable is a coverage risk that outlives the pool outage being
+        // reported here, so this reading survives the degraded response too.
+        queueStore: deps.getQueueStore(),
         sessionCanary: deps.getSessionCanary(),
         mfcSessionStale: deps.getSessionCanary().stale,
         // A throttled pod is exactly the pod whose browser pool is failing, so this

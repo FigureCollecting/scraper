@@ -29,6 +29,12 @@ import { createCapturingFetch, laneOf, ChallengePageError, type CapturingFetch, 
 import { evaluateRecordFetch, RecordFetchStatusError } from './recordFetchGate.js';
 import { observeMfcItemFetch } from './sessionCanary.js';
 import { getChallengeCooldown, ChallengeCooldownError, type ChallengeCooldown } from './challengeCooldown.js';
+import {
+  createMemoryQueueStore,
+  type PersistedQueueItem,
+  type QueueStoreReason,
+  type ScrapeQueueStore,
+} from './queueStore.js';
 import { classifyFetchFailure } from './failureClassifier.js';
 import { createFailureReporterFromEnv, type FetchFailureReport } from './failureReporter.js';
 import { ResidentialEgressUnavailableError } from './residentialEgress.js';
@@ -108,7 +114,16 @@ export interface QueueStats {
   hot: number;
   warm: number;
   cold: number;
+  /**
+   * RESIDENT depth: hot + warm + cold. Unchanged — the fleet health checks and the `queue size: N`
+   * log line both read this, and `parked` is deliberately NOT folded into it.
+   */
   total: number;
+  /**
+   * Items queued but held ON DISK, outside the in-memory working set (the bounded-working-set
+   * overflow). ADDITIVE: `hot + warm + cold` still equals `total`. Always 0 without a durable store.
+   */
+  parked: number;
   processing: number;
   completed: number;
   failed: number;
@@ -247,6 +262,43 @@ function logIngestStats(label: string, stats: IngestRecordStats): void {
   }
 }
 
+/** What a startup reconciliation put back into the queue. */
+export interface QueueRestoreSummary {
+  /** Rows that were resident and undispatched when the process died. */
+  pending: number;
+  /** Rows the dead process had dispatched, whose lease has since expired. */
+  leasedExpired: number;
+  /** Per-host challenge cooldowns still inside their window. */
+  cooldowns: number;
+  /** Rows left on disk, outside the working set. Not lost — paged in as the tiers drain. */
+  parked: number;
+  /** Leases not yet expired. Left held; `refillWorkingSet` reaps them when they do. */
+  stillLeased: number;
+}
+
+/** The `queueStore` block on /health/detailed. */
+export interface QueueStoreView {
+  /** False ⇒ the in-memory fallback: a restart WILL drop queued items. */
+  durable: boolean;
+  /**
+   * WHY `durable` reads the way it does — the field that separates a deliberate configuration from a
+   * silent failure. `dir_missing` is the INTENDED intermediate state while the engine ships ahead of
+   * its PVC; `not_writable` / `open_failed` / `write_failed` are faults. See QueueStoreReason.
+   */
+  reason: QueueStoreReason;
+  /** The file in use, or the one that was ATTEMPTED. Null only when deliberately disabled. */
+  path: string | null;
+  /** Where an unusable file was moved aside to, for manual salvage. Null in every other case. */
+  quarantinedPath: string | null;
+  /** Rows a quarantined file held that could not be carried over. Should be 0; non-zero is an alarm. */
+  lostAtStartup: number;
+  /** ISO-8601 instant of the startup reconciliation, or null if none has run. */
+  restoredAt: string | null;
+  pending: number;
+  leased: number;
+  parked: number;
+}
+
 /** Raw page-fetch capability the ingest path uses (extraction is the plugin's job). */
 type RawPageFetcher = Pick<ScrapingService, 'scrapePage' | 'scrapePageStealth'>;
 
@@ -279,6 +331,39 @@ const RATE_LIMIT = {
   /** Maximum items in queue per priority */
   MAX_QUEUE_SIZE: 10000,
 } as const;
+
+/**
+ * How long a dispatched item's lease is held before a restart treats it as abandoned. It bounds the
+ * worst case of a `kill -9` MID-NAVIGATION: nothing releases that lease but its own expiry, so this
+ * is how long that one item waits to be re-driven. 10 minutes is comfortably above the browser
+ * lane's navigation timeout and well below the hour the crawler takes to come round again.
+ */
+const QUEUE_LEASE_MS_ENV = 'SCRAPE_QUEUE_LEASE_MS';
+const DEFAULT_QUEUE_LEASE_MS = 10 * 60_000;
+
+/**
+ * The cap on RESIDENT items (hot + warm + cold). Above it an enqueue is written to disk as `parked`
+ * and never enters a tier, so depth stops being a heap number — and, just as importantly, stops
+ * being an O(n) scan: `addToQueue` scores every item in the lane to find its insertion point and
+ * `getNextProcessableItem` walks the lanes on every dispatch.
+ *
+ * 1000 is chosen to be ABOVE today's observed depth (normally < 500 at ~520-620 enqueues/hour
+ * against a ~600/hour drain), so on today's traffic NOTHING parks and the behaviour is byte-for-byte
+ * what it is now. Parking is a ceiling, not a new normal.
+ */
+const QUEUE_MAX_RESIDENT_ENV = 'SCRAPE_QUEUE_MAX_RESIDENT';
+const DEFAULT_QUEUE_MAX_RESIDENT = 1000;
+
+/**
+ * The cap on resident items for ONE host. Without it the crawler's 50-per-store burst — or a single
+ * store's backfill — could fill the entire working set, and every other store's items would sit on
+ * disk behind a host that is itself rate-limited to one request every few seconds.
+ */
+const QUEUE_MAX_RESIDENT_PER_HOST_ENV = 'SCRAPE_QUEUE_MAX_RESIDENT_PER_HOST';
+const DEFAULT_QUEUE_MAX_RESIDENT_PER_HOST = 250;
+
+/** How often the expired-lease reaper runs. One query a minute, not one per dispatch. */
+const LEASE_REAP_INTERVAL_MS = 60_000;
 
 /** Env var name for the per-host DEFAULT delay (ms) applied to hosts that declare no rate (D-11). */
 const HOST_BASE_DELAY_ENV = 'SCRAPER_HOST_BASE_DELAY_MS';
@@ -325,6 +410,21 @@ function resolvePositiveEnvMs(envVar: string): number | undefined {
 /** The per-host DEFAULT delay (ms) for UNDECLARED hosts: the env when valid, else the budget-safe 4000 ms. */
 function resolveHostBaseDefaultMs(): number {
   return resolvePositiveEnvMs(HOST_BASE_DELAY_ENV) ?? DEFAULT_HOST_BASE_FLOOR_MS;
+}
+
+/** The lease TTL (ms): the env when valid and positive, else 10 minutes. */
+function resolveLeaseMs(): number {
+  return resolvePositiveEnvMs(QUEUE_LEASE_MS_ENV) ?? DEFAULT_QUEUE_LEASE_MS;
+}
+
+/** The resident cap: the env when valid and positive, else 1000. (Same fail-safe parse as the ms knobs.) */
+function resolveMaxResident(): number {
+  return resolvePositiveEnvMs(QUEUE_MAX_RESIDENT_ENV) ?? DEFAULT_QUEUE_MAX_RESIDENT;
+}
+
+/** The per-host resident cap: the env when valid and positive, else 250. */
+function resolveMaxResidentPerHost(): number {
+  return resolvePositiveEnvMs(QUEUE_MAX_RESIDENT_PER_HOST_ENV) ?? DEFAULT_QUEUE_MAX_RESIDENT_PER_HOST;
 }
 
 /** The absolute per-host MINIMUM (ms) clamping every host: the env when valid, else the safe 1000 ms. */
@@ -552,6 +652,27 @@ export class ScrapeQueue {
   // at the challenge / clean-fetch sites (markStale / markFresh) — never mutated here.
   private cfCookieStore: CfCookieStoreLike | null = null;
 
+  // ==========================================================================
+  // Durable backing store (queueStore.ts)
+  // ==========================================================================
+  // Defaults to the no-op fallback so a unit test — and any process that never wires one — behaves
+  // EXACTLY as the queue does today. The composition root (src/index.ts) swaps in the real SQLite
+  // store at boot via setQueueStore().
+  private store: ScrapeQueueStore = createMemoryQueueStore();
+  /** ISO-8601 of the startup reconciliation, for /health/detailed. Null until restoreFromStore runs. */
+  private storeRestoredAt: string | null = null;
+  /** Mirror of the store's parked count, so the common path never pays a query. Re-synced on change. */
+  private parkedCount = 0;
+  /**
+   * Promise handlers for items PARKED on disk. The item itself lives in SQLite; only the two
+   * closures a caller is actually holding stay in the heap, so a parked item's promise still settles
+   * when it is paged back in. A fire-and-forget enqueue (crawler / initiator) leaves one entry
+   * nobody reads. Keyed by dedup key, like `pendingItems`.
+   */
+  private parkedResolvers: Map<string, QueueItem['resolvers']> = new Map();
+  /** Last expired-lease sweep (epoch ms) — the reaper is throttled to LEASE_REAP_INTERVAL_MS. */
+  private lastLeaseReapAt = 0;
+
   constructor(testMode?: boolean) {
     // Auto-detect test environment if not explicitly set
     this.testMode = testMode ?? (
@@ -574,6 +695,97 @@ export class ScrapeQueue {
     });
 
     console.log(`[SCRAPE QUEUE] Initialized (testMode: ${this.testMode})`);
+  }
+
+  /**
+   * Wire the durable backing store (src/index.ts at boot; a test injects a temp-dir store). Passing
+   * null restores the no-op fallback. Does NOT reconcile — call restoreFromStore() for that, so the
+   * wiring and the (logging, tier-populating) reload stay separable.
+   */
+  setQueueStore(store: ScrapeQueueStore | null): void {
+    this.store = store ?? createMemoryQueueStore();
+    this.parkedCount = this.store.counts().parked;
+    // WRITE-THROUGH for per-host cooldowns. Without this the register would be read back at boot and
+    // never written, so "a restart honours an open cooldown" would hold only in tests — and the very
+    // restart that re-drives the crawler's batch would walk straight back into the challenge the
+    // previous process had just backed off from. Only a DURABLE store is attached: a no-op sink adds
+    // nothing, and detaching keeps the register from holding a store the queue no longer uses.
+    this.getChallengeCooldownStore().setPersistence(this.store.durable ? this.store : null);
+  }
+
+  /** Close the backing store (process shutdown / test teardown). Safe on the fallback. */
+  closeQueueStore(): void {
+    try {
+      this.store.close();
+    } catch {
+      // A store that will not close cleanly must not hold up a shutdown.
+    }
+  }
+
+  /**
+   * STARTUP RECONCILIATION — the whole point of the durable store.
+   *
+   * Reloads rows that were resident when the process died, plus rows it had dispatched whose lease
+   * has since expired (a crash mid-navigation), into the in-memory tiers WITH their attempt counts,
+   * so a restored item neither starts its retry budget over nor is re-driven forever. Unexpired
+   * cooldowns are rehydrated too: a restart inside an open window is exactly when the engine is most
+   * likely to walk straight back into the Cloudflare challenge it just backed off from.
+   *
+   * A no-op (and silent) on the in-memory fallback — there is nothing to reconcile.
+   */
+  restoreFromStore(now: number = Date.now()): QueueRestoreSummary {
+    if (!this.store.durable) {
+      return { pending: 0, leasedExpired: 0, cooldowns: 0, parked: 0, stillLeased: 0 };
+    }
+    const restored = this.store.restore(now);
+    let pending = 0;
+    for (const row of restored.pending) if (this.adoptPersisted(row, true)) pending++;
+    let leasedExpired = 0;
+    for (const row of restored.leasedExpired) if (this.adoptPersisted(row, true)) leasedExpired++;
+    const cooldowns =
+      restored.cooldowns.length > 0 ? this.getChallengeCooldownStore().restore(restored.cooldowns) : 0;
+
+    this.parkedCount = restored.parked;
+    this.storeRestoredAt = new Date(now).toISOString();
+    console.log(
+      `[SCRAPE QUEUE] restored ${pending} pending, ${leasedExpired} leased-expired, ${cooldowns} cooldowns ` +
+        `from ${sanitizeForLog(String(this.store.path))} ` +
+        `(${restored.parked} parked, ${restored.stillLeased} still leased)`
+    ); // lgtm[js/log-injection]
+
+    if (!this.testMode && pending + leasedExpired > 0) {
+      this.startProcessing();
+    }
+    return { pending, leasedExpired, cooldowns, parked: restored.parked, stillLeased: restored.stillLeased };
+  }
+
+  /**
+   * SIGTERM: hand every leased row back as pending. A PLANNED rollout then loses nothing — the next
+   * process finds the in-flight items ready and re-drives them immediately, instead of waiting out a
+   * lease nobody holds. Returns how many were released. Safe on the fallback (0).
+   */
+  releaseLeasesForShutdown(): number {
+    const released = this.store.releaseLeases();
+    if (released > 0) {
+      console.log(`[SCRAPE QUEUE] released ${released} lease(s) for shutdown — they re-drive on the next start`);
+    }
+    return released;
+  }
+
+  /** The `queueStore` block on /health/detailed. Counts come from the store, so they are the TRUE depth. */
+  getQueueStoreView(): QueueStoreView {
+    const counts = this.store.counts();
+    return {
+      durable: this.store.durable,
+      reason: this.store.reason,
+      path: this.store.path,
+      quarantinedPath: this.store.quarantinedPath,
+      lostAtStartup: this.store.lostAtStartup,
+      restoredAt: this.storeRestoredAt,
+      pending: counts.pending,
+      leased: counts.leased,
+      parked: counts.parked,
+    };
   }
 
   /**
@@ -846,6 +1058,30 @@ export class ScrapeQueue {
     // Caller-supplied URL wins; otherwise build the MFC item URL from the key
     const url = options.url ?? `https://myfigurecollection.net/item/${mfcId}`;
 
+    // A row on disk that `pendingItems` does not know about belongs to THIS queue and must be
+    // CLAIMED, not duplicated. Two ways that happens: the item is parked (over the working-set cap),
+    // or a previous process died holding its lease — and nothing else notices the second case,
+    // because the expired-lease reaper only runs inside the dispatch scan and an idle queue never
+    // scans. Minting a new row instead would fetch the item again inside the live lease and hand the
+    // resident copy a fresh retry budget.
+    //
+    // The lookup is UNCONDITIONAL: gating it on `parkedCount > 0` skipped the stale-lease case
+    // entirely, which is the normal case. One indexed SELECT at ~600 enqueues/hour is free, and it
+    // only runs when the key is not already resident — an item being processed RIGHT NOW is still in
+    // `pendingItems`, so this never reclaims work that is on the wire.
+    if (!this.pendingItems.has(mfcId) && this.store.hasKey(mfcId)) {
+      const orphan = this.store.claimKey(mfcId);
+      if (orphan !== null) {
+        this.adoptPersisted(orphan, false);
+        this.parkedCount = this.store.counts().parked;
+        // A claimed orphan lands in `pendingItems`, so the caller below takes the DEDUP path — which
+        // deliberately never starts the loop, because an ordinary dedup joins an item something else
+        // already set running. Nothing set this one running: it came off disk. Kick the loop, or the
+        // row we just reclaimed sits resident and undispatched until some unrelated enqueue arrives.
+        if (!this.testMode) this.startProcessing();
+      }
+    }
+
     // Check for deduplication
     const existingItem = this.pendingItems.get(mfcId);
     if (existingItem) {
@@ -919,9 +1155,20 @@ export class ScrapeQueue {
     // Prevent unhandled rejection crash when items are cancelled
     promise.catch(() => {});
 
-    // Add to appropriate queue
-    this.addToQueue(item);
-    this.pendingItems.set(mfcId, item);
+    // DURABILITY: write the item down before anything can drop it. Over the working-set caps it
+    // goes STRAIGHT to disk as `parked` and never enters a tier — only the caller's promise handlers
+    // stay in the heap, so depth above the cap costs a pair of closures rather than a queue entry
+    // plus an O(n) insertion scan on every subsequent enqueue.
+    if (this.shouldPark(item)) {
+      this.store.put(this.toPersisted(item, 'parked'));
+      this.parkedResolvers.set(mfcId, item.resolvers);
+      this.parkedCount++;
+    } else {
+      // Add to appropriate queue
+      this.addToQueue(item);
+      this.pendingItems.set(mfcId, item);
+      if (this.persistable(item)) this.store.put(this.toPersisted(item, 'pending'));
+    }
 
     // Track per-status totals
     const itemStatus = status || 'wished';
@@ -951,7 +1198,9 @@ export class ScrapeQueue {
    */
   enqueueBulk(items: Array<{ mfcId: string } & EnqueueOptions>): EnqueueResult[] {
     console.log(`[SCRAPE QUEUE] Bulk enqueue: ${items.length} items`);
-    return items.map(({ mfcId, ...options }) => this.enqueue(mfcId, options));
+    // ONE transaction for the whole burst: the crawler enqueues 50 per store, and 50 commits would
+    // be 50 fsyncs where one will do.
+    return this.store.batch(() => items.map(({ mfcId, ...options }) => this.enqueue(mfcId, options)));
   }
 
   /**
@@ -963,6 +1212,7 @@ export class ScrapeQueue {
       warm: this.warmQueue.length,
       cold: this.coldQueue.length,
       total: this.hotQueue.length + this.warmQueue.length + this.coldQueue.length,
+      parked: this.parkedCount,
       processing: this.processingItem ? 1 : 0,
       completed: this.completedCount,
       failed: this.failedCount,
@@ -1014,6 +1264,7 @@ export class ScrapeQueue {
 
     this.removeFromQueue(item);
     this.pendingItems.delete(mfcId);
+    this.store.remove(item.id);
 
     // Reject all waiting promises
     const cancelError = new Error('Request cancelled');
@@ -1036,10 +1287,20 @@ export class ScrapeQueue {
       });
     }
 
+    // Parked items have no QueueItem in the heap, only the caller's handlers — settle those too so
+    // a clear() never leaves a promise hanging on work that no longer exists.
+    if (!this.testMode) {
+      const cancelError = new Error('Queue cleared');
+      this.parkedResolvers.forEach((resolvers) => resolvers.forEach(({ reject }) => reject(cancelError)));
+    }
+
     this.hotQueue = [];
     this.warmQueue = [];
     this.coldQueue = [];
     this.pendingItems.clear();
+    this.parkedResolvers.clear();
+    this.store.clearAll();
+    this.parkedCount = 0;
 
     // Reset per-status counters
     this.statusQueued = { owned: 0, ordered: 0, wished: 0 };
@@ -1076,6 +1337,146 @@ export class ScrapeQueue {
   // ==========================================================================
   // Private Methods - Queue Management
   // ==========================================================================
+
+  // ==========================================================================
+  // Private Methods - Durability
+  // ==========================================================================
+
+  /**
+   * Whether this item may be written to disk. A COOKIE-BEARING item never is: `QueueItem.cookies` is
+   * documented "ephemeral, never stored", the item is bound to a live user session, and the HTTP
+   * caller waiting on it dies with the process anyway. Nothing about such an item reaches the store.
+   */
+  private persistable(item: QueueItem): boolean {
+    return item.cookies === undefined;
+  }
+
+  /** The item's on-disk projection — the persistable SUBSET only (see queueStore.ts). */
+  private toPersisted(item: QueueItem, state: PersistedQueueItem['state']): PersistedQueueItem {
+    return {
+      id: item.id,
+      mfcId: item.mfcId,
+      url: item.url,
+      priority: item.priority,
+      ...(item.status !== undefined ? { status: item.status } : {}),
+      ...(item.sessionId !== undefined ? { sessionId: item.sessionId } : {}),
+      attempts: item.retryCount,
+      maxRetries: item.maxRetries,
+      enqueuedAt: item.queuedAt,
+      state,
+      ...(item.errorType !== undefined ? { lastErrorClass: item.errorType } : {}),
+    };
+  }
+
+  /** Resident depth across the three tiers — what the working-set caps are measured against. */
+  private residentCount(): number {
+    return this.hotQueue.length + this.warmQueue.length + this.coldQueue.length;
+  }
+
+  /** Resident items for one host. Only ever called once the total is already at the per-host cap. */
+  private residentForHost(host: string): number {
+    let n = 0;
+    for (const queue of [this.hotQueue, this.warmQueue, this.coldQueue]) {
+      for (const item of queue) if (this.hostOf(item.url) === host) n++;
+    }
+    return n;
+  }
+
+  /** Hosts already at their resident cap — skipped when paging parked rows back in. */
+  private hostsAtCap(perHost: number): string[] {
+    const counts = new Map<string, number>();
+    for (const queue of [this.hotQueue, this.warmQueue, this.coldQueue]) {
+      for (const item of queue) {
+        const host = this.hostOf(item.url);
+        if (host !== undefined) counts.set(host, (counts.get(host) ?? 0) + 1);
+      }
+    }
+    return [...counts.entries()].filter(([, n]) => n >= perHost).map(([host]) => host);
+  }
+
+  /**
+   * Whether this enqueue must go to disk instead of a tier. Never on the fallback: parking without a
+   * disk behind it would DELETE the item, which is precisely the bug this whole change exists to fix.
+   */
+  private shouldPark(item: QueueItem): boolean {
+    if (!this.store.durable || !this.persistable(item)) return false;
+    const resident = this.residentCount();
+    const perHost = resolveMaxResidentPerHost();
+    if (resident >= resolveMaxResident()) return true;
+    // A single host cannot be over its own cap while the WHOLE working set is under it, so the
+    // O(n) per-host scan below is skipped entirely on the normal path.
+    if (resident < perHost) return false;
+    const host = this.hostOf(item.url);
+    if (host === undefined) return false;
+    return this.residentForHost(host) >= perHost;
+  }
+
+  /**
+   * Rebuild a persisted row as a live QueueItem and put it in a tier. Returns false when the dedup
+   * key is already resident (nothing to adopt). `countStatus` bumps the per-status queued counter —
+   * true on a startup reload (the counters are empty), false when paging a row back in (it was
+   * already counted at its original enqueue).
+   *
+   * A restored item carries NO cookies and NO waiting users: those belonged to a connection that
+   * died with the previous process. Its resolvers come from `parkedResolvers` when this process is
+   * the one that parked it.
+   */
+  private adoptPersisted(row: PersistedQueueItem, countStatus: boolean): boolean {
+    if (this.pendingItems.has(row.mfcId)) return false;
+    const item: QueueItem = {
+      id: row.id,
+      mfcId: row.mfcId,
+      url: row.url,
+      priority: row.priority,
+      ...(row.status !== undefined ? { status: row.status } : {}),
+      ...(row.sessionId !== undefined ? { sessionId: row.sessionId } : {}),
+      retryCount: row.attempts,
+      maxRetries: row.maxRetries,
+      queuedAt: row.enqueuedAt,
+      ...(row.lastErrorClass !== undefined ? { errorType: row.lastErrorClass as ErrorType } : {}),
+      waitingUserIds: [],
+      resolvers: this.parkedResolvers.get(row.mfcId) ?? [],
+    };
+    this.parkedResolvers.delete(row.mfcId);
+    this.addToQueue(item);
+    this.pendingItems.set(row.mfcId, item);
+    if (countStatus) this.statusQueued[row.status ?? 'wished']++;
+    return true;
+  }
+
+  /**
+   * Top the working set back up from disk: reap leases the dead process never released, then page
+   * parked rows into the tiers up to the caps. Returns how many items became resident.
+   *
+   * Called before each dispatch scan. On today's traffic both halves are no-ops — the reaper is
+   * throttled to once a minute and there is nothing parked below the 1000-item cap.
+   */
+  refillWorkingSet(now: number = Date.now()): number {
+    if (!this.store.durable) return 0;
+    let loaded = 0;
+
+    // A lease left by a `kill -9` is released by NOTHING but its own expiry, so this sweep is the
+    // only thing that re-drives an item the dead process was mid-navigation on.
+    if (now - this.lastLeaseReapAt >= LEASE_REAP_INTERVAL_MS) {
+      this.lastLeaseReapAt = now;
+      for (const row of this.store.reapExpiredLeases(now)) {
+        if (this.adoptPersisted(row, false)) loaded++;
+      }
+    }
+
+    if (this.parkedCount > 0) {
+      const budget = resolveMaxResident() - this.residentCount();
+      if (budget > 0) {
+        const skipHosts = this.hostsAtCap(resolveMaxResidentPerHost());
+        for (const row of this.store.pageIn(budget, { skipHosts })) {
+          if (this.adoptPersisted(row, false)) loaded++;
+        }
+        // Re-read rather than decrement: a count that can never drift is worth one COUNT query.
+        this.parkedCount = this.store.counts().parked;
+      }
+    }
+    return loaded;
+  }
 
   private addToQueue(item: QueueItem): void {
     const queue = this.getQueueForPriority(item.priority);
@@ -1144,6 +1545,8 @@ export class ScrapeQueue {
     this.removeFromQueue(item);
     item.priority = newPriority;
     this.addToQueue(item);
+    // Record it, so an item restored after a restart comes back in the lane it was raised to.
+    this.store.setPriority(item.id, newPriority);
 
     console.log(`[SCRAPE QUEUE] Upgraded ${item.mfcId} to ${newPriority}`);
   }
@@ -1676,6 +2079,10 @@ export class ScrapeQueue {
   }
 
   private getNextProcessableItem(now: number): QueueItem | null {
+    // Top the working set up from disk BEFORE scanning: reap leases a dead process never released,
+    // and page in parked rows if the tiers have drained below the caps. A no-op on today's traffic.
+    this.refillWorkingSet(now);
+
     // Try each priority queue in order
     const queues = [this.hotQueue, this.warmQueue, this.coldQueue];
     let pausedCount = 0;
@@ -1726,6 +2133,10 @@ export class ScrapeQueue {
         // This item is processable - remove from queue, record its host dispatch, and return
         queue.splice(i, 1);
         if (host !== undefined) this.hostLastDispatch.set(host, now);
+        // LEASE it: the row stays on disk, marked as in-flight with an expiry. A crash here (the
+        // `kill -9` / OOM case) leaves a lease that the next process's reaper re-drives, instead of
+        // an item that simply vanished mid-navigation.
+        this.store.lease(item.id, now + resolveLeaseMs());
         return item;
       }
     }
@@ -1815,6 +2226,8 @@ export class ScrapeQueue {
 
     // Remove from pending
     this.pendingItems.delete(item.mfcId);
+    // Done: the row goes away, so a restart never re-scrapes what already landed in the spine.
+    this.store.remove(item.id);
 
     // Resolve all waiting promises
     item.resolvers.forEach(({ resolve }) => resolve(result));
@@ -1898,6 +2311,7 @@ export class ScrapeQueue {
 
         // Re-add to queue but it will be skipped until session is resumed
         this.addToQueue(item);
+        this.store.fail(item.id, item.retryCount, errorType);
         return;
       }
 
@@ -1905,6 +2319,7 @@ export class ScrapeQueue {
         // Apply cooldown delay before retry
         console.log(`[SCRAPE QUEUE] Cookie failure - retrying ${item.mfcId} after ${failureResult.cooldownMs / 1000}s cooldown`);
         this.addToQueue(item);
+        this.store.fail(item.id, item.retryCount, errorType);
         return;
       }
     }
@@ -1913,12 +2328,18 @@ export class ScrapeQueue {
     if (shouldRetry(error, errorType, item.retryCount, item.maxRetries)) {
       // Re-queue for retry
       this.addToQueue(item);
+      // Release the lease and write the SPENT attempt back, so a restart mid-retry resumes this
+      // item's budget where it left off instead of granting it a fresh set of attempts.
+      this.store.fail(item.id, item.retryCount, errorType);
       enrichmentLogger.retry(item.mfcId, item.retryCount, item.maxRetries, item.sessionId);
       console.log(`[SCRAPE QUEUE] Retrying ${item.mfcId} (attempt ${item.retryCount + 1})`);
     } else {
       // Give up
       this.failedCount++;
       this.pendingItems.delete(item.mfcId);
+      // Terminal: the row goes away. The fetch_failure ledger (reportTerminalFailure, below) is what
+      // records this permanently — the queue store is a working set, never a history.
+      this.store.remove(item.id);
 
       // Track per-status failure
       const itemStatus = item.status || 'wished';
@@ -2031,6 +2452,7 @@ export function resetScrapeQueue(): void {
   if (queueInstance) {
     queueInstance.stop();
     queueInstance.clear();
+    queueInstance.closeQueueStore();
     queueInstance = null;
   }
   // Also reset session manager for a clean slate
