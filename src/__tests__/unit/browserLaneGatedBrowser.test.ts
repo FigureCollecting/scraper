@@ -14,7 +14,7 @@ import { GATED_BROWSER_MAX_AGE_MS, getHostConcurrency, resetHostConcurrency } fr
  */
 describe('browser lane gated browsers', () => {
   const PROXY = 'socks5://127.0.0.1:1055';
-  let launches: Array<{ browser: jest.Mocked<Browser>; args: string[]; pages: jest.Mocked<Page>[]; contexts: any[] }>;
+  let launches: Array<{ browser: jest.Mocked<Browser>; args: string[]; pages: jest.Mocked<Page>[]; contexts: any[]; gotos?: string[] }>;
   const savedMode = process.env.BROWSER_LAUNCH_MODE;
 
   /** A page whose navigations answer with `headers`, keyed by URL when a map is given. */

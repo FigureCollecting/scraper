@@ -248,8 +248,8 @@ describe('createHealthRoutes — browserLane', () => {
         processTimezone: 'America/Chicago',
         navigationTimeoutMs: 20000,
         gatedBrowsers: [
-          { egress: 'residential', launchedAt: '2026-09-07T12:00:00.000Z', pagesOpen: 1, primedHosts: 2 },
-          { egress: 'direct', launchedAt: '2026-09-07T12:05:00.000Z', pagesOpen: 0, primedHosts: 0 },
+          { egress: 'residential', launchedAt: '2026-09-07T12:00:00.000Z', pagesOpen: 1, primedHosts: 2, lastRelaunchAt: null, relaunchCount: 0, relaunchFailures: 0, drainedTabsAtRelaunch: 0, firstNavigationRetries: 0, firstNavigationRecoveries: 0 },
+          { egress: 'direct', launchedAt: '2026-09-07T12:05:00.000Z', pagesOpen: 0, primedHosts: 0, lastRelaunchAt: null, relaunchCount: 0, relaunchFailures: 0, drainedTabsAtRelaunch: 0, firstNavigationRetries: 0, firstNavigationRecoveries: 0 },
         ],
       }),
     });
@@ -264,8 +264,8 @@ describe('createHealthRoutes — browserLane', () => {
       processTimezone: 'America/Chicago',
       navigationTimeoutMs: 20000,
       gatedBrowsers: [
-        { egress: 'residential', launchedAt: '2026-09-07T12:00:00.000Z', pagesOpen: 1, primedHosts: 2 },
-        { egress: 'direct', launchedAt: '2026-09-07T12:05:00.000Z', pagesOpen: 0, primedHosts: 0 },
+        { egress: 'residential', launchedAt: '2026-09-07T12:00:00.000Z', pagesOpen: 1, primedHosts: 2, lastRelaunchAt: null, relaunchCount: 0, relaunchFailures: 0, drainedTabsAtRelaunch: 0, firstNavigationRetries: 0, firstNavigationRecoveries: 0 },
+        { egress: 'direct', launchedAt: '2026-09-07T12:05:00.000Z', pagesOpen: 0, primedHosts: 0, lastRelaunchAt: null, relaunchCount: 0, relaunchFailures: 0, drainedTabsAtRelaunch: 0, firstNavigationRetries: 0, firstNavigationRecoveries: 0 },
       ],
     });
   });
@@ -292,7 +292,7 @@ describe('createHealthRoutes — browserLane', () => {
         directTimezone: null,
         processTimezone: 'America/Chicago',
         navigationTimeoutMs: 20000,
-        gatedBrowsers: [{ egress: 'residential', launchedAt: '2026-09-07T12:00:00.000Z', pagesOpen: 0, primedHosts: 1 }],
+        gatedBrowsers: [{ egress: 'residential', launchedAt: '2026-09-07T12:00:00.000Z', pagesOpen: 0, primedHosts: 1, lastRelaunchAt: null, relaunchCount: 0, relaunchFailures: 0, drainedTabsAtRelaunch: 0, firstNavigationRetries: 0, firstNavigationRecoveries: 0 }],
       }),
     });
 
