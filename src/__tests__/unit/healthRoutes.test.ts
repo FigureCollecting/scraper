@@ -36,6 +36,7 @@ const build = (over: Partial<HealthDeps> = {}) => {
     getImageCapture: () => NO_IMAGE_CAPTURE,
     getSessionCanary: () => ({ site: 'mfc', configured: false, stale: false }),
     getCpuThrottling: () => ({ available: false }),
+    getQueueStore: () => ({ durable: false, path: null, restoredAt: null, pending: 0, leased: 0, parked: 0 }),
     ...over,
   }));
   return app;
@@ -571,5 +572,54 @@ describe('createHealthRoutes — cpuThrottling', () => {
     // A pod that is being throttled is exactly the pod whose browser pool is failing,
     // so this reading has to survive the degraded response that reports it.
     expect(res.body.cpuThrottling).toEqual(THROTTLED);
+  });
+});
+
+
+/**
+ * The scrape queue's durable backing store. A queue that has silently fallen back to memory-only
+ * reads IDENTICALLY to a durable one from every other health field — right up to the next repin,
+ * which drops the crawler's in-flight batch as a coverage hole. So `durable` has to be named, and
+ * the TRUE depth (`pending` + `leased`, which live on disk) has to be readable beside the in-memory
+ * `hot/warm/cold` counts that stop at the working-set cap.
+ */
+describe('createHealthRoutes — queueStore', () => {
+  const DURABLE = {
+    durable: true,
+    path: '/var/lib/scraper/scrape-queue.db',
+    restoredAt: '2026-09-11T06:00:00.000Z',
+    pending: 412,
+    leased: 1,
+    parked: 0,
+  };
+
+  it('publishes the queue store block on GET /health/detailed', async () => {
+    const res = await request(build({ getQueueStore: () => DURABLE })).get('/health/detailed');
+    expect(res.status).toBe(200);
+    expect(res.body.queueStore).toEqual(DURABLE);
+  });
+
+  it('reports the in-memory fallback honestly rather than omitting the block', async () => {
+    const res = await request(build()).get('/health/detailed');
+    expect(res.body.queueStore).toEqual({
+      durable: false,
+      path: null,
+      restoredAt: null,
+      pending: 0,
+      leased: 0,
+      parked: 0,
+    });
+  });
+
+  it('keeps queueStore on the degraded (500) response', async () => {
+    const app = build({
+      getBrowserPoolHealth: async () => {
+        throw new Error('pool down');
+      },
+      getQueueStore: () => DURABLE,
+    });
+    const res = await request(app).get('/health/detailed');
+    expect(res.status).toBe(500);
+    expect(res.body.queueStore).toEqual(DURABLE);
   });
 });
