@@ -4,7 +4,7 @@ import type { Browser, Page } from 'puppeteer';
 import { BrowserPool } from '../../services/genericScraper';
 import { createScrapingService } from '../../services/engineServices/scrapingService';
 import { clearChallengeGates } from '../../services/browserChallenge';
-import { getHostConcurrency, resetHostConcurrency } from '../../services/gatedBrowsers';
+import { GATED_BROWSER_MAX_AGE_MS, getHostConcurrency, resetHostConcurrency } from '../../services/gatedBrowsers';
 
 /**
  * A challenge-gated fetch is a TAB in a dedicated per-egress browser's DEFAULT context — not a page
@@ -14,7 +14,7 @@ import { getHostConcurrency, resetHostConcurrency } from '../../services/gatedBr
  */
 describe('browser lane gated browsers', () => {
   const PROXY = 'socks5://127.0.0.1:1055';
-  let launches: Array<{ browser: jest.Mocked<Browser>; args: string[]; pages: jest.Mocked<Page>[]; contexts: any[] }>;
+  let launches: Array<{ browser: jest.Mocked<Browser>; args: string[]; pages: jest.Mocked<Page>[]; contexts: any[]; gotos?: string[] }>;
   const savedMode = process.env.BROWSER_LAUNCH_MODE;
 
   /** A page whose navigations answer with `headers`, keyed by URL when a map is given. */
@@ -62,6 +62,9 @@ describe('browser lane gated browsers', () => {
           return context;
         }),
         close: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
+        process: jest.fn(() => ({ pid: 424242 })),
+        cookies: jest.fn<(...a: any[]) => any>().mockResolvedValue([]),
+        setCookie: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
         connected: true,
       } as unknown as jest.Mocked<Browser>;
       launches.push(record);
@@ -227,6 +230,9 @@ describe('browser lane gated browsers', () => {
         }),
         createBrowserContext: jest.fn<(...a: any[]) => any>(),
         close: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
+        process: jest.fn(() => ({ pid: 424242 })),
+        cookies: jest.fn<(...a: any[]) => any>().mockResolvedValue([]),
+        setCookie: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
         connected: true,
       } as unknown as jest.Mocked<Browser>;
     });
@@ -276,6 +282,9 @@ describe('browser lane gated browsers', () => {
         }),
         createBrowserContext: jest.fn<(...a: any[]) => any>(),
         close: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
+        process: jest.fn(() => ({ pid: 424242 })),
+        cookies: jest.fn<(...a: any[]) => any>().mockResolvedValue([]),
+        setCookie: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
         connected: true,
       } as unknown as jest.Mocked<Browser>;
       launches.push(record);
@@ -287,6 +296,185 @@ describe('browser lane gated browsers', () => {
     const lastInterstitial = events.lastIndexOf('title:Just a moment...');
     expect(lastInterstitial).toBeGreaterThan(-1);
     expect(events.indexOf(`goto:${target}`)).toBeGreaterThan(lastInterstitial);
+  });
+
+  /**
+   * A launch whose Nth tab shows an interstitial that NEVER clears, and whose other tabs are clean.
+   * `gotos` records every navigation the browser was asked for, in order.
+   */
+  const wireChallengedTabs = (challenged: (nth: number) => boolean): void => {
+    launches = [];
+    jest.mocked(puppeteer.launch).mockImplementation(async (config: any) => {
+      const record: any = { args: config?.args ?? [], pages: [], contexts: [], gotos: [] };
+      let opened = 0;
+      record.browser = {
+        newPage: jest.fn<(...a: any[]) => any>().mockImplementation(async () => {
+          const stuck = challenged(opened++);
+          const page = newMockPage({ 'content-type': 'text/html' });
+          jest.mocked(page.title).mockImplementation(async () => (stuck ? 'Just a moment...' : 'Lucy'));
+          jest.mocked(page.content).mockResolvedValue(stuck ? '<html>interstitial</html>' : '<html>store</html>');
+          jest.mocked(page.goto).mockImplementation(async (url: any) => {
+            record.gotos.push(String(url));
+            return {
+              status: () => 200,
+              url: () => String(url),
+              headers: () => (stuck
+                ? { 'content-type': 'text/html', 'cf-mitigated': 'challenge' }
+                : { 'content-type': 'text/html' }),
+            } as any;
+          });
+          record.pages.push(page);
+          return page;
+        }),
+        createBrowserContext: jest.fn<(...a: any[]) => any>(),
+        close: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
+        process: jest.fn(() => ({ pid: 424242 })),
+        cookies: jest.fn<(...a: any[]) => any>().mockResolvedValue([]),
+        setCookie: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
+        connected: true,
+      } as unknown as jest.Mocked<Browser>;
+      launches.push(record);
+      return record.browser;
+    });
+  };
+
+  const SURUGAYA = 'https://www.suruga-ya.jp/product/detail/602304976';
+
+  /**
+   * THE 2026-09-11 DEFECT. A fresh gated browser holds no clearance, so the first navigation for a
+   * host that declares NO prime URL (suruga-ya.jp, hobby-genki, sugotoys all log `primed=false`) has
+   * to earn one inline. Measured in production at 00:39:41, 86 s after a relaunch, that navigation
+   * sat on the interstitial past the 30 s budget: the lane reported a challenge page, a 30-minute
+   * host cooldown opened, 15 queued items were dropped — and the SAME browser instance served the
+   * host in 6 s as soon as the cooldown expired. One retry is what stands between those outcomes.
+   */
+  it('retries the FIRST navigation for a host once when its challenge never clears', async () => {
+    wireChallengedTabs((nth) => nth === 0);
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    jest.useFakeTimers();
+    try {
+      const service = createScrapingService();
+
+      const fetching = service.browserFetch(SURUGAYA, { challengeGated: true, proxyServer: PROXY });
+      await jest.advanceTimersByTimeAsync(40_000);
+      const body = await fetching;
+
+      // The RETRY's document is what the caller gets, not the interstitial the first tab captured.
+      expect(body).toBe('<html>store</html>');
+      expect(gatedLaunch().browser.newPage).toHaveBeenCalledTimes(2);
+      expect(gatedLaunch().gotos).toEqual([SURUGAYA, SURUGAYA]);
+      expect(BrowserPool.gatedLaneStats('residential').firstNavigationRetries).toBe(1);
+      expect(BrowserPool.gatedLaneStats('residential').firstNavigationRecoveries).toBe(1);
+      expect(warnSpy.mock.calls.map((call) => String(call[0]))
+        .some((line) => line.includes('first navigation for www.suruga-ya.jp'))).toBe(true);
+    } finally {
+      jest.useRealTimers();
+      warnSpy.mockRestore();
+    }
+  });
+
+  /**
+   * The grace is ONE SHOT per (instance, host). A host that has already navigated on this browser
+   * has a clearance or has lost it for a reason, and doubling every later failing fetch is exactly
+   * the retry storm the host cooldown exists to prevent.
+   */
+  it('does not retry a challenge once the host has already navigated on this browser', async () => {
+    wireChallengedTabs((nth) => nth > 0);
+    jest.useFakeTimers();
+    try {
+      const service = createScrapingService();
+
+      await service.browserFetch(SURUGAYA, { challengeGated: true, proxyServer: PROXY });
+      expect(BrowserPool.gatedLaneStats('residential').firstNavigationRetries).toBe(0);
+
+      const second = service.browserFetch(SURUGAYA, { challengeGated: true, proxyServer: PROXY });
+      await jest.advanceTimersByTimeAsync(40_000);
+      expect(await second).toBe('<html>interstitial</html>');
+
+      expect(gatedLaunch().browser.newPage).toHaveBeenCalledTimes(2);
+      expect(BrowserPool.gatedLaneStats('residential').firstNavigationRetries).toBe(0);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  /**
+   * THE SELF-HEAL SIGNAL, end to end. On 2026-09-08 the residential browser answered every
+   * navigation with a timeout for 102 minutes and recovered only when a human restarted the pod. A
+   * navigation that times out is the browser failing; anything downstream of a page it did fetch is
+   * not, and recycling a cleared session over a ruleset bug would be the old timer in a new hat.
+   */
+  it('counts a navigation timeout against the lane, but not a failure downstream of a fetched page', async () => {
+    const service = createScrapingService();
+
+    const timeout = Object.assign(new Error('Navigation timeout of 45000 ms exceeded'), { name: 'TimeoutError' });
+    jest.mocked(puppeteer.launch).mockImplementationOnce(async (config: any) => {
+      const record: any = { args: config?.args ?? [], pages: [], contexts: [] };
+      record.browser = {
+        newPage: jest.fn<(...a: any[]) => any>().mockImplementation(async () => {
+          const page = newMockPage({ 'content-type': 'text/html' });
+          jest.mocked(page.goto).mockRejectedValue(timeout);
+          record.pages.push(page);
+          return page;
+        }),
+        createBrowserContext: jest.fn<(...a: any[]) => any>(),
+        close: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
+        process: jest.fn(() => ({ pid: 424242 })),
+        cookies: jest.fn<(...a: any[]) => any>().mockResolvedValue([]),
+        setCookie: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
+        connected: true,
+      } as unknown as jest.Mocked<Browser>;
+      launches.push(record);
+      return record.browser;
+    });
+
+    await expect(service.browserFetch('https://hobby-genki.com/item/1', { challengeGated: true })).rejects.toThrow(/Navigation timeout/);
+    expect(BrowserPool.gatedLaneStats('direct').navFailureStreak).toBe(1);
+
+    // A page that WAS fetched, whose body read then threw: the browser is fine, so the streak is not.
+    const entry = await BrowserPool.getGatedBrowser('direct');
+    jest.mocked(entry.browser.newPage).mockImplementation(async () => {
+      const page = newMockPage({ 'content-type': 'text/html' });
+      jest.mocked(page.content).mockRejectedValue(new Error('ruleset blew up'));
+      return page;
+    });
+    await expect(service.browserFetch('https://hobby-genki.com/item/2', { challengeGated: true })).rejects.toThrow('ruleset blew up');
+    expect(BrowserPool.gatedLaneStats('direct').navFailureStreak).toBe(1);
+  });
+
+  /**
+   * THE RELAUNCH PROOF, end to end. A replacement holds no clearance for any host, so before it may
+   * carry traffic it re-primes every host the OUTGOING browser had primed and waits that challenge
+   * out. Until it passes, the aged browser — which demonstrably works — keeps serving.
+   */
+  it('proves a relaunched browser by re-priming each primed host before it carries traffic', async () => {
+    const primeUrl = 'https://www.anitoysgk.com';
+    const service = createScrapingService();
+    const gotos = (index: number): string[] =>
+      launches[index].pages.flatMap((page) => jest.mocked(page.goto).mock.calls.map((call) => String(call[0])));
+
+    await service.browserFetch('https://www.anitoysgk.com/lucy.html', { challengeGated: true, proxyServer: PROXY, primeUrl });
+    expect(launches).toHaveLength(1);
+
+    const aged = await BrowserPool.getGatedBrowser('residential', PROXY);
+    aged.launchedAt = Date.now() - GATED_BROWSER_MAX_AGE_MS - 1;
+
+    // This fetch is still served by the AGED browser; the replacement is built and proven beside it.
+    await service.browserFetch('https://www.anitoysgk.com/rebecca.html', { challengeGated: true, proxyServer: PROXY, primeUrl });
+    expect(gotos(0)).toContain('https://www.anitoysgk.com/rebecca.html');
+
+    await BrowserPool.settleGatedRelaunches();
+    await BrowserPool.settleGatedRetirements();
+
+    // The replacement's ONLY navigation so far is the proof's prime — it has carried no fetch yet.
+    expect(launches).toHaveLength(2);
+    expect(gotos(1)).toEqual([primeUrl]);
+    expect(aged.browser.close).toHaveBeenCalledTimes(1);
+    expect(BrowserPool.gatedLaneStats('residential').relaunchCount).toBe(1);
+
+    // And because the proof primed it, the next fetch rides the new browser without re-priming.
+    await service.browserFetch('https://www.anitoysgk.com/nico.html', { challengeGated: true, proxyServer: PROXY, primeUrl });
+    expect(gotos(1)).toEqual([primeUrl, 'https://www.anitoysgk.com/nico.html']);
   });
 
   /** A gate LEARNED from a `cf-mitigated` response moves the host onto the gated browser next time. */
@@ -328,6 +516,9 @@ describe('browser lane gated browsers', () => {
         }),
         createBrowserContext: jest.fn<(...a: any[]) => any>(),
         close: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
+        process: jest.fn(() => ({ pid: 424242 })),
+        cookies: jest.fn<(...a: any[]) => any>().mockResolvedValue([]),
+        setCookie: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
         connected: true,
       } as unknown as jest.Mocked<Browser>;
       launches.push(record);
@@ -358,6 +549,9 @@ describe('browser lane gated browsers', () => {
         }),
         createBrowserContext: jest.fn<(...a: any[]) => any>(),
         close: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
+        process: jest.fn(() => ({ pid: 424242 })),
+        cookies: jest.fn<(...a: any[]) => any>().mockResolvedValue([]),
+        setCookie: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
         connected: true,
       } as unknown as jest.Mocked<Browser>;
       launches.push(record);

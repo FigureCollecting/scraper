@@ -219,12 +219,29 @@ async function clearanceSettled(page: ChallengeAwarePage, host: string | undefin
 }
 
 /**
+ * How a clearance wait ended.
+ *
+ *   none       — no challenge was ever shown; this was an ordinary navigation.
+ *   cleared    — a challenge was shown AND the store's own document replaced it inside the budget.
+ *   unresolved — a challenge was shown and the budget ran out on the interstitial.
+ *
+ * The distinction the boolean could not make is `cleared` vs `unresolved`, and it is the one that
+ * decides whether a host gets a 30-minute cooldown: measured in production 2026-09-11, an
+ * `unresolved` first navigation on a freshly relaunched browser was 30 s short of a clearance that
+ * did land, and the cooldown it opened cost 15 items and an hour of that store's queue.
+ */
+export type ChallengeOutcome = 'none' | 'cleared' | 'unresolved';
+
+/**
  * Wait out a Cloudflare challenge on a freshly-navigated page.
  *
  * @returns whether a challenge was seen at all (true ⇒ the host is now marked gated, whether or not
  *          the challenge finished clearing). A timeout is NOT an error: the caller captures whatever
  *          rendered — exactly as the readiness wait does — with one warning, so a store that starts
  *          hard-blocking degrades to a bad capture instead of a thrown fetch and a retry storm.
+ *
+ * Callers that must tell a cleared challenge from an abandoned one use
+ * {@link awaitChallengeClearanceOutcome}; this stays the boolean door every existing caller reads.
  */
 export async function awaitChallengeClearance(
   page: ChallengeAwarePage,
@@ -232,11 +249,21 @@ export async function awaitChallengeClearance(
   url: string,
   options: { timeoutMs?: number; pollMs?: number } = {},
 ): Promise<boolean> {
+  return (await awaitChallengeClearanceOutcome(page, response, url, options)) !== 'none';
+}
+
+/** The same wait, reporting WHICH way it ended (see {@link ChallengeOutcome}). */
+export async function awaitChallengeClearanceOutcome(
+  page: ChallengeAwarePage,
+  response: ChallengeAwareResponse | null | undefined,
+  url: string,
+  options: { timeoutMs?: number; pollMs?: number } = {},
+): Promise<ChallengeOutcome> {
   const headerSaysChallenge = isChallengeResponse(response?.headers?.());
   const title = await page.title().catch(() => '');
   const showsChallenge = async (currentTitle: string): Promise<boolean> =>
     isChallengeTitle(currentTitle) || await hasChallengeMarkers(page);
-  if (!headerSaysChallenge && !(await showsChallenge(title))) return false;
+  if (!headerSaysChallenge && !(await showsChallenge(title))) return 'none';
 
   const host = challengeHost(url);
   if (host) markChallengeGated(host);
@@ -252,7 +279,7 @@ export async function awaitChallengeClearance(
       // eslint-disable-next-line no-console
       // lgtm[js/log-injection] — url is caller-influenced; sanitize before logging
       console.warn(`[CHALLENGE] ${sanitizeForLog(url)} was still showing the Cloudflare interstitial after ${timeoutMs}ms — capturing whatever rendered`);
-      return true;
+      return 'unresolved';
     }
     await sleep(pollMs);
     current = await page.title().catch(() => current);
@@ -263,7 +290,7 @@ export async function awaitChallengeClearance(
   // post-challenge document is a navigation the caller's `goto` never waited on, so wait for it
   // here — until the HTML is parsed (`readyState` past `loading`), bounded by the same deadline.
   await awaitDocumentParsed(page, deadline, pollMs);
-  return true;
+  return 'cleared';
 }
 
 /** Poll `document.readyState` until the document is past `loading`, or the deadline passes. */
