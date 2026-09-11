@@ -29,7 +29,12 @@ import { createCapturingFetch, laneOf, ChallengePageError, type CapturingFetch, 
 import { evaluateRecordFetch, RecordFetchStatusError } from './recordFetchGate.js';
 import { observeMfcItemFetch } from './sessionCanary.js';
 import { getChallengeCooldown, ChallengeCooldownError, type ChallengeCooldown } from './challengeCooldown.js';
-import { createMemoryQueueStore, type PersistedQueueItem, type ScrapeQueueStore } from './queueStore.js';
+import {
+  createMemoryQueueStore,
+  type PersistedQueueItem,
+  type QueueStoreReason,
+  type ScrapeQueueStore,
+} from './queueStore.js';
 import { classifyFetchFailure } from './failureClassifier.js';
 import { createFailureReporterFromEnv, type FetchFailureReport } from './failureReporter.js';
 import { ResidentialEgressUnavailableError } from './residentialEgress.js';
@@ -275,7 +280,18 @@ export interface QueueRestoreSummary {
 export interface QueueStoreView {
   /** False ⇒ the in-memory fallback: a restart WILL drop queued items. */
   durable: boolean;
+  /**
+   * WHY `durable` reads the way it does — the field that separates a deliberate configuration from a
+   * silent failure. `dir_missing` is the INTENDED intermediate state while the engine ships ahead of
+   * its PVC; `not_writable` / `open_failed` / `write_failed` are faults. See QueueStoreReason.
+   */
+  reason: QueueStoreReason;
+  /** The file in use, or the one that was ATTEMPTED. Null only when deliberately disabled. */
   path: string | null;
+  /** Where an unusable file was moved aside to, for manual salvage. Null in every other case. */
+  quarantinedPath: string | null;
+  /** Rows a quarantined file held that could not be carried over. Should be 0; non-zero is an alarm. */
+  lostAtStartup: number;
   /** ISO-8601 instant of the startup reconciliation, or null if none has run. */
   restoredAt: string | null;
   pending: number;
@@ -755,7 +771,10 @@ export class ScrapeQueue {
     const counts = this.store.counts();
     return {
       durable: this.store.durable,
+      reason: this.store.reason,
       path: this.store.path,
+      quarantinedPath: this.store.quarantinedPath,
+      lostAtStartup: this.store.lostAtStartup,
       restoredAt: this.storeRestoredAt,
       pending: counts.pending,
       leased: counts.leased,

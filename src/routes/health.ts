@@ -29,10 +29,14 @@
  *     line, or a CDN answering every plate with a block page each read differently here),
  *     `failureLedger: {enabled, reported, failed, suppressed}` (the durable fetch-failure ledger's
  *     reporting counters — a ledger nobody is writing to is otherwise invisible),
- *     `queueStore: {durable, path, restoredAt, pending, leased, parked}` (the scrape queue's durable
- *     backing store — `durable:false` means a restart WILL drop queued items, which is invisible from
- *     every other reading, and `pending`/`leased` are the TRUE depth: the in-memory `hot/warm/cold`
- *     counts stop at the working-set cap while the rest sits on disk),
+ *     `queueStore: {durable, reason, path, quarantinedPath, lostAtStartup, restoredAt, pending,
+ *     leased, parked}` (the scrape queue's durable backing store — `durable:false` means a restart
+ *     WILL drop queued items, which is invisible from every other reading, and `reason` is what
+ *     separates a deliberate state from a silent failure: `dir_missing` is the INTENDED intermediate
+ *     while the engine ships ahead of its PVC, while `not_writable` / `open_failed` / `write_failed`
+ *     are faults. `pending`/`leased` are the TRUE depth: the in-memory `hot/warm/cold` counts stop at
+ *     the working-set cap while the rest sits on disk, and they stay readable even after a runtime
+ *     write degradation because those rows are still there for the next process),
  *     `sessionCanary: {site, configured, stale, staleSince?, staleReason?}` plus the flat
  *     `mfcSessionStale` boolean it mirrors (the mfc scrape session's entitlement flag — a session
  *     that lost its NSFW entitlement shows up ONLY as 404s that look like missing items, so the

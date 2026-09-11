@@ -20,6 +20,8 @@ import * as path from 'path';
 import {
   createQueueStore,
   openQueueStore,
+  resolveQueueDir,
+  QUEUE_DB_FILE,
   type PersistedQueueItem,
   type ScrapeQueueStore,
 } from '../../services/queueStore';
@@ -308,52 +310,214 @@ describe('queueStore — bounded working set (parked rows)', () => {
   });
 });
 
-describe('queueStore — in-memory fallback', () => {
-  const warn = () => (console.warn as unknown as jest.Mock).mock.calls.map((c) => String(c[0]));
+/**
+ * THE FALLBACK IS LOUD. `durable:false` on its own is ambiguous — the intended intermediate state
+ * (the engine shipped ahead of its PVC) reads identically to a permissions bug. Each condition below
+ * therefore carries a NAMED reason, the path that was attempted, and exactly one greppable line:
+ *
+ *   [SCRAPE QUEUE] queue store NOT durable: <reason> (<path>)
+ */
+describe('queueStore — fallback reasons', () => {
+  const warnings = () =>
+    (console.warn as unknown as jest.Mock).mock.calls
+      .map((c) => String(c[0]))
+      .filter((m) => m.includes('[SCRAPE QUEUE]'));
 
-  it('falls back (never throws) when the directory does not exist', () => {
-    const store = createQueueStore({ dir: path.join(tmpDir(), 'does', 'not', 'exist') });
+  it('disabled — SCRAPE_QUEUE_DIR is blank', () => {
+    process.env.SCRAPE_QUEUE_DIR = '';
+    const store = createQueueStore();
     stores.push(store);
 
     expect(store.durable).toBe(false);
+    expect(store.reason).toBe('disabled');
     expect(store.path).toBeNull();
-    // Every operation stays a safe no-op so ingest is never blocked.
-    expect(() => store.put(ITEM())).not.toThrow();
-    expect(store.counts()).toEqual({ pending: 0, leased: 0, parked: 0 });
-    expect(store.restore(1)).toMatchObject({ pending: [], leasedExpired: [], cooldowns: [] });
-    expect(store.pageIn(10)).toEqual([]);
-    expect(store.releaseLeases()).toBe(0);
+    // Deliberate: an operator who switched it off does not need a warning about it.
+    expect(warnings()).toHaveLength(0);
   });
 
-  it('falls back when the directory is not writable', () => {
+  it('disabled — SCRAPE_QUEUE_DIR is `off`', () => {
+    for (const value of ['off', 'OFF', 'none', 'false', '0']) {
+      process.env.SCRAPE_QUEUE_DIR = value;
+      const store = createQueueStore();
+      stores.push(store);
+      expect(store.reason).toBe('disabled');
+    }
+  });
+
+  it('UNSET is not disabled — it falls through to the default mount', () => {
+    delete process.env.SCRAPE_QUEUE_DIR;
+    // An unset variable in production is a manifest that has not caught up, not a switch-off: it
+    // must still TRY the standard mount, and report dir_missing if it is not there.
+    expect(resolveQueueDir()).toBe('/var/lib/scraper');
+  });
+
+  it('dir_missing — the PVC is not mounted yet (the intended intermediate state)', () => {
+    const missing = path.join(tmpDir(), 'not', 'mounted');
+    const store = createQueueStore({ dir: missing });
+    stores.push(store);
+
+    expect(store.durable).toBe(false);
+    expect(store.reason).toBe('dir_missing');
+    // The path is REPORTED even though nothing was opened — it is what the operator goes and looks at.
+    expect(store.path).toBe(path.join(missing, 'scrape-queue.db'));
+    expect(warnings()).toHaveLength(1);
+    expect(warnings()[0]).toContain('queue store NOT durable: dir_missing');
+    expect(warnings()[0]).toContain(missing);
+  });
+
+  it('not_writable — the mount exists but this uid/gid cannot write it', () => {
     const dir = tmpDir();
     fs.chmodSync(dir, 0o555);
     try {
       const store = createQueueStore({ dir });
       stores.push(store);
+
       expect(store.durable).toBe(false);
+      expect(store.reason).toBe('not_writable');
+      expect(store.path).toBe(path.join(dir, 'scrape-queue.db'));
+      expect(warnings()).toHaveLength(1);
+      expect(warnings()[0]).toContain('queue store NOT durable: not_writable');
     } finally {
       fs.chmodSync(dir, 0o755);
     }
   });
 
-  it('logs EXACTLY ONE warning naming the path when it falls back', () => {
-    const missing = path.join(tmpDir(), 'nope');
-    const store = createQueueStore({ dir: missing });
+  it('open_failed_recovered — an unusable file is moved ASIDE, never deleted, and a fresh store opens', () => {
+    const dir = tmpDir();
+    const file = path.join(dir, 'scrape-queue.db');
+    fs.writeFileSync(file, 'this is not a sqlite database at all');
+
+    const store = createQueueStore({ dir });
     stores.push(store);
 
-    const warnings = warn().filter((m) => m.includes('[SCRAPE QUEUE]'));
-    expect(warnings).toHaveLength(1);
-    expect(warnings[0]).toContain(missing);
-    expect(warnings[0]).toContain('in-memory');
+    // STILL DURABLE — the queue keeps its durability through a corrupt file.
+    expect(store.durable).toBe(true);
+    expect(store.reason).toBe('open_failed_recovered');
+    expect(store.quarantinedPath).toMatch(/scrape-queue\.db\.corrupt-/);
+    expect(store.lostAtStartup).toBe(0);
+
+    // The bad bytes are KEPT. They may be the only copy of what was queued.
+    expect(fs.existsSync(store.quarantinedPath as string)).toBe(true);
+    expect(fs.readFileSync(store.quarantinedPath as string, 'utf8')).toBe('this is not a sqlite database at all');
+    // And the fresh store works.
+    store.put(ITEM());
+    expect(store.counts().pending).toBe(1);
   });
 
-  it('opens durably when the directory IS writable', () => {
+  it('open_failed_recovered — carries readable rows over from the quarantined file', () => {
+    const dir = tmpDir();
+    const first = open(dir);
+    first.put(ITEM({ id: 'a', mfcId: 'a', url: 'https://s.example/a' }));
+    first.put(ITEM({ id: 'b', mfcId: 'b', url: 'https://s.example/b' }));
+    first.lease('b', 60_000);
+    first.saveCooldown({ host: 'cool.example', until: 900_000, reason: 'challenge page', openedAt: 1_000 });
+    first.close();
+
+    // The FIRST open fails on a WRITE (the journal-mode pragma), so a main database that READS
+    // perfectly well can still land in recovery — a file that lost its write permission is exactly
+    // that case. This is why salvage opens the quarantined file read-only instead of giving up.
+    fs.chmodSync(path.join(dir, 'scrape-queue.db'), 0o444);
+
+    const store = createQueueStore({ dir });
+    stores.push(store);
+    const restored = store.restore(50_000);
+
+    expect(store.lostAtStartup).toBe(0);
+    // Both items are back, and the leased one comes over DRIVABLE — no process holds that lease now.
+    expect(restored.pending.map((i) => i.id).sort()).toEqual(['a', 'b']);
+    expect(restored.cooldowns.map((c) => c.host)).toEqual(['cool.example']);
+  });
+
+  it('quarantines a DIRECTORY sitting where the db file belongs, and recovers', () => {
+    const dir = tmpDir();
+    fs.mkdirSync(path.join(dir, 'scrape-queue.db'));
+
+    const store = createQueueStore({ dir });
+    stores.push(store);
+
+    // Moving the obstruction aside and starting fresh is the right answer here too — and it is still
+    // moved, never removed.
+    expect(store.durable).toBe(true);
+    expect(store.reason).toBe('open_failed_recovered');
+    expect(fs.existsSync(store.quarantinedPath as string)).toBe(true);
+  });
+
+  it('open_failed — falls back in-memory when the file cannot even be moved aside', () => {
+    const dir = tmpDir();
+    const at = Date.parse('2026-09-11T12:00:00.000Z');
+    // SQLite cannot open a directory as a database...
+    fs.mkdirSync(path.join(dir, 'scrape-queue.db'));
+    // ...and the quarantine rename lands on a NON-EMPTY directory, which fails with ENOTEMPTY. So
+    // the bad path cannot be moved out of the way and there is nowhere for a fresh store to go.
+    const target = path.join(dir, `scrape-queue.db.corrupt-${new Date(at).toISOString().replace(/[:.]/g, '-')}`);
+    fs.mkdirSync(target);
+    fs.writeFileSync(path.join(target, 'occupied'), 'x');
+
+    const store = createQueueStore({ dir, now: () => at });
+    stores.push(store);
+
+    expect(store.durable).toBe(false);
+    expect(store.reason).toBe('open_failed');
+    expect(store.path).toBe(path.join(dir, 'scrape-queue.db'));
+    expect(warnings().some((w) => w.includes('queue store NOT durable: open_failed'))).toBe(true);
+  });
+
+  it('write_failed — a full disk degrades to in-memory for the rest of the process, still serving', () => {
+    const dir = tmpDir();
+    // max_page_count is the deterministic stand-in for a full filesystem: past the ceiling SQLite
+    // raises the very same "database or disk is full" a full volume does.
+    const store = openQueueStore({ dir, maxPageCount: 2 });
+    stores.push(store);
+    expect(store.durable).toBe(true);
+
+    let threw = false;
+    try {
+      for (let i = 0; i < 5000; i++) {
+        store.put(ITEM({ id: `id-${i}`, mfcId: `m-${i}`, url: `https://s.example/${'x'.repeat(200)}/${i}` }));
+      }
+    } catch {
+      threw = true;
+    }
+
+    // NEVER throws into the queue: an enqueue must not fail because the disk did.
+    expect(threw).toBe(false);
+    expect(store.durable).toBe(false);
+    expect(store.reason).toBe('write_failed');
+    expect(warnings().filter((w) => w.includes('write_failed'))).toHaveLength(1);
+
+    // Still serving: every operation stays safe, and reads stay LIVE so the rows already on disk
+    // (which the next process will reconcile) remain visible on /health/detailed.
+    expect(() => store.lease('id-0', 1)).not.toThrow();
+    expect(() => store.remove('id-0')).not.toThrow();
+    expect(() => store.saveCooldown({ host: 'a.example', until: 9, reason: 'r', openedAt: 1 })).not.toThrow();
+    expect(store.counts().pending).toBeGreaterThan(0);
+  });
+
+  it('write_failed — the queue stops parking once the store degrades', () => {
+    const dir = tmpDir();
+    const store = openQueueStore({ dir, maxPageCount: 2 });
+    stores.push(store);
+    for (let i = 0; i < 5000; i++) {
+      store.put(ITEM({ id: `id-${i}`, mfcId: `m-${i}`, url: `https://s.example/${'x'.repeat(200)}/${i}` }));
+    }
+
+    // `durable` is a GETTER for exactly this reason: the queue re-reads it before parking, and
+    // parking into a store that is no longer writing would silently delete items.
+    expect(store.durable).toBe(false);
+    expect(store.pageIn(10)).toEqual([]);
+    expect(store.restore(1)).toMatchObject({ pending: [], cooldowns: [] });
+  });
+
+  it('ok — reports a clean open with no warning at all', () => {
     const store = createQueueStore({ dir: tmpDir() });
     stores.push(store);
 
     expect(store.durable).toBe(true);
+    expect(store.reason).toBe('ok');
     expect(store.path).toMatch(/scrape-queue\.db$/);
+    expect(store.quarantinedPath).toBeNull();
+    expect(store.lostAtStartup).toBe(0);
+    expect(warnings()).toHaveLength(0);
   });
 
   it('resolves the directory from SCRAPE_QUEUE_DIR', () => {
@@ -363,17 +527,23 @@ describe('queueStore — in-memory fallback', () => {
     stores.push(store);
 
     expect(store.durable).toBe(true);
-    expect(store.path).toBe(path.join(dir, 'scrape-queue.db'));
+    expect(store.path).toBe(path.join(dir, QUEUE_DB_FILE));
   });
 
-  it('falls back rather than throwing when the db file is corrupt', () => {
-    const dir = tmpDir();
-    fs.writeFileSync(path.join(dir, 'scrape-queue.db'), 'this is not a sqlite database at all');
-    const store = createQueueStore({ dir });
+  it('every fallback answers the whole interface safely', () => {
+    const store = createQueueStore({ dir: path.join(tmpDir(), 'missing') });
     stores.push(store);
 
-    // A corrupt file must degrade to in-memory, never crash the engine at boot.
-    expect(store.durable).toBe(false);
+    expect(() => store.put(ITEM())).not.toThrow();
+    expect(store.counts()).toEqual({ pending: 0, leased: 0, parked: 0 });
+    expect(store.restore(1)).toMatchObject({ pending: [], leasedExpired: [], cooldowns: [] });
+    expect(store.pageIn(10)).toEqual([]);
+    expect(store.releaseLeases()).toBe(0);
+    expect(store.hasKey('anything')).toBe(false);
+    expect(store.pageInKey('anything')).toBeNull();
+    expect(() => store.setPriority('a', 'HOT')).not.toThrow();
+    expect(store.quarantinedPath).toBeNull();
+    expect(store.lostAtStartup).toBe(0);
   });
 });
 
@@ -558,5 +728,75 @@ describe('queueStore — paging policy and transaction edges', () => {
     expect(() => store.park('anything')).not.toThrow();
     expect(() => store.batch(() => store.put(ITEM()))).not.toThrow();
     expect(store.counts().parked).toBe(0);
+  });
+});
+
+/**
+ * Two faults found while building the fallback enumeration. Both are silent in normal operation and
+ * both break the boot reconciliation — the one moment the store exists for.
+ */
+describe('queueStore — open must prove the database is USABLE, not merely openable', () => {
+  it('refuses a database that opens cleanly but cannot be written', () => {
+    const dir = tmpDir();
+    const first = open(dir);
+    first.put(ITEM());
+    first.close();
+    // A file that lost its write permission passes every open statement — `CREATE TABLE IF NOT
+    // EXISTS` short-circuits on tables that already exist — and then throws on the FIRST real write,
+    // which is the boot reconciliation. Without the write probe the engine boots and dies there.
+    fs.chmodSync(path.join(dir, 'scrape-queue.db'), 0o444);
+
+    expect(() => openQueueStore({ dir })).toThrow(/readonly/i);
+  });
+
+  it('routes that read-only file to quarantine and salvages every row out of it', () => {
+    const dir = tmpDir();
+    const first = open(dir);
+    first.put(ITEM({ id: 'a', mfcId: 'a', url: 'https://s.example/a' }));
+    first.put(ITEM({ id: 'b', mfcId: 'b', url: 'https://s.example/b' }));
+    first.close();
+    fs.chmodSync(path.join(dir, 'scrape-queue.db'), 0o444);
+
+    const store = createQueueStore({ dir });
+    stores.push(store);
+
+    expect(store.reason).toBe('open_failed_recovered');
+    expect(store.durable).toBe(true);
+    expect(store.lostAtStartup).toBe(0);
+    // The main database read perfectly well — only writing was refused — so salvage gets it all back.
+    expect(store.restore(9_000).pending.map((i) => i.id).sort()).toEqual(['a', 'b']);
+  });
+
+  it('closes its handle when the open fails partway (no descriptor leak)', () => {
+    const fdDir = '/proc/self/fd';
+    if (!fs.existsSync(fdDir)) return; // Linux-only assertion; the engine and CI both run Linux.
+    const dir = tmpDir();
+    const first = open(dir);
+    first.close();
+    fs.chmodSync(path.join(dir, 'scrape-queue.db'), 0o444);
+
+    const before = fs.readdirSync(fdDir).length;
+    for (let i = 0; i < 20; i++) {
+      expect(() => openQueueStore({ dir })).toThrow();
+    }
+    const after = fs.readdirSync(fdDir).length;
+
+    // A failed open that keeps its handle leaks a descriptor every time. Twenty attempts make the
+    // difference unmistakable; a handful of descriptors of slack keeps this from being flaky.
+    expect(after - before).toBeLessThan(10);
+  });
+
+  it('a restore on a store that cannot write degrades instead of throwing at boot', () => {
+    const dir = tmpDir();
+    const store = openQueueStore({ dir, maxPageCount: 2 });
+    stores.push(store);
+    for (let i = 0; i < 5000; i++) {
+      store.put(ITEM({ id: `id-${i}`, mfcId: `m-${i}`, url: `https://s.example/${'x'.repeat(200)}/${i}` }));
+    }
+
+    // restore() mutates (it frees expired leases and drops duplicates). Those writes must not throw
+    // into the boot path — the engine has to come up and keep taking work regardless.
+    expect(() => store.restore(9_999)).not.toThrow();
+    expect(store.reason).toBe('write_failed');
   });
 });

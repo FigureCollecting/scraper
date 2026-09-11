@@ -42,7 +42,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { ScrapeQueue, resetScrapeQueue } from '../../services/scrapeQueue';
 import { createExtractionRegistry, ExtractionRegistryImpl } from '../../services/extractionRegistry';
-import { openQueueStore, type ScrapeQueueStore } from '../../services/queueStore';
+import { createQueueStore, openQueueStore, type ScrapeQueueStore } from '../../services/queueStore';
 import { ChallengeCooldown } from '../../services/challengeCooldown';
 import { okWriteStats } from '../helpers/ingestWriteStats';
 
@@ -531,9 +531,24 @@ describe('ScrapeQueue — observability contract', () => {
     queue.enqueue('a1', { url: urlFor('a1') });
 
     const view = queue.getQueueStoreView();
-    expect(view).toMatchObject({ durable: true, pending: 1, leased: 0 });
+    expect(view).toMatchObject({
+      durable: true, reason: 'ok', pending: 1, leased: 0, quarantinedPath: null, lostAtStartup: 0,
+    });
     expect(view.path).toBe(store.path);
     expect(view.restoredAt).toEqual(expect.any(String));
+  });
+
+  it('carries the store reason through to the health view', () => {
+    const dir = tmpDir();
+    fs.writeFileSync(path.join(dir, 'scrape-queue.db'), 'not a database');
+    const store = createQueueStore({ dir });
+    stores.push(store);
+    queue = new ScrapeQueue(true);
+    queue.setQueueStore(store);
+
+    // A recovered store is STILL durable — the reason is what tells the operator it happened.
+    expect(queue.getQueueStoreView()).toMatchObject({ durable: true, reason: 'open_failed_recovered' });
+    expect(queue.getQueueStoreView().quarantinedPath).toMatch(/corrupt-/);
   });
 
   it('reports the fallback honestly rather than pretending to be durable', () => {
@@ -541,7 +556,10 @@ describe('ScrapeQueue — observability contract', () => {
 
     expect(queue.getQueueStoreView()).toMatchObject({
       durable: false,
+      reason: 'disabled',
       path: null,
+      quarantinedPath: null,
+      lostAtStartup: 0,
       restoredAt: null,
       pending: 0,
       leased: 0,

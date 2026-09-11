@@ -58,6 +58,30 @@ export const QUEUE_DIR_ENV = 'SCRAPE_QUEUE_DIR';
 export type QueueItemState = 'pending' | 'leased' | 'parked';
 
 /**
+ * WHY the store is in the state it is — the single field an operator reads to tell a deliberate
+ * configuration from a silent failure. `durable:false` on its own is ambiguous: the intended
+ * intermediate state while the engine ships ahead of its PVC looks exactly like a permissions bug.
+ *
+ *   ok                    — durable and healthy
+ *   disabled              — SCRAPE_QUEUE_DIR explicitly blanked or set to `off` (dev / CI)
+ *   dir_missing           — the directory does not exist: the PVC is not mounted yet
+ *   not_writable          — the directory exists but this uid/gid cannot write it (fsGroup mismatch)
+ *   open_failed           — SQLite could not open or create the file, and the retry also failed
+ *   open_failed_recovered — the file was unusable, was moved ASIDE (never deleted), and a fresh
+ *                           store was opened; readable rows were carried over. STILL DURABLE.
+ *   write_failed          — a write failed at runtime (a full disk, a revoked mount). The store
+ *                           degrades to in-memory for the rest of the process life and keeps serving.
+ */
+export type QueueStoreReason =
+  | 'ok'
+  | 'disabled'
+  | 'dir_missing'
+  | 'not_writable'
+  | 'open_failed'
+  | 'open_failed_recovered'
+  | 'write_failed';
+
+/**
  * The persistable shape of a QueueItem — deliberately a SUBSET. No cookies (never stored), no
  * resolvers (a promise cannot be written to disk), no waitingUserIds (those callers' connections
  * died with the process that held them).
@@ -112,10 +136,26 @@ export interface QueueCounts {
 }
 
 export interface ScrapeQueueStore {
-  /** False for the no-op fallback: nothing is persisted and the queue must not park anything. */
+  /**
+   * False for the no-op fallback: nothing is persisted and the queue must not park anything. Can flip
+   * from true to false at RUNTIME if a write fails (see `write_failed`), so read it, never cache it.
+   */
   readonly durable: boolean;
-  /** The db file path, or null when running in the in-memory fallback. */
+  /** WHY `durable` reads the way it does. 'ok' whenever the store is healthy and persisting. */
+  readonly reason: QueueStoreReason;
+  /**
+   * The db file we are using, or ATTEMPTED to use. Null ONLY when deliberately disabled — an
+   * operator diagnosing `dir_missing` or `not_writable` needs to know which path was tried.
+   */
   readonly path: string | null;
+  /**
+   * Rows that were in a quarantined file and could NOT be carried into the fresh store. 0 in every
+   * normal case, including a clean recovery. Non-zero is an alarm: that many queued items are only
+   * in `quarantinedPath` now.
+   */
+  readonly lostAtStartup: number;
+  /** Where an unusable file was moved aside to. Null unless reason is `open_failed_recovered`. */
+  readonly quarantinedPath: string | null;
   /** Run `fn` inside ONE transaction — the crawler's 50-per-store burst costs one commit, not 50. */
   batch<T>(fn: () => T): T;
   /** Insert a row. Idempotent on `id`: a re-put is a no-op, never an overwrite. */
@@ -238,6 +278,19 @@ export interface OpenQueueStoreOptions {
   dir?: string;
   /** Injectable clock (tests). Only used where the store needs "now" without being told it. */
   now?: () => number;
+  /**
+   * Hard ceiling on the db file in SQLite pages (`PRAGMA max_page_count`). A genuine safety valve on
+   * a 1Gi PVC — the queue must never be the thing that fills the volume the queue lives on — and the
+   * deterministic way to exercise the `write_failed` path: past the ceiling SQLite raises
+   * "database or disk is full", exactly as a full filesystem does.
+   */
+  maxPageCount?: number;
+  /** Reason to report when the open succeeded after a quarantine. Default 'ok'. */
+  reason?: QueueStoreReason;
+  /** Where an unusable file was moved aside to (reported on /health/detailed). */
+  quarantinedPath?: string | null;
+  /** Rows a quarantined file held that could not be carried over. */
+  lostAtStartup?: number;
 }
 
 /**
@@ -245,23 +298,41 @@ export interface OpenQueueStoreOptions {
  * `createQueueStore` is the fail-safe wrapper every caller should use.
  */
 export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueStore {
-  const dir = opts.dir ?? resolveQueueDir();
-  // fsGroup 994 makes the PVC group-writable; this is the same check the crawler's ledger dir gets.
-  fs.accessSync(dir, fs.constants.W_OK);
+  const dir = opts.dir ?? resolveQueueDir() ?? DEFAULT_QUEUE_DIR;
   const file = path.join(dir, QUEUE_DB_FILE);
   const db = new DatabaseSync(file);
 
-  // WAL so a reader (a future ops query) never blocks the writer, and a crash mid-write recovers
-  // from the log rather than tearing the page. synchronous=FULL fsyncs on every commit: at the
-  // measured 520-620 enqueues/hour that is one fsync every ~6 seconds, which the brief's own sizing
-  // calls affordable — and it is what makes "the row was written before the pod died" TRUE rather
-  // than probable.
-  db.exec('PRAGMA journal_mode = WAL');
-  db.exec('PRAGMA synchronous = FULL');
-  db.exec('PRAGMA foreign_keys = ON');
-  db.exec(SCHEMA);
-  // Any handle that survived the SCHEMA exec has a real, readable database behind it.
-  db.prepare('SELECT COUNT(*) AS n FROM queue_items').get();
+  try {
+    // WAL so a reader (a future ops query) never blocks the writer, and a crash mid-write recovers
+    // from the log rather than tearing the page. synchronous=FULL fsyncs on every commit: at the
+    // measured 520-620 enqueues/hour that is one fsync every ~6 seconds, which the sizing calls
+    // affordable — and it is what makes "the row was written before the pod died" TRUE rather than
+    // probable.
+    db.exec('PRAGMA journal_mode = WAL');
+    db.exec('PRAGMA synchronous = FULL');
+    db.exec('PRAGMA foreign_keys = ON');
+    db.exec(SCHEMA);
+    // Any handle that survived the SCHEMA exec has a real, readable database behind it.
+    db.prepare('SELECT COUNT(*) AS n FROM queue_items').get();
+    // PROVE IT IS WRITABLE, not merely openable. A database that has lost its write permission opens
+    // cleanly and passes every statement above — `CREATE TABLE IF NOT EXISTS` short-circuits on
+    // tables that already exist — and then throws on the FIRST real write, which is the boot
+    // reconciliation. Failing here instead routes it to quarantine + salvage, where it belongs.
+    // (`BEGIN IMMEDIATE` is not enough: SQLite defers the readonly error until a page is touched.)
+    db.exec('PRAGMA user_version = 1');
+    // Applied AFTER the schema so creating the tables is never itself refused by the ceiling.
+    if (opts.maxPageCount !== undefined) db.exec(`PRAGMA max_page_count = ${Number(opts.maxPageCount)}`);
+  } catch (error) {
+    // NEVER leak the handle: it holds the -wal/-shm sidecars open, and a caller that goes on to move
+    // the file aside would leave a live mapping pointing at the old inode — the fresh database then
+    // inherits it and fails on its first write.
+    try {
+      db.close();
+    } catch {
+      /* nothing useful to do with a handle we are already abandoning */
+    }
+    throw error;
+  }
 
   const stmt = {
     put: db.prepare(
@@ -317,15 +388,74 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
    */
   let closed = false;
 
+  /**
+   * RUNTIME degradation. A write can start failing long after a healthy open — a full disk, a mount
+   * revoked under us. The queue must keep taking work regardless, so the first write fault flips the
+   * store to in-memory behaviour for the rest of the process life and says so ONCE.
+   *
+   * WRITES become no-ops; READS stay live. That combination is deliberate: rows already on disk are
+   * NOT lost (the file is intact, only writing failed), so leaving the counts readable keeps
+   * /health/detailed telling the truth about what is waiting there for the next process to reconcile.
+   * Meanwhile `durable:false` stops the queue parking anything new, which would be unrecoverable.
+   */
+  let degraded = false;
+  let reason: QueueStoreReason = opts.reason ?? 'ok';
+  const degrade = (error: unknown): void => {
+    if (degraded) return;
+    degraded = true;
+    reason = 'write_failed';
+    const detail = error instanceof Error ? error.message : String(error);
+    console.warn(
+      `[SCRAPE QUEUE] queue store NOT durable: write_failed (${sanitizeForLog(file)}) — ` +
+        `${sanitizeForLog(detail)}; continuing in-memory for the rest of this process`
+    );
+  };
+  /** Run a write; a store fault degrades instead of escaping into the queue. Never throws. */
+  const write = (fn: () => void): void => {
+    if (closed || degraded) return;
+    try {
+      fn();
+    } catch (error) {
+      degrade(error);
+    }
+  };
+  /** Run a read; a fault yields the caller's fallback rather than throwing mid-dispatch. */
+  const read = <T>(fn: () => T, fallback: T): T => {
+    if (closed) return fallback;
+    try {
+      return fn();
+    } catch {
+      return fallback;
+    }
+  };
+
   // Transaction depth — `batch` is re-entrant (an outer batch keeps ONE commit).
   let depth = 0;
   const batch = <T>(fn: () => T): T => {
-    if (closed || depth > 0) return fn();
+    if (closed || degraded || depth > 0) return fn();
+    try {
+      db.exec('BEGIN');
+    } catch (error) {
+      // Nothing has run yet, so degrading and running the body un-transacted is safe: every write
+      // inside it is now a no-op. A queue must never fail an enqueue because a transaction would not open.
+      degrade(error);
+      return fn();
+    }
     depth = 1;
-    db.exec('BEGIN');
     try {
       const out = fn();
-      db.exec('COMMIT');
+      try {
+        db.exec('COMMIT');
+      } catch (error) {
+        // The commit is where a full disk usually announces itself. Roll back, degrade, and still
+        // return: the caller's in-memory state stands, only its durability is gone.
+        try {
+          db.exec('ROLLBACK');
+        } catch {
+          /* the transaction is already gone */
+        }
+        degrade(error);
+      }
       return out;
     } catch (error) {
       try {
@@ -333,6 +463,8 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
       } catch {
         /* the transaction is already gone */
       }
+      // A fault thrown by the BODY is the caller's, not the store's — it still propagates, and the
+      // transaction is all-or-nothing around it.
       throw error;
     } finally {
       depth = 0;
@@ -346,23 +478,36 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
     const where = skipHosts.length
       ? `state = 'parked' AND (host IS NULL OR host NOT IN (${placeholders}))`
       : `state = 'parked'`;
-    const rows = db
-      .prepare(`SELECT * FROM queue_items WHERE ${where} ORDER BY enqueued_at ASC LIMIT ?`)
-      .all(...skipHosts, limit) as unknown as ItemRow[];
+    const rows = read(
+      () =>
+        db
+          .prepare(`SELECT * FROM queue_items WHERE ${where} ORDER BY enqueued_at ASC LIMIT ?`)
+          .all(...skipHosts, limit) as unknown as ItemRow[],
+      [] as ItemRow[]
+    );
     if (rows.length === 0) return [];
     return batch(() => {
-      for (const row of rows) stmt.fail.run(row.attempts, row.last_error_class, row.id);
+      for (const row of rows) write(() => stmt.fail.run(row.attempts, row.last_error_class, row.id));
       return rows.map((r) => ({ ...rowToItem(r), state: 'pending' as const }));
     });
   };
 
   return {
-    durable: true,
+    // Getters, not constants: `durable` and `reason` change if a write fails at runtime, and a caller
+    // that cached them would keep parking items into a store that is no longer writing.
+    get durable(): boolean {
+      return !degraded;
+    },
+    get reason(): QueueStoreReason {
+      return reason;
+    },
     path: file,
+    quarantinedPath: opts.quarantinedPath ?? null,
+    lostAtStartup: opts.lostAtStartup ?? 0,
     batch,
 
     put(item: PersistedQueueItem): void {
-      if (closed) return;
+      write(() =>
       stmt.put.run(
         item.id,
         item.mfcId,
@@ -377,27 +522,23 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
         item.state,
         item.leaseUntil ?? null,
         item.lastErrorClass ?? null
-      );
+      ));
     },
 
     lease(id: string, leaseUntil: number): void {
-      if (closed) return;
-      stmt.lease.run(leaseUntil, id);
+      write(() => stmt.lease.run(leaseUntil, id));
     },
 
     fail(id: string, attempts: number, errorClass?: string): void {
-      if (closed) return;
-      stmt.fail.run(attempts, errorClass ?? null, id);
+      write(() => stmt.fail.run(attempts, errorClass ?? null, id));
     },
 
     remove(id: string): void {
-      if (closed) return;
-      stmt.remove.run(id);
+      write(() => stmt.remove.run(id));
     },
 
     park(id: string): void {
-      if (closed) return;
-      stmt.park.run(id);
+      write(() => stmt.park.run(id));
     },
 
     pageIn(limit: number, opts?: { skipHosts?: readonly string[] }): PersistedQueueItem[] {
@@ -406,71 +547,72 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
     },
 
     hasKey(mfcId: string): boolean {
-      if (closed) return false;
-      return stmt.hasKey.get(mfcId) !== undefined;
+      return read(() => stmt.hasKey.get(mfcId) !== undefined, false);
     },
 
     pageInKey(mfcId: string): PersistedQueueItem | null {
-      if (closed) return null;
-      const row = stmt.selParkedKey.get(mfcId) as unknown as ItemRow | undefined;
+      const row = read(() => stmt.selParkedKey.get(mfcId) as unknown as ItemRow | undefined, undefined);
       if (row === undefined) return null;
-      stmt.fail.run(row.attempts, row.last_error_class, row.id);
+      write(() => stmt.fail.run(row.attempts, row.last_error_class, row.id));
       return { ...rowToItem(row), state: 'pending' as const };
     },
 
     setPriority(id: string, priority: QueuePriority): void {
-      if (closed) return;
-      stmt.setPriority.run(priority, id);
+      write(() => stmt.setPriority.run(priority, id));
     },
 
     releaseLeases(): number {
-      if (closed) return 0;
-      const res = stmt.releaseAll.run();
-      return Number(res.changes);
+      let released = 0;
+      write(() => {
+        released = Number(stmt.releaseAll.run().changes);
+      });
+      return released;
     },
 
     reapExpiredLeases(now: number): PersistedQueueItem[] {
-      if (closed) return [];
+      if (closed || degraded) return [];
       return batch(() => {
-        const rows = stmt.selLeasedExpired.all(now) as unknown as ItemRow[];
+        const rows = read(() => stmt.selLeasedExpired.all(now) as unknown as ItemRow[], [] as ItemRow[]);
         if (rows.length === 0) return [];
-        stmt.freeLeasedExpired.run(now);
+        write(() => stmt.freeLeasedExpired.run(now));
         return rows.map((r) => ({ ...rowToItem(r), state: 'pending' as const, leaseUntil: undefined }));
       });
     },
 
     saveCooldown(entry: PersistedCooldown): void {
-      if (closed) return;
-      stmt.saveCooldown.run(normalizeHost(entry.host), entry.until, entry.reason, entry.openedAt);
+      write(() => stmt.saveCooldown.run(normalizeHost(entry.host), entry.until, entry.reason, entry.openedAt));
     },
 
     removeCooldown(host: string): void {
-      if (closed) return;
-      stmt.removeCooldown.run(normalizeHost(host));
+      write(() => stmt.removeCooldown.run(normalizeHost(host)));
     },
 
     restore(now: number): RestoredQueue {
-      if (closed) return { pending: [], leasedExpired: [], stillLeased: 0, parked: 0, cooldowns: [] };
+      if (closed || degraded) return { pending: [], leasedExpired: [], stillLeased: 0, parked: 0, cooldowns: [] };
       return batch(() => {
         // A restart can only ever hold ONE live item per dedup key, so a second row for the same key
         // is debris from a crash that raced a re-enqueue. Keep the earliest and DELETE the rest —
         // filtering alone would leave the loser as a pending row nothing will ever dispatch.
         for (const dup of stmt.dupKeys.all() as unknown as Array<{ mfc_id: string }>) {
           for (const loser of stmt.dupLosers.all(dup.mfc_id) as unknown as Array<{ id: string }>) {
-            stmt.remove.run(loser.id);
+            write(() => stmt.remove.run(loser.id));
           }
         }
         const leasedExpiredRows = stmt.selLeasedExpired.all(now) as unknown as ItemRow[];
-        stmt.freeLeasedExpired.run(now);
+        write(() => stmt.freeLeasedExpired.run(now));
         // Read pending AFTER freeing expired leases would double-count them, so read it first and
         // report the two groups separately (the log line names both).
         const pendingRows = (stmt.selPending.all() as unknown as ItemRow[]).filter(
           (r) => !leasedExpiredRows.some((l) => l.id === r.id)
         );
-        const stillLeased = Number(
-          (stmt.countStillLeased.get(now) as unknown as { n: number }).n
+        const stillLeased = read(
+          () => Number((stmt.countStillLeased.get(now) as unknown as { n: number }).n),
+          0
         );
-        const byState = stmt.countByState.all() as unknown as Array<{ state: string; n: number }>;
+        const byState = read(
+          () => stmt.countByState.all() as unknown as Array<{ state: string; n: number }>,
+          [] as Array<{ state: string; n: number }>
+        );
         const parked = Number(byState.find((r) => r.state === 'parked')?.n ?? 0);
 
         const cooldownRows = stmt.selCooldowns.all(now) as unknown as Array<{
@@ -479,7 +621,7 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
           reason: string;
           opened_at: number;
         }>;
-        stmt.dropExpiredCooldowns.run(now);
+        write(() => stmt.dropExpiredCooldowns.run(now));
 
         return {
           pending: pendingRows.map(rowToItem),
@@ -501,15 +643,17 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
     },
 
     counts(): QueueCounts {
-      if (closed) return { ...NO_COUNTS };
-      const rows = stmt.countByState.all() as unknown as Array<{ state: string; n: number }>;
-      const of = (s: string): number => Number(rows.find((r) => r.state === s)?.n ?? 0);
-      return { pending: of('pending'), leased: of('leased'), parked: of('parked') };
+      // Stays LIVE after a write degradation on purpose: those rows are still on disk waiting for the
+      // next process, and zeroing the reading would hide exactly what the operator needs to see.
+      return read(() => {
+        const rows = stmt.countByState.all() as unknown as Array<{ state: string; n: number }>;
+        const of = (st: string): number => Number(rows.find((r) => r.state === st)?.n ?? 0);
+        return { pending: of('pending'), leased: of('leased'), parked: of('parked') };
+      }, { ...NO_COUNTS });
     },
 
     clearAll(): void {
-      if (closed) return;
-      stmt.clearItems.run();
+      write(() => stmt.clearItems.run());
     },
 
     close(): void {
@@ -527,11 +671,21 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
 /**
  * A store that persists nothing. Every method is a safe no-op and `durable` is false — which the
  * queue reads as "never park anything", because parking without a disk behind it would DELETE items.
+ *
+ * `reason` says WHY, and `path` names the file that WOULD have been used, so an operator can tell the
+ * intended intermediate state (the engine shipped ahead of its PVC → `dir_missing`) from a real fault
+ * (`not_writable`, `open_failed`) without reading pod logs.
  */
-export function createMemoryQueueStore(): ScrapeQueueStore {
+export function createMemoryQueueStore(
+  reason: QueueStoreReason = 'disabled',
+  attemptedPath: string | null = null
+): ScrapeQueueStore {
   return {
     durable: false,
-    path: null,
+    reason,
+    path: attemptedPath,
+    quarantinedPath: null,
+    lostAtStartup: 0,
     batch: <T>(fn: () => T): T => fn(),
     put: () => {},
     lease: () => {},
@@ -553,30 +707,181 @@ export function createMemoryQueueStore(): ScrapeQueueStore {
   };
 }
 
-/** The configured directory: SCRAPE_QUEUE_DIR when set and non-blank, else /var/lib/scraper. */
-export function resolveQueueDir(): string {
+/** Values that switch the store OFF outright (dev / CI), case-insensitive. */
+const DISABLED_VALUES = new Set(['off', 'false', '0', 'none', 'disabled']);
+
+/**
+ * The configured directory, or null when durability is deliberately OFF.
+ *
+ * UNSET means "not configured, use the default" → /var/lib/scraper. EXPLICITLY BLANK (or `off`) means
+ * "turn it off" → null. The two are deliberately different: an unset variable in production is a
+ * manifest that has not caught up yet and should still try the standard mount, while a blank one is
+ * a developer saying they do not want a file on disk.
+ */
+export function resolveQueueDir(): string | null {
   const raw = process.env[QUEUE_DIR_ENV];
-  return raw !== undefined && raw.trim() !== '' ? raw.trim() : DEFAULT_QUEUE_DIR;
+  if (raw === undefined) return DEFAULT_QUEUE_DIR;
+  const trimmed = raw.trim();
+  if (trimmed === '' || DISABLED_VALUES.has(trimmed.toLowerCase())) return null;
+  return trimmed;
+}
+
+/** The greppable one-liner a fleet check keys on. Exactly one per process. */
+function warnNotDurable(reason: QueueStoreReason, attemptedPath: string, detail?: string): void {
+  console.warn(
+    `[SCRAPE QUEUE] queue store NOT durable: ${reason} (${sanitizeForLog(attemptedPath)})` +
+      (detail !== undefined ? ` — ${sanitizeForLog(detail)}` : '')
+  );
 }
 
 /**
- * THE constructor every caller should use. Opens the durable store when it can; on ANY failure
- * (directory absent, not writable, file corrupt, sqlite unavailable) logs ONE warning naming the
- * path and returns the in-memory fallback.
+ * Move an unusable db file (and its WAL sidecars) aside under a timestamped name. NEVER deletes:
+ * those bytes are the only copy of whatever was queued, and an operator may be able to salvage them
+ * by hand even when SQLite will not open them here. Returns the new path, or null if it could not be
+ * moved (in which case the caller falls back to in-memory rather than fighting the filesystem).
+ */
+function quarantine(file: string, stamp: string): string | null {
+  const target = `${file}.corrupt-${stamp}`;
+  try {
+    fs.renameSync(file, target);
+  } catch {
+    return null;
+  }
+  // -wal / -shm are part of the same corruption; leaving them would poison the fresh file.
+  for (const suffix of ['-wal', '-shm']) {
+    try {
+      fs.renameSync(`${file}${suffix}`, `${target}${suffix}`);
+    } catch {
+      // Absent (the common case) or unmovable — neither is worth failing the recovery over.
+    }
+  }
+  return target;
+}
+
+/**
+ * Best-effort salvage from a quarantined file into the fresh store.
+ *
+ * This is not a formality: the FIRST open fails on a WRITE (the journal-mode pragma, the schema exec,
+ * a bad `-wal`), so a file whose main database is perfectly readable can still land here. Opening it
+ * READ-ONLY often gets every row back. Leased rows come over as pending — no process holds them now.
+ *
+ * Returns what was carried and what was left behind. A file that cannot be read at all yields
+ * {carried: 0, lost: 0}: there is nothing to enumerate, and `quarantinedPath` is what the operator
+ * follows instead.
+ */
+function salvage(quarantinedPath: string, into: ScrapeQueueStore): { carried: number; lost: number } {
+  let rows: ItemRow[] = [];
+  let cooldowns: Array<{ host: string; until: number; reason: string; opened_at: number }> = [];
+  try {
+    const old = new DatabaseSync(quarantinedPath, { readOnly: true });
+    try {
+      rows = old.prepare('SELECT * FROM queue_items').all() as unknown as ItemRow[];
+      try {
+        cooldowns = old.prepare('SELECT * FROM host_cooldowns').all() as unknown as typeof cooldowns;
+      } catch {
+        // A missing / unreadable cooldown table must not cost us the items.
+      }
+    } finally {
+      old.close();
+    }
+  } catch {
+    return { carried: 0, lost: 0 };
+  }
+  into.batch(() => {
+    for (const row of rows) {
+      const item = rowToItem(row);
+      // Nothing holds a lease across a process boundary, so an in-flight row comes back drivable.
+      into.put({ ...item, state: item.state === 'leased' ? 'pending' : item.state, leaseUntil: undefined });
+    }
+    for (const c of cooldowns) {
+      into.saveCooldown({ host: c.host, until: c.until, reason: c.reason, openedAt: c.opened_at });
+    }
+  });
+  const after = into.counts();
+  const carried = after.pending + after.leased + after.parked;
+  return { carried, lost: Math.max(0, rows.length - carried) };
+}
+
+/**
+ * THE constructor every caller should use. Walks an explicit decision tree so that "not durable" is
+ * never a shrug — every outcome has a named reason, a path, and exactly one greppable warning line:
+ *
+ *   [SCRAPE QUEUE] queue store NOT durable: <reason> (<path>)
+ *
+ *   disabled      — SCRAPE_QUEUE_DIR explicitly blank or `off`. Deliberate (dev / CI); no warning.
+ *   dir_missing   — the directory is not there. THE INTENDED INTERMEDIATE STATE while the engine
+ *                   ships ahead of its PVC, and the reason this must be distinguishable from a fault.
+ *   not_writable  — the directory exists but this process cannot write it. The check is
+ *                   `fs.accessSync(dir, W_OK)`, which tests the process's EFFECTIVE uid/gid against
+ *                   the directory mode. Under the scraper's `fsGroup: 994`, Kubernetes chgrps the
+ *                   volume to gid 994 and sets it group-writable while the container runs as
+ *                   994:994, so this passes. A mount that arrives owned by root with mode 0755 — an
+ *                   fsGroup that was dropped or never applied — is exactly what fails here.
+ *   open_failed / open_failed_recovered — SQLite refused the file. It is moved ASIDE (never deleted),
+ *                   a fresh store is opened, and readable rows are salvaged into it.
+ *
+ * NOTE: a pod rescheduled onto a node where the local-path claim cannot attach never reaches this
+ * code at all — it stays Pending and the container never starts. That is a scheduling signal, visible
+ * in `kubectl describe pod`, NOT a `durable:false` reading.
  *
  * Losing durability is a degradation, never an outage: the engine keeps taking work exactly as it
- * does today, and the operator sees one line saying why the queue is not durable.
+ * does today, and the operator sees one line saying why.
  */
 export function createQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueStore {
   const dir = opts.dir ?? resolveQueueDir();
+  if (dir === null) {
+    // Deliberate. Not a warning — an operator who switched it off does not need to be told twice.
+    console.log(`[SCRAPE QUEUE] queue store disabled (${QUEUE_DIR_ENV} is off) — running in-memory`);
+    return createMemoryQueueStore('disabled', null);
+  }
+  const file = path.join(dir, QUEUE_DB_FILE);
+
+  // (1) dir_missing — the PVC is not mounted yet.
+  if (!fs.existsSync(dir)) {
+    warnNotDurable('dir_missing', file, 'the directory does not exist (PVC not mounted?)');
+    return createMemoryQueueStore('dir_missing', file);
+  }
+
+  // (2) not_writable — the mount is there but this uid/gid cannot write it (fsGroup mismatch).
+  try {
+    fs.accessSync(dir, fs.constants.W_OK);
+  } catch {
+    warnNotDurable('not_writable', file, `uid ${process.getuid?.() ?? '?'} cannot write the directory`);
+    return createMemoryQueueStore('not_writable', file);
+  }
+
+  // (3) the happy path.
   try {
     return openQueueStore({ ...opts, dir });
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    console.warn(
-      `[SCRAPE QUEUE] durable queue unavailable at ${sanitizeForLog(dir)} (${sanitizeForLog(reason)}) — ` +
-        'running in-memory; a restart will drop queued items'
-    );
-    return createMemoryQueueStore();
+  } catch (openError) {
+    // (4) open_failed — quarantine, retry, salvage. Nothing is ever deleted.
+    // The injected clock, so a test can pin the quarantine name and exercise a rename that fails.
+    const stamp = new Date(opts.now?.() ?? Date.now()).toISOString().replace(/[:.]/g, '-');
+    const quarantinedPath = fs.existsSync(file) ? quarantine(file, stamp) : null;
+    if (quarantinedPath !== null) {
+      try {
+        // Salvage through a first handle, then CLOSE it and reopen, so the store we hand back reports
+        // the MEASURED lostAtStartup rather than the zero we would have had to guess at open time.
+        const probe = openQueueStore({ ...opts, dir, reason: 'open_failed_recovered', quarantinedPath });
+        let carried = 0;
+        let lost = 0;
+        try {
+          ({ carried, lost } = salvage(quarantinedPath, probe));
+        } finally {
+          probe.close();
+        }
+        console.warn(
+          `[SCRAPE QUEUE] queue store recovered: moved an unusable file aside to ` +
+            `${sanitizeForLog(quarantinedPath)} and opened a fresh one — ` +
+            `${carried} item(s) carried over, ${lost} lost`
+        );
+        return openQueueStore({ ...opts, dir, reason: 'open_failed_recovered', quarantinedPath, lostAtStartup: lost });
+      } catch {
+        // The fresh open failed too — the directory itself is the problem, not the file.
+      }
+    }
+    const detail = openError instanceof Error ? openError.message : String(openError);
+    warnNotDurable('open_failed', file, detail);
+    return createMemoryQueueStore('open_failed', file);
   }
 }

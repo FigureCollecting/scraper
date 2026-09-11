@@ -36,7 +36,10 @@ const build = (over: Partial<HealthDeps> = {}) => {
     getImageCapture: () => NO_IMAGE_CAPTURE,
     getSessionCanary: () => ({ site: 'mfc', configured: false, stale: false }),
     getCpuThrottling: () => ({ available: false }),
-    getQueueStore: () => ({ durable: false, path: null, restoredAt: null, pending: 0, leased: 0, parked: 0 }),
+    getQueueStore: () => ({
+      durable: false, reason: 'disabled' as const, path: null, quarantinedPath: null,
+      lostAtStartup: 0, restoredAt: null, pending: 0, leased: 0, parked: 0,
+    }),
     ...over,
   }));
   return app;
@@ -586,7 +589,10 @@ describe('createHealthRoutes — cpuThrottling', () => {
 describe('createHealthRoutes — queueStore', () => {
   const DURABLE = {
     durable: true,
+    reason: 'ok' as const,
     path: '/var/lib/scraper/scrape-queue.db',
+    quarantinedPath: null,
+    lostAtStartup: 0,
     restoredAt: '2026-09-11T06:00:00.000Z',
     pending: 412,
     leased: 1,
@@ -603,12 +609,50 @@ describe('createHealthRoutes — queueStore', () => {
     const res = await request(build()).get('/health/detailed');
     expect(res.body.queueStore).toEqual({
       durable: false,
+      reason: 'disabled',
       path: null,
+      quarantinedPath: null,
+      lostAtStartup: 0,
       restoredAt: null,
       pending: 0,
       leased: 0,
       parked: 0,
     });
+  });
+
+  it('names WHY the store is not durable, and the path it tried', async () => {
+    // `durable:false` alone cannot be acted on: the intended intermediate state while the engine
+    // ships ahead of its PVC reads identically to a permissions bug. The reason is what separates them.
+    for (const reason of ['dir_missing', 'not_writable', 'open_failed', 'write_failed'] as const) {
+      const res = await request(
+        build({
+          getQueueStore: () => ({
+            durable: false, reason, path: '/var/lib/scraper/scrape-queue.db', quarantinedPath: null,
+            lostAtStartup: 0, restoredAt: null, pending: 0, leased: 0, parked: 0,
+          }),
+        })
+      ).get('/health/detailed');
+      expect(res.body.queueStore.reason).toBe(reason);
+      expect(res.body.queueStore.path).toBe('/var/lib/scraper/scrape-queue.db');
+    }
+  });
+
+  it('surfaces a recovery: still durable, but with the quarantined file and the loss count named', async () => {
+    const recovered = {
+      durable: true,
+      reason: 'open_failed_recovered' as const,
+      path: '/var/lib/scraper/scrape-queue.db',
+      quarantinedPath: '/var/lib/scraper/scrape-queue.db.corrupt-2026-09-11T06-00-00-000Z',
+      lostAtStartup: 7,
+      restoredAt: '2026-09-11T06:00:00.000Z',
+      pending: 3,
+      leased: 0,
+      parked: 0,
+    };
+    const res = await request(build({ getQueueStore: () => recovered })).get('/health/detailed');
+
+    // lostAtStartup > 0 is the alarm: those items exist ONLY in the quarantined file now.
+    expect(res.body.queueStore).toEqual(recovered);
   });
 
   it('keeps queueStore on the degraded (500) response', async () => {
