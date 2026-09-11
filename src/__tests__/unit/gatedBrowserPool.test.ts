@@ -19,9 +19,15 @@ describe('BrowserPool gated browsers', () => {
     goto: jest.fn<(...a: any[]) => any>().mockResolvedValue({ status: () => 200, headers: () => ({}) }),
   } as unknown as jest.Mocked<Page>);
 
+  const savedCgroupReader = BrowserPool.readGatedCgroupLimitBytes;
+  const savedMemoryReader = BrowserPool.readGatedTreeMemory;
+
   beforeEach(async () => {
     jest.clearAllMocks();
     await BrowserPool.reset();
+    // The threshold is derived from the container ceiling, so a test that read a real /sys/fs/cgroup
+    // would depend on the machine it runs on. Unknown ceiling ⇒ the documented 1 GiB floor.
+    BrowserPool.readGatedCgroupLimitBytes = async () => undefined;
     process.env.BROWSER_LAUNCH_MODE = 'clean-headful';
     launched = [];
     jest.mocked(puppeteer.launch).mockImplementation(async (config: any) => {
@@ -47,8 +53,14 @@ describe('BrowserPool gated browsers', () => {
   afterEach(async () => {
     if (savedMode === undefined) delete process.env.BROWSER_LAUNCH_MODE;
     else process.env.BROWSER_LAUNCH_MODE = savedMode;
+    BrowserPool.readGatedCgroupLimitBytes = savedCgroupReader;
+    BrowserPool.readGatedTreeMemory = savedMemoryReader;
     await BrowserPool.reset();
   });
+
+  /** A measured tree, as the PSS walk reports one. */
+  const measured = (mb: number, method: 'pss-rollup' | 'rss-fallback' = 'pss-rollup') =>
+    async () => ({ bytes: mb * 1024 * 1024, method, processes: 9 });
 
   it('launches the residential browser WITH --proxy-server and the direct one without', async () => {
     const residential = await BrowserPool.getGatedBrowser('residential', PROXY);
@@ -310,10 +322,9 @@ describe('BrowserPool gated browsers', () => {
    * its renderers, which is where Chrome's growth actually lands.
    */
   it('relaunches on measured memory growth, naming rss as the reason', async () => {
-    const savedReader = BrowserPool.readGatedRssBytes;
     const savedLimit = process.env.GATED_BROWSER_MAX_RSS_MB;
     process.env.GATED_BROWSER_MAX_RSS_MB = '512';
-    BrowserPool.readGatedRssBytes = async () => 600 * 1024 * 1024;
+    BrowserPool.readGatedTreeMemory = measured(600);
     try {
       const first = await BrowserPool.getGatedBrowser('residential', PROXY);
       // The sample is deliberately not awaited by the fetch that triggers it; the NEXT one reads it.
@@ -327,17 +338,15 @@ describe('BrowserPool gated browsers', () => {
       expect(await BrowserPool.getGatedBrowser('residential', PROXY)).not.toBe(first);
       expect(BrowserPool.gatedLaneStats('residential').lastRelaunchReason).toBe('rss');
     } finally {
-      BrowserPool.readGatedRssBytes = savedReader;
       if (savedLimit === undefined) delete process.env.GATED_BROWSER_MAX_RSS_MB;
       else process.env.GATED_BROWSER_MAX_RSS_MB = savedLimit;
     }
   });
 
   it('does not relaunch on memory it could not measure', async () => {
-    const savedReader = BrowserPool.readGatedRssBytes;
     const savedLimit = process.env.GATED_BROWSER_MAX_RSS_MB;
     process.env.GATED_BROWSER_MAX_RSS_MB = '1';
-    BrowserPool.readGatedRssBytes = async () => undefined;
+    BrowserPool.readGatedTreeMemory = async () => undefined;
     try {
       const first = await BrowserPool.getGatedBrowser('residential', PROXY);
       await new Promise((resolve) => setTimeout(resolve, 5));
@@ -347,7 +356,6 @@ describe('BrowserPool gated browsers', () => {
       expect(puppeteer.launch).toHaveBeenCalledTimes(1);
       expect(BrowserPool.gatedBrowsers()[0].rssMb).toBeNull();
     } finally {
-      BrowserPool.readGatedRssBytes = savedReader;
       if (savedLimit === undefined) delete process.env.GATED_BROWSER_MAX_RSS_MB;
       else process.env.GATED_BROWSER_MAX_RSS_MB = savedLimit;
     }
@@ -355,20 +363,16 @@ describe('BrowserPool gated browsers', () => {
 
   /** A memory read that THROWS is still no evidence, and must not take the lane down with it. */
   it('survives a memory reader that throws, leaving the browser in service', async () => {
-    const savedReader = BrowserPool.readGatedRssBytes;
-    BrowserPool.readGatedRssBytes = async () => { throw new Error('/proc/424242/stat: EACCES'); };
-    try {
-      const first = await BrowserPool.getGatedBrowser('residential', PROXY);
-      await BrowserPool.getGatedBrowser('residential', PROXY);
-      await new Promise((resolve) => setTimeout(resolve, 5));
+    BrowserPool.readGatedTreeMemory = async () => { throw new Error('/proc/424242/smaps_rollup: EACCES'); };
 
-      expect(await BrowserPool.getGatedBrowser('residential', PROXY)).toBe(first);
-      expect(BrowserPool.gatedBrowsers()[0].rssMb).toBeNull();
-      await BrowserPool.settleGatedRelaunches();
-      expect(puppeteer.launch).toHaveBeenCalledTimes(1);
-    } finally {
-      BrowserPool.readGatedRssBytes = savedReader;
-    }
+    const first = await BrowserPool.getGatedBrowser('residential', PROXY);
+    await BrowserPool.getGatedBrowser('residential', PROXY);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    expect(await BrowserPool.getGatedBrowser('residential', PROXY)).toBe(first);
+    expect(BrowserPool.gatedBrowsers()[0].rssMb).toBeNull();
+    await BrowserPool.settleGatedRelaunches();
+    expect(puppeteer.launch).toHaveBeenCalledTimes(1);
   });
 
   /**
@@ -423,20 +427,29 @@ describe('BrowserPool gated browsers', () => {
 
   /**
    * A clearance can go BAD — the residential exit rotated under it — and copying a bad one into every
-   * replacement forever would pin the lane to its old browser permanently. One failure, then clean.
+   * replacement forever would pin the lane to its old browser permanently.
+   *
+   * BUT ONLY THE FAILING HOST'S. The proof loop stops at the first failure, so every host it had
+   * already passed cleared WITH its carried clearance; discarding those spends a fresh Cloudflare
+   * challenge each, from the residential IP whose reputation this whole change protects. This was
+   * lane-wide before 2026-09-11 and is now per host, escalating only on a repeat.
    */
-  it('stops carrying the session once a carried proof has failed', async () => {
-    const clearance = [{ name: 'cf_clearance', value: 'stale', domain: '.suruga-ya.jp' }];
+  it('withholds only the failing host\'s clearance after a carried proof fails', async () => {
+    const jar = [
+      { name: 'cf_clearance', value: 'stale', domain: '.anitoysgk.com' },
+      { name: 'cf_clearance', value: 'good', domain: '.suruga-ya.jp' },
+    ];
     const first = await BrowserPool.getGatedBrowser('residential', PROXY);
-    jest.mocked(first.browser.cookies).mockResolvedValue(clearance as any);
+    jest.mocked(first.browser.cookies).mockResolvedValue(jar as any);
     first.primedHosts.set('www.anitoysgk.com', 'https://www.anitoysgk.com');
     first.launchedAt = Date.now() - GATED_BROWSER_MAX_AGE_MS - 1;
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
     try {
       await BrowserPool.getGatedBrowser('residential', PROXY, (async () => false) as any);
       await BrowserPool.settleGatedRelaunches();
-      expect(jest.mocked(launched[1].browser.setCookie)).toHaveBeenCalledTimes(1);
-      expect(BrowserPool.gatedLaneStats('residential').carryOverBlocked).toBe(true);
+      expect(jest.mocked(launched[1].browser.setCookie)).toHaveBeenCalledWith(jar[0], jar[1]);
+      expect(BrowserPool.gatedLaneStats('residential').carryBlockedHosts).toEqual(['www.anitoysgk.com']);
+      expect(BrowserPool.gatedLaneStats('residential').carryOverBlocked).toBe(false);
 
       // The backoff is what stops the retry storm; clear it to exercise the NEXT attempt.
       BrowserPool.gatedLaneStats('residential').retryAfter = 0;
@@ -444,7 +457,17 @@ describe('BrowserPool gated browsers', () => {
       await BrowserPool.settleGatedRelaunches();
 
       expect(launched).toHaveLength(3);
-      expect(jest.mocked(launched[2].browser.setCookie)).not.toHaveBeenCalled();
+      // The suruga-ya clearance survives; only anitoysgk's is withheld.
+      expect(jest.mocked(launched[2].browser.setCookie)).toHaveBeenCalledWith(jar[1]);
+      // A REPEAT on the same host, with its cookies already withheld, escalates to a clean profile.
+      expect(BrowserPool.gatedLaneStats('residential').carryOverBlocked).toBe(true);
+
+      BrowserPool.gatedLaneStats('residential').retryAfter = 0;
+      await BrowserPool.getGatedBrowser('residential', PROXY, (async () => false) as any);
+      await BrowserPool.settleGatedRelaunches();
+
+      expect(launched).toHaveLength(4);
+      expect(jest.mocked(launched[3].browser.setCookie)).not.toHaveBeenCalled();
     } finally {
       warnSpy.mockRestore();
     }
@@ -539,9 +562,218 @@ describe('BrowserPool gated browsers', () => {
         firstNavigationRecoveries: 0,
         lastRelaunchReason: null,
         navFailureStreak: 0,
+        // Both names carry the SAME measurement, so the fleet check's gated-browser probe keeps
+        // working across this deploy while `memoryMethod` says which kind of number it is.
+        pssMb: null,
         rssMb: null,
+        memoryMethod: null,
+        memoryThresholdMb: 1024,
+        relaunchSuppressed: 0,
+        lastSuppressedReason: null,
+        nextRelaunchAllowedAt: null,
+        relaunchBackoffMs: 0,
+        carryBlockedHosts: [],
       },
     ]);
+  });
+
+  /**
+   * /health has to EXPLAIN itself. During the 2026-09-11 churn it showed `rssMb: null` on every
+   * fresh instance while `lastRelaunchReason` said `rss`, because a successful relaunch clears the
+   * sample — an operator reading it concluded the memory trigger was inert while it was firing
+   * every thirty seconds. The measurement, the method and the threshold now travel together.
+   */
+  it('reports the measurement, the method and the threshold it was compared against', async () => {
+    const savedLimit = process.env.GATED_BROWSER_MAX_RSS_MB;
+    delete process.env.GATED_BROWSER_MAX_RSS_MB;
+    BrowserPool.readGatedCgroupLimitBytes = async () => 3 * 1024 * 1024 * 1024;
+    BrowserPool.readGatedTreeMemory = measured(217);
+    try {
+      await BrowserPool.getGatedBrowser('residential', PROXY);
+      await BrowserPool.getGatedBrowser('residential', PROXY);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+
+      const view = BrowserPool.gatedBrowsers()[0];
+      expect(view.pssMb).toBe(217);
+      expect(view.rssMb).toBe(217);
+      expect(view.memoryMethod).toBe('pss-rollup');
+      // 40 % of the pod's own 3 GiB ceiling, derived rather than guessed.
+      expect(view.memoryThresholdMb).toBe(1229);
+      await BrowserPool.settleGatedRelaunches();
+      expect(puppeteer.launch).toHaveBeenCalledTimes(1);
+    } finally {
+      if (savedLimit !== undefined) process.env.GATED_BROWSER_MAX_RSS_MB = savedLimit;
+    }
+  });
+
+  /**
+   * THE DEFECT ITSELF, end to end. Production relaunched the residential lane eight times between
+   * 22:31:18Z and 22:40:49Z on 2026-09-11 — 30 to 40 s apart — because a successful relaunch CLEARS
+   * the measurement, so the next fetch re-measured the fresh tree, found it over the threshold
+   * again, and fired again. Eight prime navigations on Cloudflare-fronted stores in ten minutes.
+   */
+  it('relaunches ONCE on persistent memory pressure instead of on every fetch', async () => {
+    const savedLimit = process.env.GATED_BROWSER_MAX_RSS_MB;
+    process.env.GATED_BROWSER_MAX_RSS_MB = '512';
+    // Every tree this lane ever measures is over the threshold — the 2026-09-11 shape exactly.
+    BrowserPool.readGatedTreeMemory = measured(900);
+    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      const first = await BrowserPool.getGatedBrowser('residential', PROXY);
+      await BrowserPool.getGatedBrowser('residential', PROXY);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await BrowserPool.getGatedBrowser('residential', PROXY);
+      await BrowserPool.settleGatedRelaunches();
+      await BrowserPool.settleGatedRetirements();
+
+      const replacement = await BrowserPool.getGatedBrowser('residential', PROXY);
+      expect(replacement).not.toBe(first);
+
+      // Eight more fetches, each of which USED TO start a relaunch of its own.
+      for (let i = 0; i < 8; i++) {
+        BrowserPool.gatedLaneStats('residential').memorySampledAt = 0; // force a fresh sample
+        await BrowserPool.getGatedBrowser('residential', PROXY);
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+      await BrowserPool.settleGatedRelaunches();
+
+      expect(await BrowserPool.getGatedBrowser('residential', PROXY)).toBe(replacement);
+      expect(puppeteer.launch).toHaveBeenCalledTimes(2);
+      const stats = BrowserPool.gatedLaneStats('residential');
+      expect(stats.relaunchCount).toBe(1);
+      expect(stats.relaunchSuppressed).toBeGreaterThan(0);
+      expect(BrowserPool.gatedBrowsers()[0].lastSuppressedReason).toMatch(/rss rate-limited/);
+      // The suppression is stated in the log with the numbers behind it, not left to be inferred.
+      expect(logSpy.mock.calls.map((call) => String(call[0]))
+        .some((line) => /SUPPRESSED.*measured=900MB threshold=512MB method=pss-rollup/.test(line))).toBe(true);
+    } finally {
+      logSpy.mockRestore();
+      if (savedLimit === undefined) delete process.env.GATED_BROWSER_MAX_RSS_MB;
+      else process.env.GATED_BROWSER_MAX_RSS_MB = savedLimit;
+    }
+  });
+
+  /**
+   * A relaunch that does not bring the tree down cannot be the cure, so the wait DOUBLES rather
+   * than repeating. Without this the lane would settle into one relaunch every interval forever.
+   */
+  it('backs off exponentially when a relaunch does not bring the tree down', async () => {
+    const savedLimit = process.env.GATED_BROWSER_MAX_RSS_MB;
+    const savedInterval = process.env.GATED_BROWSER_MIN_RELAUNCH_INTERVAL_MS;
+    const savedGrace = process.env.GATED_RELAUNCH_GRACE_MS;
+    process.env.GATED_BROWSER_MAX_RSS_MB = '512';
+    process.env.GATED_BROWSER_MIN_RELAUNCH_INTERVAL_MS = '40';
+    process.env.GATED_RELAUNCH_GRACE_MS = '60';
+    BrowserPool.readGatedTreeMemory = measured(900);
+    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      await BrowserPool.getGatedBrowser('residential', PROXY);
+      await BrowserPool.getGatedBrowser('residential', PROXY);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await BrowserPool.getGatedBrowser('residential', PROXY);
+      await BrowserPool.settleGatedRelaunches();
+      await BrowserPool.settleGatedRetirements();
+      expect(BrowserPool.gatedLaneStats('residential').relaunchCount).toBe(1);
+
+      // Past the grace window, on a replacement that is just as big: the verdict is "this did not
+      // help", and the next attempt has to wait twice the interval instead of one.
+      await new Promise((resolve) => setTimeout(resolve, 70));
+      BrowserPool.gatedLaneStats('residential').memorySampledAt = 0;
+      await BrowserPool.getGatedBrowser('residential', PROXY); // fires the sample
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await BrowserPool.getGatedBrowser('residential', PROXY); // the gate now sees it
+      await BrowserPool.settleGatedRelaunches();
+
+      const stats = BrowserPool.gatedLaneStats('residential');
+      expect(stats.relaunchBackoffMs).toBe(80);
+      expect(stats.relaunchCount).toBe(1);
+      expect(puppeteer.launch).toHaveBeenCalledTimes(2);
+    } finally {
+      logSpy.mockRestore();
+      for (const [key, value] of [
+        ['GATED_BROWSER_MAX_RSS_MB', savedLimit],
+        ['GATED_BROWSER_MIN_RELAUNCH_INTERVAL_MS', savedInterval],
+        ['GATED_RELAUNCH_GRACE_MS', savedGrace],
+      ] as const) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
+  /**
+   * The threshold falls back to its documented 1 GiB floor when the ceiling cannot be read at all —
+   * a laptop, a cgroup-less container, a /sys that refuses. Never a reason to stop measuring.
+   */
+  it('keeps the floor threshold when the cgroup ceiling cannot be read', async () => {
+    const savedLimit = process.env.GATED_BROWSER_MAX_RSS_MB;
+    delete process.env.GATED_BROWSER_MAX_RSS_MB;
+    BrowserPool.readGatedCgroupLimitBytes = async () => { throw new Error('/sys/fs/cgroup: ENOENT'); };
+    BrowserPool.readGatedTreeMemory = measured(300);
+    try {
+      await BrowserPool.getGatedBrowser('residential', PROXY);
+      await BrowserPool.getGatedBrowser('residential', PROXY);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+
+      const view = BrowserPool.gatedBrowsers()[0];
+      expect(view.memoryThresholdMb).toBe(1024);
+      expect(view.pssMb).toBe(300);
+      await BrowserPool.settleGatedRelaunches();
+      expect(puppeteer.launch).toHaveBeenCalledTimes(1);
+    } finally {
+      if (savedLimit !== undefined) process.env.GATED_BROWSER_MAX_RSS_MB = savedLimit;
+    }
+  });
+
+  /**
+   * THE ONE EXEMPTION, and the shadowing it has to survive.
+   *
+   * The backstop is the last line of defence against whatever the evidence triggers miss, so it is
+   * never rate-limited. It is also asked SEPARATELY from the evidence ladder: this lane's memory
+   * trigger is permanently hot, so a ladder that returned the first match would answer `rss` on
+   * every evaluation, have it suppressed on every evaluation, and never reach the clock at all.
+   */
+  it('lets the backstop through even while the memory trigger is rate-limited', async () => {
+    const savedAge = process.env.GATED_BROWSER_MAX_AGE_MS;
+    const savedLimit = process.env.GATED_BROWSER_MAX_RSS_MB;
+    process.env.GATED_BROWSER_MAX_RSS_MB = '512';
+    BrowserPool.readGatedTreeMemory = measured(900);
+    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      await BrowserPool.getGatedBrowser('residential', PROXY);
+      await BrowserPool.getGatedBrowser('residential', PROXY);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await BrowserPool.getGatedBrowser('residential', PROXY);
+      await BrowserPool.settleGatedRelaunches();
+      await BrowserPool.settleGatedRetirements();
+      expect(puppeteer.launch).toHaveBeenCalledTimes(2);
+
+      // Let the replacement be MEASURED, so the memory trigger is genuinely hot on this lane…
+      const replacement = await BrowserPool.getGatedBrowser('residential', PROXY);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      // …and refused, because the lane is inside its thirty-minute interval.
+      await BrowserPool.getGatedBrowser('residential', PROXY);
+      await BrowserPool.settleGatedRelaunches();
+      expect(puppeteer.launch).toHaveBeenCalledTimes(2);
+      expect(BrowserPool.gatedLaneStats('residential').relaunchSuppressed).toBeGreaterThan(0);
+
+      // NOW age it past the backstop. A ladder that returned the first match would answer `rss`,
+      // have it suppressed, and leave this browser running forever.
+      process.env.GATED_BROWSER_MAX_AGE_MS = '1000';
+      replacement.launchedAt = Date.now() - 5000;
+      await BrowserPool.getGatedBrowser('residential', PROXY);
+      await BrowserPool.settleGatedRelaunches();
+      await BrowserPool.settleGatedRetirements();
+
+      expect(puppeteer.launch).toHaveBeenCalledTimes(3);
+      expect(BrowserPool.gatedLaneStats('residential').lastRelaunchReason).toBe('backstop');
+    } finally {
+      logSpy.mockRestore();
+      if (savedAge === undefined) delete process.env.GATED_BROWSER_MAX_AGE_MS;
+      else process.env.GATED_BROWSER_MAX_AGE_MS = savedAge;
+      if (savedLimit === undefined) delete process.env.GATED_BROWSER_MAX_RSS_MB;
+      else process.env.GATED_BROWSER_MAX_RSS_MB = savedLimit;
+    }
   });
 });
 
