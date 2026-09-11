@@ -32,12 +32,73 @@ import type { Browser } from 'puppeteer';
 export type EgressKind = 'residential' | 'direct';
 
 /**
- * How long a gated browser is kept before it is replaced. It holds live clearances, so recycling is
- * pure cost — but an immortal Chrome is the leak shape this engine has already paid for once. Two
- * hours is far past the ~30 min a Cloudflare clearance is good for (nothing of value is discarded)
- * and short enough that a slowly-growing renderer never becomes the pod's memory ceiling.
+ * The age at which a gated browser is replaced — a BACKSTOP, not the policy.
+ *
+ * This was two hours, and it cost more than it saved. A cleared Cloudflare session is an ASSET: it
+ * is bound to the egress IP, the TLS fingerprint and the user agent, it takes ~9 s of challenge to
+ * earn, and every replacement re-earns it from an IP whose Bot Management reputation those very
+ * challenges spend. Measured on 2026-09-11 the residential lane recycled four times in nine hours
+ * and one of those four cost a store 15 dropped items and ~50 minutes of its queue — a loss with no
+ * corresponding gain, because nothing was wrong with the browser being discarded.
+ *
+ * What the timer was ever FOR is stated in its own old comment: "an immortal Chrome is the leak
+ * shape this engine has already paid for once". That is a memory argument and a wedged-instance
+ * argument, and both are now measured directly (GATED_BROWSER_MAX_RSS_BYTES and the navigation
+ * failure streak). So the clock becomes the last line of defence for whatever the evidence triggers
+ * fail to catch, and twelve hours is long enough that a healthy session is left alone all day.
  */
-export const GATED_BROWSER_MAX_AGE_MS = 2 * 60 * 60 * 1000;
+export const GATED_BROWSER_MAX_AGE_MS = 12 * 60 * 60 * 1000;
+
+/**
+ * Resident bytes (browser process plus its renderers) at which a gated browser is recycled on
+ * EVIDENCE of growth. The pod's limit is 3 GiB and it runs four Chromes — two pooled, two gated —
+ * so one gated browser holding a gigabyte is already twice its fair share and heading for the
+ * ceiling. Measured on a healthy pod the three-Chrome warm pool sits around 2.5 GB total, so this
+ * fires on a leak and not on ordinary work.
+ */
+export const GATED_BROWSER_MAX_RSS_BYTES = 1024 * 1024 * 1024;
+
+/**
+ * Consecutive failed navigations on one lane before its browser is treated as wedged and replaced.
+ *
+ * THE 2026-09-08 INCIDENT: the residential browser relaunched while tabs were in flight and every
+ * navigation afterwards timed out at 20 s until a human restarted the pod. Nothing recovered it,
+ * because nothing was watching for it. Three in a row is past coincidence — a gated lane's fetches
+ * are seconds apart and independent — and short enough to self-heal inside one crawl slice.
+ */
+export const GATED_NAV_FAILURE_STREAK = 3;
+
+/** How often a lane's memory is sampled. Walking /proc is cheap, but not per-fetch cheap. */
+export const GATED_RSS_SAMPLE_MS = 60_000;
+
+/**
+ * Why a replacement was built. Recorded on every relaunch event and surfaced on /health so an
+ * operator can tell a lane that is refreshing on schedule from one that is self-healing repeatedly.
+ */
+export type GatedRelaunchReason = 'backstop' | 'rss' | 'navigation-failures';
+
+/** Read a positive-integer env override, falling back when unset, empty, or not a finite number. */
+function envNumber(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const value = Number(raw);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+/** The age backstop, overridable with GATED_BROWSER_MAX_AGE_MS. */
+export function resolveGatedMaxAgeMs(env: NodeJS.ProcessEnv = process.env): number {
+  return envNumber(env.GATED_BROWSER_MAX_AGE_MS, GATED_BROWSER_MAX_AGE_MS);
+}
+
+/** The memory trigger, overridable with GATED_BROWSER_MAX_RSS_MB (megabytes). */
+export function resolveGatedMaxRssBytes(env: NodeJS.ProcessEnv = process.env): number {
+  const mb = envNumber(env.GATED_BROWSER_MAX_RSS_MB, GATED_BROWSER_MAX_RSS_BYTES / (1024 * 1024));
+  return mb * 1024 * 1024;
+}
+
+/** The wedged-lane trigger, overridable with GATED_NAV_FAILURE_STREAK. */
+export function resolveGatedNavFailureStreak(env: NodeJS.ProcessEnv = process.env): number {
+  return Math.max(1, Math.round(envNumber(env.GATED_NAV_FAILURE_STREAK, GATED_NAV_FAILURE_STREAK)));
+}
 
 /**
  * Concurrent tabs one gated host may hold open in its browser. Two is what the traffic actually
@@ -210,6 +271,23 @@ export interface GatedLaneStats {
   firstNavigationRecoveries: number;
   /** Epoch ms before which no further relaunch is attempted (set by a failed proof). */
   retryAfter: number;
+  /** Why the last relaunch was built. */
+  lastRelaunchReason: GatedRelaunchReason | null;
+  /** Navigations that have failed in a row on this lane; any success resets it to zero. */
+  navFailureStreak: number;
+  /**
+   * Set when a proof failed while the replacement carried the outgoing browser's cookies. The next
+   * attempt then starts CLEAN — otherwise a clearance that has gone bad (the egress IP rotated under
+   * it) would be copied into every replacement forever and wedge the lane at its old browser.
+   */
+  carryOverBlocked: boolean;
+  /**
+   * Last MEASURED resident bytes for the live browser; 0 means no measurement has succeeded, which
+   * is not the same as a small browser and must never read as one.
+   */
+  rssBytes: number;
+  /** When the last sample was ATTEMPTED — the throttle, deliberately separate from the evidence. */
+  rssSampledAt: number;
 }
 
 /** A lane that has never relaunched. */
@@ -222,6 +300,11 @@ export function newGatedLaneStats(): GatedLaneStats {
     firstNavigationRetries: 0,
     firstNavigationRecoveries: 0,
     retryAfter: 0,
+    lastRelaunchReason: null,
+    navFailureStreak: 0,
+    carryOverBlocked: false,
+    rssBytes: 0,
+    rssSampledAt: 0,
   };
 }
 
@@ -247,6 +330,11 @@ export interface GatedBrowserView {
   drainedTabsAtRelaunch: number;
   firstNavigationRetries: number;
   firstNavigationRecoveries: number;
+  /** Why the last relaunch happened, or null if this lane has not relaunched. */
+  lastRelaunchReason: GatedRelaunchReason | null;
+  navFailureStreak: number;
+  /** Last sampled resident megabytes for this browser and its renderers; null ⇒ not measurable. */
+  rssMb: number | null;
 }
 
 /**
@@ -266,5 +354,8 @@ export function gatedBrowserView(entry: GatedBrowserEntry, stats: GatedLaneStats
     drainedTabsAtRelaunch: stats.drainedTabsAtRelaunch,
     firstNavigationRetries: stats.firstNavigationRetries,
     firstNavigationRecoveries: stats.firstNavigationRecoveries,
+    lastRelaunchReason: stats.lastRelaunchReason,
+    navFailureStreak: stats.navFailureStreak,
+    rssMb: stats.rssBytes === 0 ? null : Math.round(stats.rssBytes / (1024 * 1024)),
   };
 }

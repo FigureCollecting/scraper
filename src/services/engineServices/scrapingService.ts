@@ -311,6 +311,19 @@ export async function browserFetchBody(
 }
 
 /**
+ * Whether an error is the BROWSER failing to navigate, rather than anything downstream of a page it
+ * did fetch. Matched on the shapes puppeteer and Chrome actually emit: `TimeoutError` from `goto`,
+ * Chrome's own `net::ERR_*` family, a target that went away mid-navigation, and the DevTools
+ * protocol errors a wedged browser answers with. The 2026-09-08 incident presented as the first of
+ * these on every navigation for 102 minutes.
+ */
+function isNavigationFailure(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  if (err.name === 'TimeoutError') return true;
+  return /net::ERR_|Navigation timeout|Target closed|Session closed|Protocol error|detached Frame/i.test(err.message);
+}
+
+/**
  * How the LAST challenge wait on a given page ended.
  *
  * Keyed by the page rather than kept in a module variable because gated fetches run concurrently —
@@ -637,7 +650,16 @@ export function createScrapingService(
         `(primed=${entry.primedHosts.has(host)}, tabs=${entry.pagesOpen})`,
       );
       const value = await fn(page);
+      // A navigation that returned — even one holding an interstitial — proves the browser is not
+      // wedged, which is the only thing the failure streak is watching for.
+      BrowserPool.recordGatedNavigation(egress, true);
       return { value, outcome: takeChallengeOutcome(page) };
+    } catch (err) {
+      // ONLY navigation failures count. A ruleset that threw on a page the browser fetched perfectly
+      // well says nothing about the browser, and recycling a good session over it would be the timer
+      // problem wearing a different hat.
+      if (isNavigationFailure(err)) BrowserPool.recordGatedNavigation(egress, false);
+      throw err;
     } finally {
       if (page) {
         const closedCleanly = await BrowserPool.closeGatedPage(entry, page);

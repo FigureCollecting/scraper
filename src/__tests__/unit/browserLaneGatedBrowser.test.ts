@@ -62,6 +62,9 @@ describe('browser lane gated browsers', () => {
           return context;
         }),
         close: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
+        process: jest.fn(() => ({ pid: 424242 })),
+        cookies: jest.fn<(...a: any[]) => any>().mockResolvedValue([]),
+        setCookie: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
         connected: true,
       } as unknown as jest.Mocked<Browser>;
       launches.push(record);
@@ -227,6 +230,9 @@ describe('browser lane gated browsers', () => {
         }),
         createBrowserContext: jest.fn<(...a: any[]) => any>(),
         close: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
+        process: jest.fn(() => ({ pid: 424242 })),
+        cookies: jest.fn<(...a: any[]) => any>().mockResolvedValue([]),
+        setCookie: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
         connected: true,
       } as unknown as jest.Mocked<Browser>;
     });
@@ -276,6 +282,9 @@ describe('browser lane gated browsers', () => {
         }),
         createBrowserContext: jest.fn<(...a: any[]) => any>(),
         close: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
+        process: jest.fn(() => ({ pid: 424242 })),
+        cookies: jest.fn<(...a: any[]) => any>().mockResolvedValue([]),
+        setCookie: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
         connected: true,
       } as unknown as jest.Mocked<Browser>;
       launches.push(record);
@@ -319,6 +328,9 @@ describe('browser lane gated browsers', () => {
         }),
         createBrowserContext: jest.fn<(...a: any[]) => any>(),
         close: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
+        process: jest.fn(() => ({ pid: 424242 })),
+        cookies: jest.fn<(...a: any[]) => any>().mockResolvedValue([]),
+        setCookie: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
         connected: true,
       } as unknown as jest.Mocked<Browser>;
       launches.push(record);
@@ -384,6 +396,50 @@ describe('browser lane gated browsers', () => {
     } finally {
       jest.useRealTimers();
     }
+  });
+
+  /**
+   * THE SELF-HEAL SIGNAL, end to end. On 2026-09-08 the residential browser answered every
+   * navigation with a timeout for 102 minutes and recovered only when a human restarted the pod. A
+   * navigation that times out is the browser failing; anything downstream of a page it did fetch is
+   * not, and recycling a cleared session over a ruleset bug would be the old timer in a new hat.
+   */
+  it('counts a navigation timeout against the lane, but not a failure downstream of a fetched page', async () => {
+    const service = createScrapingService();
+
+    const timeout = Object.assign(new Error('Navigation timeout of 45000 ms exceeded'), { name: 'TimeoutError' });
+    jest.mocked(puppeteer.launch).mockImplementationOnce(async (config: any) => {
+      const record: any = { args: config?.args ?? [], pages: [], contexts: [] };
+      record.browser = {
+        newPage: jest.fn<(...a: any[]) => any>().mockImplementation(async () => {
+          const page = newMockPage({ 'content-type': 'text/html' });
+          jest.mocked(page.goto).mockRejectedValue(timeout);
+          record.pages.push(page);
+          return page;
+        }),
+        createBrowserContext: jest.fn<(...a: any[]) => any>(),
+        close: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
+        process: jest.fn(() => ({ pid: 424242 })),
+        cookies: jest.fn<(...a: any[]) => any>().mockResolvedValue([]),
+        setCookie: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
+        connected: true,
+      } as unknown as jest.Mocked<Browser>;
+      launches.push(record);
+      return record.browser;
+    });
+
+    await expect(service.browserFetch('https://hobby-genki.com/item/1', { challengeGated: true })).rejects.toThrow(/Navigation timeout/);
+    expect(BrowserPool.gatedLaneStats('direct').navFailureStreak).toBe(1);
+
+    // A page that WAS fetched, whose body read then threw: the browser is fine, so the streak is not.
+    const entry = await BrowserPool.getGatedBrowser('direct');
+    jest.mocked(entry.browser.newPage).mockImplementation(async () => {
+      const page = newMockPage({ 'content-type': 'text/html' });
+      jest.mocked(page.content).mockRejectedValue(new Error('ruleset blew up'));
+      return page;
+    });
+    await expect(service.browserFetch('https://hobby-genki.com/item/2', { challengeGated: true })).rejects.toThrow('ruleset blew up');
+    expect(BrowserPool.gatedLaneStats('direct').navFailureStreak).toBe(1);
   });
 
   /**
@@ -460,6 +516,9 @@ describe('browser lane gated browsers', () => {
         }),
         createBrowserContext: jest.fn<(...a: any[]) => any>(),
         close: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
+        process: jest.fn(() => ({ pid: 424242 })),
+        cookies: jest.fn<(...a: any[]) => any>().mockResolvedValue([]),
+        setCookie: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
         connected: true,
       } as unknown as jest.Mocked<Browser>;
       launches.push(record);
@@ -490,6 +549,9 @@ describe('browser lane gated browsers', () => {
         }),
         createBrowserContext: jest.fn<(...a: any[]) => any>(),
         close: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
+        process: jest.fn(() => ({ pid: 424242 })),
+        cookies: jest.fn<(...a: any[]) => any>().mockResolvedValue([]),
+        setCookie: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
         connected: true,
       } as unknown as jest.Mocked<Browser>;
       launches.push(record);
