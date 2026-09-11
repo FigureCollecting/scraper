@@ -838,10 +838,11 @@ export class BrowserPool {
   /**
    * Why this browser should be replaced, or null to leave a working session alone.
    *
-   * ORDER IS THE POLICY: the two evidence triggers are asked first and the clock last, because the
-   * clock is the only one of the three that can fire on a browser with nothing wrong with it. The
-   * verdict then passes through the rate limiter, which is what stops a trigger that keeps firing
-   * from spending a prime navigation on a gated store per fetch (see gateGatedRelaunch).
+   * ORDER IS THE POLICY: the two evidence triggers name the reason when either of them can act,
+   * because the clock is the only trigger that can fire on a browser with nothing wrong with it.
+   * The verdict then passes through the rate limiter, which is what stops a trigger that keeps
+   * firing from spending a prime navigation on a gated store per fetch (see gateGatedRelaunch) —
+   * and the clock is asked independently of it, so a rate-limited lane still has a safety net.
    */
   private static gatedRelaunchReason(
     entry: GatedBrowserEntry,
