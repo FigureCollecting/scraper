@@ -43,10 +43,14 @@ import { resolveNavTimeoutMs } from './browserNavTimeout.js';
 import { applyEgressTimezone, selectEgressTimezone } from './browserTimezone.js';
 import {
   GATED_BROWSER_MAX_AGE_MS,
+  GATED_RELAUNCH_RETRY_MS,
   gatedBrowserView,
+  newGatedLaneStats,
   type EgressKind,
   type GatedBrowserEntry,
+  type GatedBrowserProof,
   type GatedBrowserView,
+  type GatedLaneStats,
 } from './gatedBrowsers.js';
 
 export interface ScrapedData {
@@ -478,6 +482,9 @@ export class BrowserPool {
     this.gatedBrowsers_.clear();
     this.gatedLaunches.clear();
     this.gatedRetiring.clear();
+    this.gatedStats.clear();
+    this.gatedRelaunches.clear();
+    this.gatedProving.clear();
   }
 
 
@@ -728,19 +735,62 @@ export class BrowserPool {
   private static gatedRetiring = new Set<GatedBrowserEntry>();
   /** Retirement promises, so shutdown (and tests) can wait for a graceful close to finish. */
   private static gatedRetirements = new Set<Promise<void>>();
+  /** Per-egress relaunch history, surfaced on /health/detailed. Outlives any single browser. */
+  private static gatedStats = new Map<EgressKind, GatedLaneStats>();
+  /** In-flight relaunches (one per egress): launch a replacement, prove it, then swap. */
+  private static gatedRelaunches = new Map<EgressKind, Promise<void>>();
+  /** Replacements currently under proof, so shutdown can close one instead of waiting out its wait. */
+  private static gatedProving = new Map<EgressKind, Browser>();
   private static readonly GATED_DRAIN_POLL_MS = 100;
   private static readonly GATED_DRAIN_TIMEOUT_MS = 60_000;
   private static readonly GATED_PAGE_CLOSE_TIMEOUT_MS = 10_000;
 
+  /** This lane's relaunch counters, created on first use. */
+  static gatedLaneStats(egress: EgressKind): GatedLaneStats {
+    let stats = this.gatedStats.get(egress);
+    if (!stats) {
+      stats = newGatedLaneStats();
+      this.gatedStats.set(egress, stats);
+    }
+    return stats;
+  }
+
   /**
-   * The live browser for an egress, launching it on first use. A browser is replaced when it has
-   * disconnected, when it is past GATED_BROWSER_MAX_AGE_MS, or when the configured proxy no longer
-   * matches the one it was launched with — the replacement is launched FIRST and the old one drains
-   * in the background, so a recycle never interrupts a fetch in flight.
+   * Count a first-navigation challenge that was retried rather than turned into a host cooldown, and
+   * whether that retry came back clean. Both numbers ride /health/detailed: retries say how often a
+   * fresh instance meets an interstitial it has to earn through, recoveries say how many 30-minute
+   * cooldowns (and the queue behind them) that grace actually saved.
    */
-  static async getGatedBrowser(egress: EgressKind, proxyServer?: string): Promise<GatedBrowserEntry> {
+  static recordGatedFirstNavigationRetry(egress: EgressKind, recovered: boolean): void {
+    const stats = this.gatedLaneStats(egress);
+    stats.firstNavigationRetries++;
+    if (recovered) stats.firstNavigationRecoveries++;
+  }
+
+  /**
+   * The live browser for an egress, launching it on first use.
+   *
+   * AGE DOES NOT TAKE A BROWSER OUT OF SERVICE. A browser past GATED_BROWSER_MAX_AGE_MS holds live
+   * Cloudflare clearances and is, by every observable measure, working; its replacement holds none.
+   * Swapping on the age alone is what production measured costing a store an hour of its queue
+   * (2026-09-11 00:38:15 relaunch → 00:39:41 the first suruga-ya.jp navigation on the replacement sat
+   * on the interstitial past the 30 s budget → 30-minute host cooldown → 15 items dropped, while the
+   * same instance served that host in 6 s as soon as the cooldown expired). So age merely STARTS a
+   * relaunch, which must prove its replacement before the swap; the aged browser serves throughout.
+   *
+   * A browser that is genuinely unusable — disconnected, or launched with a proxy the config no
+   * longer names — has nothing to serve from, so that replacement still happens inline.
+   */
+  static async getGatedBrowser(
+    egress: EgressKind,
+    proxyServer?: string,
+    prove?: GatedBrowserProof,
+  ): Promise<GatedBrowserEntry> {
     const current = this.gatedBrowsers_.get(egress);
-    if (current && this.isGatedBrowserUsable(current, proxyServer)) return current;
+    if (current && this.isGatedBrowserServable(current, proxyServer)) {
+      if (this.isGatedBrowserStale(current)) this.beginGatedRelaunch(egress, proxyServer, current, prove);
+      return current;
+    }
 
     let launch = this.gatedLaunches.get(egress);
     if (!launch) {
@@ -754,11 +804,15 @@ export class BrowserPool {
             ...(proxyServer ? { proxyServer } : {}),
             launchedAt: Date.now(),
             pagesOpen: 0,
-            primedHosts: new Set<string>(),
+            primedHosts: new Map<string, string>(),
+            navigatedHosts: new Set<string>(),
           };
           this.gatedBrowsers_.set(egress, entry);
           // The browser this one REPLACES keeps serving its in-flight tabs until they finish.
-          if (current && current.browser !== browser) this.retireGatedBrowserInBackground(current);
+          if (current && current.browser !== browser) {
+            this.gatedLaneStats(egress).drainedTabsAtRelaunch = current.pagesOpen;
+            this.retireGatedBrowserInBackground(current);
+          }
           return entry;
         })
         // Cleared either way: a FAILED launch must be retried by the next fetch, never cached as a
@@ -771,12 +825,144 @@ export class BrowserPool {
     return await launch;
   }
 
-  /** Whether a live gated browser can still serve: connected, inside its age bound, right egress. */
-  private static isGatedBrowserUsable(entry: GatedBrowserEntry, proxyServer?: string): boolean {
+  /**
+   * Whether a live gated browser can still serve. Age is deliberately NOT part of this: an aged
+   * browser serves perfectly well and, unlike its replacement, holds clearances (see getGatedBrowser).
+   */
+  private static isGatedBrowserServable(entry: GatedBrowserEntry, proxyServer?: string): boolean {
     if (entry.closing) return false;
     if (entry.browser.connected === false) return false;
-    if ((entry.proxyServer ?? undefined) !== (proxyServer ?? undefined)) return false;
-    return Date.now() - entry.launchedAt < GATED_BROWSER_MAX_AGE_MS;
+    return (entry.proxyServer ?? undefined) === (proxyServer ?? undefined);
+  }
+
+  /** Whether this browser is old enough that a proven replacement should take over. */
+  private static isGatedBrowserStale(entry: GatedBrowserEntry): boolean {
+    return Date.now() - entry.launchedAt >= GATED_BROWSER_MAX_AGE_MS;
+  }
+
+  /**
+   * Start a relaunch for this egress, unless one is already running or a failed proof has this lane
+   * backing off. Deliberately NOT awaited by the fetch that noticed the age: the caller is handed the
+   * running browser and the replacement is built beside it.
+   */
+  private static beginGatedRelaunch(
+    egress: EgressKind,
+    proxyServer: string | undefined,
+    outgoing: GatedBrowserEntry,
+    prove?: GatedBrowserProof,
+  ): void {
+    if (this.gatedRelaunches.has(egress)) return;
+    if (Date.now() < this.gatedLaneStats(egress).retryAfter) return;
+    const relaunch = this.relaunchGatedBrowser(egress, proxyServer, outgoing, prove)
+      .catch((err: unknown) => {
+        console.error(`[BROWSER POOL] ${egress} challenge-lane relaunch threw: ${err instanceof Error ? err.message : String(err)}`);
+      })
+      .finally(() => {
+        this.gatedRelaunches.delete(egress);
+      });
+    this.gatedRelaunches.set(egress, relaunch);
+  }
+
+  /**
+   * Build a replacement beside the running browser, PROVE it, and only then swap and retire the old
+   * one. A replacement that cannot prove itself is closed and the running browser is kept — a lane
+   * that fails to refresh keeps working, which is strictly better than a lane that refreshes into a
+   * browser no gated store will talk to.
+   *
+   * The proof is per host that the OUTGOING browser had session-primed: those are the hosts whose
+   * prime URL we already know, so re-priming costs a request we would have spent on the first fetch
+   * anyway and answers the only question that matters — does this profile clear the challenge? A
+   * host with no prime URL cannot be proven without spending a store request on a page nobody asked
+   * for, so it is not probed; the first-navigation grace in the gated fetch path covers it instead.
+   */
+  private static async relaunchGatedBrowser(
+    egress: EgressKind,
+    proxyServer: string | undefined,
+    outgoing: GatedBrowserEntry,
+    prove?: GatedBrowserProof,
+  ): Promise<void> {
+    const stats = this.gatedLaneStats(egress);
+    console.log(`[BROWSER POOL] Launching the ${egress} challenge-lane browser...`);
+
+    let browser: Browser;
+    try {
+      browser = await puppeteer.launch(buildBrowserConfig(process.env, proxyServer ? { proxyServer } : {}));
+    } catch (err) {
+      stats.relaunchFailures++;
+      stats.retryAfter = Date.now() + GATED_RELAUNCH_RETRY_MS;
+      console.error(`[BROWSER POOL] ${egress} challenge-lane relaunch could not launch: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    this.gatedProving.set(egress, browser);
+
+    const primed = new Map<string, string>();
+    let proven = true;
+    let failedHost = '';
+    try {
+      if (prove) {
+        for (const [host, primeUrl] of outgoing.primedHosts) {
+          let ok = false;
+          try {
+            ok = await prove(browser, host, primeUrl);
+          } catch {
+            ok = false;
+          }
+          if (!ok) {
+            proven = false;
+            failedHost = host;
+            break;
+          }
+          primed.set(host, primeUrl);
+        }
+      }
+    } finally {
+      this.gatedProving.delete(egress);
+    }
+
+    // Something else replaced this lane's browser while the proof ran (a disconnect, a proxy change,
+    // a shutdown). The replacement we just built is no longer anyone's — close it rather than
+    // install it over whatever took our place.
+    const superseded = this.gatedBrowsers_.get(egress) !== outgoing;
+    if (!proven || superseded) {
+      if (!proven) {
+        stats.relaunchFailures++;
+        stats.retryAfter = Date.now() + GATED_RELAUNCH_RETRY_MS;
+        console.warn(
+          `[BROWSER POOL] the ${egress} challenge-lane replacement FAILED its proof on ${sanitizeForLog(failedHost)} — ` +
+          `keeping the running browser (relaunchFailures=${stats.relaunchFailures})`,
+        );
+      }
+      await browser.close().catch((err: unknown) => {
+        console.error(`[BROWSER POOL] Error closing an unused ${egress} challenge-lane replacement: ${err instanceof Error ? err.message : String(err)}`);
+      });
+      return;
+    }
+
+    const entry: GatedBrowserEntry = {
+      egress,
+      browser,
+      ...(proxyServer ? { proxyServer } : {}),
+      launchedAt: Date.now(),
+      pagesOpen: 0,
+      primedHosts: primed,
+      navigatedHosts: new Set<string>(),
+    };
+    this.gatedBrowsers_.set(egress, entry);
+    stats.relaunchCount++;
+    stats.lastRelaunchAt = entry.launchedAt;
+    stats.drainedTabsAtRelaunch = outgoing.pagesOpen;
+    console.log(
+      `[BROWSER POOL] ${egress} challenge-lane browser replaced after proof ` +
+      `(relaunch #${stats.relaunchCount}, ${outgoing.pagesOpen} tab(s) draining, ${primed.size} host(s) re-primed)`,
+    );
+    this.retireGatedBrowserInBackground(outgoing);
+  }
+
+  /** Wait for every in-flight relaunch (tests, shutdown). */
+  static async settleGatedRelaunches(): Promise<void> {
+    while (this.gatedRelaunches.size > 0) {
+      await Promise.allSettled([...this.gatedRelaunches.values()]);
+    }
   }
 
   /**
@@ -884,7 +1070,7 @@ export class BrowserPool {
 
   /** The live gated browsers, for /health/detailed. Handles never leave this class. */
   static gatedBrowsers(): GatedBrowserView[] {
-    return [...this.gatedBrowsers_.values()].map(gatedBrowserView);
+    return [...this.gatedBrowsers_.values()].map((entry) => gatedBrowserView(entry, this.gatedLaneStats(entry.egress)));
   }
 
   /** Close every gated browser (live and retiring) without waiting out their tabs — shutdown only. */
@@ -892,6 +1078,14 @@ export class BrowserPool {
     const all = [...this.gatedBrowsers_.values(), ...this.gatedRetiring];
     this.gatedBrowsers_.clear();
     this.gatedLaunches.clear();
+    // A replacement mid-proof is holding a Chrome AND a navigation that could run for the whole
+    // clearance budget. Closing the handle makes that navigation reject at once, so the relaunch
+    // settles in milliseconds instead of keeping shutdown waiting on an interstitial.
+    for (const browser of this.gatedProving.values()) {
+      await browser.close().catch(() => undefined);
+    }
+    this.gatedProving.clear();
+    await this.settleGatedRelaunches();
     for (const entry of all) await this.closeGatedBrowserHandle(entry);
     // Every drain now sees `closing` and stops, so this cannot wait out the drain timeout.
     await this.settleGatedRetirements();

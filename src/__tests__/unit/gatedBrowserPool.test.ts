@@ -117,31 +117,155 @@ describe('BrowserPool gated browsers', () => {
     expect(entry.pagesOpen).toBe(0);
   });
 
-  it('replaces a browser past its max age, closing the old one once it has drained', async () => {
+  it('replaces a browser past its max age once the replacement is proven, closing the old one after it drains', async () => {
     const first = await BrowserPool.getGatedBrowser('residential', PROXY);
     first.launchedAt = Date.now() - GATED_BROWSER_MAX_AGE_MS - 1;
 
-    const second = await BrowserPool.getGatedBrowser('residential', PROXY);
+    await BrowserPool.getGatedBrowser('residential', PROXY);
+    await BrowserPool.settleGatedRelaunches();
     await BrowserPool.settleGatedRetirements();
 
+    const second = await BrowserPool.getGatedBrowser('residential', PROXY);
     expect(second).not.toBe(first);
     expect(puppeteer.launch).toHaveBeenCalledTimes(2);
     expect(first.browser.close).toHaveBeenCalledTimes(1);
     expect(second.browser.close).not.toHaveBeenCalled();
   });
 
-  it('waits for an in-flight page before closing the browser it replaced', async () => {
+  /**
+   * THE 2026-09-08 INCIDENT: a relaunch that lands while tabs are in flight left every navigation
+   * timing out until the pod was restarted by hand. The outgoing browser must keep its tabs.
+   */
+  it('never severs an in-flight tab: the replaced browser closes only after its tab does', async () => {
     const first = await BrowserPool.getGatedBrowser('residential', PROXY);
     const page = await BrowserPool.openGatedPage(first);
     first.launchedAt = Date.now() - GATED_BROWSER_MAX_AGE_MS - 1;
 
     await BrowserPool.getGatedBrowser('residential', PROXY);
+    await BrowserPool.settleGatedRelaunches();
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(first.browser.close).not.toHaveBeenCalled();
+    expect(page.close).not.toHaveBeenCalled();
+    expect(BrowserPool.gatedLaneStats('residential').drainedTabsAtRelaunch).toBe(1);
 
     await BrowserPool.closeGatedPage(first, page);
     await BrowserPool.settleGatedRetirements();
     expect(first.browser.close).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * The replacement holds no clearances, so it must EARN service rather than be handed it. Until its
+   * proof finishes, every fetch is still answered by the browser that demonstrably works.
+   */
+  it('keeps serving from the aged browser until its replacement has passed the proof', async () => {
+    const first = await BrowserPool.getGatedBrowser('residential', PROXY);
+    first.primedHosts.set('www.anitoysgk.com', 'https://www.anitoysgk.com');
+    first.launchedAt = Date.now() - GATED_BROWSER_MAX_AGE_MS - 1;
+
+    let release!: () => void;
+    const proving = new Promise<void>((resolve) => { release = resolve; });
+    const prove = jest.fn<(...a: any[]) => any>().mockImplementation(async () => { await proving; return true; });
+
+    const during = await BrowserPool.getGatedBrowser('residential', PROXY, prove as any);
+    expect(during).toBe(first);
+    expect(puppeteer.launch).toHaveBeenCalledTimes(2);
+    expect(await BrowserPool.getGatedBrowser('residential', PROXY, prove as any)).toBe(first);
+    expect(first.browser.close).not.toHaveBeenCalled();
+
+    release();
+    await BrowserPool.settleGatedRelaunches();
+    await BrowserPool.settleGatedRetirements();
+
+    const after = await BrowserPool.getGatedBrowser('residential', PROXY, prove as any);
+    expect(after).not.toBe(first);
+    expect(prove).toHaveBeenCalledWith(launched[1].browser, 'www.anitoysgk.com', 'https://www.anitoysgk.com');
+    expect(after.primedHosts.get('www.anitoysgk.com')).toBe('https://www.anitoysgk.com');
+    expect(first.browser.close).toHaveBeenCalledTimes(1);
+    expect(BrowserPool.gatedLaneStats('residential').relaunchCount).toBe(1);
+    expect(BrowserPool.gatedLaneStats('residential').relaunchFailures).toBe(0);
+  });
+
+  /**
+   * A replacement that cannot clear the challenge is WORSE than the aged browser it would replace.
+   * Discard it, keep the running one, count it, and back off instead of burning a store request per
+   * fetch on a proof that is failing.
+   */
+  it('keeps the running browser when a replacement fails its proof, counts it, and backs off', async () => {
+    const first = await BrowserPool.getGatedBrowser('residential', PROXY);
+    first.primedHosts.set('www.anitoysgk.com', 'https://www.anitoysgk.com');
+    first.launchedAt = Date.now() - GATED_BROWSER_MAX_AGE_MS - 1;
+
+    await BrowserPool.getGatedBrowser('residential', PROXY, (async () => false) as any);
+    await BrowserPool.settleGatedRelaunches();
+
+    expect(await BrowserPool.getGatedBrowser('residential', PROXY, (async () => false) as any)).toBe(first);
+    expect(first.browser.close).not.toHaveBeenCalled();
+    expect(launched[1].browser.close).toHaveBeenCalledTimes(1);
+    expect(BrowserPool.gatedLaneStats('residential').relaunchFailures).toBe(1);
+    expect(BrowserPool.gatedLaneStats('residential').relaunchCount).toBe(0);
+    // Backing off: the second call above must NOT have started another relaunch.
+    await BrowserPool.settleGatedRelaunches();
+    expect(puppeteer.launch).toHaveBeenCalledTimes(2);
+  });
+
+  /** A replacement that cannot even be launched is the same verdict as one that fails its proof. */
+  it('counts a relaunch whose replacement cannot launch, and keeps the running browser', async () => {
+    const first = await BrowserPool.getGatedBrowser('residential', PROXY);
+    first.launchedAt = Date.now() - GATED_BROWSER_MAX_AGE_MS - 1;
+    jest.mocked(puppeteer.launch).mockRejectedValueOnce(new Error('no display'));
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await BrowserPool.getGatedBrowser('residential', PROXY);
+      await BrowserPool.settleGatedRelaunches();
+
+      expect(await BrowserPool.getGatedBrowser('residential', PROXY)).toBe(first);
+      expect(first.browser.close).not.toHaveBeenCalled();
+      expect(BrowserPool.gatedLaneStats('residential').relaunchFailures).toBe(1);
+      expect(errSpy.mock.calls.map((call) => String(call[0]))
+        .some((line) => line.includes('could not launch'))).toBe(true);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  /**
+   * A proof that THROWS (the prime navigation timed out, the tab died) is a failed proof, not a pass
+   * — and discarding the replacement must survive a handle that will not close.
+   */
+  it('treats a proof that throws as a failure, even when the replacement will not close', async () => {
+    const first = await BrowserPool.getGatedBrowser('residential', PROXY);
+    first.primedHosts.set('www.anitoysgk.com', 'https://www.anitoysgk.com');
+    first.launchedAt = Date.now() - GATED_BROWSER_MAX_AGE_MS - 1;
+    jest.mocked(puppeteer.launch).mockImplementationOnce(async (config: any) => {
+      const record: any = { args: config?.args ?? [], pages: [] };
+      record.browser = {
+        newPage: jest.fn<(...a: any[]) => any>(),
+        createBrowserContext: jest.fn<(...a: any[]) => any>(),
+        close: jest.fn<(...a: any[]) => any>().mockRejectedValue(new Error('handle gone')),
+        connected: true,
+      } as unknown as jest.Mocked<Browser>;
+      launched.push(record);
+      return record.browser;
+    });
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const thrower = (async () => { throw new Error('prime navigation failed'); });
+      await BrowserPool.getGatedBrowser('residential', PROXY, thrower as any);
+      await BrowserPool.settleGatedRelaunches();
+
+      expect(await BrowserPool.getGatedBrowser('residential', PROXY, thrower as any)).toBe(first);
+      expect(first.browser.close).not.toHaveBeenCalled();
+      expect(BrowserPool.gatedLaneStats('residential').relaunchFailures).toBe(1);
+      expect(BrowserPool.gatedLaneStats('residential').relaunchCount).toBe(0);
+      expect(warnSpy.mock.calls.map((call) => String(call[0]))
+        .some((line) => line.includes('FAILED its proof on www.anitoysgk.com'))).toBe(true);
+      expect(errSpy.mock.calls.map((call) => String(call[0]))
+        .some((line) => line.includes('Error closing an unused residential challenge-lane replacement'))).toBe(true);
+    } finally {
+      errSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
   });
 
   it('replaces a gated browser that has disconnected', async () => {
@@ -197,11 +321,22 @@ describe('BrowserPool gated browsers', () => {
 
   it('lists the live gated browsers for the health surface', async () => {
     const entry = await BrowserPool.getGatedBrowser('residential', PROXY);
-    entry.primedHosts.add('www.anitoysgk.com');
+    entry.primedHosts.set('www.anitoysgk.com', 'https://www.anitoysgk.com');
     await BrowserPool.openGatedPage(entry);
 
     expect(BrowserPool.gatedBrowsers()).toEqual([
-      { egress: 'residential', launchedAt: new Date(entry.launchedAt).toISOString(), pagesOpen: 1, primedHosts: 1 },
+      {
+        egress: 'residential',
+        launchedAt: new Date(entry.launchedAt).toISOString(),
+        pagesOpen: 1,
+        primedHosts: 1,
+        lastRelaunchAt: null,
+        relaunchCount: 0,
+        relaunchFailures: 0,
+        drainedTabsAtRelaunch: 0,
+        firstNavigationRetries: 0,
+        firstNavigationRecoveries: 0,
+      },
     ]);
   });
 });

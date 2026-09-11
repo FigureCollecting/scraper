@@ -48,6 +48,15 @@ export const GATED_BROWSER_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 export const MAX_CONCURRENT_PAGES_PER_HOST = 2;
 
 /**
+ * How long a lane waits before attempting another relaunch after one FAILED its proof. A relaunch
+ * proof spends a real store request per primed host, so a lane whose replacement cannot clear (the
+ * egress IP is in the penalty box, the store is hard-blocking) must not burn one every time a fetch
+ * arrives. The old instance keeps serving throughout — a failed relaunch costs nothing but the
+ * chance to refresh, so backing off is free.
+ */
+export const GATED_RELAUNCH_RETRY_MS = 5 * 60 * 1000;
+
+/**
  * The key a host's concurrency is counted under. Egress is part of it because the same host on two
  * exits is two different browsers: a slot in one says nothing about the other.
  */
@@ -156,8 +165,22 @@ export interface GatedBrowserEntry {
   launchedAt: number;
   /** Tabs currently open on it. A retiring browser is closed only once this reaches zero. */
   pagesOpen: number;
-  /** Hosts already session-primed on THIS browser instance (a relaunch primes them again). */
-  primedHosts: Set<string>;
+  /**
+   * Hosts already session-primed on THIS browser instance, mapped to the prime URL that did it.
+   * The URL is kept because a RELAUNCH has to re-prove those same hosts on the replacement before it
+   * may carry traffic, and the pool that runs the proof has no other way to learn where to navigate.
+   */
+  primedHosts: Map<string, string>;
+  /**
+   * Hosts that have completed at least one navigation on THIS instance. A fresh instance holds no
+   * Cloudflare clearance for any host, so the FIRST navigation for a host is the one that has to
+   * earn it inline — and that is the navigation measured failing in production (2026-09-11 00:39:41,
+   * suruga-ya.jp, 86 s after a relaunch: the interstitial outlasted the 30 s clearance budget, a
+   * 30-minute host cooldown opened, 15 queued items were dropped, and the SAME instance then served
+   * the host in 6 s once the cooldown expired). Membership here is what tells a challenge on a
+   * first navigation apart from a challenge on a settled one, so only the former gets the retry.
+   */
+  navigatedHosts: Set<string>;
   /**
    * Set when the browser is being taken out of service. It ABANDONS a drain that is waiting on
    * in-flight tabs — shutdown closes the handle immediately rather than waiting out a stuck page.
@@ -167,6 +190,48 @@ export interface GatedBrowserEntry {
   closed?: boolean;
 }
 
+/**
+ * Per-EGRESS relaunch bookkeeping. It deliberately does NOT live on GatedBrowserEntry: an entry is
+ * one Chrome, and these counts describe the SEQUENCE of Chromes a lane has been through — the thing
+ * an operator needs when asking "is this lane churning, and is it churning successfully?".
+ */
+export interface GatedLaneStats {
+  /** Successful relaunches: a replacement was proven and took over. */
+  relaunchCount: number;
+  /** Relaunch attempts whose replacement failed its proof and was discarded, the old one kept. */
+  relaunchFailures: number;
+  /** Epoch ms of the last SUCCESSFUL relaunch, or null if this lane still runs its first browser. */
+  lastRelaunchAt: number | null;
+  /** Tabs still in flight on the outgoing instance at the moment the last relaunch retired it. */
+  drainedTabsAtRelaunch: number;
+  /** First-navigation challenges that were retried once instead of opening a host cooldown. */
+  firstNavigationRetries: number;
+  /** Those retries that came back without a challenge — the cooldowns this grace actually avoided. */
+  firstNavigationRecoveries: number;
+  /** Epoch ms before which no further relaunch is attempted (set by a failed proof). */
+  retryAfter: number;
+}
+
+/** A lane that has never relaunched. */
+export function newGatedLaneStats(): GatedLaneStats {
+  return {
+    relaunchCount: 0,
+    relaunchFailures: 0,
+    lastRelaunchAt: null,
+    drainedTabsAtRelaunch: 0,
+    firstNavigationRetries: 0,
+    firstNavigationRecoveries: 0,
+    retryAfter: 0,
+  };
+}
+
+/**
+ * A relaunch's PROOF: navigate a tab of the replacement browser to one host's prime URL and answer
+ * whether the challenge cleared. Injected by the fetch layer rather than implemented here, because
+ * the clearance wait lives with the navigation code and this module deliberately imports no Chrome.
+ */
+export type GatedBrowserProof = (browser: Browser, host: string, primeUrl: string) => Promise<boolean>;
+
 /** The operator view of one gated browser for /health/detailed (counts only, no handles). */
 export interface GatedBrowserView {
   egress: EgressKind;
@@ -175,14 +240,31 @@ export interface GatedBrowserView {
   pagesOpen: number;
   /** How many hosts have already made their session-priming visit on this instance. */
   primedHosts: number;
+  /** ISO-8601 of the last successful relaunch on this egress; null while it runs its first browser. */
+  lastRelaunchAt: string | null;
+  relaunchCount: number;
+  relaunchFailures: number;
+  drainedTabsAtRelaunch: number;
+  firstNavigationRetries: number;
+  firstNavigationRecoveries: number;
 }
 
-/** Project a live entry onto its health view. */
-export function gatedBrowserView(entry: GatedBrowserEntry): GatedBrowserView {
+/**
+ * Project a live entry (and its lane's relaunch history) onto its health view. The stats default to
+ * a never-relaunched lane so every existing caller keeps working and a lane reads as quiet rather
+ * than as missing data.
+ */
+export function gatedBrowserView(entry: GatedBrowserEntry, stats: GatedLaneStats = newGatedLaneStats()): GatedBrowserView {
   return {
     egress: entry.egress,
     launchedAt: new Date(entry.launchedAt).toISOString(),
     pagesOpen: entry.pagesOpen,
     primedHosts: entry.primedHosts.size,
+    lastRelaunchAt: stats.lastRelaunchAt === null ? null : new Date(stats.lastRelaunchAt).toISOString(),
+    relaunchCount: stats.relaunchCount,
+    relaunchFailures: stats.relaunchFailures,
+    drainedTabsAtRelaunch: stats.drainedTabsAtRelaunch,
+    firstNavigationRetries: stats.firstNavigationRetries,
+    firstNavigationRecoveries: stats.firstNavigationRecoveries,
   };
 }

@@ -25,6 +25,8 @@ import { applyEgressTimezone } from '../browserTimezone.js';
 import {
   ChallengeLaneUnavailableError,
   awaitChallengeClearance,
+  awaitChallengeClearanceOutcome,
+  type ChallengeOutcome,
   challengeHost,
   isChallengeGated,
   type ChallengeAwarePage,
@@ -35,6 +37,7 @@ import {
   getHostConcurrency,
   type EgressKind,
   type GatedBrowserEntry,
+  type GatedBrowserProof,
 } from '../gatedBrowsers.js';
 
 const DEFAULT_USER_AGENT =
@@ -297,7 +300,7 @@ export async function browserFetchBody(
     // CHALLENGE: `domcontentloaded` fires on the Cloudflare interstitial too. Wait (bounded) for the
     // clean-headful browser to clear it, so the body below is the store's document and not "Just a
     // moment" — and so the host is marked gated, moving its later fetches onto the gated browser.
-    await awaitChallengeClearance(challengeAwarePage(page), response, url);
+    recordChallengeOutcome(page, await awaitChallengeClearanceOutcome(challengeAwarePage(page), response, url));
     // READINESS: a client-rendered storefront has only its app shell at domcontentloaded — wait for
     // the declared selector / network idle before reading the body. Undeclared ⇒ no wait.
     await applyWaitFor(page, url, options.waitFor);
@@ -305,6 +308,35 @@ export async function browserFetchBody(
   } finally {
     documents.stop();
   }
+}
+
+/**
+ * How the LAST challenge wait on a given page ended.
+ *
+ * Keyed by the page rather than kept in a module variable because gated fetches run concurrently —
+ * two tabs for two hosts are in flight at once, and a single "last outcome" would hand one host's
+ * verdict to the other. A WeakMap also means a closed tab's entry disappears with the tab.
+ *
+ * The navigation functions (`browserFetchBody`, `navigateAndCapture`) are opaque to the gated runner
+ * that wraps them: it hands them a page and gets a result back, with no room in the signature for
+ * "and by the way, the challenge never cleared". This is that channel.
+ */
+const challengeOutcomes = new WeakMap<object, ChallengeOutcome>();
+
+/** Record how this page's challenge wait ended. */
+function recordChallengeOutcome(page: object, outcome: ChallengeOutcome): void {
+  challengeOutcomes.set(page, outcome);
+}
+
+/**
+ * Read and clear this page's recorded outcome. Cleared on read so a page that is reused for a second
+ * navigation cannot answer with the first one's verdict; an unrecorded page reads as `'none'`, which
+ * is the honest answer for a fetch that never reached a challenge wait.
+ */
+function takeChallengeOutcome(page: object): ChallengeOutcome {
+  const outcome = challengeOutcomes.get(page) ?? 'none';
+  challengeOutcomes.delete(page);
+  return outcome;
 }
 
 /**
@@ -417,7 +449,7 @@ async function navigateAndCapture(
     response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: resolveNavTimeout(options.navTimeoutMs) });
 
     // CHALLENGE: wait out a Cloudflare interstitial before either lane is read (see browserChallenge).
-    await awaitChallengeClearance(challengeAwarePage(page), response, url);
+    recordChallengeOutcome(page, await awaitChallengeClearanceOutcome(challengeAwarePage(page), response, url));
 
     // READINESS (SearchFetch.waitFor): wait for the client-rendered product before the DOM lane is
     // read, so a PWA storefront captures the product page rather than its 8 KB app shell. This sits
@@ -531,9 +563,55 @@ export function createScrapingService(
     // of filling the shared browser with renderers.
     const slot = await getHostConcurrency().acquire(gatedHostKey(host, egress));
     let entry: GatedBrowserEntry | undefined;
+    try {
+      entry = await BrowserPool.getGatedBrowser(egress, options.proxyServer, gatedBrowserProof(options));
+      // A fresh instance holds no clearance for any host, so the FIRST navigation for a host is the
+      // one that has to earn one inline — and an interstitial that outlasts the clearance budget on
+      // THAT navigation is the measured production defect (2026-09-11 00:39:41): the lane reports a
+      // challenge page, the queue opens a 30-minute host cooldown, and every queued item for the
+      // host is dropped, while the clearance lands moments later and the same instance serves the
+      // host for the rest of its life. So the first navigation gets ONE retry before that verdict
+      // stands. It is bounded to once per (instance, host) — at most one extra request per host per
+      // browser lifetime — so a store that is genuinely hard-blocking is not hammered.
+      const firstOnInstance = !entry.navigatedHosts.has(host);
+      try {
+        const attempt = await runGatedAttempt(fn, options, entry, host, egress);
+        if (!firstOnInstance || attempt.outcome !== 'unresolved') return attempt.value;
+
+        const retry = await runGatedAttempt(fn, options, entry, host, egress);
+        const recovered = retry.outcome !== 'unresolved';
+        BrowserPool.recordGatedFirstNavigationRetry(egress, recovered);
+        // eslint-disable-next-line no-console
+        // lgtm[js/log-injection] — host is caller-influenced; sanitize before logging
+        console.warn(
+          `[GATED] first navigation for ${sanitizeForLog(host)} on the fresh ${egress} browser did not clear — ` +
+          `retried once, ${recovered ? 'cleared' : 'still challenged'}`,
+        );
+        return retry.value;
+      } finally {
+        // Recorded whichever way it went: the grace is a ONE-SHOT per (instance, host), not a
+        // standing licence to double every failing fetch.
+        entry.navigatedHosts.add(host);
+      }
+    } finally {
+      slot();
+    }
+  }
+
+  /**
+   * One attempt on the gated browser: a fresh tab in its default context, the session prime if this
+   * host has not been primed on THIS instance, the fetch, then the tab. Reports how the navigation's
+   * challenge wait ended so the caller can decide whether the attempt deserves a second go.
+   */
+  async function runGatedAttempt<T>(
+    fn: (page: Page) => Promise<T>,
+    options: EnginePageOptions,
+    entry: GatedBrowserEntry,
+    host: string,
+    egress: EgressKind,
+  ): Promise<{ value: T; outcome: ChallengeOutcome }> {
     let page: Page | undefined;
     try {
-      entry = await BrowserPool.getGatedBrowser(egress, options.proxyServer);
       page = await BrowserPool.openGatedPage(entry);
       await preparePage(page, options);
       // SESSION PRIME on a cold profile: anitoys' search results 404 without a same-session homepage
@@ -544,7 +622,9 @@ export function createScrapingService(
         // interstitial, and navigating to the target without waiting CANCELS the challenge script:
         // the homepage never loads and the cookie the prime exists for is never set.
         await awaitChallengeClearance(challengeAwarePage(page), primed, options.primeUrl);
-        entry.primedHosts.add(host);
+        // Keyed by the URL that primed it, because a RELAUNCH must re-prove this host on the
+        // replacement browser and has no other way to learn where to navigate.
+        entry.primedHosts.set(host, options.primeUrl);
       }
       // ONE line per gated fetch — the lane is invisible from outside the pod otherwise, and its
       // failure mode (a fetch quietly taking the per-request context instead) looks identical to a
@@ -556,17 +636,41 @@ export function createScrapingService(
         `[GATED] ${egress} tab for ${sanitizeForLog(host)} ` +
         `(primed=${entry.primedHosts.has(host)}, tabs=${entry.pagesOpen})`,
       );
-      return await fn(page);
+      const value = await fn(page);
+      return { value, outcome: takeChallengeOutcome(page) };
     } finally {
-      if (entry && page) {
+      if (page) {
         const closedCleanly = await BrowserPool.closeGatedPage(entry, page);
         // A tab that will not close is a live renderer on a browser that outlives every request — the
         // leak shape that once climbed to ~25 GB. Retire the whole browser and pay one round of
         // re-challenges rather than keep opening tabs on it.
         if (!closedCleanly) await BrowserPool.retireGatedBrowser(entry);
       }
-      slot();
     }
+  }
+
+  /**
+   * The proof a RELAUNCH runs before its replacement may carry traffic: navigate a tab of the NEW
+   * browser to a host's prime URL and report whether the challenge cleared. Built here rather than in
+   * the pool because the clearance wait belongs with the navigation code — the pool launches Chrome,
+   * it does not know how to tell a cleared challenge from an interstitial.
+   */
+  function gatedBrowserProof(options: EnginePageOptions): GatedBrowserProof {
+    return async (browser, _host, primeUrl) => {
+      let page: Page | undefined;
+      try {
+        page = await browser.newPage();
+        // The same page preparation a real fetch gets: the challenge reads the profile, so a proof
+        // run on a differently-shaped page proves nothing about the fetches that follow it.
+        await preparePage(page, options);
+        const primed = await page.goto(primeUrl, { waitUntil: 'domcontentloaded', timeout: resolveNavTimeout(options.navTimeoutMs) });
+        return (await awaitChallengeClearanceOutcome(challengeAwarePage(page), primed, primeUrl)) !== 'unresolved';
+      } catch {
+        return false;
+      } finally {
+        if (page) await page.close().catch(() => undefined);
+      }
+    };
   }
 
   /**
