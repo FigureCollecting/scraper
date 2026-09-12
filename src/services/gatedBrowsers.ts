@@ -27,6 +27,7 @@
  * `puppeteer.launch` in the engine.
  */
 import type { Browser } from 'puppeteer';
+import type { MemoryMeasureMethod } from './browserRss.js';
 
 /** Which egress a gated browser leaves through — one browser per value, never shared. */
 export type EgressKind = 'residential' | 'direct';
@@ -50,13 +51,51 @@ export type EgressKind = 'residential' | 'direct';
 export const GATED_BROWSER_MAX_AGE_MS = 12 * 60 * 60 * 1000;
 
 /**
- * Resident bytes (browser process plus its renderers) at which a gated browser is recycled on
- * EVIDENCE of growth. The pod's limit is 3 GiB and it runs four Chromes — two pooled, two gated —
- * so one gated browser holding a gigabyte is already twice its fair share and heading for the
- * ceiling. Measured on a healthy pod the three-Chrome warm pool sits around 2.5 GB total, so this
- * fires on a leak and not on ordinary work.
+ * Proportional bytes (browser process plus its renderers, PSS — see browserRss.ts) at which a gated
+ * browser is recycled on EVIDENCE of growth. The floor: the pod's limit is 3 GiB and it runs four
+ * Chromes — two pooled, two gated — so one gated browser holding a gigabyte is already twice its
+ * fair share and heading for the ceiling.
+ *
+ * Never compare this against a sum of VmRSS. That sum counts Chrome's shared pages once per process
+ * and reads 3.76x the true figure on this pod, which is what made the trigger fire within seconds of
+ * every launch on 2026-09-11 (eight residential relaunches in ten minutes).
  */
 export const GATED_BROWSER_MAX_RSS_BYTES = 1024 * 1024 * 1024;
+
+/**
+ * Share of the container's own memory ceiling one gated browser tree may hold before it is recycled.
+ *
+ * A constant threshold is a guess about a pod size. The cgroup publishes the real budget, so derive
+ * from it and let the constant above be the FLOOR: on the 3 GiB scraper pod this lands at 1.2 GiB,
+ * and on a pod resized either way the trigger moves with it instead of becoming either inert or
+ * permanently hot. Four Chromes share that ceiling, so 40 % is already a generous single share —
+ * it is a leak detector, not a fairness quota.
+ */
+export const GATED_MEMORY_LIMIT_FRACTION = 0.4;
+
+/**
+ * Minimum gap between EVIDENCE relaunches on one lane. The trigger that fires is not the cost; the
+ * PRIME NAVIGATION each replacement spends on a Cloudflare-fronted store is, and eight of those in
+ * ten minutes from one residential IP is request burn and reputation risk (2026-09-11 22:31–22:41,
+ * ending in a replacement that failed its proof on www.anitoysgk.com and threw the session away).
+ *
+ * Thirty minutes is chosen against the thing being protected: a genuine leak takes far longer than
+ * that to matter, while a misfiring trigger does its damage in minutes. The backstop is exempt —
+ * it is the last line of defence and must not be gated by the rate limit meant to protect it.
+ */
+export const GATED_BROWSER_MIN_RELAUNCH_INTERVAL_MS = 30 * 60 * 1000;
+
+/**
+ * How long a memory relaunch is given to prove it HELPED before the lane concludes it did not.
+ *
+ * A replacement that is still over the threshold two minutes in is not carrying a leak the old
+ * browser had — the measurement is wrong, the threshold is wrong, or Chrome simply costs that much
+ * here. Relaunching again cannot fix any of those, so the lane backs off instead of repeating it.
+ */
+export const GATED_RELAUNCH_GRACE_MS = 2 * 60 * 1000;
+
+/** Ceiling on the doubling. Past four hours the backstop arrives anyway and an operator should look. */
+export const GATED_RELAUNCH_BACKOFF_CAP_MS = 4 * 60 * 60 * 1000;
 
 /**
  * Consecutive failed navigations on one lane before its browser is treated as wedged and replaced.
@@ -89,10 +128,55 @@ export function resolveGatedMaxAgeMs(env: NodeJS.ProcessEnv = process.env): numb
   return envNumber(env.GATED_BROWSER_MAX_AGE_MS, GATED_BROWSER_MAX_AGE_MS);
 }
 
-/** The memory trigger, overridable with GATED_BROWSER_MAX_RSS_MB (megabytes). */
-export function resolveGatedMaxRssBytes(env: NodeJS.ProcessEnv = process.env): number {
-  const mb = envNumber(env.GATED_BROWSER_MAX_RSS_MB, GATED_BROWSER_MAX_RSS_BYTES / (1024 * 1024));
+/**
+ * The default memory trigger for a pod whose ceiling is `cgroupLimitBytes`: the larger of the 1 GiB
+ * floor and GATED_MEMORY_LIMIT_FRACTION of that ceiling. An unknown ceiling (no cgroup, `max`, the
+ * v1 unlimited sentinel) leaves the floor standing, which is the conservative answer.
+ */
+export function gatedMemoryThresholdBytes(cgroupLimitBytes?: number): number {
+  if (cgroupLimitBytes === undefined || !Number.isFinite(cgroupLimitBytes) || cgroupLimitBytes <= 0) {
+    return GATED_BROWSER_MAX_RSS_BYTES;
+  }
+  return Math.max(GATED_BROWSER_MAX_RSS_BYTES, Math.floor(cgroupLimitBytes * GATED_MEMORY_LIMIT_FRACTION));
+}
+
+/**
+ * The memory trigger, overridable with GATED_BROWSER_MAX_RSS_MB (megabytes). The override wins over
+ * the derived default outright — an operator who has named a number has already decided, and
+ * fc-infra currently names 2048 as the interim mitigation for the churn this replaces.
+ */
+export function resolveGatedMaxRssBytes(env: NodeJS.ProcessEnv = process.env, cgroupLimitBytes?: number): number {
+  const derived = gatedMemoryThresholdBytes(cgroupLimitBytes);
+  const mb = envNumber(env.GATED_BROWSER_MAX_RSS_MB, derived / (1024 * 1024));
   return mb * 1024 * 1024;
+}
+
+/** The evidence-relaunch rate limit, overridable with GATED_BROWSER_MIN_RELAUNCH_INTERVAL_MS. */
+export function resolveGatedMinRelaunchIntervalMs(env: NodeJS.ProcessEnv = process.env): number {
+  return envNumber(env.GATED_BROWSER_MIN_RELAUNCH_INTERVAL_MS, GATED_BROWSER_MIN_RELAUNCH_INTERVAL_MS);
+}
+
+/** The window a memory relaunch gets to prove it helped, overridable with GATED_RELAUNCH_GRACE_MS. */
+export function resolveGatedRelaunchGraceMs(env: NodeJS.ProcessEnv = process.env): number {
+  return envNumber(env.GATED_RELAUNCH_GRACE_MS, GATED_RELAUNCH_GRACE_MS);
+}
+
+/** Everything the relaunch gate needs, resolved once so a fake clock can drive the state machine. */
+export interface RelaunchGateLimits {
+  minIntervalMs: number;
+  graceMs: number;
+  backoffCapMs: number;
+  thresholdBytes: number;
+}
+
+/** The live gate settings for this process. */
+export function resolveRelaunchGateLimits(env: NodeJS.ProcessEnv = process.env, cgroupLimitBytes?: number): RelaunchGateLimits {
+  return {
+    minIntervalMs: resolveGatedMinRelaunchIntervalMs(env),
+    graceMs: resolveGatedRelaunchGraceMs(env),
+    backoffCapMs: GATED_RELAUNCH_BACKOFF_CAP_MS,
+    thresholdBytes: resolveGatedMaxRssBytes(env, cgroupLimitBytes),
+  };
 }
 
 /** The wedged-lane trigger, overridable with GATED_NAV_FAILURE_STREAK. */
@@ -276,18 +360,51 @@ export interface GatedLaneStats {
   /** Navigations that have failed in a row on this lane; any success resets it to zero. */
   navFailureStreak: number;
   /**
-   * Set when a proof failed while the replacement carried the outgoing browser's cookies. The next
-   * attempt then starts CLEAN — otherwise a clearance that has gone bad (the egress IP rotated under
-   * it) would be copied into every replacement forever and wedge the lane at its old browser.
+   * Escalation: set only when a SECOND carried proof fails on a host whose cookies were already
+   * being withheld. At that point the suspicion is no longer one host's clearance but the whole
+   * jar, so the next attempt starts completely CLEAN. One failure blocks one host (below); it takes
+   * a repeat to throw away clearances that have done nothing wrong.
    */
   carryOverBlocked: boolean;
   /**
-   * Last MEASURED resident bytes for the live browser; 0 means no measurement has succeeded, which
-   * is not the same as a small browser and must never read as one.
+   * Hosts whose carried cookies are implicated in a failed proof, and therefore withheld from the
+   * next replacement. PER HOST rather than lane-wide: the proof loop stops at the first failure, so
+   * the hosts it had ALREADY passed proved fine WITH their carried clearance — discarding those
+   * spends a fresh Cloudflare challenge each, from the very IP whose reputation this whole change is
+   * trying to protect.
    */
-  rssBytes: number;
+  carryBlockedHosts: string[];
+  /**
+   * Last MEASURED proportional bytes (PSS) for the live browser tree; 0 means no measurement has
+   * succeeded, which is not the same as a small browser and must never read as one.
+   */
+  memoryBytes: number;
+  /** How that number was obtained, so /health can flag a reading it knows is overstated. */
+  memoryMethod: MemoryMeasureMethod | null;
   /** When the last sample was ATTEMPTED — the throttle, deliberately separate from the evidence. */
-  rssSampledAt: number;
+  memorySampledAt: number;
+  /**
+   * Epoch ms before which no EVIDENCE relaunch is started on this lane. The backstop ignores it; the
+   * proof-failure retry has its own, shorter clock (`retryAfter`).
+   */
+  nextRelaunchAllowedAt: number;
+  /**
+   * Current exponential backoff, grown each time a memory relaunch fails to bring the new tree under
+   * the threshold. 0 means the plain interval applies.
+   */
+  relaunchBackoffMs: number;
+  /**
+   * Epoch ms by which the last memory relaunch must have shown a smaller tree. 0 ⇒ nothing to judge.
+   */
+  graceUntil: number;
+  /** Evidence relaunches the rate limiter declined — the counter that should stay flat in production. */
+  relaunchSuppressed: number;
+  /** Why the most recent suppression happened, for /health and the log. */
+  lastSuppressedReason: string | null;
+  /** Throttle for the per-evaluation trigger log, which a busy lane would otherwise write per fetch. */
+  lastGateLogAt: number;
+  /** What that last log said, so a CHANGE of verdict is always reported even inside the throttle. */
+  lastGateLogKey: string;
 }
 
 /** A lane that has never relaunched. */
@@ -303,9 +420,130 @@ export function newGatedLaneStats(): GatedLaneStats {
     lastRelaunchReason: null,
     navFailureStreak: 0,
     carryOverBlocked: false,
-    rssBytes: 0,
-    rssSampledAt: 0,
+    carryBlockedHosts: [],
+    memoryBytes: 0,
+    memoryMethod: null,
+    memorySampledAt: 0,
+    nextRelaunchAllowedAt: 0,
+    relaunchBackoffMs: 0,
+    graceUntil: 0,
+    relaunchSuppressed: 0,
+    lastSuppressedReason: null,
+    lastGateLogAt: 0,
+    lastGateLogKey: '',
   };
+}
+
+/**
+ * THE RATE LIMITER. Decide whether a lane may act on the trigger it just raised, and keep the
+ * grace/backoff state machine moving. Pure apart from mutating `stats`, and driven by an injected
+ * `now`, so the whole policy is testable on a fake clock without launching anything.
+ *
+ * WHY THIS EXISTS: #313 gave the lane evidence triggers but nothing to stop it acting on the same
+ * evidence over and over. On 2026-09-11 a mis-measured memory trigger (VmRSS summed over a Chrome
+ * tree, 3.76x overstated) fired within seconds of every launch, and because a successful relaunch
+ * RESETS the measurement the next fetch simply re-measured the fresh tree and fired again: eight
+ * residential relaunches in ten minutes, each spending a prime navigation on a Cloudflare-fronted
+ * store, the eighth failing its proof and throwing the carried session away.
+ *
+ * Correct measurement alone would have fixed that instance. The limiter is here because it fixes the
+ * CLASS: any trigger that is wrong, or right about something a relaunch cannot cure, now costs the
+ * lane one prime navigation per interval instead of one per fetch.
+ *
+ * Pass `reason: null` on a quiet evaluation too — an open grace window has to be able to close.
+ */
+export function gateGatedRelaunch(
+  reason: GatedRelaunchReason | null,
+  stats: GatedLaneStats,
+  now: number,
+  limits: RelaunchGateLimits,
+): { reason: GatedRelaunchReason | null; suppressed: string | null } {
+  // 1. Settle any open grace window FIRST: did the last memory relaunch actually shrink the tree?
+  //    The sample that answers this is taken fire-and-forget, so it may not have landed the instant
+  //    the window closes. Wait for a number rather than recording "no verdict" on a race — but give
+  //    up after one further window, so a lane that cannot measure at all never holds it open.
+  if (stats.graceUntil > 0 && now >= stats.graceUntil) {
+    if (stats.memoryBytes > 0) {
+      if (stats.memoryBytes >= limits.thresholdBytes) {
+        // A fresh browser as big as the one it replaced is not a leak this can cure. Double the wait.
+        const grown = stats.relaunchBackoffMs > 0 ? stats.relaunchBackoffMs * 2 : limits.minIntervalMs * 2;
+        stats.relaunchBackoffMs = Math.min(limits.backoffCapMs, grown);
+        stats.nextRelaunchAllowedAt = now + stats.relaunchBackoffMs;
+      } else {
+        stats.relaunchBackoffMs = 0; // it worked — back to the plain interval
+      }
+      stats.graceUntil = 0;
+    } else if (now >= stats.graceUntil + limits.graceMs) {
+      stats.graceUntil = 0; // nothing to judge with, and no point waiting longer for it
+    }
+  }
+
+  if (reason === null) return { reason: null, suppressed: null };
+
+  // 2. The backstop is the last line of defence against whatever the evidence triggers miss, and a
+  //    twelve-hour clock cannot storm. Everything else waits its turn.
+  if (reason !== 'backstop' && now < stats.nextRelaunchAllowedAt) {
+    stats.relaunchSuppressed++;
+    const waitSeconds = Math.ceil((stats.nextRelaunchAllowedAt - now) / 1000);
+    stats.lastSuppressedReason = `${reason} rate-limited, next attempt in ${waitSeconds}s`;
+    return { reason: null, suppressed: stats.lastSuppressedReason };
+  }
+  return { reason, suppressed: null };
+}
+
+/**
+ * Arm the rate limiter after a replacement has been PROVEN and installed. A memory relaunch also
+ * opens the grace window that judges whether it helped; the other reasons have nothing to judge.
+ */
+export function noteGatedRelaunch(
+  stats: GatedLaneStats,
+  now: number,
+  reason: GatedRelaunchReason,
+  limits: RelaunchGateLimits,
+): void {
+  stats.nextRelaunchAllowedAt = now + Math.max(limits.minIntervalMs, stats.relaunchBackoffMs);
+  stats.graceUntil = reason === 'rss' ? now + limits.graceMs : 0;
+}
+
+/**
+ * Whether a cookie's `domain` covers `host`, by the cookie rule: a leading dot is decoration, and a
+ * domain cookie covers the domain itself and everything under it.
+ */
+export function cookieAppliesToHost(domain: string | undefined, host: string): boolean {
+  if (!domain) return false;
+  const scope = domain.replace(/^\./, '').toLowerCase();
+  if (scope === '') return false;
+  const target = host.toLowerCase();
+  return target === scope || target.endsWith(`.${scope}`);
+}
+
+/**
+ * Drop only the cookies belonging to hosts a failed proof has implicated, keeping every clearance
+ * that has done nothing wrong. `blockAll` is the escalation for a lane that has failed twice on the
+ * same host: at that point the jar itself is the suspect.
+ */
+export function filterCarriedCookies<T extends { domain?: string }>(
+  cookies: readonly T[],
+  blockedHosts: readonly string[],
+  blockAll = false,
+): T[] {
+  if (blockAll) return [];
+  if (blockedHosts.length === 0) return [...cookies];
+  return cookies.filter((cookie) => !blockedHosts.some((host) => cookieAppliesToHost(cookie.domain, host)));
+}
+
+/**
+ * Record a failed carried proof against the host it failed on. A repeat on an ALREADY-blocked host
+ * escalates to withholding the whole jar: one host's clearance was clearly not the problem.
+ */
+export function noteCarriedProofFailure(stats: GatedLaneStats, failedHost: string): void {
+  const host = failedHost.toLowerCase();
+  if (host === '') return;
+  if (stats.carryBlockedHosts.includes(host)) {
+    stats.carryOverBlocked = true;
+    return;
+  }
+  stats.carryBlockedHosts = [...stats.carryBlockedHosts, host];
 }
 
 /**
@@ -333,8 +571,30 @@ export interface GatedBrowserView {
   /** Why the last relaunch happened, or null if this lane has not relaunched. */
   lastRelaunchReason: GatedRelaunchReason | null;
   navFailureStreak: number;
-  /** Last sampled resident megabytes for this browser and its renderers; null ⇒ not measurable. */
+  /**
+   * Last sampled PROPORTIONAL megabytes (PSS) for this browser and its renderers; null ⇒ not
+   * measurable, which also means the memory trigger is inert and is the one silent failure mode here.
+   */
+  pssMb: number | null;
+  /**
+   * The same number under its old name, so the fleet check's gated-browser probe keeps working
+   * across this deploy. It is PSS now, not a VmRSS sum — read `memoryMethod` to know which.
+   */
   rssMb: number | null;
+  /** `pss-rollup` / `pss-smaps` are the honest readings; `rss-fallback` OVERSTATES a Chrome tree. */
+  memoryMethod: MemoryMeasureMethod | null;
+  /** The threshold that measurement is being compared against, so /health explains its own verdict. */
+  memoryThresholdMb: number;
+  /** Evidence relaunches the rate limiter declined. Non-zero means a trigger is firing repeatedly. */
+  relaunchSuppressed: number;
+  /** Why the most recent suppression happened; null on a lane that has never been rate-limited. */
+  lastSuppressedReason: string | null;
+  /** ISO-8601 of the earliest next evidence relaunch; null when the lane is free to act now. */
+  nextRelaunchAllowedAt: string | null;
+  /** Current exponential backoff in ms; non-zero means relaunching did not bring memory down. */
+  relaunchBackoffMs: number;
+  /** Hosts whose clearances are being withheld from the next replacement after a failed proof. */
+  carryBlockedHosts: string[];
 }
 
 /**
@@ -342,7 +602,12 @@ export interface GatedBrowserView {
  * a never-relaunched lane so every existing caller keeps working and a lane reads as quiet rather
  * than as missing data.
  */
-export function gatedBrowserView(entry: GatedBrowserEntry, stats: GatedLaneStats = newGatedLaneStats()): GatedBrowserView {
+export function gatedBrowserView(
+  entry: GatedBrowserEntry,
+  stats: GatedLaneStats = newGatedLaneStats(),
+  thresholdBytes: number = resolveGatedMaxRssBytes(),
+): GatedBrowserView {
+  const measuredMb = stats.memoryBytes === 0 ? null : Math.round(stats.memoryBytes / (1024 * 1024));
   return {
     egress: entry.egress,
     launchedAt: new Date(entry.launchedAt).toISOString(),
@@ -356,6 +621,14 @@ export function gatedBrowserView(entry: GatedBrowserEntry, stats: GatedLaneStats
     firstNavigationRecoveries: stats.firstNavigationRecoveries,
     lastRelaunchReason: stats.lastRelaunchReason,
     navFailureStreak: stats.navFailureStreak,
-    rssMb: stats.rssBytes === 0 ? null : Math.round(stats.rssBytes / (1024 * 1024)),
+    pssMb: measuredMb,
+    rssMb: measuredMb,
+    memoryMethod: stats.memoryMethod,
+    memoryThresholdMb: Math.round(thresholdBytes / (1024 * 1024)),
+    relaunchSuppressed: stats.relaunchSuppressed,
+    lastSuppressedReason: stats.lastSuppressedReason,
+    nextRelaunchAllowedAt: stats.nextRelaunchAllowedAt === 0 ? null : new Date(stats.nextRelaunchAllowedAt).toISOString(),
+    relaunchBackoffMs: stats.relaunchBackoffMs,
+    carryBlockedHosts: [...stats.carryBlockedHosts],
   };
 }

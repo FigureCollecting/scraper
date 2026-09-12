@@ -45,18 +45,24 @@ import {
   GATED_RELAUNCH_RETRY_MS,
   GATED_RSS_SAMPLE_MS,
   gatedBrowserView,
+  gateGatedRelaunch,
   newGatedLaneStats,
+  noteCarriedProofFailure,
+  noteGatedRelaunch,
+  filterCarriedCookies,
   resolveGatedMaxAgeMs,
   resolveGatedMaxRssBytes,
   resolveGatedNavFailureStreak,
+  resolveRelaunchGateLimits,
   type EgressKind,
   type GatedBrowserEntry,
   type GatedBrowserProof,
   type GatedBrowserView,
   type GatedLaneStats,
   type GatedRelaunchReason,
+  type RelaunchGateLimits,
 } from './gatedBrowsers.js';
-import { readProcessTreeRssBytes } from './browserRss.js';
+import { readCgroupMemoryLimitBytes, readProcessTreeMemory, type ProcessTreeMemory } from './browserRss.js';
 
 export interface ScrapedData {
   imageUrl?: string;
@@ -490,6 +496,8 @@ export class BrowserPool {
     this.gatedStats.clear();
     this.gatedRelaunches.clear();
     this.gatedProving.clear();
+    this.cgroupLimitBytes = undefined;
+    this.cgroupLimitRead = false;
   }
 
 
@@ -774,27 +782,55 @@ export class BrowserPool {
   }
 
   /** Swappable for tests, which must never walk a real /proc. */
-  static readGatedRssBytes: (pid: number) => Promise<number | undefined> = readProcessTreeRssBytes;
+  static readGatedTreeMemory: (pid: number) => Promise<ProcessTreeMemory | undefined> = readProcessTreeMemory;
+
+  /** Swappable for tests, which must never read a real /sys/fs/cgroup. */
+  static readGatedCgroupLimitBytes: () => Promise<number | undefined> = readCgroupMemoryLimitBytes;
 
   /**
-   * Sample this browser's resident memory, at most once per GATED_RSS_SAMPLE_MS. Deliberately not
-   * awaited by the fetch that triggers it: a /proc walk is cheap but it is still I/O, and a fetch
-   * must never wait on bookkeeping. The NEXT fetch reads what this one measured.
+   * The container's memory ceiling, read ONCE and cached: it cannot change under a running process,
+   * and the threshold derived from it must not depend on when it happens to be asked for.
+   * `undefined` after the read means "no cgroup", which leaves the 1 GiB floor standing.
    */
-  private static sampleGatedRss(entry: GatedBrowserEntry, stats: GatedLaneStats): void {
+  private static cgroupLimitBytes: number | undefined;
+  private static cgroupLimitRead = false;
+
+  /** Kick off the one cgroup read. Fire-and-forget for the same reason the memory sample is. */
+  private static ensureCgroupLimit(): void {
+    if (this.cgroupLimitRead) return;
+    this.cgroupLimitRead = true;
+    void this.readGatedCgroupLimitBytes()
+      .then((bytes) => { this.cgroupLimitBytes = bytes; })
+      .catch(() => undefined);
+  }
+
+  /** The rate limit, grace window and memory threshold in force right now. */
+  private static gateLimits(): RelaunchGateLimits {
+    return resolveRelaunchGateLimits(process.env, this.cgroupLimitBytes);
+  }
+
+  /**
+   * Sample this browser's PROPORTIONAL memory, at most once per GATED_RSS_SAMPLE_MS. Deliberately
+   * not awaited by the fetch that triggers it: a /proc walk is cheap but it is still I/O, and a
+   * fetch must never wait on bookkeeping. The NEXT fetch reads what this one measured.
+   */
+  private static sampleGatedMemory(entry: GatedBrowserEntry, stats: GatedLaneStats): void {
+    this.ensureCgroupLimit();
     const now = Date.now();
-    if (now - stats.rssSampledAt < GATED_RSS_SAMPLE_MS) return;
+    if (now - stats.memorySampledAt < GATED_RSS_SAMPLE_MS) return;
     // A browser reached over the wire (`puppeteer.connect`) has NO local process, and neither does a
     // handle whose Chrome has already gone. Both are "not measurable", not "measured as zero".
     const proc = typeof entry.browser.process === 'function' ? entry.browser.process() : null;
     const pid = proc?.pid;
     if (typeof pid !== 'number') return;
-    stats.rssSampledAt = now;
-    void this.readGatedRssBytes(pid)
-      .then((bytes) => {
+    stats.memorySampledAt = now;
+    void this.readGatedTreeMemory(pid)
+      .then((measured) => {
         // `undefined` is NO EVIDENCE (not Linux, process gone, /proc unreadable) and must never be
         // recorded as a small number — that would read as a healthy browser forever.
-        if (typeof bytes === 'number' && bytes > 0) stats.rssBytes = bytes;
+        if (!measured || !(measured.bytes > 0)) return;
+        stats.memoryBytes = measured.bytes;
+        stats.memoryMethod = measured.method;
       })
       .catch(() => undefined);
   }
@@ -802,15 +838,75 @@ export class BrowserPool {
   /**
    * Why this browser should be replaced, or null to leave a working session alone.
    *
-   * ORDER IS THE POLICY: the two evidence triggers are asked first and the clock last, because the
-   * clock is the only one of the three that can fire on a browser with nothing wrong with it.
+   * ORDER IS THE POLICY: the two evidence triggers name the reason when either of them can act,
+   * because the clock is the only trigger that can fire on a browser with nothing wrong with it.
+   * The verdict then passes through the rate limiter, which is what stops a trigger that keeps
+   * firing from spending a prime navigation on a gated store per fetch (see gateGatedRelaunch) —
+   * and the clock is asked independently of it, so a rate-limited lane still has a safety net.
    */
-  private static gatedRelaunchReason(entry: GatedBrowserEntry, stats: GatedLaneStats): GatedRelaunchReason | null {
-    if (stats.navFailureStreak >= resolveGatedNavFailureStreak()) return 'navigation-failures';
-    this.sampleGatedRss(entry, stats);
-    if (stats.rssBytes > 0 && stats.rssBytes >= resolveGatedMaxRssBytes()) return 'rss';
-    if (Date.now() - entry.launchedAt >= resolveGatedMaxAgeMs()) return 'backstop';
-    return null;
+  private static gatedRelaunchReason(
+    entry: GatedBrowserEntry,
+    stats: GatedLaneStats,
+    egress: EgressKind,
+  ): GatedRelaunchReason | null {
+    // Sampled on EVERY evaluation, not only when memory is the candidate: /health should keep
+    // showing a number while a lane is failing navigations, and an open grace window needs one.
+    this.sampleGatedMemory(entry, stats);
+    const limits = this.gateLimits();
+
+    // The evidence triggers are asked first, so the reason RECORDED is the informative one. The
+    // backstop is asked SEPARATELY rather than as the last rung of the same ladder: a lane whose
+    // memory trigger is permanently hot would otherwise answer `rss` forever, have it rate-limited
+    // forever, and never reach the twelve-hour clock — the safety net would be unreachable exactly
+    // when it is most needed.
+    let evidence: GatedRelaunchReason | null = null;
+    if (stats.navFailureStreak >= resolveGatedNavFailureStreak()) evidence = 'navigation-failures';
+    else if (stats.memoryBytes > 0 && stats.memoryBytes >= limits.thresholdBytes) evidence = 'rss';
+    const backstopDue = Date.now() - entry.launchedAt >= resolveGatedMaxAgeMs();
+
+    const candidate = evidence ?? (backstopDue ? 'backstop' : null);
+    const verdict = gateGatedRelaunch(candidate, stats, Date.now(), limits);
+    const acting = verdict.reason ?? (backstopDue ? 'backstop' : null);
+
+    if (acting !== null) this.logGatedTrigger(egress, acting, stats, limits, null);
+    else if (candidate !== null) this.logGatedTrigger(egress, candidate, stats, limits, verdict.suppressed);
+    return acting;
+  }
+
+  /**
+   * Say, in the log, exactly what the trigger saw. The 2026-09-11 churn was invisible for ten
+   * minutes because the relaunch lines named only `reason=rss` — the measured number and the
+   * threshold it was compared against never appeared anywhere, and /health showed `rssMb: null` on
+   * every fresh instance because a successful relaunch clears the sample.
+   *
+   * Throttled to the sample cadence, because a firing trigger is re-evaluated on every fetch while
+   * its relaunch is still in flight; a CHANGE of verdict always prints regardless.
+   */
+  private static logGatedTrigger(
+    egress: EgressKind,
+    reason: GatedRelaunchReason,
+    stats: GatedLaneStats,
+    limits: RelaunchGateLimits,
+    suppressed: string | null,
+  ): void {
+    const key = `${reason}|${suppressed === null ? 'act' : 'suppress'}`;
+    const now = Date.now();
+    if (key === stats.lastGateLogKey && now - stats.lastGateLogAt < GATED_RSS_SAMPLE_MS) return;
+    stats.lastGateLogAt = now;
+    stats.lastGateLogKey = key;
+    const mb = (bytes: number): string => `${Math.round(bytes / (1024 * 1024))}MB`;
+    const measured = stats.memoryBytes > 0 ? mb(stats.memoryBytes) : 'unmeasured';
+    const detail =
+      `measured=${measured} threshold=${mb(limits.thresholdBytes)} method=${stats.memoryMethod ?? 'none'} ` +
+      `streak=${stats.navFailureStreak}`;
+    if (suppressed === null) {
+      console.log(`[BROWSER POOL] ${egress} challenge-lane relaunch trigger: reason=${reason} ${detail}`);
+    } else {
+      console.log(
+        `[BROWSER POOL] ${egress} challenge-lane relaunch SUPPRESSED (${sanitizeForLog(suppressed)}): ${detail} ` +
+        `backoff=${Math.round(stats.relaunchBackoffMs / 1000)}s suppressed=${stats.relaunchSuppressed}`,
+      );
+    }
   }
 
   /**
@@ -846,7 +942,7 @@ export class BrowserPool {
   ): Promise<GatedBrowserEntry> {
     const current = this.gatedBrowsers_.get(egress);
     if (current && this.isGatedBrowserServable(current, proxyServer)) {
-      const reason = this.gatedRelaunchReason(current, this.gatedLaneStats(egress));
+      const reason = this.gatedRelaunchReason(current, this.gatedLaneStats(egress), egress);
       if (reason) this.beginGatedRelaunch(egress, proxyServer, current, reason, prove);
       return current;
     }
@@ -961,10 +1057,13 @@ export class BrowserPool {
     // design, and copying a live Chrome's cookie SQLite out from under it is a torn read waiting to
     // happen. The CDP read has none of that exposure and carries no cache or history with it.
     //
-    // Skipped after a carry-over proof has already failed: a clearance can go bad (the residential
-    // exit rotated under it), and copying a bad one into every replacement forever would pin the
-    // lane to its old browser permanently.
-    const carried = stats.carryOverBlocked ? 0 : await this.carryGatedCookies(outgoing, browser, egress);
+    // Narrowed after a carry-over proof has failed: a clearance can go bad (the residential exit
+    // rotated under it), and copying a bad one into every replacement forever would pin the lane to
+    // its old browser permanently. But only the FAILING host's cookies are withheld — the hosts the
+    // proof loop had already passed proved fine WITH their carried clearance, and throwing those
+    // away spends a fresh Cloudflare challenge each, from the IP this change exists to protect. A
+    // second failure on an already-blocked host escalates to withholding everything.
+    const carried = await this.carryGatedCookies(outgoing, browser, egress, stats);
 
     const primed = new Map<string, string>();
     let proven = true;
@@ -998,9 +1097,15 @@ export class BrowserPool {
       if (!proven) {
         stats.relaunchFailures++;
         stats.retryAfter = Date.now() + GATED_RELAUNCH_RETRY_MS;
-        // The carried session is the first suspect when a proof fails, so the next attempt drops it.
-        const carriedNote = carried > 0 ? ' — next attempt will start from a clean profile' : '';
-        if (carried > 0) stats.carryOverBlocked = true;
+        // The carried session is the first suspect when a proof fails — but only for the host it
+        // failed on. Every host the loop passed before this one cleared WITH its carried clearance.
+        let carriedNote = '';
+        if (carried > 0) {
+          noteCarriedProofFailure(stats, failedHost);
+          carriedNote = stats.carryOverBlocked
+            ? ' — this host failed twice, so the next attempt starts from a clean profile'
+            : ` — the next attempt will withhold ${sanitizeForLog(failedHost)} cookies and keep the rest`;
+        }
         console.warn(
           `[BROWSER POOL] the ${egress} challenge-lane replacement FAILED its proof on ${sanitizeForLog(failedHost)} — ` +
           `keeping the running browser (relaunchFailures=${stats.relaunchFailures})${carriedNote}`,
@@ -1028,9 +1133,16 @@ export class BrowserPool {
     stats.drainedTabsAtRelaunch = outgoing.pagesOpen;
     // A proven replacement has answered the question the block was protecting against.
     stats.carryOverBlocked = false;
+    stats.carryBlockedHosts = [];
     stats.navFailureStreak = 0;
-    stats.rssBytes = 0;
-    stats.rssSampledAt = 0;
+    stats.memoryBytes = 0;
+    stats.memoryMethod = null;
+    stats.memorySampledAt = 0;
+    // ARM THE RATE LIMITER. Clearing the measurement above is exactly what let the 2026-09-11 churn
+    // close its loop: the next fetch re-measured the fresh tree and fired again, 30 s later. The
+    // lane now owes an interval before it may act on evidence again, and a memory relaunch owes a
+    // grace window in which the replacement has to show a smaller tree or the wait doubles.
+    noteGatedRelaunch(stats, entry.launchedAt, reason, this.gateLimits());
     console.log(
       `[BROWSER POOL] ${egress} challenge-lane browser replaced after proof ` +
       `(reason=${reason}, relaunch #${stats.relaunchCount}, ${outgoing.pagesOpen} tab(s) draining, ` +
@@ -1044,12 +1156,19 @@ export class BrowserPool {
    * a failed copy means the replacement faces the store cold, which is the behaviour this whole
    * change is improving on — never a reason to abandon a relaunch that is otherwise fine.
    */
-  private static async carryGatedCookies(outgoing: GatedBrowserEntry, incoming: Browser, egress: EgressKind): Promise<number> {
+  private static async carryGatedCookies(
+    outgoing: GatedBrowserEntry,
+    incoming: Browser,
+    egress: EgressKind,
+    stats: GatedLaneStats,
+  ): Promise<number> {
     try {
       const cookies = await outgoing.browser.cookies();
       if (!Array.isArray(cookies) || cookies.length === 0) return 0;
-      await incoming.setCookie(...cookies);
-      return cookies.length;
+      const carry = filterCarriedCookies(cookies, stats.carryBlockedHosts, stats.carryOverBlocked);
+      if (carry.length === 0) return 0;
+      await incoming.setCookie(...carry);
+      return carry.length;
     } catch (err) {
       console.warn(
         `[BROWSER POOL] could not carry the ${egress} challenge-lane session into its replacement ` +
@@ -1171,7 +1290,9 @@ export class BrowserPool {
 
   /** The live gated browsers, for /health/detailed. Handles never leave this class. */
   static gatedBrowsers(): GatedBrowserView[] {
-    return [...this.gatedBrowsers_.values()].map((entry) => gatedBrowserView(entry, this.gatedLaneStats(entry.egress)));
+    const thresholdBytes = resolveGatedMaxRssBytes(process.env, this.cgroupLimitBytes);
+    return [...this.gatedBrowsers_.values()]
+      .map((entry) => gatedBrowserView(entry, this.gatedLaneStats(entry.egress), thresholdBytes));
   }
 
   /** Close every gated browser (live and retiring) without waiting out their tabs — shutdown only. */
