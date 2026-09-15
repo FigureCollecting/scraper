@@ -16,6 +16,7 @@ import { HostRateLimiter } from '../../driver/hostRateLimiter.js';
 import { getRawCaptureSink, isImagePersistenceEnabled, rawStoreView } from '../s3ObjectStore.js';
 import type { CaptureSink } from '../captureSink.js';
 import { createFailureReporterFromEnv, type FetchOriginName } from '../failureReporter.js';
+import { createCaptureReporterFromEnv } from '../captureReporter.js';
 import { getResidentialProxyUrl } from '../residentialEgress.js';
 import { createCapturingScrapingService } from '../engineServices/capturingScrapingService.js';
 import { createHttpBytesFetch } from './httpBytesFetch.js';
@@ -170,12 +171,16 @@ export function createImageCaptureHookFromEnv(
       new HostRateLimiter(() => undefined),
     );
   const reporter = createFailureReporterFromEnv(env);
+  // The memo-hit reporter: a second item sharing an image never reaches the sink (which reports the
+  // objects that DO reach it), so the hook reports the depiction the memo hit would otherwise lose.
+  const captureReporter = createCaptureReporterFromEnv(env);
   return createImageCaptureHook({
     sink,
     policy: deps.policy ?? loadImageHostPolicy(env),
     fetchBytes,
     proxyUrlFor: egress => (egress === 'residential' ? getResidentialProxyUrl() : undefined),
     ...(reporter ? { reportFailure: report => reporter.report(report) } : {}),
+    ...(captureReporter ? { reportCapture: report => captureReporter.report(report) } : {}),
     enabled,
     ...(disabledReason !== undefined ? { disabledReason } : {}),
     maxPerItem: settings.maxPerItem,

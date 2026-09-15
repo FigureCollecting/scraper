@@ -29,6 +29,7 @@ import type { ClientRequest } from 'node:http';
 import { Client as MinioClient } from 'minio';
 import type { CaptureSink } from './captureSink.js';
 import { NoopCaptureSink } from './captureSink.js';
+import { createCaptureReporterFromEnv } from './captureReporter.js';
 import {
   ObjectStoreCaptureSink,
   MIN_RAW_STORE_ASSET_MAX_WAIT_MS,
@@ -464,7 +465,9 @@ export function createRawCaptureSink(env: NodeJS.ProcessEnv = process.env): Capt
   const loaded = loadRawStoreConfigFromEnv(env);
   if (!loaded) return new NoopCaptureSink();
   const store = new S3ObjectStore(loaded.config.bucket, loaded.config, loaded.creds);
-  return new ObjectStoreCaptureSink(store, loaded.config);
+  // Off unless REPORT_CAPTURES is armed. Null ⇒ the sink stores exactly as before, reporting nothing.
+  const reporter = createCaptureReporterFromEnv(env);
+  return new ObjectStoreCaptureSink(store, loaded.config, reporter ? (r) => reporter.report(r) : undefined);
 }
 
 /**

@@ -16,6 +16,7 @@ import { residentialEgressView } from './services/residentialEgress.js';
 import { rawStoreView, flushRawCaptureSink } from './services/s3ObjectStore.js';
 import { imageCaptureView } from './services/images/assembleImageCapture.js';
 import { fetchFailureReportView } from './services/failureReporter.js';
+import { captureReportView } from './services/captureReporter.js';
 import { sessionCanaryView } from './services/sessionCanary.js';
 import { cpuThrottlingView } from './services/cpuThrottling.js';
 import { createEngineLookup, createEngineCatalog } from './services/engineLookup.js';
@@ -61,6 +62,7 @@ app.use('/', createHealthRoutes({
   getRawStore: () => rawStoreView(),
   getImageCapture: () => imageCaptureView(),
   getFailureLedger: () => fetchFailureReportView(),
+  getCaptureLedger: () => captureReportView(),
   getSessionCanary: () => sessionCanaryView(),
   getCpuThrottling: () => cpuThrottlingView(),
   getQueueStore: () => getScrapeQueue().getQueueStoreView(),

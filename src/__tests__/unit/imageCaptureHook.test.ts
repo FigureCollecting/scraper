@@ -13,7 +13,8 @@
  */
 import { createImageCaptureHook } from '../../services/images/imageCaptureHook';
 import { buildImageHostPolicy } from '../../services/images/imageHostPolicy';
-import { CollectingCaptureSink, type RawCapture } from '../../services/captureSink';
+import { CollectingCaptureSink, type CaptureSink, type RawCapture } from '../../services/captureSink';
+import type { StoredCaptureReport } from '../../services/captureReporter';
 import type { ImageBytesFetcher, ImageBytesResult, ImageFetchOptions } from '../../services/images/imageBytes';
 import type { ImageFetchPlan } from '../../services/images/imageCaptureHook';
 import type { FetchFailureReport } from '../../services/failureReporter';
@@ -761,5 +762,104 @@ describe('the image capture hook under load', () => {
 
     await lane.drain();
     await task;
+  });
+});
+
+// ---------------------------------------------------------------------------
+// I3 — the memo-hit emit point. A second item sharing an image never reaches the
+// sink, so the sink's own reports can never carry its depiction: the stored
+// object's provenance names only the FIRST item. The hook reports it, against the
+// winner's already-stored object.
+// ---------------------------------------------------------------------------
+describe('the image capture hook — memo-hit capture reports (I3)', () => {
+  const SHARED = 'https://cdn.test/shared.png';
+
+  /** A sink that stores and hands back the object key + length, exactly like the object-store sink's asset admission. */
+  function storingSink() {
+    const captures: RawCapture[] = [];
+    const sink: CaptureSink = {
+      async capture(c: RawCapture) {
+        captures.push(c);
+        return { admitted: true, storageKey: `raw-img/sha256/${c.sha256.slice(0, 2)}/${c.sha256}.png`, bytesLen: c.bytes.length };
+      },
+    };
+    return { sink, captures };
+  }
+
+  /** A sink that admits but hands back NO key (the page-lane / Collecting shape) — nothing to memo-report against. */
+  function keylessSink() {
+    const captures: RawCapture[] = [];
+    const sink: CaptureSink = {
+      async capture(c: RawCapture) {
+        captures.push(c);
+        return { admitted: true };
+      },
+    };
+    return { sink, captures };
+  }
+
+  function build(sink: CaptureSink, reportCapture?: (r: StoredCaptureReport) => void) {
+    return createImageCaptureHook({
+      sink,
+      policy: buildImageHostPolicy({}),
+      fetchBytes: async (url: string) => okBytes(PNG, url),
+      proxyUrlFor: () => 'http://proxy.test:1080',
+      ...(reportCapture ? { reportCapture: async (r: StoredCaptureReport) => void reportCapture(r) } : {}),
+      now: () => 1_000_000,
+      enabled: true,
+    });
+  }
+
+  const item = (hook: ReturnType<typeof createImageCaptureHook>, itemId: string, pageUrl: string, refs: ImageRef[]) =>
+    hook.capture({ site: 'examplestore', itemId, pageUrl, fields: {}, ruleset: rulesetDescribing(refs), origin: 'ingest' });
+
+  it('reports the SECOND item\'s depiction against the winner\'s object — its own item, the winner\'s capture', async () => {
+    const reports: StoredCaptureReport[] = [];
+    const { sink, captures } = storingSink();
+    const hook = build(sink, (r) => reports.push(r));
+
+    await item(hook, 'ITEM-A', 'https://store.test/products/lucy', [gallery(SHARED, 0)]);   // fetches + stores + memoizes
+    await item(hook, 'ITEM-B', 'https://store.test/products/nadia', [gallery(SHARED, 0)]);  // memo HIT — no fetch
+
+    // Only the first item touched the sink; the second skipped the fetch entirely.
+    expect(captures).toHaveLength(1);
+    expect(hook.stats().skipped.memo).toBe(1);
+    // …but the second item still gets a depiction, reported by the hook.
+    expect(reports).toHaveLength(1);
+    const r = reports[0];
+    const winner = captures[0];
+    expect(r.itemId).toBe('ITEM-B');               // its OWN item
+    expect(r.sourceUrl).toBe('https://store.test/products/nadia'); // its OWN page
+    expect(r.role).toBe('gallery');
+    expect(r.alreadyStored).toBe(true);
+    expect(r.lane).toBe('asset');
+    // …against the WINNER's already-stored object: same sha, key, length, resolved url and fetched-at,
+    // so it folds into the one capture rather than manufacturing a fetch that never happened.
+    expect(r.sha256).toBe(winner.sha256);
+    expect(r.storageKey).toBe(`raw-img/sha256/${winner.sha256.slice(0, 2)}/${winner.sha256}.png`);
+    expect(r.bytesLen).toBe(PNG.length);
+    expect(r.fetchedAt).toBe(winner.fetchedAt);
+    expect(r.url).toBe(SHARED);
+  });
+
+  it('does not report on a memo hit for a url stored WITHOUT a descriptor — no guessed key', async () => {
+    const reports: StoredCaptureReport[] = [];
+    const { sink } = keylessSink();
+    const hook = build(sink, (r) => reports.push(r));
+
+    await item(hook, 'ITEM-A', 'https://store.test/products/lucy', [gallery(SHARED, 0)]);
+    await item(hook, 'ITEM-B', 'https://store.test/products/nadia', [gallery(SHARED, 0)]);
+
+    expect(hook.stats().skipped.memo).toBe(1); // it WAS a memo hit
+    expect(reports).toHaveLength(0);           // but there was no key to report against, so it is silent
+  });
+
+  it('never crashes a memo hit when no capture reporter is wired', async () => {
+    const { sink } = storingSink();
+    const hook = build(sink); // no reportCapture
+
+    await item(hook, 'ITEM-A', 'https://store.test/products/lucy', [gallery(SHARED, 0)]);
+    await expect(item(hook, 'ITEM-B', 'https://store.test/products/nadia', [gallery(SHARED, 0)])).resolves.toBeUndefined();
+    expect(hook.stats().skipped.memo).toBe(1);
   });
 });

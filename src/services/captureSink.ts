@@ -113,6 +113,15 @@ export interface CaptureAdmission {
   /** False only when the sink could not take it and offering it AGAIN could succeed. */
   admitted: boolean;
   reason?: CaptureRefusal;
+  /**
+   * ASSET LANE, on admit: the content-addressed object key the sink will PUT under, and the stored
+   * byte length. The image hook remembers these so a LATER item sharing the url can report its own
+   * depiction against the SAME object — the memo hit skipped the fetch and cannot know the key or
+   * length otherwise, and the provenance contract refuses a capture with no key. Absent on the page
+   * lanes and on every refusal.
+   */
+  storageKey?: string;
+  bytesLen?: number;
 }
 
 /**

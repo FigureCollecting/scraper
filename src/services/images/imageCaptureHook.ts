@@ -28,6 +28,7 @@
 import type { ExtractionRuleset, SearchFetch } from '@figurecollecting/scraper-plugin-contract';
 import { buildRawCapture, wasAdmitted, type CaptureAdmission, type CaptureSink } from '../captureSink.js';
 import type { FetchOriginName, FetchFailureReport, ReportFetchFailure } from '../failureReporter.js';
+import type { ReportStoredCapture, StoredCaptureReport } from '../captureReporter.js';
 import type { FetchReasonClass } from '../failureClassifier.js';
 import { isDeclaringStoreUrl } from '../residentialEgress.js';
 import { sanitizeForLog } from '../../utils/security.js';
@@ -240,6 +241,13 @@ export interface ImageCaptureHookDeps {
   proxyUrlFor?: (egress: ImageEgress) => string | undefined;
   /** The durable fetch-failure ledger. Absent ⇒ failures are counted and logged but not persisted. */
   reportFailure?: ReportFetchFailure;
+  /**
+   * The stored-object provenance ledger. Absent ⇒ a memo hit is silent (exactly the pre-I3 behaviour,
+   * and the behaviour with REPORT_CAPTURES off). The sink reports the objects that reach it; this
+   * reports the ones a memo hit SKIPS — a second item sharing an image never touches the sink, and
+   * the stored object's own metadata names only the first item, so nothing else can add its depiction.
+   */
+  reportCapture?: ReportStoredCapture;
   /** Whether the lane runs. Default true — the composition root owns both halves of that answer. */
   enabled?: boolean;
   /** Why it does not, published on the health view. Ignored when `enabled` is not false. */
@@ -355,9 +363,41 @@ export function createImageCaptureHook(deps: ImageCaptureHookDeps): ImageCapture
     }
   };
 
+  /**
+   * A memo hit means a PRIOR item already fetched and stored this exact url — so THIS item skipped
+   * the fetch entirely, and the stored object's provenance names only that first item. Report this
+   * item's OWN depiction against the winner's already-stored object: its site/item, its role and
+   * position, but the WINNER'S resolved url and fetched-at (from the memo) so it dedups into the one
+   * capture rather than forging a second observation for a fetch that never happened. Best-effort and
+   * silent when the reporter is absent or the memo has no stored descriptor (a content-dedup url that
+   * never went through the sink — reported with no guessed key, which the contract would refuse).
+   */
+  const reportMemoHit = (job: PlannedCapture, url: string, role: string, position: number): void => {
+    if (!deps.reportCapture) return;
+    const stored = memo.storedAssetFor(url);
+    if (!stored) return;
+    const capture: StoredCaptureReport = {
+      site: job.site,
+      itemId: job.itemId,
+      url: stored.url,
+      lane: 'asset',
+      sha256: stored.sha256,
+      bytesLen: stored.bytesLen,
+      storageKey: stored.storageKey,
+      fetchedAt: stored.fetchedAt,
+      alreadyStored: true,
+      sourceUrl: job.pageUrl,
+      role,
+      position,
+      ...(stored.contentType !== undefined ? { contentType: stored.contentType } : {}),
+    };
+    void Promise.resolve(deps.reportCapture(capture)).catch(() => undefined);
+  };
+
   const captureOne = async (job: PlannedCapture, url: string, role: string, position: number): Promise<void> => {
     if (memo.hasUrl(url)) {
       skipped.memo += 1;
+      reportMemoHit(job, url, role, position);
       return;
     }
     const decision = chooseImageLane(job.pageUrl, url, job.searchFetch, deps.policy);
@@ -537,8 +577,21 @@ export function createImageCaptureHook(deps: ImageCaptureHookDeps): ImageCapture
       }
       stored += 1;
       // Remembered only on a write that did not throw: a url whose bytes never reached the sink must
-      // be retried on the next pass, not memoized as done.
-      memo.remember(url, capture.sha256);
+      // be retried on the next pass, not memoized as done. The sink hands back the object key it will
+      // PUT and the stored length (asset lane), which is exactly what a LATER item sharing this url
+      // needs to report its own depiction against the same object — it will have skipped the fetch.
+      const admitted = admission as CaptureAdmission | undefined;
+      if (admitted?.storageKey) {
+        memo.remember(url, capture.sha256, {
+          storageKey: admitted.storageKey,
+          bytesLen: admitted.bytesLen ?? capture.bytes.length,
+          fetchedAt: capture.fetchedAt,
+          url: capture.finalUrl ?? capture.url,
+          ...(capture.contentType !== undefined ? { contentType: capture.contentType } : {}),
+        });
+      } else {
+        memo.remember(url, capture.sha256);
+      }
     } catch (err) {
       failed += 1;
       logOncePerHost(

@@ -51,6 +51,43 @@ describe('createImageUrlMemo', () => {
     expect(memo.hasUrl('a')).toBe(false);
     expect(memo.hasSha('1')).toBe(false);
   });
+
+  describe('shaFor / storedAssetFor — what a memo-hit report is built from', () => {
+    it('returns the sha a url resolved to, so a memo hit can report the SAME bytes', () => {
+      const memo = createImageUrlMemo(10);
+      memo.remember('https://cdn.test/a.jpg', 'abc123');
+      expect(memo.shaFor('https://cdn.test/a.jpg')).toBe('abc123');
+      expect(memo.shaFor('https://cdn.test/never.jpg')).toBeUndefined();
+    });
+
+    it('carries the WINNER\'s full stored descriptor when one was recorded', () => {
+      const memo = createImageUrlMemo(10);
+      memo.remember('https://cdn.test/a.jpg', 'abc123', {
+        storageKey: 'raw-img/sha256/ab/abc123.jpg',
+        bytesLen: 40_137,
+        fetchedAt: '2026-09-14T00:00:00.000Z',
+        url: 'https://cdn.test/a.jpg',
+        contentType: 'image/jpeg',
+      });
+      expect(memo.storedAssetFor('https://cdn.test/a.jpg')).toEqual({
+        sha256: 'abc123',
+        storageKey: 'raw-img/sha256/ab/abc123.jpg',
+        bytesLen: 40_137,
+        fetchedAt: '2026-09-14T00:00:00.000Z',
+        url: 'https://cdn.test/a.jpg',
+        contentType: 'image/jpeg',
+      });
+    });
+
+    it('has NO stored descriptor for a url remembered without one (a content-dedup hit)', () => {
+      // The bytes exist under another url; this url never went through the sink, so a memo hit on it
+      // cannot build a report (no key, no length) and must not guess one.
+      const memo = createImageUrlMemo(10);
+      memo.remember('https://cdn.test/v2.jpg', 'abc123');
+      expect(memo.shaFor('https://cdn.test/v2.jpg')).toBe('abc123');
+      expect(memo.storedAssetFor('https://cdn.test/v2.jpg')).toBeUndefined();
+    });
+  });
 });
 
 describe('createResidentialByteBudget', () => {

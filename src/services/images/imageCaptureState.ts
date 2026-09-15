@@ -16,14 +16,48 @@
  * boundary. A restart forgets, re-fetches a little, and the store dedups it — nothing is lost.
  */
 
+/**
+ * What the winner's sink actually PUT, remembered so a later item that shares the url can report its
+ * OWN depiction against the SAME stored object. The storage key and byte length are the two facts the
+ * bucket knows and the memo hit does not (it skipped the fetch), and `fetchedAt` lets the memo-hit
+ * report dedup into the winner's ONE `raw.capture` row instead of manufacturing a second observation
+ * for a fetch that never happened.
+ */
+export interface StoredAsset {
+  /** Lowercase hex sha256 — the content address. */
+  sha256: string;
+  /** The object key the winner wrote (raw-img/sha256/<aa>/<hex>.<ext>). */
+  storageKey: string;
+  /** Uncompressed byte length of the stored original. */
+  bytesLen: number;
+  /** The winner's fetched-at token — the capture key, re-sent so a memo hit dedups rather than forks. */
+  fetchedAt: string;
+  /**
+   * The RESOLVED address the winner reported under (finalUrl ?? url). A memo hit is keyed by the
+   * REQUEST url, but the report must name the same resolved url the winner's capture used, or a
+   * redirect would fork a second raw.capture for the same blob.
+   */
+  url: string;
+  contentType?: string;
+}
+
 /** A url→content memo with a bound on what it will hold. */
 export interface ImageUrlMemo {
   /** Whether this exact url has already been fetched and handed on. */
   hasUrl(url: string): boolean;
   /** Whether these exact BYTES have already been handed on, under any url. */
   hasSha(sha256: string): boolean;
-  /** Record the outcome of one fetch. */
-  remember(url: string, sha256: string): void;
+  /** The sha this url resolved to, or undefined — what a memo-hit report names as its content address. */
+  shaFor(url: string): string | undefined;
+  /**
+   * The winner's stored descriptor for this url, or undefined when the url was remembered WITHOUT one
+   * (a content-dedup hit that never went through the sink). A memo hit needs the descriptor to build a
+   * valid report — the contract refuses an empty storage_key — so an undefined here means "cannot
+   * report this one", never a guessed key.
+   */
+  storedAssetFor(url: string): StoredAsset | undefined;
+  /** Record the outcome of one fetch. `stored` is the winner's PUT facts, present only on a real write. */
+  remember(url: string, sha256: string, stored?: Omit<StoredAsset, 'sha256'>): void;
 }
 
 /**
@@ -59,13 +93,27 @@ function lru<V>(max: number): { get(k: string): V | undefined; set(k: string, v:
 /** Build a memo holding at most `size` urls (and as many content addresses). Size 0 ⇒ remembers nothing. */
 export function createImageUrlMemo(size: number): ImageUrlMemo {
   const max = Number.isFinite(size) && size > 0 ? Math.floor(size) : 0;
-  const byUrl = lru<string>(max);
+  const byUrl = lru<StoredAsset>(max);
   const bySha = lru<true>(max);
   return {
     hasUrl: (url: string) => byUrl.get(url) !== undefined,
     hasSha: (sha256: string) => bySha.get(sha256) !== undefined,
-    remember(url: string, sha256: string): void {
-      byUrl.set(url, sha256);
+    shaFor: (url: string) => byUrl.get(url)?.sha256,
+    storedAssetFor(url: string): StoredAsset | undefined {
+      const entry = byUrl.get(url);
+      // A key is what makes a stored capture reportable; a url remembered without one (content-dedup)
+      // has an empty key and is deliberately unreportable rather than reported with a guessed one.
+      return entry && entry.storageKey ? entry : undefined;
+    },
+    remember(url: string, sha256: string, stored?: Omit<StoredAsset, 'sha256'>): void {
+      byUrl.set(url, {
+        sha256,
+        storageKey: stored?.storageKey ?? '',
+        bytesLen: stored?.bytesLen ?? 0,
+        fetchedAt: stored?.fetchedAt ?? '',
+        url: stored?.url ?? url,
+        ...(stored?.contentType !== undefined ? { contentType: stored.contentType } : {}),
+      });
       bySha.set(sha256, true);
     },
   };
