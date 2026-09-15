@@ -280,6 +280,21 @@ describe('ObjectStoreCaptureSink — the asset lane', () => {
     expect(md['bytes']).toBe(String(JPEG.length));
   });
 
+  it('persists the ruleset provenance beside the bytes when it was proved', async () => {
+    // The backfill reads these back from S3, so the bucket is a complete writer for what it holds.
+    await send(sink, asset(JPEG, { sourceClass: 'retailer_studio', contentLevel: 'explicit' }));
+    const md = store.puts[0].opts.metadata ?? {};
+    expect(md['source-class']).toBe('retailer_studio');
+    expect(md['content-level']).toBe('explicit');
+  });
+
+  it('omits the provenance tags when the ruleset proved neither', async () => {
+    await send(sink, asset(JPEG));
+    const md = store.puts[0].opts.metadata ?? {};
+    expect(md).not.toHaveProperty('source-class');
+    expect(md).not.toHaveProperty('content-level');
+  });
+
   it('records the NEGOTIATION witnesses, so a re-encoded response is visible in the object', async () => {
     // The archival Accept asks for originals; a Polish/Shopify host may still answer with a
     // rendition. `vary: Accept` says the response was chosen from the request header and
@@ -2066,6 +2081,20 @@ describe('ObjectStoreCaptureSink — capture reporting (I3)', () => {
     await send(sink, asset(PNG, { url: 'https://cdn.x.test/req.png', finalUrl: 'https://cdn.x.test/final.png' }));
 
     expect(reports[0].url).toBe('https://cdn.x.test/final.png');
+  });
+
+  it('reports the ruleset provenance, and omits each field the capture did not carry', async () => {
+    const store = new FakeObjectStore();
+    const reports: StoredCaptureReport[] = [];
+    const sink = new ObjectStoreCaptureSink(store, IMG_CONFIG, async (r) => { reports.push(r); });
+
+    await send(sink, asset(PNG, { sourceClass: 'manufacturer_press', contentLevel: 'controversial' }));
+    await send(sink, asset(JPEG)); // distinct bytes, no provenance proved
+
+    expect(reports[0].sourceClass).toBe('manufacturer_press');
+    expect(reports[0].contentLevel).toBe('controversial');
+    expect('sourceClass' in reports[1]).toBe(false);
+    expect('contentLevel' in reports[1]).toBe(false);
   });
 
   it('reports a HEAD-dedup hit with already_stored=true and never re-PUTs', async () => {

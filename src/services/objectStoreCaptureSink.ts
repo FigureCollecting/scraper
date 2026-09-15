@@ -983,6 +983,8 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       ...(c.sourceUrl !== undefined ? { sourceUrl: c.sourceUrl } : {}),
       ...(c.role !== undefined ? { role: c.role } : {}),
       ...(c.position !== undefined ? { position: c.position } : {}),
+      ...(c.sourceClass !== undefined ? { sourceClass: c.sourceClass } : {}),
+      ...(c.contentLevel !== undefined ? { contentLevel: c.contentLevel } : {}),
     };
     // Fire-and-forget: the reporter swallows and counts its own failures; this .catch covers an
     // injected reporter that does not.
@@ -1284,6 +1286,10 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     if (c.sourceUrl) md['source-url'] = headerSafe(c.sourceUrl);
     if (c.position !== undefined) md.position = headerSafe(String(c.position));
     if (c.role) md.role = headerSafe(c.role);
+    // The ruleset's provenance, persisted beside the bytes so the I5 backfill is a complete writer
+    // for what the bucket holds. Absent — never empty — when the ruleset proved neither.
+    if (c.sourceClass) md['source-class'] = headerSafe(c.sourceClass);
+    if (c.contentLevel) md['content-level'] = headerSafe(c.contentLevel);
     if (c.contentType) md['declared-content-type'] = headerSafe(c.contentType);
     // The NEGOTIATION witnesses, beside the declared type they qualify: `vary` says the server chose
     // this representation from the request headers, `content-encoding` that the wire body was not

@@ -73,6 +73,16 @@ export interface RawCapture {
    * already made.
    */
   role?: string;
+  /**
+   * Asset lane: the PROVENANCE the ruleset proved for this plate, in the ingest
+   * contract's vocabulary — `sourceClass` is who published it (manufacturer
+   * press vs. a retailer's own studio), `contentLevel` the item's content
+   * rating. Both are the ruleset's to assert and the engine's to carry verbatim;
+   * absent when the ruleset proved neither, which is the ordinary case. They
+   * ride to the spine, where the display gate reads them.
+   */
+  sourceClass?: string;
+  contentLevel?: string;
 }
 
 export interface RawCaptureInput {
@@ -90,6 +100,8 @@ export interface RawCaptureInput {
   sourceUrl?: string;
   position?: number;
   role?: string;
+  sourceClass?: string;
+  contentLevel?: string;
 }
 
 /**
@@ -167,6 +179,8 @@ export function buildRawCapture(input: RawCaptureInput): RawCapture {
   if (input.sourceUrl !== undefined) capture.sourceUrl = input.sourceUrl;
   if (input.position !== undefined) capture.position = input.position;
   if (input.role !== undefined) capture.role = input.role;
+  if (input.sourceClass !== undefined) capture.sourceClass = input.sourceClass;
+  if (input.contentLevel !== undefined) capture.contentLevel = input.contentLevel;
   return capture;
 }
 

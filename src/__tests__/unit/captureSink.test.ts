@@ -38,11 +38,17 @@ describe('buildRawCapture', () => {
       sourceItem: { site: 'x.test', itemId: '12345' },
       sourceUrl: 'https://x.test/item/12345',
       position: 2,
+      role: 'gallery',
+      sourceClass: 'manufacturer_press',
+      contentLevel: 'explicit',
     });
     expect(c.lane).toBe('asset');
     expect(c.sourceItem).toEqual({ site: 'x.test', itemId: '12345' });
     expect(c.sourceUrl).toBe('https://x.test/item/12345');
     expect(c.position).toBe(2);
+    expect(c.role).toBe('gallery');
+    expect(c.sourceClass).toBe('manufacturer_press');
+    expect(c.contentLevel).toBe('explicit');
     expect(c.sha256).toBe(sha(bytes));
   });
 
@@ -51,6 +57,8 @@ describe('buildRawCapture', () => {
     expect('sourceItem' in c).toBe(false);
     expect('sourceUrl' in c).toBe(false);
     expect('position' in c).toBe(false);
+    expect('sourceClass' in c).toBe(false);
+    expect('contentLevel' in c).toBe(false);
   });
 });
 

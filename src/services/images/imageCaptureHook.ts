@@ -372,7 +372,7 @@ export function createImageCaptureHook(deps: ImageCaptureHookDeps): ImageCapture
    * silent when the reporter is absent or the memo has no stored descriptor (a content-dedup url that
    * never went through the sink — reported with no guessed key, which the contract would refuse).
    */
-  const reportMemoHit = (job: PlannedCapture, url: string, role: string, position: number): void => {
+  const reportMemoHit = (job: PlannedCapture, ref: PlannedImageRef, url: string): void => {
     if (!deps.reportCapture) return;
     const stored = memo.storedAssetFor(url);
     if (!stored) return;
@@ -387,17 +387,22 @@ export function createImageCaptureHook(deps: ImageCaptureHookDeps): ImageCapture
       fetchedAt: stored.fetchedAt,
       alreadyStored: true,
       sourceUrl: job.pageUrl,
-      role,
-      position,
+      role: ref.role,
+      position: ref.position,
+      // THIS item's own provenance, not the winner's: two items sharing an image can classify it
+      // differently, and each depiction carries the claim the item that referenced it made.
+      ...(ref.sourceClass !== undefined ? { sourceClass: ref.sourceClass } : {}),
+      ...(ref.contentLevel !== undefined ? { contentLevel: ref.contentLevel } : {}),
       ...(stored.contentType !== undefined ? { contentType: stored.contentType } : {}),
     };
     void Promise.resolve(deps.reportCapture(capture)).catch(() => undefined);
   };
 
-  const captureOne = async (job: PlannedCapture, url: string, role: string, position: number): Promise<void> => {
+  const captureOne = async (job: PlannedCapture, ref: PlannedImageRef): Promise<void> => {
+    const { url, role, position } = ref;
     if (memo.hasUrl(url)) {
       skipped.memo += 1;
-      reportMemoHit(job, url, role, position);
+      reportMemoHit(job, ref, url);
       return;
     }
     const decision = chooseImageLane(job.pageUrl, url, job.searchFetch, deps.policy);
@@ -551,6 +556,10 @@ export function createImageCaptureHook(deps: ImageCaptureHookDeps): ImageCapture
       sourceUrl: job.pageUrl,
       position,
       role,
+      // The ruleset's provenance, carried onto the bytes so the sink's report — and the S3 object
+      // metadata the backfill reads — both hold it. Omitted when the ruleset proved neither.
+      ...(ref.sourceClass !== undefined ? { sourceClass: ref.sourceClass } : {}),
+      ...(ref.contentLevel !== undefined ? { contentLevel: ref.contentLevel } : {}),
     });
     // Content dedupe, after the fetch because only the bytes can answer it: a store that versions its
     // urls (`?v=`) serves the same file under many names, and the bucket is addressed by content.
@@ -642,7 +651,7 @@ export function createImageCaptureHook(deps: ImageCaptureHookDeps): ImageCapture
     // serialize a shared CDN anyway, and a gallery fired in parallel would hold a browser tab per
     // image on the gated lane.
     for (const ref of job.refs) {
-      await captureOne(job, ref.url, ref.role, ref.position);
+      await captureOne(job, ref);
     }
   };
 
