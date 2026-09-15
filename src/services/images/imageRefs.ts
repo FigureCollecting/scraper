@@ -11,7 +11,7 @@
  * capturing thumbnails" becomes a contract change and a re-release of 27 rulesets, instead of one
  * line here.
  */
-import type { ImageRef, ImageRole } from '@figurecollecting/scraper-plugin-contract';
+import type { ImageRef, ImageRole, SourceClass, ContentLevel } from '@figurecollecting/scraper-plugin-contract';
 
 /**
  * The roles this landing captures, and the reason the other two are absent:
@@ -36,6 +36,13 @@ export interface PlannedImageRef {
   role: ImageRole;
   /** The ruleset's own index, carried through untouched — it is stored beside the bytes. */
   position: number;
+  /**
+   * The ruleset's PROVENANCE claims, carried through untouched — the engine neither validates nor
+   * defaults them, exactly as with role and position. Absent when the ruleset proved neither, which
+   * is the ordinary case; they ride the capture to the spine, where the display gate reads them.
+   */
+  sourceClass?: SourceClass;
+  contentLevel?: ContentLevel;
 }
 
 /** The reasons a described image never reaches a fetch. Mirrors the hook's own skip tally. */
@@ -115,7 +122,14 @@ export function normalizeImageRefs(refs: ImageRef[], pageUrl: string, maxPerItem
     if (seen.has(url)) continue;
     seen.add(url);
     const position = typeof ref.position === 'number' && Number.isFinite(ref.position) ? ref.position : planned.length;
-    planned.push({ url, role: role as ImageRole, position });
+    planned.push({
+      url,
+      role: role as ImageRole,
+      position,
+      // Provenance is the ruleset's to assert; the engine carries it verbatim and omits it when absent.
+      ...(ref.sourceClass !== undefined ? { sourceClass: ref.sourceClass } : {}),
+      ...(ref.contentLevel !== undefined ? { contentLevel: ref.contentLevel } : {}),
+    });
   }
 
   const cap = Number.isFinite(maxPerItem) && maxPerItem > 0 ? Math.floor(maxPerItem) : 0;

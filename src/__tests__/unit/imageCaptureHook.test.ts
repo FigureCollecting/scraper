@@ -862,4 +862,45 @@ describe('the image capture hook — memo-hit capture reports (I3)', () => {
     await expect(item(hook, 'ITEM-B', 'https://store.test/products/nadia', [gallery(SHARED, 0)])).resolves.toBeUndefined();
     expect(hook.stats().skipped.memo).toBe(1);
   });
+
+  it('threads the ref\'s sourceClass and contentLevel onto the bytes handed to the sink', async () => {
+    const { sink, captures } = storingSink();
+    const hook = build(sink);
+    const provenanced: ImageRef = { url: SHARED, role: 'gallery', position: 0, sourceClass: 'manufacturer_press', contentLevel: 'explicit' };
+
+    await item(hook, 'ITEM-A', 'https://store.test/products/lucy', [provenanced]);
+
+    expect(captures).toHaveLength(1);
+    expect(captures[0].sourceClass).toBe('manufacturer_press');
+    expect(captures[0].contentLevel).toBe('explicit');
+  });
+
+  it('carries THIS item\'s own provenance onto its memo-hit depiction, not the winner\'s', async () => {
+    const reports: StoredCaptureReport[] = [];
+    const { sink } = storingSink();
+    const hook = build(sink, (r) => reports.push(r));
+    const winnerRef: ImageRef = { url: SHARED, role: 'gallery', position: 0, sourceClass: 'manufacturer_press' };
+    const loserRef: ImageRef = { url: SHARED, role: 'gallery', position: 0, sourceClass: 'retailer_studio', contentLevel: 'explicit' };
+
+    await item(hook, 'ITEM-A', 'https://store.test/products/lucy', [winnerRef]);   // fetches + stores
+    await item(hook, 'ITEM-B', 'https://store.test/products/nadia', [loserRef]);   // memo HIT
+
+    expect(reports).toHaveLength(1);
+    expect(reports[0].itemId).toBe('ITEM-B');
+    expect(reports[0].sourceClass).toBe('retailer_studio'); // ITEM-B's own claim, not the winner's
+    expect(reports[0].contentLevel).toBe('explicit');
+  });
+
+  it('omits provenance from a memo-hit depiction when the item proved none', async () => {
+    const reports: StoredCaptureReport[] = [];
+    const { sink } = storingSink();
+    const hook = build(sink, (r) => reports.push(r));
+
+    await item(hook, 'ITEM-A', 'https://store.test/products/lucy', [gallery(SHARED, 0)]);
+    await item(hook, 'ITEM-B', 'https://store.test/products/nadia', [gallery(SHARED, 0)]);
+
+    expect(reports).toHaveLength(1);
+    expect('sourceClass' in reports[0]).toBe(false);
+    expect('contentLevel' in reports[0]).toBe(false);
+  });
 });

@@ -543,6 +543,42 @@ export interface ExtractContext {
 export type ImageRole = 'gallery' | 'thumbnail' | 'user' | 'other';
 
 /**
+ * WHO published a plate — the provenance the ingest contract records beside the bytes.
+ *
+ *   `manufacturer_press`  — the maker's own press/product photography (amiami's `/main/` plate, an
+ *                           hpoi official shot). The canonical image of the item.
+ *   `retailer_studio`     — a RETAILER'S own studio photography of the same item (amiami's `/review/`
+ *                           gallery). The store's work, not the manufacturer's, and not a collector's.
+ *   `user_photo`          — a photograph a community member took. NEVER written by any ruleset: user
+ *                           galleries are not captured at all, so nothing on the wire may claim it.
+ *   `unknown`             — a plate whose provenance a source asserts but cannot place. Absent is the
+ *                           ordinary case: most stores prove nothing, and the field stays undefined.
+ *
+ * The vocabulary is the ingest contract's (`ingest.v1` `source_class`); it lives here so a ruleset is
+ * type-checked against the closed set at the point it makes the claim.
+ */
+export type SourceClass = 'manufacturer_press' | 'retailer_studio' | 'user_photo' | 'unknown';
+
+/**
+ * How an item is content-rated at its source — the ingest contract's `content_level` vocabulary.
+ *
+ * `general < intermediate < explicit < controversial` is the ordered ladder a display gate compares
+ * against a viewer's ceiling. `nsfw` / `nsfw+` are the retired markers a legacy page still carries and
+ * are UNPLACEABLE on that ladder (they render only at the top ceiling). `unknown` is emitted when a
+ * source shows a content marker its ruleset does not recognise — never absent, because absence reads
+ * downstream as `general`, the most permissive answer, off a page the ruleset failed to understand.
+ * ABSENT (the field left undefined) means the source has no content-level concept at all.
+ */
+export type ContentLevel =
+  | 'general'
+  | 'intermediate'
+  | 'explicit'
+  | 'controversial'
+  | 'nsfw'
+  | 'nsfw+'
+  | 'unknown';
+
+/**
  * ONE image a ruleset found on an item, normalized out of that store's private field shapes.
  *
  * `url` may be relative — the engine resolves it against the page it came from, so a ruleset never
@@ -550,11 +586,20 @@ export type ImageRole = 'gallery' | 'thumbnail' | 'user' | 'other';
  * the store presents it (the first plate is 0); it is stored beside the bytes, so a later renderer
  * can put a gallery back in the store's own order without re-fetching the page. Positions are
  * per-role-blind and need not be contiguous — the engine only ever compares them.
+ *
+ * `sourceClass` and `contentLevel` are the PROVENANCE a ruleset can prove and are both OPTIONAL:
+ * most stores establish neither, and a ruleset fills only what it can prove rather than guessing a
+ * default. They are ADDITIVE over the original three required fields — a ruleset that names none
+ * still produces a valid ref.
  */
 export interface ImageRef {
   url: string;
   role: ImageRole;
   position: number;
+  /** WHO published this plate, when the store's shape proves it. Absent when it does not. */
+  sourceClass?: SourceClass;
+  /** The item's content rating, when the source states one. Absent when it has no such concept. */
+  contentLevel?: ContentLevel;
 }
 
 export interface ExtractionRuleset {

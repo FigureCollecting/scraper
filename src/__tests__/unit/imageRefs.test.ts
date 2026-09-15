@@ -93,4 +93,34 @@ describe('normalizeImageRefs', () => {
     expect(normalizeImageRefs(undefined as unknown as ImageRef[], PAGE, 12).refs).toEqual([]);
     expect(normalizeImageRefs('nope' as unknown as ImageRef[], PAGE, 12).refs).toEqual([]);
   });
+
+  it('carries a ref\'s sourceClass and contentLevel through untouched', () => {
+    const { refs } = normalizeImageRefs(
+      [{ url: '/main/a.jpg', role: 'gallery', position: 0, sourceClass: 'manufacturer_press', contentLevel: 'explicit' }],
+      PAGE,
+      12,
+    );
+    expect(refs[0].sourceClass).toBe('manufacturer_press');
+    expect(refs[0].contentLevel).toBe('explicit');
+  });
+
+  it('leaves provenance undefined when the ruleset named none — the ordinary case', () => {
+    const { refs } = normalizeImageRefs([ref('/a.jpg')], PAGE, 12);
+    expect(refs[0].sourceClass).toBeUndefined();
+    expect(refs[0].contentLevel).toBeUndefined();
+  });
+
+  it('keeps the FIRST ref\'s provenance when a url is named twice', () => {
+    // Dedupe is by url; the first occurrence wins, so its provenance is the one that survives.
+    const { refs } = normalizeImageRefs(
+      [
+        { url: '/a.jpg', role: 'gallery', position: 0, sourceClass: 'manufacturer_press' },
+        { url: '/a.jpg', role: 'gallery', position: 1, sourceClass: 'retailer_studio' },
+      ],
+      PAGE,
+      12,
+    );
+    expect(refs).toHaveLength(1);
+    expect(refs[0].sourceClass).toBe('manufacturer_press');
+  });
 });
