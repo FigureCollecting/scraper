@@ -54,6 +54,7 @@ import type { CfCookieHostView } from '../services/cookieJar.js';
 import type { BrowserLaneView } from '../services/genericScraper.js';
 import type { RawStoreView } from '../services/s3ObjectStore.js';
 import type { FetchFailureReportView } from '../services/failureReporter.js';
+import type { CaptureReportView } from '../services/captureReporter.js';
 import type { ImageCaptureStats } from '../services/images/imageCaptureHook.js';
 import type { SessionCanaryView } from '../services/sessionCanary.js';
 import type { CpuThrottlingView } from '../services/cpuThrottling.js';
@@ -95,6 +96,15 @@ export interface HealthDeps {
    * re-reported inside an open window. Pure counters — a silent ledger is otherwise invisible.
    */
   getFailureLedger: () => FetchFailureReportView;
+  /**
+   * The stored-object provenance ledger's counters (captureReportView()): whether capture reporting
+   * is armed at all (INGEST_BASE_URL + REPORT_CAPTURES, OFF by default), how many objects the spine
+   * acknowledged, how many reports it never took, and whether ReportCapture came back UNIMPLEMENTED
+   * (the reporter self-disables for the process). This is the acceptance signal — `capturesReported`
+   * should climb and `captureReportFailures` stay 0 once the server handler is deployed and the flag
+   * is armed. Pure counters — a silent ledger is otherwise invisible.
+   */
+  getCaptureLedger: () => CaptureReportView;
   /**
    * The image capture hook's counters (imageCaptureView()): whether the lane is switched on at all
    * (PERSIST_RAW_IMAGES), how many originals it stored, and — the part that matters — WHY the rest
@@ -156,6 +166,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         rawStore: deps.getRawStore(),
         imageCapture: deps.getImageCapture(),
         failureLedger: deps.getFailureLedger(),
+        captureLedger: deps.getCaptureLedger(),
         queueStore: deps.getQueueStore(),
         sessionCanary: deps.getSessionCanary(),
         mfcSessionStale: deps.getSessionCanary().stale,
@@ -173,6 +184,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         rawStore: deps.getRawStore(),
         imageCapture: deps.getImageCapture(),
         failureLedger: deps.getFailureLedger(),
+        captureLedger: deps.getCaptureLedger(),
         // A queue that is not durable is a coverage risk that outlives the pool outage being
         // reported here, so this reading survives the degraded response too.
         queueStore: deps.getQueueStore(),

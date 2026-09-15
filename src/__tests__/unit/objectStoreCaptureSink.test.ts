@@ -1,6 +1,7 @@
 import { jest } from '@jest/globals';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import { buildRawCapture, type RawCapture } from '../../services/captureSink';
+import type { StoredCaptureReport } from '../../services/captureReporter';
 import {
   ObjectStoreCaptureSink,
   DEFAULT_PUT_TIMEOUT_MS,
@@ -412,9 +413,13 @@ describe('ObjectStoreCaptureSink — the asset lane', () => {
     expect(html.key).toBe(`raw-html/sha256/${w.sha256.slice(0, 2)}/${w.sha256}.html.gz`);
     expect(gunzipSync(html.body).equals(HTML)).toBe(true);
     expect(html.opts.contentType).toBe('application/gzip');
-    expect(Object.keys(html.opts.metadata ?? {}).sort()).toEqual(['fetched-at', 'site', 'url']);
+    // A `lane` tag now rides the page lanes too (a forward fix so a future backfill can tell an 'api'
+    // object from a wire/dom one — they share the raw-html/ prefix with no other signal).
+    expect(Object.keys(html.opts.metadata ?? {}).sort()).toEqual(['fetched-at', 'lane', 'site', 'url']);
+    expect(html.opts.metadata?.lane).toBe('wire');
     expect(json.key).toBe(`raw-json/sha256/${a.sha256.slice(0, 2)}/${a.sha256}.json.gz`);
     expect(json.opts.contentType).toBe('application/gzip');
+    expect(json.opts.metadata?.lane).toBe('api');
   });
 
   it('never lets an image content-type on a PAGE lane divert it to the image prefix', async () => {
@@ -900,7 +905,7 @@ describe('ObjectStoreCaptureSink — bounded admission queue', () => {
     const store = new GatedObjectStore();
     const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: 60_000, concurrency: 1 });
 
-    await expect(sink.capture(cap())).resolves.toEqual({ admitted: true });
+    await expect(sink.capture(cap())).resolves.toMatchObject({ admitted: true });
     await until(() => store.parked.length === 1);
 
     expect(store.parked.length).toBe(1); // the upload is still in flight…
@@ -919,7 +924,7 @@ describe('ObjectStoreCaptureSink — bounded admission queue', () => {
     const sink = new ObjectStoreCaptureSink(boom, { ...CONFIG, concurrency: 2 });
 
     // Admitted, then the store blew up on the worker: the failure is counted, never thrown.
-    await expect(sink.capture(cap())).resolves.toEqual({ admitted: true });
+    await expect(sink.capture(cap())).resolves.toMatchObject({ admitted: true });
     await sink.flush();
 
     expect(sink.stats().failed).toBe(1);
@@ -1100,8 +1105,8 @@ describe('ObjectStoreCaptureSink — bounded admission queue', () => {
       ...CONFIG, putTimeoutMs: 60_000, concurrency: 1, queueMax: 1,
     });
 
-    await expect(sink.capture(cap({ bytes: Buffer.from('a') }))).resolves.toEqual({ admitted: true });
-    await expect(sink.capture(cap({ bytes: Buffer.from('b') }))).resolves.toEqual({ admitted: true });
+    await expect(sink.capture(cap({ bytes: Buffer.from('a') }))).resolves.toMatchObject({ admitted: true });
+    await expect(sink.capture(cap({ bytes: Buffer.from('b') }))).resolves.toMatchObject({ admitted: true });
     // Third one: the queue is full. Silence here is what let the image hook count a
     // dropped capture as stored and memoize the url, suppressing its own retry.
     await expect(sink.capture(cap({ bytes: Buffer.from('c') }))).resolves.toEqual({
@@ -1140,10 +1145,10 @@ describe('ObjectStoreCaptureSink — bounded admission queue', () => {
 
     // The sink resolved these captures. Re-offering them changes nothing, so they
     // must NOT read as "try again" — only a full queue means that.
-    await expect(sink.capture(asset(Buffer.from('<html>nope</html>')))).resolves.toEqual({ admitted: true });
+    await expect(sink.capture(asset(Buffer.from('<html>nope</html>')))).resolves.toMatchObject({ admitted: true });
     const off = new ObjectStoreCaptureSink(store, { ...CONFIG, pagesEnabled: false, assetsEnabled: false });
-    await expect(off.capture(cap())).resolves.toEqual({ admitted: true });
-    await expect(off.capture(asset(PNG))).resolves.toEqual({ admitted: true });
+    await expect(off.capture(cap())).resolves.toMatchObject({ admitted: true });
+    await expect(off.capture(asset(PNG))).resolves.toMatchObject({ admitted: true });
     await sink.flush();
   });
 
@@ -1255,16 +1260,16 @@ describe('ObjectStoreCaptureSink — the asset lane cannot evict the page lanes'
     const sink = await parkedSink(store, { queueMax: 4, assetQueueShare: 0.5 });
 
     const [a1, a2, a3] = assets(3);
-    await expect(sink.capture(a1)).resolves.toEqual({ admitted: true });
-    await expect(sink.capture(a2)).resolves.toEqual({ admitted: true });
+    await expect(sink.capture(a1)).resolves.toMatchObject({ admitted: true });
+    await expect(sink.capture(a2)).resolves.toMatchObject({ admitted: true });
     // Half of four slots is the asset share, and it is now spent — even though the
     // queue is only half full. That other half is not first-come-first-served.
     await expect(sink.capture(a3)).resolves.toEqual({ admitted: false, reason: 'assetReserve' });
 
     // ...and a page walks straight into the space the reservation just held.
     const [p1, p2, p3] = pages(3);
-    await expect(sink.capture(p1)).resolves.toEqual({ admitted: true });
-    await expect(sink.capture(p2)).resolves.toEqual({ admitted: true });
+    await expect(sink.capture(p1)).resolves.toMatchObject({ admitted: true });
+    await expect(sink.capture(p2)).resolves.toMatchObject({ admitted: true });
     // Only now, with the whole depth spent, does a PAGE drop — and it is counted as one.
     await expect(sink.capture(p3)).resolves.toEqual({ admitted: false, reason: 'queueFull' });
 
@@ -1284,14 +1289,14 @@ describe('ObjectStoreCaptureSink — the asset lane cannot evict the page lanes'
 
     const [a1, a2] = assets(2, 300);
     // Nothing is waiting yet, so the first asset displaces nobody and goes in.
-    await expect(sink.capture(a1)).resolves.toEqual({ admitted: true });
+    await expect(sink.capture(a1)).resolves.toMatchObject({ admitted: true });
     // The SECOND is refused, not the third: the share counts what the queue WOULD hold
     // (300 + 300 > 500), because one asset is a variable and possibly enormous number of
     // bytes where one slot is only ever one slot. Measured on occupancy alone this asset
     // was admitted instead and the budget then stood at 600 of 1000, reserve gone.
     await expect(sink.capture(a2)).resolves.toEqual({ admitted: false, reason: 'assetReserve' });
 
-    await expect(sink.capture(pages(1, 300)[0])).resolves.toEqual({ admitted: true });
+    await expect(sink.capture(pages(1, 300)[0])).resolves.toMatchObject({ admitted: true });
 
     expect(sink.stats()).toMatchObject({
       queued: 2, queuedBytes: 600, assetRefusedReserve: 1, assetRefusedReserveDepth: 0, assetRefusedReserveBytes: 1,
@@ -1312,9 +1317,9 @@ describe('ObjectStoreCaptureSink — the asset lane cannot evict the page lanes'
 
     // The walk that emptied the reserve at that configuration: 63999 + 64000 + 64000 all
     // landed while the queue was still short of the 192000 share line.
-    await expect(sink.capture(assets(1, 63_999)[0])).resolves.toEqual({ admitted: true });
+    await expect(sink.capture(assets(1, 63_999)[0])).resolves.toMatchObject({ admitted: true });
     const [a2, a3, a4] = assets(3, 64_000);
-    for (const a of [a2, a3]) await expect(sink.capture(a)).resolves.toEqual({ admitted: true });
+    for (const a of [a2, a3]) await expect(sink.capture(a)).resolves.toMatchObject({ admitted: true });
     expect(sink.stats().queuedBytes).toBe(191_999); // a single byte under the share line
 
     // Admitting on occupancy alone, this asset was let in BECAUSE the queue had not
@@ -1325,7 +1330,7 @@ describe('ObjectStoreCaptureSink — the asset lane cannot evict the page lanes'
 
     // The page the reserve exists for. This is the assertion the old rule failed:
     // it was refused queueBytesFull with the byte budget spent entirely on images.
-    await expect(sink.capture(pages(1, 100)[0])).resolves.toEqual({ admitted: true });
+    await expect(sink.capture(pages(1, 100)[0])).resolves.toMatchObject({ admitted: true });
 
     expect(sink.stats()).toMatchObject({
       droppedBytes: 0, assetRefusedReserve: 1, assetRefusedReserveBytes: 1, queuedBytes: 192_099,
@@ -1341,10 +1346,10 @@ describe('ObjectStoreCaptureSink — the asset lane cannot evict the page lanes'
     const sink = await parkedSink(store, { queueMax: 4 }); // no assetQueueShare configured
 
     const [a1, a2, a3, a4] = assets(4);
-    for (const a of [a1, a2, a3]) await expect(sink.capture(a)).resolves.toEqual({ admitted: true });
+    for (const a of [a1, a2, a3]) await expect(sink.capture(a)).resolves.toMatchObject({ admitted: true });
     await expect(sink.capture(a4)).resolves.toEqual({ admitted: false, reason: 'assetReserve' });
     // The last slot is the pages', and it is still there.
-    await expect(sink.capture(pages(1)[0])).resolves.toEqual({ admitted: true });
+    await expect(sink.capture(pages(1)[0])).resolves.toMatchObject({ admitted: true });
 
     expect(sink.stats()).toMatchObject({ queued: 4, assetRefusedReserve: 1, dropped: 0 });
 
@@ -1358,8 +1363,8 @@ describe('ObjectStoreCaptureSink — the asset lane cannot evict the page lanes'
     const sink = await parkedSink(store, { queueMax: 2, assetQueueShare: 1 });
 
     const [a1, a2, a3] = assets(3);
-    await expect(sink.capture(a1)).resolves.toEqual({ admitted: true });
-    await expect(sink.capture(a2)).resolves.toEqual({ admitted: true });
+    await expect(sink.capture(a1)).resolves.toMatchObject({ admitted: true });
+    await expect(sink.capture(a2)).resolves.toMatchObject({ admitted: true });
     // First-come-first-served again: the asset is refused by the DEPTH ceiling, with
     // the ceiling's own reason and the ceiling's own counter.
     await expect(sink.capture(a3)).resolves.toEqual({ admitted: false, reason: 'queueFull' });
@@ -1373,12 +1378,12 @@ describe('ObjectStoreCaptureSink — the asset lane cannot evict the page lanes'
   it('clamps a nonsense share: above 1 is no reservation, at-or-below 0 is the default', async () => {
     const store = new GatedObjectStore();
     const wide = await parkedSink(store, { queueMax: 2, assetQueueShare: 5 });
-    for (const a of assets(2)) await expect(wide.capture(a)).resolves.toEqual({ admitted: true });
+    for (const a of assets(2)) await expect(wide.capture(a)).resolves.toMatchObject({ admitted: true });
     expect(wide.stats()).toMatchObject({ queued: 2, assetRefusedReserve: 0 });
 
     const store2 = new GatedObjectStore();
     const negative = await parkedSink(store2, { queueMax: 4, assetQueueShare: -1 });
-    for (const a of assets(3)) await expect(negative.capture(a)).resolves.toEqual({ admitted: true });
+    for (const a of assets(3)) await expect(negative.capture(a)).resolves.toMatchObject({ admitted: true });
     // Back to the 0.75 default: the fourth asset is held, not the fourth slot's page.
     await expect(negative.capture(assets(4)[3])).resolves.toEqual({ admitted: false, reason: 'assetReserve' });
 
@@ -1435,7 +1440,7 @@ describe('ObjectStoreCaptureSink — the asset lane cannot evict the page lanes'
 
     // 0.1 of a 1-deep queue rounds to nothing, but the queue is empty: the capture
     // goes straight to a worker and displaces no page.
-    await expect(sink.capture(asset(PNG))).resolves.toEqual({ admitted: true });
+    await expect(sink.capture(asset(PNG))).resolves.toMatchObject({ admitted: true });
     await sink.flush();
     expect(sink.stats()).toMatchObject({ assetStored: 1, assetRefusedReserve: 0 });
   });
@@ -1447,10 +1452,10 @@ describe('ObjectStoreCaptureSink — the asset lane cannot evict the page lanes'
     // 300 bytes against a 100-byte share. The queue is empty, so this asset displaces
     // no page — and only one can ever be held that way, because the next asset is
     // measured against the bytes this one is holding.
-    await expect(parked.capture(assets(1, 300)[0])).resolves.toEqual({ admitted: true });
+    await expect(parked.capture(assets(1, 300)[0])).resolves.toMatchObject({ admitted: true });
     await expect(parked.capture(assets(2, 300)[1])).resolves.toEqual({ admitted: false, reason: 'assetReserve' });
     // The hard ceiling is still the hard ceiling: a page can have the rest, no more.
-    await expect(parked.capture(pages(1, 300)[0])).resolves.toEqual({ admitted: true });
+    await expect(parked.capture(pages(1, 300)[0])).resolves.toMatchObject({ admitted: true });
     expect(parked.stats()).toMatchObject({ queuedBytes: 600, assetRefusedReserve: 1, droppedBytes: 0 });
 
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
@@ -1481,7 +1486,7 @@ describe('ObjectStoreCaptureSink — pages reach a worker before assets', () => 
     const [p1, p2, p3] = pages(3);
     // The shape of a crawl pass: an item's images queue up before the next item's page lands.
     for (const c of [a1, a2, a3, p1, p2, a4, p3]) {
-      await expect(sink.capture(c)).resolves.toEqual({ admitted: true });
+      await expect(sink.capture(c)).resolves.toMatchObject({ admitted: true });
     }
     expect(sink.stats()).toMatchObject({ queued: 7, queuedPages: 3, queuedAssets: 4, inFlight: 1 });
 
@@ -1500,10 +1505,10 @@ describe('ObjectStoreCaptureSink — pages reach a worker before assets', () => 
       ...CONFIG, imagePrefix: 'raw-img/', putTimeoutMs: 60_000, imagePutTimeoutMs: 60_000, concurrency: 2, queueMax: 100,
     });
     const backlog = assets(10);
-    for (const a of backlog) await expect(sink.capture(a)).resolves.toEqual({ admitted: true });
+    for (const a of backlog) await expect(sink.capture(a)).resolves.toMatchObject({ admitted: true });
     await until(() => store.parked.length === 2);
     const [p1] = pages(1);
-    await expect(sink.capture(p1)).resolves.toEqual({ admitted: true });
+    await expect(sink.capture(p1)).resolves.toMatchObject({ admitted: true });
     expect(sink.stats()).toMatchObject({ queued: 9, inFlight: 2 });
 
     // One upload finishes. Eight assets have been waiting longer than the page; the
@@ -1532,12 +1537,12 @@ describe('ObjectStoreCaptureSink — pages reach a worker before assets', () => 
     // admits an asset however many images are uploading. (Counting the uploads against
     // the share instead refuses that seventh asset with the queue empty and two workers
     // idle — the lane throttled by a knob that is not the concurrency knob.)
-    for (const a of all.slice(0, 8)) await expect(sink.capture(a)).resolves.toEqual({ admitted: true });
+    for (const a of all.slice(0, 8)) await expect(sink.capture(a)).resolves.toMatchObject({ admitted: true });
     await until(() => store.parked.length === 8);
     expect(sink.stats()).toMatchObject({ queued: 0, inFlight: 8 });
 
     // Now the queue fills: six waiting is the share, the seventh is held.
-    for (const a of all.slice(8, 14)) await expect(sink.capture(a)).resolves.toEqual({ admitted: true });
+    for (const a of all.slice(8, 14)) await expect(sink.capture(a)).resolves.toMatchObject({ admitted: true });
     await expect(sink.capture(all[14])).resolves.toEqual({ admitted: false, reason: 'assetReserve' });
     // So the lane's whole footprint is share × queueMax WAITING plus concurrency RUNNING:
     // fourteen of the sixteen offered, never six. That is the number an operator sizing
@@ -1546,8 +1551,8 @@ describe('ObjectStoreCaptureSink — pages reach a worker before assets', () => 
 
     // None of it touched the pages' two slots.
     const [p1, p2, p3] = pages(3);
-    await expect(sink.capture(p1)).resolves.toEqual({ admitted: true });
-    await expect(sink.capture(p2)).resolves.toEqual({ admitted: true });
+    await expect(sink.capture(p1)).resolves.toMatchObject({ admitted: true });
+    await expect(sink.capture(p2)).resolves.toMatchObject({ admitted: true });
     await expect(sink.capture(p3)).resolves.toEqual({ admitted: false, reason: 'queueFull' });
 
     // And the running uploads are the ONLY thing a page ever waits behind: the moment one
@@ -1576,7 +1581,7 @@ describe('ObjectStoreCaptureSink — a held-back asset is counted against the bu
     // DEPTH binds: two 100-byte assets fill half of four slots with the byte budget barely touched.
     const storeA = new GatedObjectStore();
     const byDepth = await parkedSink(storeA, { queueMax: 4, queueMaxBytes: 1000, assetQueueShare: 0.5 });
-    for (const a of assets(2, 100)) await expect(byDepth.capture(a)).resolves.toEqual({ admitted: true });
+    for (const a of assets(2, 100)) await expect(byDepth.capture(a)).resolves.toMatchObject({ admitted: true });
     await expect(byDepth.capture(assets(3, 100)[2])).resolves.toEqual({ admitted: false, reason: 'assetReserve' });
     expect(byDepth.stats()).toMatchObject({
       assetRefusedReserve: 1, assetRefusedReserveDepth: 1, assetRefusedReserveBytes: 0,
@@ -1591,7 +1596,7 @@ describe('ObjectStoreCaptureSink — a held-back asset is counted against the bu
     // BYTES bind: one 300-byte asset holds 300 of a 500-byte share; the next would take it to 600.
     const storeB = new GatedObjectStore();
     const byBytes = await parkedSink(storeB, { queueMax: 100, queueMaxBytes: 1000, assetQueueShare: 0.5 });
-    await expect(byBytes.capture(assets(1, 300)[0])).resolves.toEqual({ admitted: true });
+    await expect(byBytes.capture(assets(1, 300)[0])).resolves.toMatchObject({ admitted: true });
     await expect(byBytes.capture(assets(2, 300)[1])).resolves.toEqual({ admitted: false, reason: 'assetReserve' });
     expect(byBytes.stats()).toMatchObject({
       assetRefusedReserve: 1, assetRefusedReserveDepth: 0, assetRefusedReserveBytes: 1,
@@ -1634,9 +1639,9 @@ const takeOrder = async (over: Partial<RawStoreConfig>, ageMs: number, flushFirs
   const sink = await parkedSink(store, { queueMax: 100, ...over });
   const [a1, a2] = assets(2);
   const [p1, p2, p3] = pages(3);
-  for (const a of [a1, a2]) await expect(sink.capture(a)).resolves.toEqual({ admitted: true });
+  for (const a of [a1, a2]) await expect(sink.capture(a)).resolves.toMatchObject({ admitted: true });
   now += ageMs;
-  for (const p of [p1, p2, p3]) await expect(sink.capture(p)).resolves.toEqual({ admitted: true });
+  for (const p of [p1, p2, p3]) await expect(sink.capture(p)).resolves.toMatchObject({ admitted: true });
   // A flush registered BEFORE the worker is freed, or no flush at all until the queue has
   // drained on its own — a flush() call is what makes the drain a shutdown drain.
   const flushing = flushFirst ? sink.flush() : undefined;
@@ -1689,14 +1694,14 @@ describe('ObjectStoreCaptureSink — an asset that has waited past RAW_STORE_ASS
     const store = new GatedObjectStore();
     const sink = await parkedSink(store, { queueMax: 100, assetMaxWaitMs: 30_000 });
     const [a1] = assets(1);
-    await expect(sink.capture(a1)).resolves.toEqual({ admitted: true });
+    await expect(sink.capture(a1)).resolves.toMatchObject({ admitted: true });
 
     // The burst: a new page lands every upload, each upload takes 5 s, and there is ALWAYS a
     // page waiting when the worker frees. Under strict priority a1 would upload only after the
     // burst ended — twelve pages, sixty seconds, for as long as the crawler kept going.
     const burst = pages(12);
     for (let round = 1; round <= 10; round += 1) {
-      await expect(sink.capture(burst[round - 1])).resolves.toEqual({ admitted: true });
+      await expect(sink.capture(burst[round - 1])).resolves.toMatchObject({ admitted: true });
       now += 5_000;
       store.parked.splice(0, 1).forEach(r => r()); // the running upload finishes
       await until(() => store.parked.length === 1); // the worker took the next capture and parked on its PUT
@@ -1725,7 +1730,7 @@ describe('ObjectStoreCaptureSink — the queue depth is reported by lane', () =>
     const sink = await parkedSink(store, { queueMax: 100 });
     const [a1, a2] = assets(2);
     const [p1] = pages(1);
-    for (const c of [a1, p1, a2]) await expect(sink.capture(c)).resolves.toEqual({ admitted: true });
+    for (const c of [a1, p1, a2]) await expect(sink.capture(c)).resolves.toMatchObject({ admitted: true });
     expect(sink.stats()).toMatchObject({ queued: 3, queuedPages: 1, queuedAssets: 2, inFlight: 1 });
 
     // The freed worker takes the page; the two assets are what is left waiting.
@@ -1742,7 +1747,7 @@ describe('ObjectStoreCaptureSink — the queue depth is reported by lane', () =>
     const store = new GatedObjectStore();
     const sink = await parkedSink(store, { queueMax: 4, assetQueueShare: 0.5 });
     // Two pages reach the asset share of the depth with no asset waiting at all.
-    for (const p of pages(2)) await expect(sink.capture(p)).resolves.toEqual({ admitted: true });
+    for (const p of pages(2)) await expect(sink.capture(p)).resolves.toMatchObject({ admitted: true });
     await expect(sink.capture(assets(1)[0])).resolves.toEqual({ admitted: false, reason: 'assetReserve' });
     expect(sink.stats()).toMatchObject({ queued: 2, queuedPages: 2, queuedAssets: 0, assetRefusedReserveDepth: 1 });
     const line = warn.mock.calls.map(a => String(a[0])).find(l => l.includes('held back for the page reservation'));
@@ -2012,5 +2017,168 @@ describe('the worst event-loop stall stays visible', () => {
     const sink = new ObjectStoreCaptureSink(new FakeObjectStore(), CONFIG);
     await send(sink, cap());
     expect(sink.stats().eventLoopLagMax).toBeLessThan(100);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// I3 — capture reporting from EVERY asset emit point (stored · HEAD dedup · B5
+// in-flight loser). The sink builds the StoredCaptureReport; the reporter (its
+// own suite) turns it into the wire message and omits engine_version on 'asset'.
+// ---------------------------------------------------------------------------
+describe('ObjectStoreCaptureSink — capture reporting (I3)', () => {
+  const IMG_CONFIG: RawStoreConfig = { ...CONFIG, imagePrefix: 'raw-img/', imagePutTimeoutMs: 60_000 };
+  const keyFor = (c: RawCapture, ext = 'png') => `raw-img/sha256/${c.sha256.slice(0, 2)}/${c.sha256}.${ext}`;
+
+  it('reports a freshly-stored asset with already_stored=false and its full provenance', async () => {
+    const store = new FakeObjectStore();
+    const reports: StoredCaptureReport[] = [];
+    const sink = new ObjectStoreCaptureSink(store, IMG_CONFIG, async (r) => { reports.push(r); });
+    const c = asset(PNG, {
+      url: 'https://cdn.x.test/p.png', sourceItem: { site: 'amiami', itemId: 'FIG-1' },
+      sourceUrl: 'https://amiami.test/item/FIG-1', role: 'gallery', position: 3, fetchedAt: '2026-09-08T00:00:00.000Z',
+    });
+
+    await send(sink, c);
+
+    expect(reports).toHaveLength(1);
+    const r = reports[0];
+    expect(r.lane).toBe('asset');
+    expect(r.alreadyStored).toBe(false);
+    expect(r.site).toBe('amiami');
+    expect(r.itemId).toBe('FIG-1');
+    expect(r.sha256).toBe(c.sha256);
+    expect(r.storageKey).toBe(keyFor(c));
+    expect(r.bytesLen).toBe(PNG.length);
+    expect(r.role).toBe('gallery');
+    expect(r.position).toBe(3);
+    expect(r.sourceUrl).toBe('https://amiami.test/item/FIG-1');
+    expect(r.url).toBe('https://cdn.x.test/p.png');
+    expect(r.fetchedAt).toBe('2026-09-08T00:00:00.000Z');
+    // engine_version is never populated on the asset lane (the reporter would reject it at the shell).
+    expect((r as { engineVersion?: string }).engineVersion).toBeUndefined();
+  });
+
+  it('reports the RESOLVED url (finalUrl) so a live report and a backfill dedup onto one raw.url', async () => {
+    const store = new FakeObjectStore();
+    const reports: StoredCaptureReport[] = [];
+    const sink = new ObjectStoreCaptureSink(store, IMG_CONFIG, async (r) => { reports.push(r); });
+
+    await send(sink, asset(PNG, { url: 'https://cdn.x.test/req.png', finalUrl: 'https://cdn.x.test/final.png' }));
+
+    expect(reports[0].url).toBe('https://cdn.x.test/final.png');
+  });
+
+  it('reports a HEAD-dedup hit with already_stored=true and never re-PUTs', async () => {
+    const store = new FakeObjectStore();
+    const reports: StoredCaptureReport[] = [];
+    const sink = new ObjectStoreCaptureSink(store, IMG_CONFIG, async (r) => { reports.push(r); });
+    const c = asset(PNG, { sourceItem: { site: 'x.test', itemId: '7' } });
+    store.existing.add(keyFor(c)); // already at rest from a prior run
+
+    await send(sink, c);
+
+    expect(store.puts).toHaveLength(0);
+    expect(reports).toHaveLength(1);
+    expect(reports[0].alreadyStored).toBe(true);
+    expect(reports[0].sha256).toBe(c.sha256);
+  });
+
+  it('stores exactly as before when no reporter is wired (reporting is opt-in)', async () => {
+    const store = new FakeObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, IMG_CONFIG); // no reporter
+
+    await send(sink, asset(PNG));
+
+    expect(store.puts).toHaveLength(1);
+    expect(sink.stats().assetStored).toBe(1);
+  });
+
+  it('does NOT report an asset that names no item — a hostname is never interned as a site (I5)', async () => {
+    const store = new FakeObjectStore();
+    const reports: StoredCaptureReport[] = [];
+    const sink = new ObjectStoreCaptureSink(store, IMG_CONFIG, async (r) => { reports.push(r); });
+
+    await send(sink, asset(PNG, { sourceItem: undefined }));
+
+    expect(store.puts).toHaveLength(1); // still stored — the object is not lost
+    expect(reports).toHaveLength(0);    // but not attributed to its CDN host
+  });
+
+  it('never lets a failed report reject out of the capture path', async () => {
+    const store = new FakeObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, IMG_CONFIG, async () => { throw new Error('reporter down'); });
+
+    await expect(send(sink, asset(PNG))).resolves.toBeUndefined();
+    expect(store.puts).toHaveLength(1);
+  });
+
+  // The B5 acceptance, at the unit grain, deterministic with a gated store and a fake clock in the
+  // capture. Two items reference ONE image url in one run; one wins the in-flight key, the other must
+  // AWAIT it and report the WINNER's outcome — never a guess, and never its own clock.
+  it('B5: the in-flight loser awaits the winner and reports the WINNER\'s outcome (one storing report, two depictions)', async () => {
+    const store = new GatedObjectStore();
+    const reports: StoredCaptureReport[] = [];
+    const sink = new ObjectStoreCaptureSink(store, { ...IMG_CONFIG, concurrency: 2 }, async (r) => { reports.push(r); });
+    const shared = 'https://cdn.x.test/shared.png';
+    const winner = asset(PNG, { url: shared, sourceItem: { site: 'x.test', itemId: 'ITEM-A' }, position: 0, fetchedAt: '2026-09-08T00:00:00.000Z' });
+    const loser = asset(PNG, { url: shared, sourceItem: { site: 'x.test', itemId: 'ITEM-B' }, position: 1, fetchedAt: '2026-09-08T09:09:09.000Z' });
+
+    await sink.capture(winner);
+    await until(() => store.keys.length === 1); // A is parked mid-PUT, holding the in-flight key
+    await sink.capture(loser);                   // B collides on that key and must await A's outcome
+    await drain(store, sink);
+
+    // Exactly one object PUT — B deduped against A's in-flight op, not its own upload.
+    expect(store.keys).toHaveLength(1);
+    // Both items get a depiction…
+    expect(reports).toHaveLength(2);
+    const win = reports.find((r) => r.itemId === 'ITEM-A')!;
+    const lose = reports.find((r) => r.itemId === 'ITEM-B')!;
+    expect(win).toBeDefined();
+    expect(lose).toBeDefined();
+    // …but the blob is reported as freshly stored exactly ONCE (the winner).
+    expect(reports.filter((r) => r.alreadyStored === false)).toHaveLength(1);
+    expect(win.alreadyStored).toBe(false);
+    expect(lose.alreadyStored).toBe(true);
+    // The loser carries the WINNER's capture identity (fetched-at + url + key + sha), so the two fold
+    // into ONE raw.capture rather than forking a second observation on the loser's own clock…
+    expect(lose.fetchedAt).toBe('2026-09-08T00:00:00.000Z'); // A's, NOT B's 09:09:09
+    expect(lose.fetchedAt).toBe(win.fetchedAt);
+    expect(lose.url).toBe(win.url);
+    expect(lose.sha256).toBe(win.sha256);
+    expect(lose.storageKey).toBe(win.storageKey);
+    // …while keeping its OWN depiction (its item and position).
+    expect(win.position).toBe(0);
+    expect(lose.position).toBe(1);
+  });
+
+  it('B5: when the winner\'s PUT FAILS, the loser reports NOTHING — never a guess about bytes that did not land', async () => {
+    // A store whose PUT records the key, then blocks, then throws — so a loser can collide on the
+    // in-flight key while the winner is still mid-PUT, and then that PUT fails.
+    class FailingGatedStore implements ObjectStore {
+      readonly keys: string[] = [];
+      readonly existing = new Set<string>();
+      private release!: () => void;
+      private readonly gate = new Promise<void>((r) => { this.release = r; });
+      async exists(k: string): Promise<boolean> { return this.existing.has(k); }
+      async put(k: string): Promise<void> { this.keys.push(k); await this.gate; throw new Error('simulated PUT failure'); }
+      fail(): void { this.release(); }
+    }
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new FailingGatedStore();
+    const reports: StoredCaptureReport[] = [];
+    const sink = new ObjectStoreCaptureSink(store, { ...IMG_CONFIG, concurrency: 2 }, async (r) => { reports.push(r); });
+    const shared = 'https://cdn.x.test/shared.png';
+
+    await sink.capture(asset(PNG, { url: shared, sourceItem: { site: 'x.test', itemId: 'ITEM-A' } }));
+    await until(() => store.keys.length === 1);   // A parked mid-PUT, holding the in-flight key
+    await sink.capture(asset(PNG, { url: shared, sourceItem: { site: 'x.test', itemId: 'ITEM-B' } }));
+    await new Promise((r) => setImmediate(r));      // let B reach `await winner.done`
+    store.fail();                                   // A's PUT now throws
+    await sink.flush();
+
+    expect(reports).toHaveLength(0);                // the bytes never landed, so nobody claims already-stored
+    expect(sink.stats().assetFailed).toBe(1);       // A's failure is counted, not swallowed silently
+    warn.mockRestore();
   });
 });

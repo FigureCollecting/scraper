@@ -108,7 +108,20 @@ import { gzip } from 'node:zlib';
 import { promisify } from 'node:util';
 import type { CaptureAdmission, CaptureSink, RawCapture } from './captureSink.js';
 import { CAPTURE_ADMITTED } from './captureSink.js';
+import type { ReportStoredCapture, StoredCaptureReport } from './captureReporter.js';
 import { sanitizeForLog } from '../utils/security.js';
+
+/** What a store round trip resolved to — the value a B5 in-flight loser reports rather than guesses. */
+type StoreOutcome = 'stored' | 'deduped';
+/**
+ * An op already running for a content address. The loser reports the WINNER's `fetchedAt` (so the two
+ * dedup into ONE raw.capture rather than fork on the loser's own clock) and the winner's `done` outcome
+ * (so the loser never claims already-stored for bytes a failed PUT left unwritten).
+ */
+interface InFlightEntry {
+  fetchedAt: string;
+  done: Promise<StoreOutcome>;
+}
 
 /**
  * Compression runs on libuv's threadpool, not the event loop. `gzipSync` on a wave of
@@ -638,10 +651,14 @@ export class ObjectStoreCaptureSink implements CaptureSink {
   /**
    * Content addresses with an op already running. HEAD-then-PUT is blind to a sibling:
    * two captures of the same bytes both HEAD before either PUT lands, both miss, and
-   * "write-once" becomes two uploads of the same object. Both lanes share this set —
+   * "write-once" becomes two uploads of the same object. Both lanes share this map —
    * their prefixes keep the key spaces apart, so one guard covers both.
+   *
+   * B5: a MAP, not a Set, so an asset-lane loser can AWAIT the winner's outcome and report the
+   * winner's `fetchedAt` — the loser is a second item sharing the image, and it needs its own
+   * depiction row against the ONE capture the winner is writing, not a guess or a second observation.
    */
-  private readonly inFlightKeys = new Set<string>();
+  private readonly inFlightKeys = new Map<string, InFlightEntry>();
   /**
    * Ops the BUDGET ended, counted inside `failed`/`assetFailed` rather than beside
    * them. "The store answered with an error" and "the store never answered" are
@@ -660,6 +677,12 @@ export class ObjectStoreCaptureSink implements CaptureSink {
   constructor(
     private readonly store: ObjectStore,
     private readonly config: RawStoreConfig,
+    /**
+     * Best-effort provenance reporter. Absent ⇒ captures are stored but not reported (exactly how
+     * the lane behaved before I3, and how it behaves with REPORT_CAPTURES off). Never awaited on the
+     * capture path; a report that fails is the reporter's own to swallow and count.
+     */
+    private readonly reportCapture?: ReportStoredCapture,
   ) {
     if (config.keyScheme !== SUPPORTED_KEY_SCHEME) {
       throw new Error(
@@ -776,36 +799,38 @@ export class ObjectStoreCaptureSink implements CaptureSink {
 
       // A sibling op already owns this address. Its bytes are ours by definition —
       // the key IS the content hash — so this capture is a dedup, not a second write.
+      // Page captures do not report, so the loser simply counts and returns.
       if (this.inFlightKeys.has(key)) {
         this.deduped += 1;
         return;
       }
-      this.inFlightKeys.add(key);
-      try {
-        // ONE budget across both round trips (see withTimeout): what the operator sets
-        // is what the capture may spend, rather than what EACH half may spend.
-        const outcome = await this.withTimeout(async signal => {
-          // HEAD-then-PUT: content-addressed, so an existing key means identical bytes.
-          if (await this.timed(this.headDurations, signal, () => this.store.exists(key, signal))) {
-            return 'deduped' as const;
-          }
+      // ONE budget across both round trips (see withTimeout): what the operator sets
+      // is what the capture may spend, rather than what EACH half may spend.
+      const op: Promise<StoreOutcome> = this.withTimeout(async signal => {
+        // HEAD-then-PUT: content-addressed, so an existing key means identical bytes.
+        if (await this.timed(this.headDurations, signal, () => this.store.exists(key, signal))) {
+          return 'deduped' as const;
+        }
 
-          // Off the event loop, and INSIDE the budget: it is our own cost rather than
-          // the store's, but it is time the capture holds a worker, and the budget is
-          // what bounds that. The per-phase split stays honest either way — headP50 and
-          // putP50 time the store CALLS only — and eventLoopLagP95 beside them says
-          // whether our own CPU, not the bucket, is what ran the clock down.
-          const body = await gzipAsync(c.bytes);
-          // Never open a round trip the budget has already spent: it would reach the
-          // store for an op nobody is waiting for, and record a phantom 0 ms sample.
-          signal.throwIfAborted();
-          await this.timed(this.putDurations, signal, () =>
-            this.store.put(key, body, { contentType: 'application/gzip', metadata: this.metadata(c) }, signal),
-          );
-          return 'stored' as const;
-        });
+        // Off the event loop, and INSIDE the budget: it is our own cost rather than
+        // the store's, but it is time the capture holds a worker, and the budget is
+        // what bounds that. The per-phase split stays honest either way — headP50 and
+        // putP50 time the store CALLS only — and eventLoopLagP95 beside them says
+        // whether our own CPU, not the bucket, is what ran the clock down.
+        const body = await gzipAsync(c.bytes);
+        // Never open a round trip the budget has already spent: it would reach the
+        // store for an op nobody is waiting for, and record a phantom 0 ms sample.
+        signal.throwIfAborted();
+        await this.timed(this.putDurations, signal, () =>
+          this.store.put(key, body, { contentType: 'application/gzip', metadata: this.metadata(c) }, signal),
+        );
+        return 'stored' as const;
+      });
+      this.inFlightKeys.set(key, { fetchedAt: c.fetchedAt, done: op });
+      try {
         // Counted out here, on the value the RACE resolved with: an op the budget ended
         // keeps running in the background, and must never book itself as stored.
+        const outcome = await op;
         if (outcome === 'deduped') this.deduped += 1;
         else this.stored += 1;
       } finally {
@@ -864,37 +889,61 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     }
     const stored = bytes;
     const imageType = type;
-    return this.enqueue(() => this.storeAsset(c, stored, imageType), stored.byteLength, 'asset');
+    // Computed HERE, once, and threaded to storeAsset AND back to the caller: the key is what the
+    // image hook must remember so a later item sharing this url can report against the same object.
+    const key = this.assetObjectKey(c, imageType);
+    const admission = this.enqueue(() => this.storeAsset(c, stored, imageType, key), stored.byteLength, 'asset');
+    return admission.admitted ? { ...admission, storageKey: key, bytesLen: stored.byteLength } : admission;
+  }
+
+  /** `<imagePrefix>sha256/<aa>/<sha256hex>.<ext>` — the asset lane's content-addressed object key. */
+  private assetObjectKey(c: RawCapture, type: ImageType): string {
+    const prefix = this.config.imagePrefix ?? DEFAULT_IMAGE_PREFIX;
+    return `${prefix}sha256/${c.sha256.slice(0, 2)}/${c.sha256}.${type.ext}`;
   }
 
   /** The asset lane's store round trip, on a worker — the SAME queue as the pages. */
-  private async storeAsset(c: RawCapture, bytes: Buffer, type: ImageType): Promise<void> {
+  private async storeAsset(c: RawCapture, bytes: Buffer, type: ImageType, key: string): Promise<void> {
     try {
-      const prefix = this.config.imagePrefix ?? DEFAULT_IMAGE_PREFIX;
-      const key = `${prefix}sha256/${c.sha256.slice(0, 2)}/${c.sha256}.${type.ext}`;
-
-      if (this.inFlightKeys.has(key)) {
+      // B5: a sibling op already owns this address — a SECOND item sharing the image, whose bytes
+      // are ours by definition. Await the winner's outcome rather than guess: the loser needs its
+      // OWN depiction row against the winner's ONE capture, reported under the winner's fetched-at so
+      // the two dedup instead of forking a second observation. Never a guess — if the winner's PUT
+      // failed there is nothing at rest to depict.
+      const existing = this.inFlightKeys.get(key);
+      if (existing) {
         this.assetDeduped += 1;
+        let outcome: StoreOutcome | undefined;
+        try {
+          outcome = await existing.done;
+        } catch {
+          outcome = undefined;
+        }
+        if (outcome !== undefined) this.reportAsset(c, key, bytes.length, true, existing.fetchedAt);
         return;
       }
-      this.inFlightKeys.add(key);
-      try {
-        // One budget across this lane's two round trips, exactly as the page lanes.
-        const outcome = await this.withTimeout(async signal => {
-          if (await this.timed(this.headDurations, signal, () => this.store.exists(key, signal))) {
-            return 'deduped' as const;
-          }
+      // One budget across this lane's two round trips, exactly as the page lanes.
+      const op: Promise<StoreOutcome> = this.withTimeout(async signal => {
+        if (await this.timed(this.headDurations, signal, () => this.store.exists(key, signal))) {
+          return 'deduped' as const;
+        }
 
-          // No gzip and no Content-Encoding: an image is already compressed, and the
-          // original must be readable as itself straight out of the bucket.
-          signal.throwIfAborted();
-          await this.timed(this.putDurations, signal, () =>
-            this.store.put(key, bytes, { contentType: type.contentType, metadata: this.assetMetadata(c) }, signal),
-          );
-          return 'stored' as const;
-        }, this.imagePutTimeoutMs);
+        // No gzip and no Content-Encoding: an image is already compressed, and the
+        // original must be readable as itself straight out of the bucket.
+        signal.throwIfAborted();
+        await this.timed(this.putDurations, signal, () =>
+          this.store.put(key, bytes, { contentType: type.contentType, metadata: this.assetMetadata(c) }, signal),
+        );
+        return 'stored' as const;
+      }, this.imagePutTimeoutMs);
+      this.inFlightKeys.set(key, { fetchedAt: c.fetchedAt, done: op });
+      try {
+        const outcome = await op;
         if (outcome === 'deduped') this.assetDeduped += 1;
         else this.assetStored += 1;
+        // The winner: already_stored is TRUE only when a HEAD found the object already at rest (a
+        // prior run), FALSE when this run's PUT is what put it there.
+        this.reportAsset(c, key, bytes.length, outcome === 'deduped', c.fetchedAt);
       } finally {
         this.inFlightKeys.delete(key);
       }
@@ -902,6 +951,42 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       this.assetFailed += 1;
       this.warnAssetFailure(c, err);
     }
+  }
+
+  /**
+   * Emit one asset capture, best-effort. The report names the CAPTURE'S OWN item but a supplied
+   * `fetchedAt` (the winner's, for an in-flight loser), so two items sharing an image become two
+   * depictions and ONE raw.capture. Skipped silently when no reporter is wired, or when the capture
+   * names no store — a hostname is never interned as a site (I5's rule), so an asset with no source
+   * item is left to the backfill rather than attributed to its CDN host.
+   */
+  private reportAsset(c: RawCapture, storageKey: string, bytesLen: number, alreadyStored: boolean, fetchedAt: string): void {
+    if (!this.reportCapture) return;
+    const item = c.sourceItem;
+    if (!item) return;
+    const report: StoredCaptureReport = {
+      site: item.site,
+      itemId: item.itemId,
+      // The RESOLVED address, matching what assetMetadata() records and what the I5 backfill reads
+      // back — so a live report and a backfill of the same object dedup onto one raw.url/raw.capture.
+      url: c.finalUrl ?? c.url,
+      lane: 'asset',
+      sha256: c.sha256,
+      bytesLen,
+      storageKey,
+      fetchedAt,
+      alreadyStored,
+      ...(c.statusCode !== undefined ? { httpStatus: c.statusCode } : {}),
+      ...(c.contentType !== undefined ? { contentType: c.contentType } : {}),
+      ...(c.contentEncoding !== undefined ? { contentEncoding: c.contentEncoding } : {}),
+      ...(c.vary !== undefined ? { vary: c.vary } : {}),
+      ...(c.sourceUrl !== undefined ? { sourceUrl: c.sourceUrl } : {}),
+      ...(c.role !== undefined ? { role: c.role } : {}),
+      ...(c.position !== undefined ? { position: c.position } : {}),
+    };
+    // Fire-and-forget: the reporter swallows and counts its own failures; this .catch covers an
+    // injected reporter that does not.
+    void Promise.resolve(this.reportCapture(report)).catch(() => undefined);
   }
 
   private warnAssetFailure(c: RawCapture, err: unknown): void {
@@ -1169,7 +1254,9 @@ export class ObjectStoreCaptureSink implements CaptureSink {
 
   private metadata(c: RawCapture): Record<string, string> {
     const url = c.finalUrl ?? c.url;
-    const md: Record<string, string> = { url: headerSafe(url), 'fetched-at': headerSafe(c.fetchedAt) };
+    // The lane tag, which the asset lane already writes: a forward fix so a future backfill can tell
+    // an 'api' object from a 'wire'/'dom' one (they share the raw-html/ prefix with no other signal).
+    const md: Record<string, string> = { url: headerSafe(url), 'fetched-at': headerSafe(c.fetchedAt), lane: c.lane };
     const host = hostOf(url); // best-effort — a malformed URL just omits the site tag
     if (host) md.site = headerSafe(host);
     return budgetMetadata(md);

@@ -457,7 +457,9 @@ describe('flushRawCaptureSink — pages first inside the budget', () => {
     });
     // SIGTERM arrives with one image uploading, three more waiting, and behind all of
     // them the one capture nothing will ever fetch again.
-    for (let i = 1; i <= 4; i += 1) await expect(sink.capture(image(i))).resolves.toEqual({ admitted: true });
+    // Asset admissions now also carry the object key + length (for the image hook's memo); assert the
+    // admit flag without pinning those.
+    for (let i = 1; i <= 4; i += 1) await expect(sink.capture(image(i))).resolves.toMatchObject({ admitted: true });
     await until(() => store.parked.length === 1);
     const page = buildRawCapture({ url: 'https://store.test/item/1', lane: 'wire', bytes: Buffer.from('<html>item 1</html>') });
     await expect(sink.capture(page)).resolves.toEqual({ admitted: true });

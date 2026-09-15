@@ -33,6 +33,7 @@ const build = (over: Partial<HealthDeps> = {}) => {
     getBrowserLane: () => ({ launchMode: 'headless', residentialTimezone: null, directTimezone: null, processTimezone: null, navigationTimeoutMs: 20000, gatedBrowsers: [] }),
     getRawStore: () => ({ configured: false }),
     getFailureLedger: () => ({ enabled: false, reported: 0, failed: 0, suppressed: 0 }),
+    getCaptureLedger: () => ({ enabled: false, reported: 0, failed: 0, disabled: false }),
     getImageCapture: () => NO_IMAGE_CAPTURE,
     getSessionCanary: () => ({ site: 'mfc', configured: false, stale: false }),
     getCpuThrottling: () => ({ available: false }),
@@ -448,6 +449,35 @@ describe('createHealthRoutes — failureLedger', () => {
 
     expect(res.status).toBe(500);
     expect(res.body.failureLedger).toEqual({ enabled: true, reported: 3, failed: 0, suppressed: 0 });
+  });
+});
+
+describe('createHealthRoutes — captureLedger (the I3 acceptance signal)', () => {
+  it('GET /health/detailed reports the stored-object provenance counters', async () => {
+    const app = build({ getCaptureLedger: () => ({ enabled: true, reported: 7, failed: 0, disabled: false }) });
+
+    const res = await request(app).get('/health/detailed');
+
+    expect(res.status).toBe(200);
+    // The acceptance reads capturesReported = captureLedger.reported and captureReportFailures = .failed.
+    expect(res.body.captureLedger).toEqual({ enabled: true, reported: 7, failed: 0, disabled: false });
+  });
+
+  it('shows reporting OFF (armed dark) when no capture reporter was built', async () => {
+    const res = await request(build()).get('/health/detailed');
+    expect(res.body.captureLedger).toEqual({ enabled: false, reported: 0, failed: 0, disabled: false });
+  });
+
+  it('surfaces the UNIMPLEMENTED self-disable, and keeps the counters on a degraded response', async () => {
+    const app = build({
+      getBrowserPoolHealth: async () => { throw new Error('pool down'); },
+      getCaptureLedger: () => ({ enabled: true, reported: 0, failed: 2, disabled: true }),
+    });
+
+    const res = await request(app).get('/health/detailed');
+
+    expect(res.status).toBe(500);
+    expect(res.body.captureLedger).toEqual({ enabled: true, reported: 0, failed: 2, disabled: true });
   });
 
   /**
