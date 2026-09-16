@@ -202,7 +202,7 @@ describe('ScrapeQueue - processing loop', () => {
     expect(data.name).toBe('Figure');
   });
 
-  it('should NOT retry on auth_required error', async () => {
+  it('should NOT retry on gone_or_denied error', async () => {
     const { scraping } = makeIngestQueue();
     scraping.scrapePage.mockRejectedValue(new Error('AUTH: authentication required'));
 
@@ -214,7 +214,7 @@ describe('ScrapeQueue - processing loop', () => {
 
     const error = await promiseRef;
     expect(error).toBeInstanceOf(Error);
-    expect((error as Error).message).toContain('auth_required');
+    expect((error as Error).message).toContain('gone_or_denied');
     // Should only have been called once (no retry for auth errors)
     expect(scraping.scrapePage).toHaveBeenCalledTimes(1);
   });

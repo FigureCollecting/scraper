@@ -178,7 +178,10 @@ function fromErrorType(
     case 'extraction_unavailable':
     case 'empty_record':
       return 'ruleset';
-    case 'auth_required':
+    // gone_or_denied carries BOTH a closed door and an ambiguous 404; the ledger books the pair as
+    // http_403 because the review lane must treat a maybe-denied item as reviewable, never close it
+    // as gone_404 on a status the store may have served in place of a denial.
+    case 'gone_or_denied':
       return 'http_403';
     case 'challenge_cooldown':
       return 'cooldown';

@@ -67,7 +67,17 @@ import type {
 
 export type QueuePriority = 'HOT' | 'WARM' | 'COLD';
 export type ItemStatus = 'owned' | 'ordered' | 'wished';
-export type ErrorType = 'timeout' | 'not_found' | 'rate_limited' | 'auth_required' | 'network' | 'extraction_unavailable' | 'empty_record' | 'challenge_cooldown' | 'unknown';
+/**
+ * `gone_or_denied` names the class HONESTLY. It carries two readings the store does not let us
+ * tell apart: a 401/403 closed door, and an ambiguous 404 on a store that serves a denial as a
+ * not-found (mfc's NSFW items, RecordFetchStatusError.deniedOrGone). Its predecessor spelling,
+ * 'auth_required', asserted the first reading for BOTH — a row under it could equally be an item
+ * that was simply removed, and an operator reading the queue had no way to know which. The retry
+ * policy is identical either way (never retried: no number of attempts re-mints a session cookie,
+ * and none resurrects a deleted item), so only the NAME was wrong. The spine ledger still books
+ * this class as `http_403` — see failureClassifier.ts.
+ */
+export type ErrorType = 'timeout' | 'not_found' | 'rate_limited' | 'gone_or_denied' | 'network' | 'extraction_unavailable' | 'empty_record' | 'challenge_cooldown' | 'unknown';
 
 export interface QueueItem {
   /** Unique identifier for this queue entry */
@@ -457,17 +467,17 @@ function classifyError(error: Error | string): ErrorType {
   // this queue's retry policy. 404 / 410 and a bounce to the front page are terminal-by-store, so
   // they take 'not_found' (one fetch, then FAILED) instead of being retried to exhaustion. 401 / 403
   // are a closed door: re-knocking cannot open it and only spends the egress IP's reputation, so
-  // they take 'auth_required' (also never retried). 429 rides the existing rate-limit backoff, a 5xx
+  // they take 'gone_or_denied' (also never retried). 429 rides the existing rate-limit backoff, a 5xx
   // is a transient upstream ('network'), and anything else keeps the bounded generic retry.
   if (error instanceof RecordFetchStatusError) {
     // AMBIGUOUS 404 first: on a store where a 404 may be an entitlement denial (mfc's NSFW items),
     // 'not_found' would close a live item as removed. It is an access failure — never retried,
     // because no number of retries re-mints a session cookie — and the ledger books it http_403.
-    if (error.deniedOrGone) return 'auth_required';
+    if (error.deniedOrGone) return 'gone_or_denied';
     if (error.redirectedHome) return 'not_found';
     const status = error.status ?? 0;
     if (status === 404 || status === 410) return 'not_found';
-    if (status === 401 || status === 403) return 'auth_required';
+    if (status === 401 || status === 403) return 'gone_or_denied';
     if (status === 429) return 'rate_limited';
     if (status >= 500) return 'network';
     return 'unknown';
@@ -508,7 +518,7 @@ function classifyError(error: Error | string): ErrorType {
   }
 
   if (message.includes('AUTH') || message.includes('authentication') || message.includes('NSFW')) {
-    return 'auth_required';
+    return 'gone_or_denied';
   }
 
   if (message.includes('NETWORK') || message.includes('ERR_') || message.includes('disconnected')) {
@@ -530,8 +540,9 @@ function classifyError(error: Error | string): ErrorType {
 const UNMATCHED_SITE = 'unmatched';
 
 function shouldRetry(error: Error | string, errorType: ErrorType, retryCount: number, maxRetries: number): boolean {
-  // Never retry auth errors without new cookies
-  if (errorType === 'auth_required') {
+  // Never retry a closed door or a maybe-removed item: no number of attempts re-mints a session
+  // cookie, and none resurrects a deleted item.
+  if (errorType === 'gone_or_denied') {
     return false;
   }
 

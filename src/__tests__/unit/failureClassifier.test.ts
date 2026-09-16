@@ -90,7 +90,7 @@ describe('classifyFetchFailure — the queue ErrorType', () => {
     ['not_found', 'gone_404'],
     ['extraction_unavailable', 'ruleset'],
     ['empty_record', 'ruleset'],
-    ['auth_required', 'http_403'],
+    ['gone_or_denied', 'http_403'],
     ['challenge_cooldown', 'cooldown'],
   ] as const)('maps errorType %s to %s', (errorType, reasonClass) => {
     expect(classifyFetchFailure({ errorType }).reasonClass).toBe(reasonClass);
@@ -251,7 +251,19 @@ describe('classifyFetchFailure — denied-or-gone', () => {
       status: 404,
       deniedOrGoneSite: 'mfc',
     });
-    expect(classifyFetchFailure({ error, errorType: 'auth_required', httpStatus: 404, deniedOrGone: true }).reasonClass)
+    expect(classifyFetchFailure({ error, errorType: 'gone_or_denied', httpStatus: 404, deniedOrGone: true }).reasonClass)
+      .toBe('http_403');
+  });
+
+  // The class covers TWO readings the store does not let us tell apart: a 401/403 closed door,
+  // and an ambiguous 404 on a store where a denial is served as a not-found (mfc's NSFW items).
+  // 'auth_required' named only the first and asserted a fact about the second that nothing
+  // established — a row booked under it could equally be an item that was simply removed.
+  it('names the ambiguity: the SAME class carries a closed door and a maybe-removed item', () => {
+    // a plain 403: denied, and we know it
+    expect(classifyFetchFailure({ errorType: 'gone_or_denied', httpStatus: 403 }).reasonClass).toBe('http_403');
+    // an ambiguous 404: gone OR denied, and the store will not say which
+    expect(classifyFetchFailure({ errorType: 'gone_or_denied', httpStatus: 404, deniedOrGone: true }).reasonClass)
       .toBe('http_403');
   });
 

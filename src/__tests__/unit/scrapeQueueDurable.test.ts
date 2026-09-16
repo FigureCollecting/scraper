@@ -265,7 +265,7 @@ describe('ScrapeQueue — dispatch, completion and retry', () => {
 
   it('drops the row when the queue gives up', async () => {
     const store = openStore(tmpDir());
-    // auth_required is never retried: one attempt, then terminal.
+    // gone_or_denied is never retried: one attempt, then terminal.
     const scraping = scrapingStub(() => Promise.reject(new Error('AUTH required for this item')));
     queue = new ScrapeQueue(false);
     queue.setQueueStore(store);
