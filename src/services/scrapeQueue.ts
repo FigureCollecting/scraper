@@ -79,6 +79,38 @@ export type ItemStatus = 'owned' | 'ordered' | 'wished';
  */
 export type ErrorType = 'timeout' | 'not_found' | 'rate_limited' | 'gone_or_denied' | 'network' | 'extraction_unavailable' | 'empty_record' | 'challenge_cooldown' | 'unknown';
 
+/** Every CURRENT spelling, as data — the membership test a bare cast skipped. */
+const ERROR_TYPES: ReadonlySet<string> = new Set<ErrorType>([
+  'timeout', 'not_found', 'rate_limited', 'gone_or_denied', 'network',
+  'extraction_unavailable', 'empty_record', 'challenge_cooldown', 'unknown',
+]);
+
+/** Spellings retired by a rename, mapped forward. */
+const RETIRED_ERROR_TYPES: Readonly<Record<string, ErrorType>> = { auth_required: 'gone_or_denied' };
+
+/**
+ * A persisted `last_error_class` read back as a real ErrorType.
+ *
+ * The queue PERSISTS errorType, so a row written by an older build outlives the
+ * rename: an in-flight 'auth_required' survives the upgrade, is read back
+ * through what used to be a bare `as ErrorType` cast, and then round-trips to
+ * disk again via toRow — an off-union value living indefinitely in a field
+ * typed as the union, on any row that is never re-attempted.
+ *
+ * Nothing was broken by it (processFailure re-derives errorType from the live
+ * error before shouldRetry is consulted, and shouldRetry's tail is a whitelist
+ * that excludes both spellings, so the never-retry outcome held either way).
+ * That is exactly why it is worth closing NOW, while it is still harmless: the
+ * next reader of this field has no reason to expect a value the type forbids.
+ * An unrecognised string funnels to 'unknown' rather than through the door.
+ */
+export function normalizeErrorType(v: string | undefined): ErrorType | undefined {
+  if (v === undefined) return undefined;
+  const retired = RETIRED_ERROR_TYPES[v];
+  if (retired !== undefined) return retired;
+  return ERROR_TYPES.has(v) ? (v as ErrorType) : 'unknown';
+}
+
 export interface QueueItem {
   /** Unique identifier for this queue entry */
   id: string;
@@ -1444,7 +1476,7 @@ export class ScrapeQueue {
       retryCount: row.attempts,
       maxRetries: row.maxRetries,
       queuedAt: row.enqueuedAt,
-      ...(row.lastErrorClass !== undefined ? { errorType: row.lastErrorClass as ErrorType } : {}),
+      ...(row.lastErrorClass !== undefined ? { errorType: normalizeErrorType(row.lastErrorClass) } : {}),
       waitingUserIds: [],
       resolvers: this.parkedResolvers.get(row.mfcId) ?? [],
     };
