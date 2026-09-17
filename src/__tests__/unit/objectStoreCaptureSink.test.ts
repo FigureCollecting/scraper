@@ -1919,13 +1919,30 @@ describe('the default store-op budget', () => {
   });
 
   it('lets an op that outlasts the OLD 5 s default finish and be stored', async () => {
+    // Hold the REAL clock before the fake one goes in. capture() hands the op to a
+    // worker, and the worker reaches store.put — and so the 8 s timer this test is
+    // about — only after an ASYNC gzip that runs on libuv's threadpool. Flushing
+    // microtasks cannot make a threadpool callback land, so a single
+    // advanceTimersByTimeAsync(20_000) can complete while the op has not yet
+    // scheduled any timer at all; the clock then never moves again and the op stays
+    // pending forever. Stepping the fake clock with a real tick in between lets the
+    // chain actually get there. 20 x 1 s is the same 20 s of fake time as before, and
+    // still well inside the 30 s budget under test.
+    const realSetTimeout = setTimeout;
+    const realTick = () => new Promise(resolve => realSetTimeout(resolve, 1));
     jest.useFakeTimers();
     try {
       const store = new FakeObjectStore();
       store.putDelayMs = 8_000; // over the old default, under the new one
       const sink = new ObjectStoreCaptureSink(store, { ...CONFIG, putTimeoutMs: undefined });
-      const done = send(sink, cap());
-      await jest.advanceTimersByTimeAsync(20_000);
+      let settled = false;
+      const done = send(sink, cap()).then(() => {
+        settled = true;
+      });
+      for (let i = 0; i < 20 && !settled; i += 1) {
+        await realTick();
+        await jest.advanceTimersByTimeAsync(1_000);
+      }
       await done;
       expect(sink.stats()).toMatchObject({ stored: 1, failed: 0, timedOut: 0 });
     } finally {

@@ -41,3 +41,21 @@ beforeEach(() => {
   resetAllMocks();
   jest.clearAllMocks();
 });
+
+/**
+ * Never let a fake clock outlive the test that installed it.
+ *
+ * A test that calls `jest.useFakeTimers()` and then times out is ABANDONED: the async
+ * function never resumes, so its own `finally { jest.useRealTimers() }` never runs and
+ * the fake clock stays installed. Every later test in that file then awaits a timer
+ * nothing will ever advance, times out at 30 s in turn, and one flaky test becomes a
+ * file that needs hours. That cascade is what ran this repo's CI job to GitHub's
+ * 6-hour cap (objectStoreCaptureSink.test.ts, 2026-09-11 to 2026-09-15).
+ *
+ * afterEach still runs after a timed-out test, so restoring here keeps the damage to
+ * the one test that actually broke. Files that install fake timers in their own
+ * beforeEach are unaffected: that hook re-installs them for the next test.
+ */
+afterEach(() => {
+  jest.useRealTimers();
+});
