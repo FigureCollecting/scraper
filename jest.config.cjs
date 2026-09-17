@@ -66,6 +66,12 @@ module.exports = {
   // Performance and Stability Enhancements
   bail: false, // Allow all test suites to run even if some fail
   verbose: true,
+
+  // `default` keeps the normal output; the watchdog adds nothing to a healthy run
+  // and fails a stalled one fast, naming the suites still in flight. It is armed on
+  // CI only (see jest.hangWatchdog.cjs), because a wedged worker otherwise runs
+  // silently to GitHub's 6-hour job cap and leaves no evidence behind.
+  reporters: ['default', '<rootDir>/jest.hangWatchdog.cjs'],
   
 
 };

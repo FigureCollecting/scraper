@@ -31,6 +31,10 @@ jobs:
   unit-tests:
     name: Unit Tests
     runs-on: ubuntu-latest
+    # A healthy job finishes in ~2 min. Without a cap, a wedged jest worker holds the
+    # runner until GitHub's 6-hour default — it did so five times between 2026-09-11
+    # and 2026-09-15, and one unrelated run sat queued 6.5 h behind those.
+    timeout-minutes: 20
     # Push gate: the single CI-policy expression (four cases documented above).
     if: >-
       github.event_name != 'push'
@@ -83,6 +87,8 @@ jobs:
   build:
     name: Build Application
     runs-on: ubuntu-latest
+    # A healthy job finishes in ~35 s; same reasoning as the cap on Unit Tests.
+    timeout-minutes: 15
     needs: unit-tests
     permissions:
       contents: read
