@@ -85,8 +85,13 @@ const ERROR_TYPES: ReadonlySet<string> = new Set<ErrorType>([
   'extraction_unavailable', 'empty_record', 'challenge_cooldown', 'unknown',
 ]);
 
-/** Spellings retired by a rename, mapped forward. */
-const RETIRED_ERROR_TYPES: Readonly<Record<string, ErrorType>> = { auth_required: 'gone_or_denied' };
+/**
+ * Spellings retired by a rename, mapped forward. A Map, NOT an object literal:
+ * an object's lookup walks the prototype chain, so `RETIRED['toString']` returns
+ * a Function and this guard would hand back a value the type forbids — in the
+ * one field it exists to keep clean. A Map has no such keys to inherit.
+ */
+const RETIRED_ERROR_TYPES: ReadonlyMap<string, ErrorType> = new Map([['auth_required', 'gone_or_denied']]);
 
 /**
  * A persisted `last_error_class` read back as a real ErrorType.
@@ -102,11 +107,13 @@ const RETIRED_ERROR_TYPES: Readonly<Record<string, ErrorType>> = { auth_required
  * that excludes both spellings, so the never-retry outcome held either way).
  * That is exactly why it is worth closing NOW, while it is still harmless: the
  * next reader of this field has no reason to expect a value the type forbids.
- * An unrecognised string funnels to 'unknown' rather than through the door.
+ * An unrecognised string funnels to 'unknown' rather than through the door —
+ * INCLUDING the Object.prototype keys ('toString', 'constructor', ...), which an
+ * object-literal lookup would have resolved to a Function.
  */
 export function normalizeErrorType(v: string | undefined): ErrorType | undefined {
   if (v === undefined) return undefined;
-  const retired = RETIRED_ERROR_TYPES[v];
+  const retired = RETIRED_ERROR_TYPES.get(v);
   if (retired !== undefined) return retired;
   return ERROR_TYPES.has(v) ? (v as ErrorType) : 'unknown';
 }

@@ -427,6 +427,20 @@ describe('ScrapeQueue — rehydrating an error class written by an older build',
     expect(normalizeErrorType(undefined)).toBeUndefined();
   });
 
+  // NOTE 13. The retired-spelling lookup was a plain object literal, so a handful
+  // of magic strings resolved up the PROTOTYPE CHAIN and were handed back as
+  // ErrorType: 'toString' returned a Function, in the very field this guard
+  // exists to keep clean. Not reachable from our own writes (last_error_class is
+  // only ever written from the union), so this is hardening — but a guard with a
+  // hole in it is worse than no guard, because it reads as covered.
+  it.each(['toString', 'constructor', 'valueOf', 'hasOwnProperty', 'isPrototypeOf',
+    'propertyIsEnumerable', 'toLocaleString', '__proto__', '__defineGetter__'])(
+    'funnels the Object.prototype key %s into unknown, never a Function', (key) => {
+      const out = normalizeErrorType(key);
+      expect(typeof out).toBe('string');
+      expect(out).toBe('unknown');
+    });
+
   it('round-trips a row PERSISTED with the old spelling back as the new one', () => {
     const dir = tmpDir();
     const first = openStore(dir);
