@@ -40,6 +40,10 @@ class HangWatchdogReporter {
     this._completed = 0;
     this._total = 0;
     this._timer = undefined;
+    // Armed from construction, not from onRunStart: a run can also wedge before any
+    // file is dispatched (the initial scan, or a transform), and that shape would
+    // otherwise slip past the watchdog and cost the full job timeout.
+    this._rearm();
   }
 
   onRunStart(aggregatedResult) {
