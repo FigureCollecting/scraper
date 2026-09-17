@@ -40,7 +40,7 @@ jest.mock('../../services/webhookClient', () => ({
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { ScrapeQueue, resetScrapeQueue } from '../../services/scrapeQueue';
+import { ScrapeQueue, resetScrapeQueue, normalizeErrorType } from '../../services/scrapeQueue';
 import { createExtractionRegistry, ExtractionRegistryImpl } from '../../services/extractionRegistry';
 import { createQueueStore, openQueueStore, type ScrapeQueueStore } from '../../services/queueStore';
 import { ChallengeCooldown } from '../../services/challengeCooldown';
@@ -265,7 +265,7 @@ describe('ScrapeQueue — dispatch, completion and retry', () => {
 
   it('drops the row when the queue gives up', async () => {
     const store = openStore(tmpDir());
-    // auth_required is never retried: one attempt, then terminal.
+    // gone_or_denied is never retried: one attempt, then terminal.
     const scraping = scrapingStub(() => Promise.reject(new Error('AUTH required for this item')));
     queue = new ScrapeQueue(false);
     queue.setQueueStore(store);
@@ -401,6 +401,65 @@ describe('ScrapeQueue — startup reconciliation', () => {
     expect(summary).toMatchObject({ pending: 0, leasedExpired: 0, cooldowns: 0 });
     const lines = (console.log as unknown as jest.Mock).mock.calls.map((c) => String(c[0]));
     expect(lines.filter((l) => l.includes('[SCRAPE QUEUE] restored'))).toHaveLength(0);
+  });
+});
+
+describe('ScrapeQueue — rehydrating an error class written by an older build', () => {
+  // SHOULD-FIX 10. `errorType` is PERSISTED (queue_items.last_error_class) and was
+  // read back with a bare `as ErrorType` cast. An in-flight row written before the
+  // gone_or_denied rename survives the upgrade carrying 'auth_required' — a value
+  // outside the union, sitting in a field typed as the union, which then
+  // round-trips back to disk via toRow and can live there indefinitely on a row
+  // that is never re-attempted.
+  it('maps the retired auth_required spelling to gone_or_denied', () => {
+    expect(normalizeErrorType('auth_required')).toBe('gone_or_denied');
+  });
+
+  it('leaves every current spelling alone', () => {
+    for (const t of ['timeout', 'not_found', 'rate_limited', 'gone_or_denied', 'network',
+      'extraction_unavailable', 'empty_record', 'challenge_cooldown', 'unknown'] as const) {
+      expect(normalizeErrorType(t)).toBe(t);
+    }
+  });
+
+  it('funnels an unrecognised string into unknown rather than letting it into a typed field', () => {
+    expect(normalizeErrorType('something_a_future_build_wrote')).toBe('unknown');
+    expect(normalizeErrorType(undefined)).toBeUndefined();
+  });
+
+  // NOTE 13. The retired-spelling lookup was a plain object literal, so a handful
+  // of magic strings resolved up the PROTOTYPE CHAIN and were handed back as
+  // ErrorType: 'toString' returned a Function, in the very field this guard
+  // exists to keep clean. Not reachable from our own writes (last_error_class is
+  // only ever written from the union), so this is hardening — but a guard with a
+  // hole in it is worse than no guard, because it reads as covered.
+  it.each(['toString', 'constructor', 'valueOf', 'hasOwnProperty', 'isPrototypeOf',
+    'propertyIsEnumerable', 'toLocaleString', '__proto__', '__defineGetter__'])(
+    'funnels the Object.prototype key %s into unknown, never a Function', (key) => {
+      const out = normalizeErrorType(key);
+      expect(typeof out).toBe('string');
+      expect(out).toBe('unknown');
+    });
+
+  it('round-trips a row PERSISTED with the old spelling back as the new one', () => {
+    const dir = tmpDir();
+    const first = openStore(dir);
+    first.put({
+      id: 'old-1', mfcId: 'old', url: urlFor('old'), priority: 'WARM',
+      attempts: 1, maxRetries: 3, enqueuedAt: 1_000, state: 'pending',
+      lastErrorClass: 'auth_required',          // written by the pre-rename build
+    });
+    first.close();
+
+    const second = openStore(dir);
+    queue = new ScrapeQueue(true);
+    queue.setQueueStore(second);
+    queue.restoreFromStore(9_000);
+
+    expect(queue.isPending('old')).toBe(true);
+    const item = (queue as unknown as { pendingItems: Map<string, { errorType?: string }> })
+      .pendingItems.get('old');
+    expect(item?.errorType).toBe('gone_or_denied');
   });
 });
 
