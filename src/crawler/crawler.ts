@@ -19,6 +19,18 @@
  *             actually handled, so nothing is ever re-walked and nothing is stranded; it shares the
  *             store's enqueue cap and the global budget. Ids in the window that do not exist at the
  *             store are EXPECTED — the ingest fetch 404s and the failure is recorded there, not here.
+ *   REOBSERVE — the RE-OBSERVATION lane (D4, Ross 2026-09-18), which walks the LEDGER instead of the
+ *             store's pages: the N oldest-observed ids whose last observation is older than
+ *             config.reobserveMinAgeMs are re-driven through the ABSOLUTE item url the ledger already
+ *             holds (the store's byId url where it has that axis, the listing's own item link where
+ *             it does not), so an exhausted store keeps a live price/availability series instead of
+ *             freezing on the day it was walked. It has its OWN per-store budget
+ *             (config.storeReobserveCaps, default 0 = off, so the fleet opts in per store) spent from
+ *             the SAME global gate, so neither lane can starve the other; it runs LAST, after every
+ *             discovery phase, so discovery keeps its budget priority unchanged. Stores take turns
+ *             one id at a time (round-robin), oldest first within a store. Its landings are
+ *             `reobserveLanded`, its OWN counter — never `enqueued` (which `capApplied` bounds), and
+ *             never the shared `reobserved`, which also carries the recent phase's window.
  *   BACKFILL — resume the store's durable page cursor and walk forward up to
  *             backfillPagesPerRun pages, enqueuing NEW ids only (never re-observing).
  *             The cursor advances ONLY when the page reported `hasMore: true` AND every
@@ -125,12 +137,41 @@ export interface CrawlerStoreSummary {
   known: number;
   /** Items lacking a collectUrl (cannot be enqueued). */
   uncollectable: number;
-  /** POSTs the scraper accepted (HTTP 202). */
+  /**
+   * POSTs the scraper accepted (HTTP 202) from the DISCOVERY phases — recent, backfill, id-range,
+   * seed. Bounded by `capApplied`, and deliberately so: the RE-OBSERVATION lane's accepted POSTs are
+   * counted in `reobserveLanded` and NEVER here, because a store summary reading
+   * `enqueued: 5, capApplied: 2` reads as a breached discovery cap to anyone scanning the fleet logs.
+   */
   enqueued: number;
-  /** Of `enqueued`, how many the queue coalesced onto a pending item. */
+  /** Of `enqueued`, how many the queue coalesced onto a pending item (discovery only — see `enqueued`). */
   deduplicated: number;
-  /** Of `enqueued`, how many were re-observations of known items (recent only). */
+  /**
+   * Re-observations of known items from BOTH mechanisms: the RECENT phase's `reobserveAfterMs` window
+   * (a known item that reappears on listing pages 1..N, which spends the DISCOVERY cap) and the
+   * re-observation lane. For the lane's own work — the number a live acceptance should read — use
+   * `reobserveLanded`.
+   */
   reobserved: number;
+  /** RE-OBSERVE: POSTs the LANE landed (the scraper accepted), never the recent phase's. */
+  reobserveLanded: number;
+  /** RE-OBSERVE: ids the lane SELECTED this run (what it would have driven — the dry run reports only this). */
+  reobserveSelected: number;
+  /** RE-OBSERVE: known ids passed over because their last observation (or their last refusal) is inside the min-age window. */
+  reobserveSkipped: number;
+  /** RE-OBSERVE: selected ids whose POST was refused (4xx, backed off) or failed transiently. */
+  reobserveFailed: number;
+  /**
+   * RE-OBSERVE: the ceiling the lane ACTUALLY ran under for this store — its
+   * CRAWLER_STORE_REOBSERVE_CAPS override, else the global one, and 0 whenever the lane could not
+   * touch the store at all. Deliberately not the CONFIGURED value: a store reading
+   * `reobserveCapApplied: 8` beside zero activity sends an operator looking for a broken lane instead
+   * of at whatever held the store back. The configured value is still reported once, at run level, in
+   * `reobserveCapOverrides`; `reobserveLaneSkipped` names the reason.
+   */
+  reobserveCapApplied: number;
+  /** RE-OBSERVE: why the lane did no work for this store, `null` when it considered the store. */
+  reobserveLaneSkipped: ReobserveSkipReason | null;
   /** The enqueue ceiling this store ran under: its CRAWLER_STORE_ENQUEUE_CAPS override, else the global cap. */
   capApplied: number;
   /** Failed catalog GETs, rejected/failed ingest POSTs, ledger failures. */
@@ -179,12 +220,19 @@ export interface CrawlerSummary {
   peakInFlight: number;
   totalPagesFetched: number;
   totalDiscovered: number;
+  /** Accepted DISCOVERY POSTs across every store this run (the lane's are in `totalReobserveLanded`). */
   totalEnqueued: number;
+  /** Re-observations across every store this run, from BOTH mechanisms — the recent phase's window AND the lane. */
+  totalReobserved: number;
+  /** RE-OBSERVE: POSTs the LANE landed across every store this run. */
+  totalReobserveLanded: number;
   totalRangeWalked: number;
   totalErrors: number;
   totalSkipped: number;
   /** The per-store enqueue caps that actually applied this run, keyed by siteId (a cap for a store not crawled is not listed). */
   enqueueCapOverrides: Record<string, number>;
+  /** The per-store RE-OBSERVE caps that actually applied this run, keyed by siteId. */
+  reobserveCapOverrides: Record<string, number>;
   stores: CrawlerStoreSummary[];
   startedAt: string;
   finishedAt: string;
@@ -206,6 +254,23 @@ type StopReason = 'budget' | 'cooldown' | 'unsupported' | 'failed';
  */
 export type SeedStopReason = StopReason | 'cap';
 
+/**
+ * Why the RE-OBSERVATION lane did no work for a store. `null` on the summary means the lane
+ * considered the store (it built a selection, which may still have been empty because every id was
+ * inside the min-age window).
+ */
+export type ReobserveSkipReason =
+  /** CRAWLER_MODE does not name `reobserve`: the lane did not run at all this pass. */
+  | 'mode-off'
+  /** The lane ran, but this store has no cap of its own and the global default is 0. */
+  | 'not-configured'
+  /** An explicit DISCOVERY cap of 0 pulled the store out of the whole run, this lane included. */
+  | 'store-out'
+  /** The store's ledger was corrupt or could not be loaded, so there is nothing to walk. */
+  | 'ledger'
+  /** The store was stopped before the lane — a cooling host, a sick scraper, a spent budget. */
+  | 'store-stopped';
+
 /** Why the id-range walk made no window request this run. */
 export type RangeSkipReason = StopReason | 'not-configured' | 'not-run' | 'store-stopped' | 'cap' | 'no-frontier' | 'floor' | 'window-malformed';
 
@@ -219,7 +284,7 @@ interface SeedListTarget {
 
 type PostOutcome = 'accepted' | 'accepted-dedup' | 'rejected' | 'transient' | 'budget';
 
-type Phase = 'recent' | 'backfill' | 'range' | 'seed';
+type Phase = 'recent' | 'backfill' | 'range' | 'seed' | 'reobserve';
 
 interface StoreState {
   siteId: string;
@@ -232,10 +297,14 @@ interface StoreState {
   attempted: Set<string>;
   /** POSTs dispatched this run (the per-store cap). */
   posts: number;
+  /** The RE-OBSERVATION lane's own ceiling for the run — SEPARATE from `enqueueCap`, so neither lane starves the other. */
+  reobserveCap: number;
   /** No further requests for this store this run (cooldown, unsupported, failure, budget, ledger failure). */
   stopped: boolean;
   /** The per-store enqueue cap blocked a POST this run. */
   capReached: boolean;
+  /** An explicit DISCOVERY cap of 0 pulled this store out of the whole run before any request. */
+  pulledOut: boolean;
   /**
    * The store's LISTING axis answered 422 (no byListing / no extractListing). That stops the listing
    * phases only — the id-range axis is a different axis on the same store and still runs. Every
@@ -352,9 +421,24 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
   const capFor = (siteId: string): number =>
     Object.prototype.hasOwnProperty.call(capOverrides, siteId) ? capOverrides[siteId] : config.maxEnqueuePerStore;
 
+  // The RE-OBSERVATION lane's budget, read exactly like the discovery cap but from its OWN vars. The
+  // global default is 0, so a store re-observes nothing until the fleet config opts it in by name —
+  // re-observation spends real requests at a gated store, where browser time is the scarcest resource.
+  const reobserveCapOverridesAll = config.storeReobserveCaps ?? {};
+  const reobserveCapFor = (siteId: string): number =>
+    Object.prototype.hasOwnProperty.call(reobserveCapOverridesAll, siteId) ? reobserveCapOverridesAll[siteId] : config.maxReobservePerStore;
+  const reobserveCapOverrides: Record<string, number> = {};
+  for (const siteId of stores) {
+    if (Object.prototype.hasOwnProperty.call(reobserveCapOverridesAll, siteId)) reobserveCapOverrides[siteId] = reobserveCapOverridesAll[siteId];
+  }
+  for (const siteId of Object.keys(reobserveCapOverridesAll)) {
+    if (!stores.includes(siteId)) logger.warn('[CRAWLER] CRAWLER_STORE_REOBSERVE_CAPS names a store that is not being crawled — ignored', { siteId });
+  }
+
   const states: StoreState[] = stores.map((siteId) => ({
     siteId,
     enqueueCap: capFor(siteId),
+    reobserveCap: reobserveCapFor(siteId),
     summary: {
       siteId,
       pagesFetched: 0,
@@ -367,6 +451,13 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       enqueued: 0,
       deduplicated: 0,
       reobserved: 0,
+      reobserveLanded: 0,
+      reobserveSelected: 0,
+      reobserveSkipped: 0,
+      reobserveFailed: 0,
+      // An APPLIED ceiling: 0 until the lane actually takes this store on (see reobservePhase).
+      reobserveCapApplied: 0,
+      reobserveLaneSkipped: config.phases.includes('reobserve') ? 'not-configured' : 'mode-off',
       capApplied: capFor(siteId),
       errors: 0,
       skipped: 0,
@@ -389,6 +480,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     // existing discovery-only meaning — pages are fetched, nothing is POSTed.
     stopped: Object.prototype.hasOwnProperty.call(capOverrides, siteId) && capOverrides[siteId] === 0,
     capReached: false,
+    pulledOut: Object.prototype.hasOwnProperty.call(capOverrides, siteId) && capOverrides[siteId] === 0,
     listingUnsupported: false,
     deepestRecentPage: 0,
   }));
@@ -427,10 +519,13 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       totalPagesFetched: perStore.reduce((n, s) => n + s.pagesFetched, 0),
       totalDiscovered: perStore.reduce((n, s) => n + s.discovered, 0),
       totalEnqueued: perStore.reduce((n, s) => n + s.enqueued, 0),
+      totalReobserved: perStore.reduce((n, s) => n + s.reobserved, 0),
+      totalReobserveLanded: perStore.reduce((n, s) => n + s.reobserveLanded, 0),
       totalRangeWalked: perStore.reduce((n, s) => n + s.rangeWalked, 0),
       totalErrors: perStore.reduce((n, s) => n + s.errors, 0),
       totalSkipped: perStore.reduce((n, s) => n + s.skipped, 0),
       enqueueCapOverrides,
+      reobserveCapOverrides,
       stores: perStore,
       startedAt: new Date(startedAtMs).toISOString(),
       finishedAt: new Date(finishedAtMs).toISOString(),
@@ -1121,6 +1216,213 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     if (!(await persist(st))) ledger.range = durable;
   };
 
+  /**
+   * RE-OBSERVATION LANE (D4, Ross 2026-09-18) — the answer to "an exhausted store is a store whose
+   * prices froze the day it was walked".
+   *
+   * Discovery asks the store what EXISTS; this lane asks what the things we already know COST NOW. It
+   * therefore walks the LEDGER, not the store's pages, and costs no catalog GET at all: each store's
+   * N oldest-observed ids are re-driven through the absolute item url the ledger already holds. That
+   * url is the store's byId url where the store declares that axis and the listing parser's own item
+   * link where it does not — which is the ONLY reason a store with no byId axis (hobby-genki, bbts,
+   * gkloot, akimomo, anitoys) can be re-priced by any mechanism we have.
+   *
+   * SEPARATE BUDGET, SHARED PACING. The lane spends config.storeReobserveCaps / maxReobservePerStore
+   * (default 0 — the fleet opts in per store), never the discovery cap, so a store whose discovery cap
+   * is spent still re-observes and a store whose re-observe cap is spent still discovers. Every POST
+   * still goes through the ONE global gate (concurrency, total request budget, dispatch spacing) and
+   * the scraper's per-host pacing, cooldowns and honesty gate downstream are untouched.
+   *
+   * FAIRNESS. Stores take turns ONE id at a time and the oldest observation goes first within a store,
+   * so a global budget that cannot cover every selection is split across the stores rather than spent
+   * entirely on whichever one happens to run first.
+   *
+   * THE LEDGER IS STAMPED ONCE PER STORE at the end of the lane, not per POST: the same trade the
+   * id-range axis already makes (a pod killed mid-lane re-drives those ids next run — duplicate POSTs
+   * the queue coalesces, never a lost or skipped id), and the reason it matters here is that a big
+   * store's ledger is a single large JSON document.
+   */
+  const reobservePhase = async (): Promise<void> => {
+    interface Lane {
+      st: StoreState;
+      queue: Array<{ itemId: string; collectUrl: string }>;
+      next: number;
+      changed: boolean;
+    }
+
+    const lanes: Lane[] = [];
+    for (const st of states) {
+      const skip = (reason: ReobserveSkipReason): void => {
+        st.summary.reobserveLaneSkipped = reason;
+        st.summary.reobserveCapApplied = 0;
+      };
+      // Reasons in the order that is most useful to read. A store nobody armed says so first, even if
+      // something else would also have held it back; after that, config beats circumstance.
+      if (st.reobserveCap <= 0) {
+        skip('not-configured');
+        continue;
+      }
+      if (st.pulledOut) {
+        skip('store-out');
+        continue;
+      }
+      // A store with no ledger is refused everywhere (a corrupt file or a failed load).
+      if (!st.ledger) {
+        skip('ledger');
+        continue;
+      }
+      // A 422 on the LISTING axis says nothing about this lane — the ledger needs no listing. Any
+      // other stop (cooldown, a sick scraper, a spent budget, a ledger failure) still holds: a host
+      // that is cooling must be left alone, whichever lane wants it.
+      if (st.stopped && !st.listingUnsupported) {
+        skip('store-stopped');
+        continue;
+      }
+      st.stopped = false;
+      // From here the lane HAS taken the store on: the ceiling it ran under is now a fact.
+      st.summary.reobserveCapApplied = st.reobserveCap;
+      st.summary.reobserveLaneSkipped = null;
+
+      const ledger = st.ledger;
+      const eligible: Array<{ itemId: string; collectUrl: string; age: number }> = [];
+      for (const [itemId, entry] of Object.entries(ledger.enqueued)) {
+        // Never the same id twice in one run: discovery may already have driven this one.
+        if (st.attempted.has(itemId)) continue;
+        const collectUrl = entry && typeof entry.collectUrl === 'string' ? entry.collectUrl : '';
+        if (!collectUrl) {
+          // No url to re-drive. Counted where a missing collect url is already counted, not silently dropped.
+          st.summary.uncollectable++;
+          continue;
+        }
+        const age = ageMs(entry.at);
+        if (age < config.reobserveMinAgeMs) {
+          st.summary.reobserveSkipped++;
+          continue;
+        }
+        // BACKOFF. An id whose last re-observation was deterministically refused keeps its old
+        // observation time (nothing was observed), so it would otherwise sit at the head of the
+        // oldest-first queue every run and starve the rest of the store behind a url that cannot work.
+        // One min-age window of quiet is enough to keep the queue moving and still retry it.
+        if (entry.reobserveFailedAt !== undefined && ageMs(entry.reobserveFailedAt) < config.reobserveMinAgeMs) {
+          st.summary.reobserveSkipped++;
+          continue;
+        }
+        eligible.push({ itemId, collectUrl, age });
+      }
+      // Oldest first; ties by itemId — ledger keys are unique, so there is no third case.
+      eligible.sort((a, b) => (b.age === a.age ? (a.itemId < b.itemId ? -1 : 1) : b.age - a.age));
+      const queue = eligible.slice(0, st.reobserveCap).map(({ itemId, collectUrl }) => ({ itemId, collectUrl }));
+      st.summary.reobserveSelected = queue.length;
+      logger.info('[CRAWLER] reobserve selection', {
+        siteId: st.siteId,
+        cap: st.reobserveCap,
+        known: Object.keys(ledger.enqueued).length,
+        eligible: eligible.length,
+        selected: queue.length,
+        skipped: st.summary.reobserveSkipped,
+        minAgeH: config.reobserveMinAgeMs / 3_600_000,
+      });
+      if (queue.length > 0) lanes.push({ st, queue, next: 0, changed: false });
+    }
+
+    if (lanes.length === 0) return;
+
+    if (config.reobserveDryRun) {
+      // The selection, and not one request: what the lane WOULD drive, for an operator arming a store.
+      for (const lane of lanes) {
+        const shown = lane.queue.slice(0, 50).map((q) => q.itemId);
+        logger.info('[CRAWLER] reobserve DRY RUN — selection not enqueued', {
+          siteId: lane.st.siteId,
+          count: lane.queue.length,
+          itemIds: shown,
+          ...(lane.queue.length > shown.length ? { truncated: true } : {}),
+        });
+      }
+      return;
+    }
+
+    // ROUND-ROBIN: one id per store per turn, until every queue is spent or the run stops.
+    let budgetStop = false;
+    let progress = true;
+    while (progress && !budgetStop) {
+      progress = false;
+      for (const lane of lanes) {
+        const st = lane.st;
+        // No cap check here: the queue was SLICED to the store's cap at selection, so the cap is
+        // enforced once, in the one place that can also report what it held back.
+        if (lane.next >= lane.queue.length || st.stopped) continue;
+        const { itemId, collectUrl } = lane.queue[lane.next++];
+        progress = true;
+        st.attempted.add(itemId);
+        const outcome = await postOne(st, collectUrl, itemId);
+        const entry = st.ledger!.enqueued[itemId];
+        switch (outcome) {
+          case 'accepted':
+          case 'accepted-dedup':
+            // The observation time IS the ledger's ordering key: stamping it sends the id to the back
+            // of the oldest-first queue, which is what makes the lane rotate through a catalog.
+            entry.at = iso();
+            delete entry.reobserveFailedAt;
+            delete entry.reobserveFailures;
+            // The lane's landing is the lane's OWN number. `enqueued` and `deduplicated` stay the
+            // DISCOVERY phases' counters — `enqueued` is what `capApplied` bounds — while `reobserved`
+            // remains what it has always been: re-observations from both mechanisms. A coalesced
+            // re-observation still landed, so it counts here and nowhere else.
+            st.summary.reobserveLanded++;
+            st.summary.reobserved++;
+            lane.changed = true;
+            break;
+          case 'rejected':
+            // Deterministic refusal of THIS url (postOne already filed the E10 row). `at` is left
+            // alone — nothing was observed — and the refusal is recorded so the backoff can see it.
+            entry.reobserveFailedAt = iso();
+            entry.reobserveFailures = (entry.reobserveFailures ?? 0) + 1;
+            st.summary.errors++;
+            st.summary.reobserveFailed++;
+            lane.changed = true;
+            break;
+          case 'transient':
+            // OUR scraper is unwell, not this url: count it, stop the store for the run, and record
+            // NOTHING durable — backing the id off here would punish it for our own outage.
+            st.summary.errors++;
+            st.summary.reobserveFailed++;
+            st.stopped = true;
+            break;
+          case 'budget':
+            // Not dispatched: undo the bookkeeping and end the lane — the gate is global, so every
+            // other store is equally out of budget.
+            st.attempted.delete(itemId);
+            budgetExhausted = true;
+            budgetStop = true;
+            break;
+        }
+        if (budgetStop) break;
+      }
+    }
+
+    for (const lane of lanes) {
+      if (lane.changed) await persist(lane.st);
+    }
+    logger.info('[CRAWLER] reobserve lane complete', {
+      perStore: Object.fromEntries(
+        lanes.map((lane) => [
+          lane.st.siteId,
+          {
+            cap: lane.st.reobserveCap,
+            selected: lane.st.summary.reobserveSelected,
+            // `landed`, not `reobserved`: the latter also carries the recent phase's window, so a lane
+            // printing it would claim work it did not do — on exactly the stores where that window
+            // fires today (jfigure).
+            landed: lane.st.summary.reobserveLanded,
+            failed: lane.st.summary.reobserveFailed,
+            skipped: lane.st.summary.reobserveSkipped,
+          },
+        ]),
+      ),
+      total: lanes.reduce((n, lane) => n + lane.st.summary.reobserveLanded, 0),
+    });
+  };
+
   // --- run --------------------------------------------------------------------------------------
 
   await Promise.all(states.map((st) => loadLedger(st)));
@@ -1128,7 +1430,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
   // `seed` is an EXCLUSIVE mode, not a fourth phase: its justification is the bounded, declared cost
   // of a small set of pages, and running it alongside an unbounded walk would hide that cost inside
   // the walk's. The listing and id-range phases are therefore untouched by it, in both directions.
-  if (config.mode === 'seed') {
+  if (config.phases.includes('seed')) {
     await Promise.all(states.map((st) => seedPhase(st)));
     const summary = summarize();
     logger.info('[CRAWLER] seed pass complete', summary as unknown as Record<string, unknown>);
@@ -1138,14 +1440,19 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     return summary;
   }
 
-  if (config.mode !== 'backfill') {
+  if (config.phases.includes('recent')) {
     await Promise.all(states.map((st) => recentPhase(st)));
   }
-  if (config.mode !== 'recent') {
+  if (config.phases.includes('backfill')) {
     await Promise.all(states.map((st) => backfillPhase(st)));
-    // The id-range walk goes LAST: the newest ids (listing) always outrank the deep id space for the
-    // run's budget, and a store may serve this axis while serving no listing at all.
+    // The id-range walk goes LAST of the discovery phases: the newest ids (listing) always outrank the
+    // deep id space for the run's budget, and a store may serve this axis while serving no listing at all.
     await Promise.all(states.map((st) => rangePhase(st)));
+  }
+  // The RE-OBSERVATION lane runs after EVERY discovery phase, on its own per-store budget: discovery's
+  // priority over the global request budget is therefore exactly what it was before this lane existed.
+  if (config.phases.includes('reobserve')) {
+    await reobservePhase();
   }
 
   const summary = summarize();

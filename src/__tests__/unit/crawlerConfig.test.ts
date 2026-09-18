@@ -35,13 +35,13 @@ describe('loadCrawlerConfig', () => {
     expect(loadCrawlerConfig({ CRAWLER_SEED_SPACING_MS: '-5' }).seedSpacingMs).toBe(10000);
   });
 
-  it('accepts recent / backfill / seed modes, defaulting anything else to both', () => {
+  it('accepts recent / backfill / seed modes; an ABSENT or empty value is both, an unknown one is fatal', () => {
     expect(loadCrawlerConfig({ CRAWLER_MODE: 'recent' }).mode).toBe('recent');
     expect(loadCrawlerConfig({ CRAWLER_MODE: 'backfill' }).mode).toBe('backfill');
     expect(loadCrawlerConfig({ CRAWLER_MODE: 'seed' }).mode).toBe('seed');
     expect(loadCrawlerConfig({ CRAWLER_MODE: 'both' }).mode).toBe('both');
-    expect(loadCrawlerConfig({ CRAWLER_MODE: 'whatever' }).mode).toBe('both');
     expect(loadCrawlerConfig({ CRAWLER_MODE: '' }).mode).toBe('both');
+    expect(() => loadCrawlerConfig({ CRAWLER_MODE: 'whatever' })).toThrow(/whatever/);
   });
 
   it('parses csv stores, trimming blanks and whitespace', () => {
@@ -190,6 +190,131 @@ describe('loadCrawlerConfig', () => {
       // At or below the ceiling nothing is clamped and nothing is warned.
       expect(loadCrawlerConfig({ CRAWLER_RANGE_IDS_PER_RUN: '200' }).rangeIdsPerRun).toBe(200);
       expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+/**
+ * RE-OBSERVATION LANE (D4). `CRAWLER_MODE` grows from a single token into a SUBSET of the phases,
+ * and the lane carries its own budget so it can never spend discovery's.
+ */
+describe('loadCrawlerConfig — the re-observation lane', () => {
+  it('defaults: mode both = the two discovery phases, and the lane is OFF for every store', () => {
+    const c = loadCrawlerConfig({});
+    expect(c.mode).toBe('both');
+    expect(c.phases).toEqual(['recent', 'backfill']);
+    expect(c.maxReobservePerStore).toBe(0);
+    expect(c.storeReobserveCaps).toEqual({});
+    expect(c.reobserveMinAgeMs).toBe(12 * 60 * 60 * 1000);
+    expect(c.reobserveDryRun).toBe(false);
+  });
+
+  it('keeps every legacy CRAWLER_MODE token meaning exactly what it meant', () => {
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'recent' }).phases).toEqual(['recent']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'backfill' }).phases).toEqual(['backfill']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'both' }).phases).toEqual(['recent', 'backfill']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'seed' }).phases).toEqual(['seed']);
+  });
+
+  it('CRAWLER_MODE may name any subset, in any order, deduplicated into canonical order', () => {
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'reobserve' }).phases).toEqual(['reobserve']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'reobserve' }).mode).toBe('reobserve');
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'both,reobserve' }).phases).toEqual(['recent', 'backfill', 'reobserve']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'both,reobserve' }).mode).toBe('recent,backfill,reobserve');
+    expect(loadCrawlerConfig({ CRAWLER_MODE: ' reobserve , recent ' }).phases).toEqual(['recent', 'reobserve']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'reobserve,reobserve' }).phases).toEqual(['reobserve']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'recent,backfill' }).mode).toBe('both');
+  });
+
+  it('FAILS on an unrecognised token, naming the token and the accepted grammar — never a silent discovery-only run', () => {
+    // A typo used to WARN and then run discovery-only, so `both,reobserv` armed nothing and the only
+    // trace was one line in an hourly log. The var's grammar grew a csv in this change, which is
+    // exactly when fail-closed is cheap: an unknown token is now fatal at config time.
+    for (const bad of ['reobserv', 'both,reobserv', 'nonsense,rubbish', 'reobserve;both', 'both reobserve', 'BOTH', 'Reobserve']) {
+      expect(() => loadCrawlerConfig({ CRAWLER_MODE: bad })).toThrow(/CRAWLER_MODE/);
+    }
+    // the message names the offending token AND what is accepted, so the fix needs no source dive
+    try {
+      loadCrawlerConfig({ CRAWLER_MODE: 'both,reobserv' });
+      throw new Error('expected a throw');
+    } catch (error) {
+      const message = (error as Error).message;
+      expect(message).toContain('reobserv');
+      expect(message).toContain('recent');
+      expect(message).toContain('backfill');
+      expect(message).toContain('reobserve');
+      expect(message).toContain('seed');
+      expect(message).toContain('both');
+    }
+  });
+
+  it('never dies on an EMPTY or absent value: an unset variable must not crash-loop the CronJob', () => {
+    // A CronJob whose env var is blank (or templated away) must still run the default pass. Only a
+    // value that says something we cannot honour is fatal.
+    expect(loadCrawlerConfig({}).phases).toEqual(['recent', 'backfill']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: '' }).phases).toEqual(['recent', 'backfill']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: '   ' }).phases).toEqual(['recent', 'backfill']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: ',,,' }).phases).toEqual(['recent', 'backfill']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: ' , both , ' }).phases).toEqual(['recent', 'backfill']);
+  });
+
+  it('tolerates duplicates and whitespace, which are not typos', () => {
+    expect(loadCrawlerConfig({ CRAWLER_MODE: ' both , reobserve , reobserve ' }).phases).toEqual(['recent', 'backfill', 'reobserve']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'both,both' }).phases).toEqual(['recent', 'backfill']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'reobserve,both' }).phases).toEqual(['recent', 'backfill', 'reobserve']);
+  });
+
+  it('keeps `seed` EXCLUSIVE: named with other phases it is dropped with a WARN, and the rest still run', () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      expect(loadCrawlerConfig({ CRAWLER_MODE: 'seed,reobserve' }).phases).toEqual(['reobserve']);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('seed'))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('CRAWLER_REOBSERVE_MIN_AGE_H is hours → ms, honours an explicit 0, and ignores junk', () => {
+    expect(loadCrawlerConfig({ CRAWLER_REOBSERVE_MIN_AGE_H: '6' }).reobserveMinAgeMs).toBe(6 * 60 * 60 * 1000);
+    expect(loadCrawlerConfig({ CRAWLER_REOBSERVE_MIN_AGE_H: '0' }).reobserveMinAgeMs).toBe(0);
+    expect(loadCrawlerConfig({ CRAWLER_REOBSERVE_MIN_AGE_H: 'x' }).reobserveMinAgeMs).toBe(12 * 60 * 60 * 1000);
+    expect(loadCrawlerConfig({ CRAWLER_REOBSERVE_MIN_AGE_H: '-3' }).reobserveMinAgeMs).toBe(12 * 60 * 60 * 1000);
+  });
+
+  it('parses CRAWLER_STORE_REOBSERVE_CAPS exactly like the enqueue caps, warning on a malformed entry', () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      const c = loadCrawlerConfig({ CRAWLER_STORE_REOBSERVE_CAPS: ' goodsmileus:50 , bbts:20 ,anitoys:0, nope ' });
+      expect(c.storeReobserveCaps).toEqual({ goodsmileus: 50, bbts: 20, anitoys: 0 });
+      expect(warn.mock.calls.some((call) => String(call[0]).includes('CRAWLER_STORE_REOBSERVE_CAPS'))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('CRAWLER_MAX_REOBSERVE_PER_STORE is the global default for the lane and stays 0 (off) unless set', () => {
+    expect(loadCrawlerConfig({ CRAWLER_MAX_REOBSERVE_PER_STORE: '25' }).maxReobservePerStore).toBe(25);
+    expect(loadCrawlerConfig({ CRAWLER_MAX_REOBSERVE_PER_STORE: '0' }).maxReobservePerStore).toBe(0);
+    expect(loadCrawlerConfig({ CRAWLER_MAX_REOBSERVE_PER_STORE: 'junk' }).maxReobservePerStore).toBe(0);
+  });
+
+  it('a `--dry-run` argv arms the same dry run as the env var (the CronJob operator has both)', () => {
+    expect(loadCrawlerConfig({}, ['node', 'run.js', '--dry-run']).reobserveDryRun).toBe(true);
+    expect(loadCrawlerConfig({}, ['node', 'run.js']).reobserveDryRun).toBe(false);
+    expect(loadCrawlerConfig({}, ['node', 'run.js', '--dry-run=please']).reobserveDryRun).toBe(false);
+  });
+
+  it('CRAWLER_REOBSERVE_DRY_RUN arms the dry run; CRAWLER_DRY_RUN is an alias that WARNs it covers this lane only', () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      expect(loadCrawlerConfig({ CRAWLER_REOBSERVE_DRY_RUN: '1' }).reobserveDryRun).toBe(true);
+      expect(loadCrawlerConfig({ CRAWLER_REOBSERVE_DRY_RUN: 'true' }).reobserveDryRun).toBe(true);
+      expect(loadCrawlerConfig({ CRAWLER_REOBSERVE_DRY_RUN: '0' }).reobserveDryRun).toBe(false);
+      expect(warn).not.toHaveBeenCalled();
+      expect(loadCrawlerConfig({ CRAWLER_DRY_RUN: '1' }).reobserveDryRun).toBe(true);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('CRAWLER_DRY_RUN'))).toBe(true);
     } finally {
       warn.mockRestore();
     }

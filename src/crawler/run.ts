@@ -1,10 +1,11 @@
 /**
  * Entrypoint for the catalog crawler: `node dist/crawler/run.js`.
  *
- * One invocation performs ONE bounded pass (recent THEN backfill THEN the id-range walk, by default) and
- * exits — recurrence is the K8s CronJob's schedule, and stop = the CronJob's
- * `suspend: true`. This is wiring only; all logic (and its tests) live in
- * ./config, ./ledger and ./crawler. It does NOT touch the server's default CMD
+ * One invocation performs ONE bounded pass (recent THEN backfill THEN the id-range walk, by default)
+ * and exits — recurrence is the K8s CronJob's schedule, and stop = the CronJob's `suspend: true`.
+ * CRAWLER_MODE may name any subset of the phases (`both,reobserve`); `--dry-run` prints the
+ * re-observation lane's selection without enqueuing it. This is wiring only; all logic (and its
+ * tests) live in ./config, ./ledger and ./crawler. It does NOT touch the server's default CMD
  * (node dist/index.js).
  */
 import dotenv from 'dotenv';
@@ -23,6 +24,7 @@ async function main(): Promise<void> {
   logger.info('[CRAWLER] pass starting', {
     scraperServiceUrl: config.scraperServiceUrl,
     mode: config.mode,
+    phases: config.phases,
     stores: config.stores,
     ledgerDir: config.ledgerDir,
     recentMaxPages: config.recentMaxPages,
@@ -38,6 +40,10 @@ async function main(): Promise<void> {
     rangeStores: config.rangeStores,
     rangeIdsPerRun: config.rangeIdsPerRun,
     rangeFrontiers: config.rangeFrontiers,
+    reobserveMinAgeH: config.reobserveMinAgeMs / 3_600_000,
+    maxReobservePerStore: config.maxReobservePerStore,
+    storeReobserveCaps: config.storeReobserveCaps,
+    reobserveDryRun: config.reobserveDryRun,
   });
   // The durable fetch-failure ledger (INGEST_BASE_URL + REPORT_FETCH_FAILURES). Null = off, and
   // every emit point in the pass is a no-op.
