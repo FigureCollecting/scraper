@@ -261,8 +261,12 @@ describe('runCrawlerPass — re-observation: the ledger stamp', () => {
     const c = clock();
     const s = await runCrawlerPass(mkCfg({ storeReobserveCaps: { goodsmileus: 5 } }), { fetch: fake.fetch, ledgerStore: store, now: c.now });
     const st = storeSummary(s, 'goodsmileus');
+    expect(st.reobserveLanded).toBe(1);
     expect(st.reobserved).toBe(1);
-    expect(st.deduplicated).toBe(1);
+    // `deduplicated` is "of `enqueued`", and the lane never enqueues: a coalesced re-observation
+    // counts as landed and nowhere else, so neither discovery counter can be read as breached.
+    expect(st.enqueued).toBe(0);
+    expect(st.deduplicated).toBe(0);
     expect(store.files.get('goodsmileus')!.enqueued.a.at).toBe(iso(T0));
   });
 
@@ -329,15 +333,26 @@ describe('runCrawlerPass — re-observation: the ledger stamp', () => {
 });
 
 describe('runCrawlerPass — re-observation: budgets', () => {
-  it('is OFF unless a cap opts the store in — no cap means no request at all', async () => {
-    const fake = makeFake();
-    const store = createMemoryLedgerStore({ goodsmileus: ledgerAged('goodsmileus', { a: 90, b: 80 }) });
+  it('is OFF unless a cap opts the store in — no cap means no request at all, the same ledger WITH a cap means two', async () => {
+    const seed = (): Record<string, Ledger> => ({ goodsmileus: ledgerAged('goodsmileus', { a: 90, b: 80 }) });
+    const off = makeFake();
     const c = clock();
-    const s = await runCrawlerPass(mkCfg({}), { fetch: fake.fetch, ledgerStore: store, now: c.now });
-    expect(fake.calls).toEqual([]);
+    const s = await runCrawlerPass(mkCfg({}), { fetch: off.fetch, ledgerStore: createMemoryLedgerStore(seed()), now: c.now });
+    expect(off.calls).toEqual([]);
     const st = storeSummary(s, 'goodsmileus');
-    expect(st.reobserved).toBe(0);
+    expect(st.reobserveLanded).toBe(0);
     expect(st.reobserveCapApplied).toBe(0);
+
+    // POSITIVE CONTROL, same ledger and same clock: without it this test passes just as happily
+    // when the lane does not exist at all, and proves nothing about the cap.
+    const on = makeFake();
+    const s2 = await runCrawlerPass(mkCfg({ storeReobserveCaps: { goodsmileus: 2 } }), {
+      fetch: on.fetch,
+      ledgerStore: createMemoryLedgerStore(seed()),
+      now: c.now,
+    });
+    expect(on.posted()).toEqual([byIdUrl('goodsmileus', 'a'), byIdUrl('goodsmileus', 'b')]);
+    expect(storeSummary(s2, 'goodsmileus').reobserveLanded).toBe(2);
   });
 
   it('WARNs about a re-observe cap naming a store that is not being crawled (a typo must not read as a throttle)', async () => {
@@ -406,8 +421,9 @@ describe('runCrawlerPass — re-observation: budgets', () => {
       { fetch: fake.fetch, ledgerStore: store, now: c.now },
     );
     const st = storeSummary(s, 'goodsmileus');
-    expect(st.enqueued).toBe(2); // n1 (discovery) + old (re-observation)
-    expect(st.reobserved).toBe(1);
+    expect(st.enqueued).toBe(1); // n1 — DISCOVERY only, and its cap is 1
+    expect(st.enqueued).toBeLessThanOrEqual(st.capApplied);
+    expect(st.reobserveLanded).toBe(1); // `old` — the lane's own, on the lane's own budget
     expect(fake.posted()).toEqual([byIdUrl('goodsmileus', 'n1'), byIdUrl('goodsmileus', 'old')]);
   });
 
@@ -435,8 +451,8 @@ describe('runCrawlerPass — re-observation: budgets', () => {
       { fetch: fake.fetch, ledgerStore: store, now: c.now },
     );
     const st = storeSummary(s, 'goodsmileus');
-    expect(st.enqueued).toBe(3); // n1 + n2 (discovery) + o1 (the one re-observation the cap allowed)
-    expect(st.reobserved).toBe(1);
+    expect(st.enqueued).toBe(2); // n1 + n2 — DISCOVERY only
+    expect(st.reobserveLanded).toBe(1); // o1 — the one re-observation the lane's cap allowed
     expect(st.reobserveSelected).toBe(1);
   });
 
@@ -650,5 +666,194 @@ describe('runCrawlerPass — re-observation: determinism and odd ledgers', () =>
     } finally {
       info.mockRestore();
     }
+  });
+});
+
+/**
+ * WHOSE NUMBER IS IT. Two mechanisms re-observe: the RECENT phase's `reobserveAfterMs` window, which
+ * re-POSTs a known item that reappears on listing pages 1..N and spends the DISCOVERY cap, and this
+ * lane. They must not be credited to each other — jfigure is simultaneously the one store where the
+ * recent-phase window fires today and a store on the proposed cap list, so the first live acceptance
+ * read ("did the lane land anything?") is exactly where a shared counter would lie.
+ */
+describe('runCrawlerPass — re-observation: the lane reports only what the LANE did', () => {
+  const jfigurePass = async (fake: ReturnType<typeof makeFake>, store: ReturnType<typeof createMemoryLedgerStore>, now: () => number) =>
+    runCrawlerPass(
+      mkCfg({
+        mode: 'recent,reobserve',
+        phases: ['recent', 'reobserve'],
+        stores: ['jfigure'],
+        recentMaxPages: 1,
+        reobserveAfterMs: 7 * 24 * HOUR_MS, // the legacy window, as the fleet runs it
+        storeReobserveCaps: { jfigure: 2 },
+      }),
+      { fetch: fake.fetch, ledgerStore: store, now },
+    );
+
+  /** Page 1 carries p1/p2 (known, past the legacy window); d1/d2 are deep ledger ids on no page. */
+  const jfigureFake = () =>
+    makeFake({
+      catalog: (siteId, page) => ({
+        status: 200,
+        body: {
+          siteId,
+          page,
+          items: [
+            { itemId: 'p1', collectUrl: byIdUrl(siteId, 'p1') },
+            { itemId: 'p2', collectUrl: byIdUrl(siteId, 'p2') },
+          ],
+          collectUrls: [],
+          hasMore: false,
+          count: 2,
+        },
+      }),
+    });
+
+  it('does not credit the recent phase’s window to the lane: reobserved counts both, reobserveLanded counts the lane', async () => {
+    const fake = jfigureFake();
+    const store = createMemoryLedgerStore({ jfigure: ledgerAged('jfigure', { p1: 200, p2: 200, d1: 300, d2: 290 }) });
+    const c = clock();
+    const s = await jfigurePass(fake, store, c.now);
+
+    expect(fake.posted()).toEqual([
+      byIdUrl('jfigure', 'p1'), // recent phase, legacy window
+      byIdUrl('jfigure', 'p2'), // recent phase, legacy window
+      byIdUrl('jfigure', 'd1'), // the lane, oldest first
+      byIdUrl('jfigure', 'd2'),
+    ]);
+    const st = storeSummary(s, 'jfigure');
+    expect(st.reobserveLanded).toBe(2); // the LANE's own work — the acceptance number
+    expect(st.reobserved).toBe(4); // both mechanisms, which is what this field has always meant
+    expect(st.enqueued).toBe(2); // the recent phase's two, which DID spend the discovery cap
+    expect(s.totalReobserveLanded).toBe(2);
+  });
+
+  it('the lane’s completion log states the lane’s landings, not the shared total', async () => {
+    const info = jest.spyOn(logger, 'info').mockImplementation(() => undefined);
+    try {
+      const fake = jfigureFake();
+      const store = createMemoryLedgerStore({ jfigure: ledgerAged('jfigure', { p1: 200, p2: 200, d1: 300, d2: 290 }) });
+      const c = clock();
+      await jfigurePass(fake, store, c.now);
+      const line = info.mock.calls.find((call) => String(call[0]).includes('reobserve lane complete'))![1] as {
+        total: number;
+        perStore: Record<string, { landed: number }>;
+      };
+      expect(line.total).toBe(2);
+      expect(line.perStore.jfigure.landed).toBe(2);
+    } finally {
+      info.mockRestore();
+    }
+  });
+
+  it('never reports `enqueued` past `capApplied`: the lane’s landings are not discovery enqueues', async () => {
+    const fake = makeFake({ catalog: (siteId, page) => ({
+      status: 200,
+      body: {
+        siteId,
+        page,
+        items: [
+          { itemId: 'n1', collectUrl: byIdUrl(siteId, 'n1') },
+          { itemId: 'n2', collectUrl: byIdUrl(siteId, 'n2') },
+          { itemId: 'n3', collectUrl: byIdUrl(siteId, 'n3') },
+        ],
+        collectUrls: [],
+        hasMore: false,
+        count: 3,
+      },
+    }) });
+    const store = createMemoryLedgerStore({ goodsmileus: ledgerAged('goodsmileus', { o1: 90, o2: 80, o3: 70 }) });
+    const c = clock();
+    const s = await runCrawlerPass(
+      mkCfg({
+        mode: 'recent,reobserve',
+        phases: ['recent', 'reobserve'],
+        storeEnqueueCaps: { goodsmileus: 2 },
+        storeReobserveCaps: { goodsmileus: 3 },
+      }),
+      { fetch: fake.fetch, ledgerStore: store, now: c.now },
+    );
+    const st = storeSummary(s, 'goodsmileus');
+    expect(st.capApplied).toBe(2);
+    expect(st.enqueued).toBe(2); // NOT 5 — a fleet log reading `enqueued: 5, capApplied: 2` reads as a breached cap
+    expect(st.reobserveLanded).toBe(3);
+    expect(s.totalEnqueued).toBe(2);
+    expect(s.totalReobserveLanded).toBe(3);
+  });
+});
+
+/**
+ * The three mutants that survived the first round's suite. The CODE was already right in all three;
+ * these are the tests that were missing, so a future edit cannot quietly break them.
+ */
+describe('runCrawlerPass — re-observation: the guards that had no test', () => {
+  it('does not repeat a url discovery was REFUSED for, in the same run (a rejection leaves `at` unstamped, so only the dedup guard stands)', async () => {
+    // An ACCEPTED discovery POST stamps `at`, so the min-age filter would mask the guard. A 4xx does
+    // NOT stamp it: `st.attempted` is then the only thing between the store and a second POST of a
+    // url it just refused.
+    const fake = makeFake({
+      catalog: (siteId, page) => ({
+        status: 200,
+        body: {
+          siteId,
+          page,
+          items: [{ itemId: 'bad', collectUrl: byIdUrl(siteId, 'bad') }],
+          collectUrls: [],
+          hasMore: false,
+          count: 1,
+        },
+      }),
+      ingest: (url) => (url.endsWith('/bad') ? refused() : accepted()),
+    });
+    const store = createMemoryLedgerStore({ goodsmileus: ledgerAged('goodsmileus', { bad: 300, other: 200 }) });
+    const c = clock();
+    const s = await runCrawlerPass(
+      mkCfg({
+        mode: 'recent,reobserve',
+        phases: ['recent', 'reobserve'],
+        recentMaxPages: 1,
+        reobserveAfterMs: HOUR_MS, // the recent phase re-drives `bad` and is refused
+        storeReobserveCaps: { goodsmileus: 5 },
+      }),
+      { fetch: fake.fetch, ledgerStore: store, now: c.now },
+    );
+    expect(fake.posted().filter((u) => u.endsWith('/bad'))).toHaveLength(1);
+    expect(fake.posted()).toEqual([byIdUrl('goodsmileus', 'bad'), byIdUrl('goodsmileus', 'other')]);
+    expect(storeSummary(s, 'goodsmileus').reobserveLanded).toBe(1); // `other` only
+  });
+
+  it('CRAWLER_MODE is the second safety key: caps alone never arm the lane', async () => {
+    const fake = makeFake({ catalog: (siteId, page) => ({
+      status: 200,
+      body: { siteId, page, items: [], collectUrls: [], hasMore: false, count: 0 },
+    }) });
+    const store = createMemoryLedgerStore({ goodsmileus: ledgerAged('goodsmileus', { a: 99, b: 98, d: 97 }) });
+    const c = clock();
+    // Exactly the live manifest's mode, with the caps already applied — the deployment is a TWO-key
+    // change, and this is the key the first round left untested.
+    const s = await runCrawlerPass(
+      mkCfg({ mode: 'both', phases: ['recent', 'backfill'], storeReobserveCaps: { goodsmileus: 5 } }),
+      { fetch: fake.fetch, ledgerStore: store, now: c.now },
+    );
+    expect(fake.posted()).toEqual([]);
+    const st = storeSummary(s, 'goodsmileus');
+    expect(st.reobserveSelected).toBe(0);
+    expect(st.reobserveLanded).toBe(0);
+  });
+
+  it('a per-store cap SMALLER than the global default wins at the slice', async () => {
+    const ages: Record<string, number> = {};
+    for (let i = 0; i < 10; i++) ages[`o${i}`] = 90 + i;
+    const fake = makeFake();
+    const store = createMemoryLedgerStore({ goodsmileus: ledgerAged('goodsmileus', ages) });
+    const c = clock();
+    const s = await runCrawlerPass(mkCfg({ maxReobservePerStore: 20, storeReobserveCaps: { goodsmileus: 3 } }), {
+      fetch: fake.fetch,
+      ledgerStore: store,
+      now: c.now,
+    });
+    expect(storeSummary(s, 'goodsmileus').reobserveCapApplied).toBe(3);
+    expect(fake.posted()).toHaveLength(3); // not 10 (every eligible id), not 20 (the global default)
+    expect(storeSummary(s, 'goodsmileus').reobserveLanded).toBe(3);
   });
 });
