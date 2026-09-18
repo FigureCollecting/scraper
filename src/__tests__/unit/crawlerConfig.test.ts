@@ -35,13 +35,13 @@ describe('loadCrawlerConfig', () => {
     expect(loadCrawlerConfig({ CRAWLER_SEED_SPACING_MS: '-5' }).seedSpacingMs).toBe(10000);
   });
 
-  it('accepts recent / backfill / seed modes, defaulting anything else to both', () => {
+  it('accepts recent / backfill / seed modes; an ABSENT or empty value is both, an unknown one is fatal', () => {
     expect(loadCrawlerConfig({ CRAWLER_MODE: 'recent' }).mode).toBe('recent');
     expect(loadCrawlerConfig({ CRAWLER_MODE: 'backfill' }).mode).toBe('backfill');
     expect(loadCrawlerConfig({ CRAWLER_MODE: 'seed' }).mode).toBe('seed');
     expect(loadCrawlerConfig({ CRAWLER_MODE: 'both' }).mode).toBe('both');
-    expect(loadCrawlerConfig({ CRAWLER_MODE: 'whatever' }).mode).toBe('both');
     expect(loadCrawlerConfig({ CRAWLER_MODE: '' }).mode).toBe('both');
+    expect(() => loadCrawlerConfig({ CRAWLER_MODE: 'whatever' })).toThrow(/whatever/);
   });
 
   it('parses csv stores, trimming blanks and whitespace', () => {
@@ -216,7 +216,6 @@ describe('loadCrawlerConfig — the re-observation lane', () => {
     expect(loadCrawlerConfig({ CRAWLER_MODE: 'backfill' }).phases).toEqual(['backfill']);
     expect(loadCrawlerConfig({ CRAWLER_MODE: 'both' }).phases).toEqual(['recent', 'backfill']);
     expect(loadCrawlerConfig({ CRAWLER_MODE: 'seed' }).phases).toEqual(['seed']);
-    expect(loadCrawlerConfig({ CRAWLER_MODE: 'whatever' }).phases).toEqual(['recent', 'backfill']);
   });
 
   it('CRAWLER_MODE may name any subset, in any order, deduplicated into canonical order', () => {
@@ -229,17 +228,42 @@ describe('loadCrawlerConfig — the re-observation lane', () => {
     expect(loadCrawlerConfig({ CRAWLER_MODE: 'recent,backfill' }).mode).toBe('both');
   });
 
-  it('drops an unknown token from a subset with a WARN, and falls back to both when NOTHING is recognised', () => {
-    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
-    try {
-      expect(loadCrawlerConfig({ CRAWLER_MODE: 'reobserve,nonsense' }).phases).toEqual(['reobserve']);
-      expect(warn.mock.calls.some((c) => String(c[0]).includes('CRAWLER_MODE'))).toBe(true);
-      warn.mockClear();
-      expect(loadCrawlerConfig({ CRAWLER_MODE: 'nonsense,rubbish' }).phases).toEqual(['recent', 'backfill']);
-      expect(warn.mock.calls.some((c) => String(c[0]).includes('CRAWLER_MODE'))).toBe(true);
-    } finally {
-      warn.mockRestore();
+  it('FAILS on an unrecognised token, naming the token and the accepted grammar — never a silent discovery-only run', () => {
+    // A typo used to WARN and then run discovery-only, so `both,reobserv` armed nothing and the only
+    // trace was one line in an hourly log. The var's grammar grew a csv in this change, which is
+    // exactly when fail-closed is cheap: an unknown token is now fatal at config time.
+    for (const bad of ['reobserv', 'both,reobserv', 'nonsense,rubbish', 'reobserve;both', 'both reobserve', 'BOTH', 'Reobserve']) {
+      expect(() => loadCrawlerConfig({ CRAWLER_MODE: bad })).toThrow(/CRAWLER_MODE/);
     }
+    // the message names the offending token AND what is accepted, so the fix needs no source dive
+    try {
+      loadCrawlerConfig({ CRAWLER_MODE: 'both,reobserv' });
+      throw new Error('expected a throw');
+    } catch (error) {
+      const message = (error as Error).message;
+      expect(message).toContain('reobserv');
+      expect(message).toContain('recent');
+      expect(message).toContain('backfill');
+      expect(message).toContain('reobserve');
+      expect(message).toContain('seed');
+      expect(message).toContain('both');
+    }
+  });
+
+  it('never dies on an EMPTY or absent value: an unset variable must not crash-loop the CronJob', () => {
+    // A CronJob whose env var is blank (or templated away) must still run the default pass. Only a
+    // value that says something we cannot honour is fatal.
+    expect(loadCrawlerConfig({}).phases).toEqual(['recent', 'backfill']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: '' }).phases).toEqual(['recent', 'backfill']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: '   ' }).phases).toEqual(['recent', 'backfill']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: ',,,' }).phases).toEqual(['recent', 'backfill']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: ' , both , ' }).phases).toEqual(['recent', 'backfill']);
+  });
+
+  it('tolerates duplicates and whitespace, which are not typos', () => {
+    expect(loadCrawlerConfig({ CRAWLER_MODE: ' both , reobserve , reobserve ' }).phases).toEqual(['recent', 'backfill', 'reobserve']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'both,both' }).phases).toEqual(['recent', 'backfill']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'reobserve,both' }).phases).toEqual(['recent', 'backfill', 'reobserve']);
   });
 
   it('keeps `seed` EXCLUSIVE: named with other phases it is dropped with a WARN, and the rest still run', () => {

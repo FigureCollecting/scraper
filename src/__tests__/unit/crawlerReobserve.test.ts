@@ -839,6 +839,9 @@ describe('runCrawlerPass — re-observation: the guards that had no test', () =>
     const st = storeSummary(s, 'goodsmileus');
     expect(st.reobserveSelected).toBe(0);
     expect(st.reobserveLanded).toBe(0);
+    // and it must not advertise a ceiling it never applied — see the cap-honesty block below
+    expect(st.reobserveCapApplied).toBe(0);
+    expect(st.reobserveLaneSkipped).toBe('mode-off');
   });
 
   it('a per-store cap SMALLER than the global default wins at the slice', async () => {
@@ -855,5 +858,121 @@ describe('runCrawlerPass — re-observation: the guards that had no test', () =>
     expect(storeSummary(s, 'goodsmileus').reobserveCapApplied).toBe(3);
     expect(fake.posted()).toHaveLength(3); // not 10 (every eligible id), not 20 (the global default)
     expect(storeSummary(s, 'goodsmileus').reobserveLanded).toBe(3);
+  });
+});
+
+/**
+ * `reobserveCapApplied` is an APPLIED ceiling, not a configured one. A store the lane could not touch
+ * at all must not advertise a cap, for the same reason the lane must not count the recent phase's
+ * work: a fleet log that says `reobserveCapApplied: 8` next to zero activity sends the operator
+ * looking for a broken lane instead of at the thing that held the store back.
+ */
+describe('runCrawlerPass — re-observation: the cap a store actually ran under, and why not', () => {
+  it('a store pulled OUT of the run by a discovery cap of 0 reports no cap and says why', async () => {
+    const fake = makeFake();
+    const store = createMemoryLedgerStore({ 'hobby-genki': ledgerAged('hobby-genki', { a: 50, b: 60, d: 70 }, listingUrl) });
+    const c = clock();
+    const s = await runCrawlerPass(
+      mkCfg({
+        stores: ['hobby-genki'],
+        storeEnqueueCaps: { 'hobby-genki': 0 }, // an explicit 0 pulls the store out of the WHOLE run
+        storeReobserveCaps: { 'hobby-genki': 8 },
+      }),
+      { fetch: fake.fetch, ledgerStore: store, now: c.now },
+    );
+    expect(fake.calls).toEqual([]);
+    const st = storeSummary(s, 'hobby-genki');
+    expect(st.reobserveCapApplied).toBe(0); // NOT 8 — nothing of the sort was applied
+    expect(st.reobserveLaneSkipped).toBe('store-out');
+    // the configured value is not lost: it is still reported once, at run level
+    expect(s.reobserveCapOverrides).toEqual({ 'hobby-genki': 8 });
+  });
+
+  it('a store with no cap of its own reports `not-configured`, and a store that ran reports its cap and null', async () => {
+    const fake = makeFake();
+    const store = createMemoryLedgerStore({
+      goodsmileus: ledgerAged('goodsmileus', { g: 90 }),
+      plazajapan: ledgerAged('plazajapan', { p: 90 }),
+    });
+    const c = clock();
+    const s = await runCrawlerPass(
+      mkCfg({ stores: ['goodsmileus', 'plazajapan'], storeReobserveCaps: { goodsmileus: 4 } }),
+      { fetch: fake.fetch, ledgerStore: store, now: c.now },
+    );
+    const armed = storeSummary(s, 'goodsmileus');
+    expect(armed.reobserveCapApplied).toBe(4);
+    expect(armed.reobserveLaneSkipped).toBeNull();
+    const unarmed = storeSummary(s, 'plazajapan');
+    expect(unarmed.reobserveCapApplied).toBe(0);
+    expect(unarmed.reobserveLaneSkipped).toBe('not-configured');
+  });
+
+  it('a corrupt ledger and a cooling host each report their own reason, not a cap', async () => {
+    const fake = makeFake({ catalog: (siteId) =>
+      siteId === 'anitoys'
+        ? { status: 503, body: { error: 'cooldown', siteId, host: 'anitoys.test', remainingMs: 60_000 } }
+        : { status: 200, body: { siteId, page: 1, items: [], collectUrls: [], hasMore: false, count: 0 } },
+    });
+    const store = createMemoryLedgerStore({
+      goodsmileus: 'corrupt',
+      anitoys: ledgerAged('anitoys', { x: 90 }),
+    });
+    const c = clock();
+    const s = await runCrawlerPass(
+      mkCfg({
+        mode: 'recent,reobserve',
+        phases: ['recent', 'reobserve'],
+        stores: ['goodsmileus', 'anitoys'],
+        storeReobserveCaps: { goodsmileus: 5, anitoys: 5 },
+      }),
+      { fetch: fake.fetch, ledgerStore: store, now: c.now },
+    );
+    const corrupt = storeSummary(s, 'goodsmileus');
+    expect(corrupt.reobserveCapApplied).toBe(0);
+    expect(corrupt.reobserveLaneSkipped).toBe('ledger');
+    const cooling = storeSummary(s, 'anitoys');
+    expect(cooling.reobserveCapApplied).toBe(0);
+    expect(cooling.reobserveLaneSkipped).toBe('store-stopped');
+  });
+});
+
+describe('runCrawlerPass — re-observation: the min-age window is also the back-off window', () => {
+  it('CRAWLER_REOBSERVE_MIN_AGE_H=0 disables the refusal back-off as well as the age bar', async () => {
+    // One value governs both, which is documented but easy to miss: at 0 an id refused seconds ago is
+    // driven again on the very next pass. Pinned so the coupling cannot change by accident.
+    const fake = makeFake({ ingest: () => refused() });
+    const store = createMemoryLedgerStore({
+      goodsmileus: ledgerAged('goodsmileus', { bad: 1 }, byIdUrl, {
+        bad: { reobserveFailedAt: iso(T0 - 1000), reobserveFailures: 9 },
+      }),
+    });
+    const c = clock();
+    const s = await runCrawlerPass(mkCfg({ reobserveMinAgeMs: 0, storeReobserveCaps: { goodsmileus: 5 } }), {
+      fetch: fake.fetch,
+      ledgerStore: store,
+      now: c.now,
+    });
+    expect(fake.posted()).toEqual([byIdUrl('goodsmileus', 'bad')]); // refused a second ago, driven anyway
+    const st = storeSummary(s, 'goodsmileus');
+    expect(st.reobserveSkipped).toBe(0);
+    expect(st.reobserveFailed).toBe(1);
+    expect(store.files.get('goodsmileus')!.enqueued.bad.reobserveFailures).toBe(10);
+  });
+
+  it('the default 12 h window DOES hold that id back (the control for the case above)', async () => {
+    const fake = makeFake({ ingest: () => refused() });
+    const store = createMemoryLedgerStore({
+      goodsmileus: ledgerAged('goodsmileus', { bad: 1 }, byIdUrl, {
+        bad: { reobserveFailedAt: iso(T0 - 1000), reobserveFailures: 9 },
+      }),
+    });
+    const c = clock();
+    const s = await runCrawlerPass(mkCfg({ storeReobserveCaps: { goodsmileus: 5 } }), {
+      fetch: fake.fetch,
+      ledgerStore: store,
+      now: c.now,
+    });
+    expect(fake.posted()).toEqual([]);
+    expect(storeSummary(s, 'goodsmileus').reobserveSkipped).toBe(1);
   });
 });
