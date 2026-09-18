@@ -3,8 +3,9 @@
  *
  * One invocation performs ONE bounded pass (recent THEN backfill THEN the id-range walk, by default)
  * and exits — recurrence is the K8s CronJob's schedule, and stop = the CronJob's `suspend: true`.
- * CRAWLER_MODE may name any subset of the phases (`both,reobserve`); `--dry-run` prints the
- * re-observation lane's selection without enqueuing it. This is wiring only; all logic (and its
+ * CRAWLER_MODE may name any subset of the phases (`both,reobserve`); `--dry-run` prints the OPT-IN
+ * lanes' plans without enqueuing them — the re-observation selection and the id-range gap sweep's
+ * open bands. Discovery has its own dry run (CRAWLER_MAX_ENQUEUE_PER_STORE=0). This is wiring only; all logic (and its
  * tests) live in ./config, ./ledger and ./crawler. It does NOT touch the server's default CMD
  * (node dist/index.js).
  */

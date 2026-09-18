@@ -45,6 +45,10 @@ const mkCfg = (over: Partial<CrawlerConfig> = {}): CrawlerConfig => ({
   maxReobservePerStore: 0,
   storeReobserveCaps: {},
   reobserveDryRun: false,
+  rangeReanchorMs: 24 * 60 * 60 * 1000,
+  rangeGapBudget: 0,
+  rangeGaps: {},
+  rangeGapDryRun: false,
   ...over,
   // `mode` is a LABEL; `phases` is what runs. loadCrawlerConfig derives one from the other, and so
   // does this helper, so a `mode` override keeps meaning exactly what it always meant here.
