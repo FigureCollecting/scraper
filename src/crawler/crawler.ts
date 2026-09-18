@@ -161,8 +161,17 @@ export interface CrawlerStoreSummary {
   reobserveSkipped: number;
   /** RE-OBSERVE: selected ids whose POST was refused (4xx, backed off) or failed transiently. */
   reobserveFailed: number;
-  /** RE-OBSERVE: the lane's ceiling for this store — its CRAWLER_STORE_REOBSERVE_CAPS override, else the global one. 0 = the lane is off here. */
+  /**
+   * RE-OBSERVE: the ceiling the lane ACTUALLY ran under for this store — its
+   * CRAWLER_STORE_REOBSERVE_CAPS override, else the global one, and 0 whenever the lane could not
+   * touch the store at all. Deliberately not the CONFIGURED value: a store reading
+   * `reobserveCapApplied: 8` beside zero activity sends an operator looking for a broken lane instead
+   * of at whatever held the store back. The configured value is still reported once, at run level, in
+   * `reobserveCapOverrides`; `reobserveLaneSkipped` names the reason.
+   */
   reobserveCapApplied: number;
+  /** RE-OBSERVE: why the lane did no work for this store, `null` when it considered the store. */
+  reobserveLaneSkipped: ReobserveSkipReason | null;
   /** The enqueue ceiling this store ran under: its CRAWLER_STORE_ENQUEUE_CAPS override, else the global cap. */
   capApplied: number;
   /** Failed catalog GETs, rejected/failed ingest POSTs, ledger failures. */
@@ -245,6 +254,23 @@ type StopReason = 'budget' | 'cooldown' | 'unsupported' | 'failed';
  */
 export type SeedStopReason = StopReason | 'cap';
 
+/**
+ * Why the RE-OBSERVATION lane did no work for a store. `null` on the summary means the lane
+ * considered the store (it built a selection, which may still have been empty because every id was
+ * inside the min-age window).
+ */
+export type ReobserveSkipReason =
+  /** CRAWLER_MODE does not name `reobserve`: the lane did not run at all this pass. */
+  | 'mode-off'
+  /** The lane ran, but this store has no cap of its own and the global default is 0. */
+  | 'not-configured'
+  /** An explicit DISCOVERY cap of 0 pulled the store out of the whole run, this lane included. */
+  | 'store-out'
+  /** The store's ledger was corrupt or could not be loaded, so there is nothing to walk. */
+  | 'ledger'
+  /** The store was stopped before the lane — a cooling host, a sick scraper, a spent budget. */
+  | 'store-stopped';
+
 /** Why the id-range walk made no window request this run. */
 export type RangeSkipReason = StopReason | 'not-configured' | 'not-run' | 'store-stopped' | 'cap' | 'no-frontier' | 'floor' | 'window-malformed';
 
@@ -277,6 +303,8 @@ interface StoreState {
   stopped: boolean;
   /** The per-store enqueue cap blocked a POST this run. */
   capReached: boolean;
+  /** An explicit DISCOVERY cap of 0 pulled this store out of the whole run before any request. */
+  pulledOut: boolean;
   /**
    * The store's LISTING axis answered 422 (no byListing / no extractListing). That stops the listing
    * phases only — the id-range axis is a different axis on the same store and still runs. Every
@@ -427,7 +455,9 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       reobserveSelected: 0,
       reobserveSkipped: 0,
       reobserveFailed: 0,
-      reobserveCapApplied: reobserveCapFor(siteId),
+      // An APPLIED ceiling: 0 until the lane actually takes this store on (see reobservePhase).
+      reobserveCapApplied: 0,
+      reobserveLaneSkipped: config.phases.includes('reobserve') ? 'not-configured' : 'mode-off',
       capApplied: capFor(siteId),
       errors: 0,
       skipped: 0,
@@ -450,6 +480,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     // existing discovery-only meaning — pages are fetched, nothing is POSTed.
     stopped: Object.prototype.hasOwnProperty.call(capOverrides, siteId) && capOverrides[siteId] === 0,
     capReached: false,
+    pulledOut: Object.prototype.hasOwnProperty.call(capOverrides, siteId) && capOverrides[siteId] === 0,
     listingUnsupported: false,
     deepestRecentPage: 0,
   }));
@@ -1221,15 +1252,36 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
 
     const lanes: Lane[] = [];
     for (const st of states) {
-      // A store with no ledger is refused everywhere (corrupt file, a failed load, or an explicit
-      // enqueue cap of 0, which pulls the store out of the whole run — re-observation included).
-      if (!st.ledger) continue;
-      if (st.reobserveCap <= 0) continue;
+      const skip = (reason: ReobserveSkipReason): void => {
+        st.summary.reobserveLaneSkipped = reason;
+        st.summary.reobserveCapApplied = 0;
+      };
+      // Reasons in the order that is most useful to read. A store nobody armed says so first, even if
+      // something else would also have held it back; after that, config beats circumstance.
+      if (st.reobserveCap <= 0) {
+        skip('not-configured');
+        continue;
+      }
+      if (st.pulledOut) {
+        skip('store-out');
+        continue;
+      }
+      // A store with no ledger is refused everywhere (a corrupt file or a failed load).
+      if (!st.ledger) {
+        skip('ledger');
+        continue;
+      }
       // A 422 on the LISTING axis says nothing about this lane — the ledger needs no listing. Any
       // other stop (cooldown, a sick scraper, a spent budget, a ledger failure) still holds: a host
       // that is cooling must be left alone, whichever lane wants it.
-      if (st.stopped && !st.listingUnsupported) continue;
+      if (st.stopped && !st.listingUnsupported) {
+        skip('store-stopped');
+        continue;
+      }
       st.stopped = false;
+      // From here the lane HAS taken the store on: the ceiling it ran under is now a fact.
+      st.summary.reobserveCapApplied = st.reobserveCap;
+      st.summary.reobserveLaneSkipped = null;
 
       const ledger = st.ledger;
       const eligible: Array<{ itemId: string; collectUrl: string; age: number }> = [];

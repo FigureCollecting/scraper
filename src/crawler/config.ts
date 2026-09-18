@@ -236,16 +236,31 @@ const clampedPosInt = (raw: string | undefined, fallback: number, max: number, e
 
 const PHASE_TOKENS = new Set<string>(['recent', 'backfill', 'reobserve', 'seed']);
 
+/** What `CRAWLER_MODE` accepts, for the error message an operator will read at 01:30Z. */
+const ACCEPTED_MODE = 'recent, backfill, both, seed, reobserve (csv for a subset, e.g. "both,reobserve")';
+
 /**
  * Parse `CRAWLER_MODE` into the phases that will run.
  *
  * The var grew from ONE token into a csv naming any SUBSET, so the re-observation lane can be armed
  * beside discovery (`both,reobserve`) or run alone (`reobserve`). Every legacy value keeps its exact
- * meaning: `both` (and anything unrecognised, and the unset var) is recent+backfill.
+ * meaning: `both`, and the unset or empty var, is recent+backfill.
+ *
+ * FAIL-CLOSED on a typo. An unrecognised token THROWS, naming the token and the accepted grammar,
+ * because the alternative is what this var used to do: `both,reobserv` warned once into an hourly log
+ * and then ran discovery-only, so the lane an operator believed they had armed simply did not exist
+ * and the only other tell was a summary field nobody was reading. A CronJob that dies at config time
+ * is loud, hourly, and harmless (`backoffLimit: 0`, no restart storm).
+ *
+ * What is NOT a typo, and must never be fatal: an ABSENT or EMPTY value (a blank or templated-away
+ * env var must still run the default pass rather than fail every hour), and duplicates or whitespace,
+ * which are normalised.
  *
  * `seed` stays EXCLUSIVE. Named alone it is the seed pass, unchanged; named ALONGSIDE another phase
  * it is DROPPED with a WARN rather than silently voiding the walk the operator also asked for — a
  * bounded declared poll whose whole point is a knowable cost must not be folded into an unbounded one.
+ * It is a WARN and not a throw because every token there is one we recognise: the operator asked for
+ * two things that cannot both happen, not for something we cannot read.
  */
 export const phasesForMode = (raw: string | undefined): CrawlerPhaseName[] => {
   const tokens = csv(raw ?? '');
@@ -257,8 +272,7 @@ export const phasesForMode = (raw: string | undefined): CrawlerPhaseName[] => {
       continue;
     }
     if (!PHASE_TOKENS.has(token)) {
-      logger.warn('[CRAWLER] CRAWLER_MODE names an unknown phase — ignored', { token });
-      continue;
+      throw new Error(`CRAWLER_MODE names an unknown phase ${JSON.stringify(token)} — accepted: ${ACCEPTED_MODE}`);
     }
     named.add(token as CrawlerPhaseName);
   }
@@ -268,6 +282,7 @@ export const phasesForMode = (raw: string | undefined): CrawlerPhaseName[] => {
     logger.warn('[CRAWLER] CRAWLER_MODE names `seed` alongside other phases — seed is an EXCLUSIVE pass and was dropped', { mode: raw });
   }
   const phases = PHASE_ORDER.filter((p) => named.has(p));
+  // No tokens at all (unset, empty, whitespace, or only separators) is the DEFAULT, never a failure.
   return phases.length > 0 ? phases : ['recent', 'backfill'];
 };
 

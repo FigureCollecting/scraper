@@ -602,9 +602,13 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
 - **seed** (`CRAWLER_MODE=seed`) — an EXCLUSIVE pass that runs the seed phase and nothing else. See
   *Seed pass* below.
 - `CRAWLER_MODE` names a SUBSET of the phases: one token, or a csv (`both,reobserve`). `both`
-  (default) is recent+backfill. Unknown tokens are dropped with a WARN, and a mode that names
-  nothing recognisable falls back to `both`. `seed` stays exclusive — named alongside another phase
-  it is dropped with a WARN, because its whole justification is a knowable, bounded cost.
+  (default) is recent+backfill. An UNRECOGNISED token is FATAL — the pass exits non-zero at config
+  time with a message naming the token and the accepted grammar, because a typo that merely warned
+  (`both,reobserv`) used to run discovery-only and leave the lane silently unarmed. An ABSENT or
+  EMPTY value is never fatal: it means `both`, so a blank env var cannot fail the CronJob every hour.
+  Duplicates and whitespace are normalised. `seed` stays exclusive — named alongside another phase
+  it is dropped with a WARN (every token there is one we recognise; the operator asked for two things
+  that cannot both happen), because its whole justification is a knowable, bounded cost.
 - `both` runs recent for every store, THEN backfill, THEN the id-range walk, and — when the mode
   names it — the re-observation lane LAST, so discovery's claim on the global request budget is
   exactly what it was before that lane existed. Stores run in parallel under one
@@ -623,7 +627,7 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
   a discovery-only dry run for every unnamed store (pages fetched, nothing POSTed).
 - The run ends with a `[CRAWLER] pass complete` JSON summary (per store: pagesFetched,
   discovered, known, enqueued, deduplicated, reobserved, reobserveLanded, reobserveSelected,
-  reobserveSkipped, reobserveFailed, reobserveCapApplied, errors, skipped, backfillCursor,
+  reobserveSkipped, reobserveFailed, reobserveCapApplied, reobserveLaneSkipped, errors, skipped, backfillCursor,
   exhaustCandidate, exhausted, capApplied, rangeWalked, rangeCursor, rangeFrontier, rangeSkipped,
   seedLists, seedStopped; plus totals, requestsIssued, budgetExhausted, enqueueCapOverrides,
   reobserveCapOverrides, totalReobserved, totalReobserveLanded, totalRangeWalked, durationMs). A `seed` pass logs
@@ -635,7 +639,7 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
 | Variable | Default | Meaning |
 |---|---|---|
 | `SCRAPER_SERVICE_URL` | `http://localhost:3050` | The scraper's HTTP surface (the only thing the crawler talks to) |
-| `CRAWLER_MODE` | `both` | `recent`, `backfill`, `both` (recent then backfill), `reobserve` (the re-observation lane), or `seed` (the declared seed lists ONLY — exclusive). A csv names a subset: `both,reobserve` |
+| `CRAWLER_MODE` | `both` | `recent`, `backfill`, `both` (recent then backfill), `reobserve` (the re-observation lane), or `seed` (the declared seed lists ONLY — exclusive). A csv names a subset: `both,reobserve`. An unrecognised token FAILS the pass by name; empty or unset means `both` |
 | `CRAWLER_STORES` | `orzgk` | csv of siteIds; explicitly empty = no work (kill switch) |
 | `CRAWLER_LEDGER_DIR` | `/var/lib/ingest-crawler` | Directory of per-store ledger files |
 | `CRAWLER_RECENT_MAX_PAGES` | `3` | Max listing pages walked from page 1 per store per run |
@@ -793,7 +797,10 @@ at whatever was seen the day it was walked.
   coalesces the duplicates).
 - **Counters, and whose number is whose** — per store: `reobserveSelected` (what the lane chose),
   **`reobserveLanded`** (POSTs the lane landed — the number a live acceptance should read),
-  `reobserveFailed`, `reobserveSkipped` (too young, or inside a refusal backoff), `reobserveCapApplied`;
+  `reobserveFailed`, `reobserveSkipped` (too young, or inside a refusal backoff),
+  `reobserveCapApplied` (the ceiling the lane ACTUALLY ran under — `0` for a store it could not touch,
+  never the configured value) and `reobserveLaneSkipped` (why: `mode-off`, `not-configured`,
+  `store-out`, `ledger`, `store-stopped`, or `null` when the lane took the store on);
   per run: `totalReobserveLanded`, `totalReobserved` and `reobserveCapOverrides`, plus a
   `[CRAWLER] reobserve selection` line per store and one `[CRAWLER] reobserve lane complete` line
   carrying the per-store split (its `landed` and `total` are the lane's own).
@@ -810,8 +817,9 @@ at whatever was seen the day it was walked.
 - **Dry run** — `CRAWLER_REOBSERVE_DRY_RUN=1` (or `--dry-run`) logs each store's selection and
   enqueues nothing, stamping no ledger. Use it before arming a gated store.
 - **Interaction with an enqueue cap of `0`** — that pulls a store out of the WHOLE run, this lane
-  included (its ledger is not even opened). To run re-observation without discovery, name only
-  `reobserve` in `CRAWLER_MODE`.
+  included (its ledger is not even opened). The summary says so rather than implying a live lane:
+  `reobserveCapApplied: 0` with `reobserveLaneSkipped: "store-out"`. To run re-observation without
+  discovery, name only `reobserve` in `CRAWLER_MODE`.
 - Not to be confused with `CRAWLER_REOBSERVE_AFTER_MS`, which is the RECENT phase's much older
   window: it re-POSTs a known item that happens to appear on listing pages 1..N. That path reaches
   only the first pages of a listing and nothing else; this lane reaches the whole ledger.
