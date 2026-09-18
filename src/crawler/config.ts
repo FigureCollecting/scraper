@@ -124,6 +124,34 @@ export interface CrawlerConfig {
   storeReobserveCaps: Record<string, number>;
   /** RE-OBSERVE: print the selection and enqueue NOTHING (no POST, no ledger stamp). */
   reobserveDryRun: boolean;
+  /**
+   * ID-RANGE RE-ANCHOR (D5): how often the frontier is moved up to the newest id the ledger has seen,
+   * from `CRAWLER_RANGE_REANCHOR_H` (hours). 0 = re-anchor on EVERY run. The descent walks DOWN from a
+   * frontier frozen the day it began, so without this the ids the store adds above that frontier are
+   * seen only by whatever the Latest Additions tap happens to catch between two runs.
+   */
+  rangeReanchorMs: number;
+  /**
+   * GAP SWEEP: the sweep's OWN per-run, per-store budget — at most this many ids touched AND at most
+   * this many ingest POSTs. DEFAULT 0 = the sweep is OFF, so a store fills gaps only once the fleet
+   * config asks it to. Deliberately SEPARATE from `maxEnqueuePerStore`: the descent must not be able
+   * to starve the sweep, nor the sweep the descent.
+   */
+  rangeGapBudget: number;
+  /**
+   * GAP SWEEP: operator-declared bands per siteId, from `CRAWLER_RANGE_GAPS` — a csv of
+   * `siteId:lo-hi` and `siteId:id` entries (a single id is a band of width 1). They are ADOPTED into
+   * the store's ledger once, beside the bands the re-anchor records for itself.
+   */
+  rangeGaps: Record<string, GapBandDecl[]>;
+  /** GAP SWEEP: print the open bands and their widths, and sweep NOTHING (no window GET, no POST). */
+  rangeGapDryRun: boolean;
+}
+
+/** One operator-declared gap band, before it is adopted into a store's ledger. */
+export interface GapBandDecl {
+  from: number;
+  to: number;
 }
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
@@ -135,6 +163,7 @@ const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
  * clamped HERE, once, with a WARN, rather than being truncated invisibly on the wire.
  */
 export const MAX_RANGE_IDS_PER_RUN = 200;
+
 
 /** The first store armed for continuous collection (orzgk: Woo Store API, 100/page, newest-first). */
 export const DEFAULT_CRAWLER_STORES = ['orzgk'];
@@ -155,6 +184,8 @@ const DEFAULTS = {
   rangeIdsPerRun: 50,
   reobserveMinAgeH: 12,
   maxReobservePerStore: 0,
+  rangeReanchorH: 24,
+  rangeGapBudget: 0,
 };
 
 type Env = Record<string, string | undefined>;
@@ -222,6 +253,32 @@ const parseFrontiers = (env: Env, stores: string[]): Record<string, number> => {
     if (raw === undefined) continue;
     const n = Number.parseInt(raw.trim(), 10);
     if (Number.isSafeInteger(n) && n > 0) out[siteId] = n;
+  }
+  return out;
+};
+
+/**
+ * Parse `CRAWLER_RANGE_GAPS` — a csv of `siteId:lo-hi` (a cluster range) or `siteId:id` (one id, a band
+ * of width 1). Ross's ask was "several ids or cluster ranges to track", and one shape serves both.
+ *
+ * Every entry is validated on its own and a malformed one is DROPPED with a WARN naming it, exactly
+ * like the per-store caps: a typo in one band must not void the operator's other declarations, and a
+ * band silently coerced from a typo would be swept as though those were real ids.
+ */
+const parseRangeGaps = (raw: string | undefined): Record<string, GapBandDecl[]> => {
+  const out: Record<string, GapBandDecl[]> = {};
+  for (const entry of csv(raw ?? '')) {
+    const at = entry.indexOf(':');
+    const siteId = at === -1 ? '' : entry.slice(0, at).trim();
+    const bandRaw = at === -1 ? '' : entry.slice(at + 1).trim();
+    const m = /^(\d+)(?:-(\d+))?$/.exec(bandRaw);
+    const from = m ? Number(m[1]) : Number.NaN;
+    const to = m ? (m[2] === undefined ? from : Number(m[2])) : Number.NaN;
+    if (!SAFE_SITE_ID.test(siteId) || !m || !Number.isSafeInteger(from) || !Number.isSafeInteger(to) || from < 1 || to < from) {
+      logger.warn('[CRAWLER] CRAWLER_RANGE_GAPS entry ignored (expected siteId:lowId-highId or siteId:id)', { entry });
+      continue;
+    }
+    (out[siteId] ??= []).push({ from, to });
   }
   return out;
 };
@@ -304,13 +361,15 @@ export function loadCrawlerConfig(env: Env = process.env, argv: string[] = proce
   // honored as an empty list — the operator's kill switch (zero stores → no work).
   const stores = env.CRAWLER_STORES === undefined ? [...DEFAULT_CRAWLER_STORES] : csv(env.CRAWLER_STORES);
   const phases = phasesForMode(env.CRAWLER_MODE);
-  // CRAWLER_DRY_RUN is accepted as an ALIAS, and warns about its scope: it gates the re-observation
-  // lane ONLY. The discovery lanes have their own dry run (an enqueue cap of 0 — pages are fetched,
-  // nothing is POSTed), and a name that promised a whole-pass dry run while discovery still POSTed
-  // would be the worst kind of safety knob.
+  // CRAWLER_DRY_RUN (and `--dry-run`) is accepted as an ALIAS for the OPT-IN lanes' dry runs — the
+  // re-observation lane and the id-range gap sweep — and warns about its scope. The DISCOVERY phases
+  // have their own dry run (an enqueue cap of 0 — pages are fetched, nothing is POSTed), and a name
+  // that promised a whole-pass dry run while discovery still POSTed would be the worst kind of safety
+  // knob. Gating only ONE of the two opt-in lanes would be the second worst: an operator arming the
+  // sweep with `--dry-run` would watch the re-observation selection print while the sweep enqueued.
   const aliasDryRun = boolFlag(env.CRAWLER_DRY_RUN);
   if (aliasDryRun) {
-    logger.warn('[CRAWLER] CRAWLER_DRY_RUN gates the RE-OBSERVATION lane only — discovery still enqueues (use CRAWLER_MAX_ENQUEUE_PER_STORE=0 for that)');
+    logger.warn('[CRAWLER] CRAWLER_DRY_RUN gates the RE-OBSERVATION lane and the id-range GAP SWEEP — discovery still enqueues (use CRAWLER_MAX_ENQUEUE_PER_STORE=0 for that)');
   }
 
   const scraperServiceUrl = (env.SCRAPER_SERVICE_URL || DEFAULTS.scraperServiceUrl).replace(/\/+$/, '');
@@ -344,5 +403,12 @@ export function loadCrawlerConfig(env: Env = process.env, argv: string[] = proce
     maxReobservePerStore: nonNegInt(env.CRAWLER_MAX_REOBSERVE_PER_STORE, DEFAULTS.maxReobservePerStore),
     storeReobserveCaps: parseStoreCaps(env.CRAWLER_STORE_REOBSERVE_CAPS, 'CRAWLER_STORE_REOBSERVE_CAPS'),
     reobserveDryRun: boolFlag(env.CRAWLER_REOBSERVE_DRY_RUN) || aliasDryRun || argv.includes('--dry-run'),
+    // Hours, like the re-observe window and for the same reason: the operator reasons about this
+    // cadence in hours ("once a day"), and an explicit 0 is honoured as "every run" rather than
+    // reverting to a day — a cadence knob must not fail SLOW at its most eager setting.
+    rangeReanchorMs: nonNegInt(env.CRAWLER_RANGE_REANCHOR_H, DEFAULTS.rangeReanchorH) * 60 * 60 * 1000,
+    rangeGapBudget: nonNegInt(env.CRAWLER_RANGE_GAP_BUDGET, DEFAULTS.rangeGapBudget),
+    rangeGaps: parseRangeGaps(env.CRAWLER_RANGE_GAPS),
+    rangeGapDryRun: boolFlag(env.CRAWLER_RANGE_GAP_DRY_RUN) || aliasDryRun || argv.includes('--dry-run'),
   };
 }
