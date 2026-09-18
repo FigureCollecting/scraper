@@ -10,6 +10,7 @@
  */
 import { runCrawlerPass, type CrawlerConfig, type FetchLike, type HttpResponseLike } from '../../crawler/crawler';
 import { createMemoryLedgerStore, createEmptyLedger, type Ledger } from '../../crawler/ledger';
+import { phasesForMode } from '../../crawler/config';
 import { logger } from '../../utils/logger';
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
@@ -23,6 +24,8 @@ const waitFor = async (pred: () => boolean, timeoutMs = 3000): Promise<void> => 
     await new Promise((r) => setTimeout(r, 1));
   }
 };
+
+const defaultMode = 'both';
 
 const mkCfg = (over: Partial<CrawlerConfig> = {}): CrawlerConfig => ({
   scraperServiceUrl: 'http://scraper.test',
@@ -43,7 +46,14 @@ const mkCfg = (over: Partial<CrawlerConfig> = {}): CrawlerConfig => ({
   rangeIdsPerRun: 50,
   rangeFrontiers: {},
   seedSpacingMs: 10_000,
+  reobserveMinAgeMs: 12 * 60 * 60 * 1000,
+  maxReobservePerStore: 0,
+  storeReobserveCaps: {},
+  reobserveDryRun: false,
   ...over,
+  // `mode` is a LABEL; `phases` is what runs. loadCrawlerConfig derives one from the other, and so
+  // does this helper, so a `mode` override keeps meaning exactly what it always meant here.
+  phases: over.phases ?? phasesForMode(over.mode ?? defaultMode),
 });
 
 const collectUrl = (siteId: string, id: string): string => `https://${siteId}.test/api/${id}`;

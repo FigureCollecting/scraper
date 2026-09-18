@@ -195,3 +195,104 @@ describe('loadCrawlerConfig', () => {
     }
   });
 });
+
+/**
+ * RE-OBSERVATION LANE (D4). `CRAWLER_MODE` grows from a single token into a SUBSET of the phases,
+ * and the lane carries its own budget so it can never spend discovery's.
+ */
+describe('loadCrawlerConfig — the re-observation lane', () => {
+  it('defaults: mode both = the two discovery phases, and the lane is OFF for every store', () => {
+    const c = loadCrawlerConfig({});
+    expect(c.mode).toBe('both');
+    expect(c.phases).toEqual(['recent', 'backfill']);
+    expect(c.maxReobservePerStore).toBe(0);
+    expect(c.storeReobserveCaps).toEqual({});
+    expect(c.reobserveMinAgeMs).toBe(12 * 60 * 60 * 1000);
+    expect(c.reobserveDryRun).toBe(false);
+  });
+
+  it('keeps every legacy CRAWLER_MODE token meaning exactly what it meant', () => {
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'recent' }).phases).toEqual(['recent']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'backfill' }).phases).toEqual(['backfill']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'both' }).phases).toEqual(['recent', 'backfill']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'seed' }).phases).toEqual(['seed']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'whatever' }).phases).toEqual(['recent', 'backfill']);
+  });
+
+  it('CRAWLER_MODE may name any subset, in any order, deduplicated into canonical order', () => {
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'reobserve' }).phases).toEqual(['reobserve']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'reobserve' }).mode).toBe('reobserve');
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'both,reobserve' }).phases).toEqual(['recent', 'backfill', 'reobserve']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'both,reobserve' }).mode).toBe('recent,backfill,reobserve');
+    expect(loadCrawlerConfig({ CRAWLER_MODE: ' reobserve , recent ' }).phases).toEqual(['recent', 'reobserve']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'reobserve,reobserve' }).phases).toEqual(['reobserve']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'recent,backfill' }).mode).toBe('both');
+  });
+
+  it('drops an unknown token from a subset with a WARN, and falls back to both when NOTHING is recognised', () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      expect(loadCrawlerConfig({ CRAWLER_MODE: 'reobserve,nonsense' }).phases).toEqual(['reobserve']);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('CRAWLER_MODE'))).toBe(true);
+      warn.mockClear();
+      expect(loadCrawlerConfig({ CRAWLER_MODE: 'nonsense,rubbish' }).phases).toEqual(['recent', 'backfill']);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('CRAWLER_MODE'))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('keeps `seed` EXCLUSIVE: named with other phases it is dropped with a WARN, and the rest still run', () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      expect(loadCrawlerConfig({ CRAWLER_MODE: 'seed,reobserve' }).phases).toEqual(['reobserve']);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('seed'))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('CRAWLER_REOBSERVE_MIN_AGE_H is hours → ms, honours an explicit 0, and ignores junk', () => {
+    expect(loadCrawlerConfig({ CRAWLER_REOBSERVE_MIN_AGE_H: '6' }).reobserveMinAgeMs).toBe(6 * 60 * 60 * 1000);
+    expect(loadCrawlerConfig({ CRAWLER_REOBSERVE_MIN_AGE_H: '0' }).reobserveMinAgeMs).toBe(0);
+    expect(loadCrawlerConfig({ CRAWLER_REOBSERVE_MIN_AGE_H: 'x' }).reobserveMinAgeMs).toBe(12 * 60 * 60 * 1000);
+    expect(loadCrawlerConfig({ CRAWLER_REOBSERVE_MIN_AGE_H: '-3' }).reobserveMinAgeMs).toBe(12 * 60 * 60 * 1000);
+  });
+
+  it('parses CRAWLER_STORE_REOBSERVE_CAPS exactly like the enqueue caps, warning on a malformed entry', () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      const c = loadCrawlerConfig({ CRAWLER_STORE_REOBSERVE_CAPS: ' goodsmileus:50 , bbts:20 ,anitoys:0, nope ' });
+      expect(c.storeReobserveCaps).toEqual({ goodsmileus: 50, bbts: 20, anitoys: 0 });
+      expect(warn.mock.calls.some((call) => String(call[0]).includes('CRAWLER_STORE_REOBSERVE_CAPS'))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('CRAWLER_MAX_REOBSERVE_PER_STORE is the global default for the lane and stays 0 (off) unless set', () => {
+    expect(loadCrawlerConfig({ CRAWLER_MAX_REOBSERVE_PER_STORE: '25' }).maxReobservePerStore).toBe(25);
+    expect(loadCrawlerConfig({ CRAWLER_MAX_REOBSERVE_PER_STORE: '0' }).maxReobservePerStore).toBe(0);
+    expect(loadCrawlerConfig({ CRAWLER_MAX_REOBSERVE_PER_STORE: 'junk' }).maxReobservePerStore).toBe(0);
+  });
+
+  it('a `--dry-run` argv arms the same dry run as the env var (the CronJob operator has both)', () => {
+    expect(loadCrawlerConfig({}, ['node', 'run.js', '--dry-run']).reobserveDryRun).toBe(true);
+    expect(loadCrawlerConfig({}, ['node', 'run.js']).reobserveDryRun).toBe(false);
+    expect(loadCrawlerConfig({}, ['node', 'run.js', '--dry-run=please']).reobserveDryRun).toBe(false);
+  });
+
+  it('CRAWLER_REOBSERVE_DRY_RUN arms the dry run; CRAWLER_DRY_RUN is an alias that WARNs it covers this lane only', () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      expect(loadCrawlerConfig({ CRAWLER_REOBSERVE_DRY_RUN: '1' }).reobserveDryRun).toBe(true);
+      expect(loadCrawlerConfig({ CRAWLER_REOBSERVE_DRY_RUN: 'true' }).reobserveDryRun).toBe(true);
+      expect(loadCrawlerConfig({ CRAWLER_REOBSERVE_DRY_RUN: '0' }).reobserveDryRun).toBe(false);
+      expect(warn).not.toHaveBeenCalled();
+      expect(loadCrawlerConfig({ CRAWLER_DRY_RUN: '1' }).reobserveDryRun).toBe(true);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('CRAWLER_DRY_RUN'))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});

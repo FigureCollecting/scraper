@@ -5,7 +5,8 @@
  *   {
  *     version: 1,
  *     siteId,
- *     enqueued: { [itemId]: { at: ISO-8601, collectUrl } },   // v1: enqueued-is-done
+ *     enqueued: { [itemId]: { at: ISO-8601, collectUrl,       // v1: enqueued-is-done, `at` = last observation
+ *                             reobserveFailedAt?, reobserveFailures? } },
  *     backfill: { cursor: number|null,                          // next page to backfill
  *                 exhaustCandidateCursor?, exhaustCandidateAt?, // one empty sighting (unconfirmed)
  *                 exhaustedAt?, updatedAt? },                   // confirmed end-of-catalog
@@ -27,9 +28,24 @@ import * as path from 'path';
 export const LEDGER_VERSION = 1 as const;
 
 export interface LedgerEntry {
-  /** ISO-8601 instant of the last accepted enqueue (202). */
+  /** ISO-8601 instant of the last accepted enqueue (202) — the item's LAST OBSERVATION. */
   at: string;
+  /**
+   * The item's ABSOLUTE url at the store: its byId url where the store declares that axis, else the
+   * item link the listing parser emitted (`withCollectUrl`). It is what /ingest/scrape is given, and
+   * it is what the RE-OBSERVATION lane re-drives — which is why a store with no byId axis
+   * (hobby-genki, bbts, gkloot, akimomo, anitoys) can be re-observed at all.
+   */
   collectUrl: string;
+  /**
+   * RE-OBSERVE: when the last re-observation POST for this id was DETERMINISTICALLY refused (4xx from
+   * /ingest/scrape — typically no ruleset matches the url). `at` is deliberately NOT advanced by a
+   * refusal, because nothing was observed; this field is what keeps the id from sitting at the head
+   * of the oldest-first queue every single run. Cleared by the next success.
+   */
+  reobserveFailedAt?: string;
+  /** RE-OBSERVE: consecutive refusals since the last success. Cleared by the next success. */
+  reobserveFailures?: number;
 }
 
 export interface LedgerBackfill {

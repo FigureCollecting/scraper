@@ -17,18 +17,35 @@
 import { logger } from '../utils/logger.js';
 
 /**
- * Which phases one pass runs. `recent` / `backfill` / `both` are the listing-and-id-space feeder.
- * `seed` is a DIFFERENT, exclusive pass: ONLY the declared seed lists, and none of the other phases.
- * It is not a fourth phase bolted onto `both` because its whole justification is the bounded cost of
- * a small declared set — folding it into a walk would hide that cost inside an unbounded one.
+ * One phase a pass may run.
+ *
+ * `recent` / `backfill` are the listing-and-id-space DISCOVERY feeder (the id-range walk rides
+ * `backfill`). `reobserve` is the RE-OBSERVATION lane (D4, Ross 2026-09-18): it walks the ledger
+ * instead of the store's pages and re-drives ids we already know, so an exhausted store keeps a live
+ * price/availability series instead of freezing on the day it was walked. `seed` is a DIFFERENT,
+ * EXCLUSIVE pass: ONLY the declared seed lists, and none of the other phases — its whole
+ * justification is the bounded cost of a small declared set, and folding it into a walk would hide
+ * that cost inside an unbounded one.
  */
-export type CrawlerMode = 'recent' | 'backfill' | 'both' | 'seed';
+export type CrawlerPhaseName = 'recent' | 'backfill' | 'reobserve' | 'seed';
+
+/**
+ * What `CRAWLER_MODE` named: one of the legacy single tokens (`recent`, `backfill`, `both`, `seed`),
+ * the new `reobserve`, or a csv naming any subset of them (`both,reobserve`). `both` keeps meaning
+ * recent+backfill exactly as before.
+ */
+export type CrawlerMode = CrawlerPhaseName | 'both' | `${string},${string}`;
+
+/** The order phases run in, whatever order the operator named them. Discovery keeps its priority. */
+export const PHASE_ORDER: readonly CrawlerPhaseName[] = ['recent', 'backfill', 'reobserve'] as const;
 
 export interface CrawlerConfig {
   /** Base URL of the scraper's HTTP surface — the ONLY thing the crawler talks to. */
   scraperServiceUrl: string;
-  /** Which phases run: `recent`, `backfill`, `both` (recent THEN backfill, one process), or `seed` (the declared seed lists ONLY). */
+  /** What the operator named, normalised for the summary and the logs (`both` stays `both`). */
   mode: CrawlerMode;
+  /** The phases this pass ACTUALLY runs, deduplicated and in PHASE_ORDER; `['seed']` for the exclusive seed pass. */
+  phases: CrawlerPhaseName[];
   /** siteIds to crawl this pass. */
   stores: string[];
   /** Directory holding one `<siteId>.json` ledger per store (a PVC in the cluster). */
@@ -85,6 +102,28 @@ export interface CrawlerConfig {
    * every non-alphanumeric character replaced by `_` (`good-smile` → `CRAWLER_RANGE_FRONTIER_GOOD_SMILE`).
    */
   rangeFrontiers: Record<string, number>;
+  /**
+   * RE-OBSERVE: an id is eligible only once its last observation is at least this old
+   * (`CRAWLER_REOBSERVE_MIN_AGE_H`, hours). It is also the BACKOFF window for an id whose last
+   * re-observation POST was refused: without it a permanently-refused id would sit at the head of
+   * the oldest-first queue every run and starve the store's whole lane.
+   */
+  reobserveMinAgeMs: number;
+  /**
+   * RE-OBSERVE: the global per-store ceiling on re-observation POSTs per run. DEFAULT 0 = the lane is
+   * OFF everywhere, so the fleet OPTS IN per store through `storeReobserveCaps`. Deliberately not the
+   * discovery default: re-observation spends real requests at a gated store, where browser time is
+   * the fleet's scarcest resource.
+   */
+  maxReobservePerStore: number;
+  /**
+   * RE-OBSERVE: per-store overrides of `maxReobservePerStore`, keyed by siteId — the same
+   * `siteId:cap` shape as `storeEnqueueCaps`, and a SEPARATE budget from it, so discovery can never
+   * be starved by re-observation nor re-observation by discovery.
+   */
+  storeReobserveCaps: Record<string, number>;
+  /** RE-OBSERVE: print the selection and enqueue NOTHING (no POST, no ledger stamp). */
+  reobserveDryRun: boolean;
 }
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
@@ -114,6 +153,8 @@ const DEFAULTS = {
   reobserveAfterMs: WEEK_MS,
   exhaustedRecheckMs: WEEK_MS,
   rangeIdsPerRun: 50,
+  reobserveMinAgeH: 12,
+  maxReobservePerStore: 0,
 };
 
 type Env = Record<string, string | undefined>;
@@ -148,12 +189,12 @@ const nonNegInt = (raw: string | undefined, fallback: number): number => {
 const SAFE_SITE_ID = /^[A-Za-z0-9_-]+$/;
 
 /**
- * Parse `CRAWLER_STORE_ENQUEUE_CAPS` — a csv of `siteId:cap` pairs. Every entry is validated on its
- * own: a malformed one is DROPPED with a WARN naming it, and the well-formed entries still apply, so
- * one typo can never silently unthrottle a store nor void the whole declaration. A repeated siteId
- * takes its LAST value.
+ * Parse a per-store cap var — `CRAWLER_STORE_ENQUEUE_CAPS` or `CRAWLER_STORE_REOBSERVE_CAPS` — a csv
+ * of `siteId:cap` pairs. Every entry is validated on its own: a malformed one is DROPPED with a WARN
+ * naming it AND the var it came from, and the well-formed entries still apply, so one typo can never
+ * silently unthrottle a store nor void the whole declaration. A repeated siteId takes its LAST value.
  */
-const parseStoreCaps = (raw: string | undefined): Record<string, number> => {
+const parseStoreCaps = (raw: string | undefined, envName: string): Record<string, number> => {
   const out: Record<string, number> = {};
   for (const entry of csv(raw ?? '')) {
     const at = entry.indexOf(':');
@@ -161,7 +202,7 @@ const parseStoreCaps = (raw: string | undefined): Record<string, number> => {
     const capRaw = at === -1 ? '' : entry.slice(at + 1).trim();
     const cap = Number(capRaw);
     if (!SAFE_SITE_ID.test(siteId) || !/^\d+$/.test(capRaw) || !Number.isSafeInteger(cap)) {
-      logger.warn('[CRAWLER] CRAWLER_STORE_ENQUEUE_CAPS entry ignored (expected siteId:nonNegativeInteger)', { entry });
+      logger.warn(`[CRAWLER] ${envName} entry ignored (expected siteId:nonNegativeInteger)`, { entry });
       continue;
     }
     out[siteId] = cap;
@@ -193,27 +234,84 @@ const clampedPosInt = (raw: string | undefined, fallback: number, max: number, e
   return max;
 };
 
-const parseMode = (raw: string | undefined): CrawlerMode =>
-  raw === 'recent' || raw === 'backfill' || raw === 'seed' ? raw : 'both';
+const PHASE_TOKENS = new Set<string>(['recent', 'backfill', 'reobserve', 'seed']);
 
-export function loadCrawlerConfig(env: Env = process.env): CrawlerConfig {
+/**
+ * Parse `CRAWLER_MODE` into the phases that will run.
+ *
+ * The var grew from ONE token into a csv naming any SUBSET, so the re-observation lane can be armed
+ * beside discovery (`both,reobserve`) or run alone (`reobserve`). Every legacy value keeps its exact
+ * meaning: `both` (and anything unrecognised, and the unset var) is recent+backfill.
+ *
+ * `seed` stays EXCLUSIVE. Named alone it is the seed pass, unchanged; named ALONGSIDE another phase
+ * it is DROPPED with a WARN rather than silently voiding the walk the operator also asked for — a
+ * bounded declared poll whose whole point is a knowable cost must not be folded into an unbounded one.
+ */
+export const phasesForMode = (raw: string | undefined): CrawlerPhaseName[] => {
+  const tokens = csv(raw ?? '');
+  const named = new Set<CrawlerPhaseName>();
+  for (const token of tokens) {
+    if (token === 'both') {
+      named.add('recent');
+      named.add('backfill');
+      continue;
+    }
+    if (!PHASE_TOKENS.has(token)) {
+      logger.warn('[CRAWLER] CRAWLER_MODE names an unknown phase — ignored', { token });
+      continue;
+    }
+    named.add(token as CrawlerPhaseName);
+  }
+  if (named.has('seed')) {
+    if (named.size === 1) return ['seed'];
+    named.delete('seed');
+    logger.warn('[CRAWLER] CRAWLER_MODE names `seed` alongside other phases — seed is an EXCLUSIVE pass and was dropped', { mode: raw });
+  }
+  const phases = PHASE_ORDER.filter((p) => named.has(p));
+  return phases.length > 0 ? phases : ['recent', 'backfill'];
+};
+
+/** The phase set as ONE label for the summary and the logs: recent+backfill keeps reading `both`. */
+const labelPhases = (phases: CrawlerPhaseName[]): CrawlerMode =>
+  phases.length === 2 && phases[0] === 'recent' && phases[1] === 'backfill' ? 'both' : (phases.join(',') as CrawlerMode);
+
+/** A boolean knob: `1` / `true` / `yes` / `on` (case-insensitive) is ON; anything else is OFF. */
+const boolFlag = (raw: string | undefined): boolean => ['1', 'true', 'yes', 'on'].includes((raw ?? '').trim().toLowerCase());
+
+/**
+ * `argv` is read for ONE flag: `--dry-run`, the same switch as CRAWLER_REOBSERVE_DRY_RUN. A CronJob
+ * operator reaches for a command-line flag when trying a store out by hand (`kubectl create job
+ * --from=cronjob/ingest-crawler … -- node dist/crawler/run.js --dry-run`) and for an env var when
+ * arming it in the manifest; both must reach the same knob.
+ */
+export function loadCrawlerConfig(env: Env = process.env, argv: string[] = process.argv): CrawlerConfig {
   // A csv var is defaulted ONLY when unset. An explicitly-set-but-empty value is
   // honored as an empty list — the operator's kill switch (zero stores → no work).
   const stores = env.CRAWLER_STORES === undefined ? [...DEFAULT_CRAWLER_STORES] : csv(env.CRAWLER_STORES);
+  const phases = phasesForMode(env.CRAWLER_MODE);
+  // CRAWLER_DRY_RUN is accepted as an ALIAS, and warns about its scope: it gates the re-observation
+  // lane ONLY. The discovery lanes have their own dry run (an enqueue cap of 0 — pages are fetched,
+  // nothing is POSTed), and a name that promised a whole-pass dry run while discovery still POSTed
+  // would be the worst kind of safety knob.
+  const aliasDryRun = boolFlag(env.CRAWLER_DRY_RUN);
+  if (aliasDryRun) {
+    logger.warn('[CRAWLER] CRAWLER_DRY_RUN gates the RE-OBSERVATION lane only — discovery still enqueues (use CRAWLER_MAX_ENQUEUE_PER_STORE=0 for that)');
+  }
 
   const scraperServiceUrl = (env.SCRAPER_SERVICE_URL || DEFAULTS.scraperServiceUrl).replace(/\/+$/, '');
   const ledgerDir = (env.CRAWLER_LEDGER_DIR ?? '').trim() || DEFAULTS.ledgerDir;
 
   return {
     scraperServiceUrl,
-    mode: parseMode(env.CRAWLER_MODE),
+    mode: labelPhases(phases),
+    phases,
     stores,
     ledgerDir,
     recentMaxPages: posInt(env.CRAWLER_RECENT_MAX_PAGES, DEFAULTS.recentMaxPages),
     backfillPagesPerRun: posInt(env.CRAWLER_BACKFILL_PAGES_PER_RUN, DEFAULTS.backfillPagesPerRun),
     maxRequests: nonNegInt(env.CRAWLER_MAX_REQUESTS, DEFAULTS.maxRequests),
     maxEnqueuePerStore: nonNegInt(env.CRAWLER_MAX_ENQUEUE_PER_STORE, DEFAULTS.maxEnqueuePerStore),
-    storeEnqueueCaps: parseStoreCaps(env.CRAWLER_STORE_ENQUEUE_CAPS),
+    storeEnqueueCaps: parseStoreCaps(env.CRAWLER_STORE_ENQUEUE_CAPS, 'CRAWLER_STORE_ENQUEUE_CAPS'),
     maxConcurrency: posInt(env.CRAWLER_MAX_CONCURRENCY, DEFAULTS.maxConcurrency),
     requestSpacingMs: posInt(env.CRAWLER_REQUEST_SPACING_MS, DEFAULTS.requestSpacingMs),
     requestTimeoutMs: posInt(env.CRAWLER_REQUEST_TIMEOUT_MS, DEFAULTS.requestTimeoutMs),
@@ -225,5 +323,11 @@ export function loadCrawlerConfig(env: Env = process.env): CrawlerConfig {
     rangeStores: csv(env.CRAWLER_RANGE_STORES ?? ''),
     rangeIdsPerRun: clampedPosInt(env.CRAWLER_RANGE_IDS_PER_RUN, DEFAULTS.rangeIdsPerRun, MAX_RANGE_IDS_PER_RUN, 'CRAWLER_RANGE_IDS_PER_RUN'),
     rangeFrontiers: parseFrontiers(env, stores),
+    // Hours, not ms: the operator reasons about this window in hours ("re-price nothing twice in a
+    // shift"), and an explicit 0 is honoured — it means "age is no bar", not "revert to 12 h".
+    reobserveMinAgeMs: nonNegInt(env.CRAWLER_REOBSERVE_MIN_AGE_H, DEFAULTS.reobserveMinAgeH) * 60 * 60 * 1000,
+    maxReobservePerStore: nonNegInt(env.CRAWLER_MAX_REOBSERVE_PER_STORE, DEFAULTS.maxReobservePerStore),
+    storeReobserveCaps: parseStoreCaps(env.CRAWLER_STORE_REOBSERVE_CAPS, 'CRAWLER_STORE_REOBSERVE_CAPS'),
+    reobserveDryRun: boolFlag(env.CRAWLER_REOBSERVE_DRY_RUN) || aliasDryRun || argv.includes('--dry-run'),
   };
 }
