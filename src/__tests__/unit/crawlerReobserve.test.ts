@@ -907,6 +907,24 @@ describe('runCrawlerPass — re-observation: the cap a store actually ran under,
     expect(unarmed.reobserveLaneSkipped).toBe('not-configured');
   });
 
+  it('when a store is BOTH unarmed and pulled out, the label is `not-configured` — config the operator never wrote beats config they did', async () => {
+    // Two true statements at once: no re-observe cap (nobody armed the lane here) AND a discovery cap
+    // of 0 (the store is out of the whole run). Requests and cap are 0 either way, so the only thing
+    // at stake is which of the two an operator reads — and "nobody armed it" is the one that explains
+    // the lane's silence without sending them to look at the store's discovery config.
+    const fake = makeFake();
+    const store = createMemoryLedgerStore({ goodsmileus: ledgerAged('goodsmileus', { a: 90, b: 80 }) });
+    const c = clock();
+    const s = await runCrawlerPass(
+      mkCfg({ storeEnqueueCaps: { goodsmileus: 0 } }), // no storeReobserveCaps entry, global default 0
+      { fetch: fake.fetch, ledgerStore: store, now: c.now },
+    );
+    expect(fake.calls).toEqual([]);
+    const st = storeSummary(s, 'goodsmileus');
+    expect(st.reobserveLaneSkipped).toBe('not-configured'); // NOT 'store-out'
+    expect(st.reobserveCapApplied).toBe(0);
+  });
+
   it('a corrupt ledger and a cooling host each report their own reason, not a cap', async () => {
     const fake = makeFake({ catalog: (siteId) =>
       siteId === 'anitoys'
