@@ -13,7 +13,8 @@
  *             from a frontier through GET /catalog?store=&range=1&from=&count=, which SYNTHESIZES
  *             the window's {itemId, collectUrl} pairs from the store's byId template without
  *             fetching anything upstream. Only stores named in config.rangeStores walk. The
- *             frontier is the highest numeric itemId the ledger has seen, else the operator's
+ *             frontier is the highest numeric itemId the ledger has seen (never one the gap sweep
+ *             wrote), else the operator's
  *             CRAWLER_RANGE_FRONTIER_<SITEID> seed; with neither, the walk is skipped with a WARN.
  *             The window's cursor is durable (ledger.range.cursor) and moves DOWN only over ids
  *             actually handled, so nothing is ever re-walked and nothing is stranded; it shares the
@@ -70,7 +71,7 @@ import { logger } from '../utils/logger.js';
 import { classifyFetchFailure } from '../services/failureClassifier.js';
 import type { FetchFailureReport, ReportFetchFailure } from '../services/failureReporter.js';
 import type { CrawlerConfig, CrawlerMode } from './config.js';
-import type { Ledger, LedgerRange, LedgerStore } from './ledger.js';
+import type { Ledger, LedgerGapBand, LedgerGapOrigin, LedgerRange, LedgerStore } from './ledger.js';
 
 export type { CrawlerConfig, CrawlerMode } from './config.js';
 
@@ -191,6 +192,37 @@ export interface CrawlerStoreSummary {
    */
   rangeSkipped: RangeSkipReason | null;
   /**
+   * RE-ANCHOR (D5): the id the frontier was moved UP to this run, `null` when it was not moved. The
+   * frontier itself is `rangeFrontier`; this field is what says the move HAPPENED, which is the whole
+   * acceptance signal for the lane (a frontier that merely reads high may never have moved at all).
+   */
+  rangeReanchoredTo: number | null;
+  /**
+   * RE-ANCHOR: the id the frontier would have moved to when CRAWLER_RANGE_REANCHOR_MAX_DELTA refused the
+   * move this run, `null` otherwise. The refusal repeats every run until the ledger or the knob changes.
+   */
+  rangeReanchorRefused: number | null;
+  /** GAP SWEEP: known-gap bands still open for this store AFTER this run (the backlog). */
+  gapBandsOpen: number;
+  /** GAP SWEEP: ids still unswept across those open bands (POSTed + skipped as known both count as swept). */
+  gapIdsRemaining: number;
+  /** GAP SWEEP: ids the sweep HANDLED this run — POSTed, skipped as known, or deterministically rejected. */
+  gapIdsSwept: number;
+  /**
+   * GAP SWEEP: POSTs the sweep landed. Kept OUT of `enqueued` deliberately: `enqueued` is what
+   * `capApplied` bounds, and a store reading `enqueued: 9, capApplied: 5` reads as a breached
+   * discovery cap to anyone scanning the fleet logs (the D4 lesson, applied to a second lane).
+   */
+  gapEnqueued: number;
+  /**
+   * GAP SWEEP: the budget the sweep ACTUALLY ran under for this store, and 0 whenever it could not
+   * sweep at all — not the CONFIGURED value, which would send an operator hunting a broken lane
+   * instead of reading `gapSkipped`.
+   */
+  gapBudgetApplied: number;
+  /** GAP SWEEP: why the sweep did no work this run, `null` when it swept. */
+  gapSkipped: GapSkipReason | null;
+  /**
    * Per-list stats for a `seed`-mode run, in the order the lists were polled. Empty in every other
    * mode, and empty for a store whose seed pass never got a list (no declaration, or a stop).
    */
@@ -227,6 +259,10 @@ export interface CrawlerSummary {
   /** RE-OBSERVE: POSTs the LANE landed across every store this run. */
   totalReobserveLanded: number;
   totalRangeWalked: number;
+  /** GAP SWEEP: ids swept across every store this run. */
+  totalGapIdsSwept: number;
+  /** GAP SWEEP: POSTs the sweep landed across every store this run (never counted in `totalEnqueued`). */
+  totalGapEnqueued: number;
   totalErrors: number;
   totalSkipped: number;
   /** The per-store enqueue caps that actually applied this run, keyed by siteId (a cap for a store not crawled is not listed). */
@@ -272,7 +308,37 @@ export type ReobserveSkipReason =
   | 'store-stopped';
 
 /** Why the id-range walk made no window request this run. */
-export type RangeSkipReason = StopReason | 'not-configured' | 'not-run' | 'store-stopped' | 'cap' | 'no-frontier' | 'floor' | 'window-malformed';
+export type RangeSkipReason =
+  | StopReason
+  | 'not-configured'
+  | 'not-run'
+  | 'store-stopped'
+  | 'cap'
+  | 'no-frontier'
+  | 'floor'
+  | 'window-malformed'
+  | 'window-rejected';
+
+/**
+ * Why the KNOWN-GAP SWEEP made no window request this run. Starvation and an empty band list look
+ * identical from the outside — both are "no gap window was fetched" — so the sweep names which.
+ */
+export type GapSkipReason =
+  | StopReason
+  /** The store is not in CRAWLER_RANGE_STORES, or CRAWLER_RANGE_GAP_BUDGET is 0: the sweep is off. */
+  | 'not-configured'
+  /** The id-range phases did not run this pass (CRAWLER_MODE does not name `backfill`). */
+  | 'not-run'
+  /** The store was stopped before the sweep — a cooling host, a sick scraper, a ledger failure. */
+  | 'store-stopped'
+  /** Nothing to sweep: every band this store has is closed (or it has none). */
+  | 'no-gap'
+  /** CRAWLER_RANGE_GAP_DRY_RUN: the bands were printed and nothing was fetched or POSTed. */
+  | 'dry-run'
+  /** A window came back as something other than the descending run it asked for. */
+  | 'window-malformed'
+  /** /ingest/scrape refused every id a window offered, so the band cursor was kept. */
+  | 'window-rejected';
 
 type PageOutcome = { kind: 'page'; items: CatalogItem[]; hasMore: boolean } | { kind: 'stopped'; reason: StopReason };
 
@@ -284,7 +350,17 @@ interface SeedListTarget {
 
 type PostOutcome = 'accepted' | 'accepted-dedup' | 'rejected' | 'transient' | 'budget';
 
-type Phase = 'recent' | 'backfill' | 'range' | 'seed' | 'reobserve';
+/**
+ * A POST budget one lane spends on its own. The DISCOVERY phases spend `StoreState.posts` against
+ * `StoreState.enqueueCap`; a lane that passes one of these to `processPage` spends THIS instead, so a
+ * discovery cap already exhausted cannot starve it and it cannot breach the discovery cap in return.
+ */
+interface LaneBudget {
+  spent: number;
+  cap: number;
+}
+
+type Phase = 'recent' | 'backfill' | 'range' | 'gap' | 'seed' | 'reobserve';
 
 interface StoreState {
   siteId: string;
@@ -303,6 +379,8 @@ interface StoreState {
   stopped: boolean;
   /** The per-store enqueue cap blocked a POST this run. */
   capReached: boolean;
+  /** The KNOWN-GAP SWEEP's own budget for the run — SEPARATE from `enqueueCap`, so neither lane starves the other. */
+  gapBudget: LaneBudget;
   /** An explicit DISCOVERY cap of 0 pulled this store out of the whole run before any request. */
   pulledOut: boolean;
   /**
@@ -391,6 +469,13 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
   for (const siteId of config.rangeStores) {
     if (!stores.includes(siteId)) logger.warn('[CRAWLER] CRAWLER_RANGE_STORES names a store that is not in CRAWLER_STORES — no id-range walk', { siteId });
   }
+  // A declared gap band only means something on a store that WALKS its id space. Dropping one
+  // silently would leave an operator believing a band they named is being filled.
+  for (const siteId of Object.keys(config.rangeGaps)) {
+    if (!stores.includes(siteId) || !config.rangeStores.includes(siteId)) {
+      logger.warn('[CRAWLER] CRAWLER_RANGE_GAPS names a store that is not id-range walked — no band adopted', { siteId });
+    }
+  }
 
   /**
    * Fire ONE ledger row. Best effort: no reporter is a no-op, and neither a synchronous throw nor a
@@ -466,6 +551,15 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       rangeCursor: null,
       rangeFrontier: null,
       rangeSkipped: config.rangeStores.includes(siteId) ? 'not-run' : 'not-configured',
+      rangeReanchoredTo: null,
+      rangeReanchorRefused: null,
+      gapBandsOpen: 0,
+      gapIdsRemaining: 0,
+      gapIdsSwept: 0,
+      gapEnqueued: 0,
+      // An APPLIED budget: 0 until the sweep actually takes this store on (see gapSweep).
+      gapBudgetApplied: 0,
+      gapSkipped: config.rangeStores.includes(siteId) ? 'not-run' : 'not-configured',
       seedLists: [],
       seedStopped: null,
       backfillCursor: null,
@@ -480,6 +574,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     // existing discovery-only meaning — pages are fetched, nothing is POSTed.
     stopped: Object.prototype.hasOwnProperty.call(capOverrides, siteId) && capOverrides[siteId] === 0,
     capReached: false,
+    gapBudget: { spent: 0, cap: config.rangeGapBudget },
     pulledOut: Object.prototype.hasOwnProperty.call(capOverrides, siteId) && capOverrides[siteId] === 0,
     listingUnsupported: false,
     deepestRecentPage: 0,
@@ -502,6 +597,11 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       st.summary.backfillCursor = st.ledger.backfill.cursor;
       st.summary.rangeCursor = st.ledger.range?.cursor ?? null;
       st.summary.rangeFrontier = st.ledger.range?.frontier ?? null;
+      // Read off the LEDGER, not off whatever the sweep did: the backlog is worth reporting on a
+      // store whose sweep is switched off entirely, which is exactly how mfc will first be armed.
+      const open = (st.ledger.range?.gaps ?? []).filter((b) => b.closedAt === undefined && b.next <= b.to);
+      st.summary.gapBandsOpen = open.length;
+      st.summary.gapIdsRemaining = open.reduce((n, b) => n + (b.to - b.next + 1), 0);
       st.summary.exhaustCandidate = st.ledger.backfill.exhaustCandidateCursor !== undefined;
       st.summary.exhausted = st.ledger.backfill.exhaustedAt !== undefined;
     }
@@ -522,6 +622,8 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       totalReobserved: perStore.reduce((n, s) => n + s.reobserved, 0),
       totalReobserveLanded: perStore.reduce((n, s) => n + s.reobserveLanded, 0),
       totalRangeWalked: perStore.reduce((n, s) => n + s.rangeWalked, 0),
+      totalGapIdsSwept: perStore.reduce((n, s) => n + s.gapIdsSwept, 0),
+      totalGapEnqueued: perStore.reduce((n, s) => n + s.gapEnqueued, 0),
       totalErrors: perStore.reduce((n, s) => n + s.errors, 0),
       totalSkipped: perStore.reduce((n, s) => n + s.skipped, 0),
       enqueueCapOverrides,
@@ -774,6 +876,14 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     st: StoreState,
     items: CatalogItem[],
     phase: Phase,
+    /**
+     * The lane's OWN POST budget. Absent = the DISCOVERY budget (`st.posts` / `st.enqueueCap`), which
+     * is what every phase but the gap sweep spends. Passing one swaps BOTH the counter and the
+     * ceiling, so the two lanes can never spend or breach each other's.
+     */
+    budget?: LaneBudget,
+    /** GAP SWEEP: the origin of the band this window was cut from, stamped on every entry it writes. */
+    sweptFrom?: LedgerGapOrigin,
   ): Promise<{ newCount: number; allAttempted: boolean; handled: number; accepted: number; rejected: number; stopReason?: StopReason }> => {
     const ledger = st.ledger!;
     let newCount = 0;
@@ -813,22 +923,32 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
         firstUnhandled ??= index;
         continue;
       }
-      if (st.posts >= st.enqueueCap) {
+      if ((budget ? budget.spent : st.posts) >= (budget ? budget.cap : st.enqueueCap)) {
+        // Only the DISCOVERY budget can actually block here. A lane that brings its own sizes each
+        // window to what is LEFT of that budget (see gapSweep), so it never offers this loop more ids
+        // than it may spend — which is why the flag below is unconditionally the discovery one.
         st.capReached = true;
         allAttempted = false;
         firstUnhandled ??= index;
         continue;
       }
-      st.posts++;
+      if (budget) budget.spent++;
+      else st.posts++;
       st.attempted.add(item.itemId);
       const outcome = await postOne(st, item.collectUrl, item.itemId);
       switch (outcome) {
         case 'accepted':
         case 'accepted-dedup':
-          ledger.enqueued[item.itemId] = { at: iso(), collectUrl: item.collectUrl };
+          ledger.enqueued[item.itemId] = { at: iso(), collectUrl: item.collectUrl, ...(sweptFrom ? { sweptFrom } : {}) };
           accepted++;
-          st.summary.enqueued++;
-          if (outcome === 'accepted-dedup') st.summary.deduplicated++;
+          // The SWEEP's landings are the sweep's own number. `enqueued` is what `capApplied` bounds,
+          // and `deduplicated` is "of `enqueued`" — a sweep POST in either would make a store summary
+          // read as a breached discovery cap. `gapEnqueued` counts coalesced POSTs too: they landed.
+          if (phase === 'gap') st.summary.gapEnqueued++;
+          else {
+            st.summary.enqueued++;
+            if (outcome === 'accepted-dedup') st.summary.deduplicated++;
+          }
           if (reobserve) st.summary.reobserved++;
           break;
         case 'rejected':
@@ -844,7 +964,8 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
           break;
         case 'budget':
           // Not dispatched: undo the attempt bookkeeping; the run is over for this store.
-          st.posts--;
+          if (budget) budget.spent--;
+          else st.posts--;
           st.attempted.delete(item.itemId);
           budgetExhausted = true;
           st.stopped = true;
@@ -1075,10 +1196,15 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     }
   };
 
-  /** The highest itemId the ledger has seen for this store that reads as a positive integer. */
+  /**
+   * The highest positive-integer itemId in the ledger, IGNORING entries the gap sweep wrote: a swept id
+   * was synthesized from the byId template, and /ingest/scrape accepts one whether or not the item
+   * exists, so trusting it would let a declared band become the frontier.
+   */
   const highestNumericId = (ledger: Ledger): number | undefined => {
     let best: number | undefined;
-    for (const id of Object.keys(ledger.enqueued)) {
+    for (const [id, entry] of Object.entries(ledger.enqueued)) {
+      if (entry?.sweptFrom !== undefined) continue;
       if (!/^\d+$/.test(id)) continue;
       const n = Number(id);
       if (!Number.isSafeInteger(n) || n < 1) continue;
@@ -1103,25 +1229,273 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
    * that do not exist at the store are EXPECTED — the ingest fetch answers 404 and the miss is
    * recorded there; the crawler cannot see it and does not pretend to.
    */
-  const rangePhase = async (st: StoreState): Promise<void> => {
-    if (!config.rangeStores.includes(st.siteId)) return;
+  /** A DEEP copy: `gaps` is an array of objects, so the spread the descent used alone would share it. */
+  const cloneRange = (range: LedgerRange): LedgerRange => JSON.parse(JSON.stringify(range)) as LedgerRange;
+
+  /**
+   * The bands still to sweep, OLDEST FIRST — the order Ross asked for, and the order that keeps a
+   * band the re-anchor recorded weeks ago from sitting behind every band recorded since. Ties break
+   * on the low id, because a run that adopts two operator bands stamps both with the same instant.
+   */
+  const openBands = (range: LedgerRange): LedgerGapBand[] =>
+    (range.gaps ?? [])
+      .filter((b) => b.closedAt === undefined && b.next <= b.to)
+      .sort((a, b) => (a.createdAt === b.createdAt ? a.from - b.from : a.createdAt < b.createdAt ? -1 : 1));
+
+  /**
+   * DAILY FRONTIER RE-ANCHOR (D5, Ross 2026-09-18) — the answer to "the descent walks away from a
+   * frontier the store keeps growing past".
+   *
+   * The descent starts at a frontier and walks DOWN, so every id the store adds afterwards is above
+   * everything it will ever reach. The only thing watching that end of the id space is the Latest
+   * Additions tap: ONE page with no pager, which sees whatever turned over since the last run and
+   * nothing else. mfc's frontier has been frozen at 3,765,215 while the cursor walks the 3.72M band.
+   *
+   * So once per CRAWLER_RANGE_REANCHOR_H the frontier is moved up to the newest id in the ledger that
+   * the gap sweep did NOT write (see highestNumericId): above the frontier, that is what a listing (the
+   * tap) has shown us. The band between the old frontier and the new one is recorded as a KNOWN GAP for
+   * the sweep to fill. The descent's cursor is NOT touched: it is walking a different part of the id
+   * space and owns its own progress.
+   *
+   * A move wider than CRAWLER_RANGE_REANCHOR_MAX_DELTA is refused with a WARN and tried again next run:
+   * a jump that size is a bad id, and the band it would record could never be swept.
+   *
+   * Costs no request: it reads the ledger this pass has already loaded.
+   */
+  const reanchorFrontier = (st: StoreState, range: LedgerRange): boolean => {
+    // A store that has never walked has no frontier to move. The descent seeds one from this very
+    // number moments later, and a band recorded now would be the empty band above it.
+    if (range.frontier === undefined) return false;
+    // An unparseable stamp reads as infinitely old and re-anchors — the self-healing direction: the
+    // worst case is one extra band, against a cadence that silently never fires again.
+    if (range.reanchoredAt !== undefined && ageMs(range.reanchoredAt) < config.rangeReanchorMs) return false;
+    const newest = highestNumericId(st.ledger!);
+    if (newest === undefined || newest <= range.frontier) return false;
+    const delta = newest - range.frontier;
+    if (delta > config.rangeReanchorMaxDelta) {
+      // Not stamped: the refusal repeats every run until the ledger or the knob changes.
+      logger.warn('[CRAWLER] id-range re-anchor refused: the move exceeds CRAWLER_RANGE_REANCHOR_MAX_DELTA', {
+        siteId: st.siteId,
+        frontier: range.frontier,
+        newest,
+        delta,
+        maxDelta: config.rangeReanchorMaxDelta,
+      });
+      st.summary.rangeReanchorRefused = newest;
+      return false;
+    }
+    const band: LedgerGapBand = {
+      from: range.frontier + 1,
+      to: newest,
+      next: range.frontier + 1,
+      origin: 'reanchor',
+      createdAt: iso(),
+    };
+    logger.info('[CRAWLER] id-range frontier re-anchored — the band it skipped is now a known gap', {
+      siteId: st.siteId,
+      previousFrontier: range.frontier,
+      frontier: newest,
+      band: `${band.from}-${band.to}`,
+      width: band.to - band.from + 1,
+    });
+    (range.gaps ??= []).push(band);
+    range.frontier = newest;
+    range.reanchoredAt = iso();
+    st.summary.rangeReanchoredTo = newest;
+    return true;
+  };
+
+  /**
+   * Adopt this store's `CRAWLER_RANGE_GAPS` declarations — "several ids or cluster ranges to track" —
+   * as bands of its own, once. A band is matched on its endpoints against EVERY band the store has,
+   * OPEN OR CLOSED: a declaration left in the manifest after its band was filled would otherwise
+   * re-open it on every run, and the sweep would spend its budget re-walking ids it already has.
+   *
+   * A declared band must lie AT OR BELOW the frontier. Above it the re-anchor records bands from ids a
+   * listing has shown us; a declared band up there is a typo the sweep would turn into ledger entries
+   * for ids nobody has seen. It is refused, with a WARN, on every run that finds it above the frontier.
+   */
+  const adoptOperatorGaps = (st: StoreState, range: LedgerRange): boolean => {
+    let added = false;
+    for (const decl of config.rangeGaps[st.siteId] ?? []) {
+      if ((range.gaps ?? []).some((b) => b.from === decl.from && b.to === decl.to)) continue;
+      if (range.frontier === undefined || decl.to > range.frontier) {
+        logger.warn('[CRAWLER] CRAWLER_RANGE_GAPS band not adopted: a declared band must lie at or below the id-range frontier', {
+          siteId: st.siteId,
+          band: `${decl.from}-${decl.to}`,
+          frontier: range.frontier ?? null,
+        });
+        continue;
+      }
+      (range.gaps ??= []).push({ from: decl.from, to: decl.to, next: decl.from, origin: 'operator', createdAt: iso() });
+      added = true;
+      logger.info('[CRAWLER] known gap adopted from CRAWLER_RANGE_GAPS', {
+        siteId: st.siteId,
+        band: `${decl.from}-${decl.to}`,
+        width: decl.to - decl.from + 1,
+      });
+    }
+    return added;
+  };
+
+  /**
+   * KNOWN-GAP SWEEP (D5) — fill the bands the descent will never reach, ASCENDING, oldest band first.
+   *
+   * SAME URL SHAPE, NO NEW ROUTE. A gap window is the SAME `GET /catalog?range=1&from=&count=` the
+   * descent uses, which SYNTHESIZES {itemId, collectUrl} from the store's byId template: the sweep
+   * introduces no path mfc's robots.txt has not already allowed, because it introduces no path.
+   *
+   * WHY THE WINDOW IS REVERSED. The engine serves a DESCENDING run from `from`, and `processPage`
+   * hands back how far it got as a PREFIX of what it was given. A band is swept upward, so the prefix
+   * has to start at the band's low-water mark: the window is validated as the exact descending run it
+   * asked for (anything else would strand ids silently) and then reversed, so `handled` is a prefix
+   * from `next` upward and `next += handled` can never skip an id the budget cut off.
+   *
+   * ITS OWN BUDGET, THE SAME GATE. `CRAWLER_RANGE_GAP_BUDGET` is the ids the sweep may touch per run
+   * (default 0 = off) — and therefore also a ceiling on its ingest POSTs, since an id costs at most
+   * one. It is SEPARATE from the discovery cap, so the descent cannot starve the sweep nor the sweep
+   * the descent. Ids already in the ledger count against it even though they cost no request: without
+   * that, a band the tap has largely covered would spend a whole run's GLOBAL budget on window GETs
+   * discovering it. Every request still passes the ONE global gate — concurrency, total budget,
+   * dispatch spacing — and the store's pacing downstream is untouched.
+   */
+  const gapSweep = async (st: StoreState, range: LedgerRange, commit: () => Promise<boolean>): Promise<void> => {
+    const skip = (reason: GapSkipReason): void => {
+      st.summary.gapSkipped = reason;
+    };
+    const budget = st.gapBudget;
+    if (budget.cap <= 0) return skip('not-configured');
+    const bands = openBands(range);
+    if (bands.length === 0) return skip('no-gap');
+    // A cooling host, a sick scraper or a failed save stopped the store: the sweep wants the same
+    // egress as everything else, so it waits for the next run like every other lane.
+    if (st.stopped) return skip('store-stopped');
+
+    if (config.rangeGapDryRun) {
+      // The BACKLOG, and not one request: what the sweep would walk, for an operator arming a store.
+      const shown = bands.slice(0, 20);
+      logger.info('[CRAWLER] id-range gap sweep DRY RUN — bands not swept', {
+        siteId: st.siteId,
+        budget: budget.cap,
+        bandsOpen: bands.length,
+        idsRemaining: bands.reduce((n, b) => n + (b.to - b.next + 1), 0),
+        bands: shown.map((b) => ({ band: `${b.from}-${b.to}`, next: b.next, remaining: b.to - b.next + 1, origin: b.origin })),
+        ...(bands.length > shown.length ? { truncated: true } : {}),
+      });
+      return skip('dry-run');
+    }
+
+    st.summary.gapBudgetApplied = budget.cap;
+    st.summary.gapSkipped = null;
+
+    // Why the sweep stopped EARLY, when it did. Running the budget out or closing the last band is
+    // not a skip — it is the lane doing its work — so those leave the reason null.
+    let stop: GapSkipReason | null = null;
+    while (!st.stopped && budget.spent < budget.cap && st.summary.gapIdsSwept < budget.cap) {
+      // Re-read each turn: the band just swept may have closed, and the next one is then the oldest.
+      const band = openBands(range)[0];
+      if (band === undefined) break;
+      // Bounded three ways: the engine's window ceiling, what is left of THIS band, and what is left
+      // of the run's own allowance — so a generous CRAWLER_RANGE_IDS_PER_RUN cannot overshoot the
+      // pacing budget the residential lane was sized for.
+      const count = Math.min(config.rangeIdsPerRun, band.to - band.next + 1, budget.cap - st.summary.gapIdsSwept);
+      const from = band.next + count - 1;
+      const where = { from, count, band: `${band.from}-${band.to}` };
+      const out = await fetchCatalog(st, rangeUrl(st.siteId, from, count), where, 'gap');
+      if (out.kind !== 'page') {
+        stop = out.reason;
+        break;
+      }
+      // The sweep advances by POSITION, so the window must be EXACTLY the descending run it asked
+      // for — full length included. A short window (unlike the descent's, which may bottom out at id
+      // 1) would leave the band's lowest ids out of the slice entirely, and advancing over what came
+      // back would strand them for good.
+      const exact = out.items.length === count && out.items.every((it, i) => it.itemId === String(from - i));
+      if (!exact) {
+        st.summary.errors++;
+        logger.warn('[CRAWLER] gap window is not the requested descending run — band cursor kept', {
+          siteId: st.siteId,
+          ...where,
+          received: out.items.length,
+          firstId: out.items[0]?.itemId,
+        });
+        // E11 — walking this would silently strand the band's lowest ids, so the sweep stops here.
+        emitFailure({
+          site: st.siteId,
+          target: listingTarget(st.siteId, 'gap', where),
+          kind: 'listing',
+          origin: 'crawler',
+          reasonClass: 'ruleset',
+          message: `gap window is not the requested descending run from ${from} (received ${out.items.length}, first ${out.items[0]?.itemId ?? 'none'})`,
+        });
+        stop = 'window-malformed';
+        break;
+      }
+      const { handled, rejected, stopReason } = await processPage(st, [...out.items].reverse(), 'gap', budget, band.origin);
+      if (handled === 0) {
+        // Not one id got through, so nothing durable changes. Only the GLOBAL gate can do this: the
+        // window was sized to what this lane's own budget still allowed, which makes its first id one
+        // the sweep was entitled to spend.
+        logger.info('[CRAWLER] gap window yielded no walkable id — band cursor kept', { siteId: st.siteId, ...where });
+        stop = stopReason ?? 'budget';
+        break;
+      }
+      if (rejected > 0 && rejected === handled) {
+        // Every id the window offered was deterministically refused (4xx — typically an engine /
+        // ruleset skew on the store's byId url). That is a property of the STORE, not of this band:
+        // sweeping past them would spend the band collecting nothing. A window that also held known
+        // ids is not this case: it advances, and each refusal keeps its own E10 row.
+        logger.warn('[CRAWLER] gap window entirely rejected by ingest — band cursor kept', { siteId: st.siteId, ...where, rejected });
+        emitFailure({
+          site: st.siteId,
+          target: listingTarget(st.siteId, 'gap', where),
+          kind: 'listing',
+          origin: 'crawler',
+          reasonClass: 'ruleset',
+          message: `every id in the gap window from ${from} was refused by /ingest/scrape (${rejected} rejected)`,
+        });
+        stop = 'window-rejected';
+        break;
+      }
+      // Credited only now, and deliberately NOT like `rangeWalked`: `gapIdsSwept` is ids the band
+      // cursor MOVED over. A window the store refused entirely moves nothing, and counting it here
+      // would report progress against a backlog that did not shrink.
+      st.summary.gapIdsSwept += handled;
+      band.next += handled;
+      band.updatedAt = iso();
+      if (band.next > band.to) {
+        band.closedAt = iso();
+        logger.info('[CRAWLER] known gap band closed — every id swept', {
+          siteId: st.siteId,
+          band: `${band.from}-${band.to}`,
+          origin: band.origin,
+          width: band.to - band.from + 1,
+        });
+      }
+      // Saved after EVERY window, like the descent: a pod killed between two windows must not re-walk
+      // a band it already swept.
+      if (!(await commit())) {
+        stop = 'failed';
+        break;
+      }
+      if (stopReason) {
+        stop = stopReason;
+        break;
+      }
+    }
+    if (stop) skip(stop);
+  };
+
+  const descentPhase = async (st: StoreState, range: LedgerRange, commit: () => Promise<boolean>): Promise<void> => {
     const skip = (reason: RangeSkipReason): void => {
       st.summary.rangeSkipped = reason;
     };
-    if (!st.ledger) return skip('store-stopped');
-    // A 422 on the LISTING axis says nothing about this one — mfc has no byListing yet but a full id
-    // space. Any other stop reason (cooldown, budget, a sick scraper, a ledger failure) still holds.
-    if (st.stopped && !st.listingUnsupported) return skip('store-stopped');
     // The walk shares the store's enqueue cap and runs LAST, so a listing that spends the whole cap
-    // starves it — reported, because it otherwise reads exactly like a store that never walks.
+    // starves it — reported, because it otherwise reads exactly like a store that never walks. The
+    // GAP SWEEP is NOT held back by this: it spends its own budget.
     if (st.capReached) return skip('cap');
-    st.stopped = false;
 
-    const ledger = st.ledger;
-    const range = (ledger.range ??= { cursor: null });
-    // The state as the LEDGER holds it. A save that fails is restored onto it, so the run summary
-    // never reports a cursor the next run will not resume from.
-    const durable: LedgerRange = { ...range };
+    const ledger = st.ledger!;
     const seed = config.rangeFrontiers[st.siteId];
     let cursor = range.cursor;
     if (cursor === null) {
@@ -1183,7 +1557,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       });
       return skip('window-malformed');
     }
-    const { handled, accepted, rejected } = await processPage(st, out.items, 'range');
+    const { handled, rejected } = await processPage(st, out.items, 'range');
     st.summary.rangeWalked += handled;
     if (handled === 0) {
       // Not one id got through (the cap ran out on the window's very first id, or the budget did):
@@ -1191,7 +1565,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       logger.info('[CRAWLER] id-range window yielded no walkable id — cursor kept', { siteId: st.siteId, from: cursor });
       return skip(st.capReached ? 'cap' : 'budget');
     }
-    if (accepted === 0 && rejected > 0) {
+    if (rejected > 0 && rejected === handled) {
       // Every id the window offered was deterministically refused by /ingest/scrape (4xx — typically
       // no ruleset matches the store's byId url, i.e. an engine/ruleset skew). That is a property of
       // the STORE, not of these ids: walking past them would spend the id space collecting nothing
@@ -1209,11 +1583,59 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
         reasonClass: 'ruleset',
         message: `every id in the window from ${cursor} was refused by /ingest/scrape (${rejected} rejected)`,
       });
-      return;
+      return skip('window-rejected');
     }
     range.cursor = Math.max(0, cursor - handled);
     range.updatedAt = iso();
-    if (!(await persist(st))) ledger.range = durable;
+    await commit();
+  };
+
+  /**
+   * The store's whole ID-RANGE axis for one run, in the order the three parts earn their priority:
+   *
+   *   1. RE-ANCHOR + adopt the operator's bands — no requests at all, so they happen even on a store
+   *      whose discovery cap is already spent and whose descent will not move an inch.
+   *   2. DESCENT — the deep id space, on the store's discovery cap.
+   *   3. GAP SWEEP — the bands above the frontier, on its OWN budget, so a spent discovery cap cannot
+   *      starve it. It runs last because the deep walk is the older commitment and the newest ids
+   *      already have the Latest Additions tap watching them.
+   */
+  const rangePhase = async (st: StoreState): Promise<void> => {
+    if (!config.rangeStores.includes(st.siteId)) return;
+    const skipBoth = (reason: RangeSkipReason & GapSkipReason): void => {
+      st.summary.rangeSkipped = reason;
+      st.summary.gapSkipped = reason;
+    };
+    if (!st.ledger) return skipBoth('store-stopped');
+    // A 422 on the LISTING axis says nothing about this one — mfc has no byListing yet but a full id
+    // space. Any other stop reason (cooldown, budget, a sick scraper, a ledger failure) still holds.
+    if (st.stopped && !st.listingUnsupported) return skipBoth('store-stopped');
+    st.stopped = false;
+
+    const ledger = st.ledger;
+    const range = (ledger.range ??= { cursor: null });
+    // The state as the LEDGER holds it, refreshed after every successful save. A save that fails is
+    // restored onto it, so the run summary never reports a cursor — or a band — that the next run
+    // will not resume from.
+    let durable: LedgerRange = cloneRange(range);
+    const commit = async (): Promise<boolean> => {
+      if (await persist(st)) {
+        durable = cloneRange(range);
+        return true;
+      }
+      ledger.range = durable;
+      return false;
+    };
+
+    // Bookkeeping first, and PERSISTED on its own: a re-anchor that only reached the disk when the
+    // descent happened to save would be lost on exactly the runs where the descent does nothing.
+    // Re-anchor BEFORE adopting, so a declared band is checked against the freshest frontier.
+    const reanchored = reanchorFrontier(st, range);
+    const adopted = adoptOperatorGaps(st, range);
+    if ((adopted || reanchored) && !(await commit())) return skipBoth('failed');
+
+    await descentPhase(st, range, commit);
+    await gapSweep(st, range, commit);
   };
 
   /**

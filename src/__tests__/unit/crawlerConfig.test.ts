@@ -319,4 +319,66 @@ describe('loadCrawlerConfig — the re-observation lane', () => {
       warn.mockRestore();
     }
   });
+  it('CRAWLER_RANGE_REANCHOR_H is hours → ms, defaults to a day, honours an explicit 0, and ignores junk', () => {
+    expect(loadCrawlerConfig({}).rangeReanchorMs).toBe(24 * 60 * 60 * 1000);
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_REANCHOR_H: '6' }).rangeReanchorMs).toBe(6 * 60 * 60 * 1000);
+    // 0 is "re-anchor every run", not "revert to a day": a cadence knob must not fail SLOW.
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_REANCHOR_H: '0' }).rangeReanchorMs).toBe(0);
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_REANCHOR_H: 'x' }).rangeReanchorMs).toBe(24 * 60 * 60 * 1000);
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_REANCHOR_H: '-3' }).rangeReanchorMs).toBe(24 * 60 * 60 * 1000);
+  });
+
+  it('CRAWLER_RANGE_REANCHOR_MAX_DELTA bounds one re-anchor: 50,000 by default, an explicit 0 honoured, junk ignored', () => {
+    expect(loadCrawlerConfig({}).rangeReanchorMaxDelta).toBe(50_000);
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_REANCHOR_MAX_DELTA: '120000' }).rangeReanchorMaxDelta).toBe(120_000);
+    // A safety bound at its most conservative setting must not revert to the generous default.
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_REANCHOR_MAX_DELTA: '0' }).rangeReanchorMaxDelta).toBe(0);
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_REANCHOR_MAX_DELTA: 'lots' }).rangeReanchorMaxDelta).toBe(50_000);
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_REANCHOR_MAX_DELTA: '-1' }).rangeReanchorMaxDelta).toBe(50_000);
+  });
+
+  it('CRAWLER_RANGE_GAP_BUDGET is the gap sweep own per-run budget and stays 0 (off) unless set', () => {
+    expect(loadCrawlerConfig({}).rangeGapBudget).toBe(0);
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_GAP_BUDGET: '100' }).rangeGapBudget).toBe(100);
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_GAP_BUDGET: '0' }).rangeGapBudget).toBe(0);
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_GAP_BUDGET: 'junk' }).rangeGapBudget).toBe(0);
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_GAP_BUDGET: '-5' }).rangeGapBudget).toBe(0);
+  });
+
+  it('parses CRAWLER_RANGE_GAPS into per-store bands, accepting a range and a single id', () => {
+    const c = loadCrawlerConfig({ CRAWLER_RANGE_GAPS: ' mfc:3765216-3801000 , mfc:123456 ,orzgk:10-12 ' });
+    expect(c.rangeGaps).toEqual({
+      mfc: [
+        { from: 3765216, to: 3801000 },
+        { from: 123456, to: 123456 },
+      ],
+      orzgk: [{ from: 10, to: 12 }],
+    });
+  });
+
+  it('drops a malformed CRAWLER_RANGE_GAPS entry with a WARN naming it, and keeps the well-formed ones', () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      const c = loadCrawlerConfig({ CRAWLER_RANGE_GAPS: 'mfc:10-12,mfc:20-19,mfc:0-5,mfc:abc,nope,mfc:1.5-9,bad site:1-2' });
+      expect(c.rangeGaps).toEqual({ mfc: [{ from: 10, to: 12 }] });
+      expect(warn.mock.calls.filter((call) => String(call[0]).includes('CRAWLER_RANGE_GAPS')).length).toBe(6);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('CRAWLER_RANGE_GAP_DRY_RUN arms the sweep dry run; --dry-run and CRAWLER_DRY_RUN arm BOTH lanes', () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      expect(loadCrawlerConfig({}).rangeGapDryRun).toBe(false);
+      expect(loadCrawlerConfig({ CRAWLER_RANGE_GAP_DRY_RUN: '1' }).rangeGapDryRun).toBe(true);
+      // Gating only ONE lane would be the worst kind of safety knob: a `--dry-run` the operator
+      // believed covered the pass while the sweep went on enqueueing.
+      expect(loadCrawlerConfig({}, ['node', 'run.js', '--dry-run']).rangeGapDryRun).toBe(true);
+      expect(loadCrawlerConfig({ CRAWLER_DRY_RUN: '1' }).rangeGapDryRun).toBe(true);
+      expect(loadCrawlerConfig({ CRAWLER_RANGE_GAP_DRY_RUN: '1' }).reobserveDryRun).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
+  });
 });
