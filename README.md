@@ -656,9 +656,10 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
 | `CRAWLER_RANGE_STORES` | *(none)* | csv of siteIds that walk their sequential id space; empty = no id-range walking at all |
 | `CRAWLER_RANGE_IDS_PER_RUN` | `50` | Max ids walked per store per run (the window asked of `/catalog?range=1`); clamped to the engine's `200`-id ceiling with a WARN |
 | `CRAWLER_RANGE_FRONTIER_<SITEID>` | *(none)* | Seed frontier for a store whose ledger has no numeric itemId yet; CHANGING it later re-seeds the walk from the new top. `<SITEID>` = the siteId uppercased with every non-alphanumeric character replaced by `_` |
-| `CRAWLER_RANGE_REANCHOR_H` | `24` | How often the frontier is moved up to the newest id the ledger has seen, recording the band it skipped as a KNOWN GAP. `0` = every run |
+| `CRAWLER_RANGE_REANCHOR_H` | `24` | How often the frontier is moved up to the newest id the ledger has seen (never one the gap sweep wrote), recording the band it skipped as a KNOWN GAP. `0` = every run |
+| `CRAWLER_RANGE_REANCHOR_MAX_DELTA` | `50000` | The widest move one re-anchor may make. A wider one is refused with a WARN naming this knob and reported as `rangeReanchorRefused`, and it is tried again every run until the ledger or the knob changes. Raise it for a frontier frozen a long time. `0` refuses every move |
 | `CRAWLER_RANGE_GAP_BUDGET` | `0` | Gap sweep: ids one store may sweep per run (and therefore its POST ceiling), SEPARATE from the discovery cap. `0` = the sweep is OFF |
-| `CRAWLER_RANGE_GAPS` | *(none)* | csv of operator-declared bands, `siteId:lowId-highId` or `siteId:id` (one id is a band of width 1), adopted into the store's ledger once |
+| `CRAWLER_RANGE_GAPS` | *(none)* | csv of operator-declared bands, `siteId:lowId-highId` or `siteId:id` (one id is a band of width 1), adopted into the store's ledger once. A band reaching above the store's frontier is refused with a WARN |
 | `CRAWLER_RANGE_GAP_DRY_RUN` | `false` | Print the open bands and their widths and sweep nothing. `--dry-run` / `CRAWLER_DRY_RUN` arm this lane AND the re-observation lane |
 | `CRAWLER_REOBSERVE_MIN_AGE_H` | `12` | Re-observation lane: an id is eligible once its last observation is this many hours old. The SAME value is the backoff window for an id whose last re-observation was refused, so `0` means both "age is no bar" and "no backoff at all" — a refused id is retried on the very next run |
 | `CRAWLER_MAX_REOBSERVE_PER_STORE` | `0` | Re-observation lane: global per-store ceiling on re-observations per run. `0` = the lane is OFF unless a store opts in below |
@@ -715,8 +716,8 @@ named in `CRAWLER_RANGE_STORES` walk it, so the crawler never spends a request d
 store has no such axis; the walk runs LAST (after every store's recent and listing-backfill passes),
 because the newest ids always outrank the deep id space for the run's budget.
 
-- **Frontier** — the highest itemId in the store's ledger that reads as a positive integer, else the
-  operator's `CRAWLER_RANGE_FRONTIER_<SITEID>` seed. With neither, the walk is skipped with a WARN
+- **Frontier** — the highest itemId in the store's ledger that reads as a positive integer (never
+  one the gap sweep wrote), else the operator's `CRAWLER_RANGE_FRONTIER_<SITEID>` seed. With neither, the walk is skipped with a WARN
   (it is never started from a guess). The seed in force is recorded in the ledger as `range.seed`.
 - **Re-seeding** — the walk only ever descends, so a seed set too high or too low is not something it
   corrects on its own. CHANGING `CRAWLER_RANGE_FRONTIER_<SITEID>` restarts the walk from the new top,
@@ -739,8 +740,10 @@ because the newest ids always outrank the deep id space for the run's budget.
   cursor and picked up next run: nothing is stranded, and nothing is ever re-walked. The walk ends at
   id 1, leaving `cursor: 0`; further runs make no request. A window `/ingest/scrape` rejected
   ENTIRELY (4xx for every id — typically no ruleset matches the store's `byId` url, an engine/ruleset
-  skew) leaves the cursor exactly where it was, with a WARN: that band would otherwise be spent
-  collecting nothing and is never walked again.
+  skew) leaves the cursor exactly where it was, with a WARN and `rangeSkipped: "window-rejected"`:
+  that band would otherwise be spent collecting nothing and is never walked again. A window that also
+  held ids already in the ledger is not refused entirely: the cursor moves past it, and each refused
+  id keeps its own row in the fetch-failure ledger.
 - **Durability** — the listing phases save the ledger after every page; the id-range walk saves once
   per WINDOW (its ids are one bounded batch). A pod killed mid-window (`activeDeadlineSeconds`, OOM,
   eviction) therefore re-walks that window on the next run: the POSTs it already made are coalesced
@@ -757,7 +760,7 @@ because the newest ids always outrank the deep id space for the run's budget.
   phases plus, per range store, one window GET and up to `CRAWLER_RANGE_IDS_PER_RUN` POSTs, and the
   store's cap must have that much headroom left. When it does not, `rangeSkipped` on the store
   summary says which — `cap`, `budget`, `no-frontier`, `floor`, `cooldown`, `unsupported`, `failed`,
-  `window-malformed`, `store-stopped`, `not-run`, `not-configured` — and it is `null` on a run that
+  `window-malformed`, `window-rejected`, `store-stopped`, `not-run`, `not-configured` — and it is `null` on a run that
   actually asked for a window. The window GET itself is synthesized (no upstream fetch) but is still
   charged one slot of the global budget and one spacing interval.
 - **Throughput** — one window per run, at most `CRAWLER_RANGE_IDS_PER_RUN` (ceiling 200) ids. On an
@@ -773,20 +776,27 @@ adds faster than that page turns over is invisible, and the descent never climbs
 mechanisms close the hole, and NEITHER touches the descent's cursor.
 
 - **Re-anchor** — once per `CRAWLER_RANGE_REANCHOR_H` (default 24 h; `0` = every run) the frontier is
-  moved up to the highest numeric id the store's LEDGER holds — which *is* what the tap has seen,
-  because the tap is what writes those ids — and the band between the old frontier and the new one is
-  recorded as a KNOWN GAP. It costs no request (it reads the ledger the pass already loaded) and it is
-  persisted on its own, so it still happens on a run whose descent does nothing at all. The run
-  summary reports `rangeReanchoredTo`: the id the frontier MOVED to this run, `null` when it did not
-  move. A store that has never walked has no frontier to move — the descent seeds one instead.
+  moved up to the highest numeric id the store's LEDGER holds that the gap sweep did NOT write. Above
+  the frontier that is what a listing (the tap) has shown us: every id the sweep writes carries
+  `sweptFrom` (the origin of its band), because it came from a synthesized byId window and
+  `/ingest/scrape` accepts such a url whether or not the item exists. The band between the old
+  frontier and the new one is recorded as a KNOWN GAP. It costs no request (it reads the ledger the
+  pass already loaded) and it is persisted on its own, so it still happens on a run whose descent does
+  nothing at all. The run summary reports `rangeReanchoredTo`: the id the frontier MOVED to this run,
+  `null` when it did not move. A move wider than `CRAWLER_RANGE_REANCHOR_MAX_DELTA` is refused with a
+  WARN and reported as `rangeReanchorRefused`. A store that has never walked has no frontier to move;
+  the descent seeds one instead.
 - **Known-gap bands** — `range.gaps` in the ledger, beside the cursor: `{ from, to, next, origin,
   createdAt, updatedAt?, closedAt? }`, where `next` is the LOW-water mark the sweep has reached and
   `origin` is `reanchor` or `operator`. Operators declare bands of their own with `CRAWLER_RANGE_GAPS`
-  (`mfc:3765216-3801000,mfc:123456` — a single id is a band of width 1); each is adopted ONCE, matched
+  (`mfc:3700000-3700400,mfc:123456` — a single id is a band of width 1); each is adopted ONCE, matched
   on its endpoints against every band the store has, open or closed, so a declaration left in the
   manifest after its band was filled does not re-open it every run. Closed bands are kept as the
   record that the band was filled. A declaration naming a store that is not id-range walked is WARNed
-  and adopted nowhere.
+  and adopted nowhere. A declared band must lie at or below the store's frontier (checked after this
+  run's re-anchor): above it the re-anchor records bands from ids a listing has shown us, and a
+  declared band there is refused with a WARN on every run that finds it above the frontier. A store
+  with no frontier yet adopts nothing until its walk has one.
 - **Sweep** — `CRAWLER_RANGE_GAP_BUDGET` ids per store per run (default `0` = OFF), oldest band first,
   walking each band ASCENDING from its `next`. The window is the SAME
   `GET /catalog?range=1&from=&count=` the descent uses — the sweep introduces no new URL shape, so
@@ -796,7 +806,10 @@ mechanisms close the hole, and NEITHER touches the descent's cursor.
   asked for, full length included: a short one (which the descent tolerates, since it may bottom out
   at id 1) would leave the band's lowest ids out of the slice entirely. `next` advances by the ids
   handled and the band is stamped `closedAt` once it passes `to`; a window `/ingest/scrape` refused
-  ENTIRELY leaves `next` exactly where it was, exactly as the descent leaves its cursor.
+  ENTIRELY leaves `next` exactly where it was, exactly as the descent leaves its cursor, and reports
+  `gapSkipped: "window-rejected"`. A window that also held ids already in the ledger advances past
+  its refused ids, each of which keeps its own row in the fetch-failure ledger: a re-anchor band is
+  mostly known ids by construction, and holding its cursor would re-drive the same refusal every run.
 - **Budget** — the sweep's budget is its OWN, so a discovery cap already spent by the descent cannot
   starve it and it cannot breach that cap in return. Ids already in the ledger consume the run's
   allowance even though they cost no request: without that, a band the tap had largely covered would
@@ -809,7 +822,7 @@ mechanisms close the hole, and NEITHER touches the descent's cursor.
   (the backlog, read off the ledger and reported even on a store whose sweep is switched off),
   `gapBudgetApplied` (the budget it actually ran under, 0 when it could not sweep) and `gapSkipped`
   — `not-configured`, `not-run`, `no-gap`, `dry-run`, `store-stopped`, `budget`, `cooldown`,
-  `unsupported`, `failed`, `window-malformed` — `null` on a run that actually swept. Run level:
+  `unsupported`, `failed`, `window-malformed`, `window-rejected` — `null` on a run that actually swept. Run level:
   `totalGapIdsSwept` and `totalGapEnqueued`.
 - **Dry run** — `CRAWLER_RANGE_GAP_DRY_RUN=1` (or `--dry-run`) logs each store's open bands, their
   widths and what is left of each, and makes no request at all: `gapSkipped: "dry-run"`.

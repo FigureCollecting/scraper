@@ -132,6 +132,13 @@ export interface CrawlerConfig {
    */
   rangeReanchorMs: number;
   /**
+   * RE-ANCHOR sanity bound, from `CRAWLER_RANGE_REANCHOR_MAX_DELTA`: a re-anchor that would move the
+   * frontier up by MORE than this many ids is refused with a WARN naming this knob. A jump that size is
+   * more likely a bad id in the ledger than new items; raise it for a frontier frozen a long time.
+   * 0 refuses every move.
+   */
+  rangeReanchorMaxDelta: number;
+  /**
    * GAP SWEEP: the sweep's OWN per-run, per-store budget — at most this many ids touched AND at most
    * this many ingest POSTs. DEFAULT 0 = the sweep is OFF, so a store fills gaps only once the fleet
    * config asks it to. Deliberately SEPARATE from `maxEnqueuePerStore`: the descent must not be able
@@ -185,6 +192,7 @@ const DEFAULTS = {
   reobserveMinAgeH: 12,
   maxReobservePerStore: 0,
   rangeReanchorH: 24,
+  rangeReanchorMaxDelta: 50000,
   rangeGapBudget: 0,
 };
 
@@ -407,6 +415,8 @@ export function loadCrawlerConfig(env: Env = process.env, argv: string[] = proce
     // cadence in hours ("once a day"), and an explicit 0 is honoured as "every run" rather than
     // reverting to a day — a cadence knob must not fail SLOW at its most eager setting.
     rangeReanchorMs: nonNegInt(env.CRAWLER_RANGE_REANCHOR_H, DEFAULTS.rangeReanchorH) * 60 * 60 * 1000,
+    // nonNegInt: an explicit 0 is the bound at its tightest (refuse every move), never the default.
+    rangeReanchorMaxDelta: nonNegInt(env.CRAWLER_RANGE_REANCHOR_MAX_DELTA, DEFAULTS.rangeReanchorMaxDelta),
     rangeGapBudget: nonNegInt(env.CRAWLER_RANGE_GAP_BUDGET, DEFAULTS.rangeGapBudget),
     rangeGaps: parseRangeGaps(env.CRAWLER_RANGE_GAPS),
     rangeGapDryRun: boolFlag(env.CRAWLER_RANGE_GAP_DRY_RUN) || aliasDryRun || argv.includes('--dry-run'),

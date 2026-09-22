@@ -6,7 +6,8 @@
  *     version: 1,
  *     siteId,
  *     enqueued: { [itemId]: { at: ISO-8601, collectUrl,       // v1: enqueued-is-done, `at` = last observation
- *                             reobserveFailedAt?, reobserveFailures? } },
+ *                             reobserveFailedAt?, reobserveFailures?,
+ *                             sweptFrom? } },                   // set only by the gap sweep
  *     backfill: { cursor: number|null,                          // next page to backfill
  *                 exhaustCandidateCursor?, exhaustCandidateAt?, // one empty sighting (unconfirmed)
  *                 exhaustedAt?, updatedAt? },                   // confirmed end-of-catalog
@@ -49,6 +50,11 @@ export interface LedgerEntry {
   reobserveFailedAt?: string;
   /** RE-OBSERVE: consecutive refusals since the last success. Cleared by the next success. */
   reobserveFailures?: number;
+  /**
+   * Set only on an entry the GAP SWEEP wrote: the origin of the band it was swept from. The id came from
+   * a synthesized byId window, not from anything the store listed, so it can never become the frontier.
+   */
+  sweptFrom?: LedgerGapOrigin;
 }
 
 export interface LedgerBackfill {

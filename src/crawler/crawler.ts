@@ -13,7 +13,8 @@
  *             from a frontier through GET /catalog?store=&range=1&from=&count=, which SYNTHESIZES
  *             the window's {itemId, collectUrl} pairs from the store's byId template without
  *             fetching anything upstream. Only stores named in config.rangeStores walk. The
- *             frontier is the highest numeric itemId the ledger has seen, else the operator's
+ *             frontier is the highest numeric itemId the ledger has seen (never one the gap sweep
+ *             wrote), else the operator's
  *             CRAWLER_RANGE_FRONTIER_<SITEID> seed; with neither, the walk is skipped with a WARN.
  *             The window's cursor is durable (ledger.range.cursor) and moves DOWN only over ids
  *             actually handled, so nothing is ever re-walked and nothing is stranded; it shares the
@@ -70,7 +71,7 @@ import { logger } from '../utils/logger.js';
 import { classifyFetchFailure } from '../services/failureClassifier.js';
 import type { FetchFailureReport, ReportFetchFailure } from '../services/failureReporter.js';
 import type { CrawlerConfig, CrawlerMode } from './config.js';
-import type { Ledger, LedgerGapBand, LedgerRange, LedgerStore } from './ledger.js';
+import type { Ledger, LedgerGapBand, LedgerGapOrigin, LedgerRange, LedgerStore } from './ledger.js';
 
 export type { CrawlerConfig, CrawlerMode } from './config.js';
 
@@ -196,6 +197,11 @@ export interface CrawlerStoreSummary {
    * acceptance signal for the lane (a frontier that merely reads high may never have moved at all).
    */
   rangeReanchoredTo: number | null;
+  /**
+   * RE-ANCHOR: the id the frontier would have moved to when CRAWLER_RANGE_REANCHOR_MAX_DELTA refused the
+   * move this run, `null` otherwise. The refusal repeats every run until the ledger or the knob changes.
+   */
+  rangeReanchorRefused: number | null;
   /** GAP SWEEP: known-gap bands still open for this store AFTER this run (the backlog). */
   gapBandsOpen: number;
   /** GAP SWEEP: ids still unswept across those open bands (POSTed + skipped as known both count as swept). */
@@ -302,7 +308,16 @@ export type ReobserveSkipReason =
   | 'store-stopped';
 
 /** Why the id-range walk made no window request this run. */
-export type RangeSkipReason = StopReason | 'not-configured' | 'not-run' | 'store-stopped' | 'cap' | 'no-frontier' | 'floor' | 'window-malformed';
+export type RangeSkipReason =
+  | StopReason
+  | 'not-configured'
+  | 'not-run'
+  | 'store-stopped'
+  | 'cap'
+  | 'no-frontier'
+  | 'floor'
+  | 'window-malformed'
+  | 'window-rejected';
 
 /**
  * Why the KNOWN-GAP SWEEP made no window request this run. Starvation and an empty band list look
@@ -321,7 +336,9 @@ export type GapSkipReason =
   /** CRAWLER_RANGE_GAP_DRY_RUN: the bands were printed and nothing was fetched or POSTed. */
   | 'dry-run'
   /** A window came back as something other than the descending run it asked for. */
-  | 'window-malformed';
+  | 'window-malformed'
+  /** /ingest/scrape refused every id a window offered, so the band cursor was kept. */
+  | 'window-rejected';
 
 type PageOutcome = { kind: 'page'; items: CatalogItem[]; hasMore: boolean } | { kind: 'stopped'; reason: StopReason };
 
@@ -535,6 +552,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       rangeFrontier: null,
       rangeSkipped: config.rangeStores.includes(siteId) ? 'not-run' : 'not-configured',
       rangeReanchoredTo: null,
+      rangeReanchorRefused: null,
       gapBandsOpen: 0,
       gapIdsRemaining: 0,
       gapIdsSwept: 0,
@@ -864,6 +882,8 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
      * ceiling, so the two lanes can never spend or breach each other's.
      */
     budget?: LaneBudget,
+    /** GAP SWEEP: the origin of the band this window was cut from, stamped on every entry it writes. */
+    sweptFrom?: LedgerGapOrigin,
   ): Promise<{ newCount: number; allAttempted: boolean; handled: number; accepted: number; rejected: number; stopReason?: StopReason }> => {
     const ledger = st.ledger!;
     let newCount = 0;
@@ -919,7 +939,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       switch (outcome) {
         case 'accepted':
         case 'accepted-dedup':
-          ledger.enqueued[item.itemId] = { at: iso(), collectUrl: item.collectUrl };
+          ledger.enqueued[item.itemId] = { at: iso(), collectUrl: item.collectUrl, ...(sweptFrom ? { sweptFrom } : {}) };
           accepted++;
           // The SWEEP's landings are the sweep's own number. `enqueued` is what `capApplied` bounds,
           // and `deduplicated` is "of `enqueued`" — a sweep POST in either would make a store summary
@@ -1176,10 +1196,15 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     }
   };
 
-  /** The highest itemId the ledger has seen for this store that reads as a positive integer. */
+  /**
+   * The highest positive-integer itemId in the ledger, IGNORING entries the gap sweep wrote: a swept id
+   * was synthesized from the byId template, and /ingest/scrape accepts one whether or not the item
+   * exists, so trusting it would let a declared band become the frontier.
+   */
   const highestNumericId = (ledger: Ledger): number | undefined => {
     let best: number | undefined;
-    for (const id of Object.keys(ledger.enqueued)) {
+    for (const [id, entry] of Object.entries(ledger.enqueued)) {
+      if (entry?.sweptFrom !== undefined) continue;
       if (!/^\d+$/.test(id)) continue;
       const n = Number(id);
       if (!Number.isSafeInteger(n) || n < 1) continue;
@@ -1226,10 +1251,14 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
    * Additions tap: ONE page with no pager, which sees whatever turned over since the last run and
    * nothing else. mfc's frontier has been frozen at 3,765,215 while the cursor walks the 3.72M band.
    *
-   * So once per CRAWLER_RANGE_REANCHOR_H the frontier is moved up to the newest id the LEDGER holds —
-   * which IS what the tap has seen, because the tap is what writes those ids — and the band between
-   * the old frontier and the new one is recorded as a KNOWN GAP for the sweep to fill. The descent's
-   * cursor is NOT touched: it is walking a different part of the id space and owns its own progress.
+   * So once per CRAWLER_RANGE_REANCHOR_H the frontier is moved up to the newest id in the ledger that
+   * the gap sweep did NOT write (see highestNumericId): above the frontier, that is what a listing (the
+   * tap) has shown us. The band between the old frontier and the new one is recorded as a KNOWN GAP for
+   * the sweep to fill. The descent's cursor is NOT touched: it is walking a different part of the id
+   * space and owns its own progress.
+   *
+   * A move wider than CRAWLER_RANGE_REANCHOR_MAX_DELTA is refused with a WARN and tried again next run:
+   * a jump that size is a bad id, and the band it would record could never be swept.
    *
    * Costs no request: it reads the ledger this pass has already loaded.
    */
@@ -1242,6 +1271,19 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     if (range.reanchoredAt !== undefined && ageMs(range.reanchoredAt) < config.rangeReanchorMs) return false;
     const newest = highestNumericId(st.ledger!);
     if (newest === undefined || newest <= range.frontier) return false;
+    const delta = newest - range.frontier;
+    if (delta > config.rangeReanchorMaxDelta) {
+      // Not stamped: the refusal repeats every run until the ledger or the knob changes.
+      logger.warn('[CRAWLER] id-range re-anchor refused: the move exceeds CRAWLER_RANGE_REANCHOR_MAX_DELTA', {
+        siteId: st.siteId,
+        frontier: range.frontier,
+        newest,
+        delta,
+        maxDelta: config.rangeReanchorMaxDelta,
+      });
+      st.summary.rangeReanchorRefused = newest;
+      return false;
+    }
     const band: LedgerGapBand = {
       from: range.frontier + 1,
       to: newest,
@@ -1268,11 +1310,23 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
    * as bands of its own, once. A band is matched on its endpoints against EVERY band the store has,
    * OPEN OR CLOSED: a declaration left in the manifest after its band was filled would otherwise
    * re-open it on every run, and the sweep would spend its budget re-walking ids it already has.
+   *
+   * A declared band must lie AT OR BELOW the frontier. Above it the re-anchor records bands from ids a
+   * listing has shown us; a declared band up there is a typo the sweep would turn into ledger entries
+   * for ids nobody has seen. It is refused, with a WARN, on every run that finds it above the frontier.
    */
   const adoptOperatorGaps = (st: StoreState, range: LedgerRange): boolean => {
     let added = false;
     for (const decl of config.rangeGaps[st.siteId] ?? []) {
       if ((range.gaps ?? []).some((b) => b.from === decl.from && b.to === decl.to)) continue;
+      if (range.frontier === undefined || decl.to > range.frontier) {
+        logger.warn('[CRAWLER] CRAWLER_RANGE_GAPS band not adopted: a declared band must lie at or below the id-range frontier', {
+          siteId: st.siteId,
+          band: `${decl.from}-${decl.to}`,
+          frontier: range.frontier ?? null,
+        });
+        continue;
+      }
       (range.gaps ??= []).push({ from: decl.from, to: decl.to, next: decl.from, origin: 'operator', createdAt: iso() });
       added = true;
       logger.info('[CRAWLER] known gap adopted from CRAWLER_RANGE_GAPS', {
@@ -1377,7 +1431,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
         stop = 'window-malformed';
         break;
       }
-      const { handled, accepted, rejected, stopReason } = await processPage(st, [...out.items].reverse(), 'gap', budget);
+      const { handled, rejected, stopReason } = await processPage(st, [...out.items].reverse(), 'gap', budget, band.origin);
       if (handled === 0) {
         // Not one id got through, so nothing durable changes. Only the GLOBAL gate can do this: the
         // window was sized to what this lane's own budget still allowed, which makes its first id one
@@ -1386,10 +1440,11 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
         stop = stopReason ?? 'budget';
         break;
       }
-      if (accepted === 0 && rejected > 0) {
+      if (rejected > 0 && rejected === handled) {
         // Every id the window offered was deterministically refused (4xx — typically an engine /
         // ruleset skew on the store's byId url). That is a property of the STORE, not of this band:
-        // sweeping past them would spend the band collecting nothing.
+        // sweeping past them would spend the band collecting nothing. A window that also held known
+        // ids is not this case: it advances, and each refusal keeps its own E10 row.
         logger.warn('[CRAWLER] gap window entirely rejected by ingest — band cursor kept', { siteId: st.siteId, ...where, rejected });
         emitFailure({
           site: st.siteId,
@@ -1399,6 +1454,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
           reasonClass: 'ruleset',
           message: `every id in the gap window from ${from} was refused by /ingest/scrape (${rejected} rejected)`,
         });
+        stop = 'window-rejected';
         break;
       }
       // Credited only now, and deliberately NOT like `rangeWalked`: `gapIdsSwept` is ids the band
@@ -1501,7 +1557,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       });
       return skip('window-malformed');
     }
-    const { handled, accepted, rejected } = await processPage(st, out.items, 'range');
+    const { handled, rejected } = await processPage(st, out.items, 'range');
     st.summary.rangeWalked += handled;
     if (handled === 0) {
       // Not one id got through (the cap ran out on the window's very first id, or the budget did):
@@ -1509,7 +1565,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       logger.info('[CRAWLER] id-range window yielded no walkable id — cursor kept', { siteId: st.siteId, from: cursor });
       return skip(st.capReached ? 'cap' : 'budget');
     }
-    if (accepted === 0 && rejected > 0) {
+    if (rejected > 0 && rejected === handled) {
       // Every id the window offered was deterministically refused by /ingest/scrape (4xx — typically
       // no ruleset matches the store's byId url, i.e. an engine/ruleset skew). That is a property of
       // the STORE, not of these ids: walking past them would spend the id space collecting nothing
@@ -1527,7 +1583,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
         reasonClass: 'ruleset',
         message: `every id in the window from ${cursor} was refused by /ingest/scrape (${rejected} rejected)`,
       });
-      return;
+      return skip('window-rejected');
     }
     range.cursor = Math.max(0, cursor - handled);
     range.updatedAt = iso();
@@ -1573,8 +1629,9 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
 
     // Bookkeeping first, and PERSISTED on its own: a re-anchor that only reached the disk when the
     // descent happened to save would be lost on exactly the runs where the descent does nothing.
-    const adopted = adoptOperatorGaps(st, range);
+    // Re-anchor BEFORE adopting, so a declared band is checked against the freshest frontier.
     const reanchored = reanchorFrontier(st, range);
+    const adopted = adoptOperatorGaps(st, range);
     if ((adopted || reanchored) && !(await commit())) return skipBoth('failed');
 
     await descentPhase(st, range, commit);
