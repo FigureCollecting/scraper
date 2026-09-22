@@ -7,9 +7,10 @@
  *
  * `fetchBody` is implemented over the SAME transport-dispatching `capturingFetch` the primary
  * ingest fetch already uses (`engineServices/capturingFetch.ts`), given the store's OWN declared
- * `searchFetch` transport — so the follow-up's raw bytes still land in the capture sink under the
- * 'api' lane, same as the primary fetch. Cookies pass through (opts.cookies overrides the
- * context's own).
+ * `searchFetch` transport — so the follow-up's raw bytes land in the capture sink on the SAME lane
+ * as the primary fetch: 'api' for a store that declares an impersonate/http transport, but a
+ * full browser navigation captured as wire/dom for a store that declares none (measured on hpoi,
+ * 2026-09-22). Cookies pass through (opts.cookies overrides the context's own).
  *
  * COURTESY GAP (D8): before dispatching, `fetchBody` waits until `primaryFetchedAt +
  * baseDelayMs` has elapsed — but ONLY when the follow-up targets the SAME host as the primary
@@ -198,7 +199,10 @@ export function buildExtractContext(options: BuildExtractContextOptions): Extrac
         if (targetHost !== undefined) {
           lastFetchedAt.set(targetHost, now());
         }
-        return result;
+        // The plugin contract names the HTTP status `statusCode`; the capturing fetch names it
+        // `status`. Rulesets written to the contract (hpoi's non-2xx gate, amiami's status notes)
+        // read `statusCode` and silently saw undefined. Carry both names.
+        return result.status === undefined ? result : { ...result, statusCode: result.status };
       },
     },
   };
