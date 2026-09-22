@@ -46,6 +46,7 @@ const mkCfg = (over: Partial<CrawlerConfig> = {}): CrawlerConfig => ({
   storeReobserveCaps: {},
   reobserveDryRun: false,
   rangeReanchorMs: 24 * 60 * 60 * 1000,
+  rangeReanchorMaxDelta: 50_000,
   rangeGapBudget: 0,
   rangeGaps: {},
   rangeGapDryRun: false,

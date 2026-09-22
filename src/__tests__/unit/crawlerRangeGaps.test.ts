@@ -54,6 +54,7 @@ const mkCfg = (over: Partial<CrawlerConfig> = {}): CrawlerConfig => ({
   storeReobserveCaps: {},
   reobserveDryRun: false,
   rangeReanchorMs: 24 * HOUR_MS,
+  rangeReanchorMaxDelta: 50_000,
   rangeGapBudget: 0,
   rangeGaps: {},
   rangeGapDryRun: false,
@@ -251,6 +252,149 @@ describe('id-range FRONTIER RE-ANCHOR', () => {
     const s = await runCrawlerPass(mkCfg({ rangeReanchorMs: 0 }), { fetch: makeFake().fetch, ledgerStore: store, now: clock().now });
     expect(s.stores[0].rangeReanchoredTo).toBe(1004);
   });
+
+  it('refuses a re-anchor further than CRAWLER_RANGE_REANCHOR_MAX_DELTA by name, and moves nothing until the knob allows it', async () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      // 50,001 above the frontier is a bad id in the ledger, not a day of new items.
+      const store = createMemoryLedgerStore({ mfc: walkedLedger('mfc', { cursor: 900, frontier: 1000 }, ['51001', '1004']) });
+      const c = clock();
+      const s = await runCrawlerPass(mkCfg(), { fetch: makeFake().fetch, ledgerStore: store, now: c.now });
+      const range = store.files.get('mfc')!.range!;
+      expect(range.frontier).toBe(1000);
+      expect(range.gaps ?? []).toEqual([]);
+      expect(range.reanchoredAt).toBeUndefined();
+      expect(s.stores[0]).toMatchObject({ rangeReanchoredTo: null, rangeReanchorRefused: 51001, rangeFrontier: 1000 });
+      const line = warn.mock.calls.find(([msg]) => String(msg).includes('CRAWLER_RANGE_REANCHOR_MAX_DELTA'));
+      expect(line?.[1]).toEqual({ siteId: 'mfc', frontier: 1000, newest: 51001, delta: 50001, maxDelta: 50000 });
+
+      // The knob is the operator's lever: raised, the same ledger re-anchors on the next run.
+      c.advance(HOUR_MS);
+      const s2 = await runCrawlerPass(mkCfg({ rangeReanchorMaxDelta: 60_000 }), { fetch: makeFake().fetch, ledgerStore: store, now: c.now });
+      expect(s2.stores[0]).toMatchObject({ rangeReanchoredTo: 51001, rangeReanchorRefused: null });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('allows a move of exactly CRAWLER_RANGE_REANCHOR_MAX_DELTA ids, and 0 refuses every move', async () => {
+    const edge = createMemoryLedgerStore({ mfc: walkedLedger('mfc', { cursor: 900, frontier: 1000 }, ['51000']) });
+    const s1 = await runCrawlerPass(mkCfg(), { fetch: makeFake().fetch, ledgerStore: edge, now: clock().now });
+    expect(s1.stores[0]).toMatchObject({ rangeReanchoredTo: 51000, rangeReanchorRefused: null });
+
+    const zero = createMemoryLedgerStore({ mfc: walkedLedger('mfc', { cursor: 900, frontier: 1000 }, ['1001']) });
+    const s2 = await runCrawlerPass(mkCfg({ rangeReanchorMaxDelta: 0 }), { fetch: makeFake().fetch, ledgerStore: zero, now: clock().now });
+    expect(s2.stores[0]).toMatchObject({ rangeReanchoredTo: null, rangeReanchorRefused: 1001, rangeFrontier: 1000 });
+  });
+
+  it.each(['1e7', '0x10', ' 12', '12.0', 'abc', 'item-77', '99999999999999999999'])(
+    'a ledger key that is not a plain run of digits (%j) never becomes the frontier',
+    async (key) => {
+      // Number('1e7') and Number('0x10') are safe integers: only the digits-only filter keeps them out.
+      const ledger = walkedLedger('mfc', { cursor: 5, frontier: 10 }, ['11']);
+      ledger.enqueued[key] = { at: iso(T0 - WEEK_MS), collectUrl: collectUrl('mfc', key) };
+      const store = createMemoryLedgerStore({ mfc: ledger });
+      const s = await runCrawlerPass(mkCfg(), { fetch: makeFake().fetch, ledgerStore: store, now: clock().now });
+      expect(s.stores[0]).toMatchObject({ rangeReanchoredTo: 11, rangeFrontier: 11 });
+    },
+  );
+});
+
+describe('the frontier follows only ids the STORE has shown us', () => {
+  it('CH-1: a bogus CRAWLER_RANGE_GAPS id is never swept, and the next re-anchor does not follow it', async () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      const store = createMemoryLedgerStore({ mfc: walkedLedger('mfc', { cursor: 900, frontier: 1000, reanchoredAt: iso(T0) }, []) });
+      const cfg = mkCfg({ rangeGaps: { mfc: [{ from: 9_000_000, to: 9_000_000 }] }, rangeGapBudget: 5, rangeIdsPerRun: 5 });
+
+      // RUN 1: the declaration is refused before the sweep can drive it.
+      const f1 = makeFake();
+      await runCrawlerPass(cfg, { fetch: f1.fetch, ledgerStore: store, now: clock(T0).now });
+      const mid = store.files.get('mfc')!;
+      expect(f1.postedIds()).not.toContain('9000000');
+      expect(Object.keys(mid.enqueued)).not.toContain('9000000');
+      expect(mid.range!.gaps ?? []).toEqual([]);
+      const refusal = warn.mock.calls.find(([msg]) => String(msg).includes('band not adopted'));
+      expect(refusal?.[1]).toEqual({ siteId: 'mfc', band: '9000000-9000000', frontier: 1000 });
+
+      // RUN 2: a day later the re-anchor reads the ledger, and the frontier stays where the store put it.
+      const s2 = await runCrawlerPass(cfg, { fetch: makeFake().fetch, ledgerStore: store, now: clock(T0 + 25 * HOUR_MS).now });
+      const after = store.files.get('mfc')!;
+      expect(after.range!.frontier).toBe(1000);
+      expect(after.range!.gaps ?? []).toEqual([]);
+      expect(s2.stores[0].rangeReanchoredTo).toBeNull();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('an id the SWEEP wrote never becomes the frontier, even one sitting above it', async () => {
+    // A band above the frontier that is ALREADY on the ledger: adopted before declarations were checked,
+    // or stranded there by a lowered CRAWLER_RANGE_FRONTIER_<SITEID>. Sweeping it is allowed; trusting it is not.
+    const stranded: LedgerGapBand = { from: 1500, to: 1500, next: 1500, origin: 'operator', createdAt: iso(T0 - WEEK_MS) };
+    const store = createMemoryLedgerStore({
+      mfc: walkedLedger('mfc', { cursor: 0, frontier: 1000, reanchoredAt: iso(T0), gaps: [stranded] }, ['1200']),
+    });
+    const cfg = mkCfg({ rangeGapBudget: 5, rangeIdsPerRun: 5 });
+    const f1 = makeFake();
+    await runCrawlerPass(cfg, { fetch: f1.fetch, ledgerStore: store, now: clock(T0).now });
+    expect(f1.postedIds()).toEqual(['1500']);
+    expect(store.files.get('mfc')!.enqueued['1500']).toMatchObject({ sweptFrom: 'operator' });
+
+    const s2 = await runCrawlerPass(cfg, { fetch: makeFake().fetch, ledgerStore: store, now: clock(T0 + 25 * HOUR_MS).now });
+    // 1200 is the tap's, so the frontier follows it; 1500 is the sweep's, so it does not.
+    expect(s2.stores[0].rangeReanchoredTo).toBe(1200);
+    expect(store.files.get('mfc')!.range!.frontier).toBe(1200);
+  });
+
+  it('the tap moves the frontier and the sweep never does: only the sweep marks the entries it writes', async () => {
+    const store = createMemoryLedgerStore({
+      mfc: walkedLedger('mfc', {
+        cursor: 900,
+        frontier: 1000,
+        gaps: [
+          { from: 101, to: 101, next: 101, origin: 'operator', createdAt: iso(T0 - 2 * WEEK_MS) },
+          { from: 201, to: 201, next: 201, origin: 'reanchor', createdAt: iso(T0 - WEEK_MS) },
+        ],
+      }),
+    });
+    // The Latest Additions tap: page 1 of the listing shows an id above the frontier.
+    const fake = makeFake({
+      catalog: (siteId) => ({
+        status: 200,
+        body: { siteId, page: 1, items: [{ itemId: '1100', collectUrl: collectUrl(siteId, '1100') }], hasMore: false, count: 1 },
+      }),
+    });
+    const s = await runCrawlerPass(mkCfg({ mode: 'both', phases: ['recent', 'backfill'], rangeGapBudget: 2, rangeIdsPerRun: 1 }), {
+      fetch: fake.fetch,
+      ledgerStore: store,
+      now: clock().now,
+    });
+    const enqueued = store.files.get('mfc')!.enqueued;
+    expect(enqueued['1100'].sweptFrom).toBeUndefined();
+    expect(enqueued['900'].sweptFrom).toBeUndefined();
+    expect(enqueued['101'].sweptFrom).toBe('operator');
+    expect(enqueued['201'].sweptFrom).toBe('reanchor');
+    expect(s.stores[0].rangeReanchoredTo).toBe(1100);
+  });
+
+  it('a store that has never walked does not seed its descent from an id the sweep wrote', async () => {
+    const ledger = walkedLedger('mfc', undefined, ['800']);
+    ledger.enqueued['9000000'] = { at: iso(T0 - WEEK_MS), collectUrl: collectUrl('mfc', '9000000'), sweptFrom: 'operator' };
+    const store = createMemoryLedgerStore({ mfc: ledger });
+    const fake = makeFake();
+    const s = await runCrawlerPass(mkCfg(), { fetch: fake.fetch, ledgerStore: store, now: clock().now });
+    expect(fake.rangeCalls()).toEqual([[800, 5]]);
+    expect(s.stores[0].rangeFrontier).toBe(800);
+  });
+
+  it('a null ledger entry (a hand-edited file) neither crashes the re-anchor nor hides its id', async () => {
+    const ledger = walkedLedger('mfc', { cursor: 900, frontier: 1000 });
+    (ledger.enqueued as Record<string, unknown>)['1004'] = null;
+    const store = createMemoryLedgerStore({ mfc: ledger });
+    const s = await runCrawlerPass(mkCfg(), { fetch: makeFake().fetch, ledgerStore: store, now: clock().now });
+    expect(s.stores[0].rangeReanchoredTo).toBe(1004);
+  });
 });
 
 describe('KNOWN-GAP bands declared by the operator', () => {
@@ -279,6 +423,62 @@ describe('KNOWN-GAP bands declared by the operator', () => {
     });
     expect(store.files.get('mfc')!.range!.gaps).toEqual([closed]);
     expect(s.stores[0]).toMatchObject({ gapBandsOpen: 0, gapIdsRemaining: 0 });
+  });
+
+  it('refuses a declared band that reaches above the frontier, naming it and the frontier; one at or below it is adopted', async () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      const store = createMemoryLedgerStore({ mfc: walkedLedger('mfc', { cursor: 900, frontier: 1000 }) });
+      const declared = [
+        { from: 1001, to: 1001 },
+        { from: 990, to: 1010 },
+        { from: 991, to: 1000 },
+        { from: 500, to: 504 },
+      ];
+      await runCrawlerPass(mkCfg({ rangeGaps: { mfc: declared } }), { fetch: makeFake().fetch, ledgerStore: store, now: clock().now });
+      expect(store.files.get('mfc')!.range!.gaps).toEqual([
+        { from: 991, to: 1000, next: 991, origin: 'operator', createdAt: iso(T0) },
+        { from: 500, to: 504, next: 500, origin: 'operator', createdAt: iso(T0) },
+      ]);
+      const refused = warn.mock.calls.filter(([msg]) => String(msg).includes('band not adopted')).map(([, meta]) => meta);
+      expect(refused).toEqual([
+        { siteId: 'mfc', band: '1001-1001', frontier: 1000 },
+        { siteId: 'mfc', band: '990-1010', frontier: 1000 },
+      ]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('adopts nothing on a store with no frontier yet, and adopts the band once the walk has one', async () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      const store = createMemoryLedgerStore({ mfc: walkedLedger('mfc', undefined) });
+      const cfg = mkCfg({ rangeFrontiers: { mfc: 1000 }, rangeGaps: { mfc: [{ from: 500, to: 504 }] } });
+      const c = clock();
+      await runCrawlerPass(cfg, { fetch: makeFake().fetch, ledgerStore: store, now: c.now });
+      expect(store.files.get('mfc')!.range!.gaps ?? []).toEqual([]);
+      expect(warn.mock.calls.find(([msg]) => String(msg).includes('band not adopted'))?.[1]).toEqual({ siteId: 'mfc', band: '500-504', frontier: null });
+
+      c.advance(HOUR_MS);
+      await runCrawlerPass(cfg, { fetch: makeFake().fetch, ledgerStore: store, now: c.now });
+      expect(store.files.get('mfc')!.range!.gaps).toEqual([{ from: 500, to: 504, next: 500, origin: 'operator', createdAt: iso(T0 + HOUR_MS) }]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('checks a declared band against the frontier AFTER this run has re-anchored it', async () => {
+    const store = createMemoryLedgerStore({ mfc: walkedLedger('mfc', { cursor: 900, frontier: 1000 }, ['1200']) });
+    await runCrawlerPass(mkCfg({ rangeGaps: { mfc: [{ from: 1100, to: 1150 }] } }), { fetch: makeFake().fetch, ledgerStore: store, now: clock().now });
+    const gaps = store.files.get('mfc')!.range!.gaps!;
+    expect(gaps).toHaveLength(2);
+    expect(gaps).toEqual(
+      expect.arrayContaining([
+        { from: 1001, to: 1200, next: 1001, origin: 'reanchor', createdAt: iso(T0) },
+        { from: 1100, to: 1150, next: 1100, origin: 'operator', createdAt: iso(T0) },
+      ]),
+    );
   });
 
   it('WARNs about a declared band naming a store that is not id-range walked, and adopts nothing', async () => {
@@ -435,10 +635,30 @@ describe('KNOWN-GAP SWEEP', () => {
       },
     });
     expect(openBands(store.files.get('mfc')!)[0].next).toBe(101);
-    expect(s.stores[0]).toMatchObject({ gapEnqueued: 0, gapIdsSwept: 0 });
+    expect(s.stores[0]).toMatchObject({ gapEnqueued: 0, gapIdsSwept: 0, gapSkipped: 'window-rejected' });
     // Five per-id RECORD rows, then ONE window row naming the band.
     expect(rows.filter((r) => r.kind === 'record')).toHaveLength(5);
     expect(rows.filter((r) => r.kind === 'listing' && r.target.includes('axis=gap'))).toHaveLength(1);
+  });
+
+  it('a window of known ids plus ONE refusal advances past it instead of stalling on it every run', async () => {
+    // 800..803 are already in the ledger (the tap wrote them) and 804 is refused. A re-anchor band has
+    // that shape by construction, so holding the cursor here would re-drive 804 on every run.
+    const store = createMemoryLedgerStore({ mfc: sweepOnly([band(800, 804)], ['800', '801', '802', '803']) });
+    const cfg = mkCfg({ rangeGapBudget: 5, rangeIdsPerRun: 5 });
+    const ingest = (url: string): Reply => (url.endsWith('/804') ? refused() : accepted());
+    const c = clock();
+    const f1 = makeFake({ ingest });
+    const s1 = await runCrawlerPass(cfg, { fetch: f1.fetch, ledgerStore: store, now: c.now });
+    expect(f1.postedIds()).toEqual(['804']);
+    expect(store.files.get('mfc')!.range!.gaps![0]).toMatchObject({ next: 805, closedAt: iso(T0) });
+    expect(s1.stores[0]).toMatchObject({ gapIdsSwept: 5, gapEnqueued: 0, errors: 1, gapSkipped: null });
+
+    c.advance(HOUR_MS);
+    const f2 = makeFake({ ingest });
+    const s2 = await runCrawlerPass(cfg, { fetch: f2.fetch, ledgerStore: store, now: c.now });
+    expect(f2.calls).toEqual([]);
+    expect(s2.stores[0]).toMatchObject({ gapSkipped: 'no-gap', gapBandsOpen: 0 });
   });
 
   it('the DRY RUN prints the band widths and enqueues nothing at all', async () => {
@@ -467,6 +687,9 @@ describe('KNOWN-GAP SWEEP', () => {
     const store = createMemoryLedgerStore({ mfc: sweepOnly([band(101, 103)]) });
     const fake = makeFake();
     await runCrawlerPass(mkCfg({ rangeGapBudget: 5, rangeIdsPerRun: 5 }), { fetch: fake.fetch, ledgerStore: store, now: clock().now });
+    // The descent is at the floor, so this window is the sweep's own: a sweep that fetched nothing fails here.
+    expect(fake.catalogUrls()).toEqual(['http://scraper.test/catalog?store=mfc&range=1&from=103&count=3']);
+    expect(fake.postedIds()).toEqual(['101', '102', '103']);
     for (const url of fake.catalogUrls()) {
       expect(url).toMatch(/^http:\/\/scraper\.test\/catalog\?store=mfc&range=1&from=\d+&count=\d+$/);
     }

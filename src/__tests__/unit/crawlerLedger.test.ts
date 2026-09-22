@@ -379,6 +379,16 @@ describe('the optional id-range section', () => {
     }
   });
 
+  it('round-trips the sweptFrom marker on an entry: it is what keeps a swept id off the frontier next run', async () => {
+    const f = makeFakeFs();
+    const doc = {
+      ...sample(),
+      enqueued: { '9000000': { at: '2026-09-18T04:00:00.000Z', collectUrl: 'https://mfc.test/item/9000000', sweptFrom: 'operator' } },
+    };
+    f.files.set(path.join(DIR, 'orzgk.json'), JSON.stringify(doc));
+    expect(await createFileLedgerStore(DIR, f.fs).load('orzgk')).toEqual(doc);
+  });
+
   it('accepts a band whose next is one past its top (swept, awaiting the close stamp)', async () => {
     const f = makeFakeFs();
     const doc = withRange({ cursor: 500, gaps: [{ from: 10, to: 20, next: 21, origin: 'operator', createdAt: '2026-09-18T04:00:00.000Z' }] });

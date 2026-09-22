@@ -328,6 +328,15 @@ describe('loadCrawlerConfig — the re-observation lane', () => {
     expect(loadCrawlerConfig({ CRAWLER_RANGE_REANCHOR_H: '-3' }).rangeReanchorMs).toBe(24 * 60 * 60 * 1000);
   });
 
+  it('CRAWLER_RANGE_REANCHOR_MAX_DELTA bounds one re-anchor: 50,000 by default, an explicit 0 honoured, junk ignored', () => {
+    expect(loadCrawlerConfig({}).rangeReanchorMaxDelta).toBe(50_000);
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_REANCHOR_MAX_DELTA: '120000' }).rangeReanchorMaxDelta).toBe(120_000);
+    // A safety bound at its most conservative setting must not revert to the generous default.
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_REANCHOR_MAX_DELTA: '0' }).rangeReanchorMaxDelta).toBe(0);
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_REANCHOR_MAX_DELTA: 'lots' }).rangeReanchorMaxDelta).toBe(50_000);
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_REANCHOR_MAX_DELTA: '-1' }).rangeReanchorMaxDelta).toBe(50_000);
+  });
+
   it('CRAWLER_RANGE_GAP_BUDGET is the gap sweep own per-run budget and stays 0 (off) unless set', () => {
     expect(loadCrawlerConfig({}).rangeGapBudget).toBe(0);
     expect(loadCrawlerConfig({ CRAWLER_RANGE_GAP_BUDGET: '100' }).rangeGapBudget).toBe(100);
