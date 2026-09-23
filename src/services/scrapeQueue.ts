@@ -509,8 +509,8 @@ function classifyError(error: Error | string): ErrorType {
   // they take 'gone_or_denied' (also never retried). 429 rides the existing rate-limit backoff, a 5xx
   // is a transient upstream ('network'), and anything else keeps the bounded generic retry.
   if (error instanceof RecordFetchStatusError) {
-    // AMBIGUOUS 404 first: on a store where a 404 may be an entitlement denial (mfc's NSFW items),
-    // 'not_found' would close a live item as removed. It is an access failure — never retried,
+    // AMBIGUOUS 404 (or a ruleset-declared gone page, whatever its status) first: on a store where
+    // a 404 may be an entitlement denial (mfc's NSFW items), 'not_found' would close a live item as removed. It is an access failure — never retried,
     // because no number of retries re-mints a session cookie — and the ledger books it http_403.
     if (error.deniedOrGone) return 'gone_or_denied';
     if (error.redirectedHome) return 'not_found';
@@ -1880,7 +1880,7 @@ export class ScrapeQueue {
     // discipline (one shot + host cooldown) belong to the challenge path below. Gating it here would
     // book it as http_403 and skip the cooldown that protects the egress IP.
     if (!page.challenge) {
-      const statusFailure = evaluateRecordFetch(item.url, page, laneOf(searchFetch));
+      const statusFailure = evaluateRecordFetch(item.url, page, laneOf(searchFetch), ruleset.gonePage);
       if (statusFailure) {
         console.warn(`[FETCH] ${sanitizeForLog(statusFailure.message)}`);
         throw statusFailure;

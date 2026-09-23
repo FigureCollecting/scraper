@@ -602,6 +602,19 @@ export interface ImageRef {
   contentLevel?: ContentLevel;
 }
 
+/**
+ * A store's own "this item is gone" page served with an error status instead of a 404/410 (e.g. a
+ * removed item answered with HTTP 500 and the store's "Error Page" template). Matches only when the
+ * response status is in `statuses` (4xx/5xx; a 2xx/3xx never reaches the check) AND every declared
+ * marker is found. A declaration with no marker never matches. `titleIncludes` is looked for in the
+ * page `<title>` with whitespace collapsed; `bodyIncludes` anywhere in the raw body. Case-sensitive.
+ */
+export interface GonePage {
+  statuses: number[];
+  titleIncludes?: string;
+  bodyIncludes?: string;
+}
+
 export interface ExtractionRuleset {
   siteId: string;
   version: string;
@@ -689,6 +702,13 @@ export interface ExtractionRuleset {
    * ruleset that has NOT reasoned about empties must not have its parse breaks silently pass).
    */
   emptyResultIsValid?: boolean;
+  /**
+   * OPTIONAL: this store's gone page (see {@link GonePage}). A matching response is failed as
+   * gone-or-denied on first sight — never retried, never handed to `extract` — instead of being
+   * booked by its status alone (a 5xx would otherwise be retried as a transient upstream fault).
+   * Undeclared ⇒ today's status-only behavior.
+   */
+  gonePage?: GonePage;
 }
 
 /**

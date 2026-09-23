@@ -48,12 +48,15 @@ import { sessionCanaryView, resetSessionCanary } from '../../services/sessionCan
 import type { FetchFailureReport } from '../../services/failureReporter';
 
 const FIXTURE_HTML = '<html><body><h1 class="title">Kitagawa Marin</h1></body></html>';
+const GONE_HTML = '<html><head><title>Error Page | EXAMPLE STORE</title></head><body>gone</body></html>';
+const GONE_PAGE = { statuses: [500], titleIncludes: 'Error Page | EXAMPLE STORE' };
 const CHALLENGE_HTML = '<html><head><title>Just a moment...</title></head><body>cf</body></html>';
 const HOST = 'statushost.example.test';
 const ITEM_URL = `https://${HOST}/product/12345`;
 
-function makeRuleset(extract: jest.Mock): ExtractionRuleset {
+function makeRuleset(extract: jest.Mock, extra: Partial<ExtractionRuleset> = {}): ExtractionRuleset {
   return {
+    ...extra,
     siteId: 'statusstore',
     version: '2.3.4',
     extract: extract as unknown as ExtractionRuleset['extract'],
@@ -147,9 +150,15 @@ describe('ScrapeQueue × record-fetch status gate', () => {
     }
   }
 
-  function buildQueue(http: jest.Mock, send: jest.Mock, transport: 'http' | 'impersonate' = 'http', domain = HOST): ScrapeQueue {
+  function buildQueue(
+    http: jest.Mock,
+    send: jest.Mock,
+    transport: 'http' | 'impersonate' = 'http',
+    domain = HOST,
+    extra: Partial<ExtractionRuleset> = {},
+  ): ScrapeQueue {
     const q = new ScrapeQueue(false);
-    q.setPluginRegistry(makeRegistry(makeRuleset(extract), transport, domain));
+    q.setPluginRegistry(makeRegistry(makeRuleset(extract, extra), transport, domain));
     q.setIngestEmitter({ send });
     q.setScrapingService(makeScrapingStub());
     q.setIngestTransports(transport === 'http' ? { http } : { impersonate: http });
@@ -162,12 +171,15 @@ describe('ScrapeQueue × record-fetch status gate', () => {
   /** Stop whatever queue the previous call built, so a multi-item case leaves nothing running. */
   async function runItem(
     body: unknown,
-    opts: { maxRetries?: number; send?: jest.Mock; transport?: 'http' | 'impersonate'; domain?: string; url?: string } = {},
+    opts: {
+      maxRetries?: number; send?: jest.Mock; transport?: 'http' | 'impersonate'; domain?: string; url?: string;
+      ruleset?: Partial<ExtractionRuleset>;
+    } = {},
   ) {
     if (queue) { queue.stop(); queue.clear(); }
     const http = jest.fn().mockResolvedValue(body);
     const send = opts.send ?? jest.fn().mockResolvedValue(HEALTHY_STATS);
-    queue = buildQueue(http, send, opts.transport ?? 'http', opts.domain ?? HOST);
+    queue = buildQueue(http, send, opts.transport ?? 'http', opts.domain ?? HOST, opts.ruleset);
     const url = opts.url ?? ITEM_URL;
     const result = queue.enqueue(url, { url, maxRetries: opts.maxRetries ?? 2 });
     result.promise.catch(() => {});
@@ -245,6 +257,53 @@ describe('ScrapeQueue × record-fetch status gate', () => {
     expect(http).toHaveBeenCalledTimes(1);
     expect(send).toHaveBeenCalledTimes(1);
     expect(reports).toHaveLength(0);
+  });
+
+  /**
+   * A RULESET-DECLARED GONE PAGE (mandarake answers a removed item with HTTP 500 and its own
+   * "Error Page" title). The declaration turns that answer into gone_or_denied on first sight:
+   * one fetch, no retry, booked like the other denied-or-gone rows. The same status without the
+   * marker, and the marker on a status the ruleset did not declare, behave exactly as before.
+   */
+  describe('a ruleset-declared gone page', () => {
+    it.each(['http', 'impersonate'] as const)('books a 500 carrying the marker as gone-or-denied on the %s lane, never retried', async (transport) => {
+      const { http, send } = await runItem(
+        { body: GONE_HTML, status: 500, finalUrl: ITEM_URL },
+        { transport, ruleset: { gonePage: GONE_PAGE } },
+      );
+
+      expect(queue.getStats().failed).toBe(1);
+      expect(http).toHaveBeenCalledTimes(1);          // first sight: never re-fetched
+      expect(extract).not.toHaveBeenCalled();
+      expect(send).not.toHaveBeenCalled();
+      expect(reports).toHaveLength(1);
+      expect(reports[0]).toMatchObject({ reasonClass: 'http_403', httpStatus: 500, transport });
+      expect(reports[0].message).toMatch(/^gone_or_denied: /);
+      expect(reports[0].message).toContain('declared gone page');
+    });
+
+    it('still retries a 500 WITHOUT the marker and books it http_5xx', async () => {
+      const { http } = await runItem(
+        { body: '<html><title>Busy</title></html>', status: 500, finalUrl: ITEM_URL },
+        { ruleset: { gonePage: GONE_PAGE } },
+      );
+
+      expect(http.mock.calls.length).toBeGreaterThan(1);
+      expect(reports).toHaveLength(1);
+      expect(reports[0]).toMatchObject({ reasonClass: 'http_5xx', httpStatus: 500 });
+    });
+
+    it('leaves a 200 carrying the marker to the ruleset (the status must match too)', async () => {
+      const { send } = await runItem(
+        { body: GONE_HTML, status: 200, finalUrl: ITEM_URL },
+        { ruleset: { gonePage: GONE_PAGE } },
+      );
+
+      expect(queue.getStats().completed).toBe(1);
+      expect(extract).toHaveBeenCalledTimes(1);
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(reports).toHaveLength(0);
+    });
   });
 
   it('leaves a lane that surfaced NO status alone (a bare-string transport is not a failure)', async () => {
@@ -414,9 +473,9 @@ describe('ScrapeQueue × record-fetch status gate', () => {
    */
   describe('browser lane — the default lane for an undeclared transport', () => {
     /** Build the queue around a browser stub whose navigation ENDS somewhere other than the request. */
-    function buildBrowserQueue(page: Record<string, unknown>, send: jest.Mock): ScrapeQueue {
+    function buildBrowserQueue(page: Record<string, unknown>, send: jest.Mock, extra: Partial<ExtractionRuleset> = {}): ScrapeQueue {
       const q = new ScrapeQueue(false);
-      q.setPluginRegistry(makeBrowserRegistry(makeRuleset(extract)));
+      q.setPluginRegistry(makeBrowserRegistry(makeRuleset(extract, extra)));
       q.setIngestEmitter({ send });
       q.setScrapingService({
         scrapePage: jest.fn().mockResolvedValue(page),
@@ -467,6 +526,24 @@ describe('ScrapeQueue × record-fetch status gate', () => {
 
       expect(queue.getStats().completed).toBe(1);
       expect(reports).toHaveLength(0);
+    });
+
+    it('books a rendered 500 carrying the ruleset-declared gone page as gone-or-denied, never retried', async () => {
+      const send = jest.fn().mockResolvedValue(HEALTHY_STATS);
+      const page = { html: GONE_HTML, url: ITEM_URL, finalUrl: ITEM_URL, title: 'Error Page | EXAMPLE STORE', statusCode: 500 };
+      queue = buildBrowserQueue(page, send, { gonePage: GONE_PAGE });
+      const scrapePage = jest.fn().mockResolvedValue(page);
+      queue.setScrapingService({ scrapePage, scrapePageStealth: scrapePage });
+      const result = queue.enqueue(ITEM_URL, { url: ITEM_URL, maxRetries: 2 });
+      result.promise.catch(() => {});
+      await advanceUntil(() => queue.getStats().failed === 1 || queue.getStats().completed === 1);
+
+      expect(extract).not.toHaveBeenCalled();
+      expect(reports).toHaveLength(1);
+      expect(reports[0]).toMatchObject({ reasonClass: 'http_403', httpStatus: 500, transport: 'browser' });
+      expect(reports[0].message).toMatch(/^gone_or_denied: /);
+      expect(reports[0].message).toContain('(gave up after 1 attempts)');
+      expect(scrapePage).toHaveBeenCalledTimes(1);    // first sight: never re-fetched
     });
   });
 });

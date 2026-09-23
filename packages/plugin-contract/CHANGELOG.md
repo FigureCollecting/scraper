@@ -4,6 +4,16 @@ All notable changes to `@figurecollecting/scraper-plugin-contract` will be docum
 file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this
 package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] - 2026-09-22
+
+Additive, backward-compatible: a ruleset that declares nothing behaves exactly as before.
+
+### Added
+- `ExtractionRuleset.gonePage?: GonePage` (and the `GonePage` export) — `{ statuses, titleIncludes?,
+  bodyIncludes? }`. A response whose status is listed and whose page carries every declared marker is
+  failed as gone-or-denied on first sight instead of being booked by its status (a store that serves
+  a removed item as HTTP 500 was retried as a transient fault).
+
 ## [0.11.0] - 2026-09-09
 
 Additive, backward-compatible: a store that declares nothing behaves exactly as before, and every

@@ -147,3 +147,66 @@ describe('evaluateRecordFetch — stores where a 404 is ambiguous', () => {
     expect(failure.deniedOrGone).toBe(false);
   });
 });
+
+/**
+ * A RULESET-DECLARED GONE PAGE. Some stores answer a removed item with their own error page and a
+ * 5xx instead of a 404. Left to the status alone that is a transient `http_5xx`, retried to
+ * exhaustion. A ruleset that declares its store's gone page turns a matching answer into a
+ * denied-or-gone failure on first sight; a status or body that does not match is untouched.
+ */
+describe('evaluateRecordFetch — a ruleset-declared gone page', () => {
+  const GONE_HTML = '<html><head><title>Error Page | EXAMPLE STORE</title></head><body>oops</body></html>';
+  const gonePage = { statuses: [500], titleIncludes: 'Error Page | EXAMPLE STORE' };
+
+  it('marks a declared status carrying the declared title as denied-or-gone', () => {
+    const failure = evaluateRecordFetch(ITEM, { status: 500, finalUrl: ITEM, html: GONE_HTML }, 'http', gonePage)!;
+    expect(failure.deniedOrGone).toBe(true);
+    expect(failure.declaredGone).toBe(true);
+    expect(failure.status).toBe(500);
+    expect(failure.message).toContain('declared gone page');
+  });
+
+  it('leaves the same status WITHOUT the marker as a plain status failure', () => {
+    const failure = evaluateRecordFetch(ITEM, { status: 500, html: '<title>Busy</title>' }, 'http', gonePage)!;
+    expect(failure.deniedOrGone).toBe(false);
+    expect(failure.declaredGone).toBe(false);
+    expect(failure.message).toContain('HTTP 500');
+  });
+
+  it('never fires on a status the declaration does not list (a 200 carrying the marker passes)', () => {
+    expect(evaluateRecordFetch(ITEM, { status: 200, finalUrl: ITEM, html: GONE_HTML }, 'http', gonePage)).toBeUndefined();
+    expect(evaluateRecordFetch(ITEM, { status: 503, html: GONE_HTML }, 'http', gonePage)!.declaredGone).toBe(false);
+  });
+
+  it('matches a body marker, and requires EVERY declared marker', () => {
+    const body = { statuses: [500], bodyIncludes: 'item-removed' };
+    expect(evaluateRecordFetch(ITEM, { status: 500, html: '<p class="item-removed"></p>' }, 'http', body)!.declaredGone).toBe(true);
+    const both = { statuses: [500], titleIncludes: 'Error Page | EXAMPLE STORE', bodyIncludes: 'item-removed' };
+    expect(evaluateRecordFetch(ITEM, { status: 500, html: GONE_HTML }, 'http', both)!.declaredGone).toBe(false);
+  });
+
+  it('reads the title with its whitespace collapsed, not the raw markup', () => {
+    const html = '<html><head><TITLE lang="en">\n  Error Page |\n  EXAMPLE STORE </TITLE></head></html>';
+    expect(evaluateRecordFetch(ITEM, { status: 500, html }, 'http', gonePage)!.declaredGone).toBe(true);
+    // a title marker is looked for in the title only — the same text in the body is not the title
+    expect(
+      evaluateRecordFetch(ITEM, { status: 500, html: '<body>Error Page | EXAMPLE STORE</body>' }, 'http', gonePage)!.declaredGone,
+    ).toBe(false);
+  });
+
+  it('never matches a declaration with no marker, a lane that surfaced no body, or a malformed declaration', () => {
+    expect(evaluateRecordFetch(ITEM, { status: 500, html: GONE_HTML }, 'http', { statuses: [500] })!.declaredGone).toBe(false);
+    expect(evaluateRecordFetch(ITEM, { status: 500, html: GONE_HTML }, 'http', { statuses: [500], titleIncludes: '' })!.declaredGone).toBe(false);
+    expect(evaluateRecordFetch(ITEM, { status: 500 }, 'http', gonePage)!.declaredGone).toBe(false);
+    const malformed = { statuses: 500 } as unknown as { statuses: number[] };
+    expect(evaluateRecordFetch(ITEM, { status: 500, html: GONE_HTML }, 'http', { ...malformed, titleIncludes: 'Error' })!.declaredGone).toBe(false);
+  });
+
+  it('leaves the ambiguous-404 table and an undeclared ruleset exactly as before', () => {
+    expect(evaluateRecordFetch(ITEM, { status: 500, html: GONE_HTML }, 'http')!.deniedOrGone).toBe(false);
+    const mfc = evaluateRecordFetch('https://myfigurecollection.net/item/1', { status: 404 }, 'http', gonePage)!;
+    expect(mfc.deniedOrGone).toBe(true);
+    expect(mfc.declaredGone).toBe(false);
+    expect(mfc.message).toContain('mfc 404: denied-or-gone');
+  });
+});
