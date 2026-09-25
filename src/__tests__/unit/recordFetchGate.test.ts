@@ -99,6 +99,106 @@ describe('isRedirectHome', () => {
 });
 
 /**
+ * A LOCALE ROOT is a home page too. hobbysearch (1999.co.jp) answers a dead item /eng/19999999 with
+ * a 200 that landed on /eng/ (live capture 2026-09-23). A bare language segment is never where a
+ * record lives, so a same-site redirect to one is redirect_home exactly like "/".
+ */
+describe('isRedirectHome — a locale root', () => {
+  const HS_ITEM = 'https://www.1999.co.jp/eng/19999999';
+
+  it('is true for the live hobbysearch bounce /eng/19999999 -> /eng/', () => {
+    expect(isRedirectHome(HS_ITEM, 'https://www.1999.co.jp/eng/')).toBe(true);
+  });
+
+  it.each([
+    ['https://store.example.test/eng/'],
+    ['https://store.example.test/en'],
+    ['https://store.example.test/ja/'],
+    ['https://store.example.test/zh-cn/'],
+    ['https://store.example.test/EN/'],
+    ['https://store.example.test/pt_BR/'],
+    ['https://store.example.test/zh-Hant/'],
+    ['https://store.example.test/es-419'],
+    ['https://store.example.test/ja/?from=item'],
+    ['https://www.store.example.test/en/'],
+    ['https://store.example.test/zh-hans/'],
+    ['https://store.example.test/jpn/'],
+  ])('is true when an item fetch ended on the locale root %s', (finalUrl) => {
+    expect(isRedirectHome(ITEM, finalUrl)).toBe(true);
+  });
+
+  it.each([
+    ['https://store.example.test/eng/123'],
+    ['https://store.example.test/english/'],
+    ['https://store.example.test/english-figures/'],
+    ['https://store.example.test/products/'],
+    ['https://store.example.test/e/'],
+    ['https://store.example.test/en-/'],
+    ['https://store.example.test/en-us-x/'],
+    ['https://store.example.test/12/'],
+    ['https://store.example.test/en//'],
+    ['https://store.example.test/zh-bogus/'],
+    // Root-slug stores (BigCommerce) keep categories, brands and renamed products at /<slug>/.
+    ['https://store.example.test/on-sale/'],
+    ['https://store.example.test/my-hero/'],
+    ['https://store.example.test/abs-slug/'],
+    ['https://store.example.test/rem-maid/'],
+    ['https://store.example.test/so_ta'],
+    ['https://store.example.test/ryu_ns'],
+    ['https://store.example.test/re_ment'],
+    ['https://store.example.test/lim_land'],
+    // A real language with a 4-letter word that is not a script code.
+    ['https://store.example.test/de-luxe/'],
+    ['https://store.example.test/it-girl/'],
+    // Short words are not languages.
+    ['https://store.example.test/new/'],
+    ['https://store.example.test/faq/'],
+    ['https://store.example.test/top/'],
+    ['https://store.example.test/shop/'],
+    ['https://store.example.test/sale/'],
+    ['https://store.example.test/news/'],
+  ])('is false for a path that is not a bare locale root (%s)', (finalUrl) => {
+    expect(isRedirectHome(ITEM, finalUrl)).toBe(false);
+  });
+
+  it('is false for a redirect to a locale root on ANOTHER site', () => {
+    expect(isRedirectHome(ITEM, 'https://other.example.org/en/')).toBe(false);
+    expect(isRedirectHome(HS_ITEM, 'https://www.1999.co.jp.evil.test/eng/')).toBe(false);
+    expect(isRedirectHome('https://1999.co.jp/eng/1', 'https://evil1999.co.jp/eng/')).toBe(false);
+    expect(isRedirectHome('https://evil1999.co.jp/eng/1', 'https://1999.co.jp/eng/')).toBe(false);
+  });
+
+  it('is true for a locale root on the apex of a www. item (either subdomain direction)', () => {
+    expect(isRedirectHome('https://www.s.test/product/1', 'https://s.test/en/')).toBe(true);
+  });
+
+  it('keeps a bounce to "/" as redirect_home even when the requested path looks like a locale', () => {
+    expect(isRedirectHome('https://store.example.test/abs-slug/', 'https://store.example.test/')).toBe(true);
+    expect(isRedirectHome('https://store.example.test/ssr-miku/', 'https://store.example.test/')).toBe(true);
+    expect(isRedirectHome('https://store.example.test/en?pid=5', 'https://store.example.test/')).toBe(true);
+    expect(isRedirectHome('https://store.example.test/pid?x=5', 'https://store.example.test/')).toBe(true);
+    expect(isRedirectHome('https://store.example.test/eng', 'https://store.example.test/')).toBe(true);
+  });
+
+  it('is false when nothing was redirected (the fetch stayed on the item)', () => {
+    expect(isRedirectHome(HS_ITEM, HS_ITEM)).toBe(false);
+  });
+
+  it('is false when the REQUEST was for the locale root itself', () => {
+    expect(isRedirectHome('https://www.1999.co.jp/eng/', 'https://www.1999.co.jp/eng/')).toBe(false);
+    expect(isRedirectHome('https://www.1999.co.jp/eng', 'https://www.1999.co.jp/eng/')).toBe(false);
+    expect(isRedirectHome('https://www.1999.co.jp/eng/', 'https://www.1999.co.jp/ja/')).toBe(false);
+  });
+
+  it('flags the gate verdict as redirectedHome with the landed url, and a failing status still wins', () => {
+    const failure = evaluateRecordFetch(HS_ITEM, { status: 200, finalUrl: 'https://www.1999.co.jp/eng/' }, 'http')!;
+    expect(failure.redirectedHome).toBe(true);
+    expect(failure.finalUrl).toBe('https://www.1999.co.jp/eng/');
+    expect(evaluateRecordFetch(HS_ITEM, { status: 404, finalUrl: 'https://www.1999.co.jp/eng/' }, 'http')!.redirectedHome).toBe(false);
+  });
+});
+
+/**
  * THE AMBIGUOUS-404 TABLE (owner rule, 2026-09-09). On myfigurecollection.net a 404 is not proof
  * that anything is gone: NSFW and NSFW+ items answer 404 to a session that is not entitled (age
  * gate, or stale scrape-account cookies), and the site gives no way to tell that apart from a

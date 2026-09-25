@@ -137,10 +137,10 @@ function usableStatus(status: number | undefined): number | undefined {
     : undefined;
 }
 
-/** The path of a URL, `undefined` when it will not parse. Query and hash are irrelevant here. */
-function pathOf(url: string): string | undefined {
+/** The parsed URL, `undefined` when it will not parse. */
+function parse(url: string): URL | undefined {
   try {
-    return new URL(url).pathname;
+    return new URL(url);
   } catch {
     return undefined;
   }
@@ -152,18 +152,48 @@ function isHomePath(path: string): boolean {
 }
 
 /**
+ * Languages a store localizes into (ISO 639-1 and 639-2 B/T). An allowlist, not "any 2–3 letters":
+ * root-slug stores keep categories and products at /<slug>/, and /new/ or /so_ta is not a language.
+ */
+const LOCALE_LANGUAGES =
+  'ar|cs|da|de|el|en|es|fi|fr|he|hi|hu|id|it|ja|ko|ms|nl|no|pl|pt|ro|ru|sv|th|tl|tr|uk|vi|zh|' +
+  'ara|chi|deu|dut|eng|fra|fre|ger|ind|ita|jpn|kor|nld|pol|por|rus|spa|swe|tha|tur|vie|zho';
+
+/**
+ * A bare locale root: ONE known language segment (`/eng/`, `/en`, `/zh-cn/`, `/es-419`, `/zh-Hant/`)
+ * and nothing else, with at most a region (2 letters / 3 digits) or a real script subtag.
+ */
+const LOCALE_ROOT = new RegExp(
+  `^/(?:${LOCALE_LANGUAGES})(?:[-_](?:[a-z]{2}|\\d{3}|hans|hant|latn|cyrl|arab))?/?$`,
+  'i',
+);
+
+/** Same site: one host equals, or is a subdomain of, the other (`www.` bounces included). */
+function isSameSite(a: string, b: string): boolean {
+  return a === b || a.endsWith(`.${b}`) || b.endsWith(`.${a}`);
+}
+
+/**
  * Did an ITEM fetch end up on a home/landing page? True only when the requested URL asked for a
- * real path and the fetch finished on a bare root. The host is deliberately not compared: a bounce
- * to `www.` or to a regional front page is equally not the record. Unparseable input is never a
- * guess — it answers false.
+ * real path and the fetch finished on a bare root, or on a same-site locale root. The host is not
+ * compared for `/`: a bounce to `www.` or to a regional front page is equally not the record.
+ * Unparseable input is never a guess — it answers false.
  */
 export function isRedirectHome(requestedUrl: string, finalUrl: string | undefined): boolean {
   if (finalUrl === undefined || finalUrl === '') return false;
-  const requested = pathOf(requestedUrl);
-  const landed = pathOf(finalUrl);
+  const requested = parse(requestedUrl);
+  const landed = parse(finalUrl);
   if (requested === undefined || landed === undefined) return false;
-  if (isHomePath(requested)) return false;
-  return isHomePath(landed);
+  const requestedPath = requested.pathname;
+  if (isHomePath(requestedPath)) return false;
+  if (isHomePath(landed.pathname)) return true;
+  // A locale segment is only a home page on the store's OWN site, and only when the request was not
+  // already for one; elsewhere it is just a path.
+  return (
+    !LOCALE_ROOT.test(requestedPath) &&
+    LOCALE_ROOT.test(landed.pathname) &&
+    isSameSite(requested.hostname, landed.hostname)
+  );
 }
 
 /** The page `<title>` text with whitespace collapsed, `undefined` when there is none. */

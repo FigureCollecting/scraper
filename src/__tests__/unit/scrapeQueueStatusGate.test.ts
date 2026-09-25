@@ -238,6 +238,45 @@ describe('ScrapeQueue × record-fetch status gate', () => {
     expect(reports[0].message).toContain('home');
   });
 
+  /** hobbysearch: a dead item answered with a 200 on its locale home /eng/ (live 2026-09-23). */
+  it.each(['http', 'impersonate'] as const)('books an item that landed on the store LOCALE root as redirect_home on the %s lane', async (transport) => {
+    const { http, send } = await runItem(
+      { body: '<html>locale front page</html>', status: 200, finalUrl: `https://${HOST}/eng/` },
+      { transport, url: `https://${HOST}/eng/19999999` },
+    );
+
+    expect(queue.getStats().failed).toBe(1);
+    expect(http).toHaveBeenCalledTimes(1);
+    expect(extract).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    expect(reports).toHaveLength(1);
+    expect(reports[0]).toMatchObject({ reasonClass: 'redirect_home', transport });
+  });
+
+  it.each(['/abs-slug/', '/en?pid=5'])('books a root-slug item %s that bounced to "/" as redirect_home', async (path) => {
+    const { send } = await runItem(
+      { body: '<html>front page</html>', status: 200, finalUrl: `https://${HOST}/` },
+      { url: `https://${HOST}${path}` },
+    );
+
+    expect(queue.getStats().failed).toBe(1);
+    expect(extract).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    expect(reports).toHaveLength(1);
+    expect(reports[0]).toMatchObject({ reasonClass: 'redirect_home' });
+  });
+
+  it('leaves an item that landed on a real path under the locale segment alone', async () => {
+    const { send } = await runItem(
+      { body: FIXTURE_HTML, status: 200, finalUrl: `https://${HOST}/eng/12345` },
+      { url: `https://${HOST}/eng/19999999` },
+    );
+
+    expect(queue.getStats().completed).toBe(1);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(reports).toHaveLength(0);
+  });
+
   it('leaves a Cloudflare interstitial on the CHALLENGE path even though it carries a 403', async () => {
     jest.spyOn(console, 'warn').mockImplementation(() => {});
     jest.spyOn(console, 'error').mockImplementation(() => {});
@@ -490,6 +529,22 @@ describe('ScrapeQueue × record-fetch status gate', () => {
       const send = jest.fn().mockResolvedValue(HEALTHY_STATS);
       queue = buildBrowserQueue(
         { html: '<html>front page</html>', url: ITEM_URL, finalUrl: `https://${HOST}/`, title: 'Home', statusCode: 200 },
+        send,
+      );
+      const result = queue.enqueue(ITEM_URL, { url: ITEM_URL, maxRetries: 2 });
+      result.promise.catch(() => {});
+      await advanceUntil(() => queue.getStats().failed === 1 || queue.getStats().completed === 1);
+
+      expect(extract).not.toHaveBeenCalled();
+      expect(send).not.toHaveBeenCalled();
+      expect(reports).toHaveLength(1);
+      expect(reports[0]).toMatchObject({ reasonClass: 'redirect_home', transport: 'browser' });
+    });
+
+    it('books a rendered item that landed on the store locale root as redirect_home', async () => {
+      const send = jest.fn().mockResolvedValue(HEALTHY_STATS);
+      queue = buildBrowserQueue(
+        { html: '<html>locale front page</html>', url: ITEM_URL, finalUrl: `https://${HOST}/ja/`, title: 'Home', statusCode: 200 },
         send,
       );
       const result = queue.enqueue(ITEM_URL, { url: ITEM_URL, maxRetries: 2 });
