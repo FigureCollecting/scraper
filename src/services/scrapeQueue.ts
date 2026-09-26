@@ -25,7 +25,7 @@ import { getSessionManager, resetSessionManager, SessionManager, SessionPausedEv
 import { notifyItemFailed } from './webhookClient.js';
 import { enrichmentLogger } from '../utils/logger.js';
 import { createScrapingService } from './engineServices/scrapingService.js';
-import { createCapturingFetch, laneOf, ChallengePageError, FetchMethodUnsupportedError, type CapturingFetch, type CapturingFetchTransports } from './engineServices/capturingFetch.js';
+import { createCapturingFetch, laneOf, ChallengePageError, FetchHeadersUnsupportedError, FetchMethodUnsupportedError, type CapturingFetch, type CapturingFetchTransports } from './engineServices/capturingFetch.js';
 import { evaluateRecordFetch, RecordFetchStatusError } from './recordFetchGate.js';
 import { observeMfcItemFetch } from './sessionCanary.js';
 import { getChallengeCooldown, ChallengeCooldownError, type ChallengeCooldown } from './challengeCooldown.js';
@@ -534,9 +534,13 @@ function classifyError(error: Error | string): ErrorType {
   if (error instanceof ChallengeLaneUnavailableError) {
     return 'extraction_unavailable';
   }
-  // A refused fetchBody request (malformed options, or a POST on the browser lane) is a ruleset or
-  // store-config bug: a retry re-fetches the primary page only to be refused again.
-  if (error instanceof FetchBodyRequestError || error instanceof FetchMethodUnsupportedError) {
+  // A refused fetchBody request (malformed options, or a POST or headers on the browser lane) is a
+  // ruleset or store-config bug: a retry re-fetches the primary page only to be refused again.
+  if (
+    error instanceof FetchBodyRequestError ||
+    error instanceof FetchMethodUnsupportedError ||
+    error instanceof FetchHeadersUnsupportedError
+  ) {
     return 'extraction_unavailable';
   }
 

@@ -74,16 +74,20 @@ export function createHttpFetchDetailed(options: { store?: CfCookieSource } = {}
   return async function httpFetchDetail(url: string, request?: FetchRequest): Promise<FetchBodyDetail> {
     const store = options.store ?? getCfCookieStore();
     const cookies = store.cookiesFor(url);
+    const post = request?.method === 'POST' ? request : undefined;
     const headers: Record<string, string> = {
       'user-agent': store.userAgentFor(url) ?? DESKTOP_UA,
       accept: 'application/json, text/html',
+      // The ruleset's headers, lowercase and allowlisted by the ExtractContext (never user-agent,
+      // cookie or content-type): its `accept` replaces the default above in place.
+      ...(request?.headers ?? {}),
       ...(cookies ? { cookie: serializeCookieHeader(cookies) } : {}),
-      ...(request ? { 'content-type': request.contentType } : {}),
+      ...(post ? { 'content-type': post.contentType } : {}),
     };
     const res = await fetch(url, {
       // A POST's redirect is returned, not followed: a 302/303 would come back as a GET's bytes booked
       // as the POST's, and a 307/308 would resend the body to a host no guard has seen.
-      ...(request ? { method: request.method, body: request.body, redirect: 'manual' as const } : {}),
+      ...(post ? { method: post.method, body: post.body, redirect: 'manual' as const } : {}),
       headers,
       // One signal bounds headers AND body: text() streams under the same abort.
       signal: AbortSignal.timeout(HTTP_FETCH_TIMEOUT_MS),

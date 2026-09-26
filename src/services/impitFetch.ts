@@ -103,7 +103,10 @@ export interface ImpitFetchOptions {
    * from the node IP, nor the reverse). Absent ⇒ the direct session (byte-identical).
    */
   proxyUrl?: string;
-  /** Send this POST instead of a GET (contract 0.14.0). The prime, when declared, is still a GET. */
+  /**
+   * Send this POST instead of a GET (contract 0.14.0), and/or the ruleset's request headers
+   * (0.15.0) on the target. The prime, when declared, is still a plain GET without them.
+   */
   request?: FetchRequest;
 }
 
@@ -316,13 +319,21 @@ export function createImpitFetchDetailed(makeImpit: MakeImpit = defaultMakeImpit
       ...(pinnedUa ? { 'User-Agent': pinnedUa } : {}),
     };
     const request = opts.request;
-    // Case-insensitive: a store header spelled `content-type` must not ride beside the POST's own.
+    const post = request?.method === 'POST' ? request : undefined;
+    const ruleset = request?.headers ?? {};
+    // Case-insensitive replacement: a store header spelled `Accept` must not ride beside a ruleset's
+    // `accept`, nor a store `content-type` beside the POST's own.
+    const replaced = new Set([...Object.keys(ruleset), ...(post ? ['content-type'] : [])]);
     const targetHeaders = request
-      ? { ...Object.fromEntries(Object.entries(headers).filter(([k]) => k.toLowerCase() !== 'content-type')), 'Content-Type': request.contentType }
+      ? {
+          ...Object.fromEntries(Object.entries(headers).filter(([k]) => !replaced.has(k.toLowerCase()))),
+          ...ruleset,
+          ...(post ? { 'Content-Type': post.contentType } : {}),
+        }
       : headers;
     const target = () =>
       // A POST's redirect comes back as-is, never followed (as on the http lane).
-      session.impit.fetch(url, request ? { method: request.method, headers: targetHeaders, body: request.body, redirect: 'manual' } : { method: 'GET', headers });
+      session.impit.fetch(url, post ? { method: post.method, headers: targetHeaders, body: post.body, redirect: 'manual' } : { method: 'GET', headers: targetHeaders });
     if (!opts.prime) {
       return readDetail(await target());
     }
@@ -334,7 +345,7 @@ export function createImpitFetchDetailed(makeImpit: MakeImpit = defaultMakeImpit
     if (hostOf(primeUrl) !== undefined && looksLikeChallenge(detail.body)) {
       // A POST is never replayed here (not assumed idempotent): drop the prime so the NEXT call
       // re-primes, and hand back the challenge for the caller's own retry policy.
-      if (request) {
+      if (post) {
         invalidatePrime(session, primeUrl);
         return detail;
       }

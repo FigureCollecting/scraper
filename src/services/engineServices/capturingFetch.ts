@@ -9,8 +9,9 @@
  *     impit/http lanes are captured here, under the 'api' lane, so raw.capture + the raw store
  *     stay populated no matter which transport served the fetch.
  *   - it returns `{ html }` (the shape ruleset.extract() consumes), not a bare string.
- * A POST (`options.request`, contract 0.14.0) is sent by the impit/http lanes and recorded on the
- * capture; the browser lane refuses it rather than navigate (a GET) in its place.
+ * A POST (`options.request`, contract 0.14.0) and a ruleset's allowlisted request headers (0.15.0)
+ * are sent by the impit/http lanes and recorded on the capture; the browser lane refuses either
+ * rather than navigate without them.
  *
  * On the BROWSER lane it resolves its per-request wiring through the SAME `resolveBrowserLaneOptions`
  * the other doors use (the search dispatcher, the /resolve detail fetch, the ExtractContext
@@ -145,12 +146,14 @@ export class ChallengePageError extends Error {
 /** Content-Type of a POST whose ruleset named none: what an HTML form sends. */
 export const DEFAULT_POST_CONTENT_TYPE = 'application/x-www-form-urlencoded; charset=UTF-8';
 
-/** A POST for the http/impersonate lanes (contract 0.14.0). Absent everywhere ⇒ a GET. */
-export interface FetchRequest {
-  method: 'POST';
-  body: string;
-  contentType: string;
-}
+/**
+ * What a fetchBody call asks of the http/impersonate lanes beyond a bare GET: a POST (contract
+ * 0.14.0) and/or the ruleset's request headers (0.15.0: allowlisted, names lowercase, validated by
+ * the ExtractContext). Absent everywhere ⇒ the bare GET.
+ */
+export type FetchRequest =
+  | { method: 'POST'; body: string; contentType: string; headers?: Record<string, string> }
+  | { method: 'GET'; headers: Record<string, string> };
 
 /**
  * The browser lane was asked to POST. It navigates, and a navigation is a GET, so sending the url
@@ -170,6 +173,26 @@ export class FetchMethodUnsupportedError extends Error {
   }
 }
 
+/**
+ * The browser lane was asked to send request headers. A navigation cannot carry a request's own
+ * Origin/Referer/Accept, so navigating anyway would return an answer to a different request.
+ * Thrown before any navigation.
+ */
+export class FetchHeadersUnsupportedError extends Error {
+  readonly url: string;
+  readonly headerNames: string[];
+  constructor(url: string, headerNames: string[]) {
+    super(
+      `The browser lane cannot send request headers (${headerNames.map(sanitizeForLog).join(', ')}) for ` +
+        `${sanitizeForLog(url)}: declare searchFetch.transport 'http' or 'impersonate' for this store to use ` +
+        `fetchBody with headers.`,
+    );
+    this.name = 'FetchHeadersUnsupportedError';
+    this.url = url;
+    this.headerNames = headerNames;
+  }
+}
+
 /** The browser lane's raw-fetch surface — it already captures internally via navigateAndCapture. */
 export interface BrowserLaneFetcher {
   scrapePage(url: string, options?: EngineScrapePageOptions): Promise<ScrapePageResult>;
@@ -177,9 +200,9 @@ export interface BrowserLaneFetcher {
 }
 
 export interface CapturingFetchTransports {
-  /** Plain HTTP GET (Tier-1 cookieless JSON/HTML), or the `request` POST. May answer with the status-aware detail. */
+  /** Plain HTTP GET (Tier-1 cookieless JSON/HTML), or the `request` (a POST and/or ruleset headers). May answer with the status-aware detail. */
   http: (url: string, request?: FetchRequest) => Promise<FetchBodyOutcome>;
-  /** impit TLS-impersonating GET (Cloudflare-fronted JSON APIs), or the `request` POST. `prime` primes a session-gated host; `proxyUrl` is residential egress. */
+  /** impit TLS-impersonating GET (Cloudflare-fronted JSON APIs), or the `request` (a POST and/or ruleset headers). `prime` primes a session-gated host; `proxyUrl` is residential egress. */
   impersonate: (url: string, opts: { browser?: string; headers?: Record<string, string>; userAgent?: string; prime?: { url: string }; proxyUrl?: string; request?: FetchRequest }) => Promise<FetchBodyOutcome>;
   /** Pooled browser navigation — the fallback for `browser`/undeclared transports. */
   browser: BrowserLaneFetcher;
@@ -208,7 +231,8 @@ async function captureApiBody(sink: CaptureSink, url: string, body: string, requ
       lane: 'api',
       bytes: Buffer.from(body, 'utf8'),
       fetchedAt: new Date().toISOString(),
-      ...(request ? { method: request.method, requestBody: request.body } : {}),
+      ...(request?.method === 'POST' ? { method: request.method, requestBody: request.body } : {}),
+      ...(request?.headers ? { requestHeaders: request.headers } : {}),
     }));
   } catch (err) {
     // eslint-disable-next-line no-console
@@ -286,7 +310,8 @@ export function createCapturingFetch(
       }
       case 'browser':
       default: {
-        if (request) throw new FetchMethodUnsupportedError(url, request.method);
+        if (request?.method === 'POST') throw new FetchMethodUnsupportedError(url, request.method);
+        if (request?.headers) throw new FetchHeadersUnsupportedError(url, Object.keys(request.headers));
         // STEALTH SELECTION: item (request) cookies OR stored cookies for this host ⇒ the stealth
         // browser (CF stores ride stealth). Only the CHOICE is made here — the lane itself
         // (navigateAndCapture) merges the store's cookies under the item's, so a store-only hit
