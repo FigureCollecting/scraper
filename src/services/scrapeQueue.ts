@@ -25,7 +25,7 @@ import { getSessionManager, resetSessionManager, SessionManager, SessionPausedEv
 import { notifyItemFailed } from './webhookClient.js';
 import { enrichmentLogger } from '../utils/logger.js';
 import { createScrapingService } from './engineServices/scrapingService.js';
-import { createCapturingFetch, laneOf, ChallengePageError, type CapturingFetch, type CapturingFetchTransports } from './engineServices/capturingFetch.js';
+import { createCapturingFetch, laneOf, ChallengePageError, FetchMethodUnsupportedError, type CapturingFetch, type CapturingFetchTransports } from './engineServices/capturingFetch.js';
 import { evaluateRecordFetch, RecordFetchStatusError } from './recordFetchGate.js';
 import { observeMfcItemFetch } from './sessionCanary.js';
 import { getChallengeCooldown, ChallengeCooldownError, type ChallengeCooldown } from './challengeCooldown.js';
@@ -46,7 +46,7 @@ import { impitFetchBodyDetailed } from './impitFetch.js';
 import { httpFetchBodyDetailed } from './engineLookup.js';
 import { buildProfileRegistry, ProfileRegistry } from '../driver/profileRegistry.js';
 import { extractRecords, EmptyExtractionError } from './engineServices/extractRecords.js';
-import { buildExtractContext } from './engineServices/extractContext.js';
+import { buildExtractContext, FetchBodyRequestError } from './engineServices/extractContext.js';
 import { createPluginLogger } from './engineServices/pluginLogger.js';
 import type { CaptureSink } from './captureSink.js';
 import { getImageCaptureHook } from './images/assembleImageCapture.js';
@@ -532,6 +532,11 @@ function classifyError(error: Error | string): ErrorType {
   // store declares a Cloudflare gate and this process launches the headless profile, which cannot
   // clear one. Never retried — BROWSER_LAUNCH_MODE will not change between attempts.
   if (error instanceof ChallengeLaneUnavailableError) {
+    return 'extraction_unavailable';
+  }
+  // A refused fetchBody request (malformed options, or a POST on the browser lane) is a ruleset or
+  // store-config bug: a retry re-fetches the primary page only to be refused again.
+  if (error instanceof FetchBodyRequestError || error instanceof FetchMethodUnsupportedError) {
     return 'extraction_unavailable';
   }
 

@@ -6,7 +6,7 @@
  * factory) so unit tests and non-impersonate code paths never touch the native binary. One Impit
  * instance — WITH a per-profile cookie jar — is cached per impersonation profile.
  */
-import type { FetchBodyDetail } from './engineServices/capturingFetch.js';
+import type { FetchBodyDetail, FetchRequest } from './engineServices/capturingFetch.js';
 import { CookieJar } from 'tough-cookie';
 import { isCloudflareChallenge } from './engineServices/challengeDetect.js';
 import { getCfCookieStore, type CfCookieSource } from './cookieJar.js';
@@ -67,7 +67,7 @@ export interface ImpitResponseLike {
 
 /** Minimal impit surface we depend on — lets tests inject a fake without the native module. */
 export interface ImpitLike {
-  fetch(url: string, init: { method: string; headers?: Record<string, string> }): Promise<ImpitResponseLike>;
+  fetch(url: string, init: { method: string; headers?: Record<string, string>; body?: string; redirect?: 'manual' }): Promise<ImpitResponseLike>;
 }
 
 /**
@@ -103,6 +103,8 @@ export interface ImpitFetchOptions {
    * from the node IP, nor the reverse). Absent ⇒ the direct session (byte-identical).
    */
   proxyUrl?: string;
+  /** Send this POST instead of a GET (contract 0.14.0). The prime, when declared, is still a GET. */
+  request?: FetchRequest;
 }
 
 /**
@@ -313,22 +315,36 @@ export function createImpitFetchDetailed(makeImpit: MakeImpit = defaultMakeImpit
       ...(opts.headers ?? {}),
       ...(pinnedUa ? { 'User-Agent': pinnedUa } : {}),
     };
+    const request = opts.request;
+    // Case-insensitive: a store header spelled `content-type` must not ride beside the POST's own.
+    const targetHeaders = request
+      ? { ...Object.fromEntries(Object.entries(headers).filter(([k]) => k.toLowerCase() !== 'content-type')), 'Content-Type': request.contentType }
+      : headers;
+    const target = () =>
+      // A POST's redirect comes back as-is, never followed (as on the http lane).
+      session.impit.fetch(url, request ? { method: request.method, headers: targetHeaders, body: request.body, redirect: 'manual' } : { method: 'GET', headers });
     if (!opts.prime) {
-      return readDetail(await session.impit.fetch(url, { method: 'GET', headers }));
+      return readDetail(await target());
     }
     const primeUrl = opts.prime.url;
     await ensurePrimed(session, primeUrl, headers, now(), primeTtlMs);
-    let detail = await readDetail(await session.impit.fetch(url, { method: 'GET', headers }));
+    let detail = await readDetail(await target());
     // Only a parseable prime host can be re-primed; an unparseable one has nothing to retry against,
     // so it returns the body as-is rather than re-fetching the target for no gain.
     if (hostOf(primeUrl) !== undefined && looksLikeChallenge(detail.body)) {
+      // A POST is never replayed here (not assumed idempotent): drop the prime so the NEXT call
+      // re-primes, and hand back the challenge for the caller's own retry policy.
+      if (request) {
+        invalidatePrime(session, primeUrl);
+        return detail;
+      }
       // Primed host still challenged ⇒ the clearance expired within its TTL, or CF rotated the
       // challenge. Invalidate and re-prime ONCE (bounded — no loop), then retry the target. Still
       // challenged ⇒ return it; the ruleset yields empty and the caller's own retry/backoff owns the
       // next attempt.
       invalidatePrime(session, primeUrl);
       await ensurePrimed(session, primeUrl, headers, now(), primeTtlMs);
-      detail = await readDetail(await session.impit.fetch(url, { method: 'GET', headers }));
+      detail = await readDetail(await target());
     }
     return detail;
   };

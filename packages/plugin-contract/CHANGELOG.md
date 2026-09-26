@@ -4,6 +4,18 @@ All notable changes to `@figurecollecting/scraper-plugin-contract` will be docum
 file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this
 package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 2026-09-25
+
+Additive, backward-compatible: a `fetchBody` call without the new options is the same GET as before.
+
+### Added
+- `fetchBody(url, { cookies?, method?, body?, contentType? })` (and the `FetchBodyOptions` /
+  `FetchBodyMethod` exports). `method` is `'GET'` (default) or `'POST'`; a POST sends `body` with
+  `contentType` (default `application/x-www-form-urlencoded; charset=UTF-8`). A GET with a body is
+  refused. The http and impersonate transports send it; the browser transport refuses a POST. A POST
+  that is answered with a redirect returns the 3xx itself (`statusCode`), and the redirect is not
+  followed. A POST must be a read-only query, because a retried extraction sends it again.
+
 ## [0.13.0] - 2026-09-22
 
 Additive, backward-compatible: a ruleset that declares nothing behaves exactly as before.

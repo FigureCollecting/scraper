@@ -9,6 +9,8 @@
  *     impit/http lanes are captured here, under the 'api' lane, so raw.capture + the raw store
  *     stay populated no matter which transport served the fetch.
  *   - it returns `{ html }` (the shape ruleset.extract() consumes), not a bare string.
+ * A POST (`options.request`, contract 0.14.0) is sent by the impit/http lanes and recorded on the
+ * capture; the browser lane refuses it rather than navigate (a GET) in its place.
  *
  * On the BROWSER lane it resolves its per-request wiring through the SAME `resolveBrowserLaneOptions`
  * the other doors use (the search dispatcher, the /resolve detail fetch, the ExtractContext
@@ -140,6 +142,34 @@ export class ChallengePageError extends Error {
   }
 }
 
+/** Content-Type of a POST whose ruleset named none: what an HTML form sends. */
+export const DEFAULT_POST_CONTENT_TYPE = 'application/x-www-form-urlencoded; charset=UTF-8';
+
+/** A POST for the http/impersonate lanes (contract 0.14.0). Absent everywhere ⇒ a GET. */
+export interface FetchRequest {
+  method: 'POST';
+  body: string;
+  contentType: string;
+}
+
+/**
+ * The browser lane was asked to POST. It navigates, and a navigation is a GET, so sending the url
+ * anyway would return the GET's answer as if it were the POST's. Thrown before any navigation.
+ */
+export class FetchMethodUnsupportedError extends Error {
+  readonly url: string;
+  readonly method: string;
+  constructor(url: string, method: string) {
+    super(
+      `The browser lane cannot send a ${method} (${sanitizeForLog(url)}): declare searchFetch.transport ` +
+        `'http' or 'impersonate' for this store to use fetchBody with method ${method}.`,
+    );
+    this.name = 'FetchMethodUnsupportedError';
+    this.url = url;
+    this.method = method;
+  }
+}
+
 /** The browser lane's raw-fetch surface — it already captures internally via navigateAndCapture. */
 export interface BrowserLaneFetcher {
   scrapePage(url: string, options?: EngineScrapePageOptions): Promise<ScrapePageResult>;
@@ -147,10 +177,10 @@ export interface BrowserLaneFetcher {
 }
 
 export interface CapturingFetchTransports {
-  /** Plain HTTP GET (Tier-1 cookieless JSON/HTML). May answer with the status-aware detail. */
-  http: (url: string) => Promise<FetchBodyOutcome>;
-  /** impit TLS-impersonating GET (Cloudflare-fronted JSON APIs). `prime` primes a session-gated host; `proxyUrl` is residential egress. */
-  impersonate: (url: string, opts: { browser?: string; headers?: Record<string, string>; userAgent?: string; prime?: { url: string }; proxyUrl?: string }) => Promise<FetchBodyOutcome>;
+  /** Plain HTTP GET (Tier-1 cookieless JSON/HTML), or the `request` POST. May answer with the status-aware detail. */
+  http: (url: string, request?: FetchRequest) => Promise<FetchBodyOutcome>;
+  /** impit TLS-impersonating GET (Cloudflare-fronted JSON APIs), or the `request` POST. `prime` primes a session-gated host; `proxyUrl` is residential egress. */
+  impersonate: (url: string, opts: { browser?: string; headers?: Record<string, string>; userAgent?: string; prime?: { url: string }; proxyUrl?: string; request?: FetchRequest }) => Promise<FetchBodyOutcome>;
   /** Pooled browser navigation — the fallback for `browser`/undeclared transports. */
   browser: BrowserLaneFetcher;
 }
@@ -158,7 +188,7 @@ export interface CapturingFetchTransports {
 export type CapturingFetch = (
   url: string,
   searchFetch: SearchFetch | undefined,
-  options?: { cookies?: Record<string, string> },
+  options?: { cookies?: Record<string, string>; request?: FetchRequest },
 ) => Promise<CapturingFetchResult>;
 
 /**
@@ -171,13 +201,14 @@ export function laneOf(searchFetch: SearchFetch | undefined): string {
 }
 
 /** Hand a non-browser-lane body to the sink under the 'api' lane. Capturing must never break a fetch. */
-async function captureApiBody(sink: CaptureSink, url: string, body: string): Promise<void> {
+async function captureApiBody(sink: CaptureSink, url: string, body: string, request?: FetchRequest): Promise<void> {
   try {
     await sink.capture(buildRawCapture({
       url,
       lane: 'api',
       bytes: Buffer.from(body, 'utf8'),
       fetchedAt: new Date().toISOString(),
+      ...(request ? { method: request.method, requestBody: request.body } : {}),
     }));
   } catch (err) {
     // eslint-disable-next-line no-console
@@ -208,6 +239,7 @@ export function createCapturingFetch(
     // configured proxy; with none configured this THROWS a typed config failure rather than letting
     // the request leave from the node IP. Undeclared/direct ⇒ undefined and the pre-0.7.0 path.
     const proxyUrl = requireResidentialProxy(url, searchFetch?.egress, resolveProxy());
+    const request = options.request;
     switch (searchFetch?.transport) {
       case 'impersonate': {
         // Session-gated stores (403-cold) declare `sessionPrime`; the impit transport primes the
@@ -221,6 +253,7 @@ export function createCapturingFetch(
           userAgent: searchFetch.userAgent,
           ...(prime ? { prime } : {}),
           ...(proxyUrl ? { proxyUrl } : {}),
+          ...(request ? { request } : {}),
         }));
         const html = detail.body;
         const meta = metaFields(detail);
@@ -228,7 +261,7 @@ export function createCapturingFetch(
         // interstitial rather than throwing — a ruleset's own follow-up transport may still recover
         // the record. The queue's honesty gate turns a flagged page that persisted nothing into a
         // ChallengePageError; one the ruleset recovered rows from stays a success.
-        await captureApiBody(sink, url, html);
+        await captureApiBody(sink, url, html, request);
         if (isCloudflareChallenge(html)) {
           // eslint-disable-next-line no-console
           console.warn(`[FETCH] Cloudflare challenge/block page received for ${sanitizeForLog(url)} via impersonate transport`);
@@ -240,10 +273,10 @@ export function createCapturingFetch(
         // The plain-HTTP lane cannot proxy (see refuseHttpLaneResidentialEgress) — a residential
         // store on it is refused, never quietly fetched from the node IP.
         if (proxyUrl) refuseHttpLaneResidentialEgress(url, proxyUrl);
-        const detail = detailOf(await transports.http(url));
+        const detail = detailOf(await (request ? transports.http(url, request) : transports.http(url)));
         const html = detail.body;
         const meta = metaFields(detail);
-        await captureApiBody(sink, url, html);
+        await captureApiBody(sink, url, html, request);
         if (isCloudflareChallenge(html)) {
           // eslint-disable-next-line no-console
           console.warn(`[FETCH] Cloudflare challenge/block page received for ${sanitizeForLog(url)} via http transport`);
@@ -253,6 +286,7 @@ export function createCapturingFetch(
       }
       case 'browser':
       default: {
+        if (request) throw new FetchMethodUnsupportedError(url, request.method);
         // STEALTH SELECTION: item (request) cookies OR stored cookies for this host ⇒ the stealth
         // browser (CF stores ride stealth). Only the CHOICE is made here — the lane itself
         // (navigateAndCapture) merges the store's cookies under the item's, so a store-only hit

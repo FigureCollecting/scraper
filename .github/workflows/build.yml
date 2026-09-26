@@ -69,6 +69,10 @@ jobs:
       - name: Typecheck tests
         run: npm run typecheck:tests
 
+      # The plugin contract's type tests (@ts-expect-error pins) run nowhere else.
+      - name: Contract type tests
+        run: npm --prefix packages/plugin-contract run test:types
+
       - name: Run unit tests with coverage
         run: npm run test:ci -- --coverage
 
