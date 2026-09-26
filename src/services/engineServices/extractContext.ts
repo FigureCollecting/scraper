@@ -80,7 +80,10 @@ export interface BuildExtractContextOptions {
   capturingFetch: CapturingFetch;
   /** The store's OWN declared search-fetch transport (undeclared → capturingFetch's browser default). */
   searchFetch: SearchFetch | undefined;
-  /** Cookies to pass through to `fetchBody`, unless a call overrides them via `opts.cookies`. */
+  /**
+   * The queue item's own cookies (engine-supplied), passed to the lane; a ruleset cannot add or
+   * override any (`opts.cookies` is refused, contract 0.15.0).
+   */
   cookies?: Record<string, string>;
   /** The URL the PRIMARY fetch (that produced `html`) was fetched from — for the same-host gate. */
   primaryUrl: string;
@@ -166,7 +169,10 @@ function toRequestHeaders(url: string, raw: unknown): Record<string, string> | u
       throw new FetchBodyRequestError(url, `header '${lower}' value must be printable ASCII`);
     }
     if (lower in headers) throw new FetchBodyRequestError(url, `header '${lower}' is given twice`);
-    headers[lower] = value.replace(/^[\t ]+|[\t ]+$/g, '');
+    // Empty after the OWS trim is refused: undici sends `name: ` while impit drops it, so the lanes would disagree.
+    const trimmed = value.replace(/^[\t ]+|[\t ]+$/g, '');
+    if (trimmed === '') throw new FetchBodyRequestError(url, `header '${lower}' value is empty`);
+    headers[lower] = trimmed;
   }
   return Object.keys(headers).length > 0 ? headers : undefined;
 }

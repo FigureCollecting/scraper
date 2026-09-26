@@ -14,10 +14,12 @@ now refused (see Changed); no published ruleset passes it.
   `FetchBodyHeaders` exports. A ruleset may set `origin`, `referer`, `accept`, `accept-language` and
   `x-requested-with` (names case-insensitive), on a GET or a POST; a ruleset `accept` replaces the
   transport's default. Any other name (`cookie`, `authorization`, `host`, `user-agent`,
-  `content-length`, `content-type`, `proxy-*`, `sec-*`, …), a name or value with CR or LF, and a
-  value that is not printable ASCII are refused before any request is sent: the engine owns the
-  request's identity (User-Agent, cookies, TLS profile) and framing. The http and impersonate
-  transports send the headers; the browser transport refuses a call that carries any.
+  `content-length`, `content-type`, `proxy-*`, `sec-*`, …), a name or value with CR or LF, a value
+  that is not printable ASCII, a value that is empty once surrounding spaces and tabs are trimmed,
+  one name given twice in different cases, and `headers` that is not a plain object are refused
+  before any request is sent: the engine owns the request's identity (User-Agent, cookies, TLS
+  profile) and framing. The http and impersonate transports send the headers; the browser transport
+  refuses a call that carries any.
 
 ### Changed
 - `fetchBody`'s `cookies` option is refused (deprecated in the type). The http and impersonate

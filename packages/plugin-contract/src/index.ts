@@ -502,7 +502,9 @@ export type FetchBodyMethod = 'GET' | 'POST';
  * request's identity (User-Agent, cookies, the TLS profile) and framing (Host, Content-Length,
  * Content-Type, which a POST sets through `contentType`), so `cookie`, `authorization`, `host`,
  * `user-agent`, `content-length`, `proxy-*`, `sec-*` and every unlisted name are refused. So is a
- * name or value carrying CR or LF, and a value that is not printable ASCII.
+ * name or value carrying CR or LF, a value that is not printable ASCII, a value that is empty once
+ * surrounding spaces and tabs are trimmed, one name given twice in different cases, and `headers`
+ * that is not a plain object.
  */
 export const FETCH_BODY_ALLOWED_HEADERS = ['origin', 'referer', 'accept', 'accept-language', 'x-requested-with'] as const;
 

@@ -133,6 +133,8 @@ describe('the fetchBody header allowlist (contract 0.15.0)', () => {
     ['NUL in a value', { accept: 'a\u0000b' }, /header 'accept' value must be printable ASCII/],
     ['non-ASCII in a value', { 'accept-language': 'jaあ' }, /header 'accept-language' value must be printable ASCII/],
     ['a non-string value', { origin: 1 }, /header 'origin' value must be a string/],
+    ['an empty value', { origin: '' }, /header 'origin' value is empty/],
+    ['a value of only spaces and tabs', { Referer: ' \t ' }, /header 'referer' value is empty/],
     ['one name given twice in two cases', { origin: ORIGIN, Origin: ORIGIN }, /header 'origin' is given twice/],
   ])('%s is refused before any wait or fetch', async (_name, headers, message) => {
     // Same host as the primary and inside its courtesy gap, so a check placed after the wait would sleep.
