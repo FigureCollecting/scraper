@@ -663,9 +663,9 @@ describe('lists step — failures', () => {
     expect(a.lists.files.get('mfc')!.pausedUntil).toBeUndefined();
   });
 
-  it('a window wrapping midnight pauses to ITS end: a block before midnight or after it both pause to 02:00', async () => {
+  it('a window wrapping midnight pauses to ITS end: a block at its first instant, before midnight or after it all pause to 02:00', async () => {
     const wrap = mkCfg({ listsWindow: { startMin: 22 * 60, endMin: 2 * 60 } });
-    for (const when of ['2026-10-01T23:00:00.000Z', '2026-10-02T01:00:00.000Z']) {
+    for (const when of ['2026-10-01T22:00:00.000Z', '2026-10-01T23:00:00.000Z', '2026-10-02T01:00:00.000Z']) {
       const fake = makeFake({ list: () => listFail('deterministic', 'challenge page', { blocked: true }) });
       const { lists } = await run(wrap, fake, {}, clock(Date.parse(when)));
       expect(lists.files.get('mfc')!.pausedUntil).toBe('2026-10-02T02:00:00.000Z');
@@ -721,6 +721,91 @@ describe('lists step — failures', () => {
       ['blocked', 2, undefined],
       ['blocked', undefined, '2026-10-04T15:30:00.000Z'],
     ]);
+  });
+
+  it('an INTERRUPTED pass (list 1 answered, then the host cooled) breaks the blocked streak as well', async () => {
+    const lists = createMemoryListsStateStore();
+    const blocked = () => listFail('deterministic', 'store answered 403', { upstreamStatus: 403, blocked: true });
+    const passes: [string, (id: string) => Reply][] = [
+      ['2026-10-01T15:30:00.000Z', blocked],
+      ['2026-10-02T15:30:00.000Z', (id) => (id === 'c1-d9' ? listOk(['1']) : cooldown())],
+      ['2026-10-02T16:30:00.000Z', blocked],
+    ];
+    const seen: unknown[] = [];
+    for (const [when, list] of passes) {
+      await run(mkCfg(), makeFake({ list }), { lists }, clock(Date.parse(when)));
+      const g = lists.files.get('mfc')!.groups.c1;
+      seen.push([g.outcome, g.blockedStrikes, g.lastAttemptAt]);
+    }
+    expect(seen).toEqual([
+      ['blocked', 1, undefined],
+      ['interrupted', undefined, undefined],
+      ['blocked', 1, undefined],
+    ]);
+  });
+
+  it('a company refused for good costs 3 nights its first cycle, then ONE night a cycle: a slot last spent blocked is spent on the next first refusal', async () => {
+    const decl = [9, 1].map((d) => ({ id: `c1-d${d}`, url: `https://mfc.test/s?e=1&d=${d}`, group: 'c1', order: 1 }));
+    const fake = makeFake({
+      discovery: () => ({ status: 200, body: { rotatingSeedLists: decl } }),
+      list: () => listFail('deterministic', 'store answered 403', { upstreamStatus: 403, blocked: true }),
+    });
+    const lists = createMemoryListsStateStore();
+    const night = (n: number) => Date.parse('2026-10-01T15:30:00.000Z') + n * 24 * HOUR_MS;
+    const refusedOn: number[] = [];
+    const spentOn: number[] = [];
+    for (let n = 0; n < 24; n++) {
+      const before = fake.listGets().length;
+      await run(mkCfg(), fake, { lists }, clock(night(n)));
+      if (fake.listGets().length > before) refusedOn.push(n);
+      if (lists.files.get('mfc')!.groups.c1.lastAttemptAt === iso(night(n))) spentOn.push(n);
+    }
+    // 160 h after night 2 is night 8 at 07:30Z, outside the window: due again on night 9, 16, 23.
+    expect(refusedOn).toEqual([0, 1, 2, 9, 16, 23]);
+    expect(spentOn).toEqual([2, 9, 16, 23]);
+    expect(lists.files.get('mfc')!.groups.c1).toMatchObject({ outcome: 'blocked', spentBlocked: true });
+  });
+
+  it('any answer but a refusal clears the remembered blocked spend; a pass the store never answered keeps it', async () => {
+    const decl = [9, 1].map((d) => ({ id: `c1-d${d}`, url: `https://mfc.test/s?e=1&d=${d}`, group: 'c1', order: 1 }));
+    const discovery = () => ({ status: 200, body: { rotatingSeedLists: decl } });
+    const old = iso(T0 - 200 * HOUR_MS);
+    const seeded = () =>
+      createMemoryListsStateStore({
+        mfc: {
+          ...createEmptyListsState('mfc'),
+          groups: { c1: { lastAttemptAt: old, lastTriedAt: old, outcome: 'blocked', seen: 0, new: 0, enqueued: 0, strikes: 3, retries: 0, spentBlocked: true } },
+        },
+      });
+    const refused = () => listFail('deterministic', 'store answered 403', { upstreamStatus: 403, blocked: true });
+    const firsts: [string, (id: string) => Reply][] = [
+      ['transient', () => listFail('transient', 'store answered 503', { upstreamStatus: 503 })],
+      ['interrupted', (id) => (id === 'c1-d9' ? listOk(['1']) : cooldown())],
+      ['cooling first', () => cooldown()],
+      ['failed', () => listFail('deterministic', 'parser threw')],
+      ['ok', () => listOk(['1'])],
+      // Booked as a refusal like the streak is: list 1's ids are queued, the slot is spent at once.
+      ['list 2 refused', (id) => (id === 'c1-d9' ? listOk(['1']) : refused())],
+    ];
+    const seen: Record<string, unknown> = {};
+    for (const [name, list] of firsts) {
+      const lists = seeded();
+      await run(mkCfg(), makeFake({ discovery, list }), { lists }, clock(T0));
+      const after = lists.files.get('mfc')!.groups.c1;
+      if (name === 'list 2 refused') expect(lists.files.get('mfc')!.pending.map((p) => p.itemId)).toEqual(['1']);
+      // The next night's refusal: a cleared memory needs 3 of them again, a kept one spends at once.
+      await run(mkCfg(), makeFake({ discovery, list: refused }), { lists }, clock(T0 + 24 * HOUR_MS));
+      const next = lists.files.get('mfc')!.groups.c1;
+      seen[name] = [after.spentBlocked, after.lastAttemptAt === iso(T0), next.outcome, next.lastAttemptAt === iso(T0 + 24 * HOUR_MS)];
+    }
+    expect(seen).toEqual({
+      transient: [undefined, false, 'blocked', false],
+      interrupted: [undefined, false, 'blocked', false],
+      'cooling first': [true, false, 'blocked', true],
+      failed: [undefined, true, 'failed', false],
+      ok: [undefined, true, 'ok', false],
+      'list 2 refused': [true, true, 'blocked', false],
+    });
   });
 
   it('a BLOCKED answer on list 2 keeps list 1: after the pause only list 2 is asked', async () => {
@@ -903,6 +988,23 @@ describe('lists step — discovery', () => {
     const { s } = await run(mkCfg(), fake);
     expect(fake.listGets()).toEqual(['z-1']);
     expect(s.listsGroup).toBe('z');
+  });
+
+  it('an id or group the engine safe-name rule refuses is skipped: never fetched, never a state key', async () => {
+    const decl = [
+      { id: 'p-1', url: 'https://mfc.test/p', group: '__proto__', order: 0 },
+      { id: '__proto__', url: 'https://mfc.test/q', group: 'g2', order: 0 },
+      { id: 'a b', url: 'https://mfc.test/s', group: 'g1', order: 0 },
+      { id: 'x-1', url: 'https://mfc.test/x', group: 'x/y', order: 0 },
+      { id: 'ok-1', url: 'https://mfc.test/ok', group: 'ok', order: 1 },
+    ];
+    const fake = makeFake({ discovery: () => ({ status: 200, body: { rotatingSeedLists: decl } }) });
+    const { s, lists } = await run(mkCfg(), fake);
+    expect(fake.listGets()).toEqual(['ok-1']);
+    expect(s.listsGroup).toBe('ok');
+    const groups = lists.files.get('mfc')!.groups;
+    expect(Object.keys(groups)).toEqual(['ok']);
+    expect(Object.getPrototypeOf(groups)).toBe(Object.prototype);
   });
 
   it('a lower `order` on a later list of a group moves the whole group up', async () => {

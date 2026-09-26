@@ -7,6 +7,7 @@ import {
   createFileListsStateStore,
   createMemoryListsStateStore,
   createEmptyListsState,
+  setListsGroup,
   LISTS_STATE_VERSION,
   type ListsState,
 } from '../../crawler/listsState';
@@ -84,6 +85,18 @@ const sample = (): ListsState => ({
       retries: 0,
       answered: {},
     },
+    'company-7622': {
+      lastAttemptAt: '2026-09-20T16:00:00.000Z',
+      lastTriedAt: '2026-09-20T16:00:00.000Z',
+      outcome: 'blocked',
+      reason: 'store answered 403',
+      seen: 0,
+      new: 0,
+      enqueued: 0,
+      strikes: 3,
+      retries: 0,
+      spentBlocked: true,
+    },
     'company-7633': { lastTriedAt: '2026-09-26T19:00:00.000Z', outcome: 'interrupted', seen: 0, new: 0, enqueued: 0, strikes: 0, retries: 0, answered: {} },
   },
   pending: [{ itemId: '98665', collectUrl: 'https://myfigurecollection.net/item/98665', group: 'company-7620' }],
@@ -125,6 +138,7 @@ describe('lists-state file store', () => {
       { ...sample(), groups: { g: { ...sample().groups['company-7620'], answered: { a: 'maybe' } } } },
       { ...sample(), groups: { g: { ...sample().groups['company-7620'], blockedStrikes: -1 } } },
       { ...sample(), groups: { g: { ...sample().groups['company-7620'], blockedStrikes: '1' } } },
+      { ...sample(), groups: { g: { ...sample().groups['company-7620'], spentBlocked: 'yes' } } },
       { ...sample(), groups: { g: { ...sample().groups['company-7620'], seenIds: '98665' } } },
       { ...sample(), groups: { g: { ...sample().groups['company-7620'], seenIds: [''] } } },
       { ...sample(), groups: { g: { ...sample().groups['company-7620'], seenIds: [98665] } } },
@@ -142,6 +156,19 @@ describe('lists-state file store', () => {
       fake.files.set(FILE, typeof doc === 'string' ? doc : JSON.stringify(doc));
       expect(await createFileListsStateStore(DIR, fake.fs).load('mfc')).toBe('corrupt');
     }
+  });
+
+  it('setListsGroup writes an OWN key, even one named __proto__: the prototype is untouched and the group persists', () => {
+    const state = createEmptyListsState('mfc');
+    const g = sample().groups['company-7620'];
+    setListsGroup(state, '__proto__', g);
+    setListsGroup(state, 'constructor', g);
+    setListsGroup(state, 'constructor', { ...g, seen: 1 });
+    expect(Object.getPrototypeOf(state.groups)).toBe(Object.prototype);
+    expect(Object.keys(state.groups)).toEqual(['__proto__', 'constructor']);
+    expect(Object.getOwnPropertyDescriptor(state.groups, '__proto__')?.value).toBe(g);
+    expect(state.groups['constructor'].seen).toBe(1);
+    expect(Object.keys(JSON.parse(JSON.stringify(state)).groups)).toEqual(['__proto__', 'constructor']);
   });
 
   it('refuses an unsafe siteId (it is a file stem) and lets a non-ENOENT read error propagate', async () => {

@@ -24,6 +24,7 @@
 import { resolveByIdUrl, resolveListingUrl } from './retrievalPlanner.js';
 import { withCollectUrl, withTimeout, type LookupServices } from './assembleLookup.js';
 import { sanitizeForLog } from '../utils/security.js';
+import { isSafeRotatingName } from '../utils/rotatingName.js';
 import { isCloudflareChallenge } from '../services/engineServices/challengeDetect.js';
 import { getChallengeCooldown, normalizeHost } from '../services/challengeCooldown.js';
 import { getCfCookieStore, markStaleIfStored, markFreshIfStored } from '../services/cookieJar.js';
@@ -168,9 +169,6 @@ function declaredSeedLists(retrieval: RetrievalCapability | undefined): SeedList
   }
   return out;
 }
-
-/** A rotating list id or group name: it becomes a key in the crawler's state and a url parameter. */
-const isSafeRotatingName = (v: unknown): v is string => typeof v === 'string' && /^[A-Za-z0-9._-]+$/.test(v) && v !== '__proto__';
 
 /**
  * The store's WELL-FORMED rotating seed lists, in declared order. Untrusted like `seedLists`: an

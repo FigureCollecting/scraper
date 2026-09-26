@@ -36,6 +36,8 @@ export interface ListsGroupState {
   retries: number;
   /** Consecutive blocked passes; the slot is spent as `blocked` when these reach the strike ceiling. */
   blockedStrikes?: number;
+  /** The slot was last spent `blocked` and the store has not answered since: the next refusal spends it at once. */
+  spentBlocked?: boolean;
   /** The OPEN attempt's lists that already answered — never asked again before the slot is spent. */
   answered?: Record<string, 'ok' | 'failed'>;
   /** The OPEN attempt's distinct ids so far, so a later pass does not count them in `seen` again. */
@@ -67,6 +69,11 @@ export function createEmptyListsState(siteId: string): ListsState {
   return { version: LISTS_STATE_VERSION, siteId, groups: {}, pending: [] };
 }
 
+/** Book a group under its OWN key: a plain assignment to `__proto__` would replace the map's prototype instead. */
+export function setListsGroup(state: ListsState, name: string, group: ListsGroupState): void {
+  Object.defineProperty(state.groups, name, { value: group, enumerable: true, writable: true, configurable: true });
+}
+
 const isPlainObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 const isCount = (v: unknown): boolean => typeof v === 'number' && Number.isInteger(v) && v >= 0;
 const isNonEmpty = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
@@ -81,6 +88,7 @@ const isGroupState = (v: unknown): boolean =>
   (v.reason === undefined || typeof v.reason === 'string') &&
   [v.seen, v.new, v.enqueued, v.strikes, v.retries].every(isCount) &&
   (v.blockedStrikes === undefined || isCount(v.blockedStrikes)) &&
+  (v.spentBlocked === undefined || typeof v.spentBlocked === 'boolean') &&
   (v.answered === undefined || (isPlainObject(v.answered) && Object.values(v.answered).every((a) => a === 'ok' || a === 'failed'))) &&
   (v.seenIds === undefined || (Array.isArray(v.seenIds) && v.seenIds.every(isNonEmpty)));
 
