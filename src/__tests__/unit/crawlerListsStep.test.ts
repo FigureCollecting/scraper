@@ -1,15 +1,6 @@
 /**
- * runCrawlerPass — the ROTATING COMPANY-LISTS step (Ross 2026-09-22/25/26).
- *
- * Inside the id-range phase, AFTER the recent-gap sweep (origin 'reanchor' bands) and BEFORE the
- * older-gap sweep (origin 'operator') and the archive descent. Per pass: at most ONE group (all its
- * lists, >= 10 s apart), only inside CRAWLER_LISTS_WINDOW_UTC, each group at most once per
- * CRAWLER_LISTS_INTERVAL_H, the next group = the first by `order` whose last attempt is absent or
- * older than the interval. The group's ids are UNIONed and deduped, ids the ledger knows or the
- * backlog already holds (another group's copy) are dropped, and the rest drain on
- * CRAWLER_LISTS_DRAIN_CAPS, POSTed COLD so a tap or recent-gap id never waits behind them.
- *
- * Every test drives a MOCKED http surface, in-memory ledger and lists-state stores, and a fake clock.
+ * runCrawlerPass — the ROTATING COMPANY-LISTS step (Ross 2026-09-22/25/26), between the recent and the
+ * older gap sweeps. Mocked http surface, in-memory ledger and lists-state stores, fake clock.
  */
 import { runCrawlerPass, type CrawlerConfig, type FetchLike, type HttpResponseLike } from '../../crawler/crawler';
 import { createMemoryLedgerStore, createEmptyLedger, type Ledger, type LedgerGapBand } from '../../crawler/ledger';
@@ -389,6 +380,75 @@ describe('lists step — one group per pass', () => {
   });
 });
 
+describe('lists step — FAIRNESS', () => {
+  const stamp = (at: number) => ({ lastAttemptAt: iso(at), lastTriedAt: iso(at), outcome: 'ok' as const, seen: 0, new: 0, enqueued: 0, strikes: 0, retries: 0 });
+
+  it('takes the due group attempted LONGEST ago, a never-attempted group before any, `order` only breaking ties', async () => {
+    const lists = createMemoryListsStateStore({
+      mfc: { ...createEmptyListsState('mfc'), groups: { c1: stamp(T0 - 200 * HOUR_MS), c2: stamp(T0 - 300 * HOUR_MS) } },
+    });
+    const ledgers = createMemoryLedgerStore({ mfc: ledger() });
+    const order: (string | null)[] = [];
+    for (let pass = 0; pass < 3; pass++) order.push((await run(mkCfg(), makeFake(), { lists, ledgers }, clock(T0 + pass * HOUR_MS))).s.listsGroup);
+    expect(order).toEqual(['c3', 'c2', 'c1']);
+  });
+
+  it('54 companies, 7 in-window passes a night, 160 h interval: every company is polled and none twice before the others', async () => {
+    const decl = Array.from({ length: 54 }, (_, i) =>
+      [9, 1].map((d) => ({ id: `c${i + 1}-d${d}`, url: `https://mfc.test/s?e=${i + 1}&d=${d}`, group: `c${i + 1}`, order: i + 1 })),
+    ).flat();
+    const fake = makeFake({ discovery: () => ({ status: 200, body: { rotatingSeedLists: decl } }), list: () => listOk([]) });
+    const lists = createMemoryListsStateStore();
+    const ledgers = createMemoryLedgerStore({ mfc: ledger() });
+    const polls: Record<string, number> = {};
+    const firstNight = Date.parse('2026-10-01T15:30:00.000Z');
+    // 16 nights x 7 slots = 112 = 2 x 54 + 4: a fair rotation polls each company 2 or 3 times.
+    for (let night = 0; night < 16; night++) {
+      for (let slot = 0; slot < 7; slot++) {
+        const g = (await run(mkCfg(), fake, { lists, ledgers }, clock(firstNight + night * 24 * HOUR_MS + slot * HOUR_MS))).s.listsGroup;
+        if (g) polls[g] = (polls[g] ?? 0) + 1;
+      }
+    }
+    const counts = decl.filter((d) => d.id.endsWith('-d9')).map((d) => polls[d.group] ?? 0);
+    expect(counts.filter((n) => n === 0)).toEqual([]);
+    expect(Math.max(...counts) - Math.min(...counts)).toBeLessThanOrEqual(1);
+  });
+});
+
+describe('lists step — WINDOW and INTERVAL edges', () => {
+  const at = async (whenIso: string, over: Partial<CrawlerConfig> = {}) => {
+    const fake = makeFake();
+    const { s } = await run(mkCfg(over), fake, {}, clock(Date.parse(whenIso)));
+    return { s, gets: fake.listGets() };
+  };
+
+  it('15:30-22:30: the start minute is in, the end minute is out — no list request at 22:30:00', async () => {
+    expect((await at('2026-10-01T15:30:00.000Z')).s.listsGroup).toBe('c1');
+    expect((await at('2026-10-01T15:29:59.999Z')).s.listsSkipped).toBe('outside-window');
+    expect((await at('2026-10-01T22:29:59.999Z')).s.listsGroup).toBe('c1');
+    const end = await at('2026-10-01T22:30:00.000Z');
+    expect(end.s.listsSkipped).toBe('outside-window');
+    expect(end.gets).toEqual([]);
+  });
+
+  it('a window wrapping midnight (22:00-02:00) keeps the same edges on both sides of midnight', async () => {
+    const wrap = { listsWindow: { startMin: 22 * 60, endMin: 2 * 60 } };
+    expect((await at('2026-10-01T22:00:00.000Z', wrap)).s.listsGroup).toBe('c1');
+    expect((await at('2026-10-01T21:59:59.999Z', wrap)).s.listsSkipped).toBe('outside-window');
+    expect((await at('2026-10-02T01:59:59.999Z', wrap)).s.listsGroup).toBe('c1');
+    expect((await at('2026-10-02T02:00:00.000Z', wrap)).s.listsSkipped).toBe('outside-window');
+  });
+
+  it('a group is due at exactly the interval and not 1 ms before it', async () => {
+    const polledAgo = async (ageMs: number) => {
+      const groups = Object.fromEntries(['c1', 'c2', 'c3'].map((g) => [g, { lastAttemptAt: iso(T0 - ageMs), lastTriedAt: iso(T0 - ageMs), outcome: 'ok' as const, seen: 0, new: 0, enqueued: 0, strikes: 0, retries: 0 }]));
+      return (await run(mkCfg(), makeFake(), { lists: createMemoryListsStateStore({ mfc: { ...createEmptyListsState('mfc'), groups } }) })).s;
+    };
+    expect((await polledAgo(160 * HOUR_MS)).listsGroup).toBe('c1');
+    expect((await polledAgo(160 * HOUR_MS - 1)).listsSkipped).toBe('none-due');
+  });
+});
+
 describe('lists step — failures', () => {
   it('a DETERMINISTIC failure on every list spends the slot, so the next pass moves on to the next group', async () => {
     const lists = createMemoryListsStateStore();
@@ -417,7 +477,7 @@ describe('lists step — failures', () => {
     expect(reports[0]).toMatchObject({ reasonClass: 'gone_404', httpStatus: 404 });
   });
 
-  it('a TRANSIENT failure stops the store, spends no slot and retries next pass — until the third try spends it', async () => {
+  it('a TRANSIENT failure stops the store, spends no slot and retries ONLY the unanswered list — until the third try spends it', async () => {
     const lists = createMemoryListsStateStore();
     const c = clock();
     const cfg = mkCfg();
@@ -427,14 +487,17 @@ describe('lists step — failures', () => {
       const startedAt = c.now();
       const fake = flaky();
       const { s } = await run(cfg, fake, { lists, ledgers: createMemoryLedgerStore({ mfc: ledger([], { cursor: 900, frontier: 1000 }) }) }, c, (r) => reports.push(r));
-      expect(fake.listGets()).toEqual(['c1-d9', 'c1-d1']);
+      // c1-d9 answered on the first pass: the retries never ask it again.
+      expect(fake.listGets()).toEqual(attempt === 1 ? ['c1-d9', 'c1-d1'] : ['c1-d1']);
       // The store is stopped: no drain, and the descent below the lists step does not run either.
       expect(fake.posts()).toEqual([]);
       expect(s).toMatchObject({ listsGroup: 'c1', listsOutcome: 'transient', listsDrainStopped: 'store-stopped', rangeSkipped: 'store-stopped' });
       const g = lists.files.get('mfc')!.groups.c1;
-      expect(g).toMatchObject({ outcome: 'transient', strikes: attempt, reason: 'store answered 503' });
+      expect(g).toMatchObject({ outcome: 'transient', strikes: attempt, reason: 'store answered 503', seen: 3, new: 3 });
+      if (attempt < 3) expect(g).toMatchObject({ retries: attempt, answered: { 'c1-d9': 'ok' } });
       if (attempt < 3) expect(g.lastAttemptAt).toBeUndefined();
-      else expect(g).toMatchObject({ lastAttemptAt: iso(startedAt), retries: 0 });
+      else expect(g).toEqual(expect.not.objectContaining({ answered: expect.anything() }));
+      if (attempt === 3) expect(g).toMatchObject({ lastAttemptAt: iso(startedAt), retries: 0 });
       c.advance(HOUR_MS);
     }
     expect(reports[0]).toMatchObject({ reasonClass: 'http_5xx', httpStatus: 503 });
@@ -443,28 +506,140 @@ describe('lists step — failures', () => {
     expect(s.listsGroup).toBe('c2');
   });
 
-  it('a CHALLENGE stops the store at once: the second list is not fetched and the slot is spent', async () => {
-    const fake = makeFake({ list: () => listFail('deterministic', 'challenge page', { blocked: true }) });
-    const reports: FetchFailureReport[] = [];
-    const { s, lists } = await run(mkCfg(), fake, { ledgers: createMemoryLedgerStore({ mfc: ledger([], { cursor: 900, frontier: 1000 }) }) }, clock(), (r) =>
-      reports.push(r),
-    );
-    expect(fake.listGets()).toEqual(['c1-d9']);
-    expect(fake.posts()).toEqual([]);
-    expect(s).toMatchObject({ listsOutcome: 'failed', rangeSkipped: 'store-stopped' });
-    expect(lists.files.get('mfc')!.groups.c1).toMatchObject({ lastAttemptAt: iso(T0), outcome: 'failed', reason: 'challenge page' });
-    expect(reports[0]).toMatchObject({ reasonClass: 'challenge' });
+  it('a retry that completes the group books the whole attempt: both passes counted, the slot spent once', async () => {
+    const lists = createMemoryListsStateStore();
+    const c = clock();
+    const first = makeFake({ list: (id) => (id === 'c1-d1' ? listFail('transient', 'store answered 503', { upstreamStatus: 503 }) : listOk(DEFAULT_LISTS[id])) });
+    await run(mkCfg(), first, { lists }, c);
+    c.advance(HOUR_MS);
+    const retryAt = c.now();
+    const second = makeFake();
+    const { s } = await run(mkCfg(), second, { lists }, c);
+    expect(second.listGets()).toEqual(['c1-d1']);
+    // 102 is already in the backlog from c1-d9; 104 is new.
+    expect(s).toMatchObject({ listsGroup: 'c1', listsOutcome: 'ok', listsFetched: 1, listsIdsSeen: 2, listsIdsNew: 1 });
+    expect(lists.files.get('mfc')!.groups.c1).toEqual({
+      lastAttemptAt: iso(retryAt),
+      lastTriedAt: iso(retryAt),
+      outcome: 'ok',
+      seen: 5,
+      new: 4,
+      enqueued: 4,
+      strikes: 0,
+      retries: 0,
+    });
   });
 
-  it('a 403 answer is deterministic and blocking; a 429 is transient and blocking', async () => {
-    const f403 = makeFake({ list: () => listFail('deterministic', 'store answered 403', { upstreamStatus: 403, blocked: true }) });
-    const r403 = await run(mkCfg(), f403);
-    expect(f403.listGets()).toEqual(['c1-d9']);
-    expect(r403.lists.files.get('mfc')!.groups.c1).toMatchObject({ outcome: 'failed', lastAttemptAt: iso(T0) });
-    const f429 = makeFake({ list: () => listFail('transient', 'store answered 429', { upstreamStatus: 429, blocked: true }) });
-    const r429 = await run(mkCfg(), f429);
-    expect(f429.listGets()).toEqual(['c1-d9']);
-    expect(r429.lists.files.get('mfc')!.groups.c1.lastAttemptAt).toBeUndefined();
+  it('a list that failed deterministically is not asked again on the retry, and the attempt books partial', async () => {
+    const lists = createMemoryListsStateStore();
+    const c = clock();
+    const decl = [
+      { id: 'c1-a', url: 'https://mfc.test/a', group: 'c1', order: 1 },
+      { id: 'c1-b', url: 'https://mfc.test/b', group: 'c1', order: 1 },
+      { id: 'c1-c', url: 'https://mfc.test/c', group: 'c1', order: 1 },
+    ];
+    const discovery = () => ({ status: 200, body: { rotatingSeedLists: decl } });
+    const first = makeFake({
+      discovery,
+      list: (id) =>
+        id === 'c1-a' ? listFail('deterministic', 'company filter not proven') : id === 'c1-b' ? listOk(['7']) : listFail('transient', 'socket hang up'),
+    });
+    await run(mkCfg(), first, { lists }, c);
+    expect(lists.files.get('mfc')!.groups.c1.answered).toEqual({ 'c1-a': 'failed', 'c1-b': 'ok' });
+    c.advance(HOUR_MS);
+    const second = makeFake({ discovery, list: () => listOk(['8']) });
+    const { s } = await run(mkCfg(), second, { lists }, c);
+    expect(second.listGets()).toEqual(['c1-c']);
+    expect(s.listsOutcome).toBe('partial');
+    expect(lists.files.get('mfc')!.groups.c1).toMatchObject({ outcome: 'partial', strikes: 0, lastAttemptAt: iso(c.now()) });
+  });
+
+  it('a list dropped from the declaration while its group was open is not waited for', async () => {
+    const lists = createMemoryListsStateStore({
+      mfc: {
+        ...createEmptyListsState('mfc'),
+        groups: {
+          c1: { lastTriedAt: iso(T0 - HOUR_MS), outcome: 'transient', reason: 'socket hang up', seen: 3, new: 3, enqueued: 0, strikes: 1, retries: 1, answered: { 'c1-d9': 'ok', 'c1-old': 'failed' } },
+        },
+      },
+    });
+    const decl = [{ id: 'c1-d9', url: 'https://mfc.test/s?e=1&d=9', group: 'c1', order: 1 }];
+    const fake = makeFake({ discovery: () => ({ status: 200, body: { rotatingSeedLists: decl } }) });
+    const { s } = await run(mkCfg(), fake, { lists });
+    expect(fake.listGets()).toEqual([]);
+    expect(s).toMatchObject({ listsGroup: 'c1', listsOutcome: 'ok', listsFetched: 0 });
+    expect(lists.files.get('mfc')!.groups.c1).toMatchObject({ outcome: 'ok', lastAttemptAt: iso(T0), strikes: 0 });
+  });
+
+  it('a BLOCKED answer (challenge, 401, 403, 429) spends NO slot: a strike, the store stops, and list fetching pauses 24 h', async () => {
+    const blocked: [Reply, string][] = [
+      [listFail('deterministic', 'challenge page', { blocked: true }), 'challenge'],
+      [listFail('deterministic', 'store answered 401', { upstreamStatus: 401, blocked: true }), 'other'],
+      [listFail('deterministic', 'store answered 403', { upstreamStatus: 403, blocked: true }), 'http_403'],
+      [listFail('transient', 'store answered 429', { upstreamStatus: 429, blocked: true }), 'http_429'],
+    ];
+    for (const [reply, reasonClass] of blocked) {
+      const lists = createMemoryListsStateStore({ mfc: { ...createEmptyListsState('mfc'), pending: [{ itemId: '9', collectUrl: item('9'), group: 'c3' }] } });
+      const ledgers = createMemoryLedgerStore({ mfc: ledger([], { cursor: 900, frontier: 1000 }) });
+      const c = clock();
+      const fake = makeFake({ list: () => reply });
+      const reports: FetchFailureReport[] = [];
+      const { s } = await run(mkCfg(), fake, { lists, ledgers }, c, (r) => reports.push(r));
+      expect(fake.listGets()).toEqual(['c1-d9']);
+      expect(fake.posts()).toEqual([]);
+      expect(s).toMatchObject({ listsGroup: 'c1', listsOutcome: 'blocked', listsSkipped: null, rangeSkipped: 'store-stopped' });
+      const state = lists.files.get('mfc')!;
+      expect(state.groups.c1).toMatchObject({ outcome: 'blocked', strikes: 1, retries: 0, answered: {} });
+      expect(state.groups.c1.lastAttemptAt).toBeUndefined();
+      expect(state.pausedUntil).toBe(iso(T0 + 24 * HOUR_MS));
+      expect(reports[0].reasonClass).toBe(reasonClass);
+
+      // Paused: no discovery, no list — but the backlog still drains (item pages, not the lists).
+      c.advance(HOUR_MS);
+      const paused = makeFake();
+      const p = await run(mkCfg(), paused, { lists, ledgers }, c);
+      expect(paused.discoveryGets()).toBe(0);
+      expect(paused.posts()[0]).toEqual({ id: '9', priority: 'COLD' });
+      expect(p.s).toMatchObject({ listsSkipped: 'paused', listsGroup: null, listsEnqueued: 1 });
+
+      // 24 h after the block the SAME group is asked again, and the pause is cleared.
+      c.advance(23 * HOUR_MS);
+      const again = makeFake();
+      const a = await run(mkCfg(), again, { lists, ledgers }, c);
+      expect(again.listGets()).toEqual(['c1-d9', 'c1-d1']);
+      expect(a.s).toMatchObject({ listsGroup: 'c1', listsOutcome: 'ok' });
+      expect(lists.files.get('mfc')!.pausedUntil).toBeUndefined();
+      expect(lists.files.get('mfc')!.groups.c1).toMatchObject({ strikes: 0, lastAttemptAt: iso(T0 + 24 * HOUR_MS) });
+    }
+  });
+
+  it('a night of 403s (7 hourly passes) costs ONE list request and no company its slot', async () => {
+    const lists = createMemoryListsStateStore();
+    const ledgers = createMemoryLedgerStore({ mfc: ledger() });
+    let gets = 0;
+    const skipped: (string | null)[] = [];
+    for (let h = 0; h < 7; h++) {
+      const fake = makeFake({ list: () => listFail('deterministic', 'store answered 403', { upstreamStatus: 403, blocked: true }) });
+      const { s } = await run(mkCfg(), fake, { lists, ledgers }, clock(Date.parse('2026-10-01T15:30:00.000Z') + h * HOUR_MS));
+      gets += fake.listGets().length;
+      skipped.push(s.listsSkipped);
+    }
+    expect(gets).toBe(1);
+    expect(skipped).toEqual([null, 'paused', 'paused', 'paused', 'paused', 'paused', 'paused']);
+    expect(Object.values(lists.files.get('mfc')!.groups).filter((g) => g.lastAttemptAt !== undefined)).toEqual([]);
+  });
+
+  it('a BLOCKED answer on list 2 keeps list 1: after the pause only list 2 is asked', async () => {
+    const lists = createMemoryListsStateStore();
+    const c = clock();
+    const first = makeFake({ list: (id) => (id === 'c1-d1' ? listFail('deterministic', 'challenge page', { blocked: true }) : listOk(DEFAULT_LISTS[id])) });
+    await run(mkCfg(), first, { lists }, c);
+    expect(first.listGets()).toEqual(['c1-d9', 'c1-d1']);
+    expect(lists.files.get('mfc')!.groups.c1.answered).toEqual({ 'c1-d9': 'ok' });
+    c.advance(24 * HOUR_MS);
+    const second = makeFake();
+    await run(mkCfg(), second, { lists }, c);
+    expect(second.listGets()).toEqual(['c1-d1']);
   });
 
   it('a COOLING host is left alone: no slot, no strike, and the store stops for the pass', async () => {
@@ -528,16 +703,62 @@ describe('lists step — failures', () => {
     expect(reports[0].reasonClass).toBe('timeout');
   });
 
-  it('a spent GLOBAL budget mid-group records no attempt at all', async () => {
+  it('a spent GLOBAL budget mid-group spends no slot and no strike, and keeps list 1 for the next pass', async () => {
     // discovery + the first list = 2 requests; the second list finds the gate closed.
+    const lists = createMemoryListsStateStore();
+    const c = clock();
     const fake = makeFake();
-    const { s, lists, summary } = await run(mkCfg({ maxRequests: 2 }), fake);
+    const { s, summary } = await run(mkCfg({ maxRequests: 2 }), fake, { lists }, c);
     expect(fake.listGets()).toEqual(['c1-d9']);
-    expect(s).toMatchObject({ listsSkipped: 'budget', listsOutcome: null });
+    expect(s).toMatchObject({ listsSkipped: 'budget', listsOutcome: 'interrupted' });
     expect(summary.budgetExhausted).toBe(true);
-    expect(lists.files.get('mfc')!.groups.c1).toBeUndefined();
+    expect(lists.files.get('mfc')!.groups.c1).toMatchObject({ outcome: 'interrupted', strikes: 0, retries: 0, answered: { 'c1-d9': 'ok' } });
+    expect(lists.files.get('mfc')!.groups.c1.lastAttemptAt).toBeUndefined();
     // What the first list offered is kept for the drain rather than thrown away.
     expect(lists.files.get('mfc')!.pending.map((p) => p.itemId)).toEqual(['101', '102', '103']);
+
+    c.advance(HOUR_MS);
+    const next = makeFake();
+    const n = await run(mkCfg(), next, { lists }, c);
+    expect(next.listGets()).toEqual(['c1-d1']);
+    expect(n.s.listsOutcome).toBe('ok');
+  });
+
+  it('a host that starts cooling after list 1 FAILED still books list 1, so it is not asked again', async () => {
+    const lists = createMemoryListsStateStore();
+    const c = clock();
+    const fake = makeFake({ list: (id) => (id === 'c1-d1' ? cooldown() : listFail('deterministic', 'company filter not proven')) });
+    await run(mkCfg(), fake, { lists }, c);
+    expect(lists.files.get('mfc')!.groups.c1).toMatchObject({ outcome: 'interrupted', answered: { 'c1-d9': 'failed' }, reason: 'company filter not proven' });
+    c.advance(HOUR_MS);
+    const next = makeFake();
+    const { s } = await run(mkCfg(), next, { lists }, c);
+    expect(next.listGets()).toEqual(['c1-d1']);
+    expect(s.listsOutcome).toBe('partial');
+  });
+
+  it('a new attempt starts its counters from zero; last cycle\'s numbers do not carry over', async () => {
+    const lists = createMemoryListsStateStore({
+      mfc: {
+        ...createEmptyListsState('mfc'),
+        groups: { c1: { lastAttemptAt: iso(T0 - 200 * HOUR_MS), lastTriedAt: iso(T0 - 200 * HOUR_MS), outcome: 'ok', seen: 200, new: 123, enqueued: 50, strikes: 0, retries: 0 } },
+      },
+    });
+    const decl = [{ id: 'c1-d9', url: 'https://mfc.test/s?e=1&d=9', group: 'c1', order: 1 }];
+    await run(mkCfg(), makeFake({ discovery: () => ({ status: 200, body: { rotatingSeedLists: decl } }) }), { lists });
+    expect(lists.files.get('mfc')!.groups.c1).toMatchObject({ seen: 3, new: 3, enqueued: 3 });
+  });
+
+  it('a host that starts cooling after list 1 answered keeps list 1 for the next pass', async () => {
+    const lists = createMemoryListsStateStore();
+    const c = clock();
+    const fake = makeFake({ list: (id) => (id === 'c1-d1' ? cooldown() : listOk(DEFAULT_LISTS[id])) });
+    const { s } = await run(mkCfg(), fake, { lists }, c);
+    expect(s).toMatchObject({ listsSkipped: 'cooldown', listsOutcome: 'interrupted', skipped: 1 });
+    c.advance(HOUR_MS);
+    const next = makeFake();
+    await run(mkCfg(), next, { lists }, c);
+    expect(next.listGets()).toEqual(['c1-d1']);
   });
 });
 
@@ -624,8 +845,8 @@ describe('lists step — state', () => {
     const fake = makeFake();
     const b = await run(mkCfg(), fake, { lists: unwritable, ledgers: createMemoryLedgerStore({ mfc: ledger([], { cursor: 900, frontier: 1000 }) }) });
     // The slot could not be recorded, so nothing is drained on the strength of it.
-    expect(fake.posts().filter((p) => p.priority === 'COLD')).toEqual([]);
-    expect(b.s).toMatchObject({ listsDrainStopped: 'failed', rangeWalked: 5 });
+    expect(fake.posts().map((p) => p.id)).toEqual(['900', '899', '898', '897', '896']);
+    expect(b.s).toMatchObject({ listsDrainStopped: 'failed', listsEnqueued: 0, rangeWalked: 5 });
   });
 
   it('a ledger save that fails after the drain stops the store and keeps the backlog', async () => {
@@ -662,32 +883,38 @@ describe('lists step — state', () => {
 });
 
 describe('lists step — PRECEDENCE inside one pass', () => {
-  it('tap → recent gaps → company lists (COLD) → older gaps → descent, each on its own budget', async () => {
-    const band = (from: number, to: number, origin: LedgerGapBand['origin']): LedgerGapBand => ({ from, to, next: from, origin, createdAt: iso(T0 - WEEK_MS) });
-    // The operator band is OLDER than the re-anchor band: age alone would sweep it first.
-    const older = { ...band(401, 402, 'operator'), createdAt: iso(T0 - 2 * WEEK_MS) };
-    const ledgers = createMemoryLedgerStore({
-      mfc: ledger([], { cursor: 900, frontier: 1000, reanchoredAt: iso(T0), gaps: [band(501, 502, 'reanchor'), older] }),
+  const band = (from: number, to: number, origin: LedgerGapBand['origin']): LedgerGapBand => ({ from, to, next: from, origin, createdAt: iso(T0 - WEEK_MS) });
+  // The operator band is OLDER than the re-anchor band: age alone would sweep it first.
+  const twoTiers = () =>
+    createMemoryLedgerStore({
+      mfc: ledger([], { cursor: 900, frontier: 1000, reanchoredAt: iso(T0), gaps: [band(501, 502, 'reanchor'), { ...band(401, 402, 'operator'), createdAt: iso(T0 - 2 * WEEK_MS) }] }),
     });
-    const fake = makeFake({
+  const lanes = () =>
+    makeFake({
       listing: () => ({ status: 200, body: { items: [{ itemId: '999', collectUrl: item('999') }], hasMore: false } }),
       list: (id) => listOk(id === 'c1-d9' ? ['101'] : []),
     });
-    const { s } = await run(
-      mkCfg({ mode: 'both', phases: ['recent', 'backfill'], rangeGapBudget: 4, rangeIdsPerRun: 2, maxEnqueuePerStore: 3 }),
-      fake,
-      { ledgers },
-    );
+  const cfg = (over: Partial<CrawlerConfig> = {}) => mkCfg({ mode: 'both', phases: ['recent', 'backfill'], rangeGapBudget: 4, rangeIdsPerRun: 2, maxEnqueuePerStore: 3, ...over });
+
+  it('tap, recent gaps WARM → company lists, older gaps, descent COLD: posted in lane order, so FIFO within COLD keeps it', async () => {
+    const fake = lanes();
+    const { s } = await run(cfg(), fake, { ledgers: twoTiers() });
     expect(fake.posts()).toEqual([
       { id: '999', priority: undefined }, // the Latest Additions tap
       { id: '501', priority: undefined }, // recent gap (re-anchor band)
       { id: '502', priority: undefined },
       { id: '101', priority: 'COLD' }, // company list drain
-      { id: '401', priority: undefined }, // older gap (operator band)
-      { id: '402', priority: undefined },
-      { id: '900', priority: undefined }, // archive descent
-      { id: '899', priority: undefined },
+      { id: '401', priority: 'COLD' }, // older gap (operator band)
+      { id: '402', priority: 'COLD' },
+      { id: '900', priority: 'COLD' }, // archive descent
+      { id: '899', priority: 'COLD' },
     ]);
     expect(s).toMatchObject({ enqueued: 3, gapEnqueued: 4, listsEnqueued: 1, gapSkipped: null, rangeSkipped: null });
+  });
+
+  it('a store without the lists step posts its older gaps and descent exactly as before (the queue default, WARM)', async () => {
+    const fake = lanes();
+    await run(cfg({ listsDrainCaps: {} }), fake, { ledgers: twoTiers() });
+    expect(fake.posts()).toEqual(['999', '501', '502', '401', '402', '900', '899'].map((id) => ({ id, priority: undefined })));
   });
 });

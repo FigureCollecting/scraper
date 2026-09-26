@@ -1,9 +1,6 @@
 /**
- * Type-test fixture: ROTATING SEED LISTS (contract 0.16.0) — `RetrievalCapability.rotatingSeedLists`
- * and the `RotatingSeedList` export. RED before the 0.16.0 bump (the field is an excess property and
- * `RotatingSeedList` has no export); GREEN after. `seed-lists.ts` remains the guard that the
- * `seedLists` field is untouched: the two fields are separate so an engine that predates this one
- * never sees the rotating lists at all.
+ * Type-test fixture: `RetrievalCapability.rotatingSeedLists` and the `RotatingSeedList` export (contract
+ * 0.16.0). `seed-lists.ts` still guards `seedLists`: the fields are separate so an older engine never sees these.
  */
 import type { RotatingSeedList, SeedList, StoreCapabilities } from '../src/index';
 

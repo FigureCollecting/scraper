@@ -1,19 +1,7 @@
 /**
- * Lists state — the rotating-lists step's durable state, one JSON file per store.
- *
- *   <dir>/<siteId>.lists.json
- *   {
- *     version: 1,
- *     siteId,
- *     groups:  { [group]: { lastAttemptAt?, lastTriedAt, outcome, reason?, seen, new, enqueued, strikes, retries } },
- *     pending: [ { itemId, collectUrl, group } ],   // the drain backlog, oldest first
- *     updatedAt?
- *   }
- *
- * Its OWN file, not a section of `<siteId>.json`: the ledger loader keeps only the sections it knows
- * (an older engine would erase this on its first save), and the weekly seed Job also writes the
- * ledger. Only the lists step opens this file. LOAD/SAVE follow the ledger: missing = fresh,
- * unreadable or malformed = 'corrupt' (never overwritten), written via tmp file + rename.
+ * The rotating-lists step's state, one `<dir>/<siteId>.lists.json` per store. Its OWN file: the ledger
+ * loader drops sections it does not know and the seed Job also writes the ledger. Missing = fresh;
+ * unreadable or malformed = 'corrupt' (never overwritten); written via tmp file + rename.
  */
 import { promises as nodeFs } from 'fs';
 import * as path from 'path';
@@ -21,27 +9,32 @@ import type { FsLike } from './ledger.js';
 
 export const LISTS_STATE_VERSION = 1 as const;
 
-/** `ok` every list parsed; `partial` some did; `failed` none did (deterministic); `transient` retried next pass. */
-export type ListsGroupOutcome = 'ok' | 'partial' | 'failed' | 'transient';
+/**
+ * Slot spent: `ok` every list answered, `partial` some did, `failed` none did. Slot open: `transient`
+ * (retried next pass), `blocked` (the store refused us; lists paused), `interrupted` (cooldown or budget).
+ */
+export type ListsGroupOutcome = 'ok' | 'partial' | 'failed' | 'transient' | 'blocked' | 'interrupted';
 
 export interface ListsGroupState {
-  /** The last attempt that SPENT the group's slot (success, deterministic failure, or the transient give-up). Absent = never. */
+  /** The last attempt that SPENT the group's slot. Absent = never. */
   lastAttemptAt?: string;
-  /** The last attempt of any kind. */
+  /** The last pass that asked any of the group's lists. */
   lastTriedAt: string;
   outcome: ListsGroupOutcome;
-  /** Why the last attempt failed, when it did. */
+  /** The most recent failure's reason; cleared when a spent attempt had no failed list. */
   reason?: string;
-  /** Distinct ids the group's lists offered at the last successful fetch (the union of its lists). */
+  /** Ids the attempt's lists offered (the union within a pass, summed across the attempt's passes). */
   seen: number;
   /** Of those, the ids neither the ledger nor the backlog already held — what was queued for the drain. */
   new: number;
   /** Of those, the ids the drain has landed so far. */
   enqueued: number;
-  /** Consecutive failed attempts, deterministic or transient; 0 after a success. */
+  /** Consecutive failed passes (deterministic, transient or blocked); 0 after a spent attempt with a page. */
   strikes: number;
-  /** Transient attempts not yet charged to a slot; the slot is spent when these reach the retry ceiling. */
+  /** Transient passes charged to the open attempt; the slot is spent when these reach the retry ceiling. */
   retries: number;
+  /** The OPEN attempt's lists that already answered — never asked again before the slot is spent. */
+  answered?: Record<string, 'ok' | 'failed'>;
 }
 
 export interface ListsPendingEntry {
@@ -55,6 +48,8 @@ export interface ListsState {
   siteId: string;
   groups: Record<string, ListsGroupState>;
   pending: ListsPendingEntry[];
+  /** After a blocked answer no list is fetched before this instant (the backlog still drains). */
+  pausedUntil?: string;
   updatedAt?: string;
 }
 
@@ -70,15 +65,17 @@ export function createEmptyListsState(siteId: string): ListsState {
 const isPlainObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 const isCount = (v: unknown): boolean => typeof v === 'number' && Number.isInteger(v) && v >= 0;
 const isNonEmpty = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
-const OUTCOMES = new Set<unknown>(['ok', 'partial', 'failed', 'transient']);
+const isInstant = (v: unknown): boolean => typeof v === 'string' && Number.isFinite(Date.parse(v));
+const OUTCOMES = new Set<unknown>(['ok', 'partial', 'failed', 'transient', 'blocked', 'interrupted']);
 
 const isGroupState = (v: unknown): boolean =>
   isPlainObject(v) &&
-  (v.lastAttemptAt === undefined || typeof v.lastAttemptAt === 'string') &&
-  typeof v.lastTriedAt === 'string' &&
+  (v.lastAttemptAt === undefined || isInstant(v.lastAttemptAt)) &&
+  isInstant(v.lastTriedAt) &&
   OUTCOMES.has(v.outcome) &&
   (v.reason === undefined || typeof v.reason === 'string') &&
-  [v.seen, v.new, v.enqueued, v.strikes, v.retries].every(isCount);
+  [v.seen, v.new, v.enqueued, v.strikes, v.retries].every(isCount) &&
+  (v.answered === undefined || (isPlainObject(v.answered) && Object.values(v.answered).every((a) => a === 'ok' || a === 'failed')));
 
 const isPendingEntry = (v: unknown): boolean =>
   isPlainObject(v) && isNonEmpty(v.itemId) && isNonEmpty(v.collectUrl) && typeof v.group === 'string';
@@ -87,6 +84,7 @@ function coerceListsState(doc: unknown, siteId: string): ListsState | 'corrupt' 
   if (!isPlainObject(doc) || doc.version !== LISTS_STATE_VERSION || doc.siteId !== siteId) return 'corrupt';
   if (!isPlainObject(doc.groups) || !Object.values(doc.groups).every(isGroupState)) return 'corrupt';
   if (!Array.isArray(doc.pending) || !doc.pending.every(isPendingEntry)) return 'corrupt';
+  if (doc.pausedUntil !== undefined && !isInstant(doc.pausedUntil)) return 'corrupt';
   if (doc.updatedAt !== undefined && typeof doc.updatedAt !== 'string') return 'corrupt';
   return doc as unknown as ListsState;
 }

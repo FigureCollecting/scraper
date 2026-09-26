@@ -1,12 +1,6 @@
 /**
- * assembleCatalog().rotatingSeedLists / .rotatingSeed — the ROTATING SEED LIST axis behind
- * `GET /catalog/rotating?store=` (discovery) and `GET /catalog/rotating?store=&list=<id>` (one fetch).
- *
- * Contract 0.16.0 `retrieval.rotatingSeedLists` is a SEPARATE field from `seedLists`: the seed axis
- * (and with it the exclusive seed pass) never lists or fetches a rotating list. A rotating list rides
- * the listing lane (store transport, cooldown, challenge detection) and is parsed by `extractSeedList`.
- * A failed fetch says whether it is DETERMINISTIC (the crawler spends the group's slot) or TRANSIENT
- * (retried next pass), and whether the store is BLOCKING us (the crawler stops the store for the pass).
+ * assembleCatalog().rotatingSeedLists / .rotatingSeed — the axis behind `GET /catalog/rotating`. Never on
+ * the seed axis; rides the listing lane; a failure says deterministic or transient, and whether it is blocked.
  */
 import { assembleCatalog, type CatalogServices } from '../../driver/assembleCatalog';
 import { ProfileRegistry } from '../../driver/profileRegistry';

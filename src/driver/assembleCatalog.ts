@@ -120,10 +120,9 @@ export type RotatingSeedListsResult =
   | { status: 'unsupported'; siteId: string; reason: string };
 
 /**
- * How a failed rotating fetch should be treated by its poller. `deterministic`: the same fetch would
- * fail the same way (parser throw, store 4xx, challenge), so the group's slot is spent; `transient`:
- * retry next pass. `blocked`: the store is refusing us (challenge, 401/403/429), so stop the store.
- * `upstreamStatus`: the store's own status, when the lane observed one.
+ * A failed rotating fetch: `deterministic` would fail the same way again (parser throw, store 4xx,
+ * challenge), `transient` may not (5xx, network, timeout); `blocked` = the store refuses us (challenge,
+ * 401/403/429); `upstreamStatus` = the store's own status, when the lane observed one.
  */
 export type RotatingFailure = { failure: 'deterministic' | 'transient'; blocked?: true; upstreamStatus?: number };
 

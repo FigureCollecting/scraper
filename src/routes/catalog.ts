@@ -24,11 +24,9 @@
  * a store declares before it can ask for one, and the declaration is the only place that is recorded.
  * `seed`, `seeds`, `page` and `range` are mutually exclusive.
  *
- * GET /catalog/rotating?store=<siteId>[&list=<listId>] — the ROTATING seed lists (contract 0.16.0),
- * on their own path so an engine that predates them answers 404 rather than serving a listing page.
- * Without `list`: discovery `{ siteId, rotatingSeedLists: [{ id, url, group, order }], count }`.
- * With `list`: one fetch, the seed result plus `group`. 502 bodies add `failure`
- * (`deterministic` | `transient`) and `blocked: true` when the store is refusing us.
+ * GET /catalog/rotating?store=<siteId>[&list=<listId>] — rotating seed lists (contract 0.16.0), on their
+ * own path so an older engine answers 404. No `list` = discovery `{ siteId, rotatingSeedLists, count }`;
+ * `list` = one fetch (seed result + `group`); a 502 adds `failure`, `blocked` and `upstreamStatus`.
  */
 import { Router, type Request, type Response } from 'express';
 import type { Catalog } from '../driver/assembleCatalog.js';

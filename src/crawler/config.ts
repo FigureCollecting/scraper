@@ -323,10 +323,8 @@ const clampedPosInt = (raw: string | undefined, fallback: number, max: number, e
 };
 
 /**
- * Parse `CRAWLER_LISTS_WINDOW_UTC` (`HH:MM-HH:MM`, UTC, start inclusive, end exclusive; the end may
- * be earlier than the start to wrap past midnight). Anything unreadable — or a window of no width —
- * is null (no list is fetched) with a WARN: this knob gates requests into a barred space, so a typo
- * must fail closed, never open.
+ * `CRAWLER_LISTS_WINDOW_UTC` = `HH:MM-HH:MM` UTC, start inclusive, end exclusive, may wrap midnight.
+ * Unreadable or zero-width = null (no list fetched) with a WARN: it gates a barred space, so it fails closed.
  */
 const parseUtcWindow = (raw: string | undefined): UtcWindow | null => {
   const value = (raw ?? '').trim();

@@ -1,11 +1,6 @@
 /**
- * Lists-state stores — the rotating-lists step's durable state, in its OWN file per store,
- * `<dir>/<siteId>.lists.json`, never inside `<siteId>.json`.
- *
- * WHY A SEPARATE FILE: the ledger loader rebuilds the document from the sections it knows and drops
- * any other top-level key, so an engine that predates this state would erase it on its first save;
- * and the weekly seed Job writes `<siteId>.json` too. Nothing but the lists step opens this file, so
- * no older engine and no second writer can touch it, and a corrupt file costs the lists step alone.
+ * Lists-state stores: `<dir>/<siteId>.lists.json`, never a section of `<siteId>.json` — the ledger loader
+ * drops unknown sections (an older engine would erase it) and the seed Job also writes the ledger.
  */
 import * as path from 'path';
 import {
@@ -65,9 +60,22 @@ const sample = (): ListsState => ({
       strikes: 0,
       retries: 0,
     },
-    'company-7619': { lastTriedAt: '2026-09-26T17:00:00.000Z', outcome: 'transient', reason: 'socket hang up', seen: 0, new: 0, enqueued: 0, strikes: 1, retries: 1 },
+    'company-7619': {
+      lastTriedAt: '2026-09-26T17:00:00.000Z',
+      outcome: 'transient',
+      reason: 'socket hang up',
+      seen: 100,
+      new: 40,
+      enqueued: 0,
+      strikes: 1,
+      retries: 1,
+      answered: { 'company-7619-d9': 'ok', 'company-7619-d3': 'failed' },
+    },
+    'company-7621': { lastTriedAt: '2026-09-26T18:00:00.000Z', outcome: 'blocked', reason: 'challenge page', seen: 0, new: 0, enqueued: 0, strikes: 1, retries: 0, answered: {} },
+    'company-7633': { lastTriedAt: '2026-09-26T19:00:00.000Z', outcome: 'interrupted', seen: 0, new: 0, enqueued: 0, strikes: 0, retries: 0, answered: {} },
   },
   pending: [{ itemId: '98665', collectUrl: 'https://myfigurecollection.net/item/98665', group: 'company-7620' }],
+  pausedUntil: '2026-09-27T18:00:00.000Z',
   updatedAt: '2026-09-26T16:00:10.000Z',
 });
 
@@ -98,6 +106,13 @@ describe('lists-state file store', () => {
       { ...sample(), groups: { g: { ...sample().groups['company-7620'], lastTriedAt: 5 } } },
       { ...sample(), groups: { g: { ...sample().groups['company-7620'], lastAttemptAt: 5 } } },
       { ...sample(), groups: { g: { ...sample().groups['company-7620'], reason: 5 } } },
+      // A timestamp that does not parse would make its group due on every pass: refused, not guessed.
+      { ...sample(), groups: { g: { ...sample().groups['company-7620'], lastAttemptAt: 'yesterday' } } },
+      { ...sample(), groups: { g: { ...sample().groups['company-7620'], lastTriedAt: 'x' } } },
+      { ...sample(), groups: { g: { ...sample().groups['company-7620'], answered: [] } } },
+      { ...sample(), groups: { g: { ...sample().groups['company-7620'], answered: { a: 'maybe' } } } },
+      { ...sample(), pausedUntil: 'soon' },
+      { ...sample(), pausedUntil: 5 },
       { ...sample(), pending: {} },
       { ...sample(), pending: [{ itemId: '', collectUrl: 'https://x.test/1', group: 'g' }] },
       { ...sample(), pending: [{ itemId: '1', collectUrl: 5, group: 'g' }] },

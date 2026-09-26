@@ -383,6 +383,8 @@ export type ListsSkipReason =
   /** CRAWLER_LISTS_WINDOW_UTC is unset: lists are never fetched (the backlog still drains). */
   | 'window-off'
   | 'outside-window'
+  /** A blocked answer paused list fetching (`pausedUntil` in the lists state); the backlog still drains. */
+  | 'paused'
   /** Every declared group was attempted within the interval. */
   | 'none-due'
   /** The engine does not serve rotating lists (404), or the store declares none (422). */
@@ -965,10 +967,8 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     items: CatalogItem[],
     phase: Phase,
     /**
-     * `budget` is the lane's OWN POST budget. Absent = the DISCOVERY budget (`st.posts` /
-     * `st.enqueueCap`), which is what every phase but the gap sweep and the lists drain spends.
-     * Passing one swaps BOTH the counter and the ceiling, so the lanes can never spend or breach each
-     * other's. `sweptFrom` (gap sweep) is stamped on every entry it writes; `priority` rides the POST.
+     * `budget` = the lane's OWN POST budget (absent = the discovery budget); it swaps counter AND ceiling,
+     * so lanes never spend each other's. `sweptFrom` is stamped on gap entries; `priority` rides the POST.
      */
     lane: LaneOptions = {},
   ): Promise<{ newCount: number; allAttempted: boolean; handled: number; accepted: number; rejected: number; stopReason?: StopReason }> => {
@@ -1427,6 +1427,10 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     return added;
   };
 
+  // With the lists step on, the lanes below it (older gaps, descent) post COLD too, so FIFO within
+  // COLD keeps the lane order at dispatch; a store without the step posts as it always did.
+  const belowListsPriority = (st: StoreState): 'COLD' | undefined => (st.listsBudget.cap > 0 ? 'COLD' : undefined);
+
   /**
    * KNOWN-GAP SWEEP (D5) — fill the bands the descent will never reach, ASCENDING, oldest band first.
    *
@@ -1529,7 +1533,11 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
         stop = 'window-malformed';
         break;
       }
-      const { handled, rejected, stopReason } = await processPage(st, [...out.items].reverse(), 'gap', { budget, sweptFrom: band.origin });
+      const { handled, rejected, stopReason } = await processPage(st, [...out.items].reverse(), 'gap', {
+        budget,
+        sweptFrom: band.origin,
+        priority: recentTier ? undefined : belowListsPriority(st),
+      });
       if (handled === 0) {
         // Not one id got through, so nothing durable changes. Only the GLOBAL gate can do this: the
         // window was sized to what this lane's own budget still allowed, which makes its first id one
@@ -1657,7 +1665,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       });
       return skip('window-malformed');
     }
-    const { handled, rejected } = await processPage(st, out.items, 'range');
+    const { handled, rejected } = await processPage(st, out.items, 'range', { priority: belowListsPriority(st) });
     st.summary.rangeWalked += handled;
     if (handled === 0) {
       // Not one id got through (the cap ran out on the window's very first id, or the budget did):
@@ -1788,6 +1796,8 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
 
   /** A transient failure is retried on the next pass, at most this many times before the slot is spent. */
   const MAX_LIST_RETRIES = 3;
+  /** A blocked answer pauses list fetching one full day: a refusal costs one request per window, no slot. */
+  const BLOCKED_PAUSE_MS = 24 * 60 * 60 * 1000;
 
   /**
    * ROTATE: fetch at most ONE due group and queue its new ids. Returns why no group was fetched, or
@@ -1797,6 +1807,10 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     const window = config.listsWindow ?? null;
     if (!window) return 'window-off';
     if (!inWindow(window, now())) return 'outside-window';
+    if (state.pausedUntil !== undefined) {
+      if (ageMs(state.pausedUntil) < 0) return 'paused';
+      delete state.pausedUntil;
+    }
 
     const found = await listsGet(rotatingUrl(st.siteId));
     if (found.kind === 'budget') {
@@ -1820,7 +1834,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       return 'failed';
     }
 
-    // Groups in rotation order: the lowest `order` any of their lists declares, ties by first declaration.
+    // A group's `order` is the lowest any of its lists declares.
     const groups = new Map<string, { order: number; index: number; lists: string[] }>();
     const ids = new Set<string>();
     for (const entry of raw) {
@@ -1835,50 +1849,60 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
         g.order = Math.min(g.order, order);
       } else groups.set(group, { order, index: groups.size, lists: [id] });
     }
+    // Least recently attempted first (never = first; `order`, then declaration, break ties): with fewer
+    // slots per interval than groups the cycle stretches instead of starving the tail.
     const interval = config.listsIntervalMs ?? 160 * 60 * 60 * 1000;
+    const lastMs = (name: string): number => {
+      const at = state.groups[name]?.lastAttemptAt;
+      return at === undefined ? Number.NEGATIVE_INFINITY : Date.parse(at);
+    };
     const due = [...groups.entries()]
-      .sort(([, a], [, b]) => a.order - b.order || a.index - b.index)
-      .find(([name]) => {
+      .filter(([name]) => {
         const at = state.groups[name]?.lastAttemptAt;
         return at === undefined || ageMs(at) >= interval;
-      });
+      })
+      .sort(([na, a], [nb, b]) => lastMs(na) - lastMs(nb) || a.order - b.order || a.index - b.index)[0];
     if (!due) return 'none-due';
     const [group, { lists }] = due;
     st.summary.listsGroup = group;
 
-    // Fetch every list of the group, >= the spacing floor apart; a stop or a transient failure ends it.
-    // The attempt is stamped when it STARTS, so the interval is measured between first requests.
+    // An open attempt resumes where it stopped: a list that already answered is not asked again.
+    const prior = state.groups[group];
+    const answered: Record<string, 'ok' | 'failed'> = {};
+    for (const id of lists) {
+      const a = prior?.answered?.[id];
+      if (a) answered[id] = a;
+    }
     const at = iso();
     const union = new Map<string, CatalogItem>();
-    let ok = 0;
+    let fetched = 0;
     let failed = 0;
-    let firstFailure: string | undefined;
-    let transient: string | undefined;
-    let interrupted: ListsSkipReason | undefined;
-    for (const [i, listId] of lists.entries()) {
+    let reason: string | undefined;
+    let stop: 'transient' | 'blocked' | 'cooldown' | 'budget' | undefined;
+    for (const [i, listId] of lists.filter((id) => answered[id] === undefined).entries()) {
       if (i > 0) await sleep(config.listsSpacingMs ?? 10_000);
       const out = await fetchRotatingList(st, listId);
       if (out.kind === 'budget' || out.kind === 'cooldown') {
         st.stopped = true;
-        interrupted = out.kind;
+        stop = out.kind;
         break;
       }
       if (out.kind === 'ok') {
-        ok++;
+        fetched++;
+        answered[listId] = 'ok';
         for (const it of out.items) if (it.collectUrl && !union.has(it.itemId)) union.set(it.itemId, it);
         continue;
       }
       failed++;
-      firstFailure ??= out.reason;
-      if (out.blocked) st.stopped = true;
-      if (out.kind === 'transient') {
+      reason = out.reason;
+      if (out.blocked || out.kind === 'transient') {
         st.stopped = true;
-        transient = out.reason;
+        stop = out.blocked ? 'blocked' : 'transient';
         break;
       }
-      if (out.blocked) break;
+      answered[listId] = 'failed';
     }
-    st.summary.listsFetched = ok;
+    st.summary.listsFetched = fetched;
     st.summary.listsFailed = failed;
     st.summary.listsIdsSeen = union.size;
 
@@ -1892,38 +1916,50 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       fresh++;
     }
     st.summary.listsIdsNew = fresh;
-    // No request reached the store's answer (cooldown) or the gate closed mid-group: no attempt is booked.
-    if (interrupted) return interrupted;
+    const interrupted = stop === 'cooldown' || stop === 'budget' ? stop : null;
+    // The store answered nothing (a cooling host or a closed gate on the first list): nothing to book.
+    if (interrupted && fetched + failed === 0) return interrupted;
 
-    const g: ListsGroupState = state.groups[group] ?? { lastTriedAt: at, outcome: 'ok', seen: 0, new: 0, enqueued: 0, strikes: 0, retries: 0 };
+    const g: ListsGroupState = prior ?? { lastTriedAt: at, outcome: 'ok', seen: 0, new: 0, enqueued: 0, strikes: 0, retries: 0 };
+    if (g.answered === undefined) {
+      // A new attempt opens: its counters start from zero.
+      g.seen = 0;
+      g.new = 0;
+      g.enqueued = 0;
+    }
+    g.answered = answered;
     g.lastTriedAt = at;
-    if (transient !== undefined) {
-      g.outcome = 'transient';
-      g.reason = transient;
-      g.strikes++;
-      g.retries++;
-      if (g.retries >= MAX_LIST_RETRIES) {
-        g.lastAttemptAt = at;
-        g.retries = 0;
-      }
-    } else {
-      // Every list answered (or the store blocked us): the slot is spent, whatever the answers were.
+    g.seen += union.size;
+    g.new += fresh;
+    if (reason !== undefined) g.reason = reason;
+    const spend = (outcome: ListsGroupOutcome): void => {
+      g.outcome = outcome;
       g.lastAttemptAt = at;
       g.retries = 0;
-      g.outcome = ok === 0 ? 'failed' : failed > 0 ? 'partial' : 'ok';
-      if (firstFailure !== undefined) g.reason = firstFailure;
-      else delete g.reason;
-      if (ok === 0) g.strikes++;
-      else {
-        g.strikes = 0;
-        g.seen = union.size;
-        g.new = fresh;
-        g.enqueued = 0;
-      }
+      delete g.answered;
+    };
+    if (stop === 'blocked') {
+      // The store refused US, not this list: no slot is spent, and no list is asked for a day.
+      g.outcome = 'blocked';
+      g.strikes++;
+      state.pausedUntil = new Date(now() + BLOCKED_PAUSE_MS).toISOString();
+    } else if (stop === 'transient') {
+      g.outcome = 'transient';
+      g.strikes++;
+      g.retries++;
+      if (g.retries >= MAX_LIST_RETRIES) spend('transient');
+    } else if (interrupted) {
+      g.outcome = 'interrupted';
+    } else {
+      const results = Object.values(answered);
+      const ok = results.filter((r) => r === 'ok').length;
+      if (ok === results.length) delete g.reason;
+      g.strikes = ok === 0 ? g.strikes + 1 : 0;
+      spend(ok === 0 ? 'failed' : ok < results.length ? 'partial' : 'ok');
     }
     state.groups[group] = g;
     st.summary.listsOutcome = g.outcome;
-    return null;
+    return interrupted;
   };
 
   const saveLists = async (st: StoreState, state: ListsState): Promise<boolean> => {
@@ -1939,11 +1975,9 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
   };
 
   /**
-   * COMPANY LISTS (Ross 2026-09-22/25/26) — per-company lists replace the archive descent. ROTATE at
-   * most one group (see `rotate`), persist its booking, then DRAIN the backlog oldest first on
-   * CRAWLER_LISTS_DRAIN_CAPS, POSTed COLD so a tap or recent-gap id never waits behind a list id.
-   * The ledger is saved before the backlog: a crash between the two re-offers ids the ledger now
-   * holds, and the next drain drops those without a request.
+   * COMPANY LISTS (Ross 2026-09-22/25/26): ROTATE at most one group, persist its booking, then DRAIN the
+   * backlog oldest first, COLD. The ledger is saved before the backlog: a crash between them re-offers
+   * ids the ledger holds, and the next drain drops them without a request.
    */
   const listsStep = async (st: StoreState, commit: () => Promise<boolean>): Promise<void> => {
     const budget = st.listsBudget;
@@ -2003,16 +2037,9 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
   };
 
   /**
-   * The store's whole ID-RANGE axis for one run, in Ross's precedence (2026-09-25): below the tap,
-   *
-   *   1. RE-ANCHOR + adopt the operator's bands — no requests at all.
-   *   2. RECENT GAPS — the re-anchor bands, on the gap budget.
-   *   3. COMPANY LISTS — at most one rotating group, then the drain on its own budget (COLD).
-   *   4. OLDER GAPS — the operator bands, on what is left of the gap budget.
-   *   5. DESCENT — the archive, on the store's discovery cap.
-   *
-   * Each lane has its own budget, so order decides only who gets the GLOBAL budget and the egress
-   * first; a stop (cooldown, challenge, sick scraper) in one lane stops every lane below it.
+   * The store's ID-RANGE axis in Ross's precedence (2026-09-25), below the tap: re-anchor + adopt bands
+   * (no requests) → recent gaps ('reanchor') → company lists → older gaps ('operator') → descent. Each
+   * lane has its own budget; order decides the GLOBAL budget, and a stop in one lane stops those below.
    */
   const rangePhase = async (st: StoreState): Promise<void> => {
     if (!config.rangeStores.includes(st.siteId)) return;

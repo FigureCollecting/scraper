@@ -287,14 +287,9 @@ export interface RetrievalCapability {
    */
   seedLists?: SeedList[];
   /**
-   * ROTATING SEED LISTS — declared pages the engine polls ONE GROUP AT A TIME on its own rotation,
-   * never all together. Each entry is one whole page like a seed list; `group` names the unit the
-   * rotation schedules (every list of a group is fetched in the same pass) and `order` is that group's
-   * place in the rotation, lowest first. Parsed by {@link ExtractionRuleset.extractSeedList}.
-   *
-   * A SEPARATE field from `seedLists`, deliberately: an engine that predates it never sees these
-   * pages, and the exclusive seed pass (which polls every `seedLists` entry back to back) never lists
-   * them. Ids share one namespace with `seedLists`.
+   * ROTATING SEED LISTS — whole pages the engine polls one `group` per pass, in rotation, parsed by
+   * {@link ExtractionRuleset.extractSeedList}. Separate from `seedLists` so an older engine and the
+   * exclusive seed pass never fetch them; ids share one namespace with `seedLists`.
    */
   rotatingSeedLists?: RotatingSeedList[];
 }

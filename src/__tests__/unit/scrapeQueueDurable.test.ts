@@ -539,6 +539,23 @@ describe('ScrapeQueue — bounded working set', () => {
     expect(queue.isPending('a2')).toBe(true);
   });
 
+  it('COLD items dispatch in the order they were posted and after every WARM one (the crawler posts lanes in precedence order)', () => {
+    process.env.SCRAPE_QUEUE_MAX_RESIDENT = '100';
+    const store = openStore(tmpDir());
+    queue = new ScrapeQueue(true);
+    queue.setQueueStore(store);
+    const at = (id: string) => `https://busy.test/item/${id}`;
+    // One crawler pass for a lists store: recent gap (WARM), list drain, older gap, descent (COLD); then a later tap id (WARM).
+    queue.enqueue('recent-gap', { url: at('recent-gap') });
+    for (const id of ['list-a', 'list-b', 'older-gap', 'descent']) queue.enqueue(id, { url: at(id), priority: 'COLD' });
+    queue.enqueue('tap', { url: at('tap') });
+    const next = (queue as unknown as { getNextProcessableItem(now: number): { mfcId: string } | null }).getNextProcessableItem.bind(queue);
+    const t0 = Date.now();
+    // A minute apart, so the same-host pacing floor never holds an item back.
+    const order = Array.from({ length: 6 }, (_, i) => next(t0 + i * 60_000)?.mfcId);
+    expect(order).toEqual(['recent-gap', 'tap', 'list-a', 'list-b', 'older-gap', 'descent']);
+  });
+
   it('a parked WARM item pages in and dispatches ahead of OLDER parked COLD items on the same host', () => {
     process.env.SCRAPE_QUEUE_MAX_RESIDENT = '2';
     const store = openStore(tmpDir());
