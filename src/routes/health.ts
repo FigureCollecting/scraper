@@ -43,8 +43,11 @@
  *     operator needs it named; the flat form is what an alert rule keys on, and the canary item id
  *     is never exposed)
  *     and `cfCookies: [{host, cookieNames, userAgentPinned, loadedAt, mintedAt?, expiresAt?, stale,
- *     staleSince?, staleReason?}]` (the stored-cookie jar's per-host view — cookie NAMES only, never a
- *     value; `stale` = the host still served a challenge with its stored cookies → re-mint).
+ *     staleSince?, staleReason?, sessionLost, sessionLostSince?, sessionLostReason?}]` (the stored-cookie
+ *     jar's per-host view — cookie NAMES only, never a value; `stale` = the host still served a
+ *     challenge with its stored cookies → re-mint; `sessionLost` = a login-gated image host answered
+ *     as logged out, sticky until new cookie values load → re-mint the login), plus the flat
+ *     `cookieSessionLost: [host]` it mirrors.
  *     A browser-pool-health failure still degrades to 500, now carrying { status:'degraded',
  *     challengeCooldowns, cfCookies, error } — both lists survive (neither lister can throw).
  */
@@ -141,6 +144,8 @@ export function createHealthRoutes(deps: HealthDeps): Router {
   const router = Router();
 
   const healthResponse = () => ({ service: 'scraper', version: deps.version, status: 'healthy' });
+  // Flat, like mfcSessionStale: the hosts whose login is gone, for a rule to key on without a filter.
+  const sessionLostHosts = () => deps.listCfCookies().filter(view => view.sessionLost).map(view => view.host);
 
   // Root endpoint for health checks (Docker health checks hit this)
   router.get('/', (_req: Request, res: Response) => {
@@ -161,6 +166,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         browserPool,
         challengeCooldowns: deps.listChallengeCooldowns(),
         cfCookies: deps.listCfCookies(),
+        cookieSessionLost: sessionLostHosts(),
         residentialEgress: deps.getResidentialEgress(),
         browserLane: deps.getBrowserLane(),
         rawStore: deps.getRawStore(),
@@ -179,6 +185,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         status: 'degraded',
         challengeCooldowns: deps.listChallengeCooldowns(),
         cfCookies: deps.listCfCookies(),
+        cookieSessionLost: sessionLostHosts(),
         residentialEgress: deps.getResidentialEgress(),
         browserLane: deps.getBrowserLane(),
         rawStore: deps.getRawStore(),

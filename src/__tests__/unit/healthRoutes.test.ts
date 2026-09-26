@@ -17,7 +17,7 @@ const NO_IMAGE_CAPTURE: ImageCaptureStats = {
   attempted: 0,
   stored: 0,
   deduped: 0,
-  skipped: { policyDeny: 0, memo: 0, thumbnailRole: 0, userRole: 0, cap: 0, residentialBudget: 0, notImage: 0, tooLarge: 0, refused: 0, unsupported: 0, inFlight: 0, sinkQueueFull: 0 },
+  skipped: { policyDeny: 0, memo: 0, thumbnailRole: 0, userRole: 0, cap: 0, residentialBudget: 0, notImage: 0, tooLarge: 0, refused: 0, unsupported: 0, inFlight: 0, sinkQueueFull: 0, displayGated: 0 },
   failed: 0,
   residentialBytesToday: 0,
 };
@@ -156,6 +156,7 @@ describe('createHealthRoutes', () => {
         stale: true,
         staleSince: '2023-11-14T22:13:20.000Z',
         staleReason: 'challenge page via browser transport',
+        sessionLost: false,
       }]);
       const json = JSON.stringify(res.body);
       for (const v of VALUES) expect(json).not.toContain(v);
@@ -181,6 +182,31 @@ describe('createHealthRoutes', () => {
       expect(res.body.status).toBe('degraded');
       expect(res.body.cfCookies).toEqual([expect.objectContaining({ host: 'myfigurecollection.net', cookieNames: ['cf_clearance', 'PHPSESSID'], stale: false })]);
       for (const v of VALUES) expect(JSON.stringify(res.body)).not.toContain(v);
+    });
+
+    it('GET /health/detailed lists the hosts whose login session is LOST, flat, on both branches', async () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      const store = realStore();
+      const quiet = await request(build({ listCfCookies: () => store.view() })).get('/health/detailed');
+      expect(quiet.body.cookieSessionLost).toEqual([]);
+
+      store.markSessionLost('myfigurecollection.net', 'impit', 'placeholder body on a login-gated host', 'PHPSESSID');
+      const healthy = await request(build({ listCfCookies: () => store.view() })).get('/health/detailed');
+      expect(healthy.body.cookieSessionLost).toEqual(['myfigurecollection.net']);
+      expect(healthy.body.cfCookies[0]).toMatchObject({
+        sessionLost: true,
+        sessionLostReason: 'placeholder body on a login-gated host',
+      });
+      const degraded = await request(build({
+        getBrowserPoolHealth: async () => { throw new Error('pool down'); },
+        listCfCookies: () => store.view(),
+      })).get('/health/detailed');
+      expect(degraded.status).toBe(500);
+      expect(degraded.body.cookieSessionLost).toEqual(['myfigurecollection.net']);
+      // The liveness contract is untouched.
+      const live = await request(build({ listCfCookies: () => store.view() })).get('/health');
+      expect(live.body).toEqual({ service: 'scraper', version: '9.9.9', status: 'healthy' });
+      warn.mockRestore();
     });
   });
 });
@@ -537,7 +563,7 @@ describe('createHealthRoutes — imageCapture', () => {
     attempted: 40,
     stored: 31,
     deduped: 4,
-    skipped: { policyDeny: 2, memo: 9, thumbnailRole: 12, userRole: 3, cap: 1, residentialBudget: 5, notImage: 2, tooLarge: 1, refused: 4, unsupported: 1, inFlight: 7, sinkQueueFull: 6 },
+    skipped: { policyDeny: 2, memo: 9, thumbnailRole: 12, userRole: 3, cap: 1, residentialBudget: 5, notImage: 2, tooLarge: 1, refused: 4, unsupported: 1, inFlight: 7, sinkQueueFull: 6, displayGated: 0 },
     failed: 3,
     residentialBytesToday: 12_345,
   };

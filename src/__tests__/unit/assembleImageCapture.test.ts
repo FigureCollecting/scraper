@@ -113,6 +113,33 @@ describe('createImageCaptureHookFromEnv', () => {
     });
     expect(hook.stats()).toMatchObject({ attempted: 0, failed: 0, skipped: expect.objectContaining({ policyDeny: 1 }) });
   });
+
+  it('wires the session-lost signal to the cookie store for a placeholder on a login-gated host', async () => {
+    const marks: unknown[][] = [];
+    const sessionSignals = {
+      cookiesFor: (url: string) => (url.includes('myfigurecollection.net') ? { PHPSESSID: 'x' } : undefined),
+      userAgentFor: () => undefined,
+      markSessionLost: (...args: unknown[]) => {
+        marks.push(args);
+        return true;
+      },
+    };
+    const hook = createImageCaptureHookFromEnv(env(), {
+      sink: configuredSink(),
+      policy: buildImageHostPolicy({ 'myfigurecollection.net': { lane: 'impit', loginGated: true, sessionCookie: 'PHPSESSID' } }),
+      fetchBytes: async () => ({ ok: false, reason: 'display-gated', status: 200, bytesRead: 10, detail: 'display_gated' }),
+      sessionSignals,
+    });
+    await hook.capture({
+      site: 'mfc',
+      itemId: '1',
+      pageUrl: 'https://myfigurecollection.net/item/1',
+      fields: {},
+      ruleset: { describeImages: () => [{ url: 'https://myfigurecollection.net/?_tb=commit&commit=nsp&objectId=1&size=1', role: 'gallery', position: 0 }] },
+      origin: 'ingest',
+    });
+    expect(marks).toEqual([['myfigurecollection.net', 'impit', 'placeholder body on a login-gated host', 'PHPSESSID']]);
+  });
 });
 
 describe('imageCaptureView', () => {
