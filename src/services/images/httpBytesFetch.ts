@@ -19,9 +19,13 @@ import {
   imageTooLarge,
   isTimeoutError,
   overImageSizeCap,
+  placeholderRefusal,
   refusedFinalUrl,
   resolveImageAccept,
   resolveImageTimeout,
+  sessionCookieReissued,
+  splitSetCookieHeader,
+  withSessionFlag,
   type ImageBytesFetcher,
   type ImageBytesResult,
 } from './imageBytes.js';
@@ -35,7 +39,7 @@ export const DEFAULT_IMAGE_FETCH_TIMEOUT_MS = 15_000;
 export interface BytesResponseLike {
   status: number;
   url?: string;
-  headers: { get(name: string): string | null };
+  headers: { get(name: string): string | null; getSetCookie?(): string[] };
   arrayBuffer(): Promise<ArrayBuffer>;
 }
 
@@ -104,44 +108,51 @@ export function createHttpBytesFetch(options: HttpBytesFetchOptions = {}): Image
       if (isTimeoutError(err)) return { ok: false, reason: 'timeout', detail: (err as Error).message };
       throw err;
     }
+    // This lane sends no cookies, so any value a login-gated host sets for its session is new.
+    const setCookies = typeof res.headers.getSetCookie === 'function'
+      ? res.headers.getSetCookie()
+      : splitSetCookieHeader(res.headers.get('set-cookie') ?? '');
+    const reissued = sessionCookieReissued(setCookies, opts.sessionCookie, undefined);
     // A non-2xx body is never stored: a 403 hotlink page and a 404 stub are both "no image here".
     if (res.status < 200 || res.status > 299) {
       // The block SIGNALS ride along so the pacing wrapper can tell a throttle from a per-URL verdict.
       const signals = headerSubset(res, BLOCK_SIGNAL_HEADERS);
-      return { ok: false, reason: 'http-status', status: res.status, ...(Object.keys(signals).length > 0 ? { signals } : {}) };
+      return withSessionFlag({ ok: false, reason: 'http-status', status: res.status, ...(Object.keys(signals).length > 0 ? { signals } : {}) }, reissued);
     }
     // SIZE, before the read where the server declared one: an oversized body must not be buffered
     // just to be rejected afterwards.
     const declaredLength = res.headers.get('content-length');
-    if (overImageSizeCap(declaredLength, maxBytes)) return imageTooLarge(declaredLength as string, maxBytes);
+    if (overImageSizeCap(declaredLength, maxBytes)) return withSessionFlag(imageTooLarge(declaredLength as string, maxBytes), reissued);
     let bytes: Buffer;
     try {
       bytes = Buffer.from(await res.arrayBuffer());
     } catch (err) {
-      if (isTimeoutError(err)) return { ok: false, reason: 'timeout', detail: (err as Error).message };
+      if (isTimeoutError(err)) return withSessionFlag({ ok: false, reason: 'timeout', detail: (err as Error).message }, reissued);
       throw err;
     }
     // And again on what actually arrived — a CDN that declares no length is only caught here.
-    if (overImageSizeCap(bytes.byteLength, maxBytes)) return imageTooLarge(bytes.byteLength, maxBytes, bytes.byteLength);
+    if (overImageSizeCap(bytes.byteLength, maxBytes)) return withSessionFlag(imageTooLarge(bytes.byteLength, maxBytes, bytes.byteLength), reissued);
     const served = res.headers.get('content-type') ?? undefined;
     const classified = classifyImageBytes(served, bytes);
     if (!classified.image) {
-      return { ok: false, reason: 'not-image', status: res.status, bytesRead: bytes.byteLength, ...(served ? { contentType: served } : {}) };
+      return withSessionFlag({ ok: false, reason: 'not-image', status: res.status, bytesRead: bytes.byteLength, ...(served ? { contentType: served } : {}) }, reissued);
     }
     const finalUrl = res.url && res.url !== '' ? res.url : url;
     // REDIRECTS: the lane follows them, and the lane decision only ever saw the REQUESTED url. The
     // permaban is re-asserted on what the bytes actually came from, then the caller's own guard.
-    if (isDeniedImageUrl(finalUrl)) return refusedFinalUrl(finalUrl, 'is on the image deny list', bytes.byteLength);
+    if (isDeniedImageUrl(finalUrl)) return withSessionFlag(refusedFinalUrl(finalUrl, 'is on the image deny list', bytes.byteLength), reissued);
     if (opts.allowFinalUrl && !opts.allowFinalUrl(finalUrl)) {
-      return refusedFinalUrl(finalUrl, 'the caller\'s final-URL guard rejected', bytes.byteLength);
+      return withSessionFlag(refusedFinalUrl(finalUrl, 'the caller\'s final-URL guard rejected', bytes.byteLength), reissued);
     }
-    return {
+    const placeholder = placeholderRefusal(bytes, opts.placeholders, res.status);
+    if (placeholder) return withSessionFlag(placeholder, reissued);
+    return withSessionFlag({
       ok: true,
       bytes,
       contentType: classified.contentType as string,
       status: res.status,
       finalUrl,
       headers: headerSubset(res),
-    };
+    }, reissued);
   };
 }

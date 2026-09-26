@@ -18,6 +18,7 @@ import type { CaptureSink } from '../captureSink.js';
 import { createFailureReporterFromEnv, type FetchOriginName } from '../failureReporter.js';
 import { createCaptureReporterFromEnv } from '../captureReporter.js';
 import { getResidentialProxyUrl } from '../residentialEgress.js';
+import { getCfCookieStore, markSessionLostIfStored, type CfCookieSessionSignals, type CfCookieSource } from '../cookieJar.js';
 import { createCapturingScrapingService } from '../engineServices/capturingScrapingService.js';
 import { createHttpBytesFetch } from './httpBytesFetch.js';
 import { createImpitBytesFetch } from './impitBytesFetch.js';
@@ -105,6 +106,8 @@ export interface AssembleImageCaptureDeps {
   /** The pooled browser surface for the gated lane (default: the shared capturing service, lazily). */
   browserLane?: () => GatedTabLane;
   policy?: ImageHostPolicy;
+  /** Where a lost login is marked (default: the process cookie store). */
+  sessionSignals?: CfCookieSource & CfCookieSessionSignals;
 }
 
 /**
@@ -179,6 +182,8 @@ export function createImageCaptureHookFromEnv(
     policy: deps.policy ?? loadImageHostPolicy(env),
     fetchBytes,
     proxyUrlFor: egress => (egress === 'residential' ? getResidentialProxyUrl() : undefined),
+    onSessionLost: (url, lane, reason, sessionCookie) =>
+      void markSessionLostIfStored(deps.sessionSignals ?? getCfCookieStore(), url, lane, reason, sessionCookie),
     ...(reporter ? { reportFailure: report => reporter.report(report) } : {}),
     ...(captureReporter ? { reportCapture: report => captureReporter.report(report) } : {}),
     enabled,
@@ -220,7 +225,7 @@ export function imageCaptureView(hook: ImageCaptureHook = getImageCaptureHook())
       attempted: 0,
       stored: 0,
       deduped: 0,
-      skipped: { policyDeny: 0, memo: 0, thumbnailRole: 0, userRole: 0, cap: 0, residentialBudget: 0, notImage: 0, tooLarge: 0, refused: 0, unsupported: 0, inFlight: 0, sinkQueueFull: 0 },
+      skipped: { policyDeny: 0, memo: 0, thumbnailRole: 0, userRole: 0, cap: 0, residentialBudget: 0, notImage: 0, tooLarge: 0, refused: 0, unsupported: 0, inFlight: 0, sinkQueueFull: 0, displayGated: 0 },
       failed: 0,
       residentialBytesToday: 0,
     };

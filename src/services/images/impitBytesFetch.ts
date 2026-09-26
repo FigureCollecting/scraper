@@ -43,9 +43,13 @@ import {
   imageTooLarge,
   isTimeoutError,
   overImageSizeCap,
+  placeholderRefusal,
   resolveImageAccept,
   refusedFinalUrl,
   resolveImageTimeout,
+  sessionCookieReissued,
+  splitSetCookieHeader,
+  withSessionFlag,
   type ImageBytesFetcher,
   type ImageBytesResult,
 } from './imageBytes.js';
@@ -127,6 +131,17 @@ function readHeaders(res: ImpitResponseLike, names: readonly string[] = CAPTURED
   return out;
 }
 
+/** Every Set-Cookie line, from a `Headers` (getSetCookie, else the joined get) or a plain record. */
+function readSetCookies(res: ImpitResponseLike): string[] {
+  const bag = res.headers as { getSetCookie?: () => string[]; get?: (name: string) => unknown } | Record<string, unknown> | null | undefined;
+  if (bag == null) return [];
+  if (typeof (bag as { getSetCookie?: unknown }).getSetCookie === 'function') return (bag as { getSetCookie(): string[] }).getSetCookie();
+  const joined = typeof (bag as { get?: unknown }).get === 'function'
+    ? (bag as { get(name: string): unknown }).get('set-cookie')
+    : Object.entries(bag as Record<string, unknown>).find(([name]) => name.toLowerCase() === 'set-cookie')?.[1];
+  return typeof joined === 'string' ? splitSetCookieHeader(joined) : [];
+}
+
 /**
  * Bound ONE call with the caller's per-request budget. impit's own timeout is set per SESSION (and
  * the session is shared across hosts and requests), so without this a caller asking for a tight
@@ -184,6 +199,7 @@ export function createImpitBytesFetch(options: ImpitBytesFetchOptions = {}): Ima
     };
     let res: ImpitResponseLike;
     let bytes: Buffer | undefined;
+    let reissued = false;
     try {
       const session = await getImpit(browser, opts.proxyUrl);
       const impit = 'impit' in session ? session.impit : session;
@@ -194,54 +210,61 @@ export function createImpitBytesFetch(options: ImpitBytesFetchOptions = {}): Ima
         impit.fetch(url, { method: 'GET', headers }),
         opts.timeoutMs === undefined ? undefined : resolveImageTimeout(opts.timeoutMs, opts.timeoutMs),
       );
+      // Read on EVERY response, whatever it turns out to be: a dead login shows up on a 403 as well.
+      reissued = sessionCookieReissued(readSetCookies(res), opts.sessionCookie, opts.sessionCookie ? stored?.[opts.sessionCookie] : undefined);
       // STATUS before BODY: a 403 hotlink page is not worth reading, and impit's own error bodies
       // are not images. An impit build that reports no status is treated as 2xx (the pre-status
       // behavior) rather than being failed on a value it never had.
       if (typeof res.status === 'number' && (res.status < 200 || res.status > 299)) {
         const signals = readHeaders(res, BLOCK_SIGNAL_HEADERS);
-        return { ok: false, reason: 'http-status', status: res.status, ...(Object.keys(signals).length > 0 ? { signals } : {}) };
+        return withSessionFlag({ ok: false, reason: 'http-status', status: res.status, ...(Object.keys(signals).length > 0 ? { signals } : {}) }, reissued);
       }
       // SIZE before the read where impit reports a length, and again on the bytes that arrived.
       const declaredLength = readHeaders(res, ['content-length'])['content-length'];
-      if (overImageSizeCap(declaredLength, maxBytes)) return imageTooLarge(declaredLength, maxBytes);
+      if (overImageSizeCap(declaredLength, maxBytes)) return withSessionFlag(imageTooLarge(declaredLength, maxBytes), reissued);
       bytes = await readBytes(res);
-      if (bytes !== undefined && overImageSizeCap(bytes.byteLength, maxBytes)) return imageTooLarge(bytes.byteLength, maxBytes, bytes.byteLength);
+      if (bytes !== undefined && overImageSizeCap(bytes.byteLength, maxBytes)) {
+        return withSessionFlag(imageTooLarge(bytes.byteLength, maxBytes, bytes.byteLength), reissued);
+      }
     } catch (err) {
       if (isTimeoutError(err)) return { ok: false, reason: 'timeout', detail: (err as Error).message };
       throw err;
     }
     if (bytes === undefined) {
-      return {
+      return withSessionFlag({
         ok: false,
         reason: 'unsupported',
         detail: 'this impit build exposes no bytes()/arrayBuffer() — an image must not be read through text()',
-      };
+      }, reissued);
     }
     const headerSubset = readHeaders(res);
     const served = headerSubset['content-type'];
     const classified = classifyImageBytes(served, bytes);
     if (!classified.image) {
-      return {
+      return withSessionFlag({
         ok: false,
         reason: 'not-image',
         bytesRead: bytes.byteLength,
         ...(typeof res.status === 'number' ? { status: res.status } : {}),
         ...(served ? { contentType: served } : {}),
-      };
+      }, reissued);
     }
     const finalUrl = typeof res.url === 'string' && res.url !== '' ? res.url : url;
     // impit follows redirects too — the ban, then the caller's guard, on what actually served.
-    if (isDeniedImageUrl(finalUrl)) return refusedFinalUrl(finalUrl, 'is on the image deny list', bytes.byteLength);
+    if (isDeniedImageUrl(finalUrl)) return withSessionFlag(refusedFinalUrl(finalUrl, 'is on the image deny list', bytes.byteLength), reissued);
     if (opts.allowFinalUrl && !opts.allowFinalUrl(finalUrl)) {
-      return refusedFinalUrl(finalUrl, 'the caller\'s final-URL guard rejected', bytes.byteLength);
+      return withSessionFlag(refusedFinalUrl(finalUrl, 'the caller\'s final-URL guard rejected', bytes.byteLength), reissued);
     }
-    return {
+    const status = typeof res.status === 'number' ? res.status : 200;
+    const placeholder = placeholderRefusal(bytes, opts.placeholders, status);
+    if (placeholder) return withSessionFlag(placeholder, reissued);
+    return withSessionFlag({
       ok: true,
       bytes,
       contentType: classified.contentType as string,
-      status: typeof res.status === 'number' ? res.status : 200,
+      status,
       finalUrl,
       headers: headerSubset,
-    };
+    }, reissued);
   };
 }
