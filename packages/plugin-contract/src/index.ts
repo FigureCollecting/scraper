@@ -286,6 +286,32 @@ export interface RetrievalCapability {
    * or `daily`, never faster. `note` is free text for whoever reads the declaration later.
    */
   seedLists?: SeedList[];
+  /**
+   * ROTATING SEED LISTS — declared pages the engine polls ONE GROUP AT A TIME on its own rotation,
+   * never all together. Each entry is one whole page like a seed list; `group` names the unit the
+   * rotation schedules (every list of a group is fetched in the same pass) and `order` is that group's
+   * place in the rotation, lowest first. Parsed by {@link ExtractionRuleset.extractSeedList}.
+   *
+   * A SEPARATE field from `seedLists`, deliberately: an engine that predates it never sees these
+   * pages, and the exclusive seed pass (which polls every `seedLists` entry back to back) never lists
+   * them. Ids share one namespace with `seedLists`.
+   */
+  rotatingSeedLists?: RotatingSeedList[];
+}
+
+/**
+ * One rotating seed list (see {@link RetrievalCapability.rotatingSeedLists}). There is no cadence:
+ * the engine's rotation decides when a group is due.
+ */
+export interface RotatingSeedList {
+  /** Stable, store-unique name for this list (unique across `seedLists` too). */
+  id: string;
+  /** The exact page to fetch. Fully resolved: no placeholder, no paging. */
+  url: string;
+  /** The rotation unit: every list sharing a group is fetched in the same pass. */
+  group: string;
+  /** The group's place in the rotation, lowest first. Lists of one group should declare the same value. */
+  order: number;
 }
 
 /**
@@ -713,7 +739,8 @@ export interface ExtractionRuleset {
   extractListing?(body: string, url: string, ctx?: ExtractContext): ListingPage | Promise<ListingPage>;
   /**
    * OPTIONAL: parse one DECLARED SEED LIST body (fetched from the entry in the store's
-   * `retrieval.seedLists` whose `id` is `listId`) into the item ids that page shows. Same
+   * `retrieval.seedLists` or `retrieval.rotatingSeedLists` whose `id` is `listId`) into the item ids
+   * that page shows. Same
    * `ListingPage` shape as `extractListing`, and the parser is handed the LIST ID rather than a url
    * because the url is already declared — one parser can therefore serve every list the store
    * declares and switch on which one it was asked for.

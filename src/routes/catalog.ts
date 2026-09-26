@@ -23,6 +23,12 @@
  * cadence, note? }], count }` in DECLARED order, fetching nothing. A poller has to learn which lists
  * a store declares before it can ask for one, and the declaration is the only place that is recorded.
  * `seed`, `seeds`, `page` and `range` are mutually exclusive.
+ *
+ * GET /catalog/rotating?store=<siteId>[&list=<listId>] — the ROTATING seed lists (contract 0.16.0),
+ * on their own path so an engine that predates them answers 404 rather than serving a listing page.
+ * Without `list`: discovery `{ siteId, rotatingSeedLists: [{ id, url, group, order }], count }`.
+ * With `list`: one fetch, the seed result plus `group`. 502 bodies add `failure`
+ * (`deterministic` | `transient`) and `blocked: true` when the store is refusing us.
  */
 import { Router, type Request, type Response } from 'express';
 import type { Catalog } from '../driver/assembleCatalog.js';
@@ -198,6 +204,64 @@ export function createCatalogRoute(catalog: Catalog): Router {
       }
     } catch (error) {
       res.status(502).json({ error: 'catalog failed', siteId: store, reason: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  router.get('/catalog/rotating', async (req: Request, res: Response) => {
+    const store = typeof req.query.store === 'string' ? req.query.store.trim() : '';
+    if (!store) {
+      res.status(400).json({ error: "query parameter 'store' is required" });
+      return;
+    }
+    const failed = (error: unknown): void => {
+      res.status(502).json({ error: 'catalog failed', siteId: store, reason: error instanceof Error ? error.message : String(error) });
+    };
+    if (req.query.list === undefined) {
+      try {
+        const result = catalog.rotatingSeedLists(store);
+        if (result.status === 'ok') {
+          const { status: _status, ...body } = result;
+          res.json(body);
+        } else if (result.status === 'unsupported') {
+          res.status(422).json({ error: 'unsupported', siteId: result.siteId, reason: result.reason });
+        } else {
+          failed('unrecognised catalog result');
+        }
+      } catch (error) {
+        failed(error);
+      }
+      return;
+    }
+    const listId = typeof req.query.list === 'string' ? req.query.list.trim() : '';
+    if (!listId) {
+      res.status(400).json({ error: "query parameter 'list' must name a declared rotating seed list" });
+      return;
+    }
+    try {
+      const result = await catalog.rotatingSeed(store, listId);
+      switch (result.status) {
+        case 'ok': {
+          const { status: _status, ...body } = result;
+          res.json(body);
+          return;
+        }
+        case 'unsupported':
+          res.status(422).json({ error: 'unsupported', siteId: result.siteId, reason: result.reason });
+          return;
+        case 'cooldown':
+          res.set('Retry-After', String(Math.ceil(result.remainingMs / 1000)));
+          res.status(503).json({ error: 'cooldown', siteId: result.siteId, host: result.host, remainingMs: result.remainingMs });
+          return;
+        case 'failed': {
+          const { status: _status, siteId, ...rest } = result;
+          res.status(502).json({ error: 'catalog failed', siteId, ...rest });
+          return;
+        }
+        default:
+          failed('unrecognised catalog result');
+      }
+    } catch (error) {
+      failed(error);
     }
   });
 

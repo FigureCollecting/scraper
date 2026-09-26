@@ -539,6 +539,27 @@ describe('ScrapeQueue — bounded working set', () => {
     expect(queue.isPending('a2')).toBe(true);
   });
 
+  it('a parked WARM item pages in and dispatches ahead of OLDER parked COLD items on the same host', () => {
+    process.env.SCRAPE_QUEUE_MAX_RESIDENT = '2';
+    const store = openStore(tmpDir());
+    queue = new ScrapeQueue(true);
+    queue.setQueueStore(store);
+    const at = (id: string) => `https://busy.test/item/${id}`;
+
+    // A company-list drain fills the working set (2 resident, 2 parked), then a frontier id arrives WARM.
+    for (const id of ['c0', 'c1', 'c2', 'c3']) queue.enqueue(id, { url: at(id), priority: 'COLD' });
+    queue.enqueue('w0', { url: at('w0') });
+    expect(store.counts().parked).toBe(3);
+
+    // ONE slot frees: it goes to the WARM row, not to the oldest parked COLD row.
+    queue.cancel('c0');
+    expect(queue.refillWorkingSet(Date.now())).toBe(1);
+    expect(queue.isPending('w0')).toBe(true);
+    expect(store.counts().parked).toBe(2);
+    const next = (queue as unknown as { getNextProcessableItem(now: number): { mfcId: string } | null }).getNextProcessableItem(Date.now());
+    expect(next?.mfcId).toBe('w0');
+  });
+
   it('dedupes against a PARKED item rather than queueing it twice', () => {
     process.env.SCRAPE_QUEUE_MAX_RESIDENT = '1';
     const store = openStore(tmpDir());

@@ -288,6 +288,19 @@ describe('queueStore — bounded working set (parked rows)', () => {
     expect(store.pageIn(2).map((i) => i.id)).toEqual(['p3']);
   });
 
+  it('pages in by PRIORITY first, then oldest-first: a newer WARM row never waits behind an older COLD one', () => {
+    const dir = tmpDir();
+    const store = open(dir);
+    store.put(ITEM({ id: 'c1', mfcId: 'c1', priority: 'COLD', enqueuedAt: 1_000, state: 'parked' }));
+    store.put(ITEM({ id: 'c2', mfcId: 'c2', priority: 'COLD', enqueuedAt: 2_000, state: 'parked' }));
+    store.put(ITEM({ id: 'w1', mfcId: 'w1', priority: 'WARM', enqueuedAt: 3_000, state: 'parked' }));
+    store.put(ITEM({ id: 'h1', mfcId: 'h1', priority: 'HOT', enqueuedAt: 4_000, state: 'parked' }));
+    store.put(ITEM({ id: 'w0', mfcId: 'w0', priority: 'WARM', enqueuedAt: 500, state: 'parked' }));
+
+    expect(store.pageIn(3).map((i) => i.id)).toEqual(['h1', 'w0', 'w1']);
+    expect(store.pageIn(3).map((i) => i.id)).toEqual(['c1', 'c2']);
+  });
+
   it('parked rows survive a restart and stay parked (they are not lost, just not resident)', () => {
     const dir = tmpDir();
     const first = open(dir);

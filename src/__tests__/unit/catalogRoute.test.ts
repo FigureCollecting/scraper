@@ -6,7 +6,15 @@
 import express from 'express';
 import request from 'supertest';
 import { createCatalogRoute } from '../../routes/catalog';
-import type { Catalog, CatalogResult, IdRangeResult, SeedListsResult, SeedResult } from '../../driver/assembleCatalog';
+import type {
+  Catalog,
+  CatalogResult,
+  IdRangeResult,
+  RotatingSeedListsResult,
+  RotatingSeedResult,
+  SeedListsResult,
+  SeedResult,
+} from '../../driver/assembleCatalog';
 
 const OK: CatalogResult = {
   status: 'ok',
@@ -17,6 +25,28 @@ const OK: CatalogResult = {
   collectUrls: ['https://www.orzgk.com/wp-json/wc/store/v1/products/68064530'],
   hasMore: true,
   nextPage: 2,
+  count: 1,
+};
+
+const ROTATING_LISTS_OK: RotatingSeedListsResult = {
+  status: 'ok',
+  siteId: 'mfc',
+  rotatingSeedLists: [
+    { id: 'company-7620-d9', url: 'https://myfigurecollection.net/?orEntries%5B%5D=7620&domainId=9', group: 'company-7620', order: 1 },
+    { id: 'company-7620-d1', url: 'https://myfigurecollection.net/?orEntries%5B%5D=7620&domainId=1', group: 'company-7620', order: 1 },
+  ],
+  count: 2,
+};
+
+const ROTATING_OK: RotatingSeedResult = {
+  status: 'ok',
+  siteId: 'mfc',
+  listId: 'company-7620-d9',
+  group: 'company-7620',
+  url: 'https://myfigurecollection.net/?orEntries%5B%5D=7620&domainId=9',
+  items: [{ itemId: '98665', collectUrl: 'https://myfigurecollection.net/item/98665' }],
+  collectUrls: ['https://myfigurecollection.net/item/98665'],
+  hasMore: false,
   count: 1,
 };
 
@@ -63,11 +93,15 @@ const mk = (
   range: IdRangeResult | (() => IdRangeResult) = RANGE_OK,
   seed: SeedResult | (() => Promise<SeedResult>) = SEED_OK,
   seedLists: SeedListsResult | (() => SeedListsResult) = SEEDS_OK,
+  rotatingLists: RotatingSeedListsResult | (() => RotatingSeedListsResult) = ROTATING_LISTS_OK,
+  rotating: RotatingSeedResult | (() => Promise<RotatingSeedResult>) = ROTATING_OK,
 ): Catalog => ({
   catalog: jest.fn(typeof result === 'function' ? result : async () => result),
   idRange: jest.fn(typeof range === 'function' ? range : () => range),
   seed: jest.fn(typeof seed === 'function' ? seed : async () => seed),
   seedLists: jest.fn(typeof seedLists === 'function' ? seedLists : () => seedLists),
+  rotatingSeedLists: jest.fn(typeof rotatingLists === 'function' ? rotatingLists : () => rotatingLists),
+  rotatingSeed: jest.fn(typeof rotating === 'function' ? rotating : async () => rotating),
 });
 
 describe('GET /catalog', () => {
@@ -355,5 +389,92 @@ describe('GET /catalog?seeds=1 (seed-list discovery)', () => {
     const odd = await request(appWith(mk(OK, RANGE_OK, SEED_OK, weird))).get('/catalog?store=orzgk&seeds=1');
     expect(odd.status).toBe(502);
     expect(odd.body.error).toBe('catalog failed');
+  });
+});
+
+describe('GET /catalog/rotating (rotating seed lists)', () => {
+  const at = (...args: Parameters<typeof mk>) => appWith(mk(...args));
+  const args = (lists: RotatingSeedListsResult | (() => RotatingSeedListsResult), one: RotatingSeedResult | (() => Promise<RotatingSeedResult>)) =>
+    [OK, RANGE_OK, SEED_OK, SEEDS_OK, lists, one] as Parameters<typeof mk>;
+
+  it('200 discovery: the declared rotating lists minus `status`, and nothing on the seed or listing axes', async () => {
+    const catalog = mk();
+    const res = await request(appWith(catalog)).get('/catalog/rotating?store=%20mfc%20');
+    expect(res.status).toBe(200);
+    const { status: _s, ...body } = ROTATING_LISTS_OK;
+    expect(res.body).toEqual(body);
+    expect(catalog.rotatingSeedLists).toHaveBeenCalledWith('mfc');
+    expect(catalog.seedLists).not.toHaveBeenCalled();
+    expect(catalog.catalog).not.toHaveBeenCalled();
+  });
+
+  it('200 fetch: `list` names ONE rotating list, trimmed, and the ok result comes back minus `status`', async () => {
+    const catalog = mk();
+    const res = await request(appWith(catalog)).get('/catalog/rotating?store=mfc&list=%20company-7620-d9%20');
+    expect(res.status).toBe(200);
+    const { status: _s, ...body } = ROTATING_OK;
+    expect(res.body).toEqual(body);
+    expect(catalog.rotatingSeed).toHaveBeenCalledWith('mfc', 'company-7620-d9');
+    expect(catalog.seed).not.toHaveBeenCalled();
+  });
+
+  it('400 when store is missing, or `list` is present but blank', async () => {
+    const catalog = mk();
+    expect((await request(appWith(catalog)).get('/catalog/rotating')).status).toBe(400);
+    const blank = await request(appWith(catalog)).get('/catalog/rotating?store=mfc&list=%20');
+    expect(blank.status).toBe(400);
+    expect(blank.body.error).toContain('list');
+    // Two `list` values are no single list: refused, not guessed.
+    expect((await request(appWith(catalog)).get('/catalog/rotating?store=mfc&list=a&list=b')).status).toBe(400);
+    expect(catalog.rotatingSeed).not.toHaveBeenCalled();
+    expect(catalog.rotatingSeedLists).not.toHaveBeenCalled();
+  });
+
+  it('422 unsupported, for discovery and for a fetch', async () => {
+    const unsup = { status: 'unsupported', siteId: 'mfc', reason: 'store declares no rotating seed lists' } as const;
+    const d = await request(at(...args(unsup, unsup))).get('/catalog/rotating?store=mfc');
+    expect(d.status).toBe(422);
+    expect(d.body).toEqual({ error: 'unsupported', siteId: 'mfc', reason: 'store declares no rotating seed lists' });
+    const f = await request(at(...args(ROTATING_LISTS_OK, unsup))).get('/catalog/rotating?store=mfc&list=x');
+    expect(f.status).toBe(422);
+  });
+
+  it('503 cooldown + Retry-After for a fetch', async () => {
+    const res = await request(at(...args(ROTATING_LISTS_OK, { status: 'cooldown', siteId: 'mfc', host: 'myfigurecollection.net', remainingMs: 1500 }))).get(
+      '/catalog/rotating?store=mfc&list=company-7620-d9',
+    );
+    expect(res.status).toBe(503);
+    expect(res.headers['retry-after']).toBe('2');
+    expect(res.body).toEqual({ error: 'cooldown', siteId: 'mfc', host: 'myfigurecollection.net', remainingMs: 1500 });
+  });
+
+  it('502 failed carries the failure class and the blocking flag for the poller', async () => {
+    const det = await request(
+      at(...args(ROTATING_LISTS_OK, { status: 'failed', siteId: 'mfc', reason: 'challenge page', failure: 'deterministic', blocked: true })),
+    ).get('/catalog/rotating?store=mfc&list=company-7620-d9');
+    expect(det.status).toBe(502);
+    expect(det.body).toEqual({ error: 'catalog failed', siteId: 'mfc', reason: 'challenge page', failure: 'deterministic', blocked: true });
+    const tr = await request(at(...args(ROTATING_LISTS_OK, { status: 'failed', siteId: 'mfc', reason: 'socket hang up', failure: 'transient' }))).get(
+      '/catalog/rotating?store=mfc&list=company-7620-d9',
+    );
+    expect(tr.body).toEqual({ error: 'catalog failed', siteId: 'mfc', reason: 'socket hang up', failure: 'transient' });
+  });
+
+  it('502 (never 500) when either call throws, or answers an unrecognised status', async () => {
+    const boom = () => {
+      throw new Error('boom');
+    };
+    const d = await request(at(...args(boom as never, ROTATING_OK))).get('/catalog/rotating?store=mfc');
+    expect(d.status).toBe(502);
+    expect(d.body).toEqual({ error: 'catalog failed', siteId: 'mfc', reason: 'boom' });
+    const f = await request(at(...args(ROTATING_LISTS_OK, (async () => boom()) as never))).get('/catalog/rotating?store=mfc&list=x');
+    expect(f.status).toBe(502);
+    const weird = { status: 'weird', siteId: 'mfc' } as unknown as RotatingSeedResult;
+    const w1 = await request(at(...args(weird as unknown as RotatingSeedListsResult, weird))).get('/catalog/rotating?store=mfc');
+    expect(w1.status).toBe(502);
+    const w2 = await request(at(...args(ROTATING_LISTS_OK, weird))).get('/catalog/rotating?store=mfc&list=x');
+    expect(w2.status).toBe(502);
+    const nonError = await request(at(...args((() => { throw 'str'; }) as never, ROTATING_OK))).get('/catalog/rotating?store=mfc');
+    expect(nonError.body.reason).toBe('str');
   });
 });

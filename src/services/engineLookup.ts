@@ -10,13 +10,13 @@
  * `browser` transport is wired at the mount from the ScrapingService; unset here → it degrades to http.
  */
 import { buildProfileRegistry } from '../driver/profileRegistry.js';
-import { assembleLookup, type Lookup, type LookupServices } from '../driver/assembleLookup.js';
-import { assembleCatalog, type Catalog } from '../driver/assembleCatalog.js';
+import { assembleLookup, type Lookup } from '../driver/assembleLookup.js';
+import { assembleCatalog, type Catalog, type CatalogServices } from '../driver/assembleCatalog.js';
 import { makeFetchSearch, type FetchSearchTransports } from './fetchSearch.js';
-import { impitFetchBody } from './impitFetch.js';
+import { impitFetchBody, impitFetchBodyDetailed } from './impitFetch.js';
 import { getCfCookieStore, type CfCookieSource } from './cookieJar.js';
 import { createFailureReporterFromEnv } from './failureReporter.js';
-import type { FetchBodyDetail, FetchRequest } from './engineServices/capturingFetch.js';
+import type { FetchBodyDetail, FetchBodyOutcome, FetchRequest } from './engineServices/capturingFetch.js';
 import type { ExtractionRuleset, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
 
 /** The slice of the engine ExtractionRegistry the lookup needs. */
@@ -152,7 +152,7 @@ export function createEngineCatalog(
 }
 
 /** The engine wiring both runtimes share: registry → ProfileRegistry, ruleset lookup, 3-way search fetch. */
-function wireServices(registry: LookupRegistry, transports: Partial<FetchSearchTransports>): LookupServices {
+function wireServices(registry: LookupRegistry, transports: Partial<FetchSearchTransports>): CatalogServices {
   const profiles = buildProfileRegistry(registry.allStores());
   const fetchSearch = makeFetchSearch({
     http: transports.http ?? httpFetchBody,
@@ -166,6 +166,12 @@ function wireServices(registry: LookupRegistry, transports: Partial<FetchSearchT
     profiles,
     getRulesetForUrl: (url) => registry.getRulesetForUrl(url),
     fetchSearch,
+    // The same lanes and sessions, answering the store's status too (read by the rotating axis only).
+    fetchSearchDetail: makeFetchSearch<FetchBodyOutcome>({
+      http: transports.http ?? httpFetchBodyDetailed,
+      impersonate: transports.impersonate ?? impitFetchBodyDetailed,
+      browser: transports.browser,
+    }),
     ...(reporter ? { reportFailure: (report) => reporter.report(report) } : {}),
   };
 }

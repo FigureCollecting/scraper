@@ -175,6 +175,40 @@ describe('POST /ingest/scrape', () => {
     });
   });
 
+  describe('priority', () => {
+    beforeEach(() => {
+      queue = new ScrapeQueue(true);
+      queue.setPluginRegistry(makeRegistry(makeRuleset()));
+      queue.setIngestEmitter({ send: jest.fn().mockResolvedValue(okWriteStats()) });
+    });
+
+    it('returns 400 for a priority other than WARM or COLD — HOT is reserved for cookie-bearing imports', async () => {
+      for (const priority of ['HOT', 'cold', '', 1, null, ['COLD']]) {
+        const response = await request(makeApp(queue)).post('/ingest/scrape').send({ url: FIXTURE_URL, priority }).expect(400);
+        expect(response.body).toEqual({ success: false, message: "priority must be 'WARM' or 'COLD' when present" });
+      }
+      expect(queue.getStats().total).toBe(0);
+    });
+
+    it('a COLD trigger lands in the COLD tier, and an explicit WARM in the WARM tier', async () => {
+      const enqueueSpy = jest.spyOn(queue, 'enqueue');
+      await request(makeApp(queue)).post('/ingest/scrape').send({ url: FIXTURE_URL, priority: 'COLD' }).expect(202);
+      expect(enqueueSpy).toHaveBeenLastCalledWith(FIXTURE_URL, { url: FIXTURE_URL, priority: 'COLD' });
+      const other = 'https://figures.example.test/item/778';
+      await request(makeApp(queue)).post('/ingest/scrape').send({ url: other, priority: 'WARM' }).expect(202);
+      expect(enqueueSpy).toHaveBeenLastCalledWith(other, { url: other, priority: 'WARM' });
+      expect(queue.getStats()).toMatchObject({ warm: 1, cold: 1 });
+    });
+
+    it('a WARM trigger for a url already pending COLD lifts it to WARM (a tap id never waits behind its list copy)', async () => {
+      const app = makeApp(queue);
+      await request(app).post('/ingest/scrape').send({ url: FIXTURE_URL, priority: 'COLD' }).expect(202);
+      const again = await request(app).post('/ingest/scrape').send({ url: FIXTURE_URL }).expect(202);
+      expect(again.body.deduplicated).toBe(true);
+      expect(queue.getStats()).toMatchObject({ warm: 1, cold: 0 });
+    });
+  });
+
   describe('configuration and ruleset checks', () => {
     it('returns 503 when no ingest emitter is configured (INGEST_BASE_URL unset)', async () => {
       queue = new ScrapeQueue(true);

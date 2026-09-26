@@ -83,6 +83,36 @@ describe('createEngineLookup', () => {
   });
 });
 
+describe('createEngineCatalog — rotating seed lists read the store status', () => {
+  const ROT_STORE: StoreCapabilities = {
+    ...STORE,
+    retrieval: {
+      byId: { urlTemplate: 'https://www.goodsmileus.com/item/{id}' },
+      rotatingSeedLists: [{ id: 'maker-1-d9', url: 'https://www.goodsmileus.com/search?maker=1', group: 'maker-1', order: 1 }],
+    },
+  };
+  const ROT_RULESET: ExtractionRuleset = { ...RULESET, extractSeedList: () => ({ items: [{ itemId: '7' }] }) };
+  const registry: LookupRegistry = { allStores: () => [ROT_STORE], getRulesetForUrl: () => ROT_RULESET };
+
+  it('on the default http lane a store 404 is reported as deterministic, never parsed as a page', async () => {
+    const orig = global.fetch;
+    global.fetch = jest.fn(async () => ({ status: 404, text: async () => '<html>not found</html>' })) as unknown as typeof fetch;
+    try {
+      const out = await createEngineCatalog(registry).rotatingSeed('goodsmileus', 'maker-1-d9');
+      expect(out).toEqual({ status: 'failed', siteId: 'goodsmileus', reason: 'store answered 404', failure: 'deterministic', upstreamStatus: 404 });
+    } finally {
+      global.fetch = orig;
+    }
+  });
+
+  it('an injected transport serves the rotating fetch too (bare body, no status to read)', async () => {
+    const http = jest.fn(async () => '<html>list</html>');
+    const out = await createEngineCatalog(registry, { http }).rotatingSeed('goodsmileus', 'maker-1-d9');
+    expect(http).toHaveBeenCalledWith('https://www.goodsmileus.com/search?maker=1');
+    expect(out).toMatchObject({ status: 'ok', group: 'maker-1', collectUrls: ['https://www.goodsmileus.com/item/7'] });
+  });
+});
+
 describe('createEngineCatalog', () => {
   const LISTING_STORE: StoreCapabilities = {
     ...STORE,
