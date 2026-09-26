@@ -14,7 +14,7 @@ Additive, backward-compatible: a ruleset that declares nothing behaves exactly a
   rotation (every list of the group in that pass; groups by ascending `order`), parsed by
   `extractSeedList(body, listId)`. A separate field from `seedLists`, so an engine that predates it
   never polls these pages and the exclusive seed pass never lists them. Ids share one namespace with
-  `seedLists`.
+  `seedLists`. An `id` or `group` outside `[A-Za-z0-9._-]`, or equal to `__proto__`, is dropped.
 
 ## [0.15.0] - 2026-09-26
 

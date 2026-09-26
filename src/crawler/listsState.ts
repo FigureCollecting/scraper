@@ -11,7 +11,8 @@ export const LISTS_STATE_VERSION = 1 as const;
 
 /**
  * Slot spent: `ok` every list answered, `partial` some did, `failed` none did. Slot open: `transient`
- * (retried next pass), `blocked` (the store refused us; lists paused), `interrupted` (cooldown or budget).
+ * (retried next pass), `blocked` (the store refused us; lists paused), `interrupted` (cooldown or budget);
+ * `transient` and `blocked` also spend the slot once their ceiling is reached (`lastAttemptAt` stamped).
  */
 export type ListsGroupOutcome = 'ok' | 'partial' | 'failed' | 'transient' | 'blocked' | 'interrupted';
 
@@ -23,7 +24,7 @@ export interface ListsGroupState {
   outcome: ListsGroupOutcome;
   /** The most recent failure's reason; cleared when a spent attempt had no failed list. */
   reason?: string;
-  /** Ids the attempt's lists offered (the union within a pass, summed across the attempt's passes). */
+  /** Distinct ids the attempt's lists offered: an id on two lists counts once, across passes too. */
   seen: number;
   /** Of those, the ids neither the ledger nor the backlog already held — what was queued for the drain. */
   new: number;
@@ -33,8 +34,12 @@ export interface ListsGroupState {
   strikes: number;
   /** Transient passes charged to the open attempt; the slot is spent when these reach the retry ceiling. */
   retries: number;
+  /** Consecutive blocked passes; the slot is spent as `blocked` when these reach the strike ceiling. */
+  blockedStrikes?: number;
   /** The OPEN attempt's lists that already answered — never asked again before the slot is spent. */
   answered?: Record<string, 'ok' | 'failed'>;
+  /** The OPEN attempt's distinct ids so far, so a later pass does not count them in `seen` again. */
+  seenIds?: string[];
 }
 
 export interface ListsPendingEntry {
@@ -48,7 +53,7 @@ export interface ListsState {
   siteId: string;
   groups: Record<string, ListsGroupState>;
   pending: ListsPendingEntry[];
-  /** After a blocked answer no list is fetched before this instant (the backlog still drains). */
+  /** After a blocked answer, the end of that pass's window: no list is fetched before it (the backlog still drains). */
   pausedUntil?: string;
   updatedAt?: string;
 }
@@ -75,7 +80,9 @@ const isGroupState = (v: unknown): boolean =>
   OUTCOMES.has(v.outcome) &&
   (v.reason === undefined || typeof v.reason === 'string') &&
   [v.seen, v.new, v.enqueued, v.strikes, v.retries].every(isCount) &&
-  (v.answered === undefined || (isPlainObject(v.answered) && Object.values(v.answered).every((a) => a === 'ok' || a === 'failed')));
+  (v.blockedStrikes === undefined || isCount(v.blockedStrikes)) &&
+  (v.answered === undefined || (isPlainObject(v.answered) && Object.values(v.answered).every((a) => a === 'ok' || a === 'failed'))) &&
+  (v.seenIds === undefined || (Array.isArray(v.seenIds) && v.seenIds.every(isNonEmpty)));
 
 const isPendingEntry = (v: unknown): boolean =>
   isPlainObject(v) && isNonEmpty(v.itemId) && isNonEmpty(v.collectUrl) && typeof v.group === 'string';

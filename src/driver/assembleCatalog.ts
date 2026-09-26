@@ -169,10 +169,13 @@ function declaredSeedLists(retrieval: RetrievalCapability | undefined): SeedList
   return out;
 }
 
+/** A rotating list id or group name: it becomes a key in the crawler's state and a url parameter. */
+const isSafeRotatingName = (v: unknown): v is string => typeof v === 'string' && /^[A-Za-z0-9._-]+$/.test(v) && v !== '__proto__';
+
 /**
  * The store's WELL-FORMED rotating seed lists, in declared order. Untrusted like `seedLists`: an
- * entry without a usable id, url, group or finite numeric order is dropped, a repeated id keeps its
- * first entry, and an id a seed list already uses is dropped (the two fields share one namespace).
+ * entry without a safe id or group, a url or a finite numeric order is dropped, a repeated id keeps
+ * its first entry, and an id a seed list already uses is dropped (the two fields share one namespace).
  */
 function declaredRotatingSeedLists(retrieval: RetrievalCapability | undefined): RotatingSeedList[] {
   const raw: unknown = retrieval?.rotatingSeedLists;
@@ -182,9 +185,8 @@ function declaredRotatingSeedLists(retrieval: RetrievalCapability | undefined): 
   for (const entry of raw) {
     if (!entry || typeof entry !== 'object') continue;
     const { id, url, group, order } = entry as Partial<RotatingSeedList>;
-    if (typeof id !== 'string' || id.length === 0) continue;
+    if (!isSafeRotatingName(id) || !isSafeRotatingName(group)) continue;
     if (typeof url !== 'string' || url.length === 0) continue;
-    if (typeof group !== 'string' || group.length === 0) continue;
     if (typeof order !== 'number' || !Number.isFinite(order)) continue;
     if (seen.has(id)) continue;
     seen.add(id);

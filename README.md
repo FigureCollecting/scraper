@@ -369,7 +369,8 @@ that predates them answers 404 instead of serving a listing page. `?seeds=1` nev
 **Query:** `store=<siteId>` (required); `list=<listId>` (optional — absent = discovery).
 
 **Discovery (200):** `{ siteId, rotatingSeedLists: [{ id, url, group, order }], count }`, declared
-order, nothing fetched. **Fetch (200):** the `?seed=` body plus `group`. **Errors:** `400` bad
+order, nothing fetched; an entry whose `id` or `group` is outside `[A-Za-z0-9._-]` or is `__proto__` is
+dropped. **Fetch (200):** the `?seed=` body plus `group`. **Errors:** `400` bad
 input · `422` unsupported · `503` cooldown + `Retry-After` · `502 { error, siteId, reason, failure,
 blocked?, upstreamStatus? }` — `failure` is `deterministic` (parser throw, store 4xx, challenge) or
 `transient` (store 5xx, network, timeout); `blocked: true` for a challenge, 401, 403 or 429.
@@ -857,6 +858,7 @@ a stop in one lane (cooldown, challenge, sick scraper) stops every lane below it
   (discovery, no store request), then ONE due group (never attempted, or last attempted at least
   `CRAWLER_LISTS_INTERVAL_H` ago): the one attempted longest ago, a never-attempted one first, `order`
   breaking ties. So with fewer slots per interval than groups the cycle stretches; no group starves.
+  For mfc (54 companies, 7 in-window passes a night) a full cycle takes about 7.7 days; accepted as is.
   Every list of the group via `GET /catalog/rotating?store=&list=`, `CRAWLER_LISTS_SPACING_MS` apart.
   The seed pass (`?seeds=1`, `CRAWLER_MODE=seed`) never lists them.
 - **Dedupe** — the group's ids are unioned; ids the ledger knows, and ids already in the backlog
@@ -864,19 +866,22 @@ a stop in one lane (cooldown, challenge, sick scraper) stops every lane below it
 - **Drain** — up to `CRAWLER_LISTS_DRAIN_CAPS` backlog ids per pass, oldest first, POSTed with
   `priority: "COLD"`. For a store with the step on, the older gaps and the descent post COLD too; the
   tap, the recent gaps and re-observation post WARM. WARM dispatches before COLD and COLD is FIFO, so
-  dispatch follows the lane order within a pass (across passes, an earlier pass's descent id still goes
-  before a later pass's list id). Parked rows page in by priority, then age: a WARM id waits for at
-  most one freed slot when the host's resident set is all COLD.
+  dispatch follows the lane order within a pass. Parked rows page in by priority, then age: a WARM id
+  waits for at most one freed slot when the host's resident set is all COLD. Accepted as is:
+  - across passes, an earlier pass's descent id dispatches before a later pass's list id (both COLD, FIFO);
+  - re-observation stays WARM, so a re-observed id dispatches ahead of the company lists.
 - **Failures** — an open attempt never re-asks a list that already answered. A deterministic failure
   (parser throw, store 4xx) spends the group's slot once every list has answered; a transient one
   (store 5xx, network, timeout) retries next pass, at most 3 times before the slot is spent. A BLOCKED
-  answer (challenge, 401, 403, 429) is the store refusing us, not the list: it spends no slot, records a
-  strike, stops the store for the pass and pauses list fetching for 24 h (`pausedUntil`; delete it from
-  the state file to resume early). The backlog keeps draining while paused. A cooling host or a spent
-  budget costs no slot.
+  answer (challenge, 401, 403, 429) is the store refusing us: it records a strike, stops the store for
+  the pass and pauses list fetching until the end of that night's window (`pausedUntil`; delete it from
+  the state file to resume early), so one refusal costs one night. The slot is spent (outcome `blocked`)
+  only after 3 blocked passes running on the same group, so one refused list cannot freeze the rotation.
+  The backlog keeps draining while paused. A cooling host or a spent budget costs no slot.
 - **State** — `<CRAWLER_LEDGER_DIR>/<siteId>.lists.json`: per group `lastAttemptAt` (the slot),
-  `lastTriedAt`, `outcome`, `reason`, `seen`, `new`, `enqueued`, `strikes`, `retries` and `answered` (the
-  open attempt's lists); plus the backlog and `pausedUntil`. Its own file: the ledger loader drops
+  `lastTriedAt`, `outcome`, `reason`, `seen` (distinct ids, an id on both lists once), `new`,
+  `enqueued`, `strikes`, `retries`, `blockedStrikes`, and for the open attempt `answered` (its lists)
+  and `seenIds`; plus the backlog and `pausedUntil`. Its own file: the ledger loader drops
   sections it does not know, so an older engine would erase it, and the weekly seed Job also writes the
   ledger. An unparseable timestamp makes the file corrupt: refused, never overwritten.
 - **Reporting** — `listsGroup`, `listsOutcome` (`ok`, `partial`, `failed`, `transient`, `blocked`,

@@ -299,11 +299,11 @@ export interface RetrievalCapability {
  * the engine's rotation decides when a group is due.
  */
 export interface RotatingSeedList {
-  /** Stable, store-unique name for this list (unique across `seedLists` too). */
+  /** Stable, store-unique name for this list (unique across `seedLists` too); `[A-Za-z0-9._-]`, not `__proto__`. */
   id: string;
   /** The exact page to fetch. Fully resolved: no placeholder, no paging. */
   url: string;
-  /** The rotation unit: every list sharing a group is fetched in the same pass. */
+  /** The rotation unit: every list sharing a group is fetched in the same pass. Same charset as `id`. */
   group: string;
   /** The group's place in the rotation, lowest first. Lists of one group should declare the same value. */
   order: number;

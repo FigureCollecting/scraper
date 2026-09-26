@@ -1794,10 +1794,17 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     return w.startMin < w.endMin ? m >= w.startMin && m < w.endMin : m >= w.startMin || m < w.endMin;
   };
 
+  /** The instant the window holding `atMs` closes: a blocked answer pauses the lists for the rest of tonight only. */
+  const windowEndMs = (w: { startMin: number; endMin: number }, atMs: number): number => {
+    const midnight = atMs - (((atMs % 86_400_000) + 86_400_000) % 86_400_000);
+    const end = midnight + w.endMin * 60_000;
+    return w.startMin > w.endMin && atMs - midnight >= w.startMin * 60_000 ? end + 86_400_000 : end;
+  };
+
   /** A transient failure is retried on the next pass, at most this many times before the slot is spent. */
   const MAX_LIST_RETRIES = 3;
-  /** A blocked answer pauses list fetching one full day: a refusal costs one request per window, no slot. */
-  const BLOCKED_PAUSE_MS = 24 * 60 * 60 * 1000;
+  /** Consecutive blocked passes before a group's slot is spent, so one refused list cannot freeze the rotation. */
+  const BLOCKED_STRIKES_TO_SPEND = 3;
 
   /**
    * ROTATE: fetch at most ONE due group and queue its new ids. Returns why no group was fetched, or
@@ -1806,7 +1813,8 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
   const rotate = async (st: StoreState, state: ListsState): Promise<ListsSkipReason | null> => {
     const window = config.listsWindow ?? null;
     if (!window) return 'window-off';
-    if (!inWindow(window, now())) return 'outside-window';
+    const passAt = now();
+    if (!inWindow(window, passAt)) return 'outside-window';
     if (state.pausedUntil !== undefined) {
       if (ageMs(state.pausedUntil) < 0) return 'paused';
       delete state.pausedUntil;
@@ -1852,13 +1860,16 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     // Least recently attempted first (never = first; `order`, then declaration, break ties): with fewer
     // slots per interval than groups the cycle stretches instead of starving the tail.
     const interval = config.listsIntervalMs ?? 160 * 60 * 60 * 1000;
+    // Own keys only: a group named like an Object.prototype member must not read the builtin.
+    const groupState = (name: string): ListsGroupState | undefined =>
+      Object.hasOwn(state.groups, name) ? state.groups[name] : undefined;
     const lastMs = (name: string): number => {
-      const at = state.groups[name]?.lastAttemptAt;
+      const at = groupState(name)?.lastAttemptAt;
       return at === undefined ? Number.NEGATIVE_INFINITY : Date.parse(at);
     };
     const due = [...groups.entries()]
       .filter(([name]) => {
-        const at = state.groups[name]?.lastAttemptAt;
+        const at = groupState(name)?.lastAttemptAt;
         return at === undefined || ageMs(at) >= interval;
       })
       .sort(([na, a], [nb, b]) => lastMs(na) - lastMs(nb) || a.order - b.order || a.index - b.index)[0];
@@ -1867,11 +1878,10 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     st.summary.listsGroup = group;
 
     // An open attempt resumes where it stopped: a list that already answered is not asked again.
-    const prior = state.groups[group];
+    const prior = groupState(group);
     const answered: Record<string, 'ok' | 'failed'> = {};
     for (const id of lists) {
-      const a = prior?.answered?.[id];
-      if (a) answered[id] = a;
+      if (prior?.answered && Object.hasOwn(prior.answered, id)) answered[id] = prior.answered[id];
     }
     const at = iso();
     const union = new Map<string, CatalogItem>();
@@ -1879,7 +1889,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     let failed = 0;
     let reason: string | undefined;
     let stop: 'transient' | 'blocked' | 'cooldown' | 'budget' | undefined;
-    for (const [i, listId] of lists.filter((id) => answered[id] === undefined).entries()) {
+    for (const [i, listId] of lists.filter((id) => !Object.hasOwn(answered, id)).entries()) {
       if (i > 0) await sleep(config.listsSpacingMs ?? 10_000);
       const out = await fetchRotatingList(st, listId);
       if (out.kind === 'budget' || out.kind === 'cooldown') {
@@ -1921,28 +1931,43 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     if (interrupted && fetched + failed === 0) return interrupted;
 
     const g: ListsGroupState = prior ?? { lastTriedAt: at, outcome: 'ok', seen: 0, new: 0, enqueued: 0, strikes: 0, retries: 0 };
-    if (g.answered === undefined) {
+    const opening = g.answered === undefined;
+    if (opening) {
       // A new attempt opens: its counters start from zero.
       g.seen = 0;
       g.new = 0;
       g.enqueued = 0;
     }
+    // `seen` counts each id once per attempt, even when its lists answer on different passes.
+    const attemptIds = new Set(opening ? [] : (g.seenIds ?? []));
+    for (const id of union.keys()) {
+      if (attemptIds.has(id)) continue;
+      attemptIds.add(id);
+      g.seen++;
+    }
+    g.seenIds = [...attemptIds];
     g.answered = answered;
     g.lastTriedAt = at;
-    g.seen += union.size;
     g.new += fresh;
     if (reason !== undefined) g.reason = reason;
     const spend = (outcome: ListsGroupOutcome): void => {
       g.outcome = outcome;
       g.lastAttemptAt = at;
       g.retries = 0;
+      delete g.blockedStrikes;
       delete g.answered;
+      delete g.seenIds;
     };
+    // Any answer other than a refusal breaks the group's blocked streak.
+    if (stop !== 'blocked') delete g.blockedStrikes;
     if (stop === 'blocked') {
-      // The store refused US, not this list: no slot is spent, and no list is asked for a day.
+      // The store refused US, not this list: no list is asked for the rest of tonight, and the slot
+      // is spent only after BLOCKED_STRIKES_TO_SPEND refusals running, so the rotation moves on.
       g.outcome = 'blocked';
       g.strikes++;
-      state.pausedUntil = new Date(now() + BLOCKED_PAUSE_MS).toISOString();
+      g.blockedStrikes = (g.blockedStrikes ?? 0) + 1;
+      state.pausedUntil = new Date(windowEndMs(window, passAt)).toISOString();
+      if (g.blockedStrikes >= BLOCKED_STRIKES_TO_SPEND) spend('blocked');
     } else if (stop === 'transient') {
       g.outcome = 'transient';
       g.strikes++;
@@ -2022,7 +2047,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
         { budget, priority: 'COLD' },
       );
       for (const p of slice.slice(0, handled)) {
-        const g = state.groups[p.group];
+        const g = Object.hasOwn(state.groups, p.group) ? state.groups[p.group] : undefined;
         if (g && ledger.enqueued[p.itemId]) g.enqueued++;
       }
       state.pending.splice(0, handled);

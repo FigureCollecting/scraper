@@ -506,23 +506,24 @@ describe('lists step — failures', () => {
     expect(s.listsGroup).toBe('c2');
   });
 
-  it('a retry that completes the group books the whole attempt: both passes counted, the slot spent once', async () => {
+  it('a retry that completes the group books the whole attempt: both passes counted, an id on both lists once, the slot spent once', async () => {
     const lists = createMemoryListsStateStore();
     const c = clock();
     const first = makeFake({ list: (id) => (id === 'c1-d1' ? listFail('transient', 'store answered 503', { upstreamStatus: 503 }) : listOk(DEFAULT_LISTS[id])) });
     await run(mkCfg(), first, { lists }, c);
+    expect(lists.files.get('mfc')!.groups.c1).toMatchObject({ seen: 3, seenIds: ['101', '102', '103'] });
     c.advance(HOUR_MS);
     const retryAt = c.now();
     const second = makeFake();
     const { s } = await run(mkCfg(), second, { lists }, c);
     expect(second.listGets()).toEqual(['c1-d1']);
-    // 102 is already in the backlog from c1-d9; 104 is new.
+    // 102 is already in the backlog from c1-d9 (and already seen by this attempt); 104 is new.
     expect(s).toMatchObject({ listsGroup: 'c1', listsOutcome: 'ok', listsFetched: 1, listsIdsSeen: 2, listsIdsNew: 1 });
     expect(lists.files.get('mfc')!.groups.c1).toEqual({
       lastAttemptAt: iso(retryAt),
       lastTriedAt: iso(retryAt),
       outcome: 'ok',
-      seen: 5,
+      seen: 4,
       new: 4,
       enqueued: 4,
       strikes: 0,
@@ -571,7 +572,7 @@ describe('lists step — failures', () => {
     expect(lists.files.get('mfc')!.groups.c1).toMatchObject({ outcome: 'ok', lastAttemptAt: iso(T0), strikes: 0 });
   });
 
-  it('a BLOCKED answer (challenge, 401, 403, 429) spends NO slot: a strike, the store stops, and list fetching pauses 24 h', async () => {
+  it('a BLOCKED answer (challenge, 401, 403, 429) spends NO slot: a strike, the store stops, and list fetching pauses for the rest of the window', async () => {
     const blocked: [Reply, string][] = [
       [listFail('deterministic', 'challenge page', { blocked: true }), 'challenge'],
       [listFail('deterministic', 'store answered 401', { upstreamStatus: 401, blocked: true }), 'other'],
@@ -589,9 +590,9 @@ describe('lists step — failures', () => {
       expect(fake.posts()).toEqual([]);
       expect(s).toMatchObject({ listsGroup: 'c1', listsOutcome: 'blocked', listsSkipped: null, rangeSkipped: 'store-stopped' });
       const state = lists.files.get('mfc')!;
-      expect(state.groups.c1).toMatchObject({ outcome: 'blocked', strikes: 1, retries: 0, answered: {} });
+      expect(state.groups.c1).toMatchObject({ outcome: 'blocked', strikes: 1, blockedStrikes: 1, retries: 0, answered: {} });
       expect(state.groups.c1.lastAttemptAt).toBeUndefined();
-      expect(state.pausedUntil).toBe(iso(T0 + 24 * HOUR_MS));
+      expect(state.pausedUntil).toBe('2026-09-26T22:30:00.000Z');
       expect(reports[0].reasonClass).toBe(reasonClass);
 
       // Paused: no discovery, no list — but the backlog still drains (item pages, not the lists).
@@ -602,14 +603,16 @@ describe('lists step — failures', () => {
       expect(paused.posts()[0]).toEqual({ id: '9', priority: 'COLD' });
       expect(p.s).toMatchObject({ listsSkipped: 'paused', listsGroup: null, listsEnqueued: 1 });
 
-      // 24 h after the block the SAME group is asked again, and the pause is cleared.
-      c.advance(23 * HOUR_MS);
+      // The next night's first pass asks the SAME group again, and the pause is cleared.
+      const nextNight = Date.parse('2026-09-27T15:30:00.000Z');
+      c.advance(nextNight - c.now());
       const again = makeFake();
       const a = await run(mkCfg(), again, { lists, ledgers }, c);
       expect(again.listGets()).toEqual(['c1-d9', 'c1-d1']);
       expect(a.s).toMatchObject({ listsGroup: 'c1', listsOutcome: 'ok' });
       expect(lists.files.get('mfc')!.pausedUntil).toBeUndefined();
-      expect(lists.files.get('mfc')!.groups.c1).toMatchObject({ strikes: 0, lastAttemptAt: iso(T0 + 24 * HOUR_MS) });
+      expect(lists.files.get('mfc')!.groups.c1).toMatchObject({ strikes: 0, lastAttemptAt: iso(nextNight) });
+      expect(lists.files.get('mfc')!.groups.c1.blockedStrikes).toBeUndefined();
     }
   });
 
@@ -627,6 +630,97 @@ describe('lists step — failures', () => {
     expect(gets).toBe(1);
     expect(skipped).toEqual([null, 'paused', 'paused', 'paused', 'paused', 'paused', 'paused']);
     expect(Object.values(lists.files.get('mfc')!.groups).filter((g) => g.lastAttemptAt !== undefined)).toEqual([]);
+  });
+
+  it('a block on the last pass pauses to the END of tonight: paused at pausedUntil - 1 ms, and the next night fetches', async () => {
+    const lists = createMemoryListsStateStore();
+    const ledgers = createMemoryLedgerStore({ mfc: ledger() });
+    const refused = makeFake({ list: () => listFail('deterministic', 'store answered 403', { upstreamStatus: 403, blocked: true }) });
+    await run(mkCfg(), refused, { lists, ledgers }, clock(Date.parse('2026-10-01T21:30:00.000Z')));
+    expect(lists.files.get('mfc')!.pausedUntil).toBe('2026-10-01T22:30:00.000Z');
+
+    const edge = makeFake();
+    const e = await run(mkCfg(), edge, { lists, ledgers }, clock(Date.parse('2026-10-01T22:29:59.999Z')));
+    expect(e.s.listsSkipped).toBe('paused');
+    expect(edge.discoveryGets()).toBe(0);
+    expect(edge.listGets()).toEqual([]);
+
+    const nextNight = makeFake();
+    const n = await run(mkCfg(), nextNight, { lists, ledgers }, clock(Date.parse('2026-10-02T15:30:00.000Z')));
+    expect(nextNight.listGets()).toEqual(['c1-d9', 'c1-d1']);
+    expect(n.s).toMatchObject({ listsGroup: 'c1', listsOutcome: 'ok', listsSkipped: null });
+  });
+
+  it('a pause holds until exactly pausedUntil: 1 ms before it no list is asked, at it the rotation resumes', async () => {
+    const seeded = () => createMemoryListsStateStore({ mfc: { ...createEmptyListsState('mfc'), pausedUntil: '2026-10-01T18:00:00.000Z' } });
+    const before = makeFake();
+    const b = await run(mkCfg(), before, { lists: seeded() }, clock(Date.parse('2026-10-01T17:59:59.999Z')));
+    expect(b.s.listsSkipped).toBe('paused');
+    expect(before.listGets()).toEqual([]);
+    const at = makeFake();
+    const a = await run(mkCfg(), at, { lists: seeded() }, clock(Date.parse('2026-10-01T18:00:00.000Z')));
+    expect(at.listGets()).toEqual(['c1-d9', 'c1-d1']);
+    expect(a.lists.files.get('mfc')!.pausedUntil).toBeUndefined();
+  });
+
+  it('a window wrapping midnight pauses to ITS end: a block before midnight or after it both pause to 02:00', async () => {
+    const wrap = mkCfg({ listsWindow: { startMin: 22 * 60, endMin: 2 * 60 } });
+    for (const when of ['2026-10-01T23:00:00.000Z', '2026-10-02T01:00:00.000Z']) {
+      const fake = makeFake({ list: () => listFail('deterministic', 'challenge page', { blocked: true }) });
+      const { lists } = await run(wrap, fake, {}, clock(Date.parse(when)));
+      expect(lists.files.get('mfc')!.pausedUntil).toBe('2026-10-02T02:00:00.000Z');
+    }
+  });
+
+  it('one company REFUSED, the rest answering: its slot is spent after 3 blocked nights, and every other company is polled', async () => {
+    const decl = Array.from({ length: 8 }, (_, i) =>
+      [9, 1].map((d) => ({ id: `c${i + 1}-d${d}`, url: `https://mfc.test/s?e=${i + 1}&d=${d}`, group: `c${i + 1}`, order: i + 1 })),
+    ).flat();
+    const fake = makeFake({
+      discovery: () => ({ status: 200, body: { rotatingSeedLists: decl } }),
+      list: (id) => (id.startsWith('c1-') ? listFail('deterministic', 'store answered 403', { upstreamStatus: 403, blocked: true }) : listOk([])),
+    });
+    const lists = createMemoryListsStateStore();
+    const ledgers = createMemoryLedgerStore({ mfc: ledger() });
+    const night = (n: number, slot = 0) => Date.parse('2026-10-01T15:30:00.000Z') + n * 24 * HOUR_MS + slot * HOUR_MS;
+    const nights: (string | null)[][] = [];
+    for (let n = 0; n < 5; n++) {
+      const skips: (string | null)[] = [];
+      for (let slot = 0; slot < 7; slot++) skips.push((await run(mkCfg(), fake, { lists, ledgers }, clock(night(n, slot)))).s.listsSkipped);
+      nights.push(skips);
+    }
+    const paused = [null, 'paused', 'paused', 'paused', 'paused', 'paused', 'paused'];
+    expect(nights).toEqual([paused, paused, paused, Array(7).fill(null), Array(7).fill('none-due')]);
+    expect(fake.listGets().filter((id) => id!.startsWith('c1-'))).toEqual(['c1-d9', 'c1-d9', 'c1-d9']);
+    const groups = lists.files.get('mfc')!.groups;
+    expect(groups.c1).toMatchObject({ outcome: 'blocked', strikes: 3, lastAttemptAt: iso(night(2)) });
+    expect(groups.c1).toEqual(expect.not.objectContaining({ blockedStrikes: expect.anything(), answered: expect.anything() }));
+    for (let i = 2; i <= 8; i++) expect(groups[`c${i}`]).toMatchObject({ outcome: 'ok', lastAttemptAt: iso(night(3, i - 2)) });
+  });
+
+  it('only CONSECUTIVE blocked passes count toward spending: a transient answer in between starts the count again', async () => {
+    const lists = createMemoryListsStateStore();
+    const blocked = () => listFail('deterministic', 'store answered 403', { upstreamStatus: 403, blocked: true });
+    const passes: [string, Reply][] = [
+      ['2026-10-01T15:30:00.000Z', blocked()],
+      ['2026-10-02T15:30:00.000Z', listFail('transient', 'store answered 503', { upstreamStatus: 503 })],
+      ['2026-10-02T16:30:00.000Z', blocked()],
+      ['2026-10-03T15:30:00.000Z', blocked()],
+      ['2026-10-04T15:30:00.000Z', blocked()],
+    ];
+    const seen: unknown[] = [];
+    for (const [when, reply] of passes) {
+      await run(mkCfg(), makeFake({ list: () => reply }), { lists }, clock(Date.parse(when)));
+      const g = lists.files.get('mfc')!.groups.c1;
+      seen.push([g.outcome, g.blockedStrikes, g.lastAttemptAt]);
+    }
+    expect(seen).toEqual([
+      ['blocked', 1, undefined],
+      ['transient', undefined, undefined],
+      ['blocked', 1, undefined],
+      ['blocked', 2, undefined],
+      ['blocked', undefined, '2026-10-04T15:30:00.000Z'],
+    ]);
   });
 
   it('a BLOCKED answer on list 2 keeps list 1: after the pause only list 2 is asked', async () => {
@@ -820,6 +914,46 @@ describe('lists step — discovery', () => {
     const fake = makeFake({ discovery: () => ({ status: 200, body: { rotatingSeedLists: decl } }) });
     await run(mkCfg(), fake);
     expect(fake.listGets()).toEqual(['a-1', 'a-2']);
+  });
+
+  it('group and list names that are Object.prototype members are ordinary names: fetched, booked and persisted', async () => {
+    const decl = [
+      { id: 'toString', url: 'https://mfc.test/a', group: 'constructor', order: 1 },
+      { id: 'valueOf', url: 'https://mfc.test/b', group: 'constructor', order: 1 },
+      { id: 'isPrototypeOf', url: 'https://mfc.test/c', group: 'toString', order: 2 },
+    ];
+    const fake = makeFake({ discovery: () => ({ status: 200, body: { rotatingSeedLists: decl } }), list: (id) => listOk([`${id}-1`]) });
+    // A backlog id whose group has no state yet: the drain must not book it onto the builtin.
+    const lists = createMemoryListsStateStore({ mfc: { ...createEmptyListsState('mfc'), pending: [{ itemId: '9', collectUrl: item('9'), group: 'toString' }] } });
+    const ledgers = createMemoryLedgerStore({ mfc: ledger() });
+    const got: (string | null)[] = [];
+    for (let pass = 0; pass < 3; pass++) got.push((await run(mkCfg(), fake, { lists, ledgers }, clock(T0 + pass * HOUR_MS))).s.listsGroup);
+    expect(got).toEqual(['constructor', 'toString', null]);
+    expect(fake.listGets()).toEqual(['toString', 'valueOf', 'isPrototypeOf']);
+    const groups = lists.files.get('mfc')!.groups;
+    expect(Object.keys(groups)).toEqual(['constructor', 'toString']);
+    expect(groups.constructor).toMatchObject({ outcome: 'ok', lastAttemptAt: iso(T0), seen: 2, enqueued: 2 });
+    expect(groups.toString).toMatchObject({ outcome: 'ok', lastAttemptAt: iso(T0 + HOUR_MS), seen: 1, enqueued: 1 });
+    expect(Object.prototype.hasOwnProperty.call(Object, 'lastAttemptAt')).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(Object.prototype.toString, 'lastAttemptAt')).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(Object.prototype.toString, 'enqueued')).toBe(false);
+  });
+
+  it('an open attempt over lists named like Object.prototype members resumes with exactly the unanswered one', async () => {
+    const decl = [
+      { id: 'toString', url: 'https://mfc.test/a', group: 'constructor', order: 1 },
+      { id: 'valueOf', url: 'https://mfc.test/b', group: 'constructor', order: 1 },
+    ];
+    const discovery = () => ({ status: 200, body: { rotatingSeedLists: decl } });
+    const lists = createMemoryListsStateStore();
+    const c = clock();
+    await run(mkCfg(), makeFake({ discovery, list: (id) => (id === 'valueOf' ? listFail('transient', 'socket hang up') : listOk(['1'])) }), { lists }, c);
+    expect(lists.files.get('mfc')!.groups['constructor'].answered).toEqual({ toString: 'ok' });
+    c.advance(HOUR_MS);
+    const retry = makeFake({ discovery, list: () => listOk(['2']) });
+    const { s } = await run(mkCfg(), retry, { lists }, c);
+    expect(retry.listGets()).toEqual(['valueOf']);
+    expect(s.listsOutcome).toBe('ok');
   });
 });
 

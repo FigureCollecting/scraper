@@ -109,6 +109,23 @@ describe('assembleCatalog — rotatingSeedLists (discovery)', () => {
     expect(out).toEqual({ status: 'ok', siteId: 'examplestore', rotatingSeedLists: [ROTATING[0]], count: 1 });
   });
 
+  it('drops an id or group outside [A-Za-z0-9._-], or named __proto__: names become state keys and url params', () => {
+    const ok = { id: 'company-7620.d9_x', url: 'https://example.test/ok', group: 'company-7620', order: 1 };
+    const bad = [
+      { id: 'a b', group: 'g' },
+      { id: 'a/b', group: 'g' },
+      { id: 'x?y=1', group: 'g' },
+      { id: 'café', group: 'g' },
+      { id: '__proto__', group: 'g' },
+      { id: 'ok-id', group: '__proto__' },
+      { id: 'ok-id-2', group: 'g h' },
+      { id: 'ok-id-3', group: 'g#1' },
+    ].map((e, i) => ({ ...e, url: `https://example.test/bad-${i}`, order: 2 }));
+    const store: StoreCapabilities = { ...STORE, retrieval: { rotatingSeedLists: [...bad, ok] } };
+    const cat = assembleCatalog(services({ stores: [store] }));
+    expect(cat.rotatingSeedLists('examplestore')).toEqual({ status: 'ok', siteId: 'examplestore', rotatingSeedLists: [ok], count: 1 });
+  });
+
   it('unsupported for an unknown store and for a store with no (usable) rotating lists', () => {
     const noLists: StoreCapabilities = { ...STORE, siteId: 'none', retrieval: { seedLists: STORE.retrieval!.seedLists } };
     const cat = assembleCatalog(services({ stores: [STORE, noLists] }));
