@@ -382,3 +382,66 @@ describe('loadCrawlerConfig — the re-observation lane', () => {
     }
   });
 });
+
+describe('loadCrawlerConfig — the rotating company-lists step', () => {
+  const HOUR = 60 * 60 * 1000;
+  const quiet = () => jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+
+  it('is OFF by default: no window, no drain caps, a 160 h interval and a 10 s floor between lists', () => {
+    const c = loadCrawlerConfig({});
+    expect(c.listsWindow).toBeNull();
+    expect(c.listsDrainCaps).toEqual({});
+    expect(c.listsIntervalMs).toBe(160 * HOUR);
+    expect(c.listsSpacingMs).toBe(10_000);
+  });
+
+  it('parses CRAWLER_LISTS_WINDOW_UTC as HH:MM-HH:MM in minutes after midnight, a wrap past midnight included', () => {
+    expect(loadCrawlerConfig({ CRAWLER_LISTS_WINDOW_UTC: '15:30-22:30' }).listsWindow).toEqual({ startMin: 930, endMin: 1350 });
+    expect(loadCrawlerConfig({ CRAWLER_LISTS_WINDOW_UTC: ' 22:00-2:30 ' }).listsWindow).toEqual({ startMin: 1320, endMin: 150 });
+    expect(loadCrawlerConfig({ CRAWLER_LISTS_WINDOW_UTC: '' }).listsWindow).toBeNull();
+  });
+
+  it('a malformed or empty-width window is OFF, with a WARN naming the var — never always-on', () => {
+    const warn = quiet();
+    try {
+      for (const raw of ['25:00-01:00', '15:60-16:00', '15:30', '15:30-15:30', 'evening', '1530-2230']) {
+        warn.mockClear();
+        expect(loadCrawlerConfig({ CRAWLER_LISTS_WINDOW_UTC: raw }).listsWindow).toBeNull();
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining('CRAWLER_LISTS_WINDOW_UTC'), { value: raw });
+      }
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('CRAWLER_LISTS_INTERVAL_H is hours → ms; 0 or junk keeps 160 h (the interval is a floor on how often one group is polled)', () => {
+    expect(loadCrawlerConfig({ CRAWLER_LISTS_INTERVAL_H: '168' }).listsIntervalMs).toBe(168 * HOUR);
+    expect(loadCrawlerConfig({ CRAWLER_LISTS_INTERVAL_H: '0' }).listsIntervalMs).toBe(160 * HOUR);
+    expect(loadCrawlerConfig({ CRAWLER_LISTS_INTERVAL_H: 'weekly' }).listsIntervalMs).toBe(160 * HOUR);
+  });
+
+  it('parses CRAWLER_LISTS_DRAIN_CAPS like the other per-store caps, warning on a malformed entry', () => {
+    const warn = quiet();
+    try {
+      expect(loadCrawlerConfig({ CRAWLER_LISTS_DRAIN_CAPS: 'mfc:200, hpoi:0, bad' }).listsDrainCaps).toEqual({ mfc: 200, hpoi: 0 });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('CRAWLER_LISTS_DRAIN_CAPS'), { entry: 'bad' });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('CRAWLER_LISTS_SPACING_MS may widen the gap between one group lists but never below 10 s', () => {
+    const warn = quiet();
+    try {
+      expect(loadCrawlerConfig({ CRAWLER_LISTS_SPACING_MS: '30000' }).listsSpacingMs).toBe(30_000);
+      expect(loadCrawlerConfig({ CRAWLER_LISTS_SPACING_MS: 'abc' }).listsSpacingMs).toBe(10_000);
+      warn.mockClear();
+      expect(loadCrawlerConfig({ CRAWLER_LISTS_SPACING_MS: '0' }).listsSpacingMs).toBe(10_000);
+      expect(loadCrawlerConfig({ CRAWLER_LISTS_SPACING_MS: '5000' }).listsSpacingMs).toBe(10_000);
+      expect(warn).toHaveBeenCalledTimes(2);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('CRAWLER_LISTS_SPACING_MS'), { requested: 5000, applied: 10_000 });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});

@@ -360,6 +360,20 @@ engine-side would make that id unaddressable.
 `422 { error: "unsupported", siteId, reason }` (unknown store, or it declares no seed lists) ·
 `502 { error: "catalog failed", siteId, reason }`.
 
+#### GET /catalog/rotating — rotating seed lists
+
+The company lists (contract 0.16.0 `retrieval.rotatingSeedLists`), on their own path so an engine
+that predates them answers 404 instead of serving a listing page. `?seeds=1` never lists them and
+`?seed=` never fetches them.
+
+**Query:** `store=<siteId>` (required); `list=<listId>` (optional — absent = discovery).
+
+**Discovery (200):** `{ siteId, rotatingSeedLists: [{ id, url, group, order }], count }`, declared
+order, nothing fetched. **Fetch (200):** the `?seed=` body plus `group`. **Errors:** `400` bad
+input · `422` unsupported · `503` cooldown + `Retry-After` · `502 { error, siteId, reason, failure,
+blocked?, upstreamStatus? }` — `failure` is `deterministic` (parser throw, store 4xx, challenge) or
+`transient` (store 5xx, network, timeout); `blocked: true` for a challenge, 401, 403 or 429.
+
 ### Search query encoding (`retrieval.bySearch.queryEncoding`)
 `{q}` is url-encoded into the store's `bySearch.urlTemplate` by `encodeSearchQuery`
 (`src/driver/retrievalPlanner.ts`), which every search caller goes through (`/lookup` fan-out,
@@ -661,6 +675,10 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
 | `CRAWLER_RANGE_GAP_BUDGET` | `0` | Gap sweep: ids one store may sweep per run (and therefore its POST ceiling), SEPARATE from the discovery cap. `0` = the sweep is OFF |
 | `CRAWLER_RANGE_GAPS` | *(none)* | csv of operator-declared bands, `siteId:lowId-highId` or `siteId:id` (one id is a band of width 1), adopted into the store's ledger once. A band reaching above the store's frontier is refused with a WARN |
 | `CRAWLER_RANGE_GAP_DRY_RUN` | `false` | Print the open bands and their widths and sweep nothing. `--dry-run` / `CRAWLER_DRY_RUN` arm this lane AND the re-observation lane |
+| `CRAWLER_LISTS_DRAIN_CAPS` | *(none)* | Company lists: csv of `siteId:cap` — the per-pass drain budget, and the switch: a store absent or at `0` runs no lists step at all. Only id-range stores (`CRAWLER_RANGE_STORES`) |
+| `CRAWLER_LISTS_WINDOW_UTC` | *(none = no list fetched)* | Company lists: `HH:MM-HH:MM` UTC window (may wrap midnight) in which ONE group may be fetched per pass. Malformed or zero-width = off, with a WARN. The backlog drains outside it |
+| `CRAWLER_LISTS_INTERVAL_H` | `160` | Company lists: a group is fetched at most once per this many hours |
+| `CRAWLER_LISTS_SPACING_MS` | `10000` | Company lists: wait between two lists of one group; never below `10000` (raised with a WARN) |
 | `CRAWLER_REOBSERVE_MIN_AGE_H` | `12` | Re-observation lane: an id is eligible once its last observation is this many hours old. The SAME value is the backoff window for an id whose last re-observation was refused, so `0` means both "age is no bar" and "no backoff at all" — a refused id is retried on the very next run |
 | `CRAWLER_MAX_REOBSERVE_PER_STORE` | `0` | Re-observation lane: global per-store ceiling on re-observations per run. `0` = the lane is OFF unless a store opts in below |
 | `CRAWLER_STORE_REOBSERVE_CAPS` | *(none)* | csv of `siteId:cap` (`goodsmileus:50,bbts:20`) — the lane's per-store budget, SEPARATE from `CRAWLER_STORE_ENQUEUE_CAPS`, so neither lane starves the other. A malformed entry is ignored with a WARN; the rest still apply |
@@ -797,7 +815,8 @@ mechanisms close the hole, and NEITHER touches the descent's cursor.
   run's re-anchor): above it the re-anchor records bands from ids a listing has shown us, and a
   declared band there is refused with a WARN on every run that finds it above the frontier. A store
   with no frontier yet adopts nothing until its walk has one.
-- **Sweep** — `CRAWLER_RANGE_GAP_BUDGET` ids per store per run (default `0` = OFF), oldest band first,
+- **Sweep** — `CRAWLER_RANGE_GAP_BUDGET` ids per store per run (default `0` = OFF), `reanchor` bands
+  before `operator` bands (the company lists run between the two tiers), oldest band first within each,
   walking each band ASCENDING from its `next`. The window is the SAME
   `GET /catalog?range=1&from=&count=` the descent uses — the sweep introduces no new URL shape, so
   nothing new to check against a store's robots.txt — and is then REVERSED before enqueueing: the
@@ -829,6 +848,34 @@ mechanisms close the hole, and NEITHER touches the descent's cursor.
 - **Arming it** — set the budget to what the store's egress lane can actually drain per hour, not to
   the window ceiling. mfc rides the shared residential exit, so its sweep is a slow fill measured in
   weeks, not a bulk import.
+
+**Company lists** (contract 0.16.0 `retrieval.rotatingSeedLists`; Ross 2026-09-22/25/26) — per-company
+lists replace the archive descent. The step runs inside the id-range phase, in this order: recent gaps
+(`reanchor` bands) → company lists → older gaps (`operator` bands) → descent. Each has its own budget;
+a stop in one lane (cooldown, challenge, sick scraper) stops every lane below it.
+- **Rotation** — per pass, inside `CRAWLER_LISTS_WINDOW_UTC` only: `GET /catalog/rotating?store=`
+  (discovery, no store request), then the FIRST group by `order` whose last attempt is absent or older
+  than `CRAWLER_LISTS_INTERVAL_H`; every list of that group via `GET /catalog/rotating?store=&list=`,
+  `CRAWLER_LISTS_SPACING_MS` apart. The seed pass (`?seeds=1`, `CRAWLER_MODE=seed`) never lists them.
+- **Dedupe** — the group's ids are unioned; ids the ledger knows, and ids already in the backlog
+  (another company's copy), are dropped; the rest join the backlog.
+- **Drain** — up to `CRAWLER_LISTS_DRAIN_CAPS` backlog ids per pass, oldest first, POSTed with
+  `priority: "COLD"` (the tap and the gap sweeps post WARM); the queue pages parked rows in by
+  priority, then age, so a frontier id never waits behind a company-list id.
+- **Failures** — a deterministic failure (parser throw, store 4xx, challenge) spends the group's slot
+  for the whole interval; a transient one (store 5xx, network, timeout) retries next pass, at most 3
+  times before the slot is spent. A challenge, 401/403 or 429 stops the store for the pass; a cooling
+  host costs no slot.
+- **State** — `<CRAWLER_LEDGER_DIR>/<siteId>.lists.json` (per group: `lastAttemptAt`, `outcome`, `seen`,
+  `new`, `enqueued`, `strikes`; plus the backlog). Its own file: the ledger loader drops sections it
+  does not know, so an older engine would erase it, and the weekly seed Job also writes the ledger.
+- **Reporting** — `listsGroup`, `listsOutcome`, `listsFetched`, `listsFailed`, `listsIdsSeen`,
+  `listsIdsNew`, `listsEnqueued` (kept out of `enqueued`), `listsPending`, `listsDrainApplied`,
+  `listsSkipped` (`not-configured`, `not-run`, `store-stopped`, `state-corrupt`, `state-failed`,
+  `window-off`, `outside-window`, `none-due`, `unsupported`, `cooldown`, `budget`, `failed`; `null`
+  when a group was fetched) and `listsDrainStopped`. Run level: `totalListsEnqueued`.
+- **Stop switch** — remove the store from `CRAWLER_LISTS_DRAIN_CAPS` (no fetch, no drain); unset
+  `CRAWLER_LISTS_WINDOW_UTC` to stop fetching while the backlog drains.
 
 **Re-observation lane** (`CRAWLER_MODE` names `reobserve`, e.g. `both,reobserve`) — discovery asks a
 store what EXISTS; this lane asks what the things we already know COST NOW. A store whose catalog is

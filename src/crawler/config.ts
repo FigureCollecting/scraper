@@ -153,6 +153,24 @@ export interface CrawlerConfig {
   rangeGaps: Record<string, GapBandDecl[]>;
   /** GAP SWEEP: print the open bands and their widths, and sweep NOTHING (no window GET, no POST). */
   rangeGapDryRun: boolean;
+  /**
+   * LISTS: the UTC time-of-day window in which a rotating list group may be fetched, from
+   * `CRAWLER_LISTS_WINDOW_UTC` (`HH:MM-HH:MM`, may wrap midnight). null = no list is ever fetched.
+   * loadCrawlerConfig always sets the four `lists*` knobs; absent on a hand-built config = off / default.
+   */
+  listsWindow?: UtcWindow | null;
+  /** LISTS: one group is fetched at most once per this interval (`CRAWLER_LISTS_INTERVAL_H`, default 160 h). */
+  listsIntervalMs?: number;
+  /** LISTS: per-store drain budget (`CRAWLER_LISTS_DRAIN_CAPS`, `siteId:cap`). A store absent or at 0 runs no lists step. */
+  listsDrainCaps?: Record<string, number>;
+  /** LISTS: wait between two lists of one group (`CRAWLER_LISTS_SPACING_MS`), never below 10 s. */
+  listsSpacingMs?: number;
+}
+
+/** A UTC time-of-day window in minutes after midnight; `endMin < startMin` means it wraps past midnight. */
+export interface UtcWindow {
+  startMin: number;
+  endMin: number;
 }
 
 /** One operator-declared gap band, before it is adopted into a store's ledger. */
@@ -171,6 +189,9 @@ const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
  */
 export const MAX_RANGE_IDS_PER_RUN = 200;
 
+
+/** Ross's guardrail for the rotating lists: two lists of one group are never fetched less than 10 s apart. */
+export const MIN_LISTS_SPACING_MS = 10_000;
 
 /** The first store armed for continuous collection (orzgk: Woo Store API, 100/page, newest-first). */
 export const DEFAULT_CRAWLER_STORES = ['orzgk'];
@@ -194,6 +215,8 @@ const DEFAULTS = {
   rangeReanchorH: 24,
   rangeReanchorMaxDelta: 50000,
   rangeGapBudget: 0,
+  listsIntervalH: 160,
+  listsSpacingMs: MIN_LISTS_SPACING_MS,
 };
 
 type Env = Record<string, string | undefined>;
@@ -297,6 +320,34 @@ const clampedPosInt = (raw: string | undefined, fallback: number, max: number, e
   if (n <= max) return n;
   logger.warn(`[CRAWLER] ${envName} clamped to the engine's window ceiling`, { requested: n, applied: max });
   return max;
+};
+
+/**
+ * Parse `CRAWLER_LISTS_WINDOW_UTC` (`HH:MM-HH:MM`, UTC, start inclusive, end exclusive; the end may
+ * be earlier than the start to wrap past midnight). Anything unreadable — or a window of no width —
+ * is null (no list is fetched) with a WARN: this knob gates requests into a barred space, so a typo
+ * must fail closed, never open.
+ */
+const parseUtcWindow = (raw: string | undefined): UtcWindow | null => {
+  const value = (raw ?? '').trim();
+  if (value === '') return null;
+  const m = /^(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})$/.exec(value);
+  const toMin = (h: string, mm: string): number => (Number(h) <= 23 && Number(mm) <= 59 ? Number(h) * 60 + Number(mm) : Number.NaN);
+  const startMin = m ? toMin(m[1], m[2]) : Number.NaN;
+  const endMin = m ? toMin(m[3], m[4]) : Number.NaN;
+  if (!Number.isFinite(startMin) || !Number.isFinite(endMin) || startMin === endMin) {
+    logger.warn('[CRAWLER] CRAWLER_LISTS_WINDOW_UTC ignored (expected HH:MM-HH:MM UTC of non-zero width) — no list will be fetched', { value: raw });
+    return null;
+  }
+  return { startMin, endMin };
+};
+
+/** A spacing knob with a floor: below it (0 included) is raised to the floor with a WARN naming the var. */
+const flooredNonNegInt = (raw: string | undefined, fallback: number, floor: number, envName: string): number => {
+  const n = nonNegInt(raw, fallback);
+  if (n >= floor) return n;
+  logger.warn(`[CRAWLER] ${envName} raised to its floor`, { requested: n, applied: floor });
+  return floor;
 };
 
 const PHASE_TOKENS = new Set<string>(['recent', 'backfill', 'reobserve', 'seed']);
@@ -420,5 +471,10 @@ export function loadCrawlerConfig(env: Env = process.env, argv: string[] = proce
     rangeGapBudget: nonNegInt(env.CRAWLER_RANGE_GAP_BUDGET, DEFAULTS.rangeGapBudget),
     rangeGaps: parseRangeGaps(env.CRAWLER_RANGE_GAPS),
     rangeGapDryRun: boolFlag(env.CRAWLER_RANGE_GAP_DRY_RUN) || aliasDryRun || argv.includes('--dry-run'),
+    listsWindow: parseUtcWindow(env.CRAWLER_LISTS_WINDOW_UTC),
+    // posInt: 0 would re-poll the first group every pass, so it keeps the default rather than failing open.
+    listsIntervalMs: posInt(env.CRAWLER_LISTS_INTERVAL_H, DEFAULTS.listsIntervalH) * 60 * 60 * 1000,
+    listsDrainCaps: parseStoreCaps(env.CRAWLER_LISTS_DRAIN_CAPS, 'CRAWLER_LISTS_DRAIN_CAPS'),
+    listsSpacingMs: flooredNonNegInt(env.CRAWLER_LISTS_SPACING_MS, DEFAULTS.listsSpacingMs, MIN_LISTS_SPACING_MS, 'CRAWLER_LISTS_SPACING_MS'),
   };
 }

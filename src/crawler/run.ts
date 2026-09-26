@@ -13,6 +13,7 @@ import dotenv from 'dotenv';
 import { loadCrawlerConfig } from './config.js';
 import { runCrawlerPass, type FetchLike } from './crawler.js';
 import { createFileLedgerStore } from './ledger.js';
+import { createFileListsStateStore } from './listsState.js';
 import { logger } from '../utils/logger.js';
 import { createFailureReporterFromEnv } from '../services/failureReporter.js';
 
@@ -45,6 +46,10 @@ async function main(): Promise<void> {
     maxReobservePerStore: config.maxReobservePerStore,
     storeReobserveCaps: config.storeReobserveCaps,
     reobserveDryRun: config.reobserveDryRun,
+    listsWindow: config.listsWindow,
+    listsIntervalH: (config.listsIntervalMs ?? 0) / 3_600_000,
+    listsDrainCaps: config.listsDrainCaps,
+    listsSpacingMs: config.listsSpacingMs,
   });
   // The durable fetch-failure ledger (INGEST_BASE_URL + REPORT_FETCH_FAILURES). Null = off, and
   // every emit point in the pass is a no-op.
@@ -52,6 +57,7 @@ async function main(): Promise<void> {
   await runCrawlerPass(config, {
     fetch: httpFetch,
     ledgerStore: createFileLedgerStore(config.ledgerDir),
+    listsStore: createFileListsStateStore(config.ledgerDir),
     ...(reporter ? { reportFailure: (report) => reporter.report(report) } : {}),
   });
   // Every emit point is fire-and-forget and the process exits the instant this resolves, which
