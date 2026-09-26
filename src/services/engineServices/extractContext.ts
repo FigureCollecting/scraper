@@ -10,7 +10,8 @@
  * `searchFetch` transport — so the follow-up's raw bytes land in the capture sink on the SAME lane
  * as the primary fetch: 'api' for a store that declares an impersonate/http transport, but a
  * full browser navigation captured as wire/dom for a store that declares none (measured on hpoi,
- * 2026-09-22). Cookies pass through (opts.cookies overrides the context's own).
+ * 2026-09-22). Cookies pass through (opts.cookies overrides the context's own). A POST (contract
+ * 0.14.0) is validated here, before the courtesy wait, and rides only the http/impersonate lanes.
  *
  * COURTESY GAP (D8): before dispatching, `fetchBody` waits until `primaryFetchedAt +
  * baseDelayMs` has elapsed — but ONLY when the follow-up targets the SAME host as the primary
@@ -31,12 +32,14 @@
  */
 import type {
   ExtractContext,
+  FetchBodyOptions,
   ScrapePageResult,
   SearchFetch,
   SiteConfig,
   PluginLogger,
 } from '@figurecollecting/scraper-plugin-contract';
-import type { CapturingFetch } from './capturingFetch.js';
+import { DEFAULT_POST_CONTENT_TYPE, type CapturingFetch, type FetchRequest } from './capturingFetch.js';
+import { sanitizeForLog } from '../../utils/security.js';
 import type { EngineScrapePageOptions } from './scrapingService.js';
 import {
   getResidentialProxyUrl,
@@ -121,6 +124,38 @@ function notSupported(member: string): () => never {
   };
 }
 
+/** A ruleset's fetchBody options break the contract (a GET with a body, an unknown method, …). */
+export class FetchBodyRequestError extends Error {
+  constructor(url: string, reason: string) {
+    super(`[EXTRACT CONTEXT] fetchBody(${sanitizeForLog(url)}) refused: ${reason}`);
+    this.name = 'FetchBodyRequestError';
+  }
+}
+
+/**
+ * The contract's options as the lanes' request: `undefined` for a GET (the pre-0.14.0 call), the
+ * POST otherwise. Checked at runtime too, since a JS ruleset is not held to the contract's types.
+ */
+function toFetchRequest(url: string, opts: FetchBodyOptions | undefined): FetchRequest | undefined {
+  const method: unknown = opts?.method;
+  const body: unknown = opts?.body;
+  const contentType: unknown = opts?.contentType;
+  if (method === undefined || method === 'GET') {
+    if (body !== undefined || contentType !== undefined) {
+      throw new FetchBodyRequestError(url, 'a GET carries no body or contentType (send method POST)');
+    }
+    return undefined;
+  }
+  if (method !== 'POST') {
+    throw new FetchBodyRequestError(url, `method '${sanitizeForLog(String(method))}' is not supported (GET or POST)`);
+  }
+  if (body !== undefined && typeof body !== 'string') throw new FetchBodyRequestError(url, 'body must be a string');
+  if (contentType !== undefined && typeof contentType !== 'string') {
+    throw new FetchBodyRequestError(url, 'contentType must be a string');
+  }
+  return { method: 'POST', body: body ?? '', contentType: contentType ?? DEFAULT_POST_CONTENT_TYPE };
+}
+
 /** Build the `ExtractContext` for one item's extraction (see module doc for `fetchBody`'s contract). */
 export function buildExtractContext(options: BuildExtractContextOptions): ExtractContext {
   const now = options.now ?? Date.now;
@@ -182,6 +217,8 @@ export function buildExtractContext(options: BuildExtractContextOptions): Extrac
       withPage: notSupported('withPage'),
 
       async fetchBody(url, fetchOpts) {
+        // Refused before the courtesy wait: a malformed request never costs the host a slot.
+        const request = toFetchRequest(url, fetchOpts);
         const targetHost = safeHostname(url);
         const last = targetHost !== undefined ? lastFetchedAt.get(targetHost) : undefined;
         if (last !== undefined) {
@@ -195,7 +232,10 @@ export function buildExtractContext(options: BuildExtractContextOptions): Extrac
         // Same host scope as the page passthroughs: an off-store follow-up keeps the store's
         // transport/headers but never its residential exit.
         const searchFetch = onDeclaringStore(url) ? options.searchFetch : withoutDeclaredEgress(options.searchFetch);
-        const result = await options.capturingFetch(url, searchFetch, cookies ? { cookies } : {});
+        const result = await options.capturingFetch(url, searchFetch, {
+          ...(cookies ? { cookies } : {}),
+          ...(request ? { request } : {}),
+        });
         if (targetHost !== undefined) {
           lastFetchedAt.set(targetHost, now());
         }

@@ -10,6 +10,8 @@
  *           Content-Encoding: gzip (transparent double-decode footgun)
  *   write = HEAD-then-PUT, write-once: a dedup hit records nothing here (the spine
  *           capture table is the authoritative event log); nothing is ever DELETEd.
+ *           So an object's metadata (url, lane, method) is its FIRST writer's: identical
+ *           bytes from another url or request, a POST included, never amend it.
  *
  * The ASSET lane (product images) is the one exception to the body rules above:
  *
@@ -1261,6 +1263,12 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     const md: Record<string, string> = { url: headerSafe(url), 'fetched-at': headerSafe(c.fetchedAt), lane: c.lane };
     const host = hostOf(url); // best-effort — a malformed URL just omits the site tag
     if (host) md.site = headerSafe(host);
+    // Names the request that first wrote these bytes (absent = GET, as before); a later dedup hit,
+    // GET or POST, does not amend it.
+    if (c.method === 'POST') {
+      md.method = 'POST';
+      if (c.requestBodySha256) md['request-body-sha256'] = c.requestBodySha256;
+    }
     return budgetMetadata(md);
   }
 

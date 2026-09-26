@@ -493,6 +493,26 @@ export interface StoreCapabilities extends SiteConfig {
   searchFetch?: SearchFetch;
 }
 
+/** The request methods `fetchBody` can send. */
+export type FetchBodyMethod = 'GET' | 'POST';
+
+/**
+ * Options for `ExtractContext.scraping.fetchBody` (0.14.0 adds `method`/`body`/`contentType`).
+ * Omitted `method` is a GET, exactly as before; a GET carries no `body` and no `contentType`. A POST
+ * with no `contentType` is sent as `application/x-www-form-urlencoded; charset=UTF-8`.
+ * A POST must be a read-only query: the engine never replays one inside a call, but a retried
+ * extraction runs the ruleset again and so sends it again. Only the http and impersonate transports
+ * can POST; on the browser transport the call is refused. A redirect answering a POST is returned
+ * as-is (its 3xx `statusCode`), never followed.
+ */
+export interface FetchBodyOptions {
+  cookies?: Record<string, string>;
+  method?: FetchBodyMethod;
+  /** The request body, already encoded by the ruleset (e.g. `idx=123&lang=en`). */
+  body?: string;
+  contentType?: string;
+}
+
 /**
  * Per-extraction context handed to `extract()` by the engine (E1 seam).
  * Generic engine surface only: site config, page/batch/API fetch access, and
@@ -517,7 +537,7 @@ export interface ExtractContext {
      * variation-batch endpoint) without owning their own HTTP stack. Optional: an engine that
      * doesn't yet provide it leaves this undefined; rulesets must check before calling.
      */
-    fetchBody?(url: string, opts?: { cookies?: Record<string, string> }): Promise<{ html: string; statusCode?: number }>;
+    fetchBody?(url: string, opts?: FetchBodyOptions): Promise<{ html: string; statusCode?: number }>;
   };
   logger: PluginLogger;
 }

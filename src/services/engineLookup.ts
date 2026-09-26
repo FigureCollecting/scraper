@@ -16,7 +16,7 @@ import { makeFetchSearch, type FetchSearchTransports } from './fetchSearch.js';
 import { impitFetchBody } from './impitFetch.js';
 import { getCfCookieStore, type CfCookieSource } from './cookieJar.js';
 import { createFailureReporterFromEnv } from './failureReporter.js';
-import type { FetchBodyDetail } from './engineServices/capturingFetch.js';
+import type { FetchBodyDetail, FetchRequest } from './engineServices/capturingFetch.js';
 import type { ExtractionRuleset, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
 
 /** The slice of the engine ExtractionRegistry the lookup needs. */
@@ -71,15 +71,19 @@ export function createHttpFetchDetailed(options: { store?: CfCookieSource } = {}
    * 404 or a bounce to the front page from a ruleset that failed to lift a record. A response object
    * that carries neither (a test double shaped like `{ text() }`) yields neither field.
    */
-  return async function httpFetchDetail(url: string): Promise<FetchBodyDetail> {
+  return async function httpFetchDetail(url: string, request?: FetchRequest): Promise<FetchBodyDetail> {
     const store = options.store ?? getCfCookieStore();
     const cookies = store.cookiesFor(url);
     const headers: Record<string, string> = {
       'user-agent': store.userAgentFor(url) ?? DESKTOP_UA,
       accept: 'application/json, text/html',
       ...(cookies ? { cookie: serializeCookieHeader(cookies) } : {}),
+      ...(request ? { 'content-type': request.contentType } : {}),
     };
     const res = await fetch(url, {
+      // A POST's redirect is returned, not followed: a 302/303 would come back as a GET's bytes booked
+      // as the POST's, and a 307/308 would resend the body to a host no guard has seen.
+      ...(request ? { method: request.method, body: request.body, redirect: 'manual' as const } : {}),
       headers,
       // One signal bounds headers AND body: text() streams under the same abort.
       signal: AbortSignal.timeout(HTTP_FETCH_TIMEOUT_MS),
@@ -101,8 +105,8 @@ export function createHttpFetchDetailed(options: { store?: CfCookieSource } = {}
  */
 export function createHttpFetch(options: { store?: CfCookieSource } = {}) {
   const detailed = createHttpFetchDetailed(options);
-  return async function httpFetchBody(url: string): Promise<string> {
-    return (await detailed(url)).body;
+  return async function httpFetchBody(url: string, request?: FetchRequest): Promise<string> {
+    return (await (request ? detailed(url, request) : detailed(url))).body;
   };
 }
 
@@ -115,7 +119,8 @@ export const httpFetchBodyDetailed = createHttpFetchDetailed();
  * call), so a second instance would be harmless here rather than costly as it is on the impit lane;
  * projecting the one instance anyway keeps "one fetcher per lane" true without exception.
  */
-export const httpFetchBody = async (url: string): Promise<string> => (await httpFetchBodyDetailed(url)).body;
+export const httpFetchBody = async (url: string, request?: FetchRequest): Promise<string> =>
+  (await (request ? httpFetchBodyDetailed(url, request) : httpFetchBodyDetailed(url))).body;
 
 /**
  * Build the cross-store Lookup from the engine's registered stores + the three search transports.

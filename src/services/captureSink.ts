@@ -83,6 +83,13 @@ export interface RawCapture {
    */
   sourceClass?: string;
   contentLevel?: string;
+  /**
+   * Set only for a POST (absent = GET): the url alone cannot say which request these bytes answered.
+   * The object store is write-once by content, so on a dedup hit the first writer's metadata stands.
+   */
+  method?: 'POST';
+  /** Lowercase hex sha256 of the POST request body. */
+  requestBodySha256?: string;
 }
 
 export interface RawCaptureInput {
@@ -102,6 +109,9 @@ export interface RawCaptureInput {
   role?: string;
   sourceClass?: string;
   contentLevel?: string;
+  /** A POST capture; its `requestBody` is hashed into `requestBodySha256`. */
+  method?: 'POST';
+  requestBody?: string;
 }
 
 /**
@@ -181,6 +191,10 @@ export function buildRawCapture(input: RawCaptureInput): RawCapture {
   if (input.role !== undefined) capture.role = input.role;
   if (input.sourceClass !== undefined) capture.sourceClass = input.sourceClass;
   if (input.contentLevel !== undefined) capture.contentLevel = input.contentLevel;
+  if (input.method === 'POST') {
+    capture.method = 'POST';
+    capture.requestBodySha256 = createHash('sha256').update(input.requestBody ?? '', 'utf8').digest('hex');
+  }
   return capture;
 }
 
