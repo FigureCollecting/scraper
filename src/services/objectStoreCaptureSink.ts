@@ -10,7 +10,7 @@
  *           Content-Encoding: gzip (transparent double-decode footgun)
  *   write = HEAD-then-PUT, write-once: a dedup hit records nothing here (the spine
  *           capture table is the authoritative event log); nothing is ever DELETEd.
- *           So an object's metadata (url, lane, method) is its FIRST writer's: identical
+ *           So an object's metadata (url, lane, request) is its FIRST writer's: identical
  *           bytes from another url or request, a POST included, never amend it.
  *
  * The ASSET lane (product images) is the one exception to the body rules above:
@@ -1269,6 +1269,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       md.method = 'POST';
       if (c.requestBodySha256) md['request-body-sha256'] = c.requestBodySha256;
     }
+    if (c.requestHeadersSha256) md['request-headers-sha256'] = c.requestHeadersSha256;
     return budgetMetadata(md);
   }
 

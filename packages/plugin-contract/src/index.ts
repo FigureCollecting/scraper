@@ -497,20 +497,48 @@ export interface StoreCapabilities extends SiteConfig {
 export type FetchBodyMethod = 'GET' | 'POST';
 
 /**
- * Options for `ExtractContext.scraping.fetchBody` (0.14.0 adds `method`/`body`/`contentType`).
+ * The request headers a ruleset may set on `fetchBody` (0.15.0), lowercase. The engine matches
+ * names case-insensitively and REFUSES any other header before a request is sent: it owns the
+ * request's identity (User-Agent, cookies, the TLS profile) and framing (Host, Content-Length,
+ * Content-Type, which a POST sets through `contentType`), so `cookie`, `authorization`, `host`,
+ * `user-agent`, `content-length`, `proxy-*`, `sec-*` and every unlisted name are refused. So is a
+ * name or value carrying CR or LF, and a value that is not printable ASCII.
+ */
+export const FETCH_BODY_ALLOWED_HEADERS = ['origin', 'referer', 'accept', 'accept-language', 'x-requested-with'] as const;
+
+/** A header name in {@link FETCH_BODY_ALLOWED_HEADERS}. */
+export type FetchBodyHeaderName = (typeof FETCH_BODY_ALLOWED_HEADERS)[number];
+
+/** `fetchBody` request headers: allowlisted names, lowercase or in their canonical spelling. */
+export type FetchBodyHeaders = {
+  [K in FetchBodyHeaderName | 'Origin' | 'Referer' | 'Accept' | 'Accept-Language' | 'X-Requested-With']?: string;
+};
+
+/**
+ * Options for `ExtractContext.scraping.fetchBody` (0.14.0 adds `method`/`body`/`contentType`, 0.15.0
+ * adds `headers` and refuses `cookies`).
  * Omitted `method` is a GET, exactly as before; a GET carries no `body` and no `contentType`. A POST
  * with no `contentType` is sent as `application/x-www-form-urlencoded; charset=UTF-8`.
  * A POST must be a read-only query: the engine never replays one inside a call, but a retried
  * extraction runs the ruleset again and so sends it again. Only the http and impersonate transports
- * can POST; on the browser transport the call is refused. A redirect answering a POST is returned
- * as-is (its 3xx `statusCode`), never followed.
+ * can POST or send `headers`; on the browser transport either is refused. A redirect answering a
+ * POST is returned as-is (its 3xx `statusCode`), never followed.
  */
 export interface FetchBodyOptions {
+  /**
+   * @deprecated Refused since 0.15.0: the engine owns cookies (its per-store jar), as it owns the
+   * Cookie header. Passing any value rejects the call before a request is sent.
+   */
   cookies?: Record<string, string>;
   method?: FetchBodyMethod;
   /** The request body, already encoded by the ruleset (e.g. `idx=123&lang=en`). */
   body?: string;
   contentType?: string;
+  /**
+   * Request headers from {@link FETCH_BODY_ALLOWED_HEADERS} only (0.15.0), on a GET or a POST. A
+   * ruleset `accept` replaces the transport's default Accept. Anything else is refused.
+   */
+  headers?: FetchBodyHeaders;
 }
 
 /**

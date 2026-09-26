@@ -1,8 +1,9 @@
 /**
- * ScrapeQueue × a refused fetchBody request (plugin-contract 0.14.0). A malformed POST option
- * (FetchBodyRequestError) or a POST on the browser lane (FetchMethodUnsupportedError) is a ruleset or
- * store-config bug that no retry can fix, so it is booked extraction_unavailable: one primary fetch,
- * no retry. Harness mirrors scrapeQueueChallengeExtractThrow.test.ts (fake timers, no live fetches).
+ * ScrapeQueue × a refused fetchBody request (plugin-contract 0.14.0 / 0.15.0). A malformed option
+ * (FetchBodyRequestError: a GET with a body, a header off the allowlist, a cookie map), a POST on the
+ * browser lane (FetchMethodUnsupportedError) or headers on the browser lane
+ * (FetchHeadersUnsupportedError) is a ruleset or store-config bug that no retry can fix, so it is
+ * booked extraction_unavailable: one primary fetch, no retry. Harness mirrors scrapeQueueChallengeExtractThrow.test.ts (fake timers, no live fetches).
  */
 
 const mockNotifyItemFailed = jest.fn().mockResolvedValue(true);
@@ -143,6 +144,37 @@ describe('ScrapeQueue × a refused fetchBody request is not retried', () => {
     await failAndSettle();
     const err = (await captured) as Error;
     expect(refusals).toEqual(['FetchMethodUnsupportedError']);
+    expect(scraping.scrapePage.mock.calls.length + scraping.scrapePageStealth.mock.calls.length).toBe(1);
+    expect(http).not.toHaveBeenCalled();
+    expect(queue.getStats().failed).toBe(1);
+    expect(err.message).toContain('extraction_unavailable');
+  });
+
+  it.each([
+    ['a header off the allowlist', { method: 'POST', body: 'idx=1', headers: { cookie: 'a=1' } }],
+    ['a ruleset cookie map', { cookies: { a: '1' } }],
+  ])('%s (FetchBodyRequestError, contract 0.15.0): one primary fetch, extraction_unavailable, no retry', async (_name, opts) => {
+    const refusals: string[] = [];
+    const http = jest.fn().mockResolvedValue(HTML);
+    const scraping = { scrapePage: jest.fn(), scrapePageStealth: jest.fn() };
+    const captured = run(rulesetCalling(opts, refusals), { transport: 'http' }, http, scraping);
+    await failAndSettle();
+    const err = (await captured) as Error;
+    expect(refusals).toEqual(['FetchBodyRequestError']);
+    expect(http).toHaveBeenCalledTimes(1);
+    expect(queue.getStats().failed).toBe(1);
+    expect(err.message).toContain('extraction_unavailable');
+  });
+
+  it('headers on the browser lane (FetchHeadersUnsupportedError): one navigation, extraction_unavailable, no retry', async () => {
+    const refusals: string[] = [];
+    const http = jest.fn();
+    const page = { html: HTML, url: `https://${HOST}/item/9`, title: 'item', statusCode: 200 };
+    const scraping = { scrapePage: jest.fn().mockResolvedValue(page), scrapePageStealth: jest.fn().mockResolvedValue(page) };
+    const captured = run(rulesetCalling({ headers: { origin: `https://${HOST}` } }, refusals), undefined, http, scraping);
+    await failAndSettle();
+    const err = (await captured) as Error;
+    expect(refusals).toEqual(['FetchHeadersUnsupportedError']);
     expect(scraping.scrapePage.mock.calls.length + scraping.scrapePageStealth.mock.calls.length).toBe(1);
     expect(http).not.toHaveBeenCalled();
     expect(queue.getStats().failed).toBe(1);

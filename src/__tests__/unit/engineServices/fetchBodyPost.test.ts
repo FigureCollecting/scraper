@@ -61,10 +61,11 @@ describe('fetchBody request options at the contract boundary', () => {
     expect(capturingFetch).toHaveBeenCalledWith(GETINFO, { transport: 'http' }, {});
   });
 
-  it("an explicit method 'GET' is the same call as an omitted one, cookies kept", async () => {
+  it("an explicit method 'GET' is the same call as an omitted one (a ruleset cookie map is refused since 0.15.0)", async () => {
     const { c, capturingFetch } = ctx();
-    await c.scraping.fetchBody!(GETINFO, { method: 'GET', cookies: { a: '1' } });
-    expect(capturingFetch).toHaveBeenCalledWith(GETINFO, { transport: 'http' }, { cookies: { a: '1' } });
+    await c.scraping.fetchBody!(GETINFO, { method: 'GET' });
+    expect(capturingFetch).toHaveBeenCalledWith(GETINFO, { transport: 'http' }, {});
+    await expect(c.scraping.fetchBody!(GETINFO, { method: 'GET', cookies: { a: '1' } })).rejects.toBeInstanceOf(FetchBodyRequestError);
   });
 
   it('a POST reaches the capturing fetch with its method, body and Content-Type', async () => {

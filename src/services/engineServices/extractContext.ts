@@ -10,8 +10,10 @@
  * `searchFetch` transport — so the follow-up's raw bytes land in the capture sink on the SAME lane
  * as the primary fetch: 'api' for a store that declares an impersonate/http transport, but a
  * full browser navigation captured as wire/dom for a store that declares none (measured on hpoi,
- * 2026-09-22). Cookies pass through (opts.cookies overrides the context's own). A POST (contract
- * 0.14.0) is validated here, before the courtesy wait, and rides only the http/impersonate lanes.
+ * 2026-09-22). The context's own cookies (the queue item's, engine-supplied) pass through to the
+ * lane as before; a ruleset cannot add any (`opts.cookies` is refused, contract 0.15.0). A POST
+ * (0.14.0) and request headers (0.15.0, `FETCH_BODY_ALLOWED_HEADERS` only) are validated here, before
+ * the courtesy wait, and ride only the http/impersonate lanes.
  *
  * COURTESY GAP (D8): before dispatching, `fetchBody` waits until `primaryFetchedAt +
  * baseDelayMs` has elapsed — but ONLY when the follow-up targets the SAME host as the primary
@@ -30,13 +32,14 @@
  * them through `ExtractContext.scraping` — a loud failure, not a silent no-op, if a future ruleset
  * assumes more surface than this context provides.
  */
-import type {
-  ExtractContext,
-  FetchBodyOptions,
-  ScrapePageResult,
-  SearchFetch,
-  SiteConfig,
-  PluginLogger,
+import {
+  FETCH_BODY_ALLOWED_HEADERS,
+  type ExtractContext,
+  type FetchBodyOptions,
+  type ScrapePageResult,
+  type SearchFetch,
+  type SiteConfig,
+  type PluginLogger,
 } from '@figurecollecting/scraper-plugin-contract';
 import { DEFAULT_POST_CONTENT_TYPE, type CapturingFetch, type FetchRequest } from './capturingFetch.js';
 import { sanitizeForLog } from '../../utils/security.js';
@@ -132,19 +135,60 @@ export class FetchBodyRequestError extends Error {
   }
 }
 
+const ALLOWED_HEADERS: ReadonlySet<string> = new Set(FETCH_BODY_ALLOWED_HEADERS);
+
 /**
- * The contract's options as the lanes' request: `undefined` for a GET (the pre-0.14.0 call), the
- * POST otherwise. Checked at runtime too, since a JS ruleset is not held to the contract's types.
+ * A ruleset's `headers`, checked against the contract's allowlist and returned with lowercase names
+ * and RFC 9110 surrounding whitespace dropped; `undefined` when there are none. Every refusal lands
+ * before any request: the engine owns identity (UA, cookies, TLS profile) and framing headers.
+ */
+function toRequestHeaders(url: string, raw: unknown): Record<string, string> | undefined {
+  if (raw === undefined) return undefined;
+  // A plain object only: a Map or a WHATWG Headers has no own entries, so it would be dropped silently.
+  const proto: unknown = raw !== null && typeof raw === 'object' ? Object.getPrototypeOf(raw) : undefined;
+  if (proto !== Object.prototype && proto !== null) {
+    throw new FetchBodyRequestError(url, 'headers must be a plain object of header name to string value');
+  }
+  const headers: Record<string, string> = {};
+  for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (/[\r\n]/.test(name)) throw new FetchBodyRequestError(url, 'a header name contains CR or LF');
+    const lower = name.toLowerCase();
+    if (!ALLOWED_HEADERS.has(lower)) {
+      throw new FetchBodyRequestError(
+        url,
+        `header '${sanitizeForLog(name)}' is not one a ruleset may set (allowed: ${FETCH_BODY_ALLOWED_HEADERS.join(', ')}; ` +
+          'the engine owns identity and framing headers)',
+      );
+    }
+    if (typeof value !== 'string') throw new FetchBodyRequestError(url, `header '${lower}' value must be a string`);
+    if (/[\r\n]/.test(value)) throw new FetchBodyRequestError(url, `header '${lower}' value contains CR or LF`);
+    if (!/^[\t\x20-\x7e]*$/.test(value)) {
+      throw new FetchBodyRequestError(url, `header '${lower}' value must be printable ASCII`);
+    }
+    if (lower in headers) throw new FetchBodyRequestError(url, `header '${lower}' is given twice`);
+    headers[lower] = value.replace(/^[\t ]+|[\t ]+$/g, '');
+  }
+  return Object.keys(headers).length > 0 ? headers : undefined;
+}
+
+/**
+ * The contract's options as the lanes' request: `undefined` for a bare GET (the pre-0.14.0 call), a
+ * GET carrying the ruleset's headers, or the POST. Checked at runtime too, since a JS ruleset is not
+ * held to the contract's types.
  */
 function toFetchRequest(url: string, opts: FetchBodyOptions | undefined): FetchRequest | undefined {
+  if (opts?.cookies !== undefined) {
+    throw new FetchBodyRequestError(url, 'cookies are not a fetchBody option: the engine owns the cookie jar (contract 0.15.0)');
+  }
   const method: unknown = opts?.method;
   const body: unknown = opts?.body;
   const contentType: unknown = opts?.contentType;
+  const headers = toRequestHeaders(url, opts?.headers);
   if (method === undefined || method === 'GET') {
     if (body !== undefined || contentType !== undefined) {
       throw new FetchBodyRequestError(url, 'a GET carries no body or contentType (send method POST)');
     }
-    return undefined;
+    return headers ? { method: 'GET', headers } : undefined;
   }
   if (method !== 'POST') {
     throw new FetchBodyRequestError(url, `method '${sanitizeForLog(String(method))}' is not supported (GET or POST)`);
@@ -153,7 +197,12 @@ function toFetchRequest(url: string, opts: FetchBodyOptions | undefined): FetchR
   if (contentType !== undefined && typeof contentType !== 'string') {
     throw new FetchBodyRequestError(url, 'contentType must be a string');
   }
-  return { method: 'POST', body: body ?? '', contentType: contentType ?? DEFAULT_POST_CONTENT_TYPE };
+  return {
+    method: 'POST',
+    body: body ?? '',
+    contentType: contentType ?? DEFAULT_POST_CONTENT_TYPE,
+    ...(headers ? { headers } : {}),
+  };
 }
 
 /** Build the `ExtractContext` for one item's extraction (see module doc for `fetchBody`'s contract). */
@@ -228,7 +277,7 @@ export function buildExtractContext(options: BuildExtractContextOptions): Extrac
             await sleep(remaining);
           }
         }
-        const cookies = fetchOpts?.cookies ?? options.cookies;
+        const cookies = options.cookies;
         // Same host scope as the page passthroughs: an off-store follow-up keeps the store's
         // transport/headers but never its residential exit.
         const searchFetch = onDeclaringStore(url) ? options.searchFetch : withoutDeclaredEgress(options.searchFetch);

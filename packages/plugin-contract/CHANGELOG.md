@@ -4,6 +4,27 @@ All notable changes to `@figurecollecting/scraper-plugin-contract` will be docum
 file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this
 package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-09-26
+
+The type surface is additive (every 0.14.0 call still compiles). One runtime change: `cookies` is
+now refused (see Changed); no published ruleset passes it.
+
+### Added
+- `fetchBody(url, { headers? })` and the `FETCH_BODY_ALLOWED_HEADERS` / `FetchBodyHeaderName` /
+  `FetchBodyHeaders` exports. A ruleset may set `origin`, `referer`, `accept`, `accept-language` and
+  `x-requested-with` (names case-insensitive), on a GET or a POST; a ruleset `accept` replaces the
+  transport's default. Any other name (`cookie`, `authorization`, `host`, `user-agent`,
+  `content-length`, `content-type`, `proxy-*`, `sec-*`, …), a name or value with CR or LF, and a
+  value that is not printable ASCII are refused before any request is sent: the engine owns the
+  request's identity (User-Agent, cookies, TLS profile) and framing. The http and impersonate
+  transports send the headers; the browser transport refuses a call that carries any.
+
+### Changed
+- `fetchBody`'s `cookies` option is refused (deprecated in the type). The http and impersonate
+  transports never sent it (only the engine's cookie jar is sent), so the option promised something
+  two of three transports silently dropped; a ruleset cookie map would also have been ruleset-set
+  identity, which the header allowlist refuses.
+
 ## [0.14.0] - 2026-09-25
 
 Additive, backward-compatible: a `fetchBody` call without the new options is the same GET as before.

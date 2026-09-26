@@ -259,7 +259,7 @@ describe('buildExtractContext — scraping.fetchBody', () => {
     expect(capturingFetch).toHaveBeenCalledWith(expect.any(String), expect.anything(), { cookies });
   });
 
-  it('lets a per-call opts.cookies override the context\'s own cookies', async () => {
+  it('refuses a per-call opts.cookies (contract 0.15.0: the engine owns cookies) and sends nothing', async () => {
     const capturingFetch = jest.fn().mockResolvedValue({ html: 'body' });
     const callCookies = { session: 'override' };
 
@@ -276,11 +276,13 @@ describe('buildExtractContext — scraping.fetchBody', () => {
       now: () => 0,
     });
 
-    await ctx.scraping.fetchBody!('https://orzgk.com/wp-json/wc/store/v1/products?type=variation&parent=1', {
-      cookies: callCookies,
-    });
+    await expect(
+      ctx.scraping.fetchBody!('https://orzgk.com/wp-json/wc/store/v1/products?type=variation&parent=1', {
+        cookies: callCookies,
+      }),
+    ).rejects.toThrow(/cookies are not a fetchBody option/);
 
-    expect(capturingFetch).toHaveBeenCalledWith(expect.any(String), expect.anything(), { cookies: callCookies });
+    expect(capturingFetch).not.toHaveBeenCalled();
   });
 
   it('falls back to DEFAULT_FETCH_BODY_GAP_MS when baseDelayMs is not supplied', async () => {
