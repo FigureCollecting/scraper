@@ -75,7 +75,8 @@ import { classifyFetchFailure } from '../services/failureClassifier.js';
 import type { FetchFailureReport, ReportFetchFailure } from '../services/failureReporter.js';
 import type { CrawlerConfig, CrawlerMode } from './config.js';
 import type { Ledger, LedgerGapBand, LedgerGapOrigin, LedgerRange, LedgerStore } from './ledger.js';
-import { createFileListsStateStore, type ListsGroupOutcome, type ListsGroupState, type ListsState, type ListsStateStore } from './listsState.js';
+import { isSafeRotatingName } from '../utils/rotatingName.js';
+import { createFileListsStateStore, setListsGroup, type ListsGroupOutcome, type ListsGroupState, type ListsState, type ListsStateStore } from './listsState.js';
 
 export type { CrawlerConfig, CrawlerMode } from './config.js';
 
@@ -1848,7 +1849,8 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     for (const entry of raw) {
       if (!isPlainObject(entry)) continue;
       const { id, group, order } = entry as Partial<RotatingDecl>;
-      if (typeof id !== 'string' || id === '' || typeof group !== 'string' || group === '') continue;
+      // The catalog route's own rule: a name it would never serve is never fetched nor made a state key.
+      if (!isSafeRotatingName(id) || !isSafeRotatingName(group)) continue;
       if (typeof order !== 'number' || !Number.isFinite(order) || ids.has(id)) continue;
       ids.add(id);
       const g = groups.get(group);
@@ -1958,16 +1960,23 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       delete g.answered;
       delete g.seenIds;
     };
-    // Any answer other than a refusal breaks the group's blocked streak.
-    if (stop !== 'blocked') delete g.blockedStrikes;
+    // Any answer other than a refusal breaks the group's blocked streak and forgets a blocked spend.
+    if (stop !== 'blocked') {
+      delete g.blockedStrikes;
+      delete g.spentBlocked;
+    }
     if (stop === 'blocked') {
       // The store refused US, not this list: no list is asked for the rest of tonight, and the slot
-      // is spent only after BLOCKED_STRIKES_TO_SPEND refusals running, so the rotation moves on.
+      // is spent after BLOCKED_STRIKES_TO_SPEND refusals running — or the first, when the last spend
+      // was one too — so a company refused for good costs one night a cycle.
       g.outcome = 'blocked';
       g.strikes++;
       g.blockedStrikes = (g.blockedStrikes ?? 0) + 1;
       state.pausedUntil = new Date(windowEndMs(window, passAt)).toISOString();
-      if (g.blockedStrikes >= BLOCKED_STRIKES_TO_SPEND) spend('blocked');
+      if (g.spentBlocked === true || g.blockedStrikes >= BLOCKED_STRIKES_TO_SPEND) {
+        spend('blocked');
+        g.spentBlocked = true;
+      }
     } else if (stop === 'transient') {
       g.outcome = 'transient';
       g.strikes++;
@@ -1982,7 +1991,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       g.strikes = ok === 0 ? g.strikes + 1 : 0;
       spend(ok === 0 ? 'failed' : ok < results.length ? 'partial' : 'ok');
     }
-    state.groups[group] = g;
+    setListsGroup(state, group, g);
     st.summary.listsOutcome = g.outcome;
     return interrupted;
   };

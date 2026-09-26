@@ -877,10 +877,15 @@ a stop in one lane (cooldown, challenge, sick scraper) stops every lane below it
   the pass and pauses list fetching until the end of that night's window (`pausedUntil`; delete it from
   the state file to resume early), so one refusal costs one night. The slot is spent (outcome `blocked`)
   only after 3 blocked passes running on the same group, so one refused list cannot freeze the rotation.
-  The backlog keeps draining while paused. A cooling host or a spent budget costs no slot.
+  A slot spent that way is remembered (`spentBlocked`): the group's next refusal spends it at once, and
+  any pass booked as something other than `blocked` forgets it. Steady state for a company refused for
+  good: 3 list requests and 3 nights of list fetching in its first cycle, then 1 request and 1 night per
+  cycle. The backlog keeps draining while paused. A cooling host or a spent budget costs no slot.
+  Declared ids and groups must pass the catalog route's safe-name rule (`[A-Za-z0-9._-]+`, never
+  `__proto__`); the crawler skips any other entry.
 - **State** — `<CRAWLER_LEDGER_DIR>/<siteId>.lists.json`: per group `lastAttemptAt` (the slot),
   `lastTriedAt`, `outcome`, `reason`, `seen` (distinct ids, an id on both lists once), `new`,
-  `enqueued`, `strikes`, `retries`, `blockedStrikes`, and for the open attempt `answered` (its lists)
+  `enqueued`, `strikes`, `retries`, `blockedStrikes`, `spentBlocked`, and for the open attempt `answered` (its lists)
   and `seenIds`; plus the backlog and `pausedUntil`. Its own file: the ledger loader drops
   sections it does not know, so an older engine would erase it, and the weekly seed Job also writes the
   ledger. An unparseable timestamp makes the file corrupt: refused, never overwritten.
