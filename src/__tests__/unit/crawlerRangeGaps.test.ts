@@ -362,20 +362,21 @@ describe('the frontier follows only ids the STORE has shown us', () => {
     const fake = makeFake({
       catalog: (siteId) => ({
         status: 200,
-        body: { siteId, page: 1, items: [{ itemId: '1100', collectUrl: collectUrl(siteId, '1100') }], hasMore: false, count: 1 },
+        body: { siteId, page: 1, items: [{ itemId: '1001', collectUrl: collectUrl(siteId, '1001') }], hasMore: false, count: 1 },
       }),
     });
-    const s = await runCrawlerPass(mkCfg({ mode: 'both', phases: ['recent', 'backfill'], rangeGapBudget: 2, rangeIdsPerRun: 1 }), {
+    // Budget 3: the two re-anchor bands (201, and 1001 the re-anchor records) first, then the operator band.
+    const s = await runCrawlerPass(mkCfg({ mode: 'both', phases: ['recent', 'backfill'], rangeGapBudget: 3, rangeIdsPerRun: 1 }), {
       fetch: fake.fetch,
       ledgerStore: store,
       now: clock().now,
     });
     const enqueued = store.files.get('mfc')!.enqueued;
-    expect(enqueued['1100'].sweptFrom).toBeUndefined();
+    expect(enqueued['1001'].sweptFrom).toBeUndefined();
     expect(enqueued['900'].sweptFrom).toBeUndefined();
     expect(enqueued['101'].sweptFrom).toBe('operator');
     expect(enqueued['201'].sweptFrom).toBe('reanchor');
-    expect(s.stores[0].rangeReanchoredTo).toBe(1100);
+    expect(s.stores[0].rangeReanchoredTo).toBe(1001);
   });
 
   it('a store that has never walked does not seed its descent from an id the sweep wrote', async () => {
@@ -579,8 +580,9 @@ describe('KNOWN-GAP SWEEP', () => {
       ledgerStore: store,
       now: clock().now,
     });
-    // The descent got its 2 (the store cap), the sweep its 3 (its own budget) — neither starved the other.
-    expect(fake.postedIds()).toEqual(['900', '899', '101', '102', '103']);
+    // The sweep got its 3 (its own budget), the descent its 2 (the store cap) — neither starved the other.
+    // The recent-gap sweep runs BEFORE the descent (Ross's precedence, 2026-09-25).
+    expect(fake.postedIds()).toEqual(['101', '102', '103', '900', '899']);
     expect(s.stores[0]).toMatchObject({ enqueued: 2, capApplied: 2, gapEnqueued: 3, gapIdsSwept: 3, gapBudgetApplied: 3 });
   });
 
@@ -696,12 +698,12 @@ describe('KNOWN-GAP SWEEP', () => {
     for (const url of fake.posted()) expect(url).toMatch(/^https:\/\/mfc\.test\/item\/\d+$/);
   });
 
-  it('a cooling host stops the sweep as well as the descent — same store, same egress', async () => {
+  it('a cooling host stops the descent as well as the sweep — same store, same egress', async () => {
     const store = createMemoryLedgerStore({ mfc: walkedLedger('mfc', { cursor: 900, frontier: 1000, gaps: [band(101, 110)] }) });
     const fake = makeFake({ range: (siteId) => cooldown(siteId) });
     const s = await runCrawlerPass(mkCfg({ rangeGapBudget: 5 }), { fetch: fake.fetch, ledgerStore: store, now: clock().now });
-    expect(fake.rangeCalls()).toEqual([[900, 5]]);
-    expect(s.stores[0]).toMatchObject({ rangeSkipped: 'cooldown', gapSkipped: 'store-stopped', gapIdsSwept: 0 });
+    expect(fake.rangeCalls()).toEqual([[105, 5]]);
+    expect(s.stores[0]).toMatchObject({ gapSkipped: 'cooldown', rangeSkipped: 'store-stopped', gapIdsSwept: 0 });
   });
 
   it('a sick scraper mid-sweep stops the lane and keeps the band cursor at the last id handled', async () => {
@@ -753,10 +755,10 @@ describe('KNOWN-GAP SWEEP', () => {
       ledgerStore: store,
       now: clock().now,
     });
-    // The descent is at the floor, so this 503 can only be the SWEEP's window.
+    // The descent is at the floor, so this 503 can only be the SWEEP's window; the descent below it stops too.
     expect(fake.rangeCalls()).toEqual([[105, 5]]);
     expect(openBands(store.files.get('mfc')!)[0].next).toBe(101);
-    expect(s.stores[0]).toMatchObject({ rangeSkipped: 'floor', gapSkipped: 'cooldown', gapIdsSwept: 0, skipped: 1 });
+    expect(s.stores[0]).toMatchObject({ rangeSkipped: 'store-stopped', gapSkipped: 'cooldown', gapIdsSwept: 0, skipped: 1 });
   });
 
   it('a global budget spent on the window GET itself moves nothing and reports budget, not an empty band list', async () => {
@@ -888,6 +890,52 @@ describe('KNOWN-GAP SWEEP', () => {
     expect(fake.calls).toEqual([]);
     expect(store.saveLog).toEqual([]);
     expect(s.stores[0]).toMatchObject({ ledgerCorrupt: true, rangeSkipped: 'store-stopped', gapSkipped: 'store-stopped', rangeReanchoredTo: null });
+  });
+
+  it('TWO TIERS: re-anchor bands (recent gaps) are swept before operator bands, however old those are', async () => {
+    const op = band(101, 102, 101, { origin: 'operator', createdAt: iso(T0 - 4 * WEEK_MS) });
+    const recent = band(501, 502, 501, { origin: 'reanchor', createdAt: iso(T0 - HOUR_MS) });
+    const store = createMemoryLedgerStore({ mfc: sweepOnly([op, recent]) });
+    const fake = makeFake();
+    const s = await runCrawlerPass(mkCfg({ rangeGapBudget: 3, rangeIdsPerRun: 5 }), { fetch: fake.fetch, ledgerStore: store, now: clock().now });
+    // One budget across both tiers: the recent tier's 2, then 1 left for the older tier.
+    expect(fake.postedIds()).toEqual(['501', '502', '101']);
+    expect(s.stores[0]).toMatchObject({ gapIdsSwept: 3, gapSkipped: null, gapBandsOpen: 1 });
+  });
+
+  it('the older tier never overwrites what the recent tier reported', async () => {
+    // Recent tier swept and the older tier has nothing: still `null` (it swept), never `no-gap`.
+    const onlyRecent = createMemoryLedgerStore({ mfc: sweepOnly([band(501, 501)]) });
+    const a = await runCrawlerPass(mkCfg({ rangeGapBudget: 5 }), { fetch: makeFake().fetch, ledgerStore: onlyRecent, now: clock().now });
+    expect(a.stores[0]).toMatchObject({ gapSkipped: null, gapIdsSwept: 1 });
+
+    // Recent tier empty, older tier swept: `null`.
+    const onlyOlder = createMemoryLedgerStore({ mfc: sweepOnly([band(101, 101, 101, { origin: 'operator' })]) });
+    const b = await runCrawlerPass(mkCfg({ rangeGapBudget: 5 }), { fetch: makeFake().fetch, ledgerStore: onlyOlder, now: clock().now });
+    expect(b.stores[0]).toMatchObject({ gapSkipped: null, gapIdsSwept: 1 });
+
+    // The recent tier's stop reason stands: the older tier does not run and does not relabel it.
+    const both = createMemoryLedgerStore({ mfc: sweepOnly([band(501, 510), band(101, 110, 101, { origin: 'operator' })]) });
+    const fake = makeFake({ range: (siteId) => cooldown(siteId) });
+    const c = await runCrawlerPass(mkCfg({ rangeGapBudget: 5 }), { fetch: fake.fetch, ledgerStore: both, now: clock().now });
+    expect(fake.rangeCalls()).toEqual([[505, 5]]);
+    expect(c.stores[0]).toMatchObject({ gapSkipped: 'cooldown' });
+  });
+
+  it('the DRY RUN prints both tiers once, recent tier first', async () => {
+    const info = jest.spyOn(logger, 'info').mockImplementation(() => undefined);
+    try {
+      const op = band(101, 102, 101, { origin: 'operator', createdAt: iso(T0 - 4 * WEEK_MS) });
+      const recent = band(501, 502, 501, { origin: 'reanchor', createdAt: iso(T0 - HOUR_MS) });
+      const store = createMemoryLedgerStore({ mfc: sweepOnly([op, recent]) });
+      const s = await runCrawlerPass(mkCfg({ rangeGapBudget: 5, rangeGapDryRun: true }), { fetch: makeFake().fetch, ledgerStore: store, now: clock().now });
+      const lines = info.mock.calls.filter((call) => String(call[0]).includes('gap sweep DRY RUN'));
+      expect(lines).toHaveLength(1);
+      expect((lines[0][1] as { bands: { band: string }[] }).bands.map((b) => b.band)).toEqual(['501-502', '101-102']);
+      expect(s.stores[0].gapSkipped).toBe('dry-run');
+    } finally {
+      info.mockRestore();
+    }
   });
 
   it('a store that is not id-range walked never sweeps, whatever the budget', async () => {

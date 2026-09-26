@@ -32,6 +32,9 @@
  *             one id at a time (round-robin), oldest first within a store. Its landings are
  *             `reobserveLanded`, its OWN counter — never `enqueued` (which `capApplied` bounds), and
  *             never the shared `reobserved`, which also carries the recent phase's window.
+ *   LISTS   — inside the id-range phase (recent gaps → lists → older gaps → descent), for a store
+ *             with a CRAWLER_LISTS_DRAIN_CAPS entry: at most ONE rotating company-list group per pass
+ *             (in the UTC window, once per interval); its new ids drain COLD on their own budget.
  *   BACKFILL — resume the store's durable page cursor and walk forward up to
  *             backfillPagesPerRun pages, enqueuing NEW ids only (never re-observing).
  *             The cursor advances ONLY when the page reported `hasMore: true` AND every
@@ -72,6 +75,7 @@ import { classifyFetchFailure } from '../services/failureClassifier.js';
 import type { FetchFailureReport, ReportFetchFailure } from '../services/failureReporter.js';
 import type { CrawlerConfig, CrawlerMode } from './config.js';
 import type { Ledger, LedgerGapBand, LedgerGapOrigin, LedgerRange, LedgerStore } from './ledger.js';
+import { createFileListsStateStore, type ListsGroupOutcome, type ListsGroupState, type ListsState, type ListsStateStore } from './listsState.js';
 
 export type { CrawlerConfig, CrawlerMode } from './config.js';
 
@@ -104,6 +108,8 @@ export interface CrawlerDeps {
    * (a failed catalog GET stops that axis for the run), so each exit reports exactly one row.
    */
   reportFailure?: ReportFetchFailure;
+  /** The rotating-lists step's own state files (default: `<siteId>.lists.json` beside the ledgers). */
+  listsStore?: ListsStateStore;
 }
 
 /** What one declared seed list yielded this run (mode `seed` only), in the order the lists were polled. */
@@ -222,6 +228,27 @@ export interface CrawlerStoreSummary {
   gapBudgetApplied: number;
   /** GAP SWEEP: why the sweep did no work this run, `null` when it swept. */
   gapSkipped: GapSkipReason | null;
+  /** LISTS: the rotating-list group chosen this pass, `null` when none was. */
+  listsGroup: string | null;
+  /** LISTS: how that group's attempt was booked (`null` when no attempt was recorded). */
+  listsOutcome: ListsGroupOutcome | null;
+  /** LISTS: the group's lists that answered with a page, and those that failed. */
+  listsFetched: number;
+  listsFailed: number;
+  /** LISTS: distinct ids the group's lists offered (their union). */
+  listsIdsSeen: number;
+  /** LISTS: of those, the ids neither the ledger nor the backlog held — queued for the drain. */
+  listsIdsNew: number;
+  /** LISTS: POSTs the drain landed this pass (COLD). Kept out of `enqueued`, which `capApplied` bounds. */
+  listsEnqueued: number;
+  /** LISTS: the drain backlog after this pass; `null` when the lists state was not read. */
+  listsPending: number | null;
+  /** LISTS: the drain budget the step ran under (0 when it did not run). */
+  listsDrainApplied: number;
+  /** LISTS: why no group was fetched this pass, `null` when one was. */
+  listsSkipped: ListsSkipReason | null;
+  /** LISTS: why the drain stopped short, `null` when it did not. */
+  listsDrainStopped: ListsDrainStopReason | null;
   /**
    * Per-list stats for a `seed`-mode run, in the order the lists were polled. Empty in every other
    * mode, and empty for a store whose seed pass never got a list (no declaration, or a stop).
@@ -263,6 +290,8 @@ export interface CrawlerSummary {
   totalGapIdsSwept: number;
   /** GAP SWEEP: POSTs the sweep landed across every store this run (never counted in `totalEnqueued`). */
   totalGapEnqueued: number;
+  /** LISTS: POSTs the lists drain landed across every store this run (never counted in `totalEnqueued`). */
+  totalListsEnqueued: number;
   totalErrors: number;
   totalSkipped: number;
   /** The per-store enqueue caps that actually applied this run, keyed by siteId (a cap for a store not crawled is not listed). */
@@ -340,6 +369,33 @@ export type GapSkipReason =
   /** /ingest/scrape refused every id a window offered, so the band cursor was kept. */
   | 'window-rejected';
 
+/** Why the LISTS step fetched no group this pass. */
+export type ListsSkipReason =
+  /** No drain cap for the store (or it is not id-range walked): the step is off. */
+  | 'not-configured'
+  /** The id-range phases did not run this pass. */
+  | 'not-run'
+  /** The store was stopped before the step. */
+  | 'store-stopped'
+  /** The lists state file is unreadable or malformed: refused, never overwritten. */
+  | 'state-corrupt'
+  | 'state-failed'
+  /** CRAWLER_LISTS_WINDOW_UTC is unset: lists are never fetched (the backlog still drains). */
+  | 'window-off'
+  | 'outside-window'
+  /** A blocked answer paused list fetching (`pausedUntil` in the lists state); the backlog still drains. */
+  | 'paused'
+  /** Every declared group was attempted within the interval. */
+  | 'none-due'
+  /** The engine does not serve rotating lists (404), or the store declares none (422). */
+  | 'unsupported'
+  | 'cooldown'
+  | 'budget'
+  | 'failed';
+
+/** Why the lists DRAIN stopped short. */
+export type ListsDrainStopReason = StopReason | 'store-stopped';
+
 type PageOutcome = { kind: 'page'; items: CatalogItem[]; hasMore: boolean } | { kind: 'stopped'; reason: StopReason };
 
 /** One seed list the pass will actually poll, plus the declared ids that collapsed onto its url. */
@@ -360,7 +416,14 @@ interface LaneBudget {
   cap: number;
 }
 
-type Phase = 'recent' | 'backfill' | 'range' | 'gap' | 'seed' | 'reobserve';
+type Phase = 'recent' | 'backfill' | 'range' | 'gap' | 'seed' | 'reobserve' | 'lists';
+
+/** What a lane hands `processPage` beyond the items: its own budget, its band origin, its queue priority. */
+interface LaneOptions {
+  budget?: LaneBudget;
+  sweptFrom?: LedgerGapOrigin;
+  priority?: 'COLD';
+}
 
 interface StoreState {
   siteId: string;
@@ -381,6 +444,8 @@ interface StoreState {
   capReached: boolean;
   /** The KNOWN-GAP SWEEP's own budget for the run — SEPARATE from `enqueueCap`, so neither lane starves the other. */
   gapBudget: LaneBudget;
+  /** The LISTS drain's own budget for the run (CRAWLER_LISTS_DRAIN_CAPS). */
+  listsBudget: LaneBudget;
   /** An explicit DISCOVERY cap of 0 pulled this store out of the whole run before any request. */
   pulledOut: boolean;
   /**
@@ -476,6 +541,16 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       logger.warn('[CRAWLER] CRAWLER_RANGE_GAPS names a store that is not id-range walked — no band adopted', { siteId });
     }
   }
+  // The lists step lives inside the id-range phase, so a drain cap anywhere else would do nothing.
+  const listsDrainCaps = config.listsDrainCaps ?? {};
+  const listsCapFor = (siteId: string): number =>
+    config.rangeStores.includes(siteId) && Object.prototype.hasOwnProperty.call(listsDrainCaps, siteId) ? listsDrainCaps[siteId] : 0;
+  for (const siteId of Object.keys(listsDrainCaps)) {
+    if (!stores.includes(siteId) || !config.rangeStores.includes(siteId)) {
+      logger.warn('[CRAWLER] CRAWLER_LISTS_DRAIN_CAPS names a store that is not id-range walked — no lists step', { siteId });
+    }
+  }
+  const listsStore = deps.listsStore ?? createFileListsStateStore(config.ledgerDir);
 
   /**
    * Fire ONE ledger row. Best effort: no reporter is a no-op, and neither a synchronous throw nor a
@@ -560,6 +635,17 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       // An APPLIED budget: 0 until the sweep actually takes this store on (see gapSweep).
       gapBudgetApplied: 0,
       gapSkipped: config.rangeStores.includes(siteId) ? 'not-run' : 'not-configured',
+      listsGroup: null,
+      listsOutcome: null,
+      listsFetched: 0,
+      listsFailed: 0,
+      listsIdsSeen: 0,
+      listsIdsNew: 0,
+      listsEnqueued: 0,
+      listsPending: null,
+      listsDrainApplied: 0,
+      listsSkipped: listsCapFor(siteId) > 0 ? 'not-run' : 'not-configured',
+      listsDrainStopped: null,
       seedLists: [],
       seedStopped: null,
       backfillCursor: null,
@@ -575,6 +661,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     stopped: Object.prototype.hasOwnProperty.call(capOverrides, siteId) && capOverrides[siteId] === 0,
     capReached: false,
     gapBudget: { spent: 0, cap: config.rangeGapBudget },
+    listsBudget: { spent: 0, cap: listsCapFor(siteId) },
     pulledOut: Object.prototype.hasOwnProperty.call(capOverrides, siteId) && capOverrides[siteId] === 0,
     listingUnsupported: false,
     deepestRecentPage: 0,
@@ -624,6 +711,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       totalRangeWalked: perStore.reduce((n, s) => n + s.rangeWalked, 0),
       totalGapIdsSwept: perStore.reduce((n, s) => n + s.gapIdsSwept, 0),
       totalGapEnqueued: perStore.reduce((n, s) => n + s.gapEnqueued, 0),
+      totalListsEnqueued: perStore.reduce((n, s) => n + s.listsEnqueued, 0),
       totalErrors: perStore.reduce((n, s) => n + s.errors, 0),
       totalSkipped: perStore.reduce((n, s) => n + s.skipped, 0),
       enqueueCapOverrides,
@@ -825,10 +913,12 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
   const fetchPage = (st: StoreState, page: number, phase: 'recent' | 'backfill'): Promise<PageOutcome> =>
     fetchCatalog(st, catalogUrl(st.siteId, page), { page }, phase);
 
-  const postOne = async (st: StoreState, collectUrl: string, itemId: string): Promise<PostOutcome> => {
+  const postOne = async (st: StoreState, collectUrl: string, itemId: string, priority?: 'COLD'): Promise<PostOutcome> => {
     let r: GateResult<HttpResponseLike>;
+    // No priority = the queue's default (WARM): every lane but the lists drain posts exactly what it always did.
+    const payload = priority ? { url: collectUrl, priority } : { url: collectUrl };
     try {
-      r = await gate.run(() => httpPostJson(deps.fetch, ingestUrl, { url: collectUrl }, config.requestTimeoutMs));
+      r = await gate.run(() => httpPostJson(deps.fetch, ingestUrl, payload, config.requestTimeoutMs));
     } catch (error) {
       logger.warn('[CRAWLER] ingest errored', { siteId: st.siteId, error: errMsg(error) });
       return 'transient';
@@ -877,14 +967,12 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     items: CatalogItem[],
     phase: Phase,
     /**
-     * The lane's OWN POST budget. Absent = the DISCOVERY budget (`st.posts` / `st.enqueueCap`), which
-     * is what every phase but the gap sweep spends. Passing one swaps BOTH the counter and the
-     * ceiling, so the two lanes can never spend or breach each other's.
+     * `budget` = the lane's OWN POST budget (absent = the discovery budget); it swaps counter AND ceiling,
+     * so lanes never spend each other's. `sweptFrom` is stamped on gap entries; `priority` rides the POST.
      */
-    budget?: LaneBudget,
-    /** GAP SWEEP: the origin of the band this window was cut from, stamped on every entry it writes. */
-    sweptFrom?: LedgerGapOrigin,
+    lane: LaneOptions = {},
   ): Promise<{ newCount: number; allAttempted: boolean; handled: number; accepted: number; rejected: number; stopReason?: StopReason }> => {
+    const { budget, sweptFrom, priority } = lane;
     const ledger = st.ledger!;
     let newCount = 0;
     let allAttempted = true;
@@ -935,7 +1023,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       if (budget) budget.spent++;
       else st.posts++;
       st.attempted.add(item.itemId);
-      const outcome = await postOne(st, item.collectUrl, item.itemId);
+      const outcome = await postOne(st, item.collectUrl, item.itemId, priority);
       switch (outcome) {
         case 'accepted':
         case 'accepted-dedup':
@@ -945,6 +1033,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
           // and `deduplicated` is "of `enqueued`" — a sweep POST in either would make a store summary
           // read as a breached discovery cap. `gapEnqueued` counts coalesced POSTs too: they landed.
           if (phase === 'gap') st.summary.gapEnqueued++;
+          else if (phase === 'lists') st.summary.listsEnqueued++;
           else {
             st.summary.enqueued++;
             if (outcome === 'accepted-dedup') st.summary.deduplicated++;
@@ -1338,6 +1427,10 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     return added;
   };
 
+  // With the lists step on, the lanes below it (older gaps, descent) post COLD too, so FIFO within
+  // COLD keeps the lane order at dispatch; a store without the step posts as it always did.
+  const belowListsPriority = (st: StoreState): 'COLD' | undefined => (st.listsBudget.cap > 0 ? 'COLD' : undefined);
+
   /**
    * KNOWN-GAP SWEEP (D5) — fill the bands the descent will never reach, ASCENDING, oldest band first.
    *
@@ -1359,20 +1452,29 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
    * discovering it. Every request still passes the ONE global gate — concurrency, total budget,
    * dispatch spacing — and the store's pacing downstream is untouched.
    */
-  const gapSweep = async (st: StoreState, range: LedgerRange, commit: () => Promise<boolean>): Promise<void> => {
+  const gapSweep = async (st: StoreState, range: LedgerRange, commit: () => Promise<boolean>, origin: LedgerGapOrigin): Promise<void> => {
+    // TWO TIERS, one budget: the recent gaps ('reanchor' bands) run before the company lists, the
+    // older gaps ('operator' bands) after them. The older tier runs only once the recent tier swept or
+    // found nothing, and never overwrites the reason an earlier tier recorded.
+    const recentTier = origin === 'reanchor';
+    if (!recentTier && st.summary.gapSkipped !== null && st.summary.gapSkipped !== 'no-gap') return;
+    const idle = recentTier || st.summary.gapSkipped === 'no-gap';
     const skip = (reason: GapSkipReason): void => {
-      st.summary.gapSkipped = reason;
+      if (idle) st.summary.gapSkipped = reason;
     };
     const budget = st.gapBudget;
     if (budget.cap <= 0) return skip('not-configured');
-    const bands = openBands(range);
-    if (bands.length === 0) return skip('no-gap');
+    const tierBands = (): LedgerGapBand[] => openBands(range).filter((b) => b.origin === origin);
+    if (tierBands().length === 0) return skip('no-gap');
     // A cooling host, a sick scraper or a failed save stopped the store: the sweep wants the same
     // egress as everything else, so it waits for the next run like every other lane.
     if (st.stopped) return skip('store-stopped');
 
     if (config.rangeGapDryRun) {
       // The BACKLOG, and not one request: what the sweep would walk, for an operator arming a store.
+      // Printed once for both tiers, in the order they sweep.
+      const open = openBands(range);
+      const bands = [...open.filter((b) => b.origin === 'reanchor'), ...open.filter((b) => b.origin !== 'reanchor')];
       const shown = bands.slice(0, 20);
       logger.info('[CRAWLER] id-range gap sweep DRY RUN — bands not swept', {
         siteId: st.siteId,
@@ -1393,7 +1495,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     let stop: GapSkipReason | null = null;
     while (!st.stopped && budget.spent < budget.cap && st.summary.gapIdsSwept < budget.cap) {
       // Re-read each turn: the band just swept may have closed, and the next one is then the oldest.
-      const band = openBands(range)[0];
+      const band = tierBands()[0];
       if (band === undefined) break;
       // Bounded three ways: the engine's window ceiling, what is left of THIS band, and what is left
       // of the run's own allowance — so a generous CRAWLER_RANGE_IDS_PER_RUN cannot overshoot the
@@ -1431,7 +1533,11 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
         stop = 'window-malformed';
         break;
       }
-      const { handled, rejected, stopReason } = await processPage(st, [...out.items].reverse(), 'gap', budget, band.origin);
+      const { handled, rejected, stopReason } = await processPage(st, [...out.items].reverse(), 'gap', {
+        budget,
+        sweptFrom: band.origin,
+        priority: recentTier ? undefined : belowListsPriority(st),
+      });
       if (handled === 0) {
         // Not one id got through, so nothing durable changes. Only the GLOBAL gate can do this: the
         // window was sized to what this lane's own budget still allowed, which makes its first id one
@@ -1483,13 +1589,15 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
         break;
       }
     }
-    if (stop) skip(stop);
+    if (stop) st.summary.gapSkipped = stop;
   };
 
   const descentPhase = async (st: StoreState, range: LedgerRange, commit: () => Promise<boolean>): Promise<void> => {
     const skip = (reason: RangeSkipReason): void => {
       st.summary.rangeSkipped = reason;
     };
+    // A lane above it (a gap sweep, the lists step) stopped the store: same store, same egress.
+    if (st.stopped) return skip('store-stopped');
     // The walk shares the store's enqueue cap and runs LAST, so a listing that spends the whole cap
     // starves it — reported, because it otherwise reads exactly like a store that never walks. The
     // GAP SWEEP is NOT held back by this: it spends its own budget.
@@ -1557,7 +1665,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       });
       return skip('window-malformed');
     }
-    const { handled, rejected } = await processPage(st, out.items, 'range');
+    const { handled, rejected } = await processPage(st, out.items, 'range', { priority: belowListsPriority(st) });
     st.summary.rangeWalked += handled;
     if (handled === 0) {
       // Not one id got through (the cap ran out on the window's very first id, or the budget did):
@@ -1590,21 +1698,380 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     await commit();
   };
 
+  // --- rotating company lists -----------------------------------------------------------------
+
+  /** One declared rotating list, as GET /catalog/rotating reports it. */
+  interface RotatingDecl {
+    id: string;
+    group: string;
+    order: number;
+  }
+
+  /** How one list fetch ended, for the group's booking. */
+  type ListFetch =
+    | { kind: 'ok'; items: CatalogItem[] }
+    | { kind: 'deterministic' | 'transient'; reason: string; blocked: boolean }
+    | { kind: 'cooldown' }
+    | { kind: 'budget' };
+
+  const rotatingUrl = (siteId: string, listId?: string): string =>
+    `${config.scraperServiceUrl}/catalog/rotating?store=${encodeURIComponent(siteId)}${listId === undefined ? '' : `&list=${encodeURIComponent(listId)}`}`;
+
+  /** One GET through the gate, reported raw: the lists step reads statuses its own way. */
+  const listsGet = async (
+    url: string,
+  ): Promise<{ kind: 'budget' } | { kind: 'error'; error: unknown } | { kind: 'res'; status: number; ok: boolean; body: unknown }> => {
+    let r: GateResult<HttpResponseLike>;
+    try {
+      r = await gate.run(() => httpGet(deps.fetch, url, config.requestTimeoutMs));
+    } catch (error) {
+      return { kind: 'error', error };
+    }
+    if (r.status === 'budget-exhausted') {
+      budgetExhausted = true;
+      return { kind: 'budget' };
+    }
+    const body: unknown = await r.value.json().catch(() => undefined);
+    return { kind: 'res', status: r.value.status, ok: r.value.ok, body };
+  };
+
+  /** The failure-ledger class for a failed list, from what the engine said about it. */
+  const listReasonClass = (kind: 'deterministic' | 'transient', reason: string, upstream: number | undefined): FetchFailureReport['reasonClass'] => {
+    if (reason === 'challenge page') return 'challenge';
+    if (upstream !== undefined) {
+      const byStatus: Record<number, FetchFailureReport['reasonClass']> = { 403: 'http_403', 404: 'gone_404', 410: 'gone_410', 429: 'http_429' };
+      return byStatus[upstream] ?? (upstream >= 500 ? 'http_5xx' : 'other');
+    }
+    if (kind === 'deterministic') return 'parse';
+    return /timed? ?out|timeout/i.test(reason) ? 'timeout' : 'network';
+  };
+
+  /** Fetch ONE rotating list and classify the answer. Every failure writes one ledger row. */
+  const fetchRotatingList = async (st: StoreState, listId: string): Promise<ListFetch> => {
+    const r = await listsGet(rotatingUrl(st.siteId, listId));
+    const failed = (kind: 'deterministic' | 'transient', reason: string, blocked: boolean, reasonClass: FetchFailureReport['reasonClass'], httpStatus?: number): ListFetch => {
+      st.summary.errors++;
+      logger.warn('[CRAWLER] rotating list failed', { siteId: st.siteId, list: listId, failure: kind, reason });
+      emitFailure({
+        site: st.siteId,
+        target: listingTarget(st.siteId, 'lists', { list: listId }),
+        kind: 'listing',
+        origin: 'crawler',
+        reasonClass,
+        ...(httpStatus !== undefined ? { httpStatus } : {}),
+        message: reason,
+      });
+      return { kind, reason, blocked };
+    };
+    if (r.kind === 'budget') return { kind: 'budget' };
+    if (r.kind === 'error') {
+      const timeout = classifyFetchFailure({ error: r.error }).reasonClass === 'timeout';
+      return failed('transient', errMsg(r.error), false, timeout ? 'timeout' : 'network');
+    }
+    const body = isPlainObject(r.body) ? r.body : {};
+    if (r.ok) {
+      if (!Array.isArray(body.items)) return failed('deterministic', 'catalog answered 200 with a body that is not a list', false, 'parse');
+      return { kind: 'ok', items: sanitizeItems(body.items) };
+    }
+    if (r.status === 503 && body.error === 'cooldown') {
+      st.summary.skipped++;
+      logger.warn('[CRAWLER] rotating list host cooling — store left alone this run', { siteId: st.siteId, list: listId });
+      return { kind: 'cooldown' };
+    }
+    if (r.status === 502 && (body.failure === 'deterministic' || body.failure === 'transient')) {
+      const reason = typeof body.reason === 'string' ? body.reason : 'catalog failed';
+      const upstream = typeof body.upstreamStatus === 'number' ? body.upstreamStatus : undefined;
+      return failed(body.failure, reason, body.blocked === true, listReasonClass(body.failure, reason, upstream), upstream);
+    }
+    // An engine answer without a failure class: its own 4xx is deterministic, anything else a sick scraper.
+    if (r.status >= 400 && r.status < 500) return failed('deterministic', `rotating list GET answered ${r.status}`, false, 'other');
+    return failed('transient', `rotating list GET answered ${r.status}`, false, 'http_5xx');
+  };
+
+  /** Minutes after UTC midnight inside the window (start inclusive, end exclusive, wrapping midnight). */
+  const inWindow = (w: { startMin: number; endMin: number }, atMs: number): boolean => {
+    const m = Math.floor((((atMs % 86_400_000) + 86_400_000) % 86_400_000) / 60_000);
+    return w.startMin < w.endMin ? m >= w.startMin && m < w.endMin : m >= w.startMin || m < w.endMin;
+  };
+
+  /** The instant the window holding `atMs` closes: a blocked answer pauses the lists for the rest of tonight only. */
+  const windowEndMs = (w: { startMin: number; endMin: number }, atMs: number): number => {
+    const midnight = atMs - (((atMs % 86_400_000) + 86_400_000) % 86_400_000);
+    const end = midnight + w.endMin * 60_000;
+    return w.startMin > w.endMin && atMs - midnight >= w.startMin * 60_000 ? end + 86_400_000 : end;
+  };
+
+  /** A transient failure is retried on the next pass, at most this many times before the slot is spent. */
+  const MAX_LIST_RETRIES = 3;
+  /** Consecutive blocked passes before a group's slot is spent, so one refused list cannot freeze the rotation. */
+  const BLOCKED_STRIKES_TO_SPEND = 3;
+
   /**
-   * The store's whole ID-RANGE axis for one run, in the order the three parts earn their priority:
-   *
-   *   1. RE-ANCHOR + adopt the operator's bands — no requests at all, so they happen even on a store
-   *      whose discovery cap is already spent and whose descent will not move an inch.
-   *   2. DESCENT — the deep id space, on the store's discovery cap.
-   *   3. GAP SWEEP — the bands above the frontier, on its OWN budget, so a spent discovery cap cannot
-   *      starve it. It runs last because the deep walk is the older commitment and the newest ids
-   *      already have the Latest Additions tap watching them.
+   * ROTATE: fetch at most ONE due group and queue its new ids. Returns why no group was fetched, or
+   * null when one was. The group's booking lands in `state`; the caller persists it before draining.
+   */
+  const rotate = async (st: StoreState, state: ListsState): Promise<ListsSkipReason | null> => {
+    const window = config.listsWindow ?? null;
+    if (!window) return 'window-off';
+    const passAt = now();
+    if (!inWindow(window, passAt)) return 'outside-window';
+    if (state.pausedUntil !== undefined) {
+      if (ageMs(state.pausedUntil) < 0) return 'paused';
+      delete state.pausedUntil;
+    }
+
+    const found = await listsGet(rotatingUrl(st.siteId));
+    if (found.kind === 'budget') {
+      st.stopped = true;
+      return 'budget';
+    }
+    if (found.kind === 'error') {
+      st.summary.errors++;
+      st.stopped = true;
+      logger.warn('[CRAWLER] rotating-list declaration errored — store stopped', { siteId: st.siteId, error: errMsg(found.error) });
+      return 'failed';
+    }
+    // 404: an engine that predates the route. 422: the store declares no rotating lists. Neither
+    // costs the store anything, so the lanes below still run.
+    if (found.status === 404 || found.status === 422) return 'unsupported';
+    const raw = isPlainObject(found.body) ? found.body.rotatingSeedLists : undefined;
+    if (!found.ok || !Array.isArray(raw)) {
+      st.summary.errors++;
+      logger.warn('[CRAWLER] rotating-list declaration unusable', { siteId: st.siteId, status: found.status });
+      if (!found.ok) st.stopped = true;
+      return 'failed';
+    }
+
+    // A group's `order` is the lowest any of its lists declares.
+    const groups = new Map<string, { order: number; index: number; lists: string[] }>();
+    const ids = new Set<string>();
+    for (const entry of raw) {
+      if (!isPlainObject(entry)) continue;
+      const { id, group, order } = entry as Partial<RotatingDecl>;
+      if (typeof id !== 'string' || id === '' || typeof group !== 'string' || group === '') continue;
+      if (typeof order !== 'number' || !Number.isFinite(order) || ids.has(id)) continue;
+      ids.add(id);
+      const g = groups.get(group);
+      if (g) {
+        g.lists.push(id);
+        g.order = Math.min(g.order, order);
+      } else groups.set(group, { order, index: groups.size, lists: [id] });
+    }
+    // Least recently attempted first (never = first; `order`, then declaration, break ties): with fewer
+    // slots per interval than groups the cycle stretches instead of starving the tail.
+    const interval = config.listsIntervalMs ?? 160 * 60 * 60 * 1000;
+    // Own keys only: a group named like an Object.prototype member must not read the builtin.
+    const groupState = (name: string): ListsGroupState | undefined =>
+      Object.hasOwn(state.groups, name) ? state.groups[name] : undefined;
+    const lastMs = (name: string): number => {
+      const at = groupState(name)?.lastAttemptAt;
+      return at === undefined ? Number.NEGATIVE_INFINITY : Date.parse(at);
+    };
+    const due = [...groups.entries()]
+      .filter(([name]) => {
+        const at = groupState(name)?.lastAttemptAt;
+        return at === undefined || ageMs(at) >= interval;
+      })
+      .sort(([na, a], [nb, b]) => lastMs(na) - lastMs(nb) || a.order - b.order || a.index - b.index)[0];
+    if (!due) return 'none-due';
+    const [group, { lists }] = due;
+    st.summary.listsGroup = group;
+
+    // An open attempt resumes where it stopped: a list that already answered is not asked again.
+    const prior = groupState(group);
+    const answered: Record<string, 'ok' | 'failed'> = {};
+    for (const id of lists) {
+      if (prior?.answered && Object.hasOwn(prior.answered, id)) answered[id] = prior.answered[id];
+    }
+    const at = iso();
+    const union = new Map<string, CatalogItem>();
+    let fetched = 0;
+    let failed = 0;
+    let reason: string | undefined;
+    let stop: 'transient' | 'blocked' | 'cooldown' | 'budget' | undefined;
+    for (const [i, listId] of lists.filter((id) => !Object.hasOwn(answered, id)).entries()) {
+      if (i > 0) await sleep(config.listsSpacingMs ?? 10_000);
+      const out = await fetchRotatingList(st, listId);
+      if (out.kind === 'budget' || out.kind === 'cooldown') {
+        st.stopped = true;
+        stop = out.kind;
+        break;
+      }
+      if (out.kind === 'ok') {
+        fetched++;
+        answered[listId] = 'ok';
+        for (const it of out.items) if (it.collectUrl && !union.has(it.itemId)) union.set(it.itemId, it);
+        continue;
+      }
+      failed++;
+      reason = out.reason;
+      if (out.blocked || out.kind === 'transient') {
+        st.stopped = true;
+        stop = out.blocked ? 'blocked' : 'transient';
+        break;
+      }
+      answered[listId] = 'failed';
+    }
+    st.summary.listsFetched = fetched;
+    st.summary.listsFailed = failed;
+    st.summary.listsIdsSeen = union.size;
+
+    // Queue what neither the ledger, this run, nor the backlog (another group's copy) already holds.
+    const queued = new Set(state.pending.map((p) => p.itemId));
+    let fresh = 0;
+    for (const it of union.values()) {
+      if (st.ledger!.enqueued[it.itemId] || st.attempted.has(it.itemId) || queued.has(it.itemId)) continue;
+      state.pending.push({ itemId: it.itemId, collectUrl: it.collectUrl as string, group });
+      queued.add(it.itemId);
+      fresh++;
+    }
+    st.summary.listsIdsNew = fresh;
+    const interrupted = stop === 'cooldown' || stop === 'budget' ? stop : null;
+    // The store answered nothing (a cooling host or a closed gate on the first list): nothing to book.
+    if (interrupted && fetched + failed === 0) return interrupted;
+
+    const g: ListsGroupState = prior ?? { lastTriedAt: at, outcome: 'ok', seen: 0, new: 0, enqueued: 0, strikes: 0, retries: 0 };
+    const opening = g.answered === undefined;
+    if (opening) {
+      // A new attempt opens: its counters start from zero.
+      g.seen = 0;
+      g.new = 0;
+      g.enqueued = 0;
+    }
+    // `seen` counts each id once per attempt, even when its lists answer on different passes.
+    const attemptIds = new Set(opening ? [] : (g.seenIds ?? []));
+    for (const id of union.keys()) {
+      if (attemptIds.has(id)) continue;
+      attemptIds.add(id);
+      g.seen++;
+    }
+    g.seenIds = [...attemptIds];
+    g.answered = answered;
+    g.lastTriedAt = at;
+    g.new += fresh;
+    if (reason !== undefined) g.reason = reason;
+    const spend = (outcome: ListsGroupOutcome): void => {
+      g.outcome = outcome;
+      g.lastAttemptAt = at;
+      g.retries = 0;
+      delete g.blockedStrikes;
+      delete g.answered;
+      delete g.seenIds;
+    };
+    // Any answer other than a refusal breaks the group's blocked streak.
+    if (stop !== 'blocked') delete g.blockedStrikes;
+    if (stop === 'blocked') {
+      // The store refused US, not this list: no list is asked for the rest of tonight, and the slot
+      // is spent only after BLOCKED_STRIKES_TO_SPEND refusals running, so the rotation moves on.
+      g.outcome = 'blocked';
+      g.strikes++;
+      g.blockedStrikes = (g.blockedStrikes ?? 0) + 1;
+      state.pausedUntil = new Date(windowEndMs(window, passAt)).toISOString();
+      if (g.blockedStrikes >= BLOCKED_STRIKES_TO_SPEND) spend('blocked');
+    } else if (stop === 'transient') {
+      g.outcome = 'transient';
+      g.strikes++;
+      g.retries++;
+      if (g.retries >= MAX_LIST_RETRIES) spend('transient');
+    } else if (interrupted) {
+      g.outcome = 'interrupted';
+    } else {
+      const results = Object.values(answered);
+      const ok = results.filter((r) => r === 'ok').length;
+      if (ok === results.length) delete g.reason;
+      g.strikes = ok === 0 ? g.strikes + 1 : 0;
+      spend(ok === 0 ? 'failed' : ok < results.length ? 'partial' : 'ok');
+    }
+    state.groups[group] = g;
+    st.summary.listsOutcome = g.outcome;
+    return interrupted;
+  };
+
+  const saveLists = async (st: StoreState, state: ListsState): Promise<boolean> => {
+    state.updatedAt = iso();
+    try {
+      await listsStore.save(state);
+      return true;
+    } catch (error) {
+      st.summary.errors++;
+      logger.warn('[CRAWLER] lists state save failed — no drain this run', { siteId: st.siteId, error: errMsg(error) });
+      return false;
+    }
+  };
+
+  /**
+   * COMPANY LISTS (Ross 2026-09-22/25/26): ROTATE at most one group, persist its booking, then DRAIN the
+   * backlog oldest first, COLD. The ledger is saved before the backlog: a crash between them re-offers
+   * ids the ledger holds, and the next drain drops them without a request.
+   */
+  const listsStep = async (st: StoreState, commit: () => Promise<boolean>): Promise<void> => {
+    const budget = st.listsBudget;
+    if (budget.cap <= 0) return;
+    if (st.stopped) {
+      st.summary.listsSkipped = 'store-stopped';
+      return;
+    }
+    let loaded: ListsState | 'corrupt';
+    try {
+      loaded = await listsStore.load(st.siteId);
+    } catch (error) {
+      st.summary.errors++;
+      st.summary.listsSkipped = 'state-failed';
+      logger.warn('[CRAWLER] lists state load failed — lists step skipped', { siteId: st.siteId, error: errMsg(error) });
+      return;
+    }
+    if (loaded === 'corrupt') {
+      st.summary.errors++;
+      st.summary.listsSkipped = 'state-corrupt';
+      logger.warn('[CRAWLER] lists state corrupt — lists step refused, file left untouched', { siteId: st.siteId });
+      return;
+    }
+    const state = loaded;
+    st.summary.listsDrainApplied = budget.cap;
+    st.summary.listsSkipped = await rotate(st, state);
+    st.summary.listsPending = state.pending.length;
+    if (!(await saveLists(st, state))) {
+      st.summary.listsDrainStopped = 'failed';
+      return;
+    }
+
+    const ledger = st.ledger!;
+    state.pending = state.pending.filter((p) => !ledger.enqueued[p.itemId] && !st.attempted.has(p.itemId));
+    if (st.stopped) st.summary.listsDrainStopped = 'store-stopped';
+    else {
+      const slice = state.pending.slice(0, Math.max(0, budget.cap - budget.spent));
+      const { handled, stopReason } = await processPage(
+        st,
+        slice.map((p) => ({ itemId: p.itemId, collectUrl: p.collectUrl })),
+        'lists',
+        { budget, priority: 'COLD' },
+      );
+      for (const p of slice.slice(0, handled)) {
+        const g = Object.hasOwn(state.groups, p.group) ? state.groups[p.group] : undefined;
+        if (g && ledger.enqueued[p.itemId]) g.enqueued++;
+      }
+      state.pending.splice(0, handled);
+      if (stopReason) st.summary.listsDrainStopped = stopReason;
+      if (!(await commit())) {
+        st.summary.listsDrainStopped = 'failed';
+        return;
+      }
+    }
+    st.summary.listsPending = state.pending.length;
+    await saveLists(st, state);
+  };
+
+  /**
+   * The store's ID-RANGE axis in Ross's precedence (2026-09-25), below the tap: re-anchor + adopt bands
+   * (no requests) → recent gaps ('reanchor') → company lists → older gaps ('operator') → descent. Each
+   * lane has its own budget; order decides the GLOBAL budget, and a stop in one lane stops those below.
    */
   const rangePhase = async (st: StoreState): Promise<void> => {
     if (!config.rangeStores.includes(st.siteId)) return;
     const skipBoth = (reason: RangeSkipReason & GapSkipReason): void => {
       st.summary.rangeSkipped = reason;
       st.summary.gapSkipped = reason;
+      if (st.listsBudget.cap > 0) st.summary.listsSkipped = 'store-stopped';
     };
     if (!st.ledger) return skipBoth('store-stopped');
     // A 422 on the LISTING axis says nothing about this one — mfc has no byListing yet but a full id
@@ -1634,8 +2101,10 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     const adopted = adoptOperatorGaps(st, range);
     if ((adopted || reanchored) && !(await commit())) return skipBoth('failed');
 
+    await gapSweep(st, range, commit, 'reanchor');
+    await listsStep(st, commit);
+    await gapSweep(st, range, commit, 'operator');
     await descentPhase(st, range, commit);
-    await gapSweep(st, range, commit);
   };
 
   /**

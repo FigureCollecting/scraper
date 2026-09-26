@@ -16,11 +16,12 @@ import {
   requireResidentialProxy,
 } from './residentialEgress.js';
 
-export interface FetchSearchTransports {
+/** `R` is what the http and impersonate lanes answer: the bare body, or a status-aware detail of it. */
+export interface FetchSearchTransports<R = string> {
   /** Plain HTTP GET (Tier-1 cookieless JSON). */
-  http: (url: string) => Promise<string>;
+  http: (url: string) => Promise<R>;
   /** impit TLS-impersonating GET (Cloudflare-fronted JSON APIs). `prime` primes a session-gated host; `proxyUrl` is residential egress. */
-  impersonate: (url: string, opts: { browser?: string; headers?: Record<string, string>; userAgent?: string; prime?: { url: string }; proxyUrl?: string }) => Promise<string>;
+  impersonate: (url: string, opts: { browser?: string; headers?: Record<string, string>; userAgent?: string; prime?: { url: string }; proxyUrl?: string }) => Promise<R>;
   /** Pooled browser navigation (rendered-DOM / JS-challenge). Optional — degrades to http if absent. */
   browser?: (url: string, opts?: { headers?: Record<string, string>; userAgent?: string; cookies?: Record<string, string>; proxyServer?: string; waitFor?: WaitForReadiness; challengeGated?: boolean; primeUrl?: string; navTimeoutMs?: number }) => Promise<string>;
 }
@@ -34,9 +35,9 @@ export interface FetchSearchDeps {
 }
 
 /** Build the per-store search fetcher from the three transports. */
-export function makeFetchSearch(t: FetchSearchTransports, deps: FetchSearchDeps = {}) {
+export function makeFetchSearch<R = string>(t: FetchSearchTransports<R>, deps: FetchSearchDeps = {}) {
   const resolveProxy = deps.residentialProxyUrl ?? getResidentialProxyUrl;
-  return async function fetchSearch(url: string, searchFetch: SearchFetch): Promise<string> {
+  return async function fetchSearch(url: string, searchFetch: SearchFetch): Promise<R | string> {
     // EGRESS (once per call): a store declaring `residential` fetches through the configured proxy;
     // with none configured this THROWS rather than letting the request out of the node IP. Every
     // other store resolves to `undefined` and takes exactly its pre-0.7.0 path.

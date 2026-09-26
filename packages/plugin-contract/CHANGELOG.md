@@ -4,6 +4,18 @@ All notable changes to `@figurecollecting/scraper-plugin-contract` will be docum
 file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this
 package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0] - 2026-09-26
+
+Additive, backward-compatible: a ruleset that declares nothing behaves exactly as before.
+
+### Added
+- `RetrievalCapability.rotatingSeedLists?: RotatingSeedList[]` (and the `RotatingSeedList` export) —
+  `{ id, url, group, order }`. Declared pages the engine polls one GROUP per pass on its own
+  rotation (every list of the group in that pass; groups by ascending `order`), parsed by
+  `extractSeedList(body, listId)`. A separate field from `seedLists`, so an engine that predates it
+  never polls these pages and the exclusive seed pass never lists them. Ids share one namespace with
+  `seedLists`. An `id` or `group` outside `[A-Za-z0-9._-]`, or equal to `__proto__`, is dropped.
+
 ## [0.15.0] - 2026-09-26
 
 The type surface is additive (every 0.14.0 call still compiles). One runtime change: `cookies` is

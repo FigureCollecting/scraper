@@ -186,7 +186,7 @@ export interface ScrapeQueueStore {
   remove(id: string): void;
   /** Move a resident row out of the working set without losing it. */
   park(id: string): void;
-  /** Flip up to `limit` parked rows back to pending and return them, oldest first. */
+  /** Flip up to `limit` parked rows back to pending and return them, highest priority then oldest first. */
   pageIn(limit: number, opts?: { skipHosts?: readonly string[] }): PersistedQueueItem[];
   /**
    * Whether ANY row (pending, leased or parked) holds this dedup key. The queue's dedup path asks
@@ -550,6 +550,7 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
     }
   };
 
+  const PRIORITY_RANK = "CASE priority WHEN 'HOT' THEN 0 WHEN 'WARM' THEN 1 ELSE 2 END";
   const pageInStmt = (limit: number, skipHosts: readonly string[]): PersistedQueueItem[] => {
     // A host already at its in-memory cap is skipped IN SQL, so a capped host's backlog never
     // consumes the page-in budget only to be re-parked.
@@ -560,7 +561,8 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
     const rows = read(
       () =>
         db
-          .prepare(`SELECT * FROM queue_items WHERE ${where} ORDER BY enqueued_at ASC LIMIT ?`)
+          // Priority before age: a parked WARM row must not wait behind every older parked COLD one.
+          .prepare(`SELECT * FROM queue_items WHERE ${where} ORDER BY ${PRIORITY_RANK}, enqueued_at ASC LIMIT ?`)
           .all(...skipHosts, limit) as unknown as ItemRow[],
       [] as ItemRow[]
     );
