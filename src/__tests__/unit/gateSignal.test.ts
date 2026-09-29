@@ -277,3 +277,65 @@ describe('observeGate — the one call a fetch site makes after a non-challenge 
     expect(store.markStale).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * Challenger round 1 on PR #334:
+ *   - A site that saw NO status (a bare-body lane) cannot prove a clean fetch: a non-empty body there
+ *     neither resets the host's run nor may mark it FRESH. Its body can still prove an EMPTY answer.
+ *   - A store on the RESIDENTIAL exit is gated by its egress: the thing at risk is Ross's home IP, and
+ *     rulesets projects `access` onto searchFetch only for browser-lane profiles, so mfc (impersonate
+ *     + residential) was gated only while the cf-cookies Secret held a jar for it.
+ *   - An EMPTY 404 / 410 is the store's own "gone" answer, not a refused gate; an empty 403 is refused.
+ */
+describe('gateSignal — round 1: status-blind sites, residential egress, empty gone answers', () => {
+  beforeEach(() => {
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  const MFC_SEARCH_FETCH = { transport: 'impersonate' as const, browser: 'chrome142', egress: 'residential' as const };
+
+  it('a status-blind outcome with a real body is NOT clean: no reset, verdict "other"', () => {
+    expect(isCleanFetch({ body: BODY, statusBlind: true } as never)).toBe(false);
+    const cooldown = new ChallengeCooldown({ now: () => 1, windowMs: MIN, gateFailureThreshold: 5 });
+    const store = fakeStore([HOST]);
+    for (let i = 0; i < 4; i++) cooldown.recordGateFailure(HOST, 'queue empty 500');
+    const verdict = observeGate({ cooldown, store }, { url: URL_, host: HOST, lane: 'browser', body: BODY, statusBlind: true } as never);
+    expect({ verdict, run: cooldown.gateFailureCount(HOST), stale: store.markStale.mock.calls.length }).toEqual({ verdict: 'other', run: 4, stale: 0 });
+  });
+
+  it('a status-blind EMPTY body from a gated host is still a gate failure (the body alone proves it)', () => {
+    const cooldown = new ChallengeCooldown({ now: () => 1, windowMs: MIN, gateFailureThreshold: 5 });
+    const store = fakeStore([HOST]);
+    const verdict = observeGate({ cooldown, store }, { url: URL_, host: HOST, lane: 'browser', body: '', statusBlind: true } as never);
+    expect(verdict).toBe('gate_failure');
+    expect(store.markStale).toHaveBeenCalledWith(HOST, 'browser', 'gate failure via browser transport: no status with an empty body');
+  });
+
+  it('the mfc capability shape rulesets 0.9.31 ships (impersonate + chrome142 + residential) is gated WITHOUT a stored jar', () => {
+    expect(isGatedHost(fakeStore([]), 'https://myfigurecollection.net/item/2253259', MFC_SEARCH_FETCH)).toBe(true);
+    expect(isGatedHost(fakeStore([]), URL_, { transport: 'browser', egress: 'residential' })).toBe(true);
+    expect(isGatedHost(fakeStore([]), URL_, { transport: 'impersonate', egress: 'direct' } as never)).toBe(false);
+  });
+
+  it('observeGate: an empty 500 from the residential mfc shape with NO jar is one strike (and nothing to mark stale)', () => {
+    const cooldown = new ChallengeCooldown({ now: () => 1, windowMs: MIN, gateFailureThreshold: 1 });
+    const store = fakeStore([]);
+    const url = 'https://myfigurecollection.net/item/2253259';
+    expect(observeGate({ cooldown, store }, { url, host: 'myfigurecollection.net', lane: 'impersonate', searchFetch: MFC_SEARCH_FETCH, status: 500, body: '' })).toBe('gate_failure');
+    expect(cooldown.isOpen('myfigurecollection.net')).toBe(true);
+    expect(store.markStale).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [404, 'other'],
+    [410, 'other'],
+    [403, 'gate_failure'],
+    [429, 'gate_failure'],
+  ])('an EMPTY %s from a gated host → %s', (status, expected) => {
+    const cooldown = new ChallengeCooldown({ now: () => 1, windowMs: MIN, gateFailureThreshold: 99 });
+    const store = fakeStore([HOST]);
+    const verdict = observeGate({ cooldown, store }, { url: URL_, host: HOST, lane: 'impersonate', status, body: '' });
+    expect({ verdict, run: cooldown.gateFailureCount(HOST) }).toEqual({ verdict: expected, run: expected === 'other' ? 0 : 1 });
+  });
+});

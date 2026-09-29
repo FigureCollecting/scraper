@@ -12,6 +12,7 @@ import { assembleLookup, type LookupServices } from '../../driver/assembleLookup
 import { assembleCatalog, type CatalogServices } from '../../driver/assembleCatalog';
 import { buildProfileRegistry, ProfileRegistry } from '../../driver/profileRegistry';
 import { ChallengeCooldown } from '../../services/challengeCooldown';
+import { createImpitFetchers } from '../../services/impitFetch';
 import type { ExtractionRuleset, ListingPage, SearchCandidate, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
 
 const HOST = 'gated.example.test';
@@ -54,10 +55,18 @@ describe('/lookup search fan-out × gate rule', () => {
     extractCandidates: () => CANDS,
   };
 
-  const services = (body: string, cd: ChallengeCooldown, store: ReturnType<typeof fakeStore>, caps: StoreCapabilities = STORE): LookupServices => ({
+  // A bare string is a status-blind lane (fetchSearch only); an object is what the status-aware
+  // lane answers, wired as fetchSearchDetail exactly as the engine's wireServices does.
+  const services = (
+    fetched: string | { body: string; status?: number },
+    cd: ChallengeCooldown,
+    store: ReturnType<typeof fakeStore>,
+    caps: StoreCapabilities = STORE,
+  ): LookupServices => ({
     profiles: buildProfileRegistry([caps]),
     getRulesetForUrl: () => rs,
-    fetchSearch: jest.fn(async () => body),
+    fetchSearch: jest.fn(async () => (typeof fetched === 'string' ? fetched : fetched.body)),
+    ...(typeof fetched === 'string' ? {} : { fetchSearchDetail: jest.fn(async () => fetched) }),
     challengeCooldown: cd,
     cfCookieStore: store,
   });
@@ -84,11 +93,11 @@ describe('/lookup search fan-out × gate rule', () => {
     ]);
   });
 
-  it('a real search body still marks FRESH and resets the run', async () => {
+  it('a real 2xx search body still marks FRESH and resets the run', async () => {
     const cd = new ChallengeCooldown({ now: () => 1, windowMs: MIN, gateFailureThreshold: 5 });
     cd.recordGateFailure(HOST, 'r');
     const store = fakeStore([HOST]);
-    await assembleLookup(services('{"products":[]}', cd, store)).lookup('marin');
+    await assembleLookup(services({ status: 200, body: '{"products":[]}' }, cd, store)).lookup('marin');
 
     expect(store.markFresh).toHaveBeenCalledWith(HOST);
     expect(store.markStale).not.toHaveBeenCalled();
@@ -149,11 +158,11 @@ describe('/catalog axes × gate rule', () => {
     expect(cd.isOpen(HOST)).toBe(true);
   });
 
-  it('listing page: a real body still marks FRESH and resets the run', async () => {
+  it('listing page: a real 2xx body still marks FRESH and resets the run', async () => {
     const cd = new ChallengeCooldown({ now: () => 1, windowMs: MIN });
     cd.recordGateFailure(HOST, 'r');
     const store = fakeStore([HOST]);
-    await assembleCatalog(services('<html>list</html>', cd, store)).catalog('gatedstore', 1);
+    await assembleCatalog(services({ status: 200, body: '<html>list</html>' }, cd, store)).catalog('gatedstore', 1);
 
     expect(store.markFresh).toHaveBeenCalledWith(HOST);
     expect(cd.gateFailureCount(HOST)).toBe(0);
@@ -178,7 +187,7 @@ describe('/catalog axes × gate rule', () => {
     expect(cd.gateFailureCount(HOST)).toBe(1);
 
     const cleanStore = fakeStore([HOST]);
-    await assembleCatalog(services('<html>seed</html>', cd, cleanStore)).seed('gatedstore', 'featured');
+    await assembleCatalog(services({ status: 200, body: '<html>seed</html>' }, cd, cleanStore)).seed('gatedstore', 'featured');
     expect(cleanStore.markFresh).toHaveBeenCalledWith(HOST);
     expect(cd.gateFailureCount(HOST)).toBe(0);
   });
@@ -203,5 +212,165 @@ describe('/catalog axes × gate rule', () => {
     expect(store.markStale).not.toHaveBeenCalled();
     expect(cd.isOpen(HOST)).toBe(false);
     expect(cd.gateFailureCount(HOST)).toBe(0);
+  });
+});
+
+/**
+ * Challenger round 1 on PR #334 — the three sites above were fed the BARE-BODY lanes in production
+ * (wireServices: `impersonate: impitFetchBody`, which drops the status the lane saw), so a 500
+ * "Internal Server Error" or a 403 "Security check" page from a gated host counted as clean: it
+ * marked the host FRESH and reset the SHARED run. Now:
+ *   - each site reads the status-aware lane (fetchSearchDetail, the same impit / http sessions), so
+ *     the status reaches the gate;
+ *   - a site that still saw NO status (the browser lane, a bare-body composition) cannot prove clean:
+ *     a non-empty body there neither resets the run nor marks FRESH;
+ *   - a gate failure at a /catalog axis is reported `failed`, never parsed as a page (an empty or
+ *     refused listing must not read as "end of catalog").
+ */
+describe('round 1 — the status the lane saw reaches the gate at /lookup and /catalog', () => {
+  const INTERNAL_ERROR = 'Internal Server Error';
+  const SECURITY_CHECK = '<html><head><title>Security check | MyFigure</title></head><body>' + 'x'.repeat(37_000) + '</body></html>';
+  /** The REAL impit lanes (both surfaces over one session) over a fake native impit answering `status` + `text`. */
+  const impitAnswering = (status: number, text: string) =>
+    createImpitFetchers(async () => ({ fetch: async () => ({ status, text: async () => text }) }) as never, {
+      store: { cookiesFor: () => undefined, userAgentFor: () => undefined },
+    });
+
+  const LOOKUP_STORE: StoreCapabilities = {
+    siteId: 'gatedstore', name: 'gatedstore', domains: [HOST],
+    rateLimit: { domain: HOST, baseDelayMs: 0, minDelayMs: 0, maxDelayMs: 100, backoffMultiplier: 2, recoveryDivisor: 2, successThreshold: 3 },
+    requiresBrowser: false, allowedCookies: [],
+    retrieval: { bySearch: { urlTemplate: `https://${HOST}/search?q={q}`, scope: 'listed' } },
+    searchFetch: { transport: 'impersonate', browser: 'chrome142' },
+  };
+  const lookupRs = { siteId: 'gatedstore', version: '1.0.0', extract: jest.fn(), validate: jest.fn(), extractCandidates: () => [] } as unknown as ExtractionRuleset;
+  const CAT_STORE: StoreCapabilities = {
+    ...LOOKUP_STORE,
+    retrieval: {
+      byListing: { urlTemplate: `https://${HOST}/new?page={page}`, order: 'newest' },
+      seedLists: [{ id: 'featured', url: `https://${HOST}/featured`, cadence: 'weekly' }],
+    },
+  };
+  const listing: ListingPage = { items: [{ itemId: '11' }], hasMore: false };
+  const catRs = () => ({
+    siteId: 'gatedstore', version: '1', extract: jest.fn(), validate: jest.fn(),
+    extractListing: jest.fn(() => listing), extractSeedList: jest.fn(() => listing),
+  }) as unknown as ExtractionRuleset & { extractListing: jest.Mock; extractSeedList: jest.Mock };
+  const struck = (n: number, threshold = 5) => {
+    const cd = new ChallengeCooldown({ now: () => 1, windowMs: MIN, gateFailureThreshold: threshold });
+    for (let i = 0; i < n; i++) cd.recordGateFailure(HOST, 'queue empty 500');
+    return cd;
+  };
+  const lookupOver = (lane: ReturnType<typeof impitAnswering>, cd: ChallengeCooldown, store: ReturnType<typeof fakeStore>, statusAware = true) =>
+    assembleLookup({
+      profiles: buildProfileRegistry([LOOKUP_STORE]),
+      getRulesetForUrl: () => lookupRs,
+      fetchSearch: (url) => lane.body(url),
+      ...(statusAware ? { fetchSearchDetail: (url: string) => lane.detailed(url) } : {}),
+      challengeCooldown: cd,
+      cfCookieStore: store,
+    } as LookupServices);
+  const catalogOver = (lane: ReturnType<typeof impitAnswering>, cd: ChallengeCooldown, store: ReturnType<typeof fakeStore>, rs = catRs(), statusAware = true) => {
+    const profiles = new ProfileRegistry();
+    profiles.register(CAT_STORE);
+    return assembleCatalog({
+      profiles,
+      getRulesetForUrl: () => rs,
+      fetchSearch: (url) => lane.body(url),
+      ...(statusAware ? { fetchSearchDetail: (url: string) => lane.detailed(url) } : {}),
+      challengeCooldown: cd,
+      cfCookieStore: store as unknown as CatalogServices['cfCookieStore'],
+    });
+  };
+
+  it('B0 (fact) the detailed impit lane sees HTTP 500; the body lane hands back only the text', async () => {
+    const lane = impitAnswering(500, INTERNAL_ERROR);
+    expect(await lane.detailed(`https://${HOST}/search?q=x`)).toMatchObject({ status: 500, body: INTERNAL_ERROR });
+    expect(await lane.body(`https://${HOST}/search?q=x`)).toBe(INTERNAL_ERROR);
+  });
+
+  it('B1 /lookup: a 500 "Internal Server Error" from a gated host is a strike and a stale mark, never FRESH', async () => {
+    const cd = struck(4);
+    const store = fakeStore([HOST]);
+    await lookupOver(impitAnswering(500, INTERNAL_ERROR), cd, store).lookup('marin');
+    expect({ fresh: store.markFresh.mock.calls.length, run: cd.gateFailureCount(HOST), open: cd.isOpen(HOST) }).toEqual({ fresh: 0, run: 5, open: true });
+    expect(store.markStale).toHaveBeenCalledWith(HOST, 'impersonate', 'gate failure via impersonate transport: HTTP 500');
+  });
+
+  it('B2 /lookup: a 403 "Security check" page (not a CF interstitial) neither marks FRESH nor resets the run', async () => {
+    const cd = struck(4);
+    const store = fakeStore([HOST]);
+    await lookupOver(impitAnswering(403, SECURITY_CHECK), cd, store).lookup('marin');
+    expect({ fresh: store.markFresh.mock.calls.length, run: cd.gateFailureCount(HOST) }).toEqual({ fresh: 0, run: 4 });
+  });
+
+  it('B1b /lookup on a STATUS-BLIND lane (browser, bare-body composition): a non-empty body proves nothing — no FRESH, no reset', async () => {
+    for (const [status, text] of [[500, INTERNAL_ERROR], [403, SECURITY_CHECK], [200, '{"products":[]}']] as const) {
+      const cd = struck(4);
+      const store = fakeStore([HOST]);
+      await lookupOver(impitAnswering(status, text), cd, store, false).lookup('marin');
+      expect({ status, fresh: store.markFresh.mock.calls.length, run: cd.gateFailureCount(HOST) }).toEqual({ status, fresh: 0, run: 4 });
+    }
+  });
+
+  it('B3 /catalog listing + seed: a 500 "Internal Server Error" from a gated host is `failed`, a strike each, never FRESH, never parsed', async () => {
+    const lane = impitAnswering(500, INTERNAL_ERROR);
+    const cd = struck(0, 99);
+    const store = fakeStore([HOST]);
+    const rs = catRs();
+    const cat = catalogOver(lane, cd, store, rs);
+    const listOut = await cat.catalog('gatedstore', 1);
+    const seedOut = await cat.seed('gatedstore', 'featured');
+    expect(listOut).toEqual({ status: 'failed', siteId: 'gatedstore', reason: 'gate failure via impersonate transport: HTTP 500' });
+    expect(seedOut).toEqual({ status: 'failed', siteId: 'gatedstore', reason: 'store answered 500' });
+    expect({ fresh: store.markFresh.mock.calls.length, run: cd.gateFailureCount(HOST) }).toEqual({ fresh: 0, run: 2 });
+    expect(rs.extractListing).not.toHaveBeenCalled();
+    expect(rs.extractSeedList).not.toHaveBeenCalled();
+  });
+
+  it('B3b /catalog listing + seed: a 403 "Security check" page neither marks FRESH nor resets the run', async () => {
+    const cd = struck(4);
+    const store = fakeStore([HOST]);
+    const cat = catalogOver(impitAnswering(403, SECURITY_CHECK), cd, store);
+    await cat.catalog('gatedstore', 1);
+    await cat.seed('gatedstore', 'featured');
+    expect({ fresh: store.markFresh.mock.calls.length, run: cd.gateFailureCount(HOST) }).toEqual({ fresh: 0, run: 4 });
+  });
+
+  it('B3c /catalog on a STATUS-BLIND lane: a non-empty listing / seed body neither marks FRESH nor resets the run', async () => {
+    const cd = struck(4);
+    const store = fakeStore([HOST]);
+    const cat = catalogOver(impitAnswering(200, '<html>list</html>'), cd, store, catRs(), false);
+    expect(await cat.catalog('gatedstore', 1)).toMatchObject({ status: 'ok' });
+    expect(await cat.seed('gatedstore', 'featured')).toMatchObject({ status: 'ok' });
+    expect({ fresh: store.markFresh.mock.calls.length, run: cd.gateFailureCount(HOST) }).toEqual({ fresh: 0, run: 4 });
+  });
+
+  it('a gate failure at a /catalog axis is never parsed: an EMPTY 200 listing or seed from a gated host is `failed`', async () => {
+    const cd = struck(0, 99);
+    const store = fakeStore([HOST]);
+    const rs = catRs();
+    const cat = catalogOver(impitAnswering(200, ''), cd, store, rs);
+    expect(await cat.catalog('gatedstore', 1)).toEqual({ status: 'failed', siteId: 'gatedstore', reason: 'gate failure via impersonate transport: HTTP 200 with an empty body' });
+    expect(await cat.seed('gatedstore', 'featured')).toEqual({ status: 'failed', siteId: 'gatedstore', reason: 'gate failure via impersonate transport: HTTP 200 with an empty body' });
+    expect(rs.extractListing).not.toHaveBeenCalled();
+    expect(rs.extractSeedList).not.toHaveBeenCalled();
+    expect(cd.gateFailureCount(HOST)).toBe(2);
+  });
+
+  it('the status-aware lane still proves a real 2xx at every site: FRESH, run reset', async () => {
+    const lane = impitAnswering(200, '<html>real page</html>');
+    const lookupCd = struck(3);
+    const lookupStore = fakeStore([HOST]);
+    await lookupOver(lane, lookupCd, lookupStore).lookup('marin');
+    expect({ fresh: lookupStore.markFresh.mock.calls.length, run: lookupCd.gateFailureCount(HOST) }).toEqual({ fresh: 1, run: 0 });
+
+    const catCd = struck(3);
+    const catStore = fakeStore([HOST]);
+    const cat = catalogOver(lane, catCd, catStore);
+    expect(await cat.catalog('gatedstore', 1)).toMatchObject({ status: 'ok' });
+    catCd.recordGateFailure(HOST, 'r');
+    expect(await cat.seed('gatedstore', 'featured')).toMatchObject({ status: 'ok' });
+    expect({ fresh: catStore.markFresh.mock.calls.length, run: catCd.gateFailureCount(HOST) }).toEqual({ fresh: 2, run: 0 });
   });
 });

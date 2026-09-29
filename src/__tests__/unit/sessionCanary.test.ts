@@ -198,7 +198,11 @@ describe('observeMfcItemFetch — the pair assembled from ordinary queue traffic
     const view = sessionCanaryView(ENV);
     expect(view.stale).toBe(true);
     expect(view.staleReason).toMatch(/5xx or an empty body/);
-    expect(warn.mock.calls.map((c) => String(c[0])).filter((l) => l.includes('[MFC SESSION]'))).toHaveLength(1);
+    const lines = warn.mock.calls.map((c) => String(c[0])).filter((l) => l.includes('[MFC SESSION]'));
+    expect(lines).toHaveLength(1);
+    // The transition line names the GATE refusal, not the entitlement 404 (they send the operator to different places).
+    expect(lines[0]).toContain('answered 5xx or an empty body');
+    expect(lines[0]).not.toContain('canary item 404');
   });
 
   it('goes STALE on a 5xx WITH a body for the canary item too', () => {

@@ -48,6 +48,9 @@ import { createExtractionRegistry, ExtractionRegistryImpl } from '../../services
 import { resetSessionManager } from '../../services/sessionManager';
 import { getCfCookieStore, resetCfCookieStore } from '../../services/cookieJar';
 import { sessionCanaryView, resetSessionCanary } from '../../services/sessionCanary';
+import { assembleCatalog } from '../../driver/assembleCatalog';
+import { ProfileRegistry } from '../../driver/profileRegistry';
+import { createImpitFetchers } from '../../services/impitFetch';
 import type { FetchFailureReport } from '../../services/failureReporter';
 
 const HOST = 'gated.example.test';
@@ -80,7 +83,7 @@ function makeRuleset(): ExtractionRuleset {
   };
 }
 
-function makeRegistry(domain: string): ExtractionRegistryImpl {
+function makeRegistry(domain: string, searchFetch: StoreCapabilities['searchFetch'] = { transport: 'impersonate', browser: 'chrome142' }): ExtractionRegistryImpl {
   const registry = createExtractionRegistry();
   const caps: StoreCapabilities = {
     siteId: SITE,
@@ -89,7 +92,7 @@ function makeRegistry(domain: string): ExtractionRegistryImpl {
     rateLimit: { domain, baseDelayMs: 1000, minDelayMs: 500, maxDelayMs: 5000, backoffMultiplier: 1.5, recoveryDivisor: 1.5, successThreshold: 3 },
     requiresBrowser: false,
     allowedCookies: [],
-    searchFetch: { transport: 'impersonate', browser: 'chrome142' },
+    searchFetch,
   };
   registry.registerSite(caps);
   registry.registerRuleset(makeRuleset());
@@ -154,9 +157,10 @@ describe('ScrapeQueue × gate failures (empty body / 5xx from a gated host)', ()
     cd: ChallengeCooldown;
     store: ReturnType<typeof fakeStore> | null;
     domain?: string;
+    searchFetch?: StoreCapabilities['searchFetch'];
   }): ScrapeQueue {
     const q = new ScrapeQueue(false);
-    q.setPluginRegistry(makeRegistry(opts.domain ?? HOST));
+    q.setPluginRegistry(makeRegistry(opts.domain ?? HOST, opts.searchFetch));
     q.setIngestEmitter({ send: jest.fn().mockResolvedValue(HEALTHY_STATS) });
     q.setScrapingService({ scrapePage: jest.fn(), scrapePageStealth: jest.fn() } as any);
     q.setIngestTransports({ impersonate: opts.impersonate });
@@ -302,6 +306,90 @@ describe('ScrapeQueue × gate failures (empty body / 5xx from a gated host)', ()
       expect(sessionCanaryView().staleReason).toMatch(/5xx or an empty body/);
     } finally {
       if (ORIGINAL === undefined) delete process.env.MFC_SESSION_CANARY_ITEM; else process.env.MFC_SESSION_CANARY_ITEM = ORIGINAL;
+    }
+  });
+
+  // ── Challenger round 1 on PR #334 ────────────────────────────────────────────────────────────
+
+  it('(7) a store DECLARING searchFetch.access "cloudflare" with NO stored jar strikes through the queue (the profile, not the Secret, gates it)', async () => {
+    const cd = new ChallengeCooldown({ now: () => cdNow, windowMs: 30 * MIN, gateFailureThreshold: 1 });
+    const impersonate = jest.fn().mockResolvedValue(EMPTY_500);
+    queue = buildQueue({ impersonate, cd, store: fakeStore([]), searchFetch: { transport: 'impersonate', browser: 'chrome142', access: 'cloudflare' } });
+
+    await runOne(queue, ITEM(1), 0);
+
+    expect(cd.gateFailureCount(HOST)).toBe(1);
+    expect(cd.isOpen(HOST)).toBe(true);
+  });
+
+  it('(8) an EMPTY 200 on the canary item through the queue turns the session canary STALE (the body reaches the canary)', async () => {
+    const ORIGINAL = process.env.MFC_SESSION_CANARY_ITEM;
+    process.env.MFC_SESSION_CANARY_ITEM = '2253259';
+    try {
+      const MFC = 'myfigurecollection.net';
+      const cd = new ChallengeCooldown({ now: () => cdNow, windowMs: 30 * MIN, gateFailureThreshold: 99 });
+      queue = buildQueue({ impersonate: jest.fn().mockResolvedValue({ status: 200, body: '' }), cd, store: fakeStore([MFC]), domain: MFC });
+
+      await runOne(queue, `https://${MFC}/item/2253259`, 0);
+
+      expect(sessionCanaryView().stale).toBe(true);
+      expect(sessionCanaryView().staleReason).toMatch(/5xx or an empty body/);
+    } finally {
+      if (ORIGINAL === undefined) delete process.env.MFC_SESSION_CANARY_ITEM; else process.env.MFC_SESSION_CANARY_ITEM = ORIGINAL;
+    }
+  });
+
+  /**
+   * (9) The queue and the crawler's /catalog listing share ONE run on the host. A listing poll that
+   * lands between the queue's refused fetches must not reset that run or flip the stale mark back —
+   * whether the listing lane saw a 403 "Security check" status (status-aware impit, production
+   * wiring) or saw no status at all (a bare-body lane, e.g. the browser lane).
+   */
+  it.each([
+    ['status-aware impit lane (production wiring)', true],
+    ['status-blind lane (browser / bare body)', false],
+  ])('(9) a non-empty 403 "Security check" /catalog listing between queue failures neither resets the shared run nor clears stale — %s', async (_lane, statusAware) => {
+    const ORIGINAL = process.env.CF_COOKIE_FILE;
+    process.env.CF_COOKIE_FILE = join(__dirname, '../fixtures/cfCookies/cf-cookies.json');
+    resetCfCookieStore();
+    try {
+      const MFC = 'myfigurecollection.net';
+      const SECURITY_CHECK = '<html><head><title>Security check | MyFigure</title></head><body>' + 'x'.repeat(37_000) + '</body></html>';
+      const cd = new ChallengeCooldown({ now: () => cdNow, windowMs: 30 * MIN, gateFailureThreshold: 5 });
+      const impersonate = jest.fn().mockResolvedValue(EMPTY_500);
+      queue = buildQueue({ impersonate, cd, store: null, domain: MFC });
+      const caps: StoreCapabilities = {
+        siteId: SITE, name: 'Gated Store', domains: [MFC],
+        rateLimit: { domain: MFC, baseDelayMs: 0, minDelayMs: 0, maxDelayMs: 100, backoffMultiplier: 2, recoveryDivisor: 2, successThreshold: 3 },
+        requiresBrowser: false, allowedCookies: [], searchFetch: { transport: 'impersonate', browser: 'chrome142' },
+        retrieval: { byListing: { urlTemplate: `https://${MFC}/item/browse/figure/?page={page}`, order: 'newest' } },
+      };
+      const profiles = new ProfileRegistry();
+      profiles.register(caps);
+      const lane = createImpitFetchers(async () => ({ fetch: async () => ({ status: 403, text: async () => SECURITY_CHECK }) }) as never, {
+        store: { cookiesFor: () => undefined, userAgentFor: () => undefined },
+      });
+      const cat = assembleCatalog({
+        profiles,
+        getRulesetForUrl: () => ({ siteId: SITE, version: '1', extract: jest.fn(), validate: jest.fn(), extractListing: () => ({ items: [], hasMore: false }) }) as unknown as ExtractionRuleset,
+        fetchSearch: (url) => lane.body(url),
+        ...(statusAware ? { fetchSearchDetail: (url: string) => lane.detailed(url) } : {}),
+        challengeCooldown: cd,
+        cfCookieStore: getCfCookieStore(),
+      });
+      const staleOf = () => getCfCookieStore().view().find((r) => r.host === MFC)?.stale;
+
+      await runOne(queue, `https://${MFC}/item/1`, 4); // 4 refused fetches: run 4, stale
+      expect({ run: cd.gateFailureCount(MFC), open: cd.isOpen(MFC), stale: staleOf() }).toEqual({ run: 4, open: false, stale: true });
+      await cat.catalog(SITE, 1); // the crawler's listing poll
+      expect({ run: cd.gateFailureCount(MFC), stale: staleOf() }).toEqual({ run: 4, stale: true });
+      await runOne(queue, `https://${MFC}/item/2`, 4); // the 5th refused fetch opens the cooldown
+
+      expect(cd.isOpen(MFC)).toBe(true);
+      expect(impersonate).toHaveBeenCalledTimes(5);
+    } finally {
+      if (ORIGINAL === undefined) delete process.env.CF_COOKIE_FILE; else process.env.CF_COOKIE_FILE = ORIGINAL;
+      resetCfCookieStore();
     }
   });
 });
