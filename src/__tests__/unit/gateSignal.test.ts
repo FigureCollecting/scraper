@@ -10,7 +10,8 @@
  *   - isCleanFetch: 2xx (or a lane that surfaced no status) + a non-empty body + not a flagged
  *     challenge. Nothing else may mark a host FRESH or clear its cooldown.
  *   - isGateFailure: an empty body, or a 5xx, that is not a flagged challenge.
- *   - isGatedHost: stored cookies in the CfCookieStore, OR the profile declares access 'cloudflare'.
+ *   - isGatedHost: stored cookies in the CfCookieStore, OR the profile declares access 'cloudflare',
+ *     OR the store fetches through the residential exit (egress 'residential').
  *   - ChallengeCooldown.recordGateFailure: N consecutive failures (env-configurable, default 5) open
  *     the EXISTING cooldown with its existing window; a clean fetch resets the run.
  *   - observeGate: the one call a fetch site makes — stale mark + strike on a gated host, reset on clean.
@@ -22,6 +23,7 @@ import {
   isGateFailure,
   isGatedHost,
   gateFailureReason,
+  gateOutcomeOf,
   observeGate,
 } from '../../services/gateSignal';
 
@@ -337,5 +339,49 @@ describe('gateSignal — round 1: status-blind sites, residential egress, empty 
     const store = fakeStore([HOST]);
     const verdict = observeGate({ cooldown, store }, { url: URL_, host: HOST, lane: 'impersonate', status, body: '' });
     expect({ verdict, run: cooldown.gateFailureCount(HOST) }).toEqual({ verdict: expected, run: expected === 'other' ? 0 : 1 });
+  });
+});
+
+/**
+ * Challenger round 2 on PR #334 — the edges of the rule, pinned on BOTH sides:
+ *   - CLEAN is exactly 200..299: a 199 and a 300 with a real body are not clean.
+ *   - GATE FAILURE by status is exactly >= 500: a 499 with a real body is not one.
+ *   - gateOutcomeOf: a bare body AND a detail with no status are STATUS-BLIND (never clean); a
+ *     detail with a status carries it and is judged by it.
+ */
+describe('gateSignal — round 2: both sides of every edge, and gateOutcomeOf', () => {
+  it.each([
+    [199, false],
+    [200, true],
+    [299, true],
+    [300, false],
+  ])('isCleanFetch({status: %s, non-empty body}) === %s — the 2xx band, both edges', (status, clean) => {
+    expect(isCleanFetch({ status, body: BODY })).toBe(clean);
+  });
+
+  it.each([
+    [499, false],
+    [500, true],
+    [599, true],
+  ])('isGateFailure({status: %s, non-empty body}) === %s — the 5xx edge', (status, failure) => {
+    expect(isGateFailure({ status, body: BODY })).toBe(failure);
+  });
+
+  it('gateOutcomeOf: a detail with NO status is status-blind, so a real body there is never clean', () => {
+    const outcome = gateOutcomeOf({ body: BODY });
+    expect(outcome).toEqual({ body: BODY, statusBlind: true });
+    expect(isCleanFetch(outcome)).toBe(false);
+  });
+
+  it('gateOutcomeOf: a bare body is status-blind too', () => {
+    expect(gateOutcomeOf(BODY)).toEqual({ body: BODY, statusBlind: true });
+    expect(isCleanFetch(gateOutcomeOf(BODY))).toBe(false);
+  });
+
+  it('gateOutcomeOf: a detail WITH a status carries it (and only body + status), judged by it', () => {
+    const clean = gateOutcomeOf({ body: BODY, status: 200 });
+    expect(clean).toEqual({ body: BODY, status: 200 });
+    expect(isCleanFetch(clean)).toBe(true);
+    expect(isGateFailure(gateOutcomeOf({ body: BODY, status: 500 }))).toBe(true);
   });
 });

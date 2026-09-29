@@ -374,3 +374,84 @@ describe('round 1 — the status the lane saw reaches the gate at /lookup and /c
     expect({ fresh: catStore.markFresh.mock.calls.length, run: catCd.gateFailureCount(HOST) }).toEqual({ fresh: 2, run: 0 });
   });
 });
+
+/**
+ * Challenger round 2 on PR #334.
+ *   - A declared page (seed / rotating seed) that is a gate failure although the store answered 2xx
+ *     (an EMPTY 200, or an empty body on a status-blind lane) is `failed` + `transient`, and NOT
+ *     `blocked`. The crawler's rotating pass stops the store on a transient (the refusing host is not
+ *     asked again this pass); a `deterministic` would mark only that list failed and fetch the NEXT
+ *     list of the same refusing host in the same pass. The seed result carries no failure class.
+ *   - A clean answer that lands while the host's window is OPEN (another site opened it while this
+ *     fetch was in flight) never marks the host FRESH at /lookup or any /catalog axis: the stale mark
+ *     that came with the window survives, exactly as the ingest queue's isOpen guard keeps it.
+ */
+describe('round 2 — declared-page failure class, and no FRESH inside an open window', () => {
+  const STORE: StoreCapabilities = {
+    siteId: 'gatedstore', name: 'Gated Store', domains: [HOST],
+    rateLimit: { domain: HOST, baseDelayMs: 0, minDelayMs: 0, maxDelayMs: 100, backoffMultiplier: 2, recoveryDivisor: 2, successThreshold: 3 },
+    requiresBrowser: false, allowedCookies: [],
+    retrieval: {
+      bySearch: { urlTemplate: `https://${HOST}/search?q={q}`, scope: 'listed' },
+      byListing: { urlTemplate: `https://${HOST}/new?page={page}`, order: 'newest' },
+      seedLists: [{ id: 'featured', url: `https://${HOST}/featured`, cadence: 'weekly' }],
+      rotatingSeedLists: [{ id: 'maker-1', url: `https://${HOST}/search?maker=1`, group: 'maker-1', order: 1 }],
+    },
+  };
+  const listing: ListingPage = { items: [{ itemId: '11' }], hasMore: false };
+  const rs = {
+    siteId: 'gatedstore', version: '1', extract: jest.fn(), validate: jest.fn(),
+    extractCandidates: () => [], extractListing: () => listing, extractSeedList: () => listing,
+  } as unknown as ExtractionRuleset;
+  type Fetched = string | { body: string; status?: number };
+  /** One status-aware lane for every site, as wireServices wires it. */
+  const wire = (answer: () => Fetched, cd: ChallengeCooldown, store: ReturnType<typeof fakeStore>): CatalogServices => ({
+    profiles: buildProfileRegistry([STORE]),
+    getRulesetForUrl: () => rs,
+    fetchSearch: async () => { const f = answer(); return typeof f === 'string' ? f : f.body; },
+    fetchSearchDetail: async () => answer(),
+    challengeCooldown: cd,
+    cfCookieStore: store as unknown as CatalogServices['cfCookieStore'],
+  });
+
+  it.each([
+    ['an EMPTY 200 (status-aware lane)', { status: 200, body: '' } as Fetched, 'HTTP 200 with an empty body'],
+    ['an empty body on a status-blind lane', '' as Fetched, 'no status with an empty body'],
+  ])('rotating seed: %s from a gated host is `failed` + `transient`, never `blocked`', async (_shape, fetched, tail) => {
+    const cd = new ChallengeCooldown({ now: () => 1, windowMs: MIN, gateFailureThreshold: 99 });
+    const cat = assembleCatalog(wire(() => fetched, cd, fakeStore([HOST])));
+
+    const rotating = await cat.rotatingSeed('gatedstore', 'maker-1');
+    expect(rotating).toEqual({ status: 'failed', siteId: 'gatedstore', reason: `gate failure via http transport: ${tail}`, failure: 'transient' });
+    expect(rotating).not.toHaveProperty('blocked');
+    // The seed axis reports the same failure without a class (SeedResult has none).
+    expect(await cat.seed('gatedstore', 'featured')).toEqual({ status: 'failed', siteId: 'gatedstore', reason: `gate failure via http transport: ${tail}` });
+    expect(cd.gateFailureCount(HOST)).toBe(2);
+  });
+
+  const SITES: [string, (s: CatalogServices) => Promise<unknown>][] = [
+    ['/lookup search', (s) => assembleLookup(s).lookup('marin')],
+    ['/catalog listing', (s) => assembleCatalog(s).catalog('gatedstore', 1)],
+    ['/catalog seed', (s) => assembleCatalog(s).seed('gatedstore', 'featured')],
+    ['/catalog rotating seed', (s) => assembleCatalog(s).rotatingSeed('gatedstore', 'maker-1')],
+  ];
+
+  it.each(SITES)('%s: a clean 200 that lands after the window opened in flight never marks FRESH (the window stays)', async (_site, run) => {
+    const cd = new ChallengeCooldown({ now: () => 1, windowMs: MIN, gateFailureThreshold: 5 });
+    const store = fakeStore([HOST]);
+    await run(wire(() => {
+      cd.open(HOST, 'opened by the ingest queue while this fetch was in flight');
+      return { status: 200, body: '<html>real page</html>' };
+    }, cd, store));
+
+    expect({ fresh: store.markFresh.mock.calls.length, open: cd.isOpen(HOST) }).toEqual({ fresh: 0, open: true });
+  });
+
+  it.each(SITES)('%s: the same clean 200 with the window closed still marks FRESH (control)', async (_site, run) => {
+    const cd = new ChallengeCooldown({ now: () => 1, windowMs: MIN, gateFailureThreshold: 5 });
+    const store = fakeStore([HOST]);
+    await run(wire(() => ({ status: 200, body: '<html>real page</html>' }), cd, store));
+
+    expect({ fresh: store.markFresh.mock.calls.length, open: cd.isOpen(HOST) }).toEqual({ fresh: 1, open: false });
+  });
+});

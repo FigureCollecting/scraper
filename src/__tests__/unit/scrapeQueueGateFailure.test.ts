@@ -47,7 +47,7 @@ import { ChallengeCooldown, resetChallengeCooldown } from '../../services/challe
 import { createExtractionRegistry, ExtractionRegistryImpl } from '../../services/extractionRegistry';
 import { resetSessionManager } from '../../services/sessionManager';
 import { getCfCookieStore, resetCfCookieStore } from '../../services/cookieJar';
-import { sessionCanaryView, resetSessionCanary } from '../../services/sessionCanary';
+import { sessionCanaryView, resetSessionCanary, observeMfcItemFetch } from '../../services/sessionCanary';
 import { assembleCatalog } from '../../driver/assembleCatalog';
 import { ProfileRegistry } from '../../driver/profileRegistry';
 import { createImpitFetchers } from '../../services/impitFetch';
@@ -390,6 +390,30 @@ describe('ScrapeQueue × gate failures (empty body / 5xx from a gated host)', ()
     } finally {
       if (ORIGINAL === undefined) delete process.env.CF_COOKIE_FILE; else process.env.CF_COOKIE_FILE = ORIGINAL;
       resetCfCookieStore();
+    }
+  });
+
+  // ── Challenger round 2 on PR #334 ────────────────────────────────────────────────────────────
+
+  it('(10) a CHALLENGE page answering 200 on the canary item through the queue leaves a standing canary stale flag standing', async () => {
+    const ORIGINAL = process.env.MFC_SESSION_CANARY_ITEM;
+    process.env.MFC_SESSION_CANARY_ITEM = '2253259';
+    try {
+      const MFC = 'myfigurecollection.net';
+      const url = `https://${MFC}/item/2253259`;
+      expect(observeMfcItemFetch(url, 500, { body: '' })).toBe('stale'); // the incident already flagged it
+      const since = sessionCanaryView().staleSince;
+      const CF_200 = '<html><head><title>Just a moment...</title></head><body><script>window._cf_chl_opt={}</script></body></html>';
+      const cd = new ChallengeCooldown({ now: () => cdNow, windowMs: 30 * MIN, gateFailureThreshold: 5 });
+      const impersonate = jest.fn().mockResolvedValue({ status: 200, body: CF_200 });
+      queue = buildQueue({ impersonate, cd, store: fakeStore([MFC]), domain: MFC });
+
+      await runOne(queue, url, 0);
+
+      expect(impersonate).toHaveBeenCalledTimes(1);
+      expect(sessionCanaryView()).toMatchObject({ stale: true, staleSince: since });
+    } finally {
+      if (ORIGINAL === undefined) delete process.env.MFC_SESSION_CANARY_ITEM; else process.env.MFC_SESSION_CANARY_ITEM = ORIGINAL;
     }
   });
 });

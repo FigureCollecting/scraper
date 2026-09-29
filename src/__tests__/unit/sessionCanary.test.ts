@@ -103,6 +103,12 @@ describe('observeSessionCanary — only the PAIR is proof', () => {
     observeSessionCanary({ canaryStatus: 404, controlStatus: 503 });
     expect(sessionCanaryView().stale).toBe(true);
   });
+
+  it('a canary probe that got NO status proves nothing, whatever its body (an empty body alone is not a refused gate here)', () => {
+    expect(observeSessionCanary({ canaryBody: '' })).toBe('inconclusive');
+    expect(observeSessionCanary({ canaryBody: '', controlStatus: 200 })).toBe('inconclusive');
+    expect(sessionCanaryView().stale).toBe(false);
+  });
 });
 
 describe('sessionCanaryView — the /health/detailed shape', () => {
@@ -236,6 +242,36 @@ describe('observeMfcItemFetch — the pair assembled from ordinary queue traffic
     } finally {
       if (prior === undefined) delete process.env.MFC_SESSION_CANARY_ITEM; else process.env.MFC_SESSION_CANARY_ITEM = prior;
     }
+  });
+
+  // Challenger round 2 on PR #334: a Cloudflare interstitial is not the item. A challenge page that
+  // came back 200 says nothing about entitlement — it must not clear a standing flag (the canary was
+  // not served) nor count as a served control (the store did not serve it either).
+  const CF_200 = '<html><head><title>Just a moment...</title></head><body><script>window._cf_chl_opt={}</script></body></html>';
+
+  it('a CHALLENGE page answering 200 on the canary is inconclusive: a standing stale flag stands', () => {
+    expect(observeMfcItemFetch(CANARY, 500, { env: ENV, now: T0, body: '' })).toBe('stale');
+    const since = sessionCanaryView(ENV).staleSince;
+    expect(observeMfcItemFetch(CANARY, 200, { env: ENV, now: T0 + 60_000, body: CF_200, challenge: true })).toBe('inconclusive');
+    expect(sessionCanaryView(ENV)).toMatchObject({ stale: true, staleSince: since });
+  });
+
+  it('a CHALLENGE page answering 200 on another item is NOT a served control: a canary 404 then proves nothing', () => {
+    expect(observeMfcItemFetch(OTHER, 200, { env: ENV, now: T0, body: CF_200, challenge: true })).toBe('inconclusive');
+    expect(observeMfcItemFetch(CANARY, 404, { env: ENV, now: T0 + 60_000, body: 'nf' })).toBe('inconclusive');
+    expect(sessionCanaryView(ENV).stale).toBe(false);
+  });
+
+  it('a CHALLENGE page on the canary is inconclusive whatever its status: it keeps its own path (cooldown + cookie stale mark)', () => {
+    expect(observeMfcItemFetch(CANARY, 503, { env: ENV, now: T0, body: CF_200, challenge: true })).toBe('inconclusive');
+    expect(observeMfcItemFetch(CANARY, 403, { env: ENV, now: T0, body: CF_200, challenge: true })).toBe('inconclusive');
+    expect(sessionCanaryView(ENV).stale).toBe(false);
+  });
+
+  it('a challenge flag that is not set (false) changes nothing: the canary 200 with a body is still fresh', () => {
+    observeMfcItemFetch(CANARY, 500, { env: ENV, now: T0, body: '' });
+    expect(observeMfcItemFetch(CANARY, 200, { env: ENV, now: T0 + 60_000, body: '<html>item</html>', challenge: false })).toBe('fresh');
+    expect(sessionCanaryView(ENV).stale).toBe(false);
   });
 
   it('is inert when the lane surfaced no status, and never throws on a junk URL', () => {
