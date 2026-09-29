@@ -344,9 +344,12 @@ export function assembleCatalog(services: CatalogServices): Catalog {
       const failure = upstream >= 500 || upstream === 429 ? 'transient' : 'deterministic';
       return fail(`store answered ${upstream}`, { failure, ...(blocked ? { blocked: true as const } : {}), upstreamStatus: upstream });
     }
-    // A refused gate that still answered 2xx (an empty body) is not an empty shelf either.
+    // A refused gate that still answered 2xx (an empty body) is not an empty shelf either. It is
+    // `transient` and not `blocked`: the crawler stops the store for this pass on a transient, so the
+    // next list of the same refusing host is not fetched in the same pass.
     if (verdict === 'gate_failure') return fail(gateFailureReason(gate, lane), { failure: 'transient' });
-    if (verdict === 'clean') markFreshIfStored(cfStore, url, host);
+    // A clean page inside an OPEN window (opened while this fetch was in flight) is not FRESH either.
+    if (verdict === 'clean' && !cd.isOpen(host)) markFreshIfStored(cfStore, url, host);
     try {
       // UNTRUSTED plugin output, guarded exactly as the listing axis guards it. `hasMore` and
       // `nextPage` are NOT read at all: a declared list is one page, so a parser claiming a
@@ -517,7 +520,8 @@ export function assembleCatalog(services: CatalogServices): Catalog {
           console.warn(`[catalog] ${sanitizeForLog(siteId)} page ${pageNo} failed: ${reason}`);
           return { status: 'failed', siteId, reason };
         }
-        if (verdict === 'clean') markFreshIfStored(cfStore, url, host);
+        // A clean page inside an OPEN window (opened while this fetch was in flight) is not FRESH either.
+        if (verdict === 'clean' && !cd.isOpen(host)) markFreshIfStored(cfStore, url, host);
         // UNTRUSTED plugin output: a non-object page → no items; a non-array `items` → none; each
         // item must be an object with a non-empty string itemId (else dropped); paging signals are
         // used only when well-typed, else derived (non-empty page ⇒ more; next = page + 1).

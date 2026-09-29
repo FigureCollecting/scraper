@@ -166,7 +166,8 @@ function wireServices(registry: LookupRegistry, transports: Partial<FetchSearchT
     profiles,
     getRulesetForUrl: (url) => registry.getRulesetForUrl(url),
     fetchSearch,
-    // The same lanes and sessions, answering the store's status too (read by the rotating axis only).
+    // The same lanes and sessions, answering the store's status too. /lookup and every /catalog axis
+    // read it: the gate (gateSignal) needs the status the lane saw to prove a host clean.
     fetchSearchDetail: makeFetchSearch<FetchBodyOutcome>({
       http: transports.http ?? httpFetchBodyDetailed,
       impersonate: transports.impersonate ?? impitFetchBodyDetailed,

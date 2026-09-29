@@ -171,17 +171,21 @@ export function observeSessionCanary(observation: SessionCanaryObservation): Ses
  * (which is the very ambiguity this exists to resolve), or two halves an hour apart. The canary
  * answering 200 clears the flag outright.
  *
+ * A flagged Cloudflare CHALLENGE page (`challenge`) is not the item, whatever its status: it neither
+ * clears the flag (the canary was not served) nor counts as a served control. It keeps its own path
+ * (the host cooldown and the stored-cookie stale mark), so here it is inconclusive.
+ *
  * Never throws: it is called from the queue's hot path, where bookkeeping must not become an item's
  * failure.
  */
 export function observeMfcItemFetch(
   url: string,
   status: number | undefined,
-  opts: { env?: NodeJS.ProcessEnv; now?: number; body?: string } = {},
+  opts: { env?: NodeJS.ProcessEnv; now?: number; body?: string; challenge?: boolean } = {},
 ): SessionCanaryVerdict {
   const now = opts.now ?? Date.now();
   const canaryItemId = resolveCanaryItemId(opts.env ?? process.env);
-  if (status === undefined || canaryItemId === undefined || !isCanaryHost(url)) return 'inconclusive';
+  if (status === undefined || opts.challenge === true || canaryItemId === undefined || !isCanaryHost(url)) return 'inconclusive';
 
   const isCanary = isCanaryItem(url, canaryItemId);
   // An EMPTY 200 was not served — it is a refused gate like a 5xx, for the canary and the control alike.

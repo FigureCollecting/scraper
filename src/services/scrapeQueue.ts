@@ -1870,9 +1870,9 @@ export class ScrapeQueue {
     // for the same reason: a window (and stale mark) opened while this fetch was in flight survives.
     //
     // CLEAN means CLEAN (gateSignal, the 2026-09-29 mfc incident): a 2xx with a real body. An empty
-    // body or a 5xx from a GATED host (stored cookies, or a declared Cloudflare gate) is a refused
-    // gate, not a recovery — it marks the cookies stale and strikes toward the host's cooldown
-    // (N in a row open it), and it never clears the cooldown or marks the host FRESH.
+    // body or a 5xx from a GATED host (stored cookies, a declared Cloudflare gate, or the residential
+    // exit) is a refused gate, not a recovery — it marks the cookies stale and strikes toward the
+    // host's cooldown (N in a row open it), and it never clears the cooldown or marks the host FRESH.
     if (
       host !== undefined &&
       observeGate(
@@ -1889,7 +1889,7 @@ export class ScrapeQueue {
     // same store within the hour proves the scrape session lost its entitlement (→ the stale flag on
     // /health/detailed, and the cookie runbook). Costs one comparison on traffic that was happening
     // anyway, moves nothing unless that exact pair is seen, and never throws.
-    observeMfcItemFetch(item.url, page.status, { body: page.html });
+    observeMfcItemFetch(item.url, page.status, { body: page.html, challenge: page.challenge });
     // STATUS GATE (R1) — what the STORE said, before the ruleset is asked to lift anything. Every
     // lane now surfaces {status, finalUrl}, so a 404/410 (the item is gone), a 403/429/5xx (the door
     // is closed or the host is unwell) and an item URL that bounced to the store's front page each

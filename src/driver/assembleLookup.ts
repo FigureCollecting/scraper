@@ -365,12 +365,14 @@ export function assembleLookup(services: LookupServices): Lookup {
           // A clean body for a host WITH stored cookies is the FRESH signal (clears a stale mark).
           // CLEAN means a 2xx the lane SAW with a real body (gateSignal): an empty body or a 5xx from a
           // gated host is a refused gate — stale mark + a strike toward the host's cooldown — and a
-          // status-blind body proves nothing either way. Neither marks the host FRESH.
+          // status-blind body proves nothing either way. Neither marks the host FRESH. Nor does a clean
+          // body that lands while the host's window is OPEN (another site opened it while this fetch
+          // was in flight): the stale mark that came with the window stays, as the queue keeps it.
           const verdict = observeGate(
             { cooldown: cd, store: cfStore },
             { url: p.url, host: normalizeHost(p.host), lane: transport.transport ?? 'http', searchFetch: transport, ...outcome },
           );
-          if (verdict === 'clean') markFreshIfStored(cfStore, p.url, normalizeHost(p.host));
+          if (verdict === 'clean' && !cd.isOpen(p.host)) markFreshIfStored(cfStore, p.url, normalizeHost(p.host));
           let candidates = await ruleset.extractCandidates(body, p.url);
           // Substring-store identity post-filter (record-mode): the store matched only the single
           // selective term issued as `{q}`, so drop candidates whose normalized name lacks any remaining
