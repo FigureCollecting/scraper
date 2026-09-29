@@ -28,6 +28,7 @@ import { isSafeRotatingName } from '../utils/rotatingName.js';
 import { isCloudflareChallenge } from '../services/engineServices/challengeDetect.js';
 import { getChallengeCooldown, normalizeHost } from '../services/challengeCooldown.js';
 import { getCfCookieStore, markStaleIfStored, markFreshIfStored } from '../services/cookieJar.js';
+import { observeGate } from '../services/gateSignal.js';
 import type { ListingPage, RetrievalCapability, RotatingSeedList, SearchFetch, SeedList } from '@figurecollecting/scraper-plugin-contract';
 import type { FetchBodyOutcome } from '../services/engineServices/capturingFetch.js';
 
@@ -335,12 +336,18 @@ export function assembleCatalog(services: CatalogServices): Catalog {
       markStaleIfStored(cfStore, url, host, transport.transport ?? 'http', `${label} list challenge page`);
       return fail('challenge page', { failure: 'deterministic', blocked: true });
     }
+    // CLEAN means a 2xx with a real body (gateSignal): an empty body or a 5xx from a gated host is a
+    // refused gate — stale mark + a strike toward the host's cooldown — and never marks it FRESH.
+    const verdict = observeGate(
+      { cooldown: cd, store: cfStore },
+      { url, host, lane: transport.transport ?? 'http', searchFetch: transport, body, ...(upstream !== undefined ? { status: upstream } : {}) },
+    );
     if (upstream !== undefined && upstream >= 400) {
       const blocked = upstream === 401 || upstream === 403 || upstream === 429;
       const failure = upstream >= 500 || upstream === 429 ? 'transient' : 'deterministic';
       return fail(`store answered ${upstream}`, { failure, ...(blocked ? { blocked: true as const } : {}), upstreamStatus: upstream });
     }
-    markFreshIfStored(cfStore, url, host);
+    if (verdict === 'clean') markFreshIfStored(cfStore, url, host);
     try {
       // UNTRUSTED plugin output, guarded exactly as the listing axis guards it. `hasMore` and
       // `nextPage` are NOT read at all: a declared list is one page, so a parser claiming a
@@ -495,7 +502,10 @@ export function assembleCatalog(services: CatalogServices): Catalog {
           return { status: 'failed', siteId, reason: 'challenge page' };
         }
         // A clean listing for a host WITH stored cookies is the FRESH signal (clears a stale mark).
-        markFreshIfStored(cfStore, url, host);
+        // CLEAN means a real body (gateSignal): an EMPTY body from a gated host is a refused gate —
+        // stale mark + a strike toward the host's cooldown — and never marks it FRESH.
+        const verdict = observeGate({ cooldown: cd, store: cfStore }, { url, host, lane: transport.transport ?? 'http', searchFetch: transport, body });
+        if (verdict === 'clean') markFreshIfStored(cfStore, url, host);
         // UNTRUSTED plugin output: a non-object page → no items; a non-array `items` → none; each
         // item must be an object with a non-empty string itemId (else dropped); paging signals are
         // used only when well-typed, else derived (non-empty page ⇒ more; next = page + 1).

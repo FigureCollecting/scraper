@@ -28,6 +28,7 @@ import { sanitizeForLog } from '../utils/security.js';
 import { isCloudflareChallenge } from '../services/engineServices/challengeDetect.js';
 import { getChallengeCooldown, normalizeHost, type ChallengeCooldown } from '../services/challengeCooldown.js';
 import { getCfCookieStore, markStaleIfStored, markFreshIfStored, type CfCookieStoreLike } from '../services/cookieJar.js';
+import { observeGate } from '../services/gateSignal.js';
 import { classifyFetchFailure } from '../services/failureClassifier.js';
 import type { FetchFailureReport, ReportFetchFailure } from '../services/failureReporter.js';
 import type { ProfileRegistry } from './profileRegistry.js';
@@ -351,7 +352,13 @@ export function assembleLookup(services: LookupServices): Lookup {
             return null;
           }
           // A clean body for a host WITH stored cookies is the FRESH signal (clears a stale mark).
-          markFreshIfStored(cfStore, p.url, normalizeHost(p.host));
+          // CLEAN means a real body (gateSignal): an EMPTY body from a gated host is a refused gate —
+          // stale mark + a strike toward the host's cooldown — and never marks it FRESH.
+          const verdict = observeGate(
+            { cooldown: cd, store: cfStore },
+            { url: p.url, host: normalizeHost(p.host), lane: transport.transport ?? 'http', searchFetch: transport, body },
+          );
+          if (verdict === 'clean') markFreshIfStored(cfStore, p.url, normalizeHost(p.host));
           let candidates = await ruleset.extractCandidates(body, p.url);
           // Substring-store identity post-filter (record-mode): the store matched only the single
           // selective term issued as `{q}`, so drop candidates whose normalized name lacks any remaining

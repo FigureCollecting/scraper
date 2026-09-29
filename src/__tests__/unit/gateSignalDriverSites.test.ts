@@ -54,8 +54,8 @@ describe('/lookup search fan-out × gate rule', () => {
     extractCandidates: () => CANDS,
   };
 
-  const services = (body: string, cd: ChallengeCooldown, store: ReturnType<typeof fakeStore>): LookupServices => ({
-    profiles: buildProfileRegistry([STORE]),
+  const services = (body: string, cd: ChallengeCooldown, store: ReturnType<typeof fakeStore>, caps: StoreCapabilities = STORE): LookupServices => ({
+    profiles: buildProfileRegistry([caps]),
     getRulesetForUrl: () => rs,
     fetchSearch: jest.fn(async () => body),
     challengeCooldown: cd,
@@ -70,6 +70,18 @@ describe('/lookup search fan-out × gate rule', () => {
     expect(store.markFresh).not.toHaveBeenCalled();
     expect(store.markStale).toHaveBeenCalledWith(HOST, 'http', 'gate failure via http transport: no status with an empty body');
     expect(cd.isOpen(HOST)).toBe(true);
+  });
+
+  it('a store DECLARING access "cloudflare" (no transport, no stored cookies) is gated by the declaration: an empty body strikes', async () => {
+    const cd = new ChallengeCooldown({ now: () => 1, windowMs: MIN, gateFailureThreshold: 1 });
+    const store = fakeStore([]);
+    await assembleLookup(services('', cd, store, { ...STORE, searchFetch: { access: 'cloudflare' } })).lookup('marin');
+
+    expect(store.markStale).not.toHaveBeenCalled(); // nothing stored to mark
+    expect(store.markFresh).not.toHaveBeenCalled();
+    expect(cd.list()).toEqual([
+      { host: HOST, remainingMs: MIN, reason: '1 consecutive gate failures (gate failure via http transport: no status with an empty body)' },
+    ]);
   });
 
   it('a real search body still marks FRESH and resets the run', async () => {
@@ -113,9 +125,10 @@ describe('/catalog axes × gate rule', () => {
     fetched: string | { body: string; status?: number },
     cd: ChallengeCooldown,
     store: ReturnType<typeof fakeStore>,
+    caps: StoreCapabilities = STORE,
   ): CatalogServices => {
     const profiles = new ProfileRegistry();
-    profiles.register(STORE);
+    profiles.register(caps);
     return {
       profiles,
       getRulesetForUrl: jest.fn(() => ruleset),
@@ -168,6 +181,17 @@ describe('/catalog axes × gate rule', () => {
     await assembleCatalog(services('<html>seed</html>', cd, cleanStore)).seed('gatedstore', 'featured');
     expect(cleanStore.markFresh).toHaveBeenCalledWith(HOST);
     expect(cd.gateFailureCount(HOST)).toBe(0);
+  });
+
+  it('a store DECLARING access "cloudflare" (no transport, no stored cookies) is gated by the declaration on both catalog axes', async () => {
+    const DECLARED = { ...STORE, searchFetch: { access: 'cloudflare' as const } };
+    const listCd = new ChallengeCooldown({ now: () => 1, windowMs: MIN, gateFailureThreshold: 1 });
+    await assembleCatalog(services('', listCd, fakeStore([]), DECLARED)).catalog('gatedstore', 1);
+    expect(listCd.list()[0]?.reason).toBe('1 consecutive gate failures (gate failure via http transport: no status with an empty body)');
+
+    const seedCd = new ChallengeCooldown({ now: () => 1, windowMs: MIN, gateFailureThreshold: 1 });
+    await assembleCatalog(services({ body: '', status: 502 }, seedCd, fakeStore([]), DECLARED)).rotatingSeed('gatedstore', 'maker-1');
+    expect(seedCd.list()[0]?.reason).toBe('1 consecutive gate failures (gate failure via http transport: HTTP 502 with an empty body)');
   });
 
   it('a NON-gated host: an empty body is neither FRESH nor a strike (no cookies, no access gate)', async () => {

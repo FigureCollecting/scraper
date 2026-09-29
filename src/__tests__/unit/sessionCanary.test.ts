@@ -224,6 +224,16 @@ describe('observeMfcItemFetch — the pair assembled from ordinary queue traffic
     expect(sessionCanaryView(ENV).stale).toBe(false);
   });
 
+  it('reads process.env when no options are passed (the queue\'s production call shape without a body)', () => {
+    const prior = process.env.MFC_SESSION_CANARY_ITEM;
+    process.env.MFC_SESSION_CANARY_ITEM = '777777';
+    try {
+      expect(observeMfcItemFetch(CANARY, 503)).toBe('stale');
+    } finally {
+      if (prior === undefined) delete process.env.MFC_SESSION_CANARY_ITEM; else process.env.MFC_SESSION_CANARY_ITEM = prior;
+    }
+  });
+
   it('is inert when the lane surfaced no status, and never throws on a junk URL', () => {
     expect(observeMfcItemFetch(CANARY, undefined, { env: ENV, now: T0 })).toBe('inconclusive');
     expect(() => observeMfcItemFetch('not a url', 404, { env: ENV, now: T0 })).not.toThrow();

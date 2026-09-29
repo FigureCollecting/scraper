@@ -12,6 +12,9 @@
  * cases without guessing:
  *   canary 404 + control 200 → the session lost its entitlement. Cookies need re-minting.
  *   canary 200               → entitled; any lingering flag is cleared.
+ *   canary 5xx / empty body  → the GATE refused the session or its egress (the 2026-09-29 mfc
+ *                              incident: an empty HTTP 500 on every item). Stale, with its own
+ *                              reason: the canary cannot say "entitled" through a closed door.
  *   anything else            → INCONCLUSIVE (the control failing means the store or the egress is
  *                              unwell, which says nothing about entitlement). An existing flag
  *                              STANDS: an inconclusive round must never look like a recovery.
@@ -21,6 +24,7 @@
  * exhaustively testable with no network at all. The flag surfaces on /health/detailed so the cookie
  * runbook has something to trigger on, and the transition — not every observation — logs one line.
  */
+import { isEmptyBody } from './gateSignal.js';
 
 /** The site this canary speaks for. One store today; the shape is ready for a second. */
 const CANARY_SITE = 'mfc';
@@ -41,6 +45,8 @@ export type SessionCanaryVerdict = 'stale' | 'fresh' | 'inconclusive';
 export interface SessionCanaryObservation {
   /** Status of the KNOWN NSFW+ item — the entitlement probe. */
   canaryStatus?: number;
+  /** Body of the canary response, when the caller has it. Empty ⇒ a refused gate, never "served". */
+  canaryBody?: string;
   /** Status of the KNOWN-good SFW item — proof the store and the egress are healthy. */
   controlStatus?: number;
 }
@@ -59,6 +65,9 @@ export interface SessionCanaryView {
 const STALE_REASON =
   'the NSFW canary item answered 404 while a SFW control was served — the session is not entitled; re-mint the mfc cookies';
 
+const GATE_STALE_REASON =
+  'the canary item answered HTTP 5xx or an empty body — the store refused the scrape session or its egress; check the residential exit, then re-mint the mfc cookies';
+
 interface CanaryState {
   stale: boolean;
   staleSince?: string;
@@ -71,17 +80,26 @@ interface CanaryState {
 
 let state: CanaryState = { stale: false };
 
-/** Mark the session stale, once. A repeat keeps the ORIGINAL timestamp and logs nothing more. */
-function markStale(): void {
+/** Mark the session stale, once. A repeat keeps the ORIGINAL timestamp and reason and logs nothing more. */
+function markStale(reason: string = STALE_REASON): void {
   if (state.stale) return;
   state = {
     ...state,
     stale: true,
     staleSince: new Date().toISOString(),
-    staleReason: STALE_REASON,
+    staleReason: reason,
   };
   // eslint-disable-next-line no-console
-  console.warn(`[MFC SESSION] canary item 404 while the control was served — session not entitled; re-mint the mfc cookies`);
+  console.warn(
+    reason === STALE_REASON
+      ? `[MFC SESSION] canary item 404 while the control was served — session not entitled; re-mint the mfc cookies`
+      : `[MFC SESSION] canary item answered 5xx or an empty body — the gate refused the session; check egress, re-mint the mfc cookies`,
+  );
+}
+
+/** The canary's own fetch was refused at the gate: a 5xx, or a body with nothing in it. */
+function isGateRefusal(status: number, body: string | undefined): boolean {
+  return status >= 500 || (body !== undefined && isEmptyBody(body));
 }
 
 /** The canary itself was served: the session IS entitled. Forget everything that said otherwise. */
@@ -125,7 +143,11 @@ export function resolveCanaryItemId(env: NodeJS.ProcessEnv = process.env): strin
  * operator sees when entitlement was lost, not when it was last re-checked.
  */
 export function observeSessionCanary(observation: SessionCanaryObservation): SessionCanaryVerdict {
-  const { canaryStatus, controlStatus } = observation;
+  const { canaryStatus, controlStatus, canaryBody } = observation;
+  if (canaryStatus !== undefined && isGateRefusal(canaryStatus, canaryBody)) {
+    markStale(GATE_STALE_REASON);
+    return 'stale';
+  }
   if (canaryStatus === 404 && controlStatus === 200) {
     markStale();
     return 'stale';
@@ -155,20 +177,26 @@ export function observeSessionCanary(observation: SessionCanaryObservation): Ses
 export function observeMfcItemFetch(
   url: string,
   status: number | undefined,
-  opts: { env?: NodeJS.ProcessEnv; now?: number } = {},
+  opts: { env?: NodeJS.ProcessEnv; now?: number; body?: string } = {},
 ): SessionCanaryVerdict {
   const now = opts.now ?? Date.now();
   const canaryItemId = resolveCanaryItemId(opts.env ?? process.env);
   if (status === undefined || canaryItemId === undefined || !isCanaryHost(url)) return 'inconclusive';
 
   const isCanary = isCanaryItem(url, canaryItemId);
+  // An EMPTY 200 was not served — it is a refused gate like a 5xx, for the canary and the control alike.
+  const empty = opts.body !== undefined && isEmptyBody(opts.body);
+  if (isCanary && isGateRefusal(status, opts.body)) {
+    markStale(GATE_STALE_REASON);
+    return 'stale';
+  }
   if (isCanary && status === 200) {
     markFresh();
     return 'fresh';
   }
   if (isCanary && status === 404) {
     state = { ...state, canaryDeniedAt: now };
-  } else if (!isCanary && status === 200) {
+  } else if (!isCanary && status === 200 && !empty) {
     state = { ...state, controlServedAt: now };
   } else {
     return 'inconclusive';

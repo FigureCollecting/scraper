@@ -1,0 +1,87 @@
+/**
+ * gateSignal — a GATED host answering an EMPTY body or a 5xx is a gate signal, never a clean fetch.
+ *
+ * WHY (the 2026-09-29 mfc incident): impit through the residential exit got HTTP 500 with a 0-byte
+ * body on every item. That body is not a Cloudflare interstitial, so no lane flagged it, and the
+ * queue treated it as a clean fetch: it cleared the host's cooldown and marked its stored cookies
+ * FRESH, then retried every item to exhaustion. /health/detailed stayed green while ~700 refused
+ * requests an hour left the home IP carrying the scrape account's login.
+ *
+ * THE RULE, used at every site that marks a host FRESH or clears its cooldown after a fetch:
+ *   - CLEAN = a 2xx status (or a lane that surfaced no status at all — status-blind lanes are judged
+ *     on the body alone), a non-empty body, and not a flagged challenge. Nothing else is proof.
+ *   - GATE FAILURE = not a flagged challenge (that keeps its own one-shot path), and an empty body or
+ *     a 5xx. It only COUNTS on a GATED host: one with stored cookies in the CfCookieStore, or whose
+ *     profile declares access 'cloudflare'. Elsewhere a 5xx stays the transient upstream it always was.
+ *   - A gate failure marks the stored cookies STALE (→ /health/detailed cfCookies[].stale) and adds a
+ *     strike to the host's run in the SHARED ChallengeCooldown; N in a row open that host's existing
+ *     cooldown (ChallengeCooldown.recordGateFailure). A clean fetch resets the run.
+ */
+import type { SearchFetch } from '@figurecollecting/scraper-plugin-contract';
+import type { ChallengeCooldown } from './challengeCooldown.js';
+import { markStaleIfStored, type CfCookieSource, type CfCookieStoreLike } from './cookieJar.js';
+
+/** What a fetch site knows about one response. */
+export interface GateOutcome {
+  /** The upstream status, when the lane observed one. Absent ⇒ status-blind lane. */
+  status?: number;
+  body: string;
+  /** The lane flagged the body as a Cloudflare challenge/block interstitial. */
+  challenge?: boolean;
+}
+
+/** What one response proved about the host's gate. */
+export type GateVerdict = 'clean' | 'gate_failure' | 'challenge' | 'other';
+
+/** An empty body: zero bytes or whitespace only. A non-string (untrusted transport output) reads as empty. */
+export function isEmptyBody(body: string): boolean {
+  return typeof body !== 'string' || !/\S/.test(body);
+}
+
+function is2xx(status: number | undefined): boolean {
+  return status === undefined || (status >= 200 && status <= 299);
+}
+
+/** The ONLY response that may mark a host FRESH or clear its cooldown. */
+export function isCleanFetch(o: GateOutcome): boolean {
+  return o.challenge !== true && is2xx(o.status) && !isEmptyBody(o.body);
+}
+
+/** An empty body or a 5xx that is not a flagged challenge. */
+export function isGateFailure(o: GateOutcome): boolean {
+  if (o.challenge === true) return false;
+  return isEmptyBody(o.body) || (o.status !== undefined && o.status >= 500);
+}
+
+/** A host the engine has a gate for: stored cookies, or a declared Cloudflare gate on its profile. */
+export function isGatedHost(store: CfCookieSource, url: string, searchFetch?: SearchFetch): boolean {
+  return store.cookiesFor(url) !== undefined || searchFetch?.access === 'cloudflare';
+}
+
+/** The operator-facing reason: lane, status, and whether the body was empty. */
+export function gateFailureReason(o: GateOutcome, lane: string): string {
+  const status = o.status !== undefined ? `HTTP ${o.status}` : 'no status';
+  return `gate failure via ${lane} transport: ${status}${isEmptyBody(o.body) ? ' with an empty body' : ''}`;
+}
+
+/**
+ * Judge one response at a fetch site and move the gate state. On CLEAN the host's run is reset and
+ * the caller keeps its own FRESH / cooldown-clear step (and its own guards). On a GATE FAILURE of a
+ * gated host the stored cookies are marked stale and a strike is recorded (N opens the cooldown).
+ * A flagged challenge and every other answer (a 404, a 403, a 5xx from a non-gated host) move nothing.
+ */
+export function observeGate(
+  deps: { cooldown: ChallengeCooldown; store: CfCookieStoreLike },
+  fetch: GateOutcome & { url: string; host: string; lane: string; searchFetch?: SearchFetch },
+): GateVerdict {
+  if (fetch.challenge === true) return 'challenge';
+  if (isCleanFetch(fetch)) {
+    deps.cooldown.resetGateFailures(fetch.host);
+    return 'clean';
+  }
+  if (!isGateFailure(fetch) || !isGatedHost(deps.store, fetch.url, fetch.searchFetch)) return 'other';
+  const reason = gateFailureReason(fetch, fetch.lane);
+  markStaleIfStored(deps.store, fetch.url, fetch.host, fetch.lane, reason);
+  deps.cooldown.recordGateFailure(fetch.host, reason);
+  return 'gate_failure';
+}

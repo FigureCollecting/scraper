@@ -1416,6 +1416,10 @@ See `.env.example` for complete configuration template.
   - Open cooldowns are persisted with the queue (`SCRAPE_QUEUE_DIR`) and rehydrated at boot: a restart inside an open window is exactly when the engine is most likely to walk straight back into the challenge it just backed off from
   - Unset/invalid → default; any finite value is clamped to `[60000 (1 min), 86400000 (24 h)]`
   - Default: `1800000` (30 min)
+- `GATE_FAILURE_COOLDOWN_THRESHOLD`: Consecutive gate failures that open a host's cooldown (the window above)
+  - A gate failure is an empty body or a 5xx from a GATED host: one with stored cookies (`CF_COOKIE_FILE`) or whose profile declares `access: 'cloudflare'`. It also marks the stored cookies stale on `/health/detailed`, and it never marks the host fresh or clears its cooldown — only a 2xx with a real body does, and that resets the run
+  - Unset/invalid (not a whole number ≥ 1) → default
+  - Default: `5`
 - `CF_COOKIE_FILE`: Path to the stored-cookie file (hand-minted Cloudflare clearance / session cookies, keyed by host) — see **Stored Cloudflare cookies** below
   - Unset/blank (default): the jar is disabled and every lane behaves exactly as before
   - Example: `/var/run/fc/cf-cookies/cf-cookies.json` (a Secret mounted as a directory, so a refresh changes the file's mtime)
