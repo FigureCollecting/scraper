@@ -28,7 +28,8 @@ import { sanitizeForLog } from '../utils/security.js';
 import { isCloudflareChallenge } from '../services/engineServices/challengeDetect.js';
 import { getChallengeCooldown, normalizeHost, type ChallengeCooldown } from '../services/challengeCooldown.js';
 import { getCfCookieStore, markStaleIfStored, markFreshIfStored, type CfCookieStoreLike } from '../services/cookieJar.js';
-import { observeGate } from '../services/gateSignal.js';
+import { observeGate, gateOutcomeOf } from '../services/gateSignal.js';
+import type { FetchBodyOutcome } from '../services/engineServices/capturingFetch.js';
 import { classifyFetchFailure } from '../services/failureClassifier.js';
 import type { FetchFailureReport, ReportFetchFailure } from '../services/failureReporter.js';
 import type { ProfileRegistry } from './profileRegistry.js';
@@ -131,6 +132,13 @@ export interface LookupServices {
    * and injected here, so the fan-out stays deterministic in tests.
    */
   fetchSearch: (url: string, searchFetch: SearchFetch) => Promise<string>;
+  /**
+   * The SAME lanes and sessions as `fetchSearch`, answering the status the lane saw as well (the
+   * browser lane still answers a bare body). Optional; when present every fetch site reads it so the
+   * gate (gateSignal) sees the status — without it, a 500 or 403 page with a body is status-blind
+   * and can never prove the host clean. wireServices always provides it.
+   */
+  fetchSearchDetail?: (url: string, searchFetch: SearchFetch) => Promise<FetchBodyOutcome>;
   /**
    * Per-host Cloudflare-challenge cooldown register (shared with the ingest queue and
    * /health/detailed). Optional — defaults to the process-wide singleton; tests inject a
@@ -325,7 +333,10 @@ export function assembleLookup(services: LookupServices): Lookup {
           // store can't keep the whole Promise.all pending. A timeout REJECTS → the catch below treats
           // it exactly like any other fetch failure (siteId → `failed`, reason logged, returns null).
           const transport = services.profiles.searchTransportFor(p.host);
-          const body = await withTimeout(services.fetchSearch(p.url, transport), STORE_TIMEOUT_MS);
+          const outcome = gateOutcomeOf(
+            await withTimeout(services.fetchSearchDetail ? services.fetchSearchDetail(p.url, transport) : services.fetchSearch(p.url, transport), STORE_TIMEOUT_MS),
+          );
+          const body = outcome.body;
           // HONEST SEARCH LANE: a CF challenge/block body is NOT parseable content — extractCandidates
           // would silently lift 0 candidates and pose the store as "carries nothing". Detect it BEFORE
           // parsing: report the store `failed` with a logged reason, and OPEN its host's cooldown so
@@ -352,11 +363,12 @@ export function assembleLookup(services: LookupServices): Lookup {
             return null;
           }
           // A clean body for a host WITH stored cookies is the FRESH signal (clears a stale mark).
-          // CLEAN means a real body (gateSignal): an EMPTY body from a gated host is a refused gate —
-          // stale mark + a strike toward the host's cooldown — and never marks it FRESH.
+          // CLEAN means a 2xx the lane SAW with a real body (gateSignal): an empty body or a 5xx from a
+          // gated host is a refused gate — stale mark + a strike toward the host's cooldown — and a
+          // status-blind body proves nothing either way. Neither marks the host FRESH.
           const verdict = observeGate(
             { cooldown: cd, store: cfStore },
-            { url: p.url, host: normalizeHost(p.host), lane: transport.transport ?? 'http', searchFetch: transport, body },
+            { url: p.url, host: normalizeHost(p.host), lane: transport.transport ?? 'http', searchFetch: transport, ...outcome },
           );
           if (verdict === 'clean') markFreshIfStored(cfStore, p.url, normalizeHost(p.host));
           let candidates = await ruleset.extractCandidates(body, p.url);

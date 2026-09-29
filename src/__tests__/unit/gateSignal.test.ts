@@ -296,18 +296,18 @@ describe('gateSignal — round 1: status-blind sites, residential egress, empty 
   const MFC_SEARCH_FETCH = { transport: 'impersonate' as const, browser: 'chrome142', egress: 'residential' as const };
 
   it('a status-blind outcome with a real body is NOT clean: no reset, verdict "other"', () => {
-    expect(isCleanFetch({ body: BODY, statusBlind: true } as never)).toBe(false);
+    expect(isCleanFetch({ body: BODY, statusBlind: true })).toBe(false);
     const cooldown = new ChallengeCooldown({ now: () => 1, windowMs: MIN, gateFailureThreshold: 5 });
     const store = fakeStore([HOST]);
     for (let i = 0; i < 4; i++) cooldown.recordGateFailure(HOST, 'queue empty 500');
-    const verdict = observeGate({ cooldown, store }, { url: URL_, host: HOST, lane: 'browser', body: BODY, statusBlind: true } as never);
+    const verdict = observeGate({ cooldown, store }, { url: URL_, host: HOST, lane: 'browser', body: BODY, statusBlind: true });
     expect({ verdict, run: cooldown.gateFailureCount(HOST), stale: store.markStale.mock.calls.length }).toEqual({ verdict: 'other', run: 4, stale: 0 });
   });
 
   it('a status-blind EMPTY body from a gated host is still a gate failure (the body alone proves it)', () => {
     const cooldown = new ChallengeCooldown({ now: () => 1, windowMs: MIN, gateFailureThreshold: 5 });
     const store = fakeStore([HOST]);
-    const verdict = observeGate({ cooldown, store }, { url: URL_, host: HOST, lane: 'browser', body: '', statusBlind: true } as never);
+    const verdict = observeGate({ cooldown, store }, { url: URL_, host: HOST, lane: 'browser', body: '', statusBlind: true });
     expect(verdict).toBe('gate_failure');
     expect(store.markStale).toHaveBeenCalledWith(HOST, 'browser', 'gate failure via browser transport: no status with an empty body');
   });
@@ -315,7 +315,7 @@ describe('gateSignal — round 1: status-blind sites, residential egress, empty 
   it('the mfc capability shape rulesets 0.9.31 ships (impersonate + chrome142 + residential) is gated WITHOUT a stored jar', () => {
     expect(isGatedHost(fakeStore([]), 'https://myfigurecollection.net/item/2253259', MFC_SEARCH_FETCH)).toBe(true);
     expect(isGatedHost(fakeStore([]), URL_, { transport: 'browser', egress: 'residential' })).toBe(true);
-    expect(isGatedHost(fakeStore([]), URL_, { transport: 'impersonate', egress: 'direct' } as never)).toBe(false);
+    expect(isGatedHost(fakeStore([]), URL_, { transport: 'impersonate', egress: 'direct' })).toBe(false);
   });
 
   it('observeGate: an empty 500 from the residential mfc shape with NO jar is one strike (and nothing to mark stale)', () => {
