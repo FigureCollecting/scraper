@@ -40,6 +40,7 @@ import { createFailureReporterFromEnv, type FetchFailureReport } from './failure
 import { ResidentialEgressUnavailableError } from './residentialEgress.js';
 import { ChallengeLaneUnavailableError } from './browserChallenge.js';
 import { getCfCookieStore, markStaleIfStored, markFreshIfStored, type CfCookieStoreLike } from './cookieJar.js';
+import { observeGate } from './gateSignal.js';
 import { getRawCaptureSink } from './s3ObjectStore.js';
 import { createIngestEmitterFromEnv } from './ingestEmitter.js';
 import { impitFetchBodyDetailed } from './impitFetch.js';
@@ -1867,7 +1868,19 @@ export class ScrapeQueue {
     // The same clean body is the STORED-COOKIE FRESH signal (CfCookieStore): a host WITH stored
     // cookies that served a real page has a live cookie — clear its stale mark. Same isOpen guard,
     // for the same reason: a window (and stale mark) opened while this fetch was in flight survives.
-    if (host !== undefined && !page.challenge && !cooldown.isOpen(host)) {
+    //
+    // CLEAN means CLEAN (gateSignal, the 2026-09-29 mfc incident): a 2xx with a real body. An empty
+    // body or a 5xx from a GATED host (stored cookies, a declared Cloudflare gate, or the residential
+    // exit) is a refused gate, not a recovery — it marks the cookies stale and strikes toward the
+    // host's cooldown (N in a row open it), and it never clears the cooldown or marks the host FRESH.
+    if (
+      host !== undefined &&
+      observeGate(
+        { cooldown, store: this.getCfCookieStoreRef() },
+        { url: item.url, host, lane: laneOf(searchFetch), searchFetch, status: page.status, body: page.html, challenge: page.challenge },
+      ) === 'clean' &&
+      !cooldown.isOpen(host)
+    ) {
       cooldown.clear(host);
       markFreshIfStored(this.getCfCookieStoreRef(), item.url, host);
     }
@@ -1876,7 +1889,7 @@ export class ScrapeQueue {
     // same store within the hour proves the scrape session lost its entitlement (→ the stale flag on
     // /health/detailed, and the cookie runbook). Costs one comparison on traffic that was happening
     // anyway, moves nothing unless that exact pair is seen, and never throws.
-    observeMfcItemFetch(item.url, page.status);
+    observeMfcItemFetch(item.url, page.status, { body: page.html, challenge: page.challenge });
     // STATUS GATE (R1) — what the STORE said, before the ruleset is asked to lift anything. Every
     // lane now surfaces {status, finalUrl}, so a 404/410 (the item is gone), a 403/429/5xx (the door
     // is closed or the host is unwell) and an item URL that bounced to the store's front page each

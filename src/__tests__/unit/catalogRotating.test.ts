@@ -209,7 +209,9 @@ describe('assembleCatalog — rotatingSeed (one fetch)', () => {
     const rs = ruleset(() => {
       throw new Error('company filter not proven');
     });
-    const out = await assembleCatalog(services({ ruleset: rs, cfCookieStore: cfCookieStore as unknown as CatalogServices['cfCookieStore'] })).rotatingSeed(
+    // The status-aware lane: only a 2xx the lane SAW proves the host FRESH.
+    const detail = async () => ({ status: 200, body: '<html>list</html>' });
+    const out = await assembleCatalog(services({ ruleset: rs, detail, cfCookieStore: cfCookieStore as unknown as CatalogServices['cfCookieStore'] })).rotatingSeed(
       'examplestore',
       'maker-1-d9',
     );

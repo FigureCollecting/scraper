@@ -28,16 +28,16 @@ import { isSafeRotatingName } from '../utils/rotatingName.js';
 import { isCloudflareChallenge } from '../services/engineServices/challengeDetect.js';
 import { getChallengeCooldown, normalizeHost } from '../services/challengeCooldown.js';
 import { getCfCookieStore, markStaleIfStored, markFreshIfStored } from '../services/cookieJar.js';
+import { observeGate, gateOutcomeOf, gateFailureReason } from '../services/gateSignal.js';
 import type { ListingPage, RetrievalCapability, RotatingSeedList, SearchFetch, SeedList } from '@figurecollecting/scraper-plugin-contract';
 import type { FetchBodyOutcome } from '../services/engineServices/capturingFetch.js';
 
 /**
- * The lookup's injected services, plus an optional STATUS-AWARE fetch on the same lanes. Only the
- * rotating axis reads it: it is what tells a store's 4xx (spend the slot) from its 5xx (retry).
+ * The lookup's injected services, including its optional STATUS-AWARE fetch on the same lanes
+ * (`fetchSearchDetail`). Every catalog axis reads it when present: the gate needs the status, and
+ * the declared-page axes tell a store's 4xx (spend the slot) from its 5xx (retry) with it.
  */
-export type CatalogServices = LookupServices & {
-  fetchSearchDetail?: (url: string, searchFetch: SearchFetch) => Promise<FetchBodyOutcome>;
-};
+export type CatalogServices = LookupServices;
 
 /** A listed item as /catalog returns it: the contract's listing item plus the engine-derived `collectUrl`. */
 export type CatalogItem = ListingPage['items'][number] & { collectUrl?: string };
@@ -318,16 +318,15 @@ export function assembleCatalog(services: CatalogServices): Catalog {
       return { status: 'failed' as const, reason, ...f };
     };
     const transport = services.profiles.searchTransportFor(caps.domains[0] ?? host);
-    let body: string;
-    let upstream: number | undefined;
+    let gate: ReturnType<typeof gateOutcomeOf>;
     try {
-      const outcome = await withTimeout(fetch(url, transport), timeoutMs, `${label} list fetch`);
-      body = typeof outcome === 'string' ? outcome : outcome.body;
-      upstream = typeof outcome === 'string' ? undefined : outcome.status;
+      gate = gateOutcomeOf(await withTimeout(fetch(url, transport), timeoutMs, `${label} list fetch`));
     } catch (err) {
       // The request never produced a page (network, proxy, timeout): nothing says the next try fails.
       return fail(err instanceof Error ? err.message : String(err), { failure: 'transient' });
     }
+    const body = gate.body;
+    const upstream = gate.status;
     // A challenge body is NOT an empty shelf: parsing it would report the list as yielding
     // nothing, which on a SLOW-cadence axis is a silence nobody would question for a week.
     if (isCloudflareChallenge(body)) {
@@ -335,12 +334,22 @@ export function assembleCatalog(services: CatalogServices): Catalog {
       markStaleIfStored(cfStore, url, host, transport.transport ?? 'http', `${label} list challenge page`);
       return fail('challenge page', { failure: 'deterministic', blocked: true });
     }
+    // CLEAN means a 2xx the lane SAW with a real body (gateSignal): an empty body or a 5xx from a
+    // gated host is a refused gate — stale mark + a strike toward the host's cooldown — and a
+    // status-blind body proves nothing either way. Neither marks the host FRESH.
+    const lane = transport.transport ?? 'http';
+    const verdict = observeGate({ cooldown: cd, store: cfStore }, { url, host, lane, searchFetch: transport, ...gate });
     if (upstream !== undefined && upstream >= 400) {
       const blocked = upstream === 401 || upstream === 403 || upstream === 429;
       const failure = upstream >= 500 || upstream === 429 ? 'transient' : 'deterministic';
       return fail(`store answered ${upstream}`, { failure, ...(blocked ? { blocked: true as const } : {}), upstreamStatus: upstream });
     }
-    markFreshIfStored(cfStore, url, host);
+    // A refused gate that still answered 2xx (an empty body) is not an empty shelf either. It is
+    // `transient` and not `blocked`: the crawler stops the store for this pass on a transient, so the
+    // next list of the same refusing host is not fetched in the same pass.
+    if (verdict === 'gate_failure') return fail(gateFailureReason(gate, lane), { failure: 'transient' });
+    // A clean page inside an OPEN window (opened while this fetch was in flight) is not FRESH either.
+    if (verdict === 'clean' && !cd.isOpen(host)) markFreshIfStored(cfStore, url, host);
     try {
       // UNTRUSTED plugin output, guarded exactly as the listing axis guards it. `hasMore` and
       // `nextPage` are NOT read at all: a declared list is one page, so a parser claiming a
@@ -377,7 +386,7 @@ export function assembleCatalog(services: CatalogServices): Catalog {
       // An UNDECLARED id is a coverage gap, never a fetch: the whole point of the axis is that the
       // set of pages it may reach was written down in advance.
       if (!list) return { status: 'unsupported', siteId, reason: `store declares no seed list ${JSON.stringify(listId)}` };
-      const out = await fetchDeclaredPage(siteId, listId, list.url, 'seed', services.fetchSearch);
+      const out = await fetchDeclaredPage(siteId, listId, list.url, 'seed', services.fetchSearchDetail ?? services.fetchSearch);
       if (out.status !== 'failed') return out.status === 'ok' ? { ...out, siteId, listId, url: list.url } : { ...out, siteId };
       return { status: 'failed', siteId, reason: out.reason };
     },
@@ -481,7 +490,10 @@ export function assembleCatalog(services: CatalogServices): Catalog {
         // primary domain exactly as /lookup does — the listing may live on a sibling host (api.)
         // the store's domains don't list. BOUNDED so a hung / CF-stalled store fails, not stalls.
         const transport = services.profiles.searchTransportFor(caps.domains[0] ?? host);
-        const body = await withTimeout(services.fetchSearch(url, transport), timeoutMs, 'catalog fetch');
+        const gate = gateOutcomeOf(
+          await withTimeout(services.fetchSearchDetail ? services.fetchSearchDetail(url, transport) : services.fetchSearch(url, transport), timeoutMs, 'catalog fetch'),
+        );
+        const body = gate.body;
         // HONEST LISTING: a CF challenge/block body is NOT a catalog page — extractListing would
         // lift 0 items and pose the page as "end of catalog". Detect it BEFORE parsing, open the
         // host's cooldown so the queue and the next crawl leave it alone, and report failed.
@@ -495,7 +507,21 @@ export function assembleCatalog(services: CatalogServices): Catalog {
           return { status: 'failed', siteId, reason: 'challenge page' };
         }
         // A clean listing for a host WITH stored cookies is the FRESH signal (clears a stale mark).
-        markFreshIfStored(cfStore, url, host);
+        // CLEAN means a 2xx the lane SAW with a real body (gateSignal): an empty body or a 5xx from a
+        // gated host is a refused gate — stale mark + a strike toward the host's cooldown — and a
+        // status-blind body proves nothing either way. Neither marks the host FRESH.
+        const lane = transport.transport ?? 'http';
+        const verdict = observeGate({ cooldown: cd, store: cfStore }, { url, host, lane, searchFetch: transport, ...gate });
+        // HONEST LISTING, as for a challenge: a refused gate is not a catalog page — parsing it would
+        // pose the store as "end of catalog". Report it failed; the strike above already counted.
+        if (verdict === 'gate_failure') {
+          const reason = gateFailureReason(gate, lane);
+          // eslint-disable-next-line no-console
+          console.warn(`[catalog] ${sanitizeForLog(siteId)} page ${pageNo} failed: ${reason}`);
+          return { status: 'failed', siteId, reason };
+        }
+        // A clean page inside an OPEN window (opened while this fetch was in flight) is not FRESH either.
+        if (verdict === 'clean' && !cd.isOpen(host)) markFreshIfStored(cfStore, url, host);
         // UNTRUSTED plugin output: a non-object page → no items; a non-array `items` → none; each
         // item must be an object with a non-empty string itemId (else dropped); paging signals are
         // used only when well-typed, else derived (non-empty page ⇒ more; next = page + 1).

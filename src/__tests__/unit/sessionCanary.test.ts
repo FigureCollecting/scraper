@@ -76,8 +76,25 @@ describe('observeSessionCanary — only the PAIR is proof', () => {
     expect(sessionCanaryView().stale).toBe(false);
   });
 
-  it('says nothing about a canary status that is neither served nor 404', () => {
-    expect(observeSessionCanary({ canaryStatus: 500, controlStatus: 200 })).toBe('inconclusive');
+  it('says nothing about a canary status that is neither served, 404 nor 5xx (a 403, a 429)', () => {
+    expect(observeSessionCanary({ canaryStatus: 403, controlStatus: 200 })).toBe('inconclusive');
+    expect(observeSessionCanary({ canaryStatus: 429, controlStatus: 200 })).toBe('inconclusive');
+    expect(sessionCanaryView().stale).toBe(false);
+  });
+
+  it('goes STALE when the canary itself answers 5xx — a refused gate, whatever the control said (2026-09-29)', () => {
+    expect(observeSessionCanary({ canaryStatus: 500, controlStatus: 200 })).toBe('stale');
+    const view = sessionCanaryView();
+    expect(view.stale).toBe(true);
+    expect(view.staleReason).toMatch(/5xx or an empty body/);
+    resetSessionCanary();
+    expect(observeSessionCanary({ canaryStatus: 503 })).toBe('stale');
+  });
+
+  it('goes STALE when the canary answers 200 with an EMPTY body; a 200 with a body is still fresh', () => {
+    expect(observeSessionCanary({ canaryStatus: 200, canaryBody: '' })).toBe('stale');
+    expect(sessionCanaryView().stale).toBe(true);
+    expect(observeSessionCanary({ canaryStatus: 200, canaryBody: '<html>item</html>' })).toBe('fresh');
     expect(sessionCanaryView().stale).toBe(false);
   });
 
@@ -85,6 +102,12 @@ describe('observeSessionCanary — only the PAIR is proof', () => {
     observeSessionCanary({ canaryStatus: 404, controlStatus: 200 });
     observeSessionCanary({ canaryStatus: 404, controlStatus: 503 });
     expect(sessionCanaryView().stale).toBe(true);
+  });
+
+  it('a canary probe that got NO status proves nothing, whatever its body (an empty body alone is not a refused gate here)', () => {
+    expect(observeSessionCanary({ canaryBody: '' })).toBe('inconclusive');
+    expect(observeSessionCanary({ canaryBody: '', controlStatus: 200 })).toBe('inconclusive');
+    expect(sessionCanaryView().stale).toBe(false);
   });
 });
 
@@ -174,6 +197,81 @@ describe('observeMfcItemFetch — the pair assembled from ordinary queue traffic
     observeMfcItemFetch(OTHER, 200, { env: {} as NodeJS.ProcessEnv, now: T0 });
     expect(observeMfcItemFetch(CANARY, 404, { env: {} as NodeJS.ProcessEnv, now: T0 + 60_000 })).toBe('inconclusive');
     expect(sessionCanaryView().stale).toBe(false);
+  });
+
+  it('goes STALE on an EMPTY 500 for the canary item — the 2026-09-29 incident shape — with the gate reason', () => {
+    expect(observeMfcItemFetch(CANARY, 500, { env: ENV, now: T0, body: '' })).toBe('stale');
+    const view = sessionCanaryView(ENV);
+    expect(view.stale).toBe(true);
+    expect(view.staleReason).toMatch(/5xx or an empty body/);
+    const lines = warn.mock.calls.map((c) => String(c[0])).filter((l) => l.includes('[MFC SESSION]'));
+    expect(lines).toHaveLength(1);
+    // The transition line names the GATE refusal, not the entitlement 404 (they send the operator to different places).
+    expect(lines[0]).toContain('answered 5xx or an empty body');
+    expect(lines[0]).not.toContain('canary item 404');
+  });
+
+  it('goes STALE on a 5xx WITH a body for the canary item too', () => {
+    expect(observeMfcItemFetch(CANARY, 502, { env: ENV, now: T0, body: '<html>bad gateway</html>' })).toBe('stale');
+    expect(observeMfcItemFetch(CANARY, 503, { env: ENV, now: T0 })).toBe('stale');
+  });
+
+  it('an EMPTY 200 on the canary is not a recovery: it goes stale, and a standing flag stands', () => {
+    observeMfcItemFetch(OTHER, 200, { env: ENV, now: T0 });
+    observeMfcItemFetch(CANARY, 404, { env: ENV, now: T0 + 60_000 });
+    const since = sessionCanaryView(ENV).staleSince;
+    expect(observeMfcItemFetch(CANARY, 200, { env: ENV, now: T0 + 120_000, body: '  ' })).toBe('stale');
+    expect(sessionCanaryView(ENV)).toMatchObject({ stale: true, staleSince: since });
+    expect(sessionCanaryView(ENV).staleReason).toContain('entitle'); // the first reason is kept
+    expect(observeMfcItemFetch(CANARY, 200, { env: ENV, now: T0 + 180_000, body: '<html>item</html>' })).toBe('fresh');
+    expect(sessionCanaryView(ENV).stale).toBe(false);
+  });
+
+  it('an EMPTY 200 on another item is NOT a served control, and a 5xx on an ordinary item says nothing', () => {
+    observeMfcItemFetch(OTHER, 200, { env: ENV, now: T0, body: '' });
+    expect(observeMfcItemFetch(CANARY, 404, { env: ENV, now: T0 + 60_000, body: 'nf' })).toBe('inconclusive');
+    expect(observeMfcItemFetch(OTHER, 500, { env: ENV, now: T0 + 90_000, body: '' })).toBe('inconclusive');
+    expect(sessionCanaryView(ENV).stale).toBe(false);
+  });
+
+  it('reads process.env when no options are passed (the queue\'s production call shape without a body)', () => {
+    const prior = process.env.MFC_SESSION_CANARY_ITEM;
+    process.env.MFC_SESSION_CANARY_ITEM = '777777';
+    try {
+      expect(observeMfcItemFetch(CANARY, 503)).toBe('stale');
+    } finally {
+      if (prior === undefined) delete process.env.MFC_SESSION_CANARY_ITEM; else process.env.MFC_SESSION_CANARY_ITEM = prior;
+    }
+  });
+
+  // Challenger round 2 on PR #334: a Cloudflare interstitial is not the item. A challenge page that
+  // came back 200 says nothing about entitlement — it must not clear a standing flag (the canary was
+  // not served) nor count as a served control (the store did not serve it either).
+  const CF_200 = '<html><head><title>Just a moment...</title></head><body><script>window._cf_chl_opt={}</script></body></html>';
+
+  it('a CHALLENGE page answering 200 on the canary is inconclusive: a standing stale flag stands', () => {
+    expect(observeMfcItemFetch(CANARY, 500, { env: ENV, now: T0, body: '' })).toBe('stale');
+    const since = sessionCanaryView(ENV).staleSince;
+    expect(observeMfcItemFetch(CANARY, 200, { env: ENV, now: T0 + 60_000, body: CF_200, challenge: true })).toBe('inconclusive');
+    expect(sessionCanaryView(ENV)).toMatchObject({ stale: true, staleSince: since });
+  });
+
+  it('a CHALLENGE page answering 200 on another item is NOT a served control: a canary 404 then proves nothing', () => {
+    expect(observeMfcItemFetch(OTHER, 200, { env: ENV, now: T0, body: CF_200, challenge: true })).toBe('inconclusive');
+    expect(observeMfcItemFetch(CANARY, 404, { env: ENV, now: T0 + 60_000, body: 'nf' })).toBe('inconclusive');
+    expect(sessionCanaryView(ENV).stale).toBe(false);
+  });
+
+  it('a CHALLENGE page on the canary is inconclusive whatever its status: it keeps its own path (cooldown + cookie stale mark)', () => {
+    expect(observeMfcItemFetch(CANARY, 503, { env: ENV, now: T0, body: CF_200, challenge: true })).toBe('inconclusive');
+    expect(observeMfcItemFetch(CANARY, 403, { env: ENV, now: T0, body: CF_200, challenge: true })).toBe('inconclusive');
+    expect(sessionCanaryView(ENV).stale).toBe(false);
+  });
+
+  it('a challenge flag that is not set (false) changes nothing: the canary 200 with a body is still fresh', () => {
+    observeMfcItemFetch(CANARY, 500, { env: ENV, now: T0, body: '' });
+    expect(observeMfcItemFetch(CANARY, 200, { env: ENV, now: T0 + 60_000, body: '<html>item</html>', challenge: false })).toBe('fresh');
+    expect(sessionCanaryView(ENV).stale).toBe(false);
   });
 
   it('is inert when the lane surfaced no status, and never throws on a junk URL', () => {
