@@ -64,6 +64,14 @@ const LANE_MODES: readonly LaneMode[] = ['off', 'shadow', 'on'];
 
 const isLaneClass = (value: string): value is LaneClass => (LANE_CLASSES as readonly string[]).includes(value);
 
+/**
+ * The class a lane label names. Anything outside the vocabulary (no label, or one this build does
+ * not know) is 'other', the class for unlabeled work: an unknown label must never make an item's
+ * work invisible to the scheduler.
+ */
+export const laneClassOf = (label: string | null | undefined): LaneClass =>
+  typeof label === 'string' && isLaneClass(label) ? label : 'other';
+
 const zeroCounts = (): Record<LaneClass, number> => ({ new: 0, company: 0, gap: 0, other: 0 });
 
 const gcd = (a: number, b: number): number => (b === 0 ? a : gcd(b, a % b));
@@ -129,9 +137,10 @@ class StrideTier {
   }
 
   /**
-   * Shift every pass so the lowest active pass is 0, and lift any idle member below it to 0. The
-   * shift preserves every comparison; the lift only does early what `observe` would do on return
-   * (the floor never goes down), so the numbers stay small without changing a single pick.
+   * Shift every pass so the lowest active pass is 0 (every comparison is preserved), and lift any
+   * idle member below that to 0. A member returning while others kept their work is raised to at
+   * least the virtual time anyway, so the lift changes no pick then; when every member was empty
+   * and several return together, it applies the same no-burst rule to them.
    */
   private normalize(): void {
     if (this.active.length === 0) return;
@@ -180,20 +189,24 @@ export class LaneScheduler {
   /**
    * The class that should take the host's next slot, given which classes have work; undefined only
    * when none has. Charges nothing: call `charge` once the dispatch actually costs a request.
-   * `withWork` should name classes that have dispatchable items; names outside the vocabulary are
-   * ignored.
+   * `withWork` should name classes that have dispatchable items; a name outside the vocabulary
+   * counts as 'other' (see `laneClassOf`).
    */
   pick(withWork: Iterable<LaneClass>): LaneClass | undefined {
     const set = new Set<LaneClass>();
-    for (const c of withWork) if (isLaneClass(c)) set.add(c);
+    for (const c of withWork) set.add(laneClassOf(c));
     this.positive.observe(set);
     this.filler.observe(set);
     this.otherHasWork = set.has('other');
     return this.positive.pick() ?? this.filler.pick();
   }
 
-  /** Charge one dispatch (one network attempt) to `cls`, whether or not the last pick chose it. */
-  charge(cls: LaneClass): LaneCharge {
+  /**
+   * Charge one dispatch (one network attempt) to `label`'s class, whether or not the last pick
+   * chose it; a name outside the vocabulary is charged to 'other'.
+   */
+  charge(label: LaneClass): LaneCharge {
+    const cls = laneClassOf(label);
     (this.tierOf.get(cls) as StrideTier).charge(cls);
     const otherIdle = !this.otherHasWork;
     this.counts.all[cls]++;

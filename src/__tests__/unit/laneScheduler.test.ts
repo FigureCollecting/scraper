@@ -10,6 +10,7 @@ import { logger } from '../../utils/logger';
 import {
   LANE_CLASSES,
   LaneScheduler,
+  laneClassOf,
   laneShares,
   laneWeightsForHost,
   parseLaneMode,
@@ -145,10 +146,16 @@ describe('LaneScheduler: work conservation', () => {
     for (let i = 0; i < 10; i++) expect(s.pick(ALL)).toBe(first);
   });
 
-  it('ignores a class name it does not know', () => {
+  it('counts a name outside the vocabulary as other, so no work is ever invisible', () => {
+    expect(laneClassOf('gap')).toBe('gap');
+    expect(laneClassOf('GAP')).toBe('other');
+    expect(laneClassOf('bogus')).toBe('other');
+    expect(laneClassOf(null)).toBe('other');
+    expect(laneClassOf(undefined)).toBe('other');
     const s = new LaneScheduler(DEFAULT);
-    expect(s.pick(['bogus' as LaneClass])).toBeUndefined();
-    expect(s.pick(['bogus' as LaneClass, 'gap'])).toBe('gap');
+    expect(s.pick(['bogus' as LaneClass])).toBe('other');
+    expect(s.charge('bogus' as LaneClass)).toEqual({ cls: 'other', otherIdle: false });
+    expect(s.tally().all.other).toBe(1);
   });
 
   it("hands an emptied class's share to the others in proportion, within 50 picks", () => {
