@@ -226,26 +226,55 @@ describe('LaneScheduler: a returning class gets no saved-up burst', () => {
     return worst;
   };
 
+  it('the bound needs only every other class to have work on the pick before the return: what they did earlier does not matter', () => {
+    // Why it holds for every history: each pick the returning class takes needs its pass to be the
+    // lowest, and it starts at or above the weight-averaged pass of the others (they all kept their
+    // work into the return, so the virtual time averages all of them). Adding up, by weight, how far
+    // the others' passes must have moved gives at most share * (n - 1) + 1 picks in the first n.
+    // Here the others come and go at random through the history and the absence, except on its
+    // last pick, where all of them have work.
+    const rand = prng(2);
+    for (let t = 0; t < 400; t++) {
+      const w = t % 4 === 0 ? DEFAULT : randomWeights(rand);
+      const back = LANE_CLASSES[Math.floor(rand() * 4)];
+      if (w[back] === 0 || sumOver(w, ALL.filter((c) => c !== back)) === 0) continue;
+      const s = new LaneScheduler(w);
+      const hist = Math.floor(rand() * 300);
+      const absent = 1 + Math.floor(rand() * (rand() < 0.5 ? 20 : 300));
+      for (let i = 0; i < hist + absent; i++) {
+        const last = i === hist + absent - 1;
+        step(s, LANE_CLASSES.filter((c) => (c === back ? i < hist && rand() < 0.75 : last || rand() < 0.6)));
+      }
+      expect({ t, w: label(w), back, ok: firstNExcess(s, w, back) <= 1 }).toEqual({ t, w: label(w), back, ok: true });
+    }
+  });
+
   it.each([
     [W(16, 88, 5, 85), 'company', [['new', 'gap', 'other'], ['new', 'gap', 'other'], ['other']], 1.1546],
     [W(72, 6, 74, 78), 'gap', [['company', 'other'], ['new', 'other'], []], 1.0957],
     [W(97, 89, 32, 41), 'company', [['new', 'gap', 'other'], ['new', 'gap'], ['new', 'other'], []], 1.0541],
+    [DEFAULT, 'new', [['gap', 'other'], ['company', 'other'], []], 1.3636],
+    [W(100, 1, 1, 1), 'new', [['new', 'other'], ['new', 'gap', 'other'], ['new', 'company', 'gap'], ['new', 'company'], []], 2.9126],
   ] as Array<[LaneWeights, LaneClass, LaneClass[][], number]>)(
-    'when the others change presence before the return, share plus 1 can be exceeded slightly: %j %s',
+    'when another class comes back with it, share plus 1 can be exceeded (a pinned construction, not a ceiling): %j %s',
     (w, back, history, excess) => {
-      // The other classes carry stride debt from the history, so the returning class briefly runs
-      // ahead of them: ordinary stride behaviour, not a saved-up burst. This pins today's figure.
+      // Each history ends on a pick where some other class had no work, so that class comes back
+      // WITH the returning one, carrying stride debt from earlier; the returning class runs ahead of
+      // it while it pays that debt off. No ceiling is proven for this case: these pin what short
+      // histories reach today (5 picks at 100/1/1/1 reach share + 2.91).
       const s = new LaneScheduler(w);
       for (const active of history) step(s, active);
       expect(firstNExcess(s, w, back)).toBeCloseTo(excess, 4);
     },
   );
 
-  it('over random histories, a returning class stays under share plus 2 (share plus 3 with shadow charges)', () => {
-    // Every class's presence is random before the absence; the absence lasts 1 to 600 picks. The
-    // shadow variant charges a random class on 1 pick in 5, as today's dispatch does in shadow mode.
-    for (const shadow of [false, true]) {
-      const rand = prng(shadow ? 778 : 777);
+  it('a seeded sample of random histories, pinned as a regression check and not a bound: worst under share plus 2, under share plus 3 with charges the pick did not choose', () => {
+    // Every class's presence is random before and during the absence, so other classes often come
+    // back with the returning one; the absence lasts 1 to 600 picks. The second variant charges a
+    // random class instead of the pick on 1 pick in 5. The constructions above show that other
+    // histories read more than this sample does.
+    for (const offPick of [false, true]) {
+      const rand = prng(offPick ? 778 : 777);
       let worst = -Infinity;
       for (let t = 0; t < 1_000; t++) {
         const w = t % 4 === 0 ? DEFAULT : randomWeights(rand);
@@ -257,12 +286,12 @@ describe('LaneScheduler: a returning class gets no saved-up burst', () => {
         for (let i = 0; i < hist + absent; i++) {
           const active = LANE_CLASSES.filter((c) => rand() < 0.75 && (i < hist || c !== back));
           const c = s.pick(active);
-          if (shadow && rand() < 0.2) s.charge(LANE_CLASSES[Math.floor(rand() * 4)]);
+          if (offPick && rand() < 0.2) s.charge(LANE_CLASSES[Math.floor(rand() * 4)]);
           else if (c !== undefined) s.charge(c);
         }
         worst = Math.max(worst, firstNExcess(s, w, back));
       }
-      expect({ shadow, under: worst < (shadow ? 3 : 2) }).toEqual({ shadow, under: true });
+      expect({ offPick, under: worst < (offPick ? 3 : 2) }).toEqual({ offPick, under: true });
     }
   });
 
@@ -321,6 +350,24 @@ describe('LaneScheduler: golden pick sequences', () => {
     },
   );
 
+  it('a class that comes back beside ONE class that kept its work, as another leaves, re-enters level with it', () => {
+    // 40/40/20/10: company is charged beside gap; then gap leaves as new comes back. company alone
+    // kept its work, so the virtual time is company's pass: new re-enters level with company, wins
+    // the tie by order, and the two alternate. Left at its old pass, new would take two in a row.
+    const s = new LaneScheduler(DEFAULT);
+    expect(script(s, [1, ['company', 'gap']], [4, ['new', 'company']])).toEqual([
+      'company', 'new', 'company', 'new', 'company',
+    ]);
+  });
+
+  it('no saved-up burst beside a single class that kept its work: at 100/1/100/0 the returning class takes 1 pick, not 101', () => {
+    // company (weight 1) is charged beside gap, so it is a whole span ahead; then gap leaves as new
+    // (weight 100) comes back. new re-enters at company's pass, takes one pick, and company is next.
+    // Left at its old pass, new would take 101 picks before company got one.
+    const s = new LaneScheduler(W(100, 1, 100, 0));
+    expect(script(s, [1, ['company', 'gap']], [3, ['new', 'company']])).toEqual(['company', 'new', 'company', 'new']);
+  });
+
   it('ties go to new, company, gap, other whatever order the caller lists the classes in', () => {
     const permutations = (xs: readonly LaneClass[]): LaneClass[][] =>
       xs.length <= 1 ? [[...xs]] : xs.flatMap((x, i) => permutations(xs.filter((_, j) => j !== i)).map((p) => [x, ...p]));
@@ -355,10 +402,10 @@ describe('LaneScheduler: golden pick sequences', () => {
     ]);
   });
 
-  it('a charge the pick did not choose (shadow mode) moves the charged class, not the picked one', () => {
+  it('a charge the pick did not choose moves the charged class, not the picked one', () => {
     const s = new LaneScheduler(W(1, 1, 1, 0));
     expect(s.pick(NCG)).toBe('new');
-    s.charge('gap'); // today's dispatch sent a gap item: gap waits a round, new is still first
+    s.charge('gap'); // the dispatch sent a gap item: gap waits a round, new is still first
     expect(script(s, [5, NCG])).toEqual(['new', 'company', 'new', 'company', 'gap']);
   });
 
@@ -375,11 +422,24 @@ describe('LaneScheduler: golden pick sequences', () => {
 
   it('the virtual time rounds up, so a returning class never lands below the exact average', () => {
     // 1/1/1/1: gap (step 2) and company (step 6) each come back at an average a third of a unit
-    // past a whole number. Rounded up, company sits one unit behind new at step 7; rounded down
-    // (twice), it would sit one unit ahead of new and take the pick.
+    // past a whole number. Rounded up, company sits one unit behind new at step 7. Always rounded
+    // down, company comes back ahead of new and takes step 7. Rounding to the nearest unit is not
+    // ruled out here (its first rounding shifts the later averages and the picks agree); the next
+    // case rules it out.
     const s = new LaneScheduler(W(1, 1, 1, 1));
     expect(script(s, [1, ['new', 'company', 'other']], [1, ALL], [2, NCG], [1, ['new', 'gap', 'other']], [2, ALL])).toEqual([
       'new', 'company', 'gap', 'new', 'gap', 'other', 'new',
+    ]);
+  });
+
+  it('a third of a unit is rounded up too, not to the nearest unit', () => {
+    // 3/1/1/1: new's stride is a third of the others'. At step 5 new comes back beside company, gap
+    // and other at an average a third of a unit past a whole number. Rounded up, new sits one unit
+    // behind gap after other's pick, so gap takes step 6; rounded to the nearest unit (down, for a
+    // third) or always down, new ties gap and wins step 6 by order.
+    const s = new LaneScheduler(W(3, 1, 1, 1));
+    expect(script(s, [1, ALL], [1, ['new', 'gap']], [1, ALL], [1, ['company', 'gap', 'other']], [2, ALL])).toEqual([
+      'new', 'gap', 'new', 'company', 'other', 'gap',
     ]);
   });
 
@@ -448,7 +508,7 @@ describe('LaneScheduler: a class reported empty for single picks', () => {
     const twoInThree = (n: number): boolean => n % 3 < 2;
     const twoInFive = (n: number): boolean => n % 5 < 2;
     for (const back of ['company', 'gap'] as const) expect(flickerRatio(DEFAULT, back, twoInThree, 2_200)).toBe(0);
-    expect(flickerRatio(DEFAULT, 'other', twoInFive, 2_200)).toBeLessThan(0.05);
+    expect(flickerRatio(DEFAULT, 'other', twoInFive)).toBeLessThan(0.02); // under 2 % of its share
   });
 });
 
@@ -488,6 +548,14 @@ describe('LaneScheduler: weight 0', () => {
     const counts = run(s, ALL, 1_000);
     expect(counts).toEqual({ new: 400, company: 400, gap: 200, other: 0 });
   });
+
+  it("a charge to a name outside the vocabulary moves other's pass in other's own tier, also when other is a weight-0 filler", () => {
+    const s = new LaneScheduler(W(40, 0, 0, 0)); // company, gap and other are all fillers
+    expect(s.pick(['company', 'gap', 'other'])).toBe('company');
+    expect(s.charge('bogus' as LaneClass)).toEqual({ cls: 'other', otherIdle: false });
+    // other, not company, took that turn: company and gap go next, then the three are level again
+    expect(script(s, [3, ['company', 'gap', 'other']])).toEqual(['company', 'gap', 'company']);
+  });
 });
 
 describe('LaneScheduler: determinism', () => {
@@ -501,7 +569,7 @@ describe('LaneScheduler: determinism', () => {
         out.push(c);
         const r = rand();
         if (c !== undefined && r < 0.9) s.charge(c); // charged dispatch
-        else if (r > 0.97) s.charge(LANE_CLASSES[Math.floor(rand() * 4)]); // a charge the pick did not choose (shadow)
+        else if (r > 0.97) s.charge(LANE_CLASSES[Math.floor(rand() * 4)]); // a charge the pick did not choose
         // else: a pick that cost no network request (cooldown fast-fail) is not charged
       }
       return out;
@@ -585,6 +653,29 @@ describe('share bases: Ross\'s three classes only while other has no work', () =
     expect(s.charge('new')).toEqual({ cls: 'new', otherIdle: false });
   });
 
+  it('once other goes idle again, charges count as made while other was idle again', () => {
+    const s = new LaneScheduler(DEFAULT);
+    s.pick(['new', 'other']);
+    expect(s.charge('new')).toEqual({ cls: 'new', otherIdle: false });
+    s.pick(['new']);
+    expect(s.charge('new')).toEqual({ cls: 'new', otherIdle: true });
+    expect(s.tally().whileOtherIdle.new).toBe(1);
+  });
+
+  it('after a backlog of other drains, the ross-three basis counts every later pick and reads 40/40/20', () => {
+    // At deploy, rows queued before lanes existed count as other and drain during the shadow period.
+    const s = new LaneScheduler(DEFAULT);
+    run(s, ALL, 1_100); // the backlog: other has work
+    run(s, NCG, 5_500); // drained: other idle from here on
+    const t = s.tally();
+    expect(t.all.other).toBe(100);
+    expect(LANE_CLASSES.reduce((a, c) => a + t.whileOtherIdle[c], 0)).toBe(5_500);
+    const shares = s.shares('ross-three');
+    expect(shares.new).toBeCloseTo(0.4, 2);
+    expect(shares.company).toBeCloseTo(0.4, 2);
+    expect(shares.gap).toBeCloseTo(0.2, 2);
+  });
+
   it('a charge to other itself is never counted as made while other was idle', () => {
     const s = new LaneScheduler(DEFAULT);
     s.pick(['new']); // a stale set: other had work after all, since it was dispatched
@@ -640,6 +731,27 @@ describe('share bases: Ross\'s three classes only while other has no work', () =
     const target = targetLaneShares(DEFAULT, ['new', 'gap', 'other'], 'all');
     const got = s.shares('all');
     for (const c of LANE_CLASSES) expect(Math.abs((got[c] ?? 0) - (target[c] ?? 0))).toBeLessThanOrEqual(0.01);
+  });
+
+  it('targetLaneShares is no benchmark while the classes with work change pick by pick: a repeating pattern drifts 17.5 points', () => {
+    // At 40/40/20/10 each class has work on 2 picks of every 4, in a fixed rotation. A class that
+    // leaves before it is served loses its place (see the flicker hazard above): new takes both of
+    // its picks in every 4 and other none, far from the per-pick targets summed over the run.
+    const pattern: LaneClass[][] = [['gap', 'other'], ['company', 'gap'], ['new', 'company'], ['new', 'other']];
+    const s = new LaneScheduler(DEFAULT);
+    const target = zeroCounts();
+    const picks: Array<LaneClass | undefined> = [];
+    for (let n = 0; n < 4_000; n++) {
+      const active = pattern[n % 4];
+      const t = targetLaneShares(DEFAULT, active, 'all');
+      for (const c of LANE_CLASSES) target[c] += t[c] ?? 0;
+      picks.push(step(s, active));
+    }
+    expect(picks.slice(0, 8)).toEqual(['gap', 'company', 'new', 'new', 'gap', 'company', 'new', 'new']);
+    expect(s.tally().all).toEqual({ new: 2_000, company: 1_000, gap: 1_000, other: 0 });
+    const got = s.shares('all');
+    expect((got.new ?? 0) - target.new / 4_000).toBeCloseTo(0.175, 6);
+    expect((got.other ?? 0) - target.other / 4_000).toBeCloseTo(-0.4 / 3, 6);
   });
 });
 
@@ -710,6 +822,11 @@ describe('parseLaneWeights', () => {
     expect(warn).not.toHaveBeenCalled();
   });
 
+  it('tolerates spaces on either side of the colon', () => {
+    expect(parseLaneWeights('a.example=new : 40, company: 40 ,gap :20').get('a.example')).toEqual(W(40, 40, 20, 0));
+    expect(warn).not.toHaveBeenCalled();
+  });
+
   it('a class left out gets weight 0 (served only when every other class is empty)', () => {
     expect(parseLaneWeights(`${MFC}=new:40,company:40,gap:20`).get(MFC)).toEqual(W(40, 40, 20, 0));
   });
@@ -729,6 +846,7 @@ describe('parseLaneWeights', () => {
     ['an empty host', '=new:40'],
     ['a url, not a host', 'https://myfigurecollection.net=new:40'],
     ['a host with a path', 'myfigurecollection.net/x=new:40'],
+    ['a host with a port', 'a.example:443=new:1'],
     ['a host with a bad label', '-bad-.net=new:40'],
     ['a host label over 63 characters', `${'a'.repeat(64)}.example=new:40`],
     ['an underscore in the host', 'a_b.example=new:40'],
