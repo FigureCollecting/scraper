@@ -315,6 +315,16 @@ describe('share bases: Ross\'s three classes only while other has no work', () =
     expect(shares.gap).toBeCloseTo(0.2, 2);
   });
 
+  it('the ross-three basis leaves out every pick made while other had work, even ones that change the mix', () => {
+    const s = new LaneScheduler(DEFAULT);
+    run(s, ['new', 'company', 'gap'], 5_500); // other idle: 2200/2200/1100
+    run(s, ['new', 'other'], 5_000); // other busy, company and gap dry: new 4000, other 1000
+    const shares = s.shares('ross-three');
+    expect(shares.new).toBeCloseTo(0.4, 2); // not (2200 + 4000) / 9500
+    expect(shares.company).toBeCloseTo(0.4, 2);
+    expect(shares.gap).toBeCloseTo(0.2, 2);
+  });
+
   it('the all basis mixes both phases, which is why a 40/40/20 target must not be read from it', () => {
     const s = twoPhases();
     const shares = s.shares(); // default basis: all four classes, every charged pick

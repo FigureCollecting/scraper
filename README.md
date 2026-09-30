@@ -1411,6 +1411,19 @@ See `.env.example` for complete configuration template.
   - Without it, one store's burst (the crawler enqueues 50 per store) could fill the working set and leave every other store's items on disk behind a host that is itself paced to one request every few seconds
   - Unset/invalid → default
   - Default: `250`
+- `SCRAPE_LANE_MODE`: Whether a host's dispatch slot is shared between work classes (`src/services/laneScheduler.ts`)
+  - **Not wired yet**: the queue does not read this until the lane wiring lands, so setting it today changes nothing
+  - `off` dispatches exactly as today; `shadow` computes and counts the lane pick but dispatches as today; `on` lets the pick choose which class's item takes the host's slot
+  - The scheduler only chooses WHICH class goes next, never WHEN: the host's pacing floor stays the only clock, so no lane setting can make a host faster
+  - Unset/blank → `off`; any other value → one WARN and `off`
+  - Default: `off`
+- `SCRAPE_LANE_WEIGHTS`: Per-host class weights, hosts separated by `;`, e.g. `myfigurecollection.net=new:40,company:40,gap:20,other:10`
+  - **Not wired yet** (see `SCRAPE_LANE_MODE`)
+  - Classes: `new`, `company`, `gap` (Ross's split) and `other` (anything unlabeled, such as the spine retry job's re-drives). Weights are whole numbers 0–100 and relative; a class left out gets 0. The host is matched like the queue keys hosts (lowercased, `www.` stripped)
+  - Weighted fair queueing (stride scheduling). Only classes with work compete, so a dry class's share goes to the others in proportion. A class coming back from empty gets no saved-up burst: at most its weight's share plus one pick in any window after it returns. Weight `0` is a filler, served only when every other class is empty
+  - A host entry is taken whole or not at all: a malformed one (no `=`, a bad host, an unknown or repeated class, a weight outside 0–100 or not a whole number, no positive weight) is dropped with a WARN and that host dispatches exactly as today; the other hosts still apply. A host named twice keeps its last entry, with a WARN
+  - **Reading the split.** While `other` has work, weights 40/40/20/10 give 36.4/36.4/18.2/9.1 of the slot, so a share taken over all picks cannot be checked against 40/40/20. The scheduler therefore tallies every charge twice: over all picks (basis `all`, four classes) and over the picks made while `other` had no work (basis `ross-three`, `new`/`company`/`gap` only). Check Ross's 40/40/20 on `ross-three`; `targetLaneShares` gives the expected share for whichever classes had work, on either basis
+  - Unset/blank → no host is laned
 - `CHALLENGE_COOLDOWN_MS`: Per-host cooldown window (ms) after a store serves a Cloudflare challenge/block
   - While a host is cooling, the scrape queue and lookup fan-out skip it without fetching, so repeat challenges don't degrade the egress IP's CF reputation
   - Open cooldowns are persisted with the queue (`SCRAPE_QUEUE_DIR`) and rehydrated at boot: a restart inside an open window is exactly when the engine is most likely to walk straight back into the challenge it just backed off from
