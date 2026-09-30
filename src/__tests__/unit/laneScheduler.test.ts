@@ -186,7 +186,7 @@ describe('LaneScheduler: work conservation', () => {
 });
 
 describe('LaneScheduler: a returning class gets no saved-up burst', () => {
-  it('counted from its return, it gets at most its weight share plus 1 in the first n picks, for every n', () => {
+  it('while every other class keeps its work through the absence, counted from its return it gets at most its weight share plus 1 in the first n picks, for every n', () => {
     const rand = prng(1);
     for (const w of WEIGHT_SETS) {
       for (const back of LANE_CLASSES) {
@@ -211,6 +211,58 @@ describe('LaneScheduler: a returning class gets no saved-up burst', () => {
         // and it is not punished either: after 300 picks it has its share, give or take 2
         expect(got).toBeGreaterThanOrEqual((300 * w[back]) / total - 2);
       }
+    }
+  });
+
+  /** The most `back` gets above its weight share in any of the first 300 picks after `history`, all backlogged. */
+  const firstNExcess = (s: LaneScheduler, w: LaneWeights, back: LaneClass): number => {
+    const share = w[back] / sumOver(w, LANE_CLASSES);
+    let got = 0;
+    let worst = -Infinity;
+    for (let n = 1; n <= 300; n++) {
+      if (step(s, ALL) === back) got++;
+      worst = Math.max(worst, got - n * share);
+    }
+    return worst;
+  };
+
+  it.each([
+    [W(16, 88, 5, 85), 'company', [['new', 'gap', 'other'], ['new', 'gap', 'other'], ['other']], 1.1546],
+    [W(72, 6, 74, 78), 'gap', [['company', 'other'], ['new', 'other'], []], 1.0957],
+    [W(97, 89, 32, 41), 'company', [['new', 'gap', 'other'], ['new', 'gap'], ['new', 'other'], []], 1.0541],
+  ] as Array<[LaneWeights, LaneClass, LaneClass[][], number]>)(
+    'when the others change presence before the return, share plus 1 can be exceeded slightly: %j %s',
+    (w, back, history, excess) => {
+      // The other classes carry stride debt from the history, so the returning class briefly runs
+      // ahead of them: ordinary stride behaviour, not a saved-up burst. This pins today's figure.
+      const s = new LaneScheduler(w);
+      for (const active of history) step(s, active);
+      expect(firstNExcess(s, w, back)).toBeCloseTo(excess, 4);
+    },
+  );
+
+  it('over random histories, a returning class stays under share plus 2 (share plus 3 with shadow charges)', () => {
+    // Every class's presence is random before the absence; the absence lasts 1 to 600 picks. The
+    // shadow variant charges a random class on 1 pick in 5, as today's dispatch does in shadow mode.
+    for (const shadow of [false, true]) {
+      const rand = prng(shadow ? 778 : 777);
+      let worst = -Infinity;
+      for (let t = 0; t < 1_000; t++) {
+        const w = t % 4 === 0 ? DEFAULT : randomWeights(rand);
+        const back = LANE_CLASSES[Math.floor(rand() * 4)];
+        if (w[back] === 0 || sumOver(w, ALL.filter((c) => c !== back)) === 0) continue;
+        const s = new LaneScheduler(w);
+        const hist = Math.floor(rand() * 400);
+        const absent = 1 + Math.floor(rand() * (rand() < 0.5 ? 20 : 600));
+        for (let i = 0; i < hist + absent; i++) {
+          const active = LANE_CLASSES.filter((c) => rand() < 0.75 && (i < hist || c !== back));
+          const c = s.pick(active);
+          if (shadow && rand() < 0.2) s.charge(LANE_CLASSES[Math.floor(rand() * 4)]);
+          else if (c !== undefined) s.charge(c);
+        }
+        worst = Math.max(worst, firstNExcess(s, w, back));
+      }
+      expect({ shadow, under: worst < (shadow ? 3 : 2) }).toEqual({ shadow, under: true });
     }
   });
 
@@ -254,6 +306,31 @@ describe('LaneScheduler: golden pick sequences', () => {
     const s = new LaneScheduler(W(1, 1, 1, 0));
     // company and gap take one pick each and are level again; new then arrives and ties them
     expect(script(s, [2, ['company', 'gap']], [3, NCG])).toEqual(['company', 'gap', 'new', 'company', 'gap']);
+  });
+
+  it.each([W(1, 1, 1, 0), W(2, 1, 1, 0), DEFAULT])(
+    "the virtual time averages only the classes that kept their work, never the returning class's own pass (%j)",
+    (w) => {
+      // new is picked, then sits out one pick while company (which kept its work) is charged. The
+      // virtual time is company's pass alone, so new comes back level with company and wins the tie.
+      // Folding new's own pass into the average would put it behind company.
+      const s = new LaneScheduler(w);
+      expect(script(s, [1, ['new', 'company']], [1, ['company', 'gap']], [1, ['new', 'company']])).toEqual([
+        'new', 'company', 'new',
+      ]);
+    },
+  );
+
+  it('ties go to new, company, gap, other whatever order the caller lists the classes in', () => {
+    const permutations = (xs: readonly LaneClass[]): LaneClass[][] =>
+      xs.length <= 1 ? [[...xs]] : xs.flatMap((x, i) => permutations(xs.filter((_, j) => j !== i)).map((p) => [x, ...p]));
+    const orders = permutations(LANE_CLASSES);
+    expect(orders).toHaveLength(24);
+    for (const order of orders) {
+      const s = new LaneScheduler(W(1, 1, 1, 1));
+      expect(script(s, [8, order])).toEqual([...ALL, ...ALL]);
+    }
+    expect(new LaneScheduler(DEFAULT).pick(['gap', 'company', 'new'])).toBe('new');
   });
 
   it('a class that sat idle while the others ran earns no credit when every class returns together', () => {
@@ -318,34 +395,60 @@ describe('LaneScheduler: golden pick sequences', () => {
 });
 
 /**
- * `back` has work on every pick except 1 in `k`; the others are backlogged. Returns what `back` got
- * over what it should have got on the picks where it had work.
+ * `back` has work on every pick except those `leftOut` names; the other classes of `base` are
+ * backlogged. Returns what `back` got over what it should have got on the picks where it had work.
  */
-const flickerRatio = (w: LaneWeights, back: LaneClass, k: number, picks = 22_000): number => {
+const flickerRatio = (
+  w: LaneWeights,
+  back: LaneClass,
+  leftOut: (n: number) => boolean,
+  picks = 22_000,
+  base: readonly LaneClass[] = ALL,
+): number => {
   const s = new LaneScheduler(w);
   let got = 0;
   let fair = 0;
   for (let n = 0; n < picks; n++) {
-    const active = n % k === 0 ? ALL.filter((c) => c !== back) : ALL;
+    const active = leftOut(n) ? base.filter((c) => c !== back) : [...base];
     fair += targetLaneShares(w, active, 'all')[back] ?? 0;
     if (step(s, active) === back) got++;
   }
   return got / fair;
 };
 
+/** Left out on 1 pick in `k`. */
+const oneIn = (k: number) => (n: number): boolean => n % k === 0;
+
 describe('LaneScheduler: a class reported empty for single picks', () => {
   it.each(LANE_CLASSES.flatMap((c) => [3, 4, 5, 10].map((k) => [c, k] as const)))(
     'at 40/40/20/10, %s reported empty on 1 pick in %i still gets at least 3/4 of its fair share',
     (back, k) => {
-      expect(flickerRatio(DEFAULT, back, k)).toBeGreaterThanOrEqual(0.75);
+      expect(flickerRatio(DEFAULT, back, oneIn(k))).toBeGreaterThanOrEqual(0.75);
+    },
+  );
+
+  // The filler tier has its own scaled span: at a bare span of 1 a unit is a whole stride, and the
+  // last filler in the order (other) then gets nothing when it is left out 1 pick in 3 or 4.
+  it.each((['company', 'gap', 'other'] as const).flatMap((c) => [3, 4, 10].map((k) => [c, k] as const)))(
+    'at 5/0/0/0 with new empty, the weight-0 filler %s reported empty on 1 pick in %i still gets at least 3/4 of its fair share',
+    (back, k) => {
+      const fillers: LaneClass[] = ['company', 'gap', 'other'];
+      expect(flickerRatio(W(5, 0, 0, 0), back, oneIn(k), 22_000, fillers)).toBeGreaterThanOrEqual(0.75);
     },
   );
 
   it('the hazard the queue wiring must avoid: a class left out of withWork while it has work can get nothing', () => {
-    // it re-enters at the others' average, never below the lowest pass, so it keeps losing its place
-    for (const back of ['company', 'gap', 'other'] as const) expect(flickerRatio(DEFAULT, back, 2, 2_200)).toBe(0);
-    expect(flickerRatio(W(1, 1, 1, 1), 'gap', 3, 2_200)).toBe(0);
-    expect(flickerRatio(W(100, 1, 1, 1), 'new', 3, 2_200)).toBe(0); // even the heaviest class
+    // It re-enters at the others' average, never below the lowest pass, so it keeps losing its place.
+    // These pin TODAY's re-entry rule: a rule that removes the hazard turns them red, and should then
+    // replace them with the service it gives.
+    for (const back of ['company', 'gap', 'other'] as const) expect(flickerRatio(DEFAULT, back, oneIn(2), 2_200)).toBe(0);
+    expect(flickerRatio(W(1, 1, 1, 1), 'gap', oneIn(3), 2_200)).toBe(0);
+    expect(flickerRatio(W(100, 1, 1, 1), 'new', oneIn(3), 2_200)).toBe(0); // even the heaviest class
+    // not only 1 pick in k: any repeated omission pattern can do it
+    const twoInThree = (n: number): boolean => n % 3 < 2;
+    const twoInFive = (n: number): boolean => n % 5 < 2;
+    for (const back of ['company', 'gap'] as const) expect(flickerRatio(DEFAULT, back, twoInThree, 2_200)).toBe(0);
+    expect(flickerRatio(DEFAULT, 'other', twoInFive, 2_200)).toBeLessThan(0.05);
   });
 });
 
@@ -636,6 +739,7 @@ describe('parseLaneWeights', () => {
     ['a fractional weight', 'a.example=new:2.5'],
     ['an exponent', 'a.example=new:1e2'],
     ['a hex weight', 'a.example=new:0x10'],
+    ['a plus sign', 'a.example=new:+40'],
     ['a weight above 100', 'a.example=new:101'],
     ['a huge weight', 'a.example=new:99999999999999999999'],
     ['a class without a weight', 'a.example=new'],
@@ -650,6 +754,14 @@ describe('parseLaneWeights', () => {
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn.mock.calls[0][0]).toContain('SCRAPE_LANE_WEIGHTS');
     expect(warn.mock.calls[0][1]).toEqual(expect.objectContaining({ entry: bad.trim() }));
+  });
+
+  it('strips www. only as the first label of the host', () => {
+    expect([...parseLaneWeights('shop.www.example=new:1;wwwexample.org=gap:1').keys()]).toEqual([
+      'shop.www.example',
+      'wwwexample.org',
+    ]);
+    expect(warn).not.toHaveBeenCalled();
   });
 
   it('a host named twice keeps the last entry, with a WARN', () => {
