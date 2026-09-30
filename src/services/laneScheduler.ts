@@ -18,17 +18,19 @@
  * - No saved-up burst: a class that comes back after being empty has its pass raised to the
  *   host's current virtual time, the weight-averaged pass of the classes that kept their work
  *   (rounded up to a whole unit, see `scaledSpan`). It re-enters level with them instead of
- *   spending the credit it "earned" while it had nothing to send. While every other class keeps its
- *   work through the absence, counted from its return, in the first n picks it gets at most its
- *   weight's share of n plus one, for every n. When the others change presence before the return,
- *   or come back with it, they carry stride debt and it can read a little more: the worst of 20,000
- *   random histories was share + 1.28, and share + 2.76 when a fifth of the charges went to a class
- *   the pick did not choose (shadow mode). A window that starts later than the return can read up to
- *   about 3 picks over its share, as plain stride scheduling does even when no class ever empties.
- *   (Raising it only to the MINIMUM pass, the plan's first design, overshoots more often, since the
- *   minimum sits below the others' average: over 3,974 random histories share + 1 was exceeded in
- *   542 of them against 4 for the weighted average, worst share + 1.62 against 1.06. The minimum
- *   starves fewer of the flickering classes described next.)
+ *   spending the credit it "earned" while it had nothing to send. If every other class had work on
+ *   the pick before the return and all keep it, then counted from the return, in the first n picks
+ *   it gets at most its weight's share of n plus one, for every n, whatever the others did earlier:
+ *   each pick it takes needs its pass to be the lowest, and it starts at or above the others'
+ *   weighted average. If some other class had no work on that pick and comes back with it, that
+ *   class can carry stride debt from earlier and fall behind while it pays it off, so the returning
+ *   class can read more. No ceiling is proven for that case: short histories pinned in the tests
+ *   reach share + 1.36 at 40/40/20/10 and share + 2.91 at 100/1/1/1. The bound covers only windows
+ *   that start at the return. (Raising it only to the MINIMUM pass, the plan's first design,
+ *   overshoots more often, since the minimum sits below the others' average: in a seeded simulation
+ *   of 3,974 random histories share + 1 was exceeded in 542 of them against 4 for the weighted
+ *   average, worst share + 1.62 against 1.06. The minimum starves fewer of the flickering classes
+ *   described next.)
  * - The price of that rule, and a contract for the caller: the average is never below the lowest
  *   pass, so a class reported empty while it still has work loses its place each time it comes
  *   back. Any repeated pattern of such omissions can leave it with no service at all, not only
@@ -43,8 +45,8 @@
  * - Exact and bounded: strides are whole numbers (the span, a multiple of the least common
  *   multiple of the positive weights, divided by each weight), and after every step the passes are
  *   shifted so the lowest active pass is 0. Every stride is at most 2^20. When every charge goes to
- *   the class just picked, no pass exceeds the largest stride; a charge to another class (shadow
- *   mode) adds at most one stride of debt, so even then the weighted sums stay exact integers below
+ *   the class just picked, no pass exceeds the largest stride; a charge to a class the pick did not
+ *   choose adds at most one stride of debt, so even then the weighted sums stay exact integers below
  *   2^53 for over 20 million charges. Every comparison is between whole numbers, so the same pick
  *   sequence always gives the same picks.
  *
@@ -57,8 +59,9 @@
  * nothing while 'other' always has work (a weight-0 'other' with work blanks it too, although it
  * takes no share); `shares('all')` reads all four classes from every pick. `targetLaneShares` gives
  * the matching expected share for a given set of classes with work. It is a benchmark only while
- * that set stays the same over many picks: when the set changes pick by pick, realised shares drift
- * from it (up to 4.6 points at 40/40/20/10 with each class present on half the picks).
+ * that set stays the same over many picks: when the set changes pick by pick, realised shares can
+ * drift far from it, and no bound is claimed. In a repeating 4-pick pattern at 40/40/20/10 where
+ * each class has work on half the picks, new reads 17.5 points above it and other 13.3 below.
  */
 
 import { logger } from '../utils/logger.js';
