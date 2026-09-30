@@ -186,7 +186,7 @@ describe('LaneScheduler: work conservation', () => {
 });
 
 describe('LaneScheduler: a returning class gets no saved-up burst', () => {
-  it('after being empty it gets at most its weight share plus 1 in every window after it returns', () => {
+  it('counted from its return, it gets at most its weight share plus 1 in the first n picks, for every n', () => {
     const rand = prng(1);
     for (const w of WEIGHT_SETS) {
       for (const back of LANE_CLASSES) {
@@ -222,6 +222,109 @@ describe('LaneScheduler: a returning class gets no saved-up burst', () => {
     // new comes back: it shares the host 1:1 from here, never 100 in a row
     const back = run(s, ['new', 'company'], 20);
     expect(back).toEqual({ ...zeroCounts(), new: 10, company: 10 });
+  });
+});
+
+/** Run each phase of `n` dispatches with the given classes having work; the picks, undefined = none had work. */
+const script = (s: LaneScheduler, ...phases: Array<[number, LaneClass[]]>): Array<LaneClass | undefined> =>
+  phases.flatMap(([n, active]) => Array.from({ length: n }, () => step(s, active)));
+
+const NCG: LaneClass[] = ['new', 'company', 'gap'];
+
+// Hand-derived pick sequences for scripted presence patterns. They pin the re-entry and normalize
+// rules exactly: a rule that forgives a debt, raises a returning class above the others' level,
+// hands an idle class credit, or loses a debt when every class is empty changes at least one pick.
+describe('LaneScheduler: golden pick sequences', () => {
+  it.each([
+    [1, ['new'], ['company', 'new', 'company', 'new', 'company', 'new', 'company', 'gap', 'new']],
+    [3, ['new', 'company', 'new'], ['company', 'new', 'company', 'new', 'company', 'gap', 'new', 'company', 'new']],
+  ] as const)(
+    'a debt is not forgiven: gap, charged and then empty for %i pick(s), waits until the others catch up',
+    (gone, whileGone, after) => {
+      // 4/4/1: strides 1/4, 1/4 and 1 of the span. Just after its pick gap is 3/4 of a span ahead;
+      // it comes back at max(its own pass, the others' weighted average), so it keeps that debt.
+      const s = new LaneScheduler(W(4, 4, 1, 0));
+      expect(script(s, [3, NCG], [gone, ['new', 'company']], [9, NCG])).toEqual([
+        'new', 'company', 'gap', ...whileGone, ...after,
+      ]);
+    },
+  );
+
+  it('a class that comes back while the others are level re-enters level with them (the order breaks the tie)', () => {
+    const s = new LaneScheduler(W(1, 1, 1, 0));
+    // company and gap take one pick each and are level again; new then arrives and ties them
+    expect(script(s, [2, ['company', 'gap']], [3, NCG])).toEqual(['company', 'gap', 'new', 'company', 'gap']);
+  });
+
+  it('a class that sat idle while the others ran earns no credit when every class returns together', () => {
+    const s = new LaneScheduler(W(1, 1, 1, 0));
+    script(s, [10, ['company', 'gap']]); // new idle for 10 picks: a burst of 5 would be "owed" without the lift
+    expect(script(s, [1, []], [6, NCG])).toEqual([undefined, 'new', 'company', 'gap', 'new', 'company', 'gap']);
+  });
+
+  it('a debt survives a moment when every class is empty', () => {
+    const s = new LaneScheduler(W(1, 1, 1, 0));
+    // new took its turn while all three had work; nobody has work for a pick; all three come back
+    expect(script(s, [1, NCG], [1, []], [6, NCG])).toEqual([
+      'new', undefined, 'company', 'gap', 'new', 'company', 'gap', 'new',
+    ]);
+  });
+
+  it('a class served while it was alone owes nothing when the others return', () => {
+    const s = new LaneScheduler(W(1, 1, 1, 0));
+    // work-conserving: new used a slot nobody else wanted, so it is not behind when they come back
+    expect(script(s, [1, ['new']], [1, []], [6, NCG])).toEqual([
+      'new', undefined, 'new', 'company', 'gap', 'new', 'company', 'gap',
+    ]);
+  });
+
+  it('a charge the pick did not choose (shadow mode) moves the charged class, not the picked one', () => {
+    const s = new LaneScheduler(W(1, 1, 1, 0));
+    expect(s.pick(NCG)).toBe('new');
+    s.charge('gap'); // today's dispatch sent a gap item: gap waits a round, new is still first
+    expect(script(s, [5, NCG])).toEqual(['new', 'company', 'new', 'company', 'gap']);
+  });
+
+  it('serves 97/89/83/79 as an exact cycle: every 348 picks hold exactly 97/89/83/79, and the cycle repeats', () => {
+    // pairwise coprime weights: the least common multiple is their product, 56,606,581, and every
+    // stride is a whole number, so the passes are level again after each cycle
+    const s = new LaneScheduler(W(97, 89, 83, 79));
+    const first = script(s, [348, ALL]);
+    const count = (seq: Array<LaneClass | undefined>, c: LaneClass): number => seq.filter((x) => x === c).length;
+    expect(LANE_CLASSES.map((c) => count(first, c))).toEqual([97, 89, 83, 79]);
+    for (let cycle = 0; cycle < 3; cycle++) expect(script(s, [348, ALL])).toEqual(first);
+  });
+});
+
+/**
+ * `back` has work on every pick except 1 in `k`; the others are backlogged. Returns what `back` got
+ * over what it should have got on the picks where it had work.
+ */
+const flickerRatio = (w: LaneWeights, back: LaneClass, k: number, picks = 22_000): number => {
+  const s = new LaneScheduler(w);
+  let got = 0;
+  let fair = 0;
+  for (let n = 0; n < picks; n++) {
+    const active = n % k === 0 ? ALL.filter((c) => c !== back) : ALL;
+    fair += targetLaneShares(w, active, 'all')[back] ?? 0;
+    if (step(s, active) === back) got++;
+  }
+  return got / fair;
+};
+
+describe('LaneScheduler: a class reported empty for single picks', () => {
+  it.each(LANE_CLASSES.flatMap((c) => [3, 4, 5, 10].map((k) => [c, k] as const)))(
+    'at 40/40/20/10, %s reported empty on 1 pick in %i still gets at least 3/4 of its fair share',
+    (back, k) => {
+      expect(flickerRatio(DEFAULT, back, k)).toBeGreaterThanOrEqual(0.75);
+    },
+  );
+
+  it('the hazard the queue wiring must avoid: a class reported empty for single picks while it has work can get nothing', () => {
+    // it re-enters at the others' average, never below the lowest pass, so it keeps losing its place
+    for (const back of ['company', 'gap', 'other'] as const) expect(flickerRatio(DEFAULT, back, 2, 2_200)).toBe(0);
+    expect(flickerRatio(W(1, 1, 1, 1), 'gap', 3, 2_200)).toBe(0);
+    expect(flickerRatio(W(100, 1, 1, 1), 'new', 3, 2_200)).toBe(0); // even the heaviest class
   });
 });
 
@@ -358,6 +461,19 @@ describe('share bases: Ross\'s three classes only while other has no work', () =
     expect(s.charge('new')).toEqual({ cls: 'new', otherIdle: false });
   });
 
+  it('a charge to other itself is never counted as made while other was idle', () => {
+    const s = new LaneScheduler(DEFAULT);
+    s.pick(['new']); // a stale set: other had work after all, since it was dispatched
+    expect(s.charge('other')).toEqual({ cls: 'other', otherIdle: false });
+    expect(s.charge('bogus' as LaneClass)).toEqual({ cls: 'other', otherIdle: false });
+    expect(s.tally().whileOtherIdle.other).toBe(0);
+    expect(s.tally().all.other).toBe(2);
+  });
+
+  it('before any pick, a charge assumes other is idle (the basis comes from the last pick)', () => {
+    expect(new LaneScheduler(DEFAULT).charge('new')).toEqual({ cls: 'new', otherIdle: true });
+  });
+
   it('laneShares of an empty tally is all zeros, never NaN', () => {
     const s = new LaneScheduler(DEFAULT);
     expect(laneShares(s.tally(), 'all')).toEqual({ new: 0, company: 0, gap: 0, other: 0 });
@@ -384,6 +500,14 @@ describe('share bases: Ross\'s three classes only while other has no work', () =
     });
     // nothing has work
     expect(targetLaneShares(DEFAULT, [], 'ross-three')).toEqual({ new: 0, company: 0, gap: 0 });
+  });
+
+  it('targetLaneShares counts a name outside the vocabulary as other, as pick does', () => {
+    expect(targetLaneShares(DEFAULT, ['bogus' as LaneClass], 'all')).toEqual({ new: 0, company: 0, gap: 0, other: 1 });
+    expect(targetLaneShares(DEFAULT, ['new', 'bogus' as LaneClass], 'all')).toEqual({
+      new: 40 / 50, company: 0, gap: 0, other: 10 / 50,
+    });
+    expect(targetLaneShares(DEFAULT, ['bogus' as LaneClass], 'ross-three')).toEqual({ new: 0, company: 0, gap: 0 });
   });
 
   it('measured shares match the target over classes that had work', () => {
@@ -470,12 +594,20 @@ describe('parseLaneWeights', () => {
     expect(parseLaneWeights(`${MFC}=new:100,company:0,gap:007`).get(MFC)).toEqual(W(100, 0, 7, 0));
   });
 
+  it('accepts a 63-character host label and skips empty class:weight pairs', () => {
+    const host = `${'a'.repeat(63)}.example`;
+    expect(parseLaneWeights(`${host}=new:40,,gap:20,`).get(host)).toEqual(W(40, 0, 20, 0));
+    expect(warn).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['no "="', 'myfigurecollection.net:new:40'],
     ['an empty host', '=new:40'],
     ['a url, not a host', 'https://myfigurecollection.net=new:40'],
     ['a host with a path', 'myfigurecollection.net/x=new:40'],
     ['a host with a bad label', '-bad-.net=new:40'],
+    ['a host label over 63 characters', `${'a'.repeat(64)}.example=new:40`],
+    ['an underscore in the host', 'a_b.example=new:40'],
     ['an unknown class', 'a.example=new:40,bogus:10'],
     ['a class named twice', 'a.example=new:40,new:20'],
     ['a letter in the weight', 'a.example=new:4O'],
