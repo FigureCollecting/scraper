@@ -285,6 +285,27 @@ describe('LaneScheduler: golden pick sequences', () => {
     expect(script(s, [5, NCG])).toEqual(['new', 'company', 'new', 'company', 'gap']);
   });
 
+  it('passes are whole numbers: a class that comes back beside a single class is exactly level with it', () => {
+    // 4/4/1/10. Step 2: company comes back at the weighted average of new (a stride ahead) and other
+    // (0), which rounds up to a whole unit; other is lowest. Step 3: gap comes back beside other
+    // alone, so its virtual time is exactly other's pass and the order (gap first) breaks the tie.
+    // With fractional passes, 10 * pass / 10 carries a float error here and hands the pick to other.
+    const s = new LaneScheduler(W(4, 4, 1, 10));
+    expect(script(s, [1, ['new', 'gap', 'other']], [1, ['new', 'company', 'other']], [1, ['gap', 'other']])).toEqual([
+      'new', 'other', 'gap',
+    ]);
+  });
+
+  it('the virtual time rounds up, so a returning class never lands below the exact average', () => {
+    // 1/1/1/1: gap (step 2) and company (step 6) each come back at an average a third of a unit
+    // past a whole number. Rounded up, company sits one unit behind new at step 7; rounded down
+    // (twice), it would sit one unit ahead of new and take the pick.
+    const s = new LaneScheduler(W(1, 1, 1, 1));
+    expect(script(s, [1, ['new', 'company', 'other']], [1, ALL], [2, NCG], [1, ['new', 'gap', 'other']], [2, ALL])).toEqual([
+      'new', 'company', 'gap', 'new', 'gap', 'other', 'new',
+    ]);
+  });
+
   it('serves 97/89/83/79 as an exact cycle: every 348 picks hold exactly 97/89/83/79, and the cycle repeats', () => {
     // pairwise coprime weights: the least common multiple is their product, 56,606,581, and every
     // stride is a whole number, so the passes are level again after each cycle
