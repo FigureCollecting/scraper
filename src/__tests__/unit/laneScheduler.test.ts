@@ -320,7 +320,7 @@ describe('LaneScheduler: a class reported empty for single picks', () => {
     },
   );
 
-  it('the hazard the queue wiring must avoid: a class reported empty for single picks while it has work can get nothing', () => {
+  it('the hazard the queue wiring must avoid: a class left out of withWork while it has work can get nothing', () => {
     // it re-enters at the others' average, never below the lowest pass, so it keeps losing its place
     for (const back of ['company', 'gap', 'other'] as const) expect(flickerRatio(DEFAULT, back, 2, 2_200)).toBe(0);
     expect(flickerRatio(W(1, 1, 1, 1), 'gap', 3, 2_200)).toBe(0);

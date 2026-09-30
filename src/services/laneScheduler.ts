@@ -17,18 +17,31 @@
  *   in proportion to their weights, and the slot never idles while any class has work.
  * - No saved-up burst: a class that comes back after being empty has its pass raised to the
  *   host's current virtual time, the weight-averaged pass of the classes that kept their work
- *   (rounded up). It re-enters level with them instead of spending the credit it "earned" while it
- *   had nothing to send, and in any window after it returns it gets at most its weight's share
- *   plus one pick. (Raising it only to the MINIMUM pass, the first design, is not enough: the
- *   minimum sits below the others' average, and a returning class then overshot share + 1 by up
- *   to about one more pick in 1,111 of 7,880 simulated returns. The weighted average never did.)
+ *   (rounded up to a whole unit, see `scaledSpan`). It re-enters level with them instead of
+ *   spending the credit it "earned" while it had nothing to send: counted from its return, in the
+ *   first n picks it gets at most its weight's share of n plus one, for every n. That bounds windows
+ *   that START at the return; a window starting later can read up to about 3 picks over share + 1,
+ *   as plain stride scheduling does even when no class ever empties. (Raising it only to the
+ *   MINIMUM pass, the first design, is not enough: the minimum sits below the others' average, and
+ *   a returning class then overshot share + 1 by up to about one more pick in 1,111 of 7,880
+ *   simulated returns. The weighted average never did.)
+ * - The price of that rule, and a contract for the caller: the average is never below the lowest
+ *   pass, so a class reported empty for single picks while it still has work loses its place each
+ *   time it comes back. Reported empty on every other pick it can get no service at all (company,
+ *   gap and other get none at 40/40/20/10), and at some weights 1 pick in 3 does the same (1/1/1/1;
+ *   even new at 100/1/1/1). So `withWork` must name every class that has a queued item (resident
+ *   or parked), never leave one out for a transient state such as a paused session. A class that
+ *   really was empty is not affected: once it has work it keeps it until it is served, and its pass
+ *   stays put while the others' advance.
  * - Weight 0 is a filler: served only when every positive-weight class is empty. Several weight-0
  *   classes with work share the slot evenly between themselves.
- * - Exact and bounded: strides are integers (the least common multiple of the positive weights,
- *   divided by each weight; weights are whole numbers 0-100, so that multiple is at most 100^4),
- *   and after every step the passes are shifted so the lowest active pass is 0, which keeps the
- *   numbers small. Every comparison is between whole numbers, so the same pick sequence always
- *   gives the same picks.
+ * - Exact and bounded: strides are whole numbers (the span, a multiple of the least common
+ *   multiple of the positive weights, divided by each weight), and after every step the passes are
+ *   shifted so the lowest active pass is 0. Every stride is at most 2^20. When every charge goes to
+ *   the class just picked, no pass exceeds the largest stride; a charge to another class (shadow
+ *   mode) adds at most one stride of debt, so even then the weighted sums stay exact integers below
+ *   2^53 for over 20 million charges. Every comparison is between whole numbers, so the same pick
+ *   sequence always gives the same picks.
  *
  * Share measurement (the review's note on 'other'): the fourth class 'other' (unlabeled work such as
  * the spine retry job's re-drives) is not part of Ross's split. While it has work, weights
@@ -76,6 +89,19 @@ const zeroCounts = (): Record<LaneClass, number> => ({ new: 0, company: 0, gap: 
 
 const gcd = (a: number, b: number): number => (b === 0 ? a : gcd(b, a % b));
 
+/** The span is scaled up to about this many units (between 2^19 and 2^20 unless the multiple is larger). */
+const SPAN_UNITS = 2 ** 20;
+
+/**
+ * The span for a tier whose weights have least common multiple `lcm`: a multiple of it, so every
+ * stride stays a whole number, scaled up to about 2^20 units. The virtual time is rounded up to a
+ * whole unit, and at the bare multiple a unit can be a whole stride (40/40/20/10 has span 40 and
+ * strides 1/1/2/4): a class reported empty on 1 pick in 3 then lost all its service to the rounding.
+ * Scaled, a unit is under 1/5,000 of any stride. The span stays below 2^27 (the multiple of four
+ * weights of at most 100), and span / weight is at most 2^20.
+ */
+const scaledSpan = (lcm: number): number => lcm * Math.max(1, Math.floor(SPAN_UNITS / lcm));
+
 // ---------------------------------------------------------------------------------------------
 // the scheduler
 // ---------------------------------------------------------------------------------------------
@@ -107,8 +133,9 @@ class StrideTier {
 
   /**
    * Record which members have work now. A member coming back from empty re-enters at the tier's
-   * virtual time: the weight-averaged pass of the members that kept their work, rounded up (the
-   * passes are whole numbers). It keeps its own pass if that is higher (a debt is not forgiven).
+   * virtual time: the weight-averaged pass of the members that kept their work, rounded up to a
+   * whole unit (the passes are whole numbers). It keeps its own pass if that is higher (a debt is
+   * not forgiven).
    */
   observe(withWork: ReadonlySet<LaneClass>): void {
     const was = new Set(this.active);
@@ -180,17 +207,18 @@ export class LaneScheduler {
     const zero = LANE_CLASSES.filter((c) => weights[c] === 0);
 
     const lcm = positive.reduce((acc, c) => (acc * weights[c]) / gcd(acc, weights[c]), 1);
-    this.positive = new StrideTier(positive, new Map(positive.map((c) => [c, weights[c]])), lcm);
+    this.positive = new StrideTier(positive, new Map(positive.map((c) => [c, weights[c]])), scaledSpan(lcm));
     // the fillers share their slot evenly: equal weights among themselves
-    this.filler = new StrideTier(zero, new Map(zero.map((c) => [c, 1])), 1);
+    this.filler = new StrideTier(zero, new Map(zero.map((c) => [c, 1])), scaledSpan(1));
     this.tierOf = new Map(LANE_CLASSES.map((c) => [c, weights[c] > 0 ? this.positive : this.filler]));
   }
 
   /**
    * The class that should take the host's next slot, given which classes have work; undefined only
    * when none has. Charges nothing: call `charge` once the dispatch actually costs a request.
-   * `withWork` should name classes that have dispatchable items; a name outside the vocabulary
-   * counts as 'other' (see `laneClassOf`).
+   * `withWork` must name every class that has a queued item, resident or parked; leaving a class
+   * out for a transient state costs it its place (see the module note). A name outside the
+   * vocabulary counts as 'other' (see `laneClassOf`).
    */
   pick(withWork: Iterable<LaneClass>): LaneClass | undefined {
     const set = new Set<LaneClass>();
@@ -203,12 +231,14 @@ export class LaneScheduler {
 
   /**
    * Charge one dispatch (one network attempt) to `label`'s class, whether or not the last pick
-   * chose it; a name outside the vocabulary is charged to 'other'.
+   * chose it; a name outside the vocabulary is charged to 'other'. Whether 'other' had work comes
+   * from the most recent `pick`, so call `pick` with the current classes before each charge
+   * (before any pick, 'other' counts as idle). A charge to 'other' itself always means it had work.
    */
   charge(label: LaneClass): LaneCharge {
     const cls = laneClassOf(label);
     (this.tierOf.get(cls) as StrideTier).charge(cls);
-    const otherIdle = !this.otherHasWork;
+    const otherIdle = cls !== 'other' && !this.otherHasWork;
     this.counts.all[cls]++;
     if (otherIdle) this.counts.whileOtherIdle[cls]++;
     return { cls, otherIdle };
@@ -244,7 +274,8 @@ export function laneShares(tally: LaneTally, basis: LaneShareBasis): Partial<Rec
 /**
  * The share each class should get when `withWork` are the classes that have work: weight over the
  * sum of the positive weights with work; if only weight-0 classes have work, they split evenly.
- * Classes without work (and weight-0 classes beside a positive one) get 0.
+ * Classes without work (and weight-0 classes beside a positive one) get 0. A name outside the
+ * vocabulary counts as 'other', as in `pick`.
  */
 export function targetLaneShares(
   weights: LaneWeights,
@@ -252,7 +283,8 @@ export function targetLaneShares(
   basis: LaneShareBasis,
 ): Partial<Record<LaneClass, number>> {
   const classes = basisClasses(basis);
-  const busy = new Set(withWork);
+  const busy = new Set<LaneClass>();
+  for (const c of withWork) busy.add(laneClassOf(c));
   const competing = classes.filter((c) => busy.has(c));
   const positive = competing.filter((c) => weights[c] > 0);
   const total = positive.reduce((acc, c) => acc + weights[c], 0);
