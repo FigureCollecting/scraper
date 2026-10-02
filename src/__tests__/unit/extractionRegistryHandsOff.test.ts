@@ -10,6 +10,7 @@ import type {
   AiBarSummary,
   HandsOffPolicy,
   RobotsClassifier,
+  RobotsPin,
   SiteConfig,
 } from '@figurecollecting/scraper-plugin-contract';
 
@@ -365,6 +366,105 @@ describe('ExtractionRegistry — a registered policy is a frozen snapshot', () =
 
 });
 
+/**
+ * The registry reads a policy ONCE, as plain data: it copies the plugin's object first (its own
+ * enumerable fields, each read once, through a structured clone) and then checks and stores that
+ * copy. So what it checked is what it stores, and a field the copy cannot see is missing, never
+ * trusted from a second read.
+ */
+describe('ExtractionRegistry.registerHandsOffPolicy — the policy is read once, as plain data', () => {
+  /** A policy whose `field` is an own enumerable getter: `first` on the first read, `later` on every other. */
+  function changing(field: keyof HandsOffPolicy, first: unknown, later: unknown, over: Partial<HandsOffPolicy> = {}) {
+    const reads = { count: 0 };
+    const target = { ...policy(over) } as Record<string, unknown>;
+    delete target[field];
+    Object.defineProperty(target, field, { enumerable: true, get: () => (++reads.count === 1 ? first : later) });
+    return { policy: target as unknown as HandsOffPolicy, reads };
+  }
+
+  it('stores the denied flag it checked, so the lookup and /health/detailed agree', () => {
+    const registry = createExtractionRegistry();
+    const { policy: changingDenied, reads } = changing('denied', undefined, 'yes');
+    registry.registerHandsOffPolicy(changingDenied);
+
+    expect(registry.handsOffPolicyFor('https://alpha.example.test/')?.denied).toBeUndefined();
+    expect(registry.handsOffView()[0].denied).toBe(false);
+    expect(reads.count).toBe(1);
+  });
+
+  it('stores the tier and the decision it checked', () => {
+    const registry = createExtractionRegistry();
+    const tier = changing('tier', 'FULL_BAR', 'BOGUS');
+    const decision = changing('handsOff', true, false, { siteId: 'beta', hosts: ['beta.example.test'] });
+    registry.registerHandsOffPolicy(tier.policy);
+    registry.registerHandsOffPolicy(decision.policy);
+
+    expect(registry.handsOffView().map(v => [v.siteId, v.tier, v.handsOff])).toEqual([
+      ['alpha', 'FULL_BAR', true],
+      ['beta', 'FULL_BAR', true],
+    ]);
+    expect(registry.handsOffPolicyFor('https://beta.example.test/')?.handsOff).toBe(true);
+    expect([tier.reads.count, decision.reads.count]).toEqual([1, 1]);
+  });
+
+  it('refuses a policy whose fields come from a class getter, a prototype or a non-enumerable property, naming the missing field', () => {
+    const registry = createExtractionRegistry();
+    class GeneratedPolicy {
+      readonly siteId = 'alpha';
+      readonly hosts = ['alpha.example.test'];
+      get handsOff(): boolean { return true; }
+      get denied(): boolean { return true; }
+      get tier(): 'FULL_BAR' { return 'FULL_BAR'; }
+      get summary(): AiBarSummary { return SUMMARY; }
+      get pins(): [] { return []; }
+      get routeSamples(): [] { return []; }
+      get policyVersion(): string { return 'generated-1'; }
+    }
+    const { handsOff: _handsOff, ...withoutDecision } = policy();
+    const onPrototype = Object.assign(Object.create({ handsOff: true, denied: true }), withoutDecision);
+    const nonEnumerable = Object.defineProperty({ ...withoutDecision }, 'handsOff', { value: true, enumerable: false });
+
+    for (const unreadable of [new GeneratedPolicy(), onPrototype, nonEnumerable]) {
+      expect(() => registry.registerHandsOffPolicy(unreadable as unknown as HandsOffPolicy)).toThrow(
+        'hands-off policy "alpha": handsOff must be a boolean, got undefined'
+      );
+    }
+    expect(registry.handsOffView()).toEqual([]);
+    // Nothing was stored without its decision, so nothing can be lifted under it either.
+    expect(registry.handsOffPolicyFor('https://alpha.example.test/')).toBeUndefined();
+  });
+
+  it('refuses pins or route samples with a hole (a hole reads as undefined, not as a pin or a URL)', () => {
+    const registry = createExtractionRegistry();
+    const holeyPins = new Array<RobotsPin>(2);
+    holeyPins[1] = { url: 'https://alpha.example.test/robots.txt', sha256: 'a'.repeat(64), fetchedAt: '2026-09-29T00:00:00.000Z' };
+    const holeySamples: string[] = [];
+    holeySamples[1] = 'https://alpha.example.test/item/1';
+
+    expect(() => registry.registerHandsOffPolicy(policy({ pins: holeyPins }))).toThrow(/pins must be an array of \{url, sha256, fetchedAt\}/);
+    expect(() => registry.registerHandsOffPolicy(policy({ routeSamples: holeySamples }))).toThrow(/routeSamples must be an array of strings/);
+    expect(registry.handsOffView()).toEqual([]);
+  });
+
+  it.each([
+    ['an empty summary', {}, 'summary.tier must be one of FULL_BAR'],
+    ['a summary tier outside AiBarTier', { ...SUMMARY, tier: 'PARTIAL_BAR' }, 'summary.tier must be one of FULL_BAR'],
+    ['no namedTokens', { ...SUMMARY, namedTokens: undefined }, 'summary.namedTokens must be an array of strings'],
+    ['no fullBarTokens', { ...SUMMARY, fullBarTokens: undefined }, 'summary.fullBarTokens must be an array of strings'],
+    ['no routeBarTokens', { ...SUMMARY, routeBarTokens: undefined }, 'summary.routeBarTokens must be an array of strings'],
+    ['no crawlDelayTokens', { ...SUMMARY, crawlDelayTokens: undefined }, 'summary.crawlDelayTokens must be an array of strings'],
+    ['contentSignals that is a string', { ...SUMMARY, contentSignals: 'ai-train=no' }, 'summary.contentSignals must be an array of strings'],
+    ['a token that is not a string', { ...SUMMARY, fullBarTokens: [1] }, 'summary.fullBarTokens must be an array of strings'],
+  ])('rejects a policy whose summary has %s, naming the field (the robots probe reads every list)', (_label, summary, message) => {
+    const registry = createExtractionRegistry();
+
+    expect(() => registry.registerHandsOffPolicy(policy({ summary: summary as unknown as AiBarSummary }))).toThrow(
+      `hands-off policy "alpha": ${message}`
+    );
+    expect(registry.handsOffView()).toEqual([]);
+  });
+});
+
 describe('ExtractionRegistry.robotsPinsFor', () => {
   it("returns the pins of the siteId's policy, and undefined for a siteId with no policy", () => {
     const registry = createExtractionRegistry();
@@ -382,6 +482,8 @@ describe('ExtractionRegistry.robotsPinsFor', () => {
 
     expect(registry.handsOffPolicyFor('https://denied.example.test/')?.denied).toBe(true);
     expect(registry.robotsPinsFor('undefined')).toBeUndefined();
+    // Nor through a missing siteId from an untyped caller: a host-only entry is indexed by host alone.
+    expect(registry.robotsPinsFor(undefined as unknown as string)).toBeUndefined();
   });
 });
 

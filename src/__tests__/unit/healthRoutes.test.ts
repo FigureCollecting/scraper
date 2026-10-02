@@ -43,6 +43,7 @@ const build = (over: Partial<HealthDeps> = {}) => {
       lostAtStartup: 0, restoredAt: null, pending: 0, leased: 0, parked: 0,
     }),
     listHandsOff: () => [],
+    listPlugins: () => ({ loaded: [], refused: [] }),
     ...over,
   }));
   return app;
@@ -790,5 +791,32 @@ describe('createHealthRoutes — handsOff', () => {
     expect(res.status).toBe(500);
     expect(res.body.status).toBe('degraded');
     expect(res.body.handsOff).toEqual(EXPECTED);
+  });
+});
+
+/**
+ * Which plugins loaded and which were refused at startup. It tells the two readings of handsOff: []
+ * apart (a plugin that registered no policy vs. a plugin that was refused), and explains a queueStore
+ * reading `held`. Names and versions only: the refusal itself is in the pod log, never on this
+ * unauthenticated endpoint.
+ */
+describe('createHealthRoutes — plugins', () => {
+  const VIEW = { loaded: [{ name: 'rules-plugin', version: '0.9.32' }], refused: [{ name: 'broken-plugin', version: '1.0.0' }] };
+
+  it('GET /health/detailed lists the loaded and the refused plugins', async () => {
+    const res = await request(build({ listPlugins: () => VIEW })).get('/health/detailed');
+
+    expect(res.status).toBe(200);
+    expect(res.body.plugins).toEqual(VIEW);
+  });
+
+  it('keeps plugins on the degraded (500) response', async () => {
+    const res = await request(build({
+      getBrowserPoolHealth: async () => { throw new Error('pool down'); },
+      listPlugins: () => VIEW,
+    })).get('/health/detailed');
+
+    expect(res.status).toBe(500);
+    expect(res.body.plugins).toEqual(VIEW);
   });
 });

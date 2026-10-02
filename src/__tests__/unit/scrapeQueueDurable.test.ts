@@ -981,3 +981,82 @@ describe('ScrapeQueue — a stale lease is claimed, never duplicated', () => {
     expect(scraping.scrapePage).toHaveBeenCalledTimes(1);
   });
 });
+
+/**
+ * STARTUP HOLD (src/index.ts, durableQueueHold): when the engine came up without every plugin, the
+ * durable file is closed untouched instead of restored. Restoring into a registry that cannot extract
+ * a row's store fails the row EXTRACTION_UNAVAILABLE, which is terminal, and deletes it; so would the
+ * dispatch scan's lease reaper and parked-row page-in, and a re-enqueue's claim of the row, the moment
+ * any new item set the queue running. So the process queues in memory, and the rows wait for a start
+ * whose registry is whole.
+ */
+describe('ScrapeQueue — holding the durable store when the registry came up incomplete', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.useFakeTimers({ advanceTimers: true });
+    resetScrapeQueue();
+  });
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  function seedEveryState(dir: string) {
+    const first = openStore(dir);
+    first.put({
+      id: 'p1-1', mfcId: 'p1', url: urlFor('p1'), priority: 'WARM',
+      attempts: 2, maxRetries: 3, enqueuedAt: 1_000, state: 'pending', lastErrorClass: 'network',
+    });
+    first.put({ id: 'k1-1', mfcId: 'k1', url: urlFor('k1'), priority: 'COLD', attempts: 0, maxRetries: 3, enqueuedAt: 2_000, state: 'parked' });
+    first.put({ id: 'l1-1', mfcId: 'l1', url: urlFor('l1'), priority: 'WARM', attempts: 1, maxRetries: 3, enqueuedAt: 3_000, state: 'pending' });
+    first.lease('l1-1', 5_000); // long expired: the reaper would re-drive it
+    first.close();
+  }
+
+  it('leaves every row on disk as it was while the process keeps taking (and failing) new items', async () => {
+    const dir = tmpDir();
+    seedEveryState(dir);
+    const store = openStore(dir);
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    queue = new ScrapeQueue(false);
+    queue.setQueueStore(store);
+    queue.setPluginRegistry(createExtractionRegistry()); // the rulesets plugin was refused: no store at all
+    queue.setIngestEmitter({ send: jest.fn().mockResolvedValue(okWriteStats()) });
+    queue.setScrapingService(scrapingStub());
+
+    queue.holdQueueStore('plugin(s) refused at startup: rules');
+    queue.enqueue('p1', { url: urlFor('p1') }); // the key of the pending row
+    queue.enqueue('k1', { url: urlFor('k1') }); // the key of the parked row
+    queue.enqueue('n1', { url: urlFor('n1') });
+    for (let i = 0; i < 4; i++) {
+      jest.advanceTimersByTime(200);
+      await jest.advanceTimersByTimeAsync(50);
+    }
+    queue.refillWorkingSet(Date.now() + 3_600_000);
+
+    expect(queue.getStats().failed).toBe(3);
+    expect(queue.getQueueStoreView()).toMatchObject({
+      durable: false, reason: 'held', path: store.path, restoredAt: null, pending: 0, leased: 0, parked: 0,
+    });
+    const reopened = openStore(dir);
+    expect(reopened.counts()).toEqual({ pending: 1, leased: 1, parked: 1 });
+    const rows = reopened.restore(Date.now());
+    expect(rows.pending.map(r => [r.id, r.attempts, r.lastErrorClass])).toEqual([['p1-1', 2, 'network']]);
+    expect(rows.leasedExpired.map(r => [r.id, r.attempts])).toEqual([['l1-1', 1]]);
+    expect(errorSpy.mock.calls.map(c => String(c[0])).filter(l => l.includes('HELD'))).toEqual([
+      `[SCRAPE QUEUE] durable queue HELD, not restored (plugin(s) refused at startup: rules): ` +
+        `1 pending, 1 leased, 1 parked left untouched in ${store.path} for the next start`,
+    ]);
+    errorSpy.mockRestore();
+  });
+
+  it('is a no-op on a store that is not durable: there is nothing to hold, and its own reason stays', () => {
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    queue = new ScrapeQueue(true);
+
+    queue.holdQueueStore('no plugin registered a store');
+
+    expect(queue.getQueueStoreView()).toMatchObject({ durable: false, reason: 'disabled', path: null });
+    expect(errorSpy).not.toHaveBeenCalled();
+    errorSpy.mockRestore();
+  });
+});

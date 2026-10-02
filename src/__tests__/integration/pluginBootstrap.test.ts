@@ -7,7 +7,7 @@ import path from 'path';
 import request from 'supertest';
 import express from 'express';
 import { jest } from '@jest/globals';
-import { bootstrapPlugins, shutdownPlugins } from '../../services/pluginBootstrap';
+import { bootstrapPlugins, durableQueueHold, pluginsView, shutdownPlugins } from '../../services/pluginBootstrap';
 import { ScraperPlugin, ExtractionRegistry, PluginContext, ExpressRouter } from '@figurecollecting/scraper-plugin-contract';
 
 const FIXTURES_DIR = path.join(__dirname, '..', 'fixtures', 'plugins');
@@ -427,5 +427,160 @@ describe('bootstrapPlugins — a plugin is loaded whole or not at all', () => {
     // A failed plugin that kept its registry (a timer, a late callback) cannot register later either.
     expect(() => kept?.registerSite(storeSite('late', 'late.example.test'))).toThrow('plugin registration was discarded');
     expect(registry.allStores()).toEqual([]);
+  });
+
+  it('refuses a call made after the plugin has loaded, so a late policy never takes effect', async () => {
+    const app = buildApp();
+    let kept: ExtractionRegistry | undefined;
+    const late = buildSpyPlugin({
+      name: 'late-plugin',
+      register: async (registry: ExtractionRegistry) => {
+        kept = registry;
+        registry.registerSite(storeSite('guarded', 'guarded.example.test'));
+      },
+    });
+
+    const { registry, plugins } = await bootstrapPlugins(app, { discover: async () => [late] });
+
+    expect(plugins.map(p => p.name)).toEqual(['late-plugin']);
+    // A valid policy and a malformed one alike: after the plugin has loaded, neither applies.
+    expect(() => kept?.registerHandsOffPolicy?.(handsOffPolicy('guarded', 'guarded.example.test'))).toThrow(
+      'plugin registration is closed: the plugin has loaded, so a registry call made after its register() resolved takes no effect'
+    );
+    expect(() => kept?.registerHandsOffPolicy?.(handsOffPolicy('guarded', 'guarded.example.test:443'))).toThrow('plugin registration is closed');
+    expect(() => kept?.registerSite(storeSite('later', 'later.example.test'))).toThrow('plugin registration is closed');
+    expect(registry.handsOffView()).toEqual([]);
+    expect(registry.allStores().map(s => s.siteId)).toEqual(['guarded']);
+  });
+
+  it('hands register() only the four registry methods, so a plugin cannot commit its own registration early', async () => {
+    const app = buildApp();
+    let handedKeys: string[] = [];
+    const early = buildSpyPlugin({
+      name: 'early-plugin',
+      register: async (registry: ExtractionRegistry) => {
+        handedKeys = Object.keys(registry).sort();
+        registry.registerSite(storeSite('barred', 'barred.example.test'));
+        (registry as unknown as { commit?: () => void }).commit?.();
+        try {
+          registry.registerHandsOffPolicy?.(handsOffPolicy('barred', 'barred.example.test:443'));
+        } catch {
+          // swallowed, after trying to commit early
+        }
+      },
+    });
+
+    const { registry, plugins, refused } = await bootstrapPlugins(app, { discover: async () => [early] });
+
+    expect(handedKeys).toEqual(['registerHandsOffPolicy', 'registerRobotsClassifier', 'registerRuleset', 'registerSite']);
+    expect(plugins).toEqual([]);
+    expect(refused.map(p => p.name)).toEqual(['early-plugin']);
+    expect(registry.allStores()).toEqual([]);
+    expect(String(errorSpy.mock.calls[0]?.[1])).toContain('plugin registration refused');
+  });
+
+  it('loads a plugin that registers only sites after another plugin registered the classifier', async () => {
+    const app = buildApp();
+    const classifying = buildSpyPlugin({
+      name: 'classifying-plugin',
+      register: async (registry: ExtractionRegistry) => {
+        registry.registerRobotsClassifier?.({ tokenListDate: '2026-09-29', classify: () => SUMMARY });
+      },
+    });
+    const sitesOnly = buildSpyPlugin({
+      name: 'sites-only-plugin',
+      register: async (registry: ExtractionRegistry) => {
+        registry.registerSite(storeSite('beta', 'beta.example.test'));
+      },
+    });
+
+    const { registry, plugins, refused } = await bootstrapPlugins(app, { discover: async () => [classifying, sitesOnly] });
+
+    expect(plugins.map(p => p.name)).toEqual(['classifying-plugin', 'sites-only-plugin']);
+    expect(refused).toEqual([]);
+    expect(registry.getSiteConfigForUrl('https://beta.example.test/')?.siteId).toBe('beta');
+    expect(registry.robotsClassifier()?.tokenListDate).toBe('2026-09-29');
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  it('returns the refused plugins beside the loaded ones, in discovery order', async () => {
+    const app = buildApp();
+    const refusing = (name: string) =>
+      buildSpyPlugin({
+        name,
+        version: `${name.length}.0.0`,
+        register: async (registry: ExtractionRegistry) => {
+          registry.registerHandsOffPolicy?.(handsOffPolicy(name, `${name}.example.test:443`));
+        },
+      });
+    const healthy = buildSpyPlugin({
+      name: 'healthy',
+      register: async (registry: ExtractionRegistry) => registry.registerSite(storeSite('healthy', 'healthy.example.test')),
+    });
+
+    const result = await bootstrapPlugins(app, { discover: async () => [refusing('first'), healthy, refusing('third')] });
+
+    expect(result.plugins.map(p => p.name)).toEqual(['healthy']);
+    expect(result.refused.map(p => p.name)).toEqual(['first', 'third']);
+    expect(pluginsView(result)).toEqual({
+      loaded: [{ name: 'healthy', version: '1.0.0' }],
+      refused: [{ name: 'first', version: '5.0.0' }, { name: 'third', version: '5.0.0' }],
+    });
+  });
+});
+
+/**
+ * The durable scrape queue is restored only into a registry that came up whole. A restored row whose
+ * store has no ruleset fails EXTRACTION_UNAVAILABLE, which is terminal, and is deleted from disk; so
+ * when a plugin was refused, or no store registered at all, index.ts holds the queue instead.
+ */
+describe('durableQueueHold and pluginsView', () => {
+  const site = (siteId: string) => ({
+    siteId,
+    name: siteId,
+    domains: [`${siteId}.example.test`],
+    rateLimit: { domain: `${siteId}.example.test`, baseDelayMs: 1000, minDelayMs: 500, maxDelayMs: 5000, backoffMultiplier: 1.5, recoveryDivisor: 1.5, successThreshold: 3 },
+    requiresBrowser: false,
+    allowedCookies: [],
+  });
+  const plugin = (name: string, sites: string[], refuse = false) =>
+    buildSpyPlugin({
+      name,
+      register: async (registry: ExtractionRegistry) => {
+        for (const siteId of sites) registry.registerSite(site(siteId));
+        if (refuse) throw new Error(`${name} failed`);
+      },
+    });
+  let errorSpy: ReturnType<typeof jest.spyOn>;
+  beforeEach(() => {
+    errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+  });
+  afterEach(() => errorSpy.mockRestore());
+
+  it('lets the queue restore when every plugin loaded and at least one store registered', async () => {
+    const result = await bootstrapPlugins(buildApp(), { discover: async () => [plugin('a', ['alpha']), plugin('b', [])] });
+
+    expect(durableQueueHold(result)).toBeUndefined();
+  });
+
+  it('holds the queue when any plugin was refused, naming every refused plugin, even with other stores live', async () => {
+    const result = await bootstrapPlugins(buildApp(), {
+      discover: async () => [plugin('a', ['alpha']), plugin('broken-one', ['beta'], true), plugin('broken-two', [], true)],
+    });
+
+    expect(result.registry.allStores().map(s => s.siteId)).toEqual(['alpha']);
+    expect(durableQueueHold(result)).toBe('plugin(s) refused at startup: broken-one, broken-two');
+  });
+
+  it('holds the queue when no store registered (no plugin, or plugins with no sites)', async () => {
+    for (const candidates of [[], [plugin('empty', [])]]) {
+      const result = await bootstrapPlugins(buildApp(), { discover: async () => candidates });
+
+      expect(durableQueueHold(result)).toBe('no plugin registered a store');
+    }
+  });
+
+  it('reports no plugins before the bootstrap has run', () => {
+    expect(pluginsView(undefined)).toEqual({ loaded: [], refused: [] });
   });
 });

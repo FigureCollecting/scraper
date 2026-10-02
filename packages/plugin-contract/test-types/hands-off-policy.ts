@@ -153,6 +153,15 @@ const badClassifier: RobotsClassifier = {
 // @ts-expect-error — requiredCookies are cookie NAMES (strings)
 const numericRequiredCookies: SiteConfig = { ...site, requiredCookies: [1, 2] };
 
+// @ts-expect-error — `denied` is a boolean when present, never a string a generator wrote
+const stringDenied: HandsOffPolicy = { ...policy, denied: 'yes' };
+
+// The classifier a plugin registers is a RobotsClassifier, not any value.
+function registersAClassifier(registry: ExtractionRegistry): void {
+  // @ts-expect-error — no classify: not a RobotsClassifier
+  registry.registerRobotsClassifier?.({ tokenListDate: '2026-09-29' });
+}
+
 void callsWithoutOptionalChaining;
 void tiers;
 void unknownTier;
@@ -165,3 +174,5 @@ void missingHosts;
 void missingPolicyVersion;
 void badClassifier;
 void numericRequiredCookies;
+void stringDenied;
+void registersAClassifier;

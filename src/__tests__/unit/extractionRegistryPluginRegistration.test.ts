@@ -255,21 +255,23 @@ describe('ExtractionRegistry.beginRegistration — every call checked against th
 });
 
 describe('ExtractionRegistry.beginRegistration — after commit or discard', () => {
-  it('sends calls made after commit straight to the registry', () => {
+  it('refuses every call made after commit: the registration closes once the plugin has loaded, applying nothing late', () => {
     const registry = createExtractionRegistry();
     const registration = registry.beginRegistration();
+    registration.registerSite(site('alpha', 'alpha.example.test'));
     registration.commit();
 
-    registration.registerSite(site('alpha', 'alpha.example.test'));
-    registration.registerRuleset(ruleset('alpha'));
-    registration.registerHandsOffPolicy(policy());
-    registration.registerRobotsClassifier(classifier());
-
-    expect(visible(registry).policies).toEqual(['alpha']);
-    expect(visible(registry).sites).toEqual(['alpha']);
-    expect(visible(registry).rulesetForAlpha).toBe('alpha');
-    expect(visible(registry).classifier).toBe('2026-09-29');
-    expect(() => registration.registerHandsOffPolicy(policy({ siteId: 'beta' }))).toThrow('already registered by policy "alpha"');
+    for (const call of [
+      () => registration.registerSite(site('beta', 'beta.example.test')),
+      () => registration.registerRuleset(ruleset('alpha')),
+      () => registration.registerHandsOffPolicy(policy()),
+      () => registration.registerRobotsClassifier(classifier()),
+    ]) {
+      expect(call).toThrow('plugin registration is closed: the plugin has loaded, so a registry call made after its register() resolved takes no effect');
+    }
+    expect(visible(registry)).toEqual({ ...NOTHING, sites: ['alpha'], siteForAlpha: 'alpha', requiredCookies: ['session'] });
+    // A late call is not a refusal of the loaded plugin: what it committed stays committed.
+    expect(registry.allStores().map(s => s.siteId)).toEqual(['alpha']);
   });
 
   it('refuses every call made after discard, so a late call cannot bring the plugin back', () => {
@@ -297,9 +299,9 @@ describe('ExtractionRegistry.beginRegistration — after commit or discard', () 
     expect(() => committed.commit()).toThrow('plugin registration is already committed');
     committed.discard();
     expect(registry.allStores().map(s => s.siteId)).toEqual(['alpha']);
-    // Still committed: a later call still reaches the registry.
-    committed.registerSite(site('beta', 'beta.example.test'));
-    expect(registry.allStores().map(s => s.siteId)).toEqual(['alpha', 'beta']);
+    // Still committed, not discarded: a later call is refused as late, not as a discarded plugin.
+    expect(() => committed.registerSite(site('beta', 'beta.example.test'))).toThrow('plugin registration is closed');
+    expect(registry.allStores().map(s => s.siteId)).toEqual(['alpha']);
 
     const discarded = registry.beginRegistration();
     discarded.discard();
@@ -313,5 +315,69 @@ describe('ExtractionRegistry.beginRegistration — after commit or discard', () 
 
     expect(() => registration.commit()).toThrow(/refused/);
     expect(() => registration.commit()).toThrow('plugin registration is already discarded');
+  });
+});
+
+describe('ExtractionRegistry.beginRegistration — what the plugin is handed', () => {
+  it('hands the plugin only the four registry methods (forPlugin), so it cannot commit, discard or reach the registry', () => {
+    const registry = createExtractionRegistry();
+    const registration = registry.beginRegistration();
+    const handed = registration.forPlugin();
+
+    expect(Object.keys(handed).sort()).toEqual(['registerHandsOffPolicy', 'registerRobotsClassifier', 'registerRuleset', 'registerSite']);
+    expect(Object.getPrototypeOf(handed)).toBe(Object.prototype);
+    expect(Object.isFrozen(handed)).toBe(true);
+    for (const reach of ['commit', 'discard', 'registry', 'target', 'staged']) {
+      expect((handed as unknown as Record<string, unknown>)[reach]).toBeUndefined();
+    }
+  });
+
+  it('stages every call made through it, and a refused one poisons the registration as a direct call does', () => {
+    const registry = createExtractionRegistry();
+    const registration = registry.beginRegistration();
+    const { registerSite, registerRuleset, registerHandsOffPolicy, registerRobotsClassifier } = registration.forPlugin();
+
+    // Detached calls work: the methods do not depend on how the plugin calls them.
+    registerSite(site('alpha', 'alpha.example.test'));
+    registerRuleset(ruleset('alpha'));
+    registerHandsOffPolicy?.(policy());
+    registerRobotsClassifier?.(classifier());
+    expect(visible(registry)).toEqual(NOTHING);
+    registration.commit();
+    expect(visible(registry)).toEqual({
+      sites: ['alpha'], siteForAlpha: 'alpha', rulesetForAlpha: 'alpha', policies: ['alpha'], classifier: '2026-09-29', requiredCookies: ['session'],
+    });
+
+    const refused = registry.beginRegistration();
+    const handed = refused.forPlugin();
+    handed.registerSite(site('beta', 'beta.example.test'));
+    expect(() => handed.registerHandsOffPolicy?.(policy({ siteId: 'beta', hosts: ['beta.example.test:443'] }))).toThrow('is not a DNS hostname');
+    expect(() => refused.commit()).toThrow(/plugin registration refused/);
+    expect(registry.allStores().map(s => s.siteId)).toEqual(['alpha']);
+  });
+
+  it('commits a registration with no classifier after another plugin committed one', () => {
+    const registry = createExtractionRegistry();
+    const first = registry.beginRegistration();
+    first.registerRobotsClassifier(classifier('2026-01-01'));
+    first.commit();
+
+    const second = registry.beginRegistration();
+    second.registerSite(site('beta', 'beta.example.test'));
+    expect(() => second.commit()).not.toThrow();
+
+    expect(registry.allStores().map(s => s.siteId)).toEqual(['beta']);
+    expect(registry.robotsClassifier()?.tokenListDate).toBe('2026-01-01');
+  });
+
+  it('refuses at commit a plugin that caught a throw from reading its own ruleset', () => {
+    const registry = createExtractionRegistry();
+    const registration = registry.beginRegistration();
+    const unreadable = { get siteId(): string { throw new Error('siteId unreadable'); }, version: '1' } as unknown as ExtractionRuleset;
+    registration.registerSite(site('alpha', 'alpha.example.test'));
+
+    expect(() => registration.registerRuleset(unreadable)).toThrow('siteId unreadable');
+    expect(() => registration.commit()).toThrow('plugin registration refused: a registry call threw during register() (siteId unreadable)');
+    expect(visible(registry)).toEqual(NOTHING);
   });
 });
