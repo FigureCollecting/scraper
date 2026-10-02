@@ -43,8 +43,9 @@ is a no-op. A plugin that calls none of the new methods and makes all its regist
   together with the plugin's stores or not at all; one left until after `register()` resolves is
   refused, never applied late.
 - `SiteConfig.requiredCookies?: string[]` — the cookie names a healthy session jar must hold.
-  `allowedCookies` stays the allow-list. `registerSite` throws, naming the site, when it is present
-  and not an array of strings (a hole counts as a non-string), which refuses the whole plugin.
+  `allowedCookies` stays the allow-list. `registerSite` copies it once and checks the copy, throwing,
+  naming the site, when it is present and not an array of strings (a hole counts as a non-string),
+  which refuses the whole plugin. A later change to the plugin's own array has no effect.
 
 ## [0.16.0] - 2026-09-26
 

@@ -139,13 +139,25 @@ export type SettleableQueue = Pick<ScrapeQueue, 'restoreFromStore' | 'holdQueueS
  * The startup decision for the durable scrape queue, made ONCE, after the plugins have loaded: restore
  * it into a registry that came up whole, otherwise HOLD it (durableQueueHold says why). `undefined`
  * means the bootstrap did not complete (it threw, or its registry never reached the queue), which holds
- * too. Returns why the queue was held, or undefined when it was restored.
+ * too. A restore that throws (a row the store cannot read back, an I/O error mid-read) holds the queue
+ * as well, so it never ends the process: the row would still be there at every start. Returns why the
+ * queue was held, or undefined when it was restored.
  */
 export function settleDurableQueue(queue: SettleableQueue, bootstrap: BootstrapPluginsResult | undefined): string | undefined {
   const hold = bootstrap === undefined ? 'the plugin bootstrap did not complete' : durableQueueHold(bootstrap);
-  if (hold === undefined) queue.restoreFromStore();
-  else queue.holdQueueStore(hold);
-  return hold;
+  if (hold !== undefined) {
+    queue.holdQueueStore(hold);
+    return hold;
+  }
+  try {
+    queue.restoreFromStore();
+    return undefined;
+  } catch (error) {
+    console.error('[PLUGIN BOOTSTRAP] Restoring the durable scrape queue failed; holding it instead:', error);
+    const why = `the durable queue could not be restored (${error instanceof Error ? error.message : String(error)})`;
+    queue.holdQueueStore(why);
+    return why;
+  }
 }
 
 /** The `plugins` block on /health/detailed for a bootstrap result; both lists empty before it has run. */

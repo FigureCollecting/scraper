@@ -304,15 +304,27 @@ interface PreparedSite {
   config: SiteConfig;
   siteId: string;
   domains: string[];
+  /** A copy of config.requiredCookies, taken once and checked; undefined when the site declares none. */
+  requiredCookies: string[] | undefined;
 }
 
-/** Read the config's index keys, and refuse it (naming the site) when it declares requiredCookies that are not cookie names. */
+/**
+ * Read the config's index keys, and refuse it (naming the site) when it declares requiredCookies that
+ * are not cookie names. requiredCookies is copied once and the copy is checked and kept: the plugin
+ * keeps its config object, so a later read could answer names the check never saw.
+ */
 function prepareSite(config: SiteConfig): PreparedSite {
-  const { requiredCookies } = config;
-  if (requiredCookies !== undefined && !isArrayOf(requiredCookies, isString)) {
+  const declared: unknown = config.requiredCookies;
+  const requiredCookies: unknown[] | undefined = Array.isArray(declared) ? Array.from(declared) : undefined;
+  if (declared !== undefined && !isArrayOf(requiredCookies, isString)) {
     throw new Error(`site ${JSON.stringify(config.siteId)}: requiredCookies must be an array of cookie names (strings) when present`);
   }
-  return { config, siteId: config.siteId, domains: Array.from(config.domains, domain => domain.toLowerCase()) };
+  return {
+    config,
+    siteId: config.siteId,
+    domains: Array.from(config.domains, domain => domain.toLowerCase()),
+    requiredCookies: requiredCookies as string[] | undefined,
+  };
 }
 
 /** Everything one plugin staged, applied to the registry in one step by PluginRegistration.commit(). */
@@ -338,6 +350,8 @@ export class ExtractionRegistryImpl implements ExtractionRegistry {
   private readonly rulesets = new Map<string, ExtractionRuleset>();
   /** hostname (lowercased) -> siteId */
   private readonly hostnameIndex = new Map<string, string>();
+  /** siteId -> the requiredCookies copy prepareSite checked (undefined: the site declares none) */
+  private readonly requiredCookiesBySite = new Map<string, string[] | undefined>();
   /** Hands-off policies in registration order (frozen snapshots). */
   private readonly policies: HandsOffPolicy[] = [];
   /** canonical host -> the policy that lists it; siteId -> its policy (a host-only entry has none) */
@@ -421,13 +435,13 @@ export class ExtractionRegistryImpl implements ExtractionRegistry {
 
   /**
    * The cookie names a healthy session jar for this host must hold (SiteConfig.requiredCookies of the
-   * site covering the host, parent-domain match as for the site lookups). A copy; undefined when no
-   * site covers the host or the site declares no required set.
+   * site covering the host, parent-domain match as for the site lookups), as registerSite copied and
+   * checked them. A copy; undefined when no site covers the host or the site declares no required set.
    */
   requiredCookiesFor(host: string): string[] | undefined {
     const siteId = this.resolveSiteIdForHost(canonicalHost(host));
-    const declared = siteId === undefined ? undefined : this.sites.get(siteId)?.requiredCookies;
-    return Array.isArray(declared) ? [...declared] : undefined;
+    const declared = siteId === undefined ? undefined : this.requiredCookiesBySite.get(siteId);
+    return declared === undefined ? undefined : [...declared];
   }
 
   /** Every registered policy, in registration order, as /health/detailed lists it (hosts frozen). */
@@ -462,6 +476,7 @@ export class ExtractionRegistryImpl implements ExtractionRegistry {
 
   private addSite(site: PreparedSite): void {
     this.sites.set(site.siteId, site.config);
+    this.requiredCookiesBySite.set(site.siteId, site.requiredCookies);
     for (const domain of site.domains) this.hostnameIndex.set(domain, site.siteId);
   }
 

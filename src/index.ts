@@ -158,7 +158,8 @@ async function startServer(): Promise<void> {
   // plugin's stores, would delete the very batch it had just recovered. Otherwise (a plugin was refused
   // or failed to load, no store registered, or the bootstrap threw) settleDurableQueue HOLDS the queue:
   // the file is closed without being restored, for the next start, rather than burned against an engine
-  // that cannot extract. The decision and its four paths are unit-tested in pluginBootstrap.test.ts.
+  // that cannot extract. A restore that throws holds it too, so it never stops the server listening.
+  // The decision and its paths are unit-tested in pluginBootstrap.test.ts.
   settleDurableQueue(queue, queueBootstrap);
 
   app.listen(PORT, async () => {

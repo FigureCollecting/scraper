@@ -327,7 +327,8 @@ export interface SiteConfig {
   /**
    * The cookie NAMES a healthy session jar for this store must hold (0.17.0). Absent = the store
    * declares no required set. `allowedCookies` stays the allow-list of names the engine may send.
-   * registerSite throws, naming the site, when it is present and not an array of strings.
+   * registerSite copies it once and throws, naming the site, when it is present and not an array of
+   * strings; a later change to the array has no effect.
    */
   requiredCookies?: string[];
 }

@@ -23,7 +23,7 @@ interface CandidatePackageJson {
   name?: unknown;
   version?: unknown;
   main?: string;
-  keywords?: string[];
+  keywords?: unknown;
 }
 
 /**
@@ -133,10 +133,11 @@ function nonEmptyString(value: unknown): string | undefined {
 }
 
 async function importPlugin(packageDir: string, pkg: CandidatePackageJson): Promise<ScraperPlugin | FailedPluginCandidate['reason']> {
-  const entryFile = path.join(packageDir, pkg.main || 'index.js');
-
   let mod: unknown;
   try {
+    // Inside the try: a `main` that is not a string makes path.join throw, and that candidate fails
+    // to import like any other whose entry file will not load.
+    const entryFile = path.join(packageDir, pkg.main || 'index.js');
     mod = await import(pathToFileURL(entryFile).href);
   } catch (error) {
     console.warn(`[PLUGIN LOADER] Failed to import candidate plugin at ${packageDir}:`, error);
@@ -169,7 +170,9 @@ export async function discoverPluginCandidates(options: DiscoverPluginsOptions):
 
   for (const dir of candidateDirs) {
     const pkg = await readPackageJson(dir);
-    if (!pkg || !pkg.keywords?.includes(PLUGIN_KEYWORD)) continue;
+    // `keywords` is an array by the package.json spec, but any package here can carry anything there:
+    // anything else is not the keyword (and a string is not searched for it as a substring).
+    if (!pkg || !Array.isArray(pkg.keywords) || !pkg.keywords.includes(PLUGIN_KEYWORD)) continue;
 
     const outcome = await importPlugin(dir, pkg);
     if (typeof outcome === 'string') {
