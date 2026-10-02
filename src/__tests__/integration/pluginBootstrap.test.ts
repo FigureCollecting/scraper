@@ -293,3 +293,134 @@ describe('bootstrapPlugins — hands-off registrations', () => {
     expect(String(errorSpy.mock.calls[0]?.[1])).toContain('"contested.example.test"');
   });
 });
+
+/**
+ * A plugin is loaded whole or not at all. Its registry calls are staged and committed only once
+ * register() and registerRoutes() have both succeeded, so a refused hands-off policy can never leave
+ * the plugin's stores live (crawled, scraped, looked up) without it, nor a partial policy list.
+ */
+describe('bootstrapPlugins — a plugin is loaded whole or not at all', () => {
+  const SUMMARY = { tier: 'FULL_BAR' as const, namedTokens: [], fullBarTokens: [], routeBarTokens: [], crawlDelayTokens: [], contentSignals: [] };
+  const handsOffPolicy = (siteId: string, host: string, handsOff = true) => ({
+    siteId,
+    hosts: [host],
+    handsOff,
+    tier: 'FULL_BAR' as const,
+    summary: SUMMARY,
+    pins: [],
+    routeSamples: [],
+    policyVersion: 'policy-test',
+  });
+  const storeSite = (siteId: string, domain: string) => ({
+    siteId,
+    name: siteId,
+    domains: [domain],
+    rateLimit: { domain, baseDelayMs: 1000, minDelayMs: 500, maxDelayMs: 5000, backoffMultiplier: 1.5, recoveryDivisor: 1.5, successThreshold: 3 },
+    requiresBrowser: false,
+    allowedCookies: [],
+  });
+  const storeRuleset = (siteId: string) => ({ siteId, version: '1', extract: () => ({}) }) as unknown as Parameters<ExtractionRegistry['registerRuleset']>[0];
+  const routeOf = (path: string) => (router: ExpressRouter) => {
+    router.get(path, (_req: any, res: any) => res.json({ ok: true }));
+  };
+
+  let errorSpy: ReturnType<typeof jest.spyOn>;
+  beforeEach(() => {
+    errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+  });
+  afterEach(() => errorSpy.mockRestore());
+
+  it('keeps none of the sites, rulesets, policies, classifier or routes of a plugin whose policy is refused after it registered sites', async () => {
+    const app = buildApp();
+    const halfPlugin = buildSpyPlugin({
+      name: 'half-plugin',
+      register: async (registry: ExtractionRegistry) => {
+        registry.registerSite(storeSite('barred', 'barred.example.test'));
+        registry.registerSite(storeSite('other', 'other.example.test'));
+        registry.registerRuleset(storeRuleset('barred'));
+        registry.registerRobotsClassifier?.({ tokenListDate: '2026-09-29', classify: () => SUMMARY });
+        registry.registerHandsOffPolicy?.(handsOffPolicy('other', 'other.example.test', false));
+        registry.registerHandsOffPolicy?.(handsOffPolicy('typo', 'barred.example.test:443'));
+        registry.registerHandsOffPolicy?.(handsOffPolicy('barred', 'barred.example.test'));
+      },
+      registerRoutes: jest.fn(routeOf('/half/ping')),
+    });
+    const healthyPlugin = buildSpyPlugin({
+      name: 'healthy-plugin',
+      register: async (registry: ExtractionRegistry) => {
+        registry.registerSite(storeSite('healthy', 'healthy.example.test'));
+        registry.registerHandsOffPolicy?.(handsOffPolicy('healthy', 'healthy.example.test'));
+      },
+      registerRoutes: jest.fn(routeOf('/healthy/ping')),
+    });
+
+    const { registry, plugins } = await bootstrapPlugins(app, { discover: async () => [halfPlugin, healthyPlugin] });
+
+    expect(plugins.map(p => p.name)).toEqual(['healthy-plugin']);
+    expect({
+      sites: registry.allStores().map(s => s.siteId),
+      siteForBarred: registry.getSiteConfigForUrl('https://barred.example.test/item/1')?.siteId,
+      rulesetForBarred: registry.getRulesetForUrl('https://barred.example.test/item/1')?.siteId,
+      policies: registry.handsOffView().map(v => v.siteId),
+      classifier: registry.robotsClassifier(),
+    }).toEqual({ sites: ['healthy'], siteForBarred: undefined, rulesetForBarred: undefined, policies: ['healthy'], classifier: undefined });
+    expect((await request(app).get('/half/ping')).status).toBe(404);
+    expect((await request(app).get('/healthy/ping')).status).toBe(200);
+    expect(String(errorSpy.mock.calls[0]?.[0])).toBe(
+      '[PLUGIN BOOTSTRAP] Failed to register plugin "half-plugin"; none of its sites, rulesets, policies or routes were kept:'
+    );
+    expect(String(errorSpy.mock.calls[0]?.[1])).toContain('"barred.example.test:443" is not a DNS hostname');
+  });
+
+  it('does not load a plugin that catches its refused policy and carries on', async () => {
+    const app = buildApp();
+    const swallowing = buildSpyPlugin({
+      name: 'swallowing-plugin',
+      register: async (registry: ExtractionRegistry) => {
+        registry.registerSite(storeSite('barred', 'barred.example.test'));
+        try {
+          registry.registerHandsOffPolicy?.(handsOffPolicy('barred', '*.barred.example.test'));
+        } catch {
+          // carries on without its policy
+        }
+      },
+      registerRoutes: jest.fn(routeOf('/swallowing/ping')),
+    });
+
+    const { registry, plugins } = await bootstrapPlugins(app, { discover: async () => [swallowing] });
+
+    expect(plugins).toEqual([]);
+    expect(registry.allStores()).toEqual([]);
+    expect((await request(app).get('/swallowing/ping')).status).toBe(404);
+    expect(String(errorSpy.mock.calls[0]?.[1])).toContain('plugin registration refused');
+  });
+
+  it('keeps nothing of a plugin whose register() rejects after it registered a site, or whose registerRoutes() throws', async () => {
+    const app = buildApp();
+    const rejects = buildSpyPlugin({
+      name: 'rejects-plugin',
+      register: async (registry: ExtractionRegistry) => {
+        registry.registerSite(storeSite('rejected', 'rejected.example.test'));
+        throw new Error('ruleset constructor failed');
+      },
+    });
+    const badRoutes = buildSpyPlugin({
+      name: 'bad-routes-plugin',
+      register: async (registry: ExtractionRegistry) => {
+        registry.registerSite(storeSite('routeless', 'routeless.example.test'));
+        registry.registerHandsOffPolicy?.(handsOffPolicy('routeless', 'routeless.example.test'));
+      },
+      registerRoutes: jest.fn((router: ExpressRouter) => {
+        router.get('/routeless/ping', (_req: any, res: any) => res.json({ ok: true }));
+        throw new Error('route table failed');
+      }),
+    });
+
+    const { registry, plugins } = await bootstrapPlugins(app, { discover: async () => [rejects, badRoutes] });
+
+    expect(plugins).toEqual([]);
+    expect(registry.allStores()).toEqual([]);
+    expect(registry.handsOffView()).toEqual([]);
+    expect((await request(app).get('/routeless/ping')).status).toBe(404);
+  });
+});

@@ -80,6 +80,32 @@ describe('engine source names no hands-off site, denied host or AI token', () =>
     expect(grown).toEqual([]);
   });
 
+  it('the baseline is exact: a file that names fewer must lower its count here, so it cannot grow back', () => {
+    const drifted = Object.entries(BASELINE)
+      .filter(([file, count]) => (found[file] ?? 0) !== count)
+      .map(([file, count]) => `${file}: ${count} -> ${found[file] ?? 0}`);
+
+    expect(drifted).toEqual([]);
+  });
+
+  it('catches a hands-off or denied site named by its siteId, not only by its host', () => {
+    const source = [
+      "if (siteId === 'mfc') return;",
+      'const id = "surugaya";',
+      'const store = `vndb`;',
+      "{ site: 'hpoi' }",
+      "const BANNED = 'tom';",
+      "case 'hobbygenki':",
+      "siteId === 'hobby-genki'",
+    ].join('\n');
+
+    expect(source.match(NAMES)).toHaveLength(7);
+  });
+
+  it('does not count an identifier or a word that merely contains a short siteId', () => {
+    expect('mfcSessionStale customfc tomorrow atom tom mfc "tomato" \'xmfc\''.match(NAMES)).toBeNull();
+  });
+
   it('really reads the tree: a file known to name a host is found (an empty walk cannot pass)', () => {
     expect(found['src/services/sessionCanary.ts']).toBeGreaterThan(0);
     expect(found['packages/plugin-contract/src/index.ts']).toBeGreaterThan(0);

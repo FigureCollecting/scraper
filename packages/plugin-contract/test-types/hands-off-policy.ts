@@ -4,6 +4,7 @@
  * `registerRobotsClassifier`, and `SiteConfig.requiredCookies`. RED before the 0.17.0 bump (none of
  * these exist); GREEN after. `hands-off-old-shape.ts` guards that the older shapes still compile.
  */
+import { AI_BAR_TIERS } from '../src/index';
 import type {
   AiBarSummary,
   AiBarTier,
@@ -120,6 +121,18 @@ const tiers: AiBarTier[] = ['FULL_BAR', 'ROUTE_BAR', 'NAMED_NO_ROUTE_BAR', 'CRAW
 // @ts-expect-error — a tier outside the union is refused
 const unknownTier: AiBarTier = 'PARTIAL_BAR';
 
+// The runtime list the engine validates a registered tier against is exactly the union.
+const runtimeTiers: readonly AiBarTier[] = AI_BAR_TIERS;
+const everyTierListed: (typeof AI_BAR_TIERS)[number][] = tiers;
+// @ts-expect-error — the list is read-only: an engine cannot widen it at runtime
+AI_BAR_TIERS.push('PARTIAL_BAR');
+
+// @ts-expect-error — `pins` is required: the robots probe reports drift against them
+const missingPins: HandsOffPolicy = { hosts: ['example.test'], handsOff: true, tier: 'FULL_BAR', summary, routeSamples: [], policyVersion: 'v' };
+
+// @ts-expect-error — `tier` is an AiBarTier, not any string
+const stringTier: HandsOffPolicy = { ...policy, tier: 'PARTIAL_BAR' as string };
+
 // @ts-expect-error — `handsOff` is required: it is the decision itself
 const missingHandsOff: HandsOffPolicy = { hosts: ['example.test'], tier: 'FULL_BAR', summary, pins: [], routeSamples: [], policyVersion: 'v' };
 
@@ -143,6 +156,10 @@ const numericRequiredCookies: SiteConfig = { ...site, requiredCookies: [1, 2] };
 void callsWithoutOptionalChaining;
 void tiers;
 void unknownTier;
+void runtimeTiers;
+void everyTierListed;
+void missingPins;
+void stringTier;
 void missingHandsOff;
 void missingHosts;
 void missingPolicyVersion;
