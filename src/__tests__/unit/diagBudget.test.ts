@@ -194,6 +194,15 @@ describe('openDiagBudget — the diag_budget table in the queue sqlite', () => {
     expect(() => openDiagBudget({ dir: tmpDir(), hostDailyCap: cap })).toThrow(/hostDailyCap/);
   });
 
+  it('throws when the file is not a database, and leaves it as it was', () => {
+    const dir = tmpDir();
+    const file = path.join(dir, QUEUE_DB_FILE);
+    fs.writeFileSync(file, 'this is not a database, it is a long enough line of text '.repeat(40));
+    const before = fs.readFileSync(file);
+    expect(() => openDiagBudget({ dir, hostDailyCap: 6 })).toThrow(/not a database/);
+    expect(fs.readFileSync(file).equals(before)).toBe(true);
+  });
+
   it('throws when the directory does not exist (the caller treats diag as unavailable)', () => {
     expect(() => openDiagBudget({ dir: path.join(tmpDir(), 'missing'), hostDailyCap: 6 })).toThrow();
   });
@@ -297,7 +306,25 @@ describe('the per-host rolling 24 h cap', () => {
     const b = open(dir, 2);
     b.startCall({ probe: Probe.ROBOTS_SNAPSHOT, host: 'WWW.Store.Example', runId: 'r' }).charge();
     expect(b.remaining('store.example')).toBe(1);
+    expect(b.remaining('www.STORE.example')).toBe(1);
     expect(rows(dir)[0].host).toBe('store.example');
+    expect(() => b.remaining('')).toThrow(/host/);
+  });
+
+  it('a cap lowered below what the window already holds reports 0 left, never a negative number', () => {
+    const dir = tmpDir();
+    const first = open(dir, 6);
+    for (const runId of ['a', 'b']) {
+      const call = first.startCall({ probe: Probe.ITEM_STATUS, host: 'store.example', runId });
+      call.charge();
+      call.charge();
+    }
+    first.close();
+    const lowered = open(dir, 2);
+    expect(lowered.remaining('store.example')).toBe(0);
+    const call = lowered.startCall({ probe: Probe.ITEM_STATUS, host: 'store.example', runId: 'c' });
+    expect(call.granted).toBe(0);
+    expect(call.refusal).toBe('host-cap');
   });
 
   it('counts a failed dispatch: the charge lands on disk before the dispatch and is never refunded', async () => {

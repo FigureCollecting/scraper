@@ -25,8 +25,10 @@ const STORES: Record<string, DiagStoreInfo & { domains: string[] }> = {
   alpha: { siteId: 'alpha', domains: ['alpha.example.com'] },
   beta: { siteId: 'beta', domains: ['beta.example.org'], idPattern: /[a-z]{2}-[0-9]{3}/ },
   gamma: { siteId: 'gamma', domains: ['gamma.example.net'], idPattern: /[0-9]+/g },
+  delta: { siteId: 'delta', domains: ['www.delta.example.com'], idPattern: /[a-z]{2}-[0-9]{3}/m },
+  sticky: { siteId: 'sticky', domains: ['sticky.example.com'], idPattern: /[0-9]+/y },
 };
-const DENIED = ['denied.example.org'];
+const DENIED = ['denied.example.org', 'www.denied-www.example.org'];
 
 /** Parent-domain match, the way the engine registry resolves a host. */
 function covers(domain: string, host: string): boolean {
@@ -145,6 +147,58 @@ describe('robots-snapshot --origin (store-less first contact)', () => {
     }
   );
 
+  it('a store registered under www. owns its bare name too: refuses https://delta.example.com', () => {
+    expect(refusal({ probe: Probe.ROBOTS_SNAPSHOT, origin: 'https://delta.example.com' })).toEqual({
+      field: 'origin',
+      reason: expect.stringContaining('use --store delta'),
+    });
+  });
+
+  it('a host denied under www. is denied under its bare name too', () => {
+    expect(refusal({ probe: Probe.ROBOTS_SNAPSHOT, origin: 'https://denied-www.example.org' })).toEqual({
+      field: 'origin',
+      reason: expect.stringMatching(/denied/),
+    });
+  });
+
+  it('a bare-name store is found from its www. twin as well', () => {
+    expect(refusal({ probe: Probe.ROBOTS_SNAPSHOT, origin: 'https://www.alpha.example.com' }).reason).toContain('use --store alpha');
+  });
+
+  it('says why: plain http is refused for its scheme, an IPv6 literal for being an IP literal', () => {
+    expect(refusal({ probe: Probe.ROBOTS_SNAPSHOT, origin: 'http://public.example.net' }).reason).toMatch(/must use https/);
+    expect(refusal({ probe: Probe.ROBOTS_SNAPSHOT, origin: 'https://[::1]' }).reason).toMatch(/IP literal/);
+    expect(refusal({ probe: Probe.ROBOTS_SNAPSHOT, origin: 'https://[2001:db8::1]' }).reason).toMatch(/IP literal/);
+  });
+
+  it('a DNS label may be 63 characters, not 64', () => {
+    const label = (n: number) => 'a'.repeat(n);
+    expect(check({ probe: Probe.ROBOTS_SNAPSHOT, origin: `https://${label(63)}.example.net` }).ok).toBe(true);
+    expect(refusal({ probe: Probe.ROBOTS_SNAPSHOT, origin: `https://${label(64)}.example.net` }).field).toBe('origin');
+  });
+
+  it('a hostname may be 253 characters, not 254', () => {
+    const name = (n: number) => {
+      const labels: string[] = [];
+      let left = n - '.net'.length;
+      while (left > 0) {
+        const len = Math.min(63, left - (labels.length > 0 ? 1 : 0));
+        labels.push('b'.repeat(len));
+        left -= len + (labels.length > 1 ? 1 : 0);
+      }
+      return `${labels.join('.')}.net`;
+    };
+    expect(name(253)).toHaveLength(253);
+    expect(name(254)).toHaveLength(254);
+    expect(check({ probe: Probe.ROBOTS_SNAPSHOT, origin: `https://${name(253)}` }).ok).toBe(true);
+    expect(refusal({ probe: Probe.ROBOTS_SNAPSHOT, origin: `https://${name(254)}` }).reason).toMatch(/not a DNS hostname/);
+  });
+
+  it('a name that only ends in the same letters as a reserved suffix is not refused for it', () => {
+    expect(check({ probe: Probe.ROBOTS_SNAPSHOT, origin: 'https://shop.contest' }).ok).toBe(true);
+    expect(check({ probe: Probe.ROBOTS_SNAPSHOT, origin: 'https://shop.glocal' }).ok).toBe(true);
+  });
+
   it.each(['https://denied.example.org', 'https://www.denied.example.org'])('refuses %j, a denied host', (origin) => {
     expect(refusal({ probe: Probe.ROBOTS_SNAPSHOT, origin })).toEqual({
       field: 'origin',
@@ -188,7 +242,7 @@ describe('item-status', () => {
   });
 
   it('refuses a missing or unregistered store', () => {
-    expect(refusal({ probe: Probe.ITEM_STATUS, ids: ['1'] }).field).toBe('store');
+    expect(refusal({ probe: Probe.ITEM_STATUS, ids: ['1'] })).toEqual({ field: 'store', reason: expect.stringMatching(/needs store/) });
     expect(refusal({ probe: Probe.ITEM_STATUS, store: 'nope', ids: ['1'] }).field).toBe('store');
   });
 
@@ -216,6 +270,15 @@ describe('item-status', () => {
       expect(check({ probe: Probe.ITEM_STATUS, store: 'gamma', ids: ['42'] }).ok).toBe(true);
     }
     expect(check({ probe: Probe.ITEM_STATUS, store: 'gamma', ids: ['42', '43'] }).ok).toBe(true);
+  });
+
+  it('a declared pattern carrying the y flag accepts the second id too', () => {
+    expect(check({ probe: Probe.ITEM_STATUS, store: 'sticky', ids: ['42', '43'] }).ok).toBe(true);
+  });
+
+  it('a declared pattern carrying the m flag cannot match one line of a multi-line id', () => {
+    expect(check({ probe: Probe.ITEM_STATUS, store: 'delta', ids: ['ab-123'] }).ok).toBe(true);
+    expect(refusal({ probe: Probe.ITEM_STATUS, store: 'delta', ids: ['ab-123\nzz'] }).field).toBe('ids');
   });
 });
 
