@@ -27,7 +27,8 @@ import { scraperDebug } from './utils/logger.js';
 
 // Import browser pool functionality
 import { browserLaneView, initializeBrowserPool, BrowserPool } from './services/genericScraper.js';
-import { bootstrapPlugins, shutdownPlugins } from './services/pluginBootstrap.js';
+import { bootstrapPlugins, pluginsView, settleDurableQueue, shutdownPlugins, type BootstrapPluginsResult } from './services/pluginBootstrap.js';
+import type { ExtractionRegistryImpl } from './services/extractionRegistry.js';
 import { getScrapeQueue } from './services/scrapeQueue.js';
 import { createQueueStore } from './services/queueStore.js';
 import { ScraperPlugin } from '@figurecollecting/scraper-plugin-contract';
@@ -66,6 +67,10 @@ app.use('/', createHealthRoutes({
   getSessionCanary: () => sessionCanaryView(),
   getCpuThrottling: () => cpuThrottlingView(),
   getQueueStore: () => getScrapeQueue().getQueueStoreView(),
+  // The registry exists once the plugins have loaded; until then (and with no plugin) the list is [].
+  listHandsOff: () => pluginRegistry?.handsOffView() ?? [],
+  // Which plugins loaded and which were refused; both empty until the bootstrap has run.
+  listPlugins: () => pluginsView(pluginBootstrap),
 }));
 
 // Scraper routes (no /api prefix for consistency)
@@ -77,13 +82,17 @@ app.use('/', ingestRoutes);
 
 // Plugins loaded at boot (populated by startServer, read by gracefulShutdown)
 let loadedPlugins: ScraperPlugin[] = [];
+// The plugin registry (populated by startServer, read by /health/detailed's handsOff)
+let pluginRegistry: ExtractionRegistryImpl | undefined;
+// The bootstrap's loaded and refused plugins (populated by startServer, read by /health/detailed's plugins)
+let pluginBootstrap: BootstrapPluginsResult | undefined;
 
 // Discover + register plugins (mounting their routes) before accepting
 // connections, then start the server and initialize the browser pool.
 async function startServer(): Promise<void> {
   // DURABLE SCRAPE QUEUE (SCRAPE_QUEUE_DIR, default /var/lib/scraper): open the backing store first,
   // so nothing can be enqueued before there is somewhere to write it. The RECONCILE deliberately
-  // happens later — see the comment at restoreFromStore() below.
+  // happens later — see the comment at settleDurableQueue() below.
   // Without a writable directory createQueueStore logs one warning and returns the in-memory
   // fallback: the engine then runs exactly as it did before, minus the durability.
   const queue = getScrapeQueue();
@@ -93,20 +102,21 @@ async function startServer(): Promise<void> {
   // run, and start its mtime poller so a re-minted file (a refreshed Secret) goes live without a
   // restart. Unset env ⇒ the store is disabled and this is a no-op. Never throws.
   getCfCookieStore().start();
+  // The bootstrap whose registry reached the scrape queue; it stays undefined if bootstrapPlugins (or
+  // threading its registry into the queue) threw, and the durable queue is then held below.
+  let queueBootstrap: BootstrapPluginsResult | undefined;
   try {
-    const { registry, plugins } = await bootstrapPlugins(app);
+    const bootstrap = await bootstrapPlugins(app);
+    const { registry, plugins } = bootstrap;
     loadedPlugins = plugins;
+    pluginRegistry = registry;
+    pluginBootstrap = bootstrap;
     // Thread the plugin registry into the scrape queue so items whose URLs
     // resolve to a plugin ruleset take the ingest path (when INGEST_BASE_URL
     // is configured). The engine carries no extraction fallback — items with
     // no matching ruleset fail cleanly through the queue's failure handling.
     queue.setPluginRegistry(registry);
-    // RECONCILE ONLY NOW, and only on a successful bootstrap. A restored item is dispatched as soon
-    // as it lands in a tier, and with no ruleset registry every one would fail EXTRACTION_UNAVAILABLE
-    // — which is TERMINAL, not retryable — so restoring ahead of the registry would delete the very
-    // batch it had just recovered. If bootstrapPlugins threw, we leave the rows on disk for the next
-    // start rather than burning them against an engine that cannot extract anything.
-    queue.restoreFromStore();
+    queueBootstrap = bootstrap;
     // Mount the cross-store buy-decision search (GET /lookup) now that the registry is populated.
     // Each store fetches via the transport its `searchFetch` declares (http / impersonate / browser);
     // http + impersonate use the engine defaults, and the `browser` transport is backed here by the
@@ -142,6 +152,15 @@ async function startServer(): Promise<void> {
   } catch (error) {
     console.error('[PAGE-SCRAPER] Plugin bootstrap failed:', error);
   }
+  // RECONCILE ONLY NOW, and only into a registry that came up WHOLE. A restored item is dispatched as
+  // soon as it lands in a tier, and an item whose store has no ruleset fails EXTRACTION_UNAVAILABLE —
+  // which is TERMINAL, not retryable — so restoring ahead of the registry, or into one missing a refused
+  // plugin's stores, would delete the very batch it had just recovered. Otherwise (a plugin was refused
+  // or failed to load, no store registered, or the bootstrap threw) settleDurableQueue HOLDS the queue:
+  // the file is closed without being restored, for the next start, rather than burned against an engine
+  // that cannot extract. A restore that throws holds it too, so it never stops the server listening.
+  // The decision and its paths are unit-tested in pluginBootstrap.test.ts.
+  settleDurableQueue(queue, queueBootstrap);
 
   app.listen(PORT, async () => {
     console.log(`[PAGE-SCRAPER] Server running on port ${PORT}`);
