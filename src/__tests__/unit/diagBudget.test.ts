@@ -190,6 +190,24 @@ describe('openDiagBudget — the diag_budget table in the queue sqlite', () => {
     expect(rows(dir)).toHaveLength(1);
   });
 
+  it('with no options at all it reads both SCRAPE_QUEUE_DIR and DIAG_HOST_DAILY_CAP', () => {
+    const dir = tmpDir();
+    process.env[QUEUE_DIR_ENV] = dir;
+    process.env[DIAG_HOST_DAILY_CAP_ENV] = '2';
+    const b = openDiagBudget();
+    budgets.push(b);
+    expect(b.hostDailyCap).toBe(2);
+    expect(b.remaining('store.example')).toBe(2);
+  });
+
+  it.each(['off', ''])(
+    'refuses to open when the queue sqlite is switched off (SCRAPE_QUEUE_DIR=%j): an unpersisted budget would reset on restart',
+    (value) => {
+      process.env[QUEUE_DIR_ENV] = value;
+      expect(() => openDiagBudget({ hostDailyCap: 6 })).toThrow(/SCRAPE_QUEUE_DIR/);
+    }
+  );
+
   it.each([-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])('refuses hostDailyCap %p by name', (cap) => {
     expect(() => openDiagBudget({ dir: tmpDir(), hostDailyCap: cap })).toThrow(/hostDailyCap/);
   });
