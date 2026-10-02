@@ -15,31 +15,33 @@
  *   pick that cost no network request (a cooldown fast-fail) can go uncharged.
  * - Work-conserving: only classes with work compete, so an empty class's share goes to the others
  *   in proportion to their weights, and the slot never idles while any class has work.
- * - No saved-up burst: a class that comes back after being empty has its pass raised to the
- *   host's current virtual time, the weight-averaged pass of the classes that kept their work
- *   (rounded up to a whole unit, see `scaledSpan`). It re-enters level with them instead of
- *   spending the credit it "earned" while it had nothing to send. If every other class had work on
- *   the pick before the return and all keep it, then counted from the return, in the first n picks
- *   it gets at most its weight's share of n plus one, for every n, whatever the others did earlier:
- *   each pick it takes needs its pass to be the lowest, and it starts at or above the others'
- *   weighted average. If some other class had no work on that pick and comes back with it, that
- *   class can carry stride debt from earlier and fall behind while it pays it off, so the returning
- *   class can read more. No ceiling is proven for that case: short histories pinned in the tests
- *   reach share + 1.36 at 40/40/20/10 and share + 2.91 at 100/1/1/1. The bound covers only windows
- *   that start at the return. (Raising it only to the MINIMUM pass, the plan's first design,
- *   overshoots more often, since the minimum sits below the others' average: in a seeded simulation
- *   of 3,974 random histories share + 1 was exceeded in 542 of them against 4 for the weighted
- *   average, worst share + 1.62 against 1.06. The minimum starves fewer of the flickering classes
- *   described next.)
+ * - No saved-up burst: a class that comes back after being empty has its pass raised to the host's
+ *   current virtual time, the weight-averaged pass of the classes that kept their work (rounded up
+ *   to a whole unit, see `scaledSpan`). It re-enters level with them instead of spending the credit
+ *   it "earned" while it had nothing to send. If every other class had work on the pick before the
+ *   return and all keep it, while every pick is charged to the class it picked, then counted from
+ *   the return, in the first n picks it gets at most its weight's share of n plus one, for every n,
+ *   whatever the others did earlier: each pick it takes needs its pass to be the lowest, and it
+ *   starts at or above the others' weighted average. (An uncharged pick or a charge to a class the
+ *   pick did not choose falls outside the bound.) If some other class had no work on that pick and
+ *   comes back with it, that class can carry stride debt from earlier and fall behind while it pays
+ *   it off, so the returning class can read more. No ceiling is proven for that case: short
+ *   histories pinned in the tests reach share + 1.36 at 40/40/20/10 and share + 2.91 at 100/1/1/1.
+ *   The bound covers only windows that start at the return. (Raising it only to the MINIMUM pass,
+ *   the plan's first design, overshoots more often, since the minimum sits below the others'
+ *   average: in a seeded simulation of 3,974 random histories share + 1 was exceeded in 542 of them
+ *   against 4 for the weighted average, worst share + 1.62 against 1.06. The minimum starves fewer
+ *   of the flickering classes described next.)
  * - The price of that rule, and a contract for the caller: the average is never below the lowest
  *   pass, so a class reported empty while it still has work loses its place each time it comes
- *   back. Any repeated pattern of such omissions can leave it with no service at all, not only
- *   every other pick (company, gap and other get none at 40/40/20/10): 2 picks in 3 (company and
- *   gap get none at 40/40/20/10), 2 in 5 (other gets under 2 % of its share), and at some weights 1
- *   in 3 (1/1/1/1; even new at 100/1/1/1). So `withWork` must name every class that has a queued
- *   item (resident or parked), never leave one out because its items were skipped for one pick. A
- *   class that really was empty is not affected: once it has work it keeps it until it is served,
- *   and its pass stays put while the others' advance.
+ *   back. Some repeated patterns of such omissions can leave it with little or no service, and not
+ *   only every other pick (company, gap and other get none at 40/40/20/10): 2 picks in 3 (company
+ *   and gap get none at 40/40/20/10), 2 in 5 (other gets under 2 % of its share), and at some
+ *   weights 1 in 3 (1/1/1/1; even new at 100/1/1/1). Others cost less: at 40/40/20/10 a class left
+ *   out 1 pick in 3, 4, 5 or 10 still gets at least 3/4 of its fair share. So `withWork` must name
+ *   every class that has a queued item (resident or parked), never leave one out because its items
+ *   were skipped for one pick. A class that really was empty is not affected: once it has work it
+ *   keeps it until it is served, and its pass stays put while the others' advance.
  * - Weight 0 is a filler: served only when every positive-weight class is empty. Several weight-0
  *   classes with work share the slot evenly between themselves.
  * - Exact and bounded: strides are whole numbers (the span, a multiple of the least common
@@ -364,22 +366,45 @@ function parseClassWeights(spec: string): LaneWeights | string {
  * `SCRAPE_LANE_WEIGHTS`: per host, hosts separated by ';', e.g.
  * `myfigurecollection.net=new:40,company:40,gap:20,other:10`. A class left out gets weight 0.
  *
- * Fail-safe: a host entry is taken whole or not at all. A malformed one (no '=', a bad host, an
- * unknown or repeated class, a weight that is not a whole number 0-100, no positive weight) is
- * DROPPED with a WARN naming it, so that host stays unlaned and dispatches exactly as today; the
- * other hosts' entries still apply. A host named twice keeps its last entry, with a WARN.
+ * Fail-safe: a host is laned by one whole, well-formed entry or not at all. An entry whose class
+ * list is malformed (an unknown or repeated class, a class without a weight, a weight that is not a
+ * whole number 0-100, no positive weight) is DROPPED with a WARN naming it and why, and its host is
+ * then unlaned for the whole setting: every other entry for that host, before or after it, is
+ * ignored too, so the host dispatches exactly as today. An entry with no readable host (no '=', or
+ * not a plain host name: a url, a port, a path, a bad label) is dropped with a WARN that it changes
+ * no host's dispatch: it names no host, so it lanes none and cannot unlane the one it meant. The
+ * other hosts' entries still apply. A host named twice in well-formed entries keeps its last
+ * entry, with a WARN.
  */
 export function parseLaneWeights(raw: string | undefined): ReadonlyMap<string, LaneWeights> {
   const out = new Map<string, LaneWeights>();
+  const refused = new Set<string>();
   for (const segment of (raw ?? '').split(';')) {
     const entry = segment.trim();
     if (entry === '') continue;
     const eq = entry.indexOf('=');
     const host = eq === -1 ? '' : normalizeLaneHost(entry.slice(0, eq));
-    const parsed = eq === -1 ? 'expected host=class:weight,...' : SAFE_HOST.test(host) ? parseClassWeights(entry.slice(eq + 1)) : 'not a host name';
-    if (typeof parsed === 'string') {
-      logger.warn(`[SCRAPE LANES] ${LANE_WEIGHTS_ENV} entry ignored; that host keeps today's dispatch`, {
+    if (!SAFE_HOST.test(host)) {
+      logger.warn(`[SCRAPE LANES] ${LANE_WEIGHTS_ENV} entry ignored; it names no valid host, so it changes no host's dispatch`, {
         entry,
+        reason: eq === -1 ? 'expected host=class:weight,...' : 'not a host name',
+      });
+      continue;
+    }
+    if (refused.has(host)) {
+      logger.warn(`[SCRAPE LANES] ${LANE_WEIGHTS_ENV} entry ignored; an earlier entry for that host was refused, so it keeps today's dispatch`, {
+        entry,
+        host,
+      });
+      continue;
+    }
+    const parsed = parseClassWeights(entry.slice(eq + 1));
+    if (typeof parsed === 'string') {
+      refused.add(host);
+      out.delete(host);
+      logger.warn(`[SCRAPE LANES] ${LANE_WEIGHTS_ENV} entry ignored; that host keeps today's dispatch, whatever its other entries say`, {
+        entry,
+        host,
         reason: parsed,
       });
       continue;
