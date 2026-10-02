@@ -4,6 +4,49 @@ All notable changes to `@figurecollecting/scraper-plugin-contract` will be docum
 file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this
 package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] - 2026-10-02
+
+Additive: every addition is optional, and a plugin that calls them on an older engine (with `?.`)
+is a no-op. A plugin that calls none of the new methods and makes all its registry calls before
+`register()` resolves loads exactly as before.
+
+### Changed
+- A registry call made after the plugin has loaded — any method, `registerSite` and
+  `registerRuleset` included, from a timer or an un-awaited load — now throws
+  (`plugin registration is closed`) and takes no effect; an older engine applied it late. Uncaught,
+  that throw ends the engine process, so a plugin that registers lazily must move those calls into
+  `register()` before it resolves.
+
+### Added
+- `ExtractionRegistry.registerHandsOffPolicy?(policy: HandsOffPolicy)` and the `HandsOffPolicy`,
+  `AiBarTier`, `AiBarSummary` and `RobotsPin` exports, plus `AI_BAR_TIERS` (the tiers as a runtime
+  list; `AiBarTier` is derived from it). A plugin registers which hosts Claude and its tools must
+  never contact (`handsOff`), permanently denied hosts (`denied`, `siteId` absent for a host-only
+  entry), the robots.txt classification behind the decision and its pins. The engine covers each
+  host and its subdomains and lists `{siteId, hosts, tier, handsOff, denied, policyVersion}` on
+  `/health/detailed` as `handsOff`. It throws, naming the policy and the value, on a host or siteId
+  another policy already holds, a host that is not a DNS hostname, a malformed field (`handsOff` or
+  `denied` not a boolean, a `tier` outside `AI_BAR_TIERS`, a missing `policyVersion`, a `summary`
+  that is not an `AiBarSummary`, `pins` or `routeSamples` that are not arrays of the declared shape),
+  or a policy on a subdomain that is less strict than the policy on its parent (it would lift the
+  parent's `handsOff` or `denied` there). The policy must be plain data: the engine copies its own
+  enumerable fields once and checks the copy, so a field on a prototype, behind a class getter or
+  non-enumerable counts as missing.
+- `ExtractionRegistry.registerRobotsClassifier?(classifier: RobotsClassifier)` and the
+  `RobotsClassifier` export (`{ tokenListDate, classify(body, routeUrls) }`). One per engine; a
+  second registration throws.
+- A refused call refuses the whole plugin. The engine stages the calls a plugin makes while it loads
+  (in `register()` and `registerRoutes()`) and applies them only once both have succeeded, so none of
+  the plugin's sites, rulesets, policies, classifier or routes take effect after a refusal, even one
+  the plugin caught. Make every call before `register()` resolves: once the plugin has loaded the
+  engine closes its registration, and a later call throws and takes no effect. So a policy goes live
+  together with the plugin's stores or not at all; one left until after `register()` resolves is
+  refused, never applied late.
+- `SiteConfig.requiredCookies?: string[]` — the cookie names a healthy session jar must hold.
+  `allowedCookies` stays the allow-list. `registerSite` copies it once and checks the copy, throwing,
+  naming the site, when it is present and not an array of strings (a hole counts as a non-string),
+  which refuses the whole plugin. A later change to the plugin's own array has no effect.
+
 ## [0.16.0] - 2026-09-26
 
 Additive, backward-compatible: a ruleset that declares nothing behaves exactly as before.

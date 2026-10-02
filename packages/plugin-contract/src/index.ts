@@ -20,12 +20,125 @@ export interface ScraperPlugin {
 export interface ExtractionRegistry {
   registerSite(config: SiteConfig): void;
   registerRuleset(ruleset: ExtractionRuleset): void;
+  /**
+   * Register which hosts Claude and its tools must never contact, and why (0.17.0). Optional: an
+   * engine that predates it has no such method, so a plugin calls it as
+   * `registry.registerHandsOffPolicy?.(policy)`. The engine indexes `hosts` (normalised; a policy
+   * covers each host and every subdomain of it) and THROWS, naming the policy and the value, when a
+   * host or the siteId is already held by another policy, a host is not a DNS hostname, a field is
+   * malformed (`handsOff`/`denied` not booleans, a `tier` outside {@link AI_BAR_TIERS}, no
+   * `policyVersion`, `summary`, `pins` or `routeSamples` of the declared shape), or the policy would
+   * lift a stricter one: a policy on a subdomain of another policy's host must be at least as strict
+   * (hands-off and denied wherever the parent is), whichever is registered first. The policy must be
+   * plain data: the engine copies its own enumerable fields once (a structured clone) and checks the
+   * copy, so a field on a prototype, behind a class getter or non-enumerable counts as missing.
+   *
+   * A refused call refuses the whole plugin. The engine stages the calls a plugin makes while it loads
+   * (in register() and registerRoutes()) and applies them only once both have succeeded, so after any
+   * refused call none of the plugin's sites, rulesets, policies, classifier or routes take effect —
+   * even when the plugin catches the throw and carries on. Make every call before register()
+   * resolves: once the plugin has loaded the engine closes its registration, and a later call (a
+   * timer, an un-awaited load) throws and takes no effect. So a policy is applied together with the
+   * plugin's stores or not at all, and a store is never live while a policy registered with it was
+   * refused; a policy the plugin leaves until after register() resolves is refused, not applied late.
+   */
+  registerHandsOffPolicy?(policy: HandsOffPolicy): void;
+  /**
+   * Register the robots.txt classifier the engine's robots probe runs on a fetched body (0.17.0).
+   * Optional, called as `registry.registerRobotsClassifier?.(classifier)`. An engine holds ONE: a
+   * second registration throws, naming the token list already registered (and, like a refused
+   * policy, refuses the whole plugin).
+   */
+  registerRobotsClassifier?(classifier: RobotsClassifier): void;
 }
 
 export interface PluginContext {
   logger: PluginLogger;
   config: RuntimeConfig;
   services: EngineServices;
+}
+
+// ============================================================================
+// Hands-off policy & robots classification (0.17.0) — registered by a plugin
+// ============================================================================
+
+/**
+ * How a store's robots.txt treats AI agents BY NAME, as the plugin's classifier reads it:
+ *   - `FULL_BAR`: a named AI token is disallowed from the root.
+ *   - `ROUTE_BAR`: the root is allowed, but a URL the store's rules would fetch is disallowed for a
+ *     named AI token.
+ *   - `NAMED_NO_ROUTE_BAR`: a named AI token is barred only from paths the rules never fetch.
+ *   - `CRAWL_DELAY_ONLY`: a named AI token gets a Crawl-delay and no Disallow.
+ *   - `NOT_NAMED`: no AI token is named.
+ *   - `UNREADABLE`: the body could not be classified (a challenge page, an error body).
+ * A `*` group's `Disallow: /` is a crawler matter, not a bar by name, and does not change the tier.
+ * Which tiers make a store hands-off is the plugin's policy (`HandsOffPolicy.handsOff`), not the tier's.
+ */
+export const AI_BAR_TIERS = ['FULL_BAR', 'ROUTE_BAR', 'NAMED_NO_ROUTE_BAR', 'CRAWL_DELAY_ONLY', 'NOT_NAMED', 'UNREADABLE'] as const;
+
+/** A tier in {@link AI_BAR_TIERS}; the engine refuses a policy whose tier is not one of them. */
+export type AiBarTier = (typeof AI_BAR_TIERS)[number];
+
+/** One robots.txt body classified for AI-agent bars. Token lists are lowercased robots tokens. */
+export interface AiBarSummary {
+  tier: AiBarTier;
+  /** Every AI token the file names, in any group. */
+  namedTokens: string[];
+  /** Tokens disallowed from the root. */
+  fullBarTokens: string[];
+  /** Tokens disallowed from a route URL the rules would fetch (the root allowed). */
+  routeBarTokens: string[];
+  /** Tokens given a Crawl-delay. */
+  crawlDelayTokens: string[];
+  /** The file's Content-Signal lines, verbatim. Recorded; not a bar on their own. */
+  contentSignals: string[];
+}
+
+/** A robots.txt body the plugin pinned: where it came from, its digest and when it was fetched. */
+export interface RobotsPin {
+  /** The robots.txt URL. */
+  url: string;
+  /** Lowercase hex sha256 of the pinned body. */
+  sha256: string;
+  /** ISO-8601 UTC time the pinned body was fetched. */
+  fetchedAt: string;
+}
+
+/**
+ * One store's (or one bare host's) hands-off policy, registered through
+ * `ExtractionRegistry.registerHandsOffPolicy`. The engine answers `handsOffPolicyFor(url)` from it and
+ * lists `{siteId, hosts, tier, handsOff, denied, policyVersion}` on /health/detailed.
+ */
+export interface HandsOffPolicy {
+  /** The store this policy belongs to. Absent = a host-only entry (e.g. a denied host with no store). */
+  siteId?: string;
+  /**
+   * DNS hostnames the policy covers, each with every subdomain (`example.test` covers
+   * `www.example.test`, never `notexample.test`). No scheme, port, path or wildcard; at least one.
+   * Another policy may list a subdomain only if it is at least as strict (the engine refuses one
+   * that would lift `handsOff` or `denied`), so a covered subdomain never answers weaker.
+   */
+  hosts: string[];
+  /** The decision: true = Claude and its tools never send a request to these hosts. */
+  handsOff: boolean;
+  /** True for a host that is permanently denied, whatever its robots.txt says. A boolean when present. */
+  denied?: boolean;
+  tier: AiBarTier;
+  summary: AiBarSummary;
+  /** The robots.txt pins the summary was computed from (the robots probe reports drift against them). */
+  pins: RobotsPin[];
+  /** URLs the store's rules fetch, the ones a ROUTE_BAR is judged against. */
+  routeSamples: string[];
+  /** Which policy produced this entry (e.g. the plugin's generated-policy version). */
+  policyVersion: string;
+}
+
+/** The plugin's robots.txt classifier, registered through `ExtractionRegistry.registerRobotsClassifier`. */
+export interface RobotsClassifier {
+  /** The date of the AI-token list the classifier recognises (YYYY-MM-DD). */
+  tokenListDate: string;
+  /** Classify one robots.txt body; `routeUrls` are the URLs a ROUTE_BAR is judged against. */
+  classify(body: string, routeUrls: string[]): AiBarSummary;
 }
 
 // ============================================================================
@@ -211,6 +324,13 @@ export interface SiteConfig {
   rateLimit: DomainRateLimit;
   requiresBrowser: boolean;
   allowedCookies: string[];
+  /**
+   * The cookie NAMES a healthy session jar for this store must hold (0.17.0). Absent = the store
+   * declares no required set. `allowedCookies` stays the allow-list of names the engine may send.
+   * registerSite copies it once and throws, naming the site, when it is present and not an array of
+   * strings; a later change to the array has no effect.
+   */
+  requiredCookies?: string[];
 }
 
 export interface DomainRateLimit {

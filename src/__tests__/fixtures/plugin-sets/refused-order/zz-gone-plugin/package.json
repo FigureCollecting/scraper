@@ -1,0 +1,6 @@
+{
+  "name": "zz-gone-plugin",
+  "version": "3.0.0",
+  "main": "gone.js",
+  "keywords": ["scraper-ruleset"]
+}

@@ -20,9 +20,31 @@ export interface DiscoverPluginsOptions {
 }
 
 interface CandidatePackageJson {
-  name?: string;
+  name?: unknown;
+  version?: unknown;
   main?: string;
-  keywords?: string[];
+  keywords?: unknown;
+}
+
+/**
+ * A package that advertised the keyword but did not load: its entry file failed to import (it threw,
+ * or it is missing), or what it exports is not a ScraperPlugin. The engine came up without it, so the
+ * bootstrap lists it as refused rather than as not installed.
+ */
+export interface FailedPluginCandidate {
+  /** package.json `name`; the package's directory under the scanned one when that is not a non-empty string. */
+  name: string;
+  /** package.json `version`; 'unknown' when that is not a non-empty string. */
+  version: string;
+  /** The package directory (the loader's warning names it too). */
+  dir: string;
+  reason: 'import_failed' | 'not_a_plugin';
+}
+
+/** What a scan found: the plugins that loaded and the candidates that did not, each in scan order. */
+export interface PluginDiscovery {
+  plugins: ScraperPlugin[];
+  failed: FailedPluginCandidate[];
 }
 
 function defaultNodeModulesDir(): string {
@@ -105,21 +127,27 @@ export function resolvePluginExport(mod: unknown): ScraperPlugin | null {
   return isScraperPlugin(candidate) ? candidate : null;
 }
 
-async function importPlugin(packageDir: string, pkg: CandidatePackageJson): Promise<ScraperPlugin | null> {
-  const entryFile = path.join(packageDir, pkg.main || 'index.js');
+/** A package.json string field, or undefined when it is missing, not a string, or empty. */
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value !== '' ? value : undefined;
+}
 
+async function importPlugin(packageDir: string, pkg: CandidatePackageJson): Promise<ScraperPlugin | FailedPluginCandidate['reason']> {
   let mod: unknown;
   try {
+    // Inside the try: a `main` that is not a string makes path.join throw, and that candidate fails
+    // to import like any other whose entry file will not load.
+    const entryFile = path.join(packageDir, pkg.main || 'index.js');
     mod = await import(pathToFileURL(entryFile).href);
   } catch (error) {
     console.warn(`[PLUGIN LOADER] Failed to import candidate plugin at ${packageDir}:`, error);
-    return null;
+    return 'import_failed';
   }
 
   const plugin = resolvePluginExport(mod);
   if (!plugin) {
     console.warn(`[PLUGIN LOADER] Skipping ${packageDir}: does not implement the ScraperPlugin contract`);
-    return null;
+    return 'not_a_plugin';
   }
 
   return plugin;
@@ -128,25 +156,41 @@ async function importPlugin(packageDir: string, pkg: CandidatePackageJson): Prom
 /**
  * Scan node_modules (or a provided directory) for packages whose
  * package.json advertises the "scraper-ruleset" keyword, dynamic-import
- * each candidate, and return only those that structurally satisfy the
- * ScraperPlugin contract. Malformed or non-matching packages are skipped
- * (logged, never thrown) so a single bad plugin can't take down the engine.
+ * each candidate, and return those that structurally satisfy the
+ * ScraperPlugin contract beside those that did not load (logged, never
+ * thrown, so a single bad plugin can't take down the engine). A package
+ * without the keyword, or with no readable package.json, is not a candidate.
  */
-export async function discoverPlugins(options: DiscoverPluginsOptions = {}): Promise<ScraperPlugin[]> {
+export async function discoverPluginCandidates(options: DiscoverPluginsOptions): Promise<PluginDiscovery> {
   const nodeModulesDir = options.nodeModulesDir ?? defaultNodeModulesDir();
   const candidateDirs = await listCandidateDirs(nodeModulesDir);
 
   const plugins: ScraperPlugin[] = [];
+  const failed: FailedPluginCandidate[] = [];
 
   for (const dir of candidateDirs) {
     const pkg = await readPackageJson(dir);
-    if (!pkg || !pkg.keywords?.includes(PLUGIN_KEYWORD)) continue;
+    // `keywords` is an array by the package.json spec, but any package here can carry anything there:
+    // anything else is not the keyword (and a string is not searched for it as a substring).
+    if (!pkg || !Array.isArray(pkg.keywords) || !pkg.keywords.includes(PLUGIN_KEYWORD)) continue;
 
-    const plugin = await importPlugin(dir, pkg);
-    if (plugin) {
-      plugins.push(plugin);
+    const outcome = await importPlugin(dir, pkg);
+    if (typeof outcome === 'string') {
+      failed.push({
+        name: nonEmptyString(pkg.name) ?? path.relative(nodeModulesDir, dir),
+        version: nonEmptyString(pkg.version) ?? 'unknown',
+        dir,
+        reason: outcome,
+      });
+    } else {
+      plugins.push(outcome);
     }
   }
 
-  return plugins;
+  return { plugins, failed };
+}
+
+/** The plugins discoverPluginCandidates finds, without the candidates that did not load. */
+export async function discoverPlugins(options: DiscoverPluginsOptions = {}): Promise<ScraperPlugin[]> {
+  return (await discoverPluginCandidates(options)).plugins;
 }
