@@ -543,6 +543,18 @@ describe('queueStore lane — (e) a lane this build does not know reads as null,
     expect(String(laneWarnings[0][0])).toMatch(/\[SCRAPE QUEUE\].*unknown lane/);
   });
 
+  it('the warning is per store, not per process: a second store warns about its own unknown lanes', () => {
+    const [dirA, dirB] = [tmpDir(), tmpDir()];
+    seedUnknown(dirA);
+    seedUnknown(dirB);
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    open(dirA).restore(1_000);
+    open(dirB).restore(1_000);
+
+    expect(warn.mock.calls.filter((c) => /unknown lane/.test(String(c[0])))).toHaveLength(2);
+  });
+
   it('warns once for a boot that moves the file aside and salvages it: the salvage read and the store it hands back share it', () => {
     const dir = tmpDir();
     seedUnknown(dir);
