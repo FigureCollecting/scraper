@@ -77,6 +77,11 @@ function wholeIdMatcher(pattern: RegExp | undefined): RegExp {
   return new RegExp(`^(?:${pattern.source})$`, pattern.flags.replace(/[gmy]/g, ''));
 }
 
+/** The host and its www. twin: a store or policy registered as www.x also covers x, and x covers www.x. */
+function hostVariants(host: string): string[] {
+  return [host, host.startsWith('www.') ? host.slice(4) : `www.${host}`];
+}
+
 function checkOrigin(raw: string, lookups: DiagInputLookups): { host: string } | DiagInputResult {
   let url: URL;
   try {
@@ -99,10 +104,15 @@ function checkOrigin(raw: string, lookups: DiagInputLookups): { host: string } |
   }
   const reserved = NON_PUBLIC_SUFFIXES.find((s) => host.endsWith(`.${s}`));
   if (reserved !== undefined) return refuse('origin', `${quote(host)} is not a public name (.${reserved})`);
-  if (lookups.isDeniedHost(host)) return refuse('origin', `${quote(host)} is denied by a registered policy`);
-  const siteId = lookups.storeIdForHost(host);
-  if (siteId !== undefined) {
-    return refuse('origin', `${quote(host)} belongs to store ${quote(siteId)}: use --store ${sanitizeForLog(siteId)}`);
+  const variants = hostVariants(host);
+  if (variants.some((h) => lookups.isDeniedHost(h))) {
+    return refuse('origin', `${quote(host)} is denied by a registered policy`);
+  }
+  for (const h of variants) {
+    const siteId = lookups.storeIdForHost(h);
+    if (siteId !== undefined) {
+      return refuse('origin', `${quote(host)} belongs to store ${quote(siteId)}: use --store ${sanitizeForLog(siteId)}`);
+    }
   }
   return { host };
 }
