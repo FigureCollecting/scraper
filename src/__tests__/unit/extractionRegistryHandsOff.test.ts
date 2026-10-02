@@ -575,19 +575,22 @@ describe('ExtractionRegistry.registerHandsOffPolicy — a subdomain policy never
     expect(registry.handsOffPolicyFor('https://www.denied.example.test/')?.denied).toBe(true);
   });
 
-  it('does not treat a look-alike or a sibling as a parent', () => {
-    const registry = createExtractionRegistry();
-    registry.registerHandsOffPolicy(barred());
-
-    for (const [siteId, host] of [
+  it('does not treat a look-alike or a sibling as a parent or a child, whichever is registered first', () => {
+    const weaker = [
       ['lookalike', 'notbarred.example.test'],
       ['suffix', 'shop.barredexample.test'],
       ['sibling', 'shop.other.example.test'],
-    ]) {
-      registry.registerHandsOffPolicy(policy({ siteId, hosts: [host], handsOff: false }));
-    }
+    ].map(([siteId, host]) => policy({ siteId, hosts: [host], handsOff: false }));
 
-    expect(registry.handsOffView()).toHaveLength(4);
+    const strictFirst = createExtractionRegistry();
+    strictFirst.registerHandsOffPolicy(barred());
+    for (const p of weaker) strictFirst.registerHandsOffPolicy(p);
+    expect(strictFirst.handsOffView()).toHaveLength(4);
+
+    const strictLast = createExtractionRegistry();
+    for (const p of weaker) strictLast.registerHandsOffPolicy(p);
+    strictLast.registerHandsOffPolicy(barred());
+    expect(strictLast.handsOffView()).toHaveLength(4);
   });
 
   it('lets one policy list a host and its own subdomain', () => {

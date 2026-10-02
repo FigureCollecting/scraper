@@ -60,6 +60,13 @@ const BASELINE: Readonly<Record<string, number>> = {
   'src/services/sessionCanary.ts': 3,
 };
 
+/** Every baseline file whose count differs from the scan, as `file: baseline -> found`. */
+function drift(found: Record<string, number>, baseline: Readonly<Record<string, number>>): string[] {
+  return Object.entries(baseline)
+    .filter(([file, count]) => (found[file] ?? 0) !== count)
+    .map(([file, count]) => `${file}: ${count} -> ${found[file] ?? 0}`);
+}
+
 /** Every engine source file (tests excluded) that names one, with its count. */
 function scan(): Record<string, number> {
   const found: Record<string, number> = {};
@@ -94,11 +101,11 @@ describe('engine source names no hands-off site, denied host or AI token', () =>
   });
 
   it('the baseline is exact: a file that names fewer must lower its count here, so it cannot grow back', () => {
-    const drifted = Object.entries(BASELINE)
-      .filter(([file, count]) => (found[file] ?? 0) !== count)
-      .map(([file, count]) => `${file}: ${count} -> ${found[file] ?? 0}`);
+    expect(drift(found, BASELINE)).toEqual([]);
+  });
 
-    expect(drifted).toEqual([]);
+  it('reports a baseline file that names fewer, or none at all, as drift', () => {
+    expect(drift({ 'a.ts': 1 }, { 'a.ts': 2, 'b.ts': 1 })).toEqual(['a.ts: 2 -> 1', 'b.ts: 1 -> 0']);
   });
 
   it('catches a hands-off or denied site named by its siteId, not only by its host', () => {

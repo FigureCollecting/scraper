@@ -169,6 +169,17 @@ describe('ExtractionRegistry.beginRegistration — staged until commit', () => {
     expect(() => registration.commit()).toThrow('plugin registration refused: a registry call threw during register() (domains unreadable)');
   });
 
+  it('indexes a staged site by its domains in lowercase, as a direct registration does', () => {
+    const registry = createExtractionRegistry();
+    const registration = registry.beginRegistration();
+    registration.registerSite(site('alpha', 'Alpha.Example.TEST'));
+    registration.commit();
+    registry.registerSite(site('beta', 'BETA.example.test'));
+
+    expect(registry.getSiteConfigForUrl('https://www.alpha.example.test/')?.siteId).toBe('alpha');
+    expect(registry.getSiteConfigForUrl('https://beta.example.test/')?.siteId).toBe('beta');
+  });
+
   it('refuses a malformed site config at the call, not at commit (no half-registered site either)', () => {
     const registry = createExtractionRegistry();
     const registration = registry.beginRegistration();
@@ -286,6 +297,9 @@ describe('ExtractionRegistry.beginRegistration — after commit or discard', () 
     expect(() => committed.commit()).toThrow('plugin registration is already committed');
     committed.discard();
     expect(registry.allStores().map(s => s.siteId)).toEqual(['alpha']);
+    // Still committed: a later call still reaches the registry.
+    committed.registerSite(site('beta', 'beta.example.test'));
+    expect(registry.allStores().map(s => s.siteId)).toEqual(['alpha', 'beta']);
 
     const discarded = registry.beginRegistration();
     discarded.discard();

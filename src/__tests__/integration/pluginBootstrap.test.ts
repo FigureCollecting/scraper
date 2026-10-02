@@ -397,9 +397,11 @@ describe('bootstrapPlugins — a plugin is loaded whole or not at all', () => {
 
   it('keeps nothing of a plugin whose register() rejects after it registered a site, or whose registerRoutes() throws', async () => {
     const app = buildApp();
+    let kept: ExtractionRegistry | undefined;
     const rejects = buildSpyPlugin({
       name: 'rejects-plugin',
       register: async (registry: ExtractionRegistry) => {
+        kept = registry;
         registry.registerSite(storeSite('rejected', 'rejected.example.test'));
         throw new Error('ruleset constructor failed');
       },
@@ -422,5 +424,8 @@ describe('bootstrapPlugins — a plugin is loaded whole or not at all', () => {
     expect(registry.allStores()).toEqual([]);
     expect(registry.handsOffView()).toEqual([]);
     expect((await request(app).get('/routeless/ping')).status).toBe(404);
+    // A failed plugin that kept its registry (a timer, a late callback) cannot register later either.
+    expect(() => kept?.registerSite(storeSite('late', 'late.example.test'))).toThrow('plugin registration was discarded');
+    expect(registry.allStores()).toEqual([]);
   });
 });
