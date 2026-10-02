@@ -280,6 +280,44 @@ describe('ScrapeQueue — dispatch, completion and retry', () => {
     // The fetch_failure ledger already books a terminal failure; this store is not a history.
     expect(store.counts()).toEqual({ pending: 0, leased: 0, parked: 0 });
   });
+
+  // The crawler enqueues an id at COLD and, while that fetch is on the wire, the REST default enqueues
+  // it again at WARM. The raise used to put the in-flight item in the WARM tier as well, so the loop
+  // fetched it a SECOND time after the first fetch had already completed it.
+  it.each([
+    ['succeeds', () => Promise.resolve({ html: '<html></html>', url: urlFor('a1'), title: 'Item', statusCode: 200 }), 1],
+    ['fails and is retried', () => Promise.reject(new Error('NETWORK timeout reaching host')), 2],
+  ])('an item raised while its fetch is on the wire, whose fetch then %s, is fetched once per attempt, never from a second copy', async (_outcome, settle, fetches) => {
+    const store = openStore(tmpDir());
+    let release: () => void = () => {};
+    let calls = 0;
+    const scraping = scrapingStub(() => {
+      calls += 1;
+      // The FIRST fetch is held on the wire until the test releases it; any later one succeeds.
+      return calls === 1
+        ? new Promise((resolve, reject) => { release = () => settle().then(resolve, reject); })
+        : Promise.resolve({ html: '<html></html>', url: urlFor('a1'), title: 'Item', statusCode: 200 });
+    });
+    queue = new ScrapeQueue(false);
+    queue.setQueueStore(store);
+    queue.setPluginRegistry(makeRegistry());
+    queue.setIngestEmitter({ send: jest.fn().mockResolvedValue(okWriteStats()) });
+    queue.setScrapingService(scraping);
+
+    queue.enqueue('a1', { url: urlFor('a1'), priority: 'COLD' });
+    expect(store.counts().leased).toBe(1);
+    queue.enqueue('a1', { url: urlFor('a1'), priority: 'WARM' });
+    for (let i = 0; i < 20 && calls === 0; i++) await jest.advanceTimersByTimeAsync(10);
+    expect(calls).toBe(1);
+
+    release();
+    await flush(2_000, 6);
+
+    // One fetch per attempt: a success needs one; a retry needs exactly one more.
+    expect(scraping.scrapePage).toHaveBeenCalledTimes(fetches);
+    expect(queue.getStats()).toMatchObject({ total: 0, completed: 1 });
+    expect(store.counts()).toEqual({ pending: 0, leased: 0, parked: 0 });
+  });
 });
 
 describe('ScrapeQueue — startup reconciliation', () => {

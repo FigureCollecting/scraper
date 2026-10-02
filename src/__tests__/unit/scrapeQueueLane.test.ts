@@ -101,6 +101,22 @@ function recountResident(q: ScrapeQueue, host: string): Record<QueueLaneClass, n
   return out;
 }
 
+/** How many slots of the tiers hold THIS item object (an item must never sit in the tiers twice). */
+function tierCopies(q: ScrapeQueue, item: QueueItem): number {
+  const i = internals(q);
+  return [...i.hotQueue, ...i.warmQueue, ...i.coldQueue].filter((x) => x === item).length;
+}
+
+/** The priority on disk for a dedup key, read through a separate read-only handle. */
+function diskPriority(dir: string, key: string): unknown {
+  const db = new DatabaseSync(path.join(dir, QUEUE_DB_FILE), { readOnly: true });
+  try {
+    return (db.prepare('SELECT priority FROM queue_items WHERE mfc_id = ?').get(key) as unknown as { priority: unknown } | undefined)?.priority;
+  } finally {
+    db.close();
+  }
+}
+
 /** Parked depth recounted from the store — the truth the parked counters must match. */
 function recountParked(store: ScrapeQueueStore, host: string): Record<QueueLaneClass, number> {
   const out = { new: 0, company: 0, gap: 0, other: 0 } as Record<QueueLaneClass, number>;
@@ -172,6 +188,27 @@ describe('ScrapeQueue lane — enqueue takes an optional lane', () => {
     expect(diskLane(dir, 'a1')).toBeNull();
     expect(depth(q)).toEqual({ ...Z, other: 1 });
     expect(warn.mock.calls.filter((c) => /lane/.test(String(c[0])))).toHaveLength(1);
+  });
+
+  // Neither REST nor the planned gRPC enum can send such a value; an in-process caller can. The door
+  // promises "queued unlabelled with a warning" for ANY value outside the vocabulary, so printing the
+  // value for that warning must never be what throws the enqueue away.
+  it.each([
+    ['a null-prototype object', () => Object.create(null) as unknown],
+    ['an object whose toString throws', () => ({ toString: () => { throw new Error('no text'); } }) as unknown],
+  ])('queues a lane that cannot even be printed (%s) as unlabelled, with a warning, never a throw', (_what, make) => {
+    const dir = tmpDir();
+    const q = wired(openStore(dir));
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const r = q.enqueue('a1', { url: urlFor('a1'), lane: make() as QueueLane });
+
+    expect(r.deduplicated).toBe(false);
+    expect('lane' in r).toBe(false);
+    expect(diskLane(dir, 'a1')).toBeNull();
+    expect(depth(q)).toEqual({ ...Z, other: 1 });
+    const lines = warn.mock.calls.map((c) => String(c[0])).filter((l) => /Ignored lane/.test(l));
+    expect(lines).toEqual(["[SCRAPE QUEUE] Ignored lane '<object>' for a1: not one of new, company, gap; queued with no lane"]);
   });
 
   it('carries a lane per item through a bulk enqueue', () => {
@@ -476,6 +513,70 @@ describe('ScrapeQueue lane — per-(host, lane) depth', () => {
     expect(depth(q)).toEqual(recountResident(q, HOST));
   });
 
+  // A raise used to ADD the in-flight item to its new tier; the retry then added it a second time, so
+  // one item sat in one tier twice, was dispatched twice, and a relabel (which moves resident depth by
+  // one) left a phantom 'other' and, once drained, a negative 'new' that nothing ever reconciled.
+  it.each([
+    ['a higher priority', { priority: 'HOT' as const }],
+    ['cookies', { priority: 'WARM' as const, cookies: { sid: 'x' }, sessionId: 's1' }],
+  ])('a raise (by %s) that finds the item on the wire records it and queues nothing; the retry comes back raised', (_by, raise) => {
+    const dir = tmpDir();
+    const q = wired(openStore(dir));
+    q.enqueue('k', { url: urlFor('k'), priority: 'COLD', lane: 'gap' });
+    const inFlight = internals(q).getNextProcessableItem(Date.now()) as QueueItem;
+    expect(inFlight.mfcId).toBe('k');
+
+    const r = q.enqueue('k', { url: urlFor('k'), ...raise });
+
+    expect(r.deduplicated).toBe(true);
+    expect(inFlight.priority).toBe('HOT');
+    expect(diskPriority(dir, 'k')).toBe('HOT');
+    expect(tierCopies(q, inFlight)).toBe(0);
+    expect(depth(q)).toEqual(Z);
+
+    internals(q).handleFailure(inFlight, new Error('NETWORK timeout reaching host'));
+
+    expect(internals(q).hotQueue).toEqual([inFlight]);
+    expect(tierCopies(q, inFlight)).toBe(1);
+    expect(depth(q)).toEqual({ ...Z, gap: 1 });
+  });
+
+  it('an unlabelled item raised on the wire, retried, then relabeled sits in its tier ONCE, and its depth moves with it', () => {
+    const q = wired(openStore(tmpDir()));
+    q.enqueue('k', { url: urlFor('k'), priority: 'COLD' });
+    const inFlight = internals(q).getNextProcessableItem(Date.now()) as QueueItem;
+    q.enqueue('k', { url: urlFor('k'), priority: 'WARM' });
+    internals(q).handleFailure(inFlight, new Error('NETWORK timeout reaching host'));
+
+    q.enqueue('k', { url: urlFor('k'), lane: 'new' });
+
+    expect(tierCopies(q, inFlight)).toBe(1);
+    expect(depth(q)).toEqual({ ...Z, new: 1 });
+    expect(depth(q)).toEqual(recountResident(q, HOST));
+  });
+
+  it('...and drained, it is fetched ONCE and every resident counter is back to zero', () => {
+    const q = wired(openStore(tmpDir()));
+    q.enqueue('k', { url: urlFor('k'), priority: 'COLD' });
+    let now = Date.now();
+    const inFlight = internals(q).getNextProcessableItem(now) as QueueItem;
+    q.enqueue('k', { url: urlFor('k'), priority: 'WARM' });
+    internals(q).handleFailure(inFlight, new Error('NETWORK timeout reaching host'));
+    q.enqueue('k', { url: urlFor('k'), lane: 'new' });
+
+    const dispatched: string[] = [];
+    for (let n = 0; n < 3; n++) {
+      const next = internals(q).getNextProcessableItem((now += 600_000));
+      if (next === null) break;
+      dispatched.push(next.mfcId);
+      internals(q).handleSuccess(next, {});
+    }
+
+    expect(dispatched).toEqual(['k']);
+    expect(depth(q)).toEqual(Z);
+    expect(recountResident(q, HOST)).toEqual(Z);
+  });
+
   it('dispatch takes an item out of resident depth; a retry puts it back; success does not', () => {
     const q = wired(openStore(tmpDir()));
     q.enqueue('k1', { url: urlFor('k1'), lane: 'company' });
@@ -528,7 +629,7 @@ describe('ScrapeQueue lane — per-(host, lane) depth', () => {
     expect(depth(q, HOST, 'parked')).toEqual({ ...Z, company: 2, gap: 1 });
   });
 
-  it('never drifts from the tiers and the disk across a long mixed run, with items held in flight and restarts', () => {
+  it('never drifts from the tiers and the disk across a long mixed run, with items held in flight, raised there, and restarts', () => {
     process.env.SCRAPE_QUEUE_MAX_RESIDENT = '8';
     process.env.SCRAPE_QUEUE_MAX_RESIDENT_PER_HOST = '5';
     const dir = tmpDir();
@@ -553,7 +654,7 @@ describe('ScrapeQueue lane — per-(host, lane) depth', () => {
     };
 
     for (let step = 0; step < 600; step++) {
-      const op = rnd(13);
+      const op = rnd(15);
       const key = `k${rnd(30)}`;
       if (op < 5) {
         const host = hosts[rnd(hosts.length)];
@@ -571,6 +672,15 @@ describe('ScrapeQueue lane — per-(host, lane) depth', () => {
         if (item) settle(item);
       } else if (op < 12) {
         q.refillWorkingSet(now);
+      } else if (op < 14) {
+        // Enqueue the key of an item that is ON THE WIRE: the raise and relabel paths then
+        // meet an item that is in pendingItems but in no tier.
+        const held = inFlight[rnd(Math.max(inFlight.length, 1))];
+        if (held) {
+          const priority = (['WARM', 'COLD', 'HOT'] as const)[rnd(3)];
+          const lane = lanes[rnd(lanes.length)];
+          q.enqueue(held.mfcId, { url: held.url, priority, ...(lane ? { lane } : {}) });
+        }
       } else {
         q.stop();
         store.close();
@@ -579,6 +689,10 @@ describe('ScrapeQueue lane — per-(host, lane) depth', () => {
         q.restoreFromStore(now);
         inFlight = [];
       }
+      // An item sits in the tiers at most once, and never while it is on the wire.
+      const tiers = [...internals(q).hotQueue, ...internals(q).warmQueue, ...internals(q).coldQueue];
+      expect({ step, twice: tiers.filter((x, i) => tiers.indexOf(x) !== i).map((x) => x.mfcId) }).toEqual({ step, twice: [] });
+      expect({ step, queuedOnTheWire: inFlight.filter((x) => tiers.includes(x)).map((x) => x.mfcId) }).toEqual({ step, queuedOnTheWire: [] });
       for (const host of [HOST, 'b.example', 'c.example']) {
         expect({ step, host, resident: depth(q, host) }).toEqual({ step, host, resident: recountResident(q, host) });
         expect({ step, host, parked: depth(q, host, 'parked') }).toEqual({ step, host, parked: recountParked(store, host) });

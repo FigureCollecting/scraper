@@ -543,6 +543,23 @@ describe('queueStore lane — (e) a lane this build does not know reads as null,
     expect(String(laneWarnings[0][0])).toMatch(/\[SCRAPE QUEUE\].*unknown lane/);
   });
 
+  it('warns once for a boot that moves the file aside and salvages it: the salvage read and the store it hands back share it', () => {
+    const dir = tmpDir();
+    seedUnknown(dir);
+    fs.chmodSync(path.join(dir, QUEUE_DB_FILE), 0o444);
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const store = createQueueStore({ dir });
+    stores.push(store);
+    expect(store.reason).toBe('open_failed_recovered');
+    const restored = new Map(store.restore(1_000).pending.map((i) => [i.id, i]));
+    store.pageIn(5);
+    store.countByHostLane('parked');
+
+    expect(restored.get('u1')?.unknownLane).toBe('promo');
+    expect(warn.mock.calls.filter((c) => /unknown lane/.test(String(c[0])))).toHaveLength(1);
+  });
+
   it('does not warn about NULL lanes: no lane is not an unknown lane', () => {
     const store = open(tmpDir());
     store.put(ITEM({ id: 'a', mfcId: 'a' }));
