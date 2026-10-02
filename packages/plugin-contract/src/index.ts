@@ -24,15 +24,24 @@ export interface ExtractionRegistry {
    * Register which hosts Claude and its tools must never contact, and why (0.17.0). Optional: an
    * engine that predates it has no such method, so a plugin calls it as
    * `registry.registerHandsOffPolicy?.(policy)`. The engine indexes `hosts` (normalised; a policy
-   * covers each host and every subdomain of it) and THROWS, naming the host or siteId, when a host
-   * or a siteId is already held by another policy, or when a host is not a DNS hostname — so a
-   * conflicting policy fails the plugin's register() rather than silently losing.
+   * covers each host and every subdomain of it) and THROWS, naming the policy and the value, when a
+   * host or the siteId is already held by another policy, a host is not a DNS hostname, a field is
+   * malformed (`handsOff`/`denied` not booleans, a `tier` outside {@link AI_BAR_TIERS}, no
+   * `policyVersion`, `summary`, `pins` or `routeSamples` of the declared shape), or the policy would
+   * lift a stricter one: a policy on a subdomain of another policy's host must be at least as strict
+   * (hands-off and denied wherever the parent is), whichever is registered first.
+   *
+   * A refused call refuses the whole plugin. The engine stages a plugin's registry calls and applies
+   * them only once its register() and registerRoutes() have succeeded, so after any refused call
+   * none of the plugin's sites, rulesets, policies, classifier or routes take effect — even when the
+   * plugin catches the throw and carries on. Its stores are never live without their policy.
    */
   registerHandsOffPolicy?(policy: HandsOffPolicy): void;
   /**
    * Register the robots.txt classifier the engine's robots probe runs on a fetched body (0.17.0).
    * Optional, called as `registry.registerRobotsClassifier?.(classifier)`. An engine holds ONE: a
-   * second registration throws, naming the token list already registered.
+   * second registration throws, naming the token list already registered (and, like a refused
+   * policy, refuses the whole plugin).
    */
   registerRobotsClassifier?(classifier: RobotsClassifier): void;
 }
@@ -59,7 +68,10 @@ export interface PluginContext {
  * A `*` group's `Disallow: /` is a crawler matter, not a bar by name, and does not change the tier.
  * Which tiers make a store hands-off is the plugin's policy (`HandsOffPolicy.handsOff`), not the tier's.
  */
-export type AiBarTier = 'FULL_BAR' | 'ROUTE_BAR' | 'NAMED_NO_ROUTE_BAR' | 'CRAWL_DELAY_ONLY' | 'NOT_NAMED' | 'UNREADABLE';
+export const AI_BAR_TIERS = ['FULL_BAR', 'ROUTE_BAR', 'NAMED_NO_ROUTE_BAR', 'CRAWL_DELAY_ONLY', 'NOT_NAMED', 'UNREADABLE'] as const;
+
+/** A tier in {@link AI_BAR_TIERS}; the engine refuses a policy whose tier is not one of them. */
+export type AiBarTier = (typeof AI_BAR_TIERS)[number];
 
 /** One robots.txt body classified for AI-agent bars. Token lists are lowercased robots tokens. */
 export interface AiBarSummary {
@@ -97,11 +109,13 @@ export interface HandsOffPolicy {
   /**
    * DNS hostnames the policy covers, each with every subdomain (`example.test` covers
    * `www.example.test`, never `notexample.test`). No scheme, port, path or wildcard; at least one.
+   * Another policy may list a subdomain only if it is at least as strict (the engine refuses one
+   * that would lift `handsOff` or `denied`), so a covered subdomain never answers weaker.
    */
   hosts: string[];
   /** The decision: true = Claude and its tools never send a request to these hosts. */
   handsOff: boolean;
-  /** True for a host that is permanently denied, whatever its robots.txt says. */
+  /** True for a host that is permanently denied, whatever its robots.txt says. A boolean when present. */
   denied?: boolean;
   tier: AiBarTier;
   summary: AiBarSummary;

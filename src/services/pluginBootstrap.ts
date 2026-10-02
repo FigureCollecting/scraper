@@ -10,6 +10,14 @@
  * A single misbehaving plugin (throws in register(), or fails the
  * ScraperPlugin shape check upstream in pluginLoader) is logged and skipped
  * rather than taking down the whole engine boot.
+ *
+ * A plugin is loaded whole or not at all. register() receives a staged
+ * PluginRegistration, not the shared registry: its calls are committed only
+ * after register() and registerRoutes() have both succeeded, and only then
+ * are its routes mounted. So a plugin that fails anywhere — including a
+ * hands-off policy the registry refused, even one the plugin caught — leaves
+ * none of its sites, rulesets, policies, classifier or routes behind: its
+ * stores are never live without their policy.
  */
 import { Router, type Express } from 'express';
 import { discoverPlugins } from './pluginLoader.js';
@@ -50,19 +58,29 @@ export async function bootstrapPlugins(app: Express, options: BootstrapPluginsOp
     const logger = createPluginLogger(`plugin:${plugin.name}`);
     const context: PluginContext = { logger, config, services };
 
-    try {
-      await plugin.register(registry, context);
+    const registration = registry.beginRegistration();
 
+    try {
+      await plugin.register(registration, context);
+
+      let router: Router | undefined;
       if (plugin.registerRoutes) {
-        const router = Router();
+        router = Router();
         plugin.registerRoutes(router as unknown as ExpressRouter);
-        app.use('/', router);
       }
+
+      // The last step that can fail: after it, nothing below throws.
+      registration.commit();
+      if (router) app.use('/', router);
 
       loaded.push(plugin);
       console.log(`[PLUGIN BOOTSTRAP] Registered plugin ${plugin.name}@${plugin.version}`);
     } catch (error) {
-      console.error(`[PLUGIN BOOTSTRAP] Failed to register plugin "${plugin.name}":`, error);
+      registration.discard();
+      console.error(
+        `[PLUGIN BOOTSTRAP] Failed to register plugin "${plugin.name}"; none of its sites, rulesets, policies or routes were kept:`,
+        error
+      );
     }
   }
 

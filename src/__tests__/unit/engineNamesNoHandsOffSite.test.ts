@@ -7,7 +7,8 @@
  * The engine predates that rule: the files in BASELINE named these hosts before the plan (comments
  * that record where a behaviour was measured, plus a few code paths such as the session canary).
  * They are frozen here at their 2026-10-02 counts (develop 26c145a8). The list may only shrink: a
- * file outside it that names one, or a baseline file that names more, fails.
+ * file outside it that names one, or a baseline file that names more, fails; and a file that names
+ * fewer fails until its count here is lowered, so a removed name cannot quietly come back.
  */
 import fs from 'fs';
 import path from 'path';
@@ -15,8 +16,16 @@ import path from 'path';
 const REPO_ROOT = path.resolve(__dirname, '../../..');
 const SCANNED_ROOTS = ['src', 'packages/plugin-contract/src'];
 
-/** The hands-off hosts of the static list (R0) and the permanently denied host, as name stems. */
-const HOST_NAMES = ['myfigurecollection', 'suruga-ya', 'hobby-genki', 'vndb', 'hpoi', 'otakumode'];
+/**
+ * The hands-off sites of the static list (R0) and the permanently denied host, as name stems: their
+ * hosts, plus the siteIds the rulesets plugin registers them under that the host stems miss.
+ */
+const HOST_NAMES = ['myfigurecollection', 'suruga-ya', 'surugaya', 'hobby-genki', 'hobbygenki', 'vndb', 'hpoi', 'otakumode'];
+/**
+ * siteIds too short to scan as a stem (`mfc` sits inside identifiers such as `mfcSessionStale`), so
+ * only a quoted string literal that is exactly the id counts.
+ */
+const SHORT_SITE_IDS = ['mfc', 'tom'];
 /** AI agent tokens a robots.txt names; the classifier that reads them lives in the plugin. */
 const AI_TOKENS = [
   'claudebot', 'claude-user', 'claude-searchbot', 'claude-web', 'anthropic-ai',
@@ -24,7 +33,11 @@ const AI_TOKENS = [
   'ccbot', 'google-extended', 'bytespider', 'applebot-extended', 'meta-externalagent',
   'amazonbot', 'cohere-ai',
 ];
-const NAMES = new RegExp([...HOST_NAMES, ...AI_TOKENS].map(n => n.replace(/[.*+?^${}()|[\]\\-]/g, '\\$&')).join('|'), 'gi');
+const escape = (name: string) => name.replace(/[.*+?^${}()|[\]\\-]/g, '\\$&');
+const NAMES = new RegExp(
+  [...[...HOST_NAMES, ...AI_TOKENS].map(escape), `(?<=['"\`])(?:${SHORT_SITE_IDS.map(escape).join('|')})(?=['"\`])`].join('|'),
+  'gi'
+);
 
 const BASELINE: Readonly<Record<string, number>> = {
   'packages/plugin-contract/src/index.ts': 1,
@@ -40,11 +53,11 @@ const BASELINE: Readonly<Record<string, number>> = {
   'src/services/genericScraper.ts': 5,
   'src/services/images/httpBytesFetch.ts': 1,
   'src/services/images/imageBytes.ts': 2,
-  'src/services/images/imageHostPolicy.ts': 5,
-  'src/services/recordFetchGate.ts': 4,
-  'src/services/residentialEgress.ts': 1,
-  'src/services/scrapeQueue.ts': 2,
-  'src/services/sessionCanary.ts': 2,
+  'src/services/images/imageHostPolicy.ts': 6,
+  'src/services/recordFetchGate.ts': 5,
+  'src/services/residentialEgress.ts': 2,
+  'src/services/scrapeQueue.ts': 3,
+  'src/services/sessionCanary.ts': 3,
 };
 
 /** Every engine source file (tests excluded) that names one, with its count. */

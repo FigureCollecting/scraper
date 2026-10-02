@@ -11,15 +11,23 @@ methods loads exactly as before; a plugin that calls them on an older engine (wi
 
 ### Added
 - `ExtractionRegistry.registerHandsOffPolicy?(policy: HandsOffPolicy)` and the `HandsOffPolicy`,
-  `AiBarTier`, `AiBarSummary` and `RobotsPin` exports. A plugin registers which hosts Claude and its
-  tools must never contact (`handsOff`), permanently denied hosts (`denied`, `siteId` absent for a
-  host-only entry), the robots.txt classification behind the decision and its pins. The engine covers
-  each host and its subdomains, lists `{siteId, hosts, tier, handsOff, denied, policyVersion}` on
-  `/health/detailed` as `handsOff`, and throws (naming it) on a host or siteId another policy already
-  holds, or a host that is not a DNS hostname.
+  `AiBarTier`, `AiBarSummary` and `RobotsPin` exports, plus `AI_BAR_TIERS` (the tiers as a runtime
+  list; `AiBarTier` is derived from it). A plugin registers which hosts Claude and its tools must
+  never contact (`handsOff`), permanently denied hosts (`denied`, `siteId` absent for a host-only
+  entry), the robots.txt classification behind the decision and its pins. The engine covers each
+  host and its subdomains and lists `{siteId, hosts, tier, handsOff, denied, policyVersion}` on
+  `/health/detailed` as `handsOff`. It throws, naming the policy and the value, on a host or siteId
+  another policy already holds, a host that is not a DNS hostname, a malformed field (`handsOff` or
+  `denied` not a boolean, a `tier` outside `AI_BAR_TIERS`, a missing `policyVersion`, `summary`,
+  `pins` or `routeSamples`), or a policy on a subdomain that is less strict than the policy on its
+  parent (it would lift the parent's `handsOff` or `denied` there).
 - `ExtractionRegistry.registerRobotsClassifier?(classifier: RobotsClassifier)` and the
   `RobotsClassifier` export (`{ tokenListDate, classify(body, routeUrls) }`). One per engine; a
   second registration throws.
+- A refused call refuses the whole plugin. The engine stages a plugin's registry calls and applies
+  them only once its `register()` and `registerRoutes()` have succeeded, so none of the plugin's
+  sites, rulesets, policies, classifier or routes take effect after a refusal, even one the plugin
+  caught. A plugin's stores are never live without their hands-off policy.
 - `SiteConfig.requiredCookies?: string[]` — the cookie names a healthy session jar must hold.
   `allowedCookies` stays the allow-list.
 
