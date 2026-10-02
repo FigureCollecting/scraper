@@ -849,32 +849,42 @@ describe('parseLaneWeights', () => {
     expect(warn).not.toHaveBeenCalled();
   });
 
+  it('accepts a single-label host such as localhost', () => {
+    expect(parseLaneWeights('localhost=new:1').get('localhost')).toEqual(W(1, 0, 0, 0));
+    expect(warn).not.toHaveBeenCalled();
+  });
+
   // Every refused entry names the guard that refused it, so each row proves the guard in its title.
-  const NO_HOST = 'names no valid host';
+  const NO_EQ = 'it has no "="';
+  const NOT_PLAIN = 'the text before "=" is not a plain host name';
+  const NOT_READ = "so it is not read as any host's entry and changes no host's dispatch";
+  const EXPECTED = 'expected host=class:weight,...';
   const KEEPS_TODAY = "that host keeps today's dispatch";
+  const REPLACES = 'names a host twice; this entry replaces the earlier one';
   const WEIGHT = (c: LaneClass): string => `weight for ${c} must be a whole number 0-100`;
   const UNKNOWN = (c: string): string => `unknown class "${c}" (expected new|company|gap|other)`;
   const NO_WEIGHT = (pair: string): string => `"${pair}" has no weight (expected class:weight)`;
 
   it.each([
-    ['no "="', 'myfigurecollection.net:new:40', 'expected host=class:weight,...'],
-    ['an empty host', '=new:40', 'not a host name'],
-    ['a url, not a host', 'https://myfigurecollection.net=new:40', 'not a host name'],
-    ['a host with a path', 'myfigurecollection.net/x=new:40', 'not a host name'],
-    ['a host with a port', 'a.example:443=new:1', 'not a host name'],
-    ['a host with a bad label', '-bad-.net=new:40', 'not a host name'],
-    ['a label that starts with a hyphen', '-bad.example=new:1', 'not a host name'],
-    ['a label that ends with a hyphen', 'bad-.example=new:1', 'not a host name'],
-    ['a trailing dot', 'a.example.=new:1', 'not a host name'],
-    ['a host label over 63 characters', `${'a'.repeat(64)}.example=new:40`, 'not a host name'],
-    ['an underscore in the host', 'a_b.example=new:40', 'not a host name'],
-  ])('drops an entry with %s, with a WARN that it names no host and so changes none; the good hosts still apply', (_name, bad, reason) => {
+    ['no "="', 'myfigurecollection.net:new:40', NO_EQ, EXPECTED],
+    ['no "=", only the name of the good host itself', 'good.example', NO_EQ, EXPECTED],
+    ['an empty host', '=new:40', NOT_PLAIN, 'not a plain host name'],
+    ['a url, not a host', 'https://myfigurecollection.net=new:40', NOT_PLAIN, 'not a plain host name'],
+    ['a host with a path', 'myfigurecollection.net/x=new:40', NOT_PLAIN, 'not a plain host name'],
+    ['a host with a port', 'a.example:443=new:1', NOT_PLAIN, 'not a plain host name'],
+    ['a host with a bad label', '-bad-.net=new:40', NOT_PLAIN, 'not a plain host name'],
+    ['a label that starts with a hyphen', '-bad.example=new:1', NOT_PLAIN, 'not a plain host name'],
+    ['a label that ends with a hyphen', 'bad-.example=new:1', NOT_PLAIN, 'not a plain host name'],
+    ['a trailing dot', 'a.example.=new:1', NOT_PLAIN, 'not a plain host name'],
+    ['a host label over 63 characters', `${'a'.repeat(64)}.example=new:40`, NOT_PLAIN, 'not a plain host name'],
+    ['an underscore in the host', 'a_b.example=new:40', NOT_PLAIN, 'not a plain host name'],
+  ])('drops an entry with %s, with a WARN that it is no host\'s entry and so changes none; the good hosts still apply', (_name, bad, guard, reason) => {
     const hosts = parseLaneWeights(`${bad};good.example=new:1,gap:1`);
     expect([...hosts.keys()]).toEqual(['good.example']);
     expect(hosts.get('good.example')).toEqual(W(1, 0, 1, 0));
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn.mock.calls[0][0]).toContain('SCRAPE_LANE_WEIGHTS');
-    expect(warn.mock.calls[0][0]).toContain(NO_HOST);
+    expect(warn.mock.calls[0][0]).toContain(`${guard}, ${NOT_READ}`);
     expect(warn.mock.calls[0][1]).toEqual({ entry: bad, reason });
   });
 
@@ -923,6 +933,7 @@ describe('parseLaneWeights', () => {
     expect(hosts.get(MFC)).toEqual(W(0, 0, 3, 0));
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn.mock.calls[0][0]).toContain('SCRAPE_LANE_WEIGHTS');
+    expect(warn.mock.calls[0][0]).toContain(REPLACES);
     expect(warn.mock.calls[0][1]).toEqual({ host: MFC });
   });
 
@@ -941,7 +952,16 @@ describe('parseLaneWeights', () => {
     expect([...hosts.keys()]).toEqual(['good.example']);
     const texts = warn.mock.calls.map((call) => String(call[0]));
     expect(texts.filter((t) => t.includes(KEEPS_TODAY))).toHaveLength(1);
-    expect(texts.some((t) => t.includes('the last entry wins'))).toBe(false);
+    expect(texts.some((t) => t.includes('names a host twice'))).toBe(false);
+  });
+
+  it('a host named twice and then refused: the replace WARN is true when given, and the refusal unlanes the host', () => {
+    expect(parseLaneWeights(`${GOOD};${MFC}=new:1;${TYPO}`).has(MFC)).toBe(false);
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn.mock.calls[0][0]).toContain(REPLACES);
+    expect(warn.mock.calls[0][1]).toEqual({ host: MFC });
+    expect(warn.mock.calls[1][0]).toContain(`${KEEPS_TODAY}, whatever its other entries say`);
+    expect(warn.mock.calls[1][1]).toEqual({ entry: TYPO, host: MFC, reason: WEIGHT('company') });
   });
 
   it('a malformed entry after a good one for the same host drops the good one too, with one WARN', () => {
@@ -972,7 +992,20 @@ describe('parseLaneWeights', () => {
     const hosts = parseLaneWeights(`${MFC}:new:40;https://${MFC}=new:1;${GOOD}`);
     expect(hosts.get(MFC)).toEqual(DEFAULT);
     expect(warn).toHaveBeenCalledTimes(2);
-    for (const call of warn.mock.calls) expect(call[0]).toContain(NO_HOST);
+    for (const call of warn.mock.calls) expect(call[0]).toContain(NOT_READ);
+  });
+
+  it.each([
+    ['before', MFC, [MFC, GOOD]],
+    ['after', MFC, [GOOD, MFC]],
+    ['written with www. and capitals, before', `WWW.MyFigureCollection.NET`, [`WWW.MyFigureCollection.NET`, GOOD]],
+  ])('a bare host name with no "=" %s a good entry for that host cannot unlane it, with one WARN saying it is no host\'s entry', (_where, bare, entries) => {
+    const hosts = parseLaneWeights(entries.join(';'));
+    expect([...hosts.keys()]).toEqual([MFC]);
+    expect(hosts.get(MFC)).toEqual(DEFAULT);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain(`${NO_EQ}, ${NOT_READ}`);
+    expect(warn.mock.calls[0][1]).toEqual({ entry: bare, reason: EXPECTED });
   });
 
   it('the parsed weights are frozen', () => {
