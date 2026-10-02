@@ -638,6 +638,7 @@ describe('ExtractionRegistry.requiredCookiesFor', () => {
     ['a name that is not a string', ['cf_clearance', 5]],
     ['a hole', [, 'session']],
     ['an object', { 0: 'cf_clearance', length: 1 }],
+    ['null', null],
   ])('refuses a site whose requiredCookies is %s, naming the site, and registers none of it', (_label, requiredCookies) => {
     const registry = createExtractionRegistry();
 
@@ -648,11 +649,68 @@ describe('ExtractionRegistry.requiredCookiesFor', () => {
     expect(registry.getSiteConfigForUrl('https://alpha.example.test/')).toBeUndefined();
   });
 
-  it('answers undefined when the plugin later swaps its own site object\'s requiredCookies for a non-array (the config is held as registered)', () => {
+  /**
+   * The names are copied once, at registerSite, and the copy is what was checked and what is answered.
+   * The plugin keeps its own config object, so reading it again later could answer names the check
+   * never saw (requiredCookiesFor is typed string[]).
+   */
+  it('keeps the names it checked at registration when the plugin later changes its own array or swaps it', () => {
     const registry = createExtractionRegistry();
-    const config = site({ requiredCookies: ['cf_clearance'] });
+    const names = ['cf_clearance'];
+    const config = site({ requiredCookies: names });
     registry.registerSite(config);
+
+    names.push(5 as unknown as string, { evil: 1 } as unknown as string);
+    expect(registry.requiredCookiesFor('alpha.example.test')).toEqual(['cf_clearance']);
     (config as { requiredCookies: unknown }).requiredCookies = 'cf_clearance';
+    expect(registry.requiredCookiesFor('alpha.example.test')).toEqual(['cf_clearance']);
+  });
+
+  it('reads requiredCookies once, so a getter that changes between reads cannot slip names past the check', () => {
+    const registry = createExtractionRegistry();
+    let reads = 0;
+    const config = site();
+    Object.defineProperty(config, 'requiredCookies', {
+      enumerable: true,
+      get: () => (++reads === 1 ? ['cf_clearance'] : [7, null]),
+    });
+
+    registry.registerSite(config);
+
+    expect(registry.requiredCookiesFor('alpha.example.test')).toEqual(['cf_clearance']);
+    expect(reads).toBe(1);
+  });
+
+  it('reads each name once, so an array that answers differently on a second read is kept as it was checked', () => {
+    const registry = createExtractionRegistry();
+    let reads = 0;
+    const lying = new Proxy(['cf_clearance'], {
+      get: (target, key, receiver) => (key === '0' ? (++reads === 1 ? 'cf_clearance' : 99) : Reflect.get(target, key, receiver)),
+    });
+
+    registry.registerSite(site({ requiredCookies: lying }));
+
+    expect(registry.requiredCookiesFor('alpha.example.test')).toEqual(['cf_clearance']);
+    expect(reads).toBe(1);
+  });
+
+  it('refuses a name that only the second read of an index would have shown', () => {
+    const registry = createExtractionRegistry();
+    let reads = 0;
+    const lying = new Proxy(['cf_clearance'], {
+      get: (target, key, receiver) => (key === '0' ? (++reads === 1 ? 99 : 'cf_clearance') : Reflect.get(target, key, receiver)),
+    });
+
+    expect(() => registry.registerSite(site({ requiredCookies: lying }))).toThrow(
+      'site "alpha": requiredCookies must be an array of cookie names (strings) when present'
+    );
+    expect(registry.requiredCookiesFor('alpha.example.test')).toBeUndefined();
+  });
+
+  it('forgets the names when the site is registered again without requiredCookies', () => {
+    const registry = createExtractionRegistry();
+    registry.registerSite(site({ requiredCookies: ['cf_clearance'] }));
+    registry.registerSite(site());
 
     expect(registry.requiredCookiesFor('alpha.example.test')).toBeUndefined();
   });

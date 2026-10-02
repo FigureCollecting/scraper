@@ -42,7 +42,8 @@ import * as os from 'os';
 import * as path from 'path';
 import { ScrapeQueue, resetScrapeQueue, normalizeErrorType } from '../../services/scrapeQueue';
 import { createExtractionRegistry, ExtractionRegistryImpl } from '../../services/extractionRegistry';
-import { createQueueStore, openQueueStore, type ScrapeQueueStore } from '../../services/queueStore';
+import { createQueueStore, openQueueStore, QUEUE_DB_FILE, type ScrapeQueueStore } from '../../services/queueStore';
+import { settleDurableQueue } from '../../services/pluginBootstrap';
 import { ChallengeCooldown } from '../../services/challengeCooldown';
 import { okWriteStats } from '../helpers/ingestWriteStats';
 
@@ -1080,6 +1081,77 @@ describe('ScrapeQueue — holding the durable store when the registry came up in
 
     expect(queue.getQueueStoreView()).toMatchObject({ durable: false, reason: 'disabled', path: null });
     expect(errorSpy).not.toHaveBeenCalled();
+    errorSpy.mockRestore();
+  });
+});
+
+/**
+ * A restore that THROWS (pluginBootstrap's settleDurableQueue): the store degrades rather than throws
+ * on a write, but a row it cannot read back throws out of the restore. node:sqlite refuses an INTEGER
+ * past 2^53 with ERR_OUT_OF_RANGE, and opening the file reads no row, so the file opens fine and the
+ * fault surfaces only at the restore. That row is still on disk at every start, so a throw here would
+ * crash-loop the engine. It holds the queue instead, and the restore's own transaction rolled back.
+ */
+describe('ScrapeQueue — a restore that throws holds the durable store instead of ending the process', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    resetScrapeQueue();
+  });
+
+  function rowsOnDisk(dir: string) {
+    const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
+    const raw = new DatabaseSync(path.join(dir, QUEUE_DB_FILE), { readOnly: true });
+    try {
+      return raw
+        .prepare('SELECT id, state, CAST(attempts AS TEXT) AS attempts FROM queue_items ORDER BY id')
+        .all()
+        .map(r => [r.id, r.state, r.attempts]);
+    } finally {
+      raw.close();
+    }
+  }
+
+  it('holds the queue, leaving every row as it was, when a row cannot be read back', () => {
+    const dir = tmpDir();
+    const first = openStore(dir);
+    first.put({ id: 'p1-1', mfcId: 'p1', url: urlFor('p1'), priority: 'WARM', attempts: 1, maxRetries: 3, enqueuedAt: 1_000, state: 'pending' });
+    first.put({ id: 'l1-1', mfcId: 'l1', url: urlFor('l1'), priority: 'WARM', attempts: 1, maxRetries: 3, enqueuedAt: 2_000, state: 'pending' });
+    first.lease('l1-1', 5_000); // long expired: the restore frees it before it reads the pending rows
+    first.put({ id: 'o1-1', mfcId: 'o1', url: urlFor('o1'), priority: 'WARM', attempts: 1, maxRetries: 3, enqueuedAt: 3_000, state: 'pending' });
+    first.close();
+    const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
+    const raw = new DatabaseSync(path.join(dir, QUEUE_DB_FILE));
+    raw.prepare("UPDATE queue_items SET attempts = ? WHERE id = 'o1-1'").run(2n ** 60n);
+    raw.close();
+    const before = rowsOnDisk(dir);
+    expect(before).toEqual([
+      ['l1-1', 'leased', '1'],
+      ['o1-1', 'pending', '1152921504606846976'],
+      ['p1-1', 'pending', '1'],
+    ]);
+
+    const store = openStore(dir);
+    expect(store.reason).toBe('ok');
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const registry = makeRegistry();
+    queue = new ScrapeQueue(true);
+    queue.setQueueStore(store);
+    queue.setPluginRegistry(registry);
+    const plugin = { name: 'rules', version: '1.0.0', register: async () => undefined };
+
+    let hold: string | undefined;
+    expect(() => {
+      hold = settleDurableQueue(queue!, { registry, plugins: [plugin], refused: [] });
+    }).not.toThrow();
+
+    expect(hold).toMatch(/^the durable queue could not be restored \(.*1152921504606846976\)$/);
+    expect(queue.getQueueStoreView()).toMatchObject({ durable: false, reason: 'held', path: store.path, restoredAt: null });
+    expect(queue.getStats().total).toBe(0);
+    expect(rowsOnDisk(dir)).toEqual(before);
+    expect(errorSpy.mock.calls.map(c => String(c[0])).filter(l => l.includes('HELD'))).toEqual([
+      `[SCRAPE QUEUE] durable queue HELD, not restored (${hold}): 2 pending, 1 leased, 0 parked left in ${store.path} ` +
+        'for the next start; its open host cooldowns are not applied in this process',
+    ]);
     errorSpy.mockRestore();
   });
 });

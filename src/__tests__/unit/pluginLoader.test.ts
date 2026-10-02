@@ -172,6 +172,66 @@ describe('discoverPluginCandidates', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  /**
+   * One package's package.json must not take the scan down with it. `keywords` is an array by the
+   * package.json spec, but any package in the directory can carry anything there; a non-array is not
+   * the plugin keyword, and a string is not searched for it as a substring. A candidate whose `main`
+   * is not a path fails to import like any other candidate whose entry file will not load.
+   */
+  describe('a package.json of an unexpected shape', () => {
+    let dir: string;
+    const write = (rel: string, pkg: Record<string, unknown>, entry?: string) => {
+      mkdirSync(path.join(dir, rel), { recursive: true });
+      writeFileSync(path.join(dir, rel, 'package.json'), JSON.stringify(pkg));
+      if (entry !== undefined) writeFileSync(path.join(dir, rel, 'index.js'), entry);
+    };
+    const OK_PLUGIN = "module.exports = { name: 'ok-plugin', version: '1.0.0', register: async () => {} };";
+    beforeEach(() => {
+      dir = mkdtempSync(path.join(os.tmpdir(), 'plugin-loader-shape-'));
+      write('zz-ok-plugin', { name: 'ok-plugin', version: '1.0.0', main: 'index.js', keywords: ['scraper-ruleset'] }, OK_PLUGIN);
+    });
+    afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+    it.each([
+      ['a number', 7],
+      ['an object', { 0: 'scraper-ruleset' }],
+      ['null', null],
+    ])('skips a package whose keywords is %s, and still loads the plugins beside it', async (_label, keywords) => {
+      write('aaa-unrelated', { name: 'aaa-unrelated', version: '1.0.0', main: 'gone.js', keywords });
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+      const { plugins, failed } = await discoverPluginCandidates({ nodeModulesDir: dir });
+
+      expect(plugins.map(p => p.name)).toEqual(['ok-plugin']);
+      expect(failed).toEqual([]);
+      warnSpy.mockRestore();
+    });
+
+    it('does not treat a keywords string that merely contains the keyword as the keyword', async () => {
+      write('aaa-stringy', { name: 'aaa-stringy', version: '1.0.0', main: 'gone.js', keywords: 'not-a-scraper-ruleset-package' });
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+      const { plugins, failed } = await discoverPluginCandidates({ nodeModulesDir: dir });
+
+      expect(plugins.map(p => p.name)).toEqual(['ok-plugin']);
+      expect(failed).toEqual([]);
+      expect(warnSpy).not.toHaveBeenCalled();
+      warnSpy.mockRestore();
+    });
+
+    it('reports a candidate whose main is not a string as failing to import, and still loads the plugins beside it', async () => {
+      write('aaa-bad-main', { name: 'aaa-bad-main', version: '2.0.0', main: 7, keywords: ['scraper-ruleset'] });
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+      const { plugins, failed } = await discoverPluginCandidates({ nodeModulesDir: dir });
+
+      expect(plugins.map(p => p.name)).toEqual(['ok-plugin']);
+      expect(failed).toEqual([{ name: 'aaa-bad-main', version: '2.0.0', dir: path.join(dir, 'aaa-bad-main'), reason: 'import_failed' }]);
+      expect(String(warnSpy.mock.calls[0]?.[0])).toBe(`[PLUGIN LOADER] Failed to import candidate plugin at ${path.join(dir, 'aaa-bad-main')}:`);
+      warnSpy.mockRestore();
+    });
+  });
 });
 
 describe('resolvePluginExport', () => {

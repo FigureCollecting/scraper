@@ -709,4 +709,70 @@ describe('settleDurableQueue', () => {
     expect(queue.holdQueueStore.mock.calls).toEqual([['the plugin bootstrap did not complete']]);
     expect(queue.restoreFromStore).not.toHaveBeenCalled();
   });
+
+  it('names the refused candidates, not an incomplete bootstrap, when the only candidate failed to load', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'plugin-bootstrap-'));
+    try {
+      mkdirSync(path.join(dir, 'lone-plugin'));
+      writeFileSync(
+        path.join(dir, 'lone-plugin', 'package.json'),
+        JSON.stringify({ name: 'lone-plugin', version: '0.9.32', main: 'gone.js', keywords: ['scraper-ruleset'] })
+      );
+      const queue = fakeQueue();
+      const result = await bootstrapPlugins(buildApp(), { nodeModulesDir: dir });
+
+      expect(result.plugins).toEqual([]);
+      expect(settleDurableQueue(queue, result)).toBe('plugin(s) refused at startup: lone-plugin');
+      expect(queue.holdQueueStore.mock.calls).toEqual([['plugin(s) refused at startup: lone-plugin']]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('says no store registered, not an incomplete bootstrap, when no plugin was found at all', async () => {
+    const queue = fakeQueue();
+    const result = await bootstrapPlugins(buildApp(), { discover: async () => [] });
+
+    expect(settleDurableQueue(queue, result)).toBe('no plugin registered a store');
+    expect(queue.holdQueueStore.mock.calls).toEqual([['no plugin registered a store']]);
+  });
+
+  /**
+   * The store degrades rather than throws on a write, but a row it cannot READ back throws out of the
+   * restore: an INTEGER past 2^53 (node:sqlite refuses it with ERR_OUT_OF_RANGE), or an I/O error
+   * mid-read. That must cost the process its durable queue, not its life. Thrown out of here it would
+   * reject startServer() before the server listens, and the row would still be on disk at the next
+   * start, so the pod would crash-loop.
+   */
+  it('holds, and does not throw, when the restore itself throws, naming why', async () => {
+    const queue = fakeQueue();
+    const fault = new RangeError('Value is too large to be represented as a JavaScript number: 1152921504606846976');
+    queue.restoreFromStore.mockImplementation(() => {
+      throw fault;
+    });
+    const result = await bootstrapPlugins(buildApp(), { discover: async () => [plugin('a', ['alpha'])] });
+    errorSpy.mockClear();
+
+    let hold: string | undefined;
+    expect(() => {
+      hold = settleDurableQueue(queue, result);
+    }).not.toThrow();
+
+    const why = `the durable queue could not be restored (${fault.message})`;
+    expect(hold).toBe(why);
+    expect(queue.restoreFromStore).toHaveBeenCalledTimes(1);
+    expect(queue.holdQueueStore.mock.calls).toEqual([[why]]);
+    expect(errorSpy.mock.calls).toEqual([['[PLUGIN BOOTSTRAP] Restoring the durable scrape queue failed; holding it instead:', fault]]);
+  });
+
+  it('names a restore fault that is not an Error by its string form', async () => {
+    const queue = fakeQueue();
+    queue.restoreFromStore.mockImplementation(() => {
+      throw 'disk I/O error';
+    });
+    const result = await bootstrapPlugins(buildApp(), { discover: async () => [plugin('a', ['alpha'])] });
+
+    expect(settleDurableQueue(queue, result)).toBe('the durable queue could not be restored (disk I/O error)');
+    expect(queue.holdQueueStore.mock.calls).toEqual([['the durable queue could not be restored (disk I/O error)']]);
+  });
 });
