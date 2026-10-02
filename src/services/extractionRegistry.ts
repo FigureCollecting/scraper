@@ -92,9 +92,12 @@ function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** Freeze a plain-data snapshot all the way down. */
+/**
+ * Freeze a plain-data snapshot all the way down. An object already frozen is not entered again, which
+ * ends a cycle: the snapshot is a fresh structured clone, so nothing in it was frozen before this walk.
+ */
 function deepFreeze<T>(value: T): T {
-  if (value !== null && typeof value === 'object') {
+  if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
     Object.freeze(value);
     for (const child of Object.values(value)) deepFreeze(child);
   }
@@ -111,9 +114,17 @@ function isString(value: unknown): value is string {
   return typeof value === 'string';
 }
 
-/** True when `value` is an array whose every element passes; a hole is an element too (undefined). */
-function isArrayOf<T>(value: unknown, element: (item: unknown) => item is T): value is T[] {
-  return Array.isArray(value) && Array.from(value).every(item => element(item));
+/**
+ * True when `value` is an array whose every element passes; a hole is an element too (undefined). It
+ * stops at the first element that fails, so a sparse array of any length costs one read, not one per
+ * index. Exported for its unit test.
+ */
+export function isArrayOf<T>(value: unknown, element: (item: unknown) => item is T): value is T[] {
+  if (!Array.isArray(value)) return false;
+  for (let index = 0; index < value.length; index++) {
+    if (!element(value[index])) return false;
+  }
+  return true;
 }
 
 /** The AiBarSummary lists the robots probe reads, each an array of strings. */
@@ -295,7 +306,12 @@ interface PreparedSite {
   domains: string[];
 }
 
+/** Read the config's index keys, and refuse it (naming the site) when it declares requiredCookies that are not cookie names. */
 function prepareSite(config: SiteConfig): PreparedSite {
+  const { requiredCookies } = config;
+  if (requiredCookies !== undefined && !isArrayOf(requiredCookies, isString)) {
+    throw new Error(`site ${JSON.stringify(config.siteId)}: requiredCookies must be an array of cookie names (strings) when present`);
+  }
   return { config, siteId: config.siteId, domains: Array.from(config.domains, domain => domain.toLowerCase()) };
 }
 

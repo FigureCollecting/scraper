@@ -27,7 +27,7 @@ import { scraperDebug } from './utils/logger.js';
 
 // Import browser pool functionality
 import { browserLaneView, initializeBrowserPool, BrowserPool } from './services/genericScraper.js';
-import { bootstrapPlugins, durableQueueHold, pluginsView, shutdownPlugins, type BootstrapPluginsResult } from './services/pluginBootstrap.js';
+import { bootstrapPlugins, pluginsView, settleDurableQueue, shutdownPlugins, type BootstrapPluginsResult } from './services/pluginBootstrap.js';
 import type { ExtractionRegistryImpl } from './services/extractionRegistry.js';
 import { getScrapeQueue } from './services/scrapeQueue.js';
 import { createQueueStore } from './services/queueStore.js';
@@ -92,7 +92,7 @@ let pluginBootstrap: BootstrapPluginsResult | undefined;
 async function startServer(): Promise<void> {
   // DURABLE SCRAPE QUEUE (SCRAPE_QUEUE_DIR, default /var/lib/scraper): open the backing store first,
   // so nothing can be enqueued before there is somewhere to write it. The RECONCILE deliberately
-  // happens later — see the comment at restoreFromStore() below.
+  // happens later — see the comment at settleDurableQueue() below.
   // Without a writable directory createQueueStore logs one warning and returns the in-memory
   // fallback: the engine then runs exactly as it did before, minus the durability.
   const queue = getScrapeQueue();
@@ -102,9 +102,9 @@ async function startServer(): Promise<void> {
   // run, and start its mtime poller so a re-minted file (a refreshed Secret) goes live without a
   // restart. Unset env ⇒ the store is disabled and this is a no-op. Never throws.
   getCfCookieStore().start();
-  // Why the durable queue must be held rather than restored; it stays set unless the bootstrap
-  // completes with a whole registry.
-  let queueHold: string | undefined = 'the plugin bootstrap did not complete';
+  // The bootstrap whose registry reached the scrape queue; it stays undefined if bootstrapPlugins (or
+  // threading its registry into the queue) threw, and the durable queue is then held below.
+  let queueBootstrap: BootstrapPluginsResult | undefined;
   try {
     const bootstrap = await bootstrapPlugins(app);
     const { registry, plugins } = bootstrap;
@@ -116,14 +116,7 @@ async function startServer(): Promise<void> {
     // is configured). The engine carries no extraction fallback — items with
     // no matching ruleset fail cleanly through the queue's failure handling.
     queue.setPluginRegistry(registry);
-    // RECONCILE ONLY NOW, and only into a registry that came up WHOLE. A restored item is dispatched
-    // as soon as it lands in a tier, and an item whose store has no ruleset fails EXTRACTION_UNAVAILABLE
-    // — which is TERMINAL, not retryable — so restoring ahead of the registry, or into one missing a
-    // refused plugin's stores, would delete the very batch it had just recovered. Otherwise (a plugin
-    // was refused, no store registered, or bootstrapPlugins threw) the queue is HELD below: the file
-    // is closed untouched for the next start rather than burned against an engine that cannot extract.
-    queueHold = durableQueueHold(bootstrap);
-    if (queueHold === undefined) queue.restoreFromStore();
+    queueBootstrap = bootstrap;
     // Mount the cross-store buy-decision search (GET /lookup) now that the registry is populated.
     // Each store fetches via the transport its `searchFetch` declares (http / impersonate / browser);
     // http + impersonate use the engine defaults, and the `browser` transport is backed here by the
@@ -159,7 +152,14 @@ async function startServer(): Promise<void> {
   } catch (error) {
     console.error('[PAGE-SCRAPER] Plugin bootstrap failed:', error);
   }
-  if (queueHold !== undefined) queue.holdQueueStore(queueHold);
+  // RECONCILE ONLY NOW, and only into a registry that came up WHOLE. A restored item is dispatched as
+  // soon as it lands in a tier, and an item whose store has no ruleset fails EXTRACTION_UNAVAILABLE —
+  // which is TERMINAL, not retryable — so restoring ahead of the registry, or into one missing a refused
+  // plugin's stores, would delete the very batch it had just recovered. Otherwise (a plugin was refused
+  // or failed to load, no store registered, or the bootstrap threw) settleDurableQueue HOLDS the queue:
+  // the file is closed without being restored, for the next start, rather than burned against an engine
+  // that cannot extract. The decision and its four paths are unit-tested in pluginBootstrap.test.ts.
+  settleDurableQueue(queue, queueBootstrap);
 
   app.listen(PORT, async () => {
     console.log(`[PAGE-SCRAPER] Server running on port ${PORT}`);

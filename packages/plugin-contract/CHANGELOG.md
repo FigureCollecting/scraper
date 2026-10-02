@@ -6,8 +6,16 @@ package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.17.0] - 2026-10-02
 
-Additive, backward-compatible: every addition is optional. A plugin that calls none of the new
-methods loads exactly as before; a plugin that calls them on an older engine (with `?.`) is a no-op.
+Additive: every addition is optional, and a plugin that calls them on an older engine (with `?.`)
+is a no-op. A plugin that calls none of the new methods and makes all its registry calls before
+`register()` resolves loads exactly as before.
+
+### Changed
+- A registry call made after the plugin has loaded — any method, `registerSite` and
+  `registerRuleset` included, from a timer or an un-awaited load — now throws
+  (`plugin registration is closed`) and takes no effect; an older engine applied it late. Uncaught,
+  that throw ends the engine process, so a plugin that registers lazily must move those calls into
+  `register()` before it resolves.
 
 ### Added
 - `ExtractionRegistry.registerHandsOffPolicy?(policy: HandsOffPolicy)` and the `HandsOffPolicy`,
@@ -35,7 +43,8 @@ methods loads exactly as before; a plugin that calls them on an older engine (wi
   together with the plugin's stores or not at all; one left until after `register()` resolves is
   refused, never applied late.
 - `SiteConfig.requiredCookies?: string[]` — the cookie names a healthy session jar must hold.
-  `allowedCookies` stays the allow-list.
+  `allowedCookies` stays the allow-list. `registerSite` throws, naming the site, when it is present
+  and not an array of strings (a hole counts as a non-string), which refuses the whole plugin.
 
 ## [0.16.0] - 2026-09-26
 

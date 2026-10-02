@@ -83,10 +83,11 @@ export type QueueItemState = 'pending' | 'leased' | 'parked';
  *                           store was opened; readable rows were carried over. STILL DURABLE.
  *   write_failed          — a write failed at runtime (a full disk, a revoked mount). The store
  *                           degrades to in-memory for the rest of the process life and keeps serving.
- *   held                  — the engine came up without every plugin (one was refused, or no store
- *                           registered), so the durable file was closed UNTOUCHED at startup instead
- *                           of restored: its rows wait for a start with a whole registry, and this
- *                           process queues in memory (ScrapeQueue.holdQueueStore).
+ *   held                  — the engine came up without every plugin (one was refused or failed to
+ *                           load, no store registered, or the bootstrap threw), so the durable file was
+ *                           closed at startup without being restored: its rows (and open host
+ *                           cooldowns) wait for a start with a whole registry, and this process queues
+ *                           in memory (ScrapeQueue.holdQueueStore).
  */
 export type QueueStoreReason =
   | 'ok'
