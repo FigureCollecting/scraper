@@ -125,7 +125,7 @@ export interface PersistedQueueItem {
   lane?: QueueLane;
   /**
    * A lane cell this build does not know (a newer build wrote it), as text. It COUNTS as no lane, but
-   * the row HAS a lane: the coalesce rule never relabels it and a salvage copy writes it back as is.
+   * the row HAS a lane: the coalesce rule never relabels it and a salvage copy writes it back as text.
    */
   unknownLane?: string;
 }
@@ -383,7 +383,8 @@ interface ItemRow {
  * A `lane` cell read back. NULL and an absent column are no lane. A value outside the vocabulary is a
  * lane a newer build wrote: it reads as no lane here (an unknown label must never become a class of
  * its own), and comes back as `unknownLane` so nothing in this build overwrites it: the coalesce rule
- * never relabels the row, `setLane` only writes a NULL cell, and salvage copies the value as is.
+ * never relabels the row, `setLane` only writes a NULL cell, and salvage copies it back as text (a
+ * text cell exactly; a non-text cell, which no build writes, as its String() form, still unknown).
  */
 function laneFromDisk(raw: unknown, onUnknown: (value: string) => void): Pick<PersistedQueueItem, 'lane' | 'unknownLane'> {
   if (raw === null || raw === undefined) return {};
@@ -462,6 +463,15 @@ export interface OpenQueueStoreOptions {
  * `createQueueStore` is the fail-safe wrapper every caller should use.
  */
 export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueStore {
+  return openSqliteStore(opts, warnUnknownLaneOnce());
+}
+
+/**
+ * `openQueueStore` with its unknown-lane warner handed in: ONE warning for this store, whichever read
+ * meets an unknown lane first. A recovery hands the same warner to the salvage read and to both of
+ * its handles, so a boot that salvages a file warns once, not once per handle.
+ */
+function openSqliteStore(opts: OpenQueueStoreOptions, onUnknownLane: (value: string) => void): ScrapeQueueStore {
   const dir = opts.dir ?? resolveQueueDir() ?? DEFAULT_QUEUE_DIR;
   const file = path.join(dir, QUEUE_DB_FILE);
   const db = new DatabaseSync(file);
@@ -564,8 +574,6 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
    */
   let degraded = false;
   let reason: QueueStoreReason = opts.reason ?? 'ok';
-  /** One unknown-lane warning for this store, whichever read meets it first. */
-  const onUnknownLane = warnUnknownLaneOnce();
   const toItem = (row: ItemRow): PersistedQueueItem => rowToItem(row, onUnknownLane);
   let loggedLogicFault = false;
   const degrade = (error: unknown): void => {
@@ -994,7 +1002,11 @@ function quarantine(file: string, stamp: string): string | null {
  * {carried: 0, lost: 0}: there is nothing to enumerate, and `quarantinedPath` is what the operator
  * follows instead.
  */
-function salvage(quarantinedPath: string, into: ScrapeQueueStore): { carried: number; lost: number } {
+function salvage(
+  quarantinedPath: string,
+  into: ScrapeQueueStore,
+  onUnknownLane: (value: string) => void
+): { carried: number; lost: number } {
   let rows: ItemRow[] = [];
   let cooldowns: Array<{ host: string; until: number; reason: string; opened_at: number }> = [];
   try {
@@ -1012,7 +1024,6 @@ function salvage(quarantinedPath: string, into: ScrapeQueueStore): { carried: nu
   } catch {
     return { carried: 0, lost: 0 };
   }
-  const onUnknownLane = warnUnknownLaneOnce();
   into.batch(() => {
     for (const row of rows) {
       const item = rowToItem(row, onUnknownLane);
@@ -1088,11 +1099,13 @@ export function createQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueS
       try {
         // Salvage through a first handle, then CLOSE it and reopen, so the store we hand back reports
         // the MEASURED lostAtStartup rather than the zero we would have had to guess at open time.
-        const probe = openQueueStore({ ...opts, dir, reason: 'open_failed_recovered', quarantinedPath });
+        // One unknown-lane warner spans the salvage read and both handles: one boot, one warning.
+        const onUnknownLane = warnUnknownLaneOnce();
+        const probe = openSqliteStore({ ...opts, dir, reason: 'open_failed_recovered', quarantinedPath }, onUnknownLane);
         let carried = 0;
         let lost = 0;
         try {
-          ({ carried, lost } = salvage(quarantinedPath, probe));
+          ({ carried, lost } = salvage(quarantinedPath, probe, onUnknownLane));
         } finally {
           probe.close();
         }
@@ -1101,7 +1114,10 @@ export function createQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueS
             `${sanitizeForLog(quarantinedPath)} and opened a fresh one — ` +
             `${carried} item(s) carried over, ${lost} lost`
         );
-        return openQueueStore({ ...opts, dir, reason: 'open_failed_recovered', quarantinedPath, lostAtStartup: lost });
+        return openSqliteStore(
+          { ...opts, dir, reason: 'open_failed_recovered', quarantinedPath, lostAtStartup: lost },
+          onUnknownLane
+        );
       } catch {
         // The fresh open failed too — the directory itself is the problem, not the file.
       }

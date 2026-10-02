@@ -1296,8 +1296,16 @@ export class ScrapeQueue {
   private enqueueLane(raw: unknown, mfcId: string): QueueLane | undefined {
     if (raw === undefined) return undefined;
     if (isQueueLane(raw)) return raw;
+    // Printing the value must not be what throws the enqueue away (a null-prototype object has no
+    // toString), so a value that will not print is named by its type.
+    let printed: string;
+    try {
+      printed = String(raw);
+    } catch {
+      printed = `<${typeof raw}>`;
+    }
     console.warn(
-      `[SCRAPE QUEUE] Ignored lane '${sanitizeForLog(String(raw))}' for ${sanitizeForLog(mfcId)}: ` +
+      `[SCRAPE QUEUE] Ignored lane '${sanitizeForLog(printed)}' for ${sanitizeForLog(mfcId)}: ` +
         'not one of new, company, gap; queued with no lane'
     ); // lgtm[js/log-injection]
     return undefined;
@@ -1320,7 +1328,8 @@ export class ScrapeQueue {
       return;
     }
     // Move resident depth only if the item IS resident: an in-flight item is in no tier, and is
-    // counted under its new lane if a failure puts it back.
+    // counted under its new lane if a failure puts it back. An item sits in its tier at most once
+    // (upgradePriority never queues an item that is on the wire), so one is the whole move.
     if (this.getQueueForPriority(item.priority).includes(item)) {
       this.laneCounters.adjust(host, undefined, 'resident', -1);
       this.laneCounters.adjust(host, incoming, 'resident', 1);
@@ -1653,13 +1662,14 @@ export class ScrapeQueue {
     this.laneCounters.adjust(this.hostOf(item.url), item.lane, 'resident', 1);
   }
 
-  private removeFromQueue(item: QueueItem): void {
+  /** Take the item out of its tier. Returns whether it was there (false: not resident, e.g. on the wire). */
+  private removeFromQueue(item: QueueItem): boolean {
     const queue = this.getQueueForPriority(item.priority);
     const index = queue.indexOf(item);
-    if (index !== -1) {
-      queue.splice(index, 1);
-      this.laneCounters.adjust(this.hostOf(item.url), item.lane, 'resident', -1);
-    }
+    if (index === -1) return false;
+    queue.splice(index, 1);
+    this.laneCounters.adjust(this.hostOf(item.url), item.lane, 'resident', -1);
+    return true;
   }
 
   /** Re-read the per-(host, lane) parked depth from the store (the parked side of the lane counters). */
@@ -1699,9 +1709,12 @@ export class ScrapeQueue {
       return; // Not an upgrade
     }
 
-    this.removeFromQueue(item);
+    const resident = this.removeFromQueue(item);
     item.priority = newPriority;
-    this.addToQueue(item);
+    // An item on the wire is in no tier: the raise is RECORDED (a retry re-queues it at the new
+    // priority) but nothing is queued. Queuing it here would put a second copy in the tier when the
+    // retry re-queues it: the item would be fetched twice, and the lane counters would drift.
+    if (resident) this.addToQueue(item);
     // Record it, so an item restored after a restart comes back in the lane it was raised to.
     this.store.setPriority(item.id, newPriority);
 
