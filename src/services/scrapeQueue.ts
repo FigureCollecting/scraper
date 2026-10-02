@@ -1712,8 +1712,8 @@ export class ScrapeQueue {
     const resident = this.removeFromQueue(item);
     item.priority = newPriority;
     // An item on the wire is in no tier: the raise is RECORDED (a retry re-queues it at the new
-    // priority) but nothing is queued. Queuing it here would put a second copy in the tier when the
-    // retry re-queues it: the item would be fetched twice, and the lane counters would drift.
+    // priority) but nothing is queued. A copy queued here would be fetched again after the wire fetch
+    // completed, and a retry would add a second copy to the tier, throwing the lane counters off.
     if (resident) this.addToQueue(item);
     // Record it, so an item restored after a restart comes back in the lane it was raised to.
     this.store.setPriority(item.id, newPriority);
