@@ -15,6 +15,8 @@
     "lint": "echo 'No linter configured'",
     "typecheck": "npm run build:contract && tsc --noEmit",
     "typecheck:tests": "tsc --noEmit -p tsconfig.test.json",
+    "proto:lint": "buf lint",
+    "proto:generate": "buf generate",
     "test": "jest --config jest.config.cjs --testPathIgnorePatterns='inter-service'",
     "test:unit": "jest --config jest.config.cjs src/__tests__/unit",
     "test:integration": "jest --config jest.config.cjs src/__tests__/integration --testPathIgnorePatterns='inter-service'",
@@ -26,7 +28,7 @@
     "postinstall": "patch-package"
   },
   "dependencies": {
-    "@bufbuild/protobuf": "^2.13.0",
+    "@bufbuild/protobuf": "^2.16.0",
     "@connectrpc/connect": "^2.1.2",
     "@connectrpc/connect-node": "^2.1.2",
     "@figurecollecting/fc-shared": "^1.6.0",
@@ -48,6 +50,7 @@
     "minio": "^8.0.7",
     "patch-package": "^8.0.1",
     "puppeteer": "^25.9.0",
+    "tldts": "^7.4.16",
     "tough-cookie": "6.0.2"
   },
   "overrides": {
@@ -56,17 +59,19 @@
     "basic-ftp": "^5.3.1",
     "undici": "^7.30.0",
     "protobufjs": "^7.6.4",
-    "@grpc/grpc-js": "^1.14.4",
+    "@grpc/grpc-js": "^1.14.5",
     "path-to-regexp": "^8.4.0",
     "typescript": {
       "glob": "^10.5.0"
     },
-    "brace-expansion@1": "1.1.18",
-    "brace-expansion@2": "2.1.4",
-    "brace-expansion@5": "5.0.9",
-    "js-yaml@3": "3.15.1"
+    "brace-expansion@1": "1.1.21",
+    "brace-expansion@2": "2.1.7",
+    "brace-expansion@5": "5.0.12",
+    "js-yaml@3": "3.15.2"
   },
   "devDependencies": {
+    "@bufbuild/buf": "^1.73.0",
+    "@bufbuild/protoc-gen-es": "^2.16.0",
     "@types/cors": "^2.8.14",
     "@types/express": "^5.0.3",
     "@types/jest": "^30.0.0",
