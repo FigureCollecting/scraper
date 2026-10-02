@@ -1,0 +1,183 @@
+// ============================================================================
+// fc.diag.v1 — the engine's diagnostic probes, triggered by an operator.
+//
+// One service, one RPC: DiagService.RunProbe. The only client is the scraper's
+// own CLI (dist/diag/run.js), run as a Kubernetes Job that Ross triggers or
+// arms; it reaches the engine over gRPC (h2c inside Linkerd mTLS). Connect over
+// HTTP/1.1 is not a supported transport for this service.
+//
+// WHY IT EXISTS. Some stores bar AI agents by name. Claude and its tools never
+// contact those hosts. When passive evidence (logs, /health/detailed, the
+// fetch_failure ledger) is not enough, a probe sends at most a handful of
+// requests through the engine's own lanes, and the result is read afterwards.
+// Every request a probe may send is bounded twice by the engine: per call
+// (the probe's hard maximum) and per host (a rolling 24 h cap).
+//
+// FIDELITY: instants are RFC 3339 UTC strings; sha256 values are lowercase hex
+// (the same spelling as the robots pins they are compared with); nothing here
+// is a float or a Struct. The canary item id is never carried in either
+// direction: the engine resolves it and labels its target role CANARY.
+// ============================================================================
+
+syntax = "proto3";
+
+package fc.diag.v1;
+
+service DiagService {
+  // Run one probe. Input outside the declared surface is INVALID_ARGUMENT
+  // with 0 requests sent. A refusal after validation (budget spent, host in
+  // cooldown) is a normal response whose verdict says so.
+  rpc RunProbe(RunProbeRequest) returns (RunProbeResponse);
+}
+
+// The probes. Nothing else: the cookie-jar view is a /health/detailed block
+// that sends no request and has no RPC.
+enum Probe {
+  PROBE_UNSPECIFIED = 0;
+  // GET /robots.txt once (1 request).
+  PROBE_ROBOTS_SNAPSHOT = 1;
+  // GET one item page per id (at most 2 requests).
+  PROBE_ITEM_STATUS = 2;
+}
+
+message RunProbeRequest {
+  Probe probe = 1;
+
+  // A siteId the engine registry holds. Required for ITEM_STATUS; for
+  // ROBOTS_SNAPSHOT exactly one of store and origin is set.
+  string store = 2;
+
+  // ROBOTS_SNAPSHOT without a store (first contact with a new store):
+  // "https://<host>", a bare public DNS hostname with no port, path, query,
+  // fragment or userinfo. A host that belongs to a registered store is
+  // refused (use store), as is a host a registered policy denies.
+  string origin = 3;
+
+  // ITEM_STATUS only: at most 2 ids, each a full match of the store's
+  // declared id pattern (digits only when it declares none). With pair, the
+  // single id is the control.
+  repeated string ids = 4;
+
+  // ITEM_STATUS only: pair the control id with the engine's configured
+  // session canary.
+  bool pair = 5;
+
+  // The most requests this call may send. Absent = the probe maximum; 0 =
+  // send nothing. The engine grants min(this, probe maximum, the host's
+  // remaining 24 h budget).
+  optional uint32 max_requests = 6;
+
+  // Names the run in logs and in the stored result's object key. Empty = the
+  // engine assigns one. Letters, digits, '.', '_' and '-' only.
+  string run_id = 7;
+}
+
+// What happened, for the whole call (RunProbeResponse.verdict) and for each
+// target (Target.class).
+enum Outcome {
+  OUTCOME_UNSPECIFIED = 0;
+  OUTCOME_OK = 1;
+  // A 5xx, including an empty one. Wins over every other class for an empty
+  // 5xx: an outage is not a bot check.
+  OUTCOME_OUTAGE = 2;
+  OUTCOME_CHALLENGE = 3;
+  OUTCOME_LOGIN_LOST = 4;
+  // The page answered, but with the content-level placeholder instead of the
+  // item.
+  OUTCOME_DISPLAY_GATED = 5;
+  OUTCOME_NOT_FOUND_AMBIGUOUS = 6;
+  // The host's challenge cooldown is open: 0 requests.
+  OUTCOME_COOLDOWN_SKIPPED = 7;
+  // The budget granted no request: 0 requests.
+  OUTCOME_BUDGET_REFUSED = 8;
+  // pair was asked for but no canary is configured: 0 requests for that half.
+  OUTCOME_CANARY_UNCONFIGURED = 9;
+  // The dispatch threw. The request still counts against the budget.
+  OUTCOME_ERROR = 10;
+}
+
+enum TargetRole {
+  TARGET_ROLE_UNSPECIFIED = 0;
+  TARGET_ROLE_ROBOTS = 1;
+  TARGET_ROLE_ITEM = 2;
+  TARGET_ROLE_CANARY = 3;
+  TARGET_ROLE_CONTROL = 4;
+}
+
+// One request the probe sent, or would have sent. Targets are in request
+// order: one per id for ITEM_STATUS ([canary, control] with pair), one for
+// ROBOTS_SNAPSHOT.
+message Target {
+  TargetRole role = 1;
+  // HTTP status; 0 when no response arrived (not dispatched, or it threw).
+  uint32 status = 2;
+  // Body length in bytes.
+  uint32 bytes = 3;
+  Outcome class = 4;
+  // The raw-store key the body was captured under; empty when none.
+  string raw_key = 5;
+  // Lowercase hex sha256 of the body; empty when no body.
+  string sha256 = 6;
+  // The transport followed a redirect.
+  bool redirected = 7;
+}
+
+// The AI-bar tiers of the plugin contract.
+enum AiBarTier {
+  AI_BAR_TIER_UNSPECIFIED = 0;
+  AI_BAR_TIER_FULL_BAR = 1;
+  AI_BAR_TIER_ROUTE_BAR = 2;
+  AI_BAR_TIER_NAMED_NO_ROUTE_BAR = 3;
+  AI_BAR_TIER_CRAWL_DELAY_ONLY = 4;
+  AI_BAR_TIER_NOT_NAMED = 5;
+  // A challenge body or an unreadable file is never classified.
+  AI_BAR_TIER_UNREADABLE = 6;
+}
+
+message AiBarSummary {
+  AiBarTier tier = 1;
+  repeated string named_tokens = 2;
+  repeated string full_bar_tokens = 3;
+  repeated string route_bar_tokens = 4;
+  repeated string crawl_delay_tokens = 5;
+  repeated string content_signals = 6;
+}
+
+enum RobotsDrift {
+  ROBOTS_DRIFT_UNSPECIFIED = 0;
+  // The body's sha256 equals the pinned one.
+  ROBOTS_DRIFT_UNCHANGED = 1;
+  ROBOTS_DRIFT_CHANGED = 2;
+  // Nothing to compare against (no pin, store-less mode) or no readable body.
+  ROBOTS_DRIFT_UNKNOWN = 3;
+}
+
+// ROBOTS_SNAPSHOT only.
+message RobotsFindings {
+  RobotsDrift drift = 1;
+  // The pinned sha256 compared against, lowercase hex; empty when none.
+  string pin_sha = 2;
+  // Absent when no classifier is registered or the body is a challenge.
+  AiBarSummary summary = 3;
+  // Why drift is UNKNOWN or summary is absent, e.g. "no-pin", "no-classifier".
+  string reason = 4;
+}
+
+message RunProbeResponse {
+  Outcome verdict = 1;
+  // Requests actually charged and dispatched by this call.
+  uint32 requests_issued = 2;
+  // What the host has left in its rolling 24 h budget after this call.
+  uint32 budget_remaining = 3;
+  repeated Target targets = 4;
+  RobotsFindings robots = 5;
+  // The registry's hands-off decision for the host.
+  bool hands_off = 6;
+  string started_at = 7;
+  string finished_at = 8;
+  // Echoes, so a stored result or a log line is self-describing.
+  Probe probe = 9;
+  string run_id = 10;
+  // The normalised host the budget was charged against.
+  string host = 11;
+}

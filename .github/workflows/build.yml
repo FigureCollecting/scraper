@@ -62,6 +62,19 @@ jobs:
       - name: Run linter
         run: npm run lint || true
 
+      # proto/ is the source of truth for src/gen, which is committed so the image build needs no
+      # buf. Lint it, regenerate it, and fail if the committed output differs (buf.gen.yaml has
+      # clean: true, so a file orphaned by a deleted proto shows up as a deletion, and an
+      # uncommitted new file shows up in the status check).
+      - name: Proto lint and codegen drift
+        run: |
+          npm run proto:lint
+          npm run proto:generate
+          if ! git diff --exit-code -- src/gen || [ -n "$(git status --porcelain -- src/gen)" ]; then
+            echo "::error::src/gen is stale. Run 'npm run proto:generate' and commit the result."
+            exit 1
+          fi
+
       # The test sources are never type-checked by anything else: jest transpiles them
       # per-file with no cross-file checking, and `npm run build` excludes them from the
       # source project. Without this step a test can carry type errors through a green CI

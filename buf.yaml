@@ -1,0 +1,12 @@
+# buf module config for the engine's own gRPC contracts (fc.diag.v1).
+# The proto lives here, not in fc-shared, because its only client is the
+# scraper's own CLI in the same image (hands-off plan HD-9 (a), pending Ross).
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+breaking:
+  use:
+    - FILE
