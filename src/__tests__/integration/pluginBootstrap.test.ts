@@ -564,12 +564,14 @@ describe('durableQueueHold and pluginsView', () => {
   });
 
   it('holds the queue when any plugin was refused, naming every refused plugin, even with other stores live', async () => {
-    const result = await bootstrapPlugins(buildApp(), {
+    const one = await bootstrapPlugins(buildApp(), { discover: async () => [plugin('a', ['alpha']), plugin('broken-one', ['beta'], true)] });
+    const two = await bootstrapPlugins(buildApp(), {
       discover: async () => [plugin('a', ['alpha']), plugin('broken-one', ['beta'], true), plugin('broken-two', [], true)],
     });
 
-    expect(result.registry.allStores().map(s => s.siteId)).toEqual(['alpha']);
-    expect(durableQueueHold(result)).toBe('plugin(s) refused at startup: broken-one, broken-two');
+    expect(one.registry.allStores().map(s => s.siteId)).toEqual(['alpha']);
+    expect(durableQueueHold(one)).toBe('plugin(s) refused at startup: broken-one');
+    expect(durableQueueHold(two)).toBe('plugin(s) refused at startup: broken-one, broken-two');
   });
 
   it('holds the queue when no store registered (no plugin, or plugins with no sites)', async () => {

@@ -16,9 +16,10 @@
  * are hands-off is the plugin's data: no host, store or AI token is named here.
  *
  * ALL OR NOTHING PER PLUGIN. Those two methods can refuse a call, so bootstrapPlugins never hands a
- * plugin this registry: it hands it a PluginRegistration (beginRegistration()), which checks each
- * call as it is made and applies them all only at commit(), once the plugin has loaded. A refused
- * policy therefore cannot leave the plugin's sites live without it.
+ * plugin this registry: it opens a PluginRegistration (beginRegistration()) and hands the plugin its
+ * forPlugin() methods, which check each call as it is made; the calls are applied all at once only at
+ * commit(), once the plugin has loaded, and the registration is closed from then on. A refused
+ * policy therefore cannot leave the plugin's sites live without it, and no policy can arrive late.
  */
 
 import {
@@ -106,50 +107,86 @@ function isRobotsPin(value: unknown): value is RobotsPin {
   return typeof pin.url === 'string' && typeof pin.sha256 === 'string' && typeof pin.fetchedAt === 'string';
 }
 
+function isString(value: unknown): value is string {
+  return typeof value === 'string';
+}
+
+/** True when `value` is an array whose every element passes; a hole is an element too (undefined). */
+function isArrayOf<T>(value: unknown, element: (item: unknown) => item is T): value is T[] {
+  return Array.isArray(value) && Array.from(value).every(item => element(item));
+}
+
+/** The AiBarSummary lists the robots probe reads, each an array of strings. */
+const SUMMARY_LISTS = ['namedTokens', 'fullBarTokens', 'routeBarTokens', 'crawlDelayTokens', 'contentSignals'] as const;
+
+/** Throw, naming the policy and the field, when `summary` is not an AiBarSummary. */
+function checkSummary(owner: string, summary: unknown): void {
+  if (summary === null || typeof summary !== 'object' || Array.isArray(summary)) {
+    throw refused(owner, 'summary must be an object (an AiBarSummary)');
+  }
+  const fields = summary as Record<string, unknown>;
+  if (!KNOWN_TIERS.has(fields.tier as string)) {
+    throw refused(owner, `summary.tier must be one of ${AI_BAR_TIERS.join(', ')}, got ${JSON.stringify(fields.tier)}`);
+  }
+  for (const list of SUMMARY_LISTS) {
+    if (!isArrayOf(fields[list], isString)) throw refused(owner, `summary.${list} must be an array of strings`);
+  }
+}
+
 /**
- * Check a plugin's policy on its own and return a frozen snapshot with canonical hosts: the plugin can
- * no longer change the decision through its own object, and a caller cannot change it through a
- * returned one. Throws, naming the policy and the value, when a field is not of its declared shape —
- * `handsOff` and `denied` are never inferred from a missing or truthy value, and the fields
- * /health/detailed and the probes read (`tier`, `policyVersion`, `summary`, `pins`, `routeSamples`)
- * are checked here rather than trusted to the plugin's types.
+ * Copy a plugin's policy, check the copy and return it frozen with canonical hosts. The copy is taken
+ * FIRST — the policy's own enumerable fields, each read once, then a structured clone of them — and
+ * every check runs on it, so what is checked is exactly what is stored: a getter cannot answer the
+ * check one value and the snapshot another, and a field on a prototype, behind a class getter or
+ * non-enumerable is missing (and refused as such), never trusted. The plugin can no longer change the
+ * decision through its own object, nor a caller through a returned one. Throws, naming the policy and
+ * the value, when a field is not of its declared shape: `handsOff` and `denied` are never inferred
+ * from a missing or truthy value, and the fields /health/detailed and the probes read (`tier`,
+ * `policyVersion`, `summary`, `pins`, `routeSamples`) are checked here rather than trusted to the
+ * plugin's types.
  */
 function snapshotPolicy(policy: HandsOffPolicy): HandsOffPolicy {
   if (policy === null || typeof policy !== 'object') {
     throw new Error('hands-off policy: expected an object');
   }
-  const { siteId } = policy;
+  const fields: HandsOffPolicy = { ...policy };
+  const { siteId } = fields;
   if (siteId !== undefined && (typeof siteId !== 'string' || siteId === '')) {
     throw new Error(`hands-off policy: siteId must be a non-empty string when present, got ${JSON.stringify(siteId)}`);
   }
   const owner = policyLabel(siteId);
-  if (typeof policy.handsOff !== 'boolean') {
-    throw refused(owner, `handsOff must be a boolean, got ${JSON.stringify(policy.handsOff)}`);
+  let copy: HandsOffPolicy;
+  try {
+    copy = structuredClone(fields);
+  } catch (error) {
+    throw new Error(`hands-off ${owner}: the policy must be plain data (${describeError(error)})`, { cause: error });
   }
-  if (policy.denied !== undefined && typeof policy.denied !== 'boolean') {
-    throw refused(owner, `denied must be a boolean when present, got ${JSON.stringify(policy.denied)}`);
+
+  if (typeof copy.handsOff !== 'boolean') {
+    throw refused(owner, `handsOff must be a boolean, got ${JSON.stringify(copy.handsOff)}`);
   }
-  if (!KNOWN_TIERS.has(policy.tier)) {
-    throw refused(owner, `tier must be one of ${AI_BAR_TIERS.join(', ')}, got ${JSON.stringify(policy.tier)}`);
+  if (copy.denied !== undefined && typeof copy.denied !== 'boolean') {
+    throw refused(owner, `denied must be a boolean when present, got ${JSON.stringify(copy.denied)}`);
   }
-  if (typeof policy.policyVersion !== 'string' || policy.policyVersion === '') {
-    throw refused(owner, `policyVersion must be a non-empty string, got ${JSON.stringify(policy.policyVersion)}`);
+  if (!KNOWN_TIERS.has(copy.tier)) {
+    throw refused(owner, `tier must be one of ${AI_BAR_TIERS.join(', ')}, got ${JSON.stringify(copy.tier)}`);
   }
-  if (policy.summary === null || typeof policy.summary !== 'object' || Array.isArray(policy.summary)) {
-    throw refused(owner, 'summary must be an object (an AiBarSummary)');
+  if (typeof copy.policyVersion !== 'string' || copy.policyVersion === '') {
+    throw refused(owner, `policyVersion must be a non-empty string, got ${JSON.stringify(copy.policyVersion)}`);
   }
-  if (!Array.isArray(policy.pins) || !policy.pins.every(isRobotsPin)) {
+  checkSummary(owner, copy.summary);
+  if (!isArrayOf(copy.pins, isRobotsPin)) {
     throw refused(owner, 'pins must be an array of {url, sha256, fetchedAt}, each a string');
   }
-  if (!Array.isArray(policy.routeSamples) || !policy.routeSamples.every(sample => typeof sample === 'string')) {
+  if (!isArrayOf(copy.routeSamples, isString)) {
     throw refused(owner, 'routeSamples must be an array of strings');
   }
-  if (!Array.isArray(policy.hosts) || policy.hosts.length === 0) {
+  if (!Array.isArray(copy.hosts) || copy.hosts.length === 0) {
     throw refused(owner, 'hosts must be a non-empty array of hostnames');
   }
 
   const hosts: string[] = [];
-  for (const raw of policy.hosts) {
+  for (const raw of copy.hosts) {
     const host = normalisePolicyHost(raw);
     if (host === undefined) {
       throw refused(
@@ -162,14 +199,8 @@ function snapshotPolicy(policy: HandsOffPolicy): HandsOffPolicy {
     }
     hosts.push(host);
   }
-
-  let snapshot: HandsOffPolicy;
-  try {
-    snapshot = structuredClone({ ...policy, hosts });
-  } catch (error) {
-    throw new Error(`hands-off ${owner}: the policy must be plain data (${describeError(error)})`, { cause: error });
-  }
-  return deepFreeze(snapshot);
+  copy.hosts = hosts;
+  return deepFreeze(copy);
 }
 
 /** The policies a check runs against, by canonical host and by siteId. */
@@ -396,11 +427,12 @@ export class ExtractionRegistryImpl implements ExtractionRegistry {
   }
 
   /**
-   * Open one plugin's registration: what bootstrapPlugins hands the plugin's register() instead of this
-   * registry. Nothing the plugin registers through it is visible here until commit().
+   * Open one plugin's registration: bootstrapPlugins hands the plugin's register() its forPlugin()
+   * methods instead of this registry. Nothing the plugin registers through it is visible here until
+   * commit(), and nothing after.
    */
   beginRegistration(): PluginRegistration {
-    return new PluginRegistration(this, {
+    return new PluginRegistration({
       checkPolicy: policy => checkPolicyAgainst(policy, this.policyIndex),
       checkClassifier: () => refuseSecondClassifier(this.classifier),
       apply: staged => {
@@ -453,8 +485,14 @@ export class ExtractionRegistryImpl implements ExtractionRegistry {
  * more (another registration may have committed in between), then applies every call at once, or
  * none. A refused call poisons the registration: commit() refuses it even when the plugin caught the
  * throw and carried on, because the plugin's stores must never go live without the policy it meant
- * to register. After commit() calls go straight to the registry; after discard() or a failed
- * commit() they throw.
+ * to register.
+ *
+ * The registration is open only while the plugin loads. After commit() it is CLOSED: every call
+ * throws without taking effect, whatever it carries, so no policy is ever applied after the stores it
+ * guards have gone live (a policy left that late is refused, and registering in time is the plugin's
+ * part). After discard() or a failed commit() calls throw too. The plugin is handed forPlugin(), which
+ * carries the four registry methods and nothing else, so it cannot commit or discard its own
+ * registration.
  */
 export class PluginRegistration implements ExtractionRegistry {
   private state: 'open' | 'committed' | 'discarded' = 'open';
@@ -463,23 +501,31 @@ export class PluginRegistration implements ExtractionRegistry {
   private readonly staged: StagedRegistrations = { sites: [], rulesets: [], policies: [], classifier: undefined };
   private readonly stagedIndex = emptyPolicyIndex();
 
-  constructor(
-    private readonly registry: ExtractionRegistryImpl,
-    private readonly target: RegistrationTarget
-  ) {}
+  constructor(private readonly target: RegistrationTarget) {}
+
+  /**
+   * What bootstrapPlugins hands the plugin's register(): a frozen object with the four registry
+   * methods (each works detached) and nothing else — no commit(), no discard(), no way to the
+   * registry behind it.
+   */
+  forPlugin(): ExtractionRegistry {
+    return Object.freeze({
+      registerSite: (config: SiteConfig) => this.registerSite(config),
+      registerRuleset: (ruleset: ExtractionRuleset) => this.registerRuleset(ruleset),
+      registerHandsOffPolicy: (policy: HandsOffPolicy) => this.registerHandsOffPolicy(policy),
+      registerRobotsClassifier: (classifier: RobotsClassifier) => this.registerRobotsClassifier(classifier),
+    });
+  }
 
   registerSite(config: SiteConfig): void {
-    if (this.isCommitted()) return this.registry.registerSite(config);
     this.stage(() => this.staged.sites.push(prepareSite(config)));
   }
 
   registerRuleset(ruleset: ExtractionRuleset): void {
-    if (this.isCommitted()) return this.registry.registerRuleset(ruleset);
     this.stage(() => this.staged.rulesets.push([ruleset.siteId, ruleset]));
   }
 
   registerHandsOffPolicy(policy: HandsOffPolicy): void {
-    if (this.isCommitted()) return this.registry.registerHandsOffPolicy(policy);
     this.stage(() => {
       const stored = snapshotPolicy(policy);
       this.target.checkPolicy(stored);
@@ -490,7 +536,6 @@ export class PluginRegistration implements ExtractionRegistry {
   }
 
   registerRobotsClassifier(classifier: RobotsClassifier): void {
-    if (this.isCommitted()) return this.registry.registerRobotsClassifier(classifier);
     this.stage(() => {
       checkClassifierShape(classifier);
       this.target.checkClassifier();
@@ -526,15 +571,17 @@ export class PluginRegistration implements ExtractionRegistry {
     if (this.state === 'open') this.state = 'discarded';
   }
 
-  /** True once committed (calls then go straight to the registry); throws once discarded. */
-  private isCommitted(): boolean {
+  /** Run one call while the registration is open, remembering the first that throws. */
+  private stage(call: () => void): void {
+    if (this.state === 'committed') {
+      throw new Error(
+        'plugin registration is closed: the plugin has loaded, so a registry call made after its register() resolved ' +
+          'takes no effect (make every call before register() resolves)'
+      );
+    }
     if (this.state === 'discarded') {
       throw new Error('plugin registration was discarded: the plugin is not loaded');
     }
-    return this.state === 'committed';
-  }
-
-  private stage(call: () => void): void {
     try {
       call();
     } catch (error) {

@@ -29,12 +29,18 @@ export interface ExtractionRegistry {
    * malformed (`handsOff`/`denied` not booleans, a `tier` outside {@link AI_BAR_TIERS}, no
    * `policyVersion`, `summary`, `pins` or `routeSamples` of the declared shape), or the policy would
    * lift a stricter one: a policy on a subdomain of another policy's host must be at least as strict
-   * (hands-off and denied wherever the parent is), whichever is registered first.
+   * (hands-off and denied wherever the parent is), whichever is registered first. The policy must be
+   * plain data: the engine copies its own enumerable fields once (a structured clone) and checks the
+   * copy, so a field on a prototype, behind a class getter or non-enumerable counts as missing.
    *
-   * A refused call refuses the whole plugin. The engine stages a plugin's registry calls and applies
-   * them only once its register() and registerRoutes() have succeeded, so after any refused call
-   * none of the plugin's sites, rulesets, policies, classifier or routes take effect — even when the
-   * plugin catches the throw and carries on. Its stores are never live without their policy.
+   * A refused call refuses the whole plugin. The engine stages the calls a plugin makes while it loads
+   * (in register() and registerRoutes()) and applies them only once both have succeeded, so after any
+   * refused call none of the plugin's sites, rulesets, policies, classifier or routes take effect —
+   * even when the plugin catches the throw and carries on. Make every call before register()
+   * resolves: once the plugin has loaded the engine closes its registration, and a later call (a
+   * timer, an un-awaited load) throws and takes no effect. So a policy is applied together with the
+   * plugin's stores or not at all, and a store is never live while a policy registered with it was
+   * refused; a policy the plugin leaves until after register() resolves is refused, not applied late.
    */
   registerHandsOffPolicy?(policy: HandsOffPolicy): void;
   /**

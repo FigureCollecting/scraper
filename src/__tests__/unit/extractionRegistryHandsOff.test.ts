@@ -407,6 +407,16 @@ describe('ExtractionRegistry.registerHandsOffPolicy — the policy is read once,
     expect([tier.reads.count, decision.reads.count]).toEqual([1, 1]);
   });
 
+  it('stores the siteId it checked (a second read cannot turn a store policy into a host-only one)', () => {
+    const registry = createExtractionRegistry();
+    const { policy: changingSiteId, reads } = changing('siteId', 'alpha', null);
+    registry.registerHandsOffPolicy(changingSiteId);
+
+    expect(registry.handsOffView()[0].siteId).toBe('alpha');
+    expect(registry.robotsPinsFor('alpha')).toHaveLength(1);
+    expect(reads.count).toBe(1);
+  });
+
   it('refuses a policy whose fields come from a class getter, a prototype or a non-enumerable property, naming the missing field', () => {
     const registry = createExtractionRegistry();
     class GeneratedPolicy {

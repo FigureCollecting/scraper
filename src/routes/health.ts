@@ -50,7 +50,10 @@
  *     `cookieSessionLost: [host]` it mirrors,
  *     and `handsOff: [{siteId, hosts, tier, handsOff, denied, policyVersion}]` (the hands-off
  *     policies the rulesets plugin registered — the hosts Claude and its tools never contact — read
- *     from our own system with zero upstream requests; `[]` when no plugin registered any).
+ *     from our own system with zero upstream requests; `[]` when no plugin registered any), and
+ *     `plugins: {loaded: [{name, version}], refused: [{name, version}]}` (which plugins loaded at
+ *     startup and which were refused — it tells a plugin with no policy from a refused plugin, and
+ *     explains a queueStore `held`; why a plugin was refused stays in the pod log).
  *     A browser-pool-health failure still degrades to 500, now carrying { status:'degraded',
  *     challengeCooldowns, cfCookies, error } — both lists survive (neither lister can throw).
  */
@@ -66,6 +69,7 @@ import type { SessionCanaryView } from '../services/sessionCanary.js';
 import type { CpuThrottlingView } from '../services/cpuThrottling.js';
 import type { QueueStoreView } from '../services/scrapeQueue.js';
 import type { HandsOffView } from '../services/extractionRegistry.js';
+import type { PluginsView } from '../services/pluginBootstrap.js';
 
 export interface HealthDeps {
   /** The service version (package.json). */
@@ -149,6 +153,11 @@ export interface HealthDeps {
    * plugins load and when no plugin registered any. Never throws.
    */
   listHandsOff: () => HandsOffView[];
+  /**
+   * Which plugins loaded at startup and which were refused (pluginBootstrap's pluginsView): names and
+   * versions only. Both lists empty before the plugins load. Never throws.
+   */
+  listPlugins: () => PluginsView;
 }
 
 export function createHealthRoutes(deps: HealthDeps): Router {
@@ -189,6 +198,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         mfcSessionStale: deps.getSessionCanary().stale,
         cpuThrottling: deps.getCpuThrottling(),
         handsOff: deps.listHandsOff(),
+        plugins: deps.listPlugins(),
         timestamp: new Date().toISOString(),
       });
     } catch (error) {
@@ -214,6 +224,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         cpuThrottling: deps.getCpuThrottling(),
         // Which hosts are off limits matters most when the pod is sick and someone goes looking.
         handsOff: deps.listHandsOff(),
+        plugins: deps.listPlugins(),
         error: error instanceof Error ? error.message : 'Unknown error',
       });
     }

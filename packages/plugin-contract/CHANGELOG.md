@@ -18,16 +18,22 @@ methods loads exactly as before; a plugin that calls them on an older engine (wi
   host and its subdomains and lists `{siteId, hosts, tier, handsOff, denied, policyVersion}` on
   `/health/detailed` as `handsOff`. It throws, naming the policy and the value, on a host or siteId
   another policy already holds, a host that is not a DNS hostname, a malformed field (`handsOff` or
-  `denied` not a boolean, a `tier` outside `AI_BAR_TIERS`, a missing `policyVersion`, `summary`,
-  `pins` or `routeSamples`), or a policy on a subdomain that is less strict than the policy on its
-  parent (it would lift the parent's `handsOff` or `denied` there).
+  `denied` not a boolean, a `tier` outside `AI_BAR_TIERS`, a missing `policyVersion`, a `summary`
+  that is not an `AiBarSummary`, `pins` or `routeSamples` that are not arrays of the declared shape),
+  or a policy on a subdomain that is less strict than the policy on its parent (it would lift the
+  parent's `handsOff` or `denied` there). The policy must be plain data: the engine copies its own
+  enumerable fields once and checks the copy, so a field on a prototype, behind a class getter or
+  non-enumerable counts as missing.
 - `ExtractionRegistry.registerRobotsClassifier?(classifier: RobotsClassifier)` and the
   `RobotsClassifier` export (`{ tokenListDate, classify(body, routeUrls) }`). One per engine; a
   second registration throws.
-- A refused call refuses the whole plugin. The engine stages a plugin's registry calls and applies
-  them only once its `register()` and `registerRoutes()` have succeeded, so none of the plugin's
-  sites, rulesets, policies, classifier or routes take effect after a refusal, even one the plugin
-  caught. A plugin's stores are never live without their hands-off policy.
+- A refused call refuses the whole plugin. The engine stages the calls a plugin makes while it loads
+  (in `register()` and `registerRoutes()`) and applies them only once both have succeeded, so none of
+  the plugin's sites, rulesets, policies, classifier or routes take effect after a refusal, even one
+  the plugin caught. Make every call before `register()` resolves: once the plugin has loaded the
+  engine closes its registration, and a later call throws and takes no effect. So a policy goes live
+  together with the plugin's stores or not at all; one left until after `register()` resolves is
+  refused, never applied late.
 - `SiteConfig.requiredCookies?: string[]` — the cookie names a healthy session jar must hold.
   `allowedCookies` stays the allow-list.
 

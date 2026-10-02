@@ -1027,8 +1027,9 @@ describe('ScrapeQueue — holding the durable store when the registry came up in
     queue.enqueue('p1', { url: urlFor('p1') }); // the key of the pending row
     queue.enqueue('k1', { url: urlFor('k1') }); // the key of the parked row
     queue.enqueue('n1', { url: urlFor('n1') });
-    for (let i = 0; i < 4; i++) {
-      jest.advanceTimersByTime(200);
+    // One host, paced per host: give each of the three items its turn.
+    for (let i = 0; i < 6; i++) {
+      jest.advanceTimersByTime(5_000);
       await jest.advanceTimersByTimeAsync(50);
     }
     queue.refillWorkingSet(Date.now() + 3_600_000);
@@ -1037,6 +1038,8 @@ describe('ScrapeQueue — holding the durable store when the registry came up in
     expect(queue.getQueueStoreView()).toMatchObject({
       durable: false, reason: 'held', path: store.path, restoredAt: null, pending: 0, leased: 0, parked: 0,
     });
+    // The held handle is CLOSED: it reads nothing although the rows are there, and can write nothing.
+    expect(store.counts()).toEqual({ pending: 0, leased: 0, parked: 0 });
     const reopened = openStore(dir);
     expect(reopened.counts()).toEqual({ pending: 1, leased: 1, parked: 1 });
     const rows = reopened.restore(Date.now());

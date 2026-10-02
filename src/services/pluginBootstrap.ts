@@ -11,13 +11,20 @@
  * ScraperPlugin shape check upstream in pluginLoader) is logged and skipped
  * rather than taking down the whole engine boot.
  *
- * A plugin is loaded whole or not at all. register() receives a staged
- * PluginRegistration, not the shared registry: its calls are committed only
- * after register() and registerRoutes() have both succeeded, and only then
- * are its routes mounted. So a plugin that fails anywhere — including a
- * hands-off policy the registry refused, even one the plugin caught — leaves
- * none of its sites, rulesets, policies, classifier or routes behind: its
- * stores are never live without their policy.
+ * A plugin is loaded whole or not at all. register() receives the four
+ * methods of a staged PluginRegistration, not the shared registry: its calls
+ * are committed only after register() and registerRoutes() have both
+ * succeeded, and only then are its routes mounted. So a plugin that fails
+ * anywhere — including a hands-off policy the registry refused, even one the
+ * plugin caught — leaves none of its sites, rulesets, policies, classifier or
+ * routes behind: its stores never go live without a policy it registered
+ * while loading. Once the plugin has loaded its registration is closed, so a
+ * late call throws and takes no effect rather than arriving after its stores
+ * went live.
+ *
+ * The result names the refused plugins beside the loaded ones: /health/detailed
+ * lists both (pluginsView), and src/index.ts restores the durable scrape queue
+ * only when the registry came up whole (durableQueueHold).
  */
 import { Router, type Express } from 'express';
 import { discoverPlugins } from './pluginLoader.js';
@@ -40,7 +47,25 @@ export interface BootstrapPluginsOptions {
 
 export interface BootstrapPluginsResult {
   registry: ExtractionRegistryImpl;
+  /** The plugins that loaded, in discovery order. */
   plugins: ScraperPlugin[];
+  /** The plugins that failed to load (none of their registrations were kept), in discovery order. */
+  refused: ScraperPlugin[];
+}
+
+/** One plugin as /health/detailed lists it. */
+export interface PluginRef {
+  name: string;
+  version: string;
+}
+
+/**
+ * The `plugins` block on /health/detailed: which plugins loaded and which were refused at startup.
+ * Names and versions only; why a plugin was refused is in the pod log, not on that endpoint.
+ */
+export interface PluginsView {
+  loaded: PluginRef[];
+  refused: PluginRef[];
 }
 
 export async function bootstrapPlugins(app: Express, options: BootstrapPluginsOptions = {}): Promise<BootstrapPluginsResult> {
@@ -53,6 +78,7 @@ export async function bootstrapPlugins(app: Express, options: BootstrapPluginsOp
   const candidates = await discover();
 
   const loaded: ScraperPlugin[] = [];
+  const refused: ScraperPlugin[] = [];
 
   for (const plugin of candidates) {
     const logger = createPluginLogger(`plugin:${plugin.name}`);
@@ -61,7 +87,7 @@ export async function bootstrapPlugins(app: Express, options: BootstrapPluginsOp
     const registration = registry.beginRegistration();
 
     try {
-      await plugin.register(registration, context);
+      await plugin.register(registration.forPlugin(), context);
 
       let router: Router | undefined;
       if (plugin.registerRoutes) {
@@ -77,6 +103,7 @@ export async function bootstrapPlugins(app: Express, options: BootstrapPluginsOp
       console.log(`[PLUGIN BOOTSTRAP] Registered plugin ${plugin.name}@${plugin.version}`);
     } catch (error) {
       registration.discard();
+      refused.push(plugin);
       console.error(
         `[PLUGIN BOOTSTRAP] Failed to register plugin "${plugin.name}"; none of its sites, rulesets, policies or routes were kept:`,
         error
@@ -84,7 +111,25 @@ export async function bootstrapPlugins(app: Express, options: BootstrapPluginsOp
     }
   }
 
-  return { registry, plugins: loaded };
+  return { registry, plugins: loaded, refused };
+}
+
+/**
+ * Why the durable scrape queue must be HELD rather than restored after this bootstrap, or undefined
+ * when it may be restored. A restored row whose store has no ruleset fails EXTRACTION_UNAVAILABLE,
+ * which is terminal, and is deleted from disk; so the queue is restored only into a registry that
+ * came up whole: no plugin refused, and at least one store registered.
+ */
+export function durableQueueHold({ registry, refused }: BootstrapPluginsResult): string | undefined {
+  if (refused.length > 0) return `plugin(s) refused at startup: ${refused.map(plugin => plugin.name).join(', ')}`;
+  if (registry.allStores().length === 0) return 'no plugin registered a store';
+  return undefined;
+}
+
+/** The `plugins` block on /health/detailed for a bootstrap result; both lists empty before it has run. */
+export function pluginsView(result: Pick<BootstrapPluginsResult, 'plugins' | 'refused'> | undefined): PluginsView {
+  const ref = ({ name, version }: ScraperPlugin): PluginRef => ({ name, version });
+  return { loaded: (result?.plugins ?? []).map(ref), refused: (result?.refused ?? []).map(ref) };
 }
 
 /**
