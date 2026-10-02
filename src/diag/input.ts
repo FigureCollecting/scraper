@@ -8,19 +8,24 @@
  * The engine registry is INJECTED (DiagInputLookups), so this file names no store and no host.
  *
  * `origin` is the SSRF-sensitive field: the engine runs inside the cluster, so a store-less
- * robots-snapshot may only name a bare public DNS hostname over https: a host under an ICANN
- * top-level domain (the Public Suffix List's ICANN section, through tldts), not a public suffix
- * itself, and not a reserved special-use name. That refuses the cluster's short <svc>.<ns> form and
- * home-network names (router.lan, nas.home).
+ * robots-snapshot may only name a bare DNS hostname over https: a host under an ICANN top-level
+ * domain (the Public Suffix List's ICANN section, through tldts), not a public suffix itself, and
+ * not a reserved special-use name. That refuses every name outside the ICANN TLDs: most cluster
+ * <svc>.<ns> names (scraper.fc, kubernetes.default) and home-network names under private-use
+ * suffixes (router.lan, nas.home).
  *
- * This is a check on the NAME only. It cannot see where a public name points (127.0.0.1.nip.io,
- * localtest.me), nor a cluster namespace that is also an ICANN TLD (<svc>.data resolves through the
- * pod's ClusterFirst search list). So the dispatch path (S2) must resolve the name itself, as the
- * fully qualified name with a trailing dot so no search list applies; refuse a loopback, private,
- * link-local, CGNAT, unique-local, multicast or unspecified address; and connect to the address it
- * checked.
+ * This is a check on the NAME only. A name under an ICANN TLD passes wherever it points: a cluster
+ * namespace that is also an ICANN TLD (<svc>.data resolves through the pod's ClusterFirst search
+ * list), a home router under a delegated TLD (fritz.box), a tailnet name (*.ts.net), and the
+ * wildcard-DNS names (127.0.0.1.nip.io, 169.254.169.254.sslip.io, localtest.me). So the dispatch
+ * path (S2) must resolve the name itself, as the fully qualified name with a trailing dot so no
+ * search list applies; refuse a loopback, private, link-local, CGNAT, unique-local, multicast or
+ * unspecified address; connect to the address it checked, on a lane that does not resolve the name
+ * again (impit, the browser and the residential SOCKS5 proxy each resolve it themselves); and
+ * follow no redirect to a host it has not checked the same way.
  */
 import { isIP } from 'node:net';
+import { domainToASCII } from 'node:url';
 import { parse as parseDomain } from 'tldts';
 import { Probe, type RunProbeRequest } from '../gen/fc/diag/v1/diag_pb.js';
 import { sanitizeForLog } from '../utils/security.js';
@@ -103,12 +108,17 @@ function checkOrigin(raw: string, lookups: DiagInputLookups): { host: string } |
   }
   if (url.protocol !== 'https:') return refuse('origin', `${quote(raw)} must use https`);
   const host = url.hostname;
+  if (host.startsWith('[') || isIP(host) !== 0) return refuse('origin', `${quote(host)} is an IP literal`);
   const canonical = `https://${host}`;
   const given = raw.toLowerCase();
   if (given !== canonical && given !== `${canonical}/`) {
+    // Only the host's spelling differs (bücher, full-width letters, %-escapes): name the one to give.
+    const spelled = /^https:\/\/([^/?#]+)\/?$/.exec(given);
+    if (spelled !== null && domainToASCII(spelled[1]) === host) {
+      return refuse('origin', `${quote(raw)} must name the host in plain ASCII (xn-- punycode for a non-ASCII name): ${canonical}`);
+    }
     return refuse('origin', `${quote(raw)} must be exactly https://<host>: no port, path, query, fragment or userinfo`);
   }
-  if (host.startsWith('[') || isIP(host) !== 0) return refuse('origin', `${quote(host)} is an IP literal`);
   const labels = host.split('.');
   if (labels.length < 2) return refuse('origin', `${quote(host)} is a single-label name`);
   if (!isDnsHostname(host)) return refuse('origin', `${quote(host)} is not a DNS hostname`);

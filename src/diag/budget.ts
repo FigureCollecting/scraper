@@ -9,8 +9,9 @@
  *
  * A host is booked under ONE spelling: case folded, one leading www. and one trailing dot removed,
  * and then it must be a bare ASCII DNS hostname (hostname.ts). Anything else (a port, a space, a
- * URL, a non-ASCII spelling instead of its xn-- form) throws, so no host can be charged under a
- * second spelling with a cap of its own.
+ * URL, a non-ASCII spelling instead of its xn-- form, or an IPv4 address in any of its spellings:
+ * 127.0.0.1, 127.1, 2130706433, 0x7f.0.0.1) throws, so no host can be charged under a second
+ * spelling with a cap of its own.
  *
  * CHARGED BEFORE DISPATCH, NEVER REFUNDED. `charge()` writes one row and returns true before the
  * caller sends the request; a request that then fails still counts. A crash between the charge and
