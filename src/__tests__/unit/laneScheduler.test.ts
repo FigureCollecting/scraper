@@ -857,7 +857,7 @@ describe('parseLaneWeights', () => {
   // Every refused entry names the guard that refused it, so each row proves the guard in its title.
   const NO_EQ = 'it has no "="';
   const NOT_PLAIN = 'the text before "=" is not a plain host name';
-  const NOT_READ = "so it is not read as any host's entry and changes no host's dispatch";
+  const NOT_READ = "so it is not read as any host's entry; the other entries are read as if it were not there";
   const EXPECTED = 'expected host=class:weight,...';
   const KEEPS_TODAY = "that host keeps today's dispatch";
   const REPLACES = 'names a host twice; this entry replaces the earlier one';
@@ -868,6 +868,9 @@ describe('parseLaneWeights', () => {
   it.each([
     ['no "="', 'myfigurecollection.net:new:40', NO_EQ, EXPECTED],
     ['no "=", only the name of the good host itself', 'good.example', NO_EQ, EXPECTED],
+    ['no "=", a host name that starts with a class name', 'news.example', NO_EQ, EXPECTED],
+    ['no "=", a host with ":" typed for "=" and more pairs after it', 'myfigurecollection.net:new:40,company:40', NO_EQ, EXPECTED],
+    ['no "=", only a comma', ',', NO_EQ, EXPECTED],
     ['an empty host', '=new:40', NOT_PLAIN, 'not a plain host name'],
     ['a url, not a host', 'https://myfigurecollection.net=new:40', NOT_PLAIN, 'not a plain host name'],
     ['a host with a path', 'myfigurecollection.net/x=new:40', NOT_PLAIN, 'not a plain host name'],
@@ -878,7 +881,8 @@ describe('parseLaneWeights', () => {
     ['a trailing dot', 'a.example.=new:1', NOT_PLAIN, 'not a plain host name'],
     ['a host label over 63 characters', `${'a'.repeat(64)}.example=new:40`, NOT_PLAIN, 'not a plain host name'],
     ['an underscore in the host', 'a_b.example=new:40', NOT_PLAIN, 'not a plain host name'],
-  ])('drops an entry with %s, with a WARN that it is no host\'s entry and so changes none; the good hosts still apply', (_name, bad, guard, reason) => {
+    ['a dotted capital I in the host', 'MYF\u0130GURECOLLECT\u0130ON.NET=new:1', NOT_PLAIN, 'not a plain host name'],
+  ])('drops an entry with %s, with a WARN that it is no host\'s entry; the good hosts still apply', (_name, bad, guard, reason) => {
     const hosts = parseLaneWeights(`${bad};good.example=new:1,gap:1`);
     expect([...hosts.keys()]).toEqual(['good.example']);
     expect(hosts.get('good.example')).toEqual(W(1, 0, 1, 0));
@@ -988,7 +992,7 @@ describe('parseLaneWeights', () => {
     expect(warn.mock.calls[1][1]).toEqual({ entry: typo2, host: MFC });
   });
 
-  it('an entry that names no host cannot unlane one: a good entry for the host it meant still applies', () => {
+  it('an entry with no "=" or no plain host name before "=" cannot unlane the host it meant: a good entry for that host still applies', () => {
     const hosts = parseLaneWeights(`${MFC}:new:40;https://${MFC}=new:1;${GOOD}`);
     expect(hosts.get(MFC)).toEqual(DEFAULT);
     expect(warn).toHaveBeenCalledTimes(2);
@@ -1006,6 +1010,79 @@ describe('parseLaneWeights', () => {
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn.mock.calls[0][0]).toContain(`${NO_EQ}, ${NOT_READ}`);
     expect(warn.mock.calls[0][1]).toEqual({ entry: bare, reason: EXPECTED });
+  });
+
+  it('a dropped entry is named in its WARN without the spaces around it', () => {
+    parseLaneWeights('  good.example  ;  a.example.=new:1  ;good.example=gap:1');
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn.mock.calls[0][0]).toContain(NO_EQ);
+    expect(warn.mock.calls[0][1]).toEqual({ entry: 'good.example', reason: EXPECTED });
+    expect(warn.mock.calls[1][0]).toContain(NOT_PLAIN);
+    expect(warn.mock.calls[1][1]).toEqual({ entry: 'a.example.=new:1', reason: 'not a plain host name' });
+  });
+
+  it('an identical repeat of a host\'s entry gets the replace WARN too', () => {
+    expect(parseLaneWeights(`${GOOD};${GOOD}`).get(MFC)).toEqual(DEFAULT);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain(REPLACES);
+    expect(warn.mock.calls[0][1]).toEqual({ host: MFC });
+  });
+
+  // A ';' typed for ',' cuts a host's class list in two. The piece with no '=' starts with a class
+  // name, and which host it belongs to cannot be told, so the whole setting is refused.
+  const REFUSED_ALL = 'refused as a whole';
+  const NO_HOST_LANED = 'no host is laned';
+  const PIECE = 'starts with a class name but names no host';
+
+  it.each([
+    ['a ";" for the "," before gap', `${MFC}=new:40,company:40;gap:20,other:10`, 'gap:20,other:10'],
+    ['a ";" for the "," before other', `${MFC}=new:40,company:40,gap:20;other:10`, 'other:10'],
+    ['a ";" for the "," before company', `${MFC}=new:40;company:40,gap:20,other:10`, 'company:40,gap:20,other:10'],
+    ['the cut-off piece first', `gap:20,other:10;${MFC}=new:40,company:40`, 'gap:20,other:10'],
+    ['the cut-off piece, then a good entry for the same host', `${MFC}=new:40,company:40;gap:20,other:10;${GOOD}`, 'gap:20,other:10'],
+    ['a piece with only weight 0 (the split is unchanged, refused all the same)', `${MFC}=new:40,company:40,gap:20;other:0`, 'other:0'],
+    ['a piece with a bad weight', `${MFC}=new:40,company:40;gap:2O,other:10`, 'gap:2O,other:10'],
+    ['a piece that is a class name alone', `${MFC}=new:40,company:40,gap:20;other`, 'other'],
+    ['a piece in capitals, with spaces around it and its colon', `${MFC}=new:40,company:40;  Gap : 20 , OTHER:10  `, 'Gap : 20 , OTHER:10'],
+    ['a piece that starts with empty pairs', `${MFC}=new:40,company:40; , ,gap:20,other:10`, ', ,gap:20,other:10'],
+  ])('a setting with %s is refused as a whole: no host is laned, with one WARN naming the piece', (_name, raw, piece) => {
+    const hosts = parseLaneWeights(`good.example=gap:1;${raw};later.example=new:1`);
+    expect(hosts.size).toBe(0);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain('SCRAPE_LANE_WEIGHTS');
+    expect(warn.mock.calls[0][0]).toContain(REFUSED_ALL);
+    expect(warn.mock.calls[0][0]).toContain(NO_HOST_LANED);
+    expect(warn.mock.calls[0][1]).toEqual({ entry: piece, reason: PIECE });
+  });
+
+  it('a ";" typed for any one or more of the "," in a well-formed class list refuses the whole setting', () => {
+    const lists = ['new:40,company:40,gap:20,other:10', 'new:40,company:40,gap:20,other:0', 'gap:1, NEW : 3 ,,other:0'];
+    let cases = 0;
+    for (const list of lists) {
+      const commas = [...list].flatMap((ch, i) => (ch === ',' ? [i] : []));
+      for (let mask = 1; mask < 1 << commas.length; mask++) {
+        const chars = [...list];
+        commas.forEach((at, bit) => {
+          if (mask & (1 << bit)) chars[at] = ';';
+        });
+        const raw = `good.example=gap:1;${MFC}=${chars.join('')}`;
+        expect({ raw, laned: [...parseLaneWeights(raw).keys()] }).toEqual({ raw, laned: [] });
+        cases++;
+      }
+    }
+    expect(cases).toBe(7 + 7 + 7);
+  });
+
+  it.each([
+    ['a ";" inserted inside a weight', `${MFC}=new:4;0,company:40,gap:20,other:10`, W(4, 0, 0, 0), '0,company:40,gap:20,other:10'],
+    ['a cut-off piece that starts with a misspelt class', `${MFC}=new:40,company:40;gpa:20,other:10`, W(40, 40, 0, 0), 'gpa:20,other:10'],
+  ])('not caught: %s leaves the host laned by the part before it, with the no-"=" WARN', (_name, raw, laned, piece) => {
+    const hosts = parseLaneWeights(raw);
+    expect([...hosts.keys()]).toEqual([MFC]);
+    expect(hosts.get(MFC)).toEqual(laned);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain(`${NO_EQ}, ${NOT_READ}`);
+    expect(warn.mock.calls[0][1]).toEqual({ entry: piece, reason: EXPECTED });
   });
 
   it('the parsed weights are frozen', () => {
@@ -1078,6 +1155,12 @@ describe('resolveLaneConfig / laneWeightsForHost: fail-safe', () => {
     const cfg = resolveLaneConfig({ SCRAPE_LANE_MODE: 'on', SCRAPE_LANE_WEIGHTS: weights });
     expect(warn.mock.calls[0][0]).toContain("that host keeps today's dispatch");
     expect(laneWeightsForHost(cfg, MFC)).toBeUndefined();
+  });
+
+  it('a ";" typed for "," inside the host\'s list leaves it unlaned in mode on, never laned by part of the list', () => {
+    const cfg = resolveLaneConfig({ SCRAPE_LANE_MODE: 'on', SCRAPE_LANE_WEIGHTS: `${MFC}=new:40,company:40;gap:20,other:10` });
+    expect(cfg.hosts.size).toBe(0);
+    expect(laneWeightsForHost(cfg, `www.${MFC}`)).toBeUndefined();
   });
 
   it('every weight set the parser accepts builds a scheduler that never deadlocks', () => {
