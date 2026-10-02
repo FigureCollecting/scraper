@@ -820,6 +820,33 @@ export class ScrapeQueue {
   }
 
   /**
+   * STARTUP HOLD — what src/index.ts does INSTEAD of restoreFromStore() when the engine came up without
+   * every plugin (pluginBootstrap's settleDurableQueue: a plugin was refused or failed to load, no store
+   * registered, or the bootstrap threw). Every row restored into that registry whose store it cannot
+   * extract would fail EXTRACTION_UNAVAILABLE, which is terminal, and be deleted; and merely skipping
+   * the restore is not enough, because the dispatch scan's lease reaper and parked-row page-in, and a
+   * re-enqueue's claim of a row, reach the file the moment any new item sets the queue running. So the
+   * durable file is closed without being restored and this process queues in memory (reason `held`,
+   * `path` still naming the file); the next start with a whole registry restores the rows left in it.
+   * The file's open host cooldowns stay in it too, unapplied in this process, and a cooldown opened
+   * while held lives in memory only. index.ts holds once the plugins have loaded, so anything enqueued
+   * before that (a plugin enqueuing from inside register()) has already run against the file. A no-op
+   * on a store that is not durable: there is nothing to hold, and its own reason says more.
+   */
+  holdQueueStore(why: string): void {
+    if (!this.store.durable) return;
+    const { path } = this.store;
+    const counts = this.store.counts();
+    this.closeQueueStore();
+    this.setQueueStore(createMemoryQueueStore('held', path));
+    console.error(
+      `[SCRAPE QUEUE] durable queue HELD, not restored (${sanitizeForLog(why)}): ` +
+        `${counts.pending} pending, ${counts.leased} leased, ${counts.parked} parked left in ` +
+        `${sanitizeForLog(String(path))} for the next start; its open host cooldowns are not applied in this process`
+    ); // lgtm[js/log-injection]
+  }
+
+  /**
    * SIGTERM: hand every leased row back as pending. A PLANNED rollout then loses nothing — the next
    * process finds the in-flight items ready and re-drives them immediately, instead of waiting out a
    * lease nobody holds. Returns how many were released. Safe on the fallback (0).
