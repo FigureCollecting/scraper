@@ -49,7 +49,7 @@
     "impit": "0.14.4",
     "minio": "^8.0.7",
     "patch-package": "^8.0.1",
-    "puppeteer": "^25.9.0",
+    "puppeteer": "^25.12.0",
     "tldts": "^7.4.16",
     "tough-cookie": "6.0.2"
   },
