@@ -1055,6 +1055,12 @@ describe('parseLaneWeights', () => {
     expect(warn.mock.calls[0][1]).toEqual({ entry: piece, reason: PIECE });
   });
 
+  it('a cut-off piece refuses the setting when it is the first entry, with no host read before it', () => {
+    expect(parseLaneWeights(`gap:20,other:10;${MFC}=new:40,company:40`).size).toBe(0);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][1]).toEqual({ entry: 'gap:20,other:10', reason: PIECE });
+  });
+
   // Why this holds for any well-formed list, not only these three: 'host=' opens the list, so every
   // piece a ';' cuts off comes after it and starts with the list's next pairs. In a well-formed list
   // each non-empty pair names a known class, so the piece starts with a class name; a piece made only
