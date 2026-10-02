@@ -199,3 +199,97 @@ describe('bootstrapPlugins PLUGIN_DIR environment override', () => {
     expect(plugins.map(p => p.name)).toContain('mock-scraper-ruleset');
   });
 });
+
+/**
+ * The hands-off surface across the plugin seam (contract 0.17.0). Every new registry method is
+ * optional, so an older plugin registers nothing and still loads, and a newer plugin's registrations
+ * reach the same registry the engine reads (/health/detailed's handsOff, the diag probes).
+ */
+describe('bootstrapPlugins — hands-off registrations', () => {
+  const HANDS_OFF_SUMMARY = {
+    tier: 'FULL_BAR' as const,
+    namedTokens: ['examplebot'],
+    fullBarTokens: ['examplebot'],
+    routeBarTokens: [],
+    crawlDelayTokens: [],
+    contentSignals: [],
+  };
+
+  it('loads an older plugin (the fixture package predates the surface) with no policy and no classifier', async () => {
+    const app = buildApp();
+
+    const { registry, plugins } = await bootstrapPlugins(app, { nodeModulesDir: FIXTURES_DIR });
+
+    expect(plugins.map(p => p.name)).toContain('mock-scraper-ruleset');
+    expect(registry.getSiteConfigForUrl('https://mock.example.test/item/1')?.siteId).toBe('mock');
+    expect(registry.handsOffView()).toEqual([]);
+    expect(registry.robotsClassifier()).toBeUndefined();
+    expect(registry.requiredCookiesFor('mock.example.test')).toBeUndefined();
+  });
+
+  it("delivers a newer plugin's policy, classifier and required cookies to the engine registry", async () => {
+    const app = buildApp();
+    const plugin = buildSpyPlugin({
+      name: 'hands-off-plugin',
+      register: async (registry: ExtractionRegistry) => {
+        registry.registerSite({
+          siteId: 'guarded',
+          name: 'Guarded',
+          domains: ['guarded.example.test'],
+          rateLimit: { domain: 'guarded.example.test', baseDelayMs: 1000, minDelayMs: 500, maxDelayMs: 5000, backoffMultiplier: 1.5, recoveryDivisor: 1.5, successThreshold: 3 },
+          requiresBrowser: false,
+          allowedCookies: ['cf_clearance', 'session'],
+          requiredCookies: ['cf_clearance', 'session'],
+        });
+        registry.registerHandsOffPolicy?.({
+          siteId: 'guarded',
+          hosts: ['guarded.example.test'],
+          handsOff: true,
+          tier: 'FULL_BAR',
+          summary: HANDS_OFF_SUMMARY,
+          pins: [],
+          routeSamples: [],
+          policyVersion: 'policy-test',
+        });
+        registry.registerRobotsClassifier?.({ tokenListDate: '2026-09-29', classify: () => HANDS_OFF_SUMMARY });
+      },
+    });
+
+    const { registry, plugins } = await bootstrapPlugins(app, { discover: async () => [plugin] });
+
+    expect(plugins.map(p => p.name)).toEqual(['hands-off-plugin']);
+    expect(registry.handsOffPolicyFor('https://www.guarded.example.test/item/1')?.handsOff).toBe(true);
+    expect(registry.robotsClassifier()?.tokenListDate).toBe('2026-09-29');
+    expect(registry.requiredCookiesFor('guarded.example.test')).toEqual(['cf_clearance', 'session']);
+  });
+
+  it('skips a plugin whose policy claims a host another plugin already holds, keeping the first policy', async () => {
+    const app = buildApp();
+    const claim = (name: string, siteId: string, handsOff: boolean) =>
+      buildSpyPlugin({
+        name,
+        register: async (registry: ExtractionRegistry) => {
+          registry.registerHandsOffPolicy?.({
+            siteId,
+            hosts: ['contested.example.test'],
+            handsOff,
+            tier: 'FULL_BAR',
+            summary: HANDS_OFF_SUMMARY,
+            pins: [],
+            routeSamples: [],
+            policyVersion: 'policy-test',
+          });
+        },
+      });
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    const { registry, plugins } = await bootstrapPlugins(app, {
+      discover: async () => [claim('first', 'first-site', true), claim('second', 'second-site', false)],
+    });
+
+    expect(plugins.map(p => p.name)).toEqual(['first']);
+    expect(registry.handsOffPolicyFor('https://contested.example.test/')?.siteId).toBe('first-site');
+    expect(registry.handsOffPolicyFor('https://contested.example.test/')?.handsOff).toBe(true);
+    expect(String(errorSpy.mock.calls[0]?.[1])).toContain('"contested.example.test"');
+  });
+});

@@ -8,6 +8,7 @@ import express from 'express';
 import request from 'supertest';
 import { createHealthRoutes, type HealthDeps } from '../../routes/health';
 import { CfCookieStore } from '../../services/cookieJar';
+import { createExtractionRegistry } from '../../services/extractionRegistry';
 import type { ImageCaptureStats } from '../../services/images/imageCaptureHook';
 import type { SinkStats } from '../../services/objectStoreCaptureSink';
 
@@ -41,6 +42,7 @@ const build = (over: Partial<HealthDeps> = {}) => {
       durable: false, reason: 'disabled' as const, path: null, quarantinedPath: null,
       lostAtStartup: 0, restoredAt: null, pending: 0, leased: 0, parked: 0,
     }),
+    listHandsOff: () => [],
     ...over,
   }));
   return app;
@@ -721,5 +723,72 @@ describe('createHealthRoutes — queueStore', () => {
     const res = await request(app).get('/health/detailed');
     expect(res.status).toBe(500);
     expect(res.body.queueStore).toEqual(DURABLE);
+  });
+});
+
+/**
+ * The hands-off list (plugin contract 0.17.0): which hosts the rulesets plugin registered as off
+ * limits to Claude and its tools, read from our own system with zero upstream requests. Driven by a
+ * REAL registry so the block is exactly what the registry reports; the robots summary, pins and route
+ * samples stay out of it.
+ */
+describe('createHealthRoutes — handsOff', () => {
+  const registryWithPolicies = () => {
+    const registry = createExtractionRegistry();
+    registry.registerHandsOffPolicy({
+      siteId: 'alpha',
+      hosts: ['alpha.example.test'],
+      handsOff: true,
+      tier: 'FULL_BAR',
+      summary: { tier: 'FULL_BAR', namedTokens: ['examplebot'], fullBarTokens: ['examplebot'], routeBarTokens: [], crawlDelayTokens: [], contentSignals: ['ai-train=no'] },
+      pins: [{ url: 'https://alpha.example.test/robots.txt', sha256: 'c'.repeat(64), fetchedAt: '2026-09-29T00:00:00.000Z' }],
+      routeSamples: ['https://alpha.example.test/item/1'],
+      policyVersion: 'policy-2026-09-29',
+    });
+    registry.registerHandsOffPolicy({
+      hosts: ['denied.example.test'],
+      handsOff: true,
+      denied: true,
+      tier: 'NOT_NAMED',
+      summary: { tier: 'NOT_NAMED', namedTokens: [], fullBarTokens: [], routeBarTokens: [], crawlDelayTokens: [], contentSignals: [] },
+      pins: [],
+      routeSamples: [],
+      policyVersion: 'policy-2026-09-29',
+    });
+    return registry;
+  };
+  const EXPECTED = [
+    { siteId: 'alpha', hosts: ['alpha.example.test'], tier: 'FULL_BAR', handsOff: true, denied: false, policyVersion: 'policy-2026-09-29' },
+    { siteId: null, hosts: ['denied.example.test'], tier: 'NOT_NAMED', handsOff: true, denied: true, policyVersion: 'policy-2026-09-29' },
+  ];
+
+  it('GET /health/detailed carries handsOff [{siteId, hosts, tier, handsOff, denied, policyVersion}] and no robots detail', async () => {
+    const registry = registryWithPolicies();
+    const res = await request(build({ listHandsOff: () => registry.handsOffView() })).get('/health/detailed');
+
+    expect(res.status).toBe(200);
+    expect(res.body.handsOff).toEqual(EXPECTED);
+    expect(JSON.stringify(res.body)).not.toContain('c'.repeat(64));
+    expect(JSON.stringify(res.body)).not.toContain('ai-train=no');
+  });
+
+  it('reports handsOff: [] when no plugin registered a policy (an older plugin, or none loaded yet)', async () => {
+    const res = await request(build({ listHandsOff: () => createExtractionRegistry().handsOffView() })).get('/health/detailed');
+
+    expect(res.status).toBe(200);
+    expect(res.body.handsOff).toEqual([]);
+  });
+
+  it('keeps handsOff on the degraded (500) response (the list matters most when the pod is sick)', async () => {
+    const registry = registryWithPolicies();
+    const app = build({
+      getBrowserPoolHealth: async () => { throw new Error('pool down'); },
+      listHandsOff: () => registry.handsOffView(),
+    });
+    const res = await request(app).get('/health/detailed');
+
+    expect(res.status).toBe(500);
+    expect(res.body.status).toBe('degraded');
+    expect(res.body.handsOff).toEqual(EXPECTED);
   });
 });
