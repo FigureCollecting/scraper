@@ -7,6 +7,6 @@ modules:
 lint:
   use:
     - STANDARD
-breaking:
-  use:
-    - FILE
+# No `breaking:` section and no `buf breaking` step: the server and its only client (the diag CLI)
+# ship in the same image, and the diag CronJobs run the scraper's own image digest (plan unit I1),
+# so no two versions talk. Field names and numbers are pinned by src/__tests__/unit/diagProto.test.ts.

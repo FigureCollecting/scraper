@@ -5,7 +5,12 @@
  * is the safety property. Two caps bound every call:
  *   - PER CALL: min(requested, the probe's hard maximum) — robots-snapshot 1, item-status 2 — and
  *     never more than the host has left;
- *   - PER HOST: DIAG_HOST_DAILY_CAP requests (default 6) in any rolling 24 h.
+ *   - PER HOST: DIAG_HOST_DAILY_CAP requests (default 6, at most 24) in any rolling 24 h.
+ *
+ * A host is booked under ONE spelling: case folded, one leading www. and one trailing dot removed,
+ * and then it must be a bare ASCII DNS hostname (hostname.ts). Anything else (a port, a space, a
+ * URL, a non-ASCII spelling instead of its xn-- form) throws, so no host can be charged under a
+ * second spelling with a cap of its own.
  *
  * CHARGED BEFORE DISPATCH, NEVER REFUNDED. `charge()` writes one row and returns true before the
  * caller sends the request; a request that then fails still counts. A crash between the charge and
@@ -18,6 +23,13 @@
  *
  * Open this AFTER createQueueStore: a queue file found unusable at boot is moved aside, and a handle
  * opened before that would point at the old file.
+ *
+ * Two ways the window can lose charges (accepted: both need a fault, and the per-call cap and the
+ * per-host cap still bound every later call):
+ *   - a queue file moved aside at boot takes its diag_budget rows with it (salvage copies only
+ *     queue_items), so the new file starts with a full budget;
+ *   - pruning is on the clock: a charge made while the clock ran ahead deletes rows that would have
+ *     still counted once the clock is put right.
  */
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import * as path from 'path';
@@ -25,11 +37,14 @@ import { normalizeHost } from '../services/challengeCooldown.js';
 import { QUEUE_DB_FILE, QUEUE_DIR_ENV, resolveQueueDir } from '../services/queueStore.js';
 import { sanitizeForLog } from '../utils/security.js';
 import { Probe } from '../gen/fc/diag/v1/diag_pb.js';
+import { isDnsHostname } from './hostname.js';
 
 /** Env naming the per-host rolling 24 h request cap. */
 export const DIAG_HOST_DAILY_CAP_ENV = 'DIAG_HOST_DAILY_CAP';
 /** The per-host cap when DIAG_HOST_DAILY_CAP is unset. */
 export const DEFAULT_DIAG_HOST_DAILY_CAP = 6;
+/** The highest per-host cap anyone may set: one request an hour on average. */
+export const DIAG_HOST_DAILY_CAP_MAX = 24;
 /** The rolling window: a charge stops counting exactly this long after it was made. */
 export const DIAG_BUDGET_WINDOW_MS = 24 * 60 * 60 * 1000;
 /** How long a charge waits for another connection's write lock before it throws. */
@@ -61,7 +76,8 @@ export function probeMaxRequests(probe: Probe): number {
 /**
  * DIAG_HOST_DAILY_CAP as a number. Unset = the default. Anything but a plain non-negative integer
  * (digits only, no sign, no leading zero, no whitespace) is fatal and names the variable: a cap
- * nobody can read must stop the boot, never fall back to a guess.
+ * nobody can read must stop the boot, never fall back to a guess. So is a cap above
+ * DIAG_HOST_DAILY_CAP_MAX.
  */
 export function resolveHostDailyCap(env: NodeJS.ProcessEnv = process.env): number {
   const raw = env[DIAG_HOST_DAILY_CAP_ENV];
@@ -69,6 +85,9 @@ export function resolveHostDailyCap(env: NodeJS.ProcessEnv = process.env): numbe
   const n = Number(raw);
   if (!/^(0|[1-9][0-9]*)$/.test(raw) || !Number.isSafeInteger(n)) {
     throw new Error(`${DIAG_HOST_DAILY_CAP_ENV} must be a non-negative integer, got '${sanitizeForLog(raw)}'`);
+  }
+  if (n > DIAG_HOST_DAILY_CAP_MAX) {
+    throw new Error(`${DIAG_HOST_DAILY_CAP_ENV} must be at most ${DIAG_HOST_DAILY_CAP_MAX}, got '${raw}'`);
   }
   return n;
 }
@@ -123,9 +142,12 @@ export interface OpenDiagBudgetOptions {
   now?: () => number;
 }
 
+/** The one spelling a host is booked under (see the header). Throws for anything else. */
 function hostKey(host: string): string {
-  const key = normalizeHost(host);
-  if (key === '') throw new RangeError('diag budget: host must not be empty');
+  const key = normalizeHost(host).replace(/\.$/, '');
+  if (!isDnsHostname(key)) {
+    throw new RangeError(`diag budget: host '${sanitizeForLog(host)}' is not a bare DNS hostname`);
+  }
   return key;
 }
 
@@ -137,6 +159,9 @@ export function openDiagBudget(opts: OpenDiagBudgetOptions = {}): DiagBudget {
   const hostDailyCap = opts.hostDailyCap ?? resolveHostDailyCap();
   if (!Number.isSafeInteger(hostDailyCap) || hostDailyCap < 0) {
     throw new RangeError(`diag budget: hostDailyCap must be a non-negative integer, got ${String(hostDailyCap)}`);
+  }
+  if (hostDailyCap > DIAG_HOST_DAILY_CAP_MAX) {
+    throw new RangeError(`diag budget: hostDailyCap must be at most ${DIAG_HOST_DAILY_CAP_MAX}, got ${hostDailyCap}`);
   }
   const now = opts.now ?? Date.now;
   const dir = opts.dir ?? resolveQueueDir();

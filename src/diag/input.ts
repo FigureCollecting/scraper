@@ -8,19 +8,32 @@
  * The engine registry is INJECTED (DiagInputLookups), so this file names no store and no host.
  *
  * `origin` is the SSRF-sensitive field: the engine runs inside the cluster, so a store-less
- * robots-snapshot may only name a bare public DNS hostname over https. This is a check on the NAME;
- * a public name that resolves to a private address is a matter for the dispatch path.
+ * robots-snapshot may only name a bare public DNS hostname over https: a host under an ICANN
+ * top-level domain (the Public Suffix List's ICANN section, through tldts), not a public suffix
+ * itself, and not a reserved special-use name. That refuses the cluster's short <svc>.<ns> form and
+ * home-network names (router.lan, nas.home).
+ *
+ * This is a check on the NAME only. It cannot see where a public name points (127.0.0.1.nip.io,
+ * localtest.me), nor a cluster namespace that is also an ICANN TLD (<svc>.data resolves through the
+ * pod's ClusterFirst search list). So the dispatch path (S2) must resolve the name itself, as the
+ * fully qualified name with a trailing dot so no search list applies; refuse a loopback, private,
+ * link-local, CGNAT, unique-local, multicast or unspecified address; and connect to the address it
+ * checked.
  */
 import { isIP } from 'node:net';
+import { parse as parseDomain } from 'tldts';
 import { Probe, type RunProbeRequest } from '../gen/fc/diag/v1/diag_pb.js';
 import { sanitizeForLog } from '../utils/security.js';
 import { probeMaxRequests } from './budget.js';
+import { isDnsHostname } from './hostname.js';
 
 /** What the validator needs to know about a registered store. */
 export interface DiagStoreInfo {
   readonly siteId: string;
   /** The store's declared byId id pattern, matched against the WHOLE id. Absent = digits only. */
   readonly idPattern?: RegExp;
+  /** True when a registered policy denies this store's hosts: the store is refused in every mode. */
+  readonly denied?: boolean;
 }
 
 /** The registry lookups the validator needs, adapted from the engine registry by the caller. */
@@ -56,7 +69,6 @@ const MAX_ID_LENGTH = 64;
 /** run_id lands in an object key and a log line: a plain token, no separators. */
 const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const DIGITS_ONLY = /^[0-9]+$/;
-const DNS_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 /**
  * Names that are never public DNS: loopback, mDNS, cluster service names, private-use and the
  * RFC 6761 / 7686 special-use names. `cluster.local` is covered by `local`.
@@ -99,11 +111,16 @@ function checkOrigin(raw: string, lookups: DiagInputLookups): { host: string } |
   if (host.startsWith('[') || isIP(host) !== 0) return refuse('origin', `${quote(host)} is an IP literal`);
   const labels = host.split('.');
   if (labels.length < 2) return refuse('origin', `${quote(host)} is a single-label name`);
-  if (host.length > 253 || !labels.every((l) => DNS_LABEL.test(l))) {
-    return refuse('origin', `${quote(host)} is not a DNS hostname`);
-  }
+  if (!isDnsHostname(host)) return refuse('origin', `${quote(host)} is not a DNS hostname`);
   const reserved = NON_PUBLIC_SUFFIXES.find((s) => host.endsWith(`.${s}`));
   if (reserved !== undefined) return refuse('origin', `${quote(host)} is not a public name (.${reserved})`);
+  // Privately run suffixes (myshopify.com, github.io) are not suffixes here: a shop under one is a
+  // host under .com or .io, which is what decides whether the name is public.
+  const domain = parseDomain(host, { allowPrivateDomains: false });
+  if (domain.isIcann !== true) {
+    return refuse('origin', `${quote(host)} is not under an ICANN top-level domain (.${labels[labels.length - 1]})`);
+  }
+  if (domain.domain === null) return refuse('origin', `${quote(host)} is a public suffix, not a host`);
   const variants = hostVariants(host);
   if (variants.some((h) => lookups.isDeniedHost(h))) {
     return refuse('origin', `${quote(host)} is denied by a registered policy`);
@@ -115,6 +132,20 @@ function checkOrigin(raw: string, lookups: DiagInputLookups): { host: string } |
     }
   }
   return { host };
+}
+
+/**
+ * The registered store named `siteId`. A lookup that answers with another store, or a plain-object
+ * lookup answering a built-in property (`constructor`, `__proto__`), names no store.
+ */
+function lookupStore(
+  siteId: string,
+  lookups: DiagInputLookups
+): { store: DiagStoreInfo } | { refusal: DiagInputResult } {
+  const store = lookups.storeById(siteId);
+  if (store?.siteId !== siteId) return { refusal: refuse('store', `${quote(siteId)} is not a registered store`) };
+  if (store.denied === true) return { refusal: refuse('store', `${quote(siteId)} is denied by a registered policy`) };
+  return { store };
 }
 
 function checkIds(ids: readonly string[], store: DiagStoreInfo): DiagInputResult | undefined {
@@ -148,8 +179,9 @@ export function validateRunProbeInput(req: RunProbeRequest, lookups: DiagInputLo
     if (req.pair) return refuse('pair', 'pair belongs to item-status');
     if (req.store !== '' && req.origin !== '') return refuse('origin', 'give store or origin, not both');
     if (req.store !== '') {
-      if (lookups.storeById(req.store) === undefined) return refuse('store', `${quote(req.store)} is not a registered store`);
-      return { ok: true, input: { probe: Probe.ROBOTS_SNAPSHOT, mode: 'store', siteId: req.store, ...common } };
+      const found = lookupStore(req.store, lookups);
+      if ('refusal' in found) return found.refusal;
+      return { ok: true, input: { probe: Probe.ROBOTS_SNAPSHOT, mode: 'store', siteId: found.store.siteId, ...common } };
     }
     if (req.origin === '') return refuse('store', 'robots-snapshot needs store or origin');
     const origin = checkOrigin(req.origin, lookups);
@@ -159,10 +191,11 @@ export function validateRunProbeInput(req: RunProbeRequest, lookups: DiagInputLo
 
   if (req.origin !== '') return refuse('origin', 'origin belongs to store-less robots-snapshot');
   if (req.store === '') return refuse('store', 'item-status needs store');
-  const store = lookups.storeById(req.store);
-  if (store === undefined) return refuse('store', `${quote(req.store)} is not a registered store`);
+  const found = lookupStore(req.store, lookups);
+  if ('refusal' in found) return found.refusal;
+  const { store } = found;
   const idsRefusal = checkIds(req.ids, store);
   if (idsRefusal !== undefined) return idsRefusal;
   if (req.pair && req.ids.length !== 1) return refuse('pair', 'pair takes exactly one id, the control');
-  return { ok: true, input: { probe: Probe.ITEM_STATUS, siteId: req.store, ids: [...req.ids], pair: req.pair, ...common } };
+  return { ok: true, input: { probe: Probe.ITEM_STATUS, siteId: store.siteId, ids: [...req.ids], pair: req.pair, ...common } };
 }
