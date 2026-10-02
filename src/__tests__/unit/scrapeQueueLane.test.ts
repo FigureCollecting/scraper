@@ -149,14 +149,16 @@ describe('ScrapeQueue lane — enqueue takes an optional lane', () => {
     expect(diskLane(dir, 'a1')).toBe('new');
   });
 
-  it('an unlabelled enqueue writes lane NULL and its result carries no lane at all', () => {
+  it('an unlabelled enqueue writes lane NULL, warns about nothing, and its result carries no lane at all', () => {
     const dir = tmpDir();
     const q = wired(openStore(dir));
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
 
     const r = q.enqueue('a1', { url: urlFor('a1') });
 
     expect('lane' in r).toBe(false);
     expect(diskLane(dir, 'a1')).toBeNull();
+    expect(warn).not.toHaveBeenCalled();
   });
 
   it.each([['other'], ['bogus'], ['']])('queues a label outside the vocabulary (%p) as unlabelled, with a warning', (bad) => {
@@ -389,6 +391,25 @@ describe('ScrapeQueue lane — per-(host, lane) depth', () => {
     expect(depth(q)).toEqual({ ...Z, company: 1, other: 1 });
     expect(depth(q, HOST, 'parked')).toEqual(Z);
     expect(internals(q).pendingItems.get('a2')?.lane).toBe('company');
+  });
+
+  it('re-reads parked depth from the store only when a page-in actually moved rows', () => {
+    process.env.SCRAPE_QUEUE_MAX_RESIDENT = '10';
+    process.env.SCRAPE_QUEUE_MAX_RESIDENT_PER_HOST = '1';
+    const store = openStore(tmpDir());
+    const q = wired(store);
+    q.enqueue('a0', { url: urlFor('a0'), lane: 'new' });
+    q.enqueue('a1', { url: urlFor('a1'), lane: 'new' });
+    const reads = jest.spyOn(store, 'countByHostLane');
+
+    // The only parked row is on a host at its cap: nothing pages in, so nothing is re-read.
+    expect(q.refillWorkingSet(Date.now())).toBe(0);
+    expect(reads).not.toHaveBeenCalled();
+
+    q.cancel('a0');
+    expect(q.refillWorkingSet(Date.now())).toBe(1);
+    expect(reads).toHaveBeenCalledWith('parked');
+    expect(depth(q, HOST, 'parked')).toEqual(Z);
   });
 
   it('a priority upgrade does not count an item twice', () => {

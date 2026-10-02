@@ -66,7 +66,7 @@ describe('queueLane — LaneCounters', () => {
     c.adjust(undefined, 'new', 'resident', 1);
     c.note(undefined, 'new', 'relabeledLegacy');
 
-    expect(c.hosts()).toEqual([]);
+    expect(c.hosts()).toStrictEqual([]);
   });
 
   it('notes the two coalesce events against the class the row ends in', () => {
@@ -100,6 +100,8 @@ describe('queueLane — LaneCounters', () => {
     expect(h.other.parked).toBe(4);
     // A host that is no longer parked anywhere reads zero, not its stale figure.
     expect(c.forHost('gone').gap.parked).toBe(0);
+    // A row with no host (a url that would not parse) is not a host.
+    expect(c.hosts()).not.toContain(null);
   });
 
   it('hands out a copy, so a reader cannot move the counters', () => {
@@ -118,7 +120,7 @@ describe('queueLane — LaneCounters', () => {
     expect(c.hosts().sort()).toEqual(['a', 'b']);
 
     c.reset();
-    expect(c.hosts()).toEqual([]);
+    expect(c.hosts()).toStrictEqual([]);
     expect(c.forHost('a').new).toEqual(ZERO);
   });
 });

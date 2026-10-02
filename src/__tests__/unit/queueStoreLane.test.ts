@@ -444,17 +444,19 @@ describe('queueStore lane — (d) the salvage copy carries the lane', () => {
     expect(store.pageIn(5).map((i) => [i.id, i.lane])).toEqual([['b', 'gap']]);
   });
 
-  it('salvaging a v1 file (no lane column at all) reads every lane as null', () => {
+  it('salvaging a v1 file (no lane column at all) reads every lane as null, without an unknown-lane warning', () => {
     const dir = tmpDir();
     const db = v1Open(path.join(dir, QUEUE_DB_FILE));
     v1Put(db, 'old-a', 'https://s.example/a');
     db.close();
     fs.chmodSync(path.join(dir, QUEUE_DB_FILE), 0o444);
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
 
     const store = createQueueStore({ dir });
     stores.push(store);
     expect(store.reason).toBe('open_failed_recovered');
     expect(store.restore(1_000).pending.map((i) => [i.id, i.lane])).toEqual([['old-a', undefined]]);
+    expect(warn.mock.calls.filter((c) => /unknown lane/.test(String(c[0])))).toEqual([]);
   });
 });
 
@@ -494,6 +496,19 @@ describe('queueStore lane — (e) a lane this build does not know reads as null,
     const laneWarnings = warn.mock.calls.filter((c) => /unknown lane/.test(String(c[0])));
     expect(laneWarnings).toHaveLength(1);
     expect(String(laneWarnings[0][0])).toMatch(/\[SCRAPE QUEUE\].*unknown lane/);
+  });
+
+  it('does not warn about NULL lanes: no lane is not an unknown lane', () => {
+    const store = open(tmpDir());
+    store.put(ITEM({ id: 'a', mfcId: 'a' }));
+    store.put(ITEM({ id: 'b', mfcId: 'b', state: 'parked' }));
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    store.restore(1_000);
+    store.countByHostLane('parked');
+    store.pageIn(5);
+
+    expect(warn.mock.calls.filter((c) => /unknown lane/.test(String(c[0])))).toEqual([]);
   });
 
   it('leaves the unknown value on disk untouched (a newer build may know it)', () => {
