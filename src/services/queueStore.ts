@@ -120,9 +120,14 @@ export interface PersistedQueueItem {
   lastErrorClass?: string;
   /**
    * The work class the item was enqueued for (QB-U1). Absent = no lane, counted as 'other'. A value
-   * on disk this build does not know reads back as absent (see `laneFromDisk`).
+   * on disk this build does not know reads back as absent here and as `unknownLane` (see `laneFromDisk`).
    */
   lane?: QueueLane;
+  /**
+   * A lane cell this build does not know (a newer build wrote it), as text. It COUNTS as no lane, but
+   * the row HAS a lane: the coalesce rule never relabels it and a salvage copy writes it back as is.
+   */
+  unknownLane?: string;
 }
 
 /** A persisted per-host challenge cooldown (mirrors challengeCooldown.ts's CooldownEntry). */
@@ -213,7 +218,10 @@ export interface ScrapeQueueStore {
   claimKey(mfcId: string): PersistedQueueItem | null;
   /** Record a priority upgrade, so a restored item comes back at the priority it was raised to. */
   setPriority(id: string, priority: QueuePriority): void;
-  /** Label an unlabelled row (the queue's coalesce rule), so a restored item keeps the lane it adopted. */
+  /**
+   * Label an UNLABELLED row (the queue's coalesce rule), so a restored item keeps the lane it adopted.
+   * A row that already carries a lane, one this build knows or not, is left as it is.
+   */
   setLane(id: string, lane: QueueLane): void;
   /**
    * Rows in one state counted by (host, lane). A lane this build does not know counts as no lane.
@@ -291,8 +299,9 @@ const LANE_STEP = { key: 'queue_items.lane', value: '1' } as const;
 
 /**
  * QB-U1: a nullable `lane` on every queue row, and the index the lane scheduler pages and counts
- * through. The upsert keeps the FIRST applied_at on a re-open; it only rewrites a record whose value
- * differs from this step's.
+ * through. The upsert keeps the FIRST applied_at on a re-open and only RAISES a record: one below this
+ * step's value (or not a number) is rewritten, and one a newer build wrote is left as it is, so after
+ * a rollback the record still says what the file has had.
  */
 function applySchemaSteps(db: DatabaseSync, now: number): void {
   db.exec(SCHEMA_META);
@@ -304,7 +313,7 @@ function applySchemaSteps(db: DatabaseSync, now: number): void {
   db.prepare(
     `INSERT INTO schema_meta (key, value, applied_at) VALUES (?, ?, ?)
      ON CONFLICT(key) DO UPDATE SET value = excluded.value, applied_at = excluded.applied_at
-     WHERE schema_meta.value <> excluded.value`
+     WHERE CAST(schema_meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)`
   ).run(LANE_STEP.key, LANE_STEP.value, now);
 }
 
@@ -371,15 +380,17 @@ interface ItemRow {
 }
 
 /**
- * A `lane` cell read back. NULL, an absent column and any value outside the vocabulary all read as no
- * lane: a newer build may have written a class this one does not know, and an unknown label must
- * never become a class of its own here. The cell itself is left as it is.
+ * A `lane` cell read back. NULL and an absent column are no lane. A value outside the vocabulary is a
+ * lane a newer build wrote: it reads as no lane here (an unknown label must never become a class of
+ * its own), and comes back as `unknownLane` so nothing in this build overwrites it: the coalesce rule
+ * never relabels the row, `setLane` only writes a NULL cell, and salvage copies the value as is.
  */
-function laneFromDisk(raw: unknown, onUnknown: (value: string) => void): QueueLane | undefined {
-  if (raw === null || raw === undefined) return undefined;
-  if (isQueueLane(raw)) return raw;
-  onUnknown(String(raw));
-  return undefined;
+function laneFromDisk(raw: unknown, onUnknown: (value: string) => void): Pick<PersistedQueueItem, 'lane' | 'unknownLane'> {
+  if (raw === null || raw === undefined) return {};
+  if (isQueueLane(raw)) return { lane: raw };
+  const text = String(raw);
+  onUnknown(text);
+  return { unknownLane: text };
 }
 
 /** ONE warning per store for unknown lanes, however many rows carry one and however often they are read. */
@@ -396,7 +407,6 @@ function warnUnknownLaneOnce(): (value: string) => void {
 }
 
 function rowToItem(row: ItemRow, onUnknownLane: (value: string) => void): PersistedQueueItem {
-  const lane = laneFromDisk(row.lane, onUnknownLane);
   return {
     id: row.id,
     mfcId: row.mfc_id,
@@ -410,7 +420,7 @@ function rowToItem(row: ItemRow, onUnknownLane: (value: string) => void): Persis
     state: row.state as QueueItemState,
     ...(row.lease_until !== null ? { leaseUntil: row.lease_until } : {}),
     ...(row.last_error_class !== null ? { lastErrorClass: row.last_error_class } : {}),
-    ...(lane !== undefined ? { lane } : {}),
+    ...laneFromDisk(row.lane, onUnknownLane),
   };
 }
 
@@ -529,7 +539,7 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
     hasKey: db.prepare('SELECT 1 AS hit FROM queue_items WHERE mfc_id = ? LIMIT 1'),
     selKey: db.prepare('SELECT * FROM queue_items WHERE mfc_id = ? ORDER BY enqueued_at ASC LIMIT 1'),
     setPriority: db.prepare('UPDATE queue_items SET priority = ? WHERE id = ?'),
-    setLane: db.prepare('UPDATE queue_items SET lane = ? WHERE id = ?'),
+    setLane: db.prepare('UPDATE queue_items SET lane = ? WHERE id = ? AND lane IS NULL'),
     countByHostLane: db.prepare('SELECT host, lane, COUNT(*) AS n FROM queue_items WHERE state = ? GROUP BY host, lane'),
     clearItems: db.prepare('DELETE FROM queue_items'),
   } satisfies Record<string, StatementSync>;
@@ -699,7 +709,7 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
         item.state,
         item.leaseUntil ?? null,
         item.lastErrorClass ?? null,
-        item.lane ?? null
+        item.lane ?? item.unknownLane ?? null
       ));
     },
 
@@ -752,7 +762,7 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
       // An unknown lane folds into no lane, so it merges with that host's NULL row.
       const merged = new Map<string, HostLaneRow>();
       for (const row of rows) {
-        const lane = laneFromDisk(row.lane, onUnknownLane);
+        const { lane } = laneFromDisk(row.lane, onUnknownLane);
         const key = JSON.stringify([row.host, lane ?? null]);
         const prev = merged.get(key);
         if (prev !== undefined) prev.n += Number(row.n);

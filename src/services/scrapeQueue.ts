@@ -149,6 +149,8 @@ export interface QueueItem {
   waitingUserIds: string[];
   /** Work class (new | company | gap). Absent = no lane, counted as 'other'. Persisted. */
   lane?: QueueLane;
+  /** A lane on disk this build does not know (a newer build wrote it): counted as 'other', never relabeled. */
+  unknownLane?: string;
   /** Promise resolvers for waiting callers */
   resolvers: Array<{
     resolve: (data: ScrapedData) => void;
@@ -1306,13 +1308,14 @@ export class ScrapeQueue {
    *   - existing row unlabelled + incoming lane L -> the row ADOPTS L (relabeledLegacy). This is how
    *     rows queued before labels went live, and work first queued unlabelled, find their class.
    *   - existing row labelled + a different incoming lane -> the FIRST label is kept
-   *     (coalescedCrossLane, counted against the kept lane).
+   *     (coalescedCrossLane, counted against the kept lane). A lane this build does not know is a
+   *     label too (a newer build wrote it): it is kept for the build that knows it, counted as 'other'.
    *   - a HOT row is never relabeled (and not counted): HOT is dispatched ahead of every lane.
    */
   private coalesceLane(item: QueueItem, incoming: QueueLane | undefined): void {
     if (incoming === undefined || item.priority === 'HOT' || item.lane === incoming) return;
     const host = this.hostOf(item.url);
-    if (item.lane !== undefined) {
+    if (item.lane !== undefined || item.unknownLane !== undefined) {
       this.laneCounters.note(host, item.lane, 'coalescedCrossLane');
       return;
     }
@@ -1579,6 +1582,7 @@ export class ScrapeQueue {
       waitingUserIds: [],
       resolvers: this.parkedResolvers.get(row.mfcId) ?? [],
       ...(row.lane !== undefined ? { lane: row.lane } : {}),
+      ...(row.unknownLane !== undefined ? { unknownLane: row.unknownLane } : {}),
     };
     this.parkedResolvers.delete(row.mfcId);
     this.addToQueue(item);
