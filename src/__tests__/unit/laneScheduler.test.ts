@@ -894,6 +894,8 @@ describe('parseLaneWeights', () => {
     ['an empty weight', 'new:', WEIGHT('new')],
     ['an empty weight beside a good pair', 'new:40,gap:', WEIGHT('gap')],
     ['an empty class', ':40', UNKNOWN('')],
+    ['a stray colon in a weight', 'new:4:0', WEIGHT('new')],
+    ['a stray "=" in the class list', 'new:1=2', WEIGHT('new')],
     ['every weight 0', 'new:0,company:0', 'no class has a positive weight'],
     ['no classes at all', '', 'no class has a positive weight'],
   ])('drops an entry with %s, with a WARN naming it and why, and keeps the good hosts', (_name, spec, reason) => {
@@ -956,6 +958,14 @@ describe('parseLaneWeights', () => {
     expect(warn.mock.calls[1][0]).toContain('SCRAPE_LANE_WEIGHTS');
     expect(warn.mock.calls[1][0]).toContain('an earlier entry for that host was refused');
     expect(warn.mock.calls[1][1]).toEqual({ entry: `www.${GOOD}`, host: MFC });
+  });
+
+  it('a second malformed entry for a refused host gets the refused-host WARN, not a second refusal', () => {
+    const typo2 = `${MFC}=gap:x`;
+    expect(parseLaneWeights(`${TYPO};${typo2}`).has(MFC)).toBe(false);
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn.mock.calls[1][0]).toContain('an earlier entry for that host was refused');
+    expect(warn.mock.calls[1][1]).toEqual({ entry: typo2, host: MFC });
   });
 
   it('an entry that names no host cannot unlane one: a good entry for the host it meant still applies', () => {
