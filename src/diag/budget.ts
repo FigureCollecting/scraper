@@ -22,7 +22,7 @@
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import * as path from 'path';
 import { normalizeHost } from '../services/challengeCooldown.js';
-import { DEFAULT_QUEUE_DIR, QUEUE_DB_FILE, resolveQueueDir } from '../services/queueStore.js';
+import { QUEUE_DB_FILE, QUEUE_DIR_ENV, resolveQueueDir } from '../services/queueStore.js';
 import { sanitizeForLog } from '../utils/security.js';
 import { Probe } from '../gen/fc/diag/v1/diag_pb.js';
 
@@ -112,7 +112,10 @@ export interface DiagBudget {
 }
 
 export interface OpenDiagBudgetOptions {
-  /** The queue directory. Default: SCRAPE_QUEUE_DIR, else /var/lib/scraper. */
+  /**
+   * The queue directory. Default: SCRAPE_QUEUE_DIR, else /var/lib/scraper. A SCRAPE_QUEUE_DIR that
+   * switches the queue sqlite off (blank or `off`) refuses the open: the budget must persist.
+   */
   dir?: string;
   /** Default: DIAG_HOST_DAILY_CAP (resolveHostDailyCap). */
   hostDailyCap?: number;
@@ -136,7 +139,10 @@ export function openDiagBudget(opts: OpenDiagBudgetOptions = {}): DiagBudget {
     throw new RangeError(`diag budget: hostDailyCap must be a non-negative integer, got ${String(hostDailyCap)}`);
   }
   const now = opts.now ?? Date.now;
-  const dir = opts.dir ?? resolveQueueDir() ?? DEFAULT_QUEUE_DIR;
+  const dir = opts.dir ?? resolveQueueDir();
+  if (dir === null) {
+    throw new Error(`diag budget: ${QUEUE_DIR_ENV} switches the queue sqlite off, so the budget could not persist`);
+  }
   const db = new DatabaseSync(path.join(dir, QUEUE_DB_FILE));
 
   let stmt: { count: StatementSync; charge: StatementSync; prune: StatementSync };
