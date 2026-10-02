@@ -4,6 +4,25 @@ All notable changes to `@figurecollecting/scraper-plugin-contract` will be docum
 file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this
 package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] - 2026-10-02
+
+Additive, backward-compatible: every addition is optional. A plugin that calls none of the new
+methods loads exactly as before; a plugin that calls them on an older engine (with `?.`) is a no-op.
+
+### Added
+- `ExtractionRegistry.registerHandsOffPolicy?(policy: HandsOffPolicy)` and the `HandsOffPolicy`,
+  `AiBarTier`, `AiBarSummary` and `RobotsPin` exports. A plugin registers which hosts Claude and its
+  tools must never contact (`handsOff`), permanently denied hosts (`denied`, `siteId` absent for a
+  host-only entry), the robots.txt classification behind the decision and its pins. The engine covers
+  each host and its subdomains, lists `{siteId, hosts, tier, handsOff, denied, policyVersion}` on
+  `/health/detailed` as `handsOff`, and throws (naming it) on a host or siteId another policy already
+  holds, or a host that is not a DNS hostname.
+- `ExtractionRegistry.registerRobotsClassifier?(classifier: RobotsClassifier)` and the
+  `RobotsClassifier` export (`{ tokenListDate, classify(body, routeUrls) }`). One per engine; a
+  second registration throws.
+- `SiteConfig.requiredCookies?: string[]` — the cookie names a healthy session jar must hold.
+  `allowedCookies` stays the allow-list.
+
 ## [0.16.0] - 2026-09-26
 
 Additive, backward-compatible: a ruleset that declares nothing behaves exactly as before.

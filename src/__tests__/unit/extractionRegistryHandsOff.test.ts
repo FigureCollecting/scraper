@@ -103,6 +103,8 @@ describe('ExtractionRegistry.handsOffPolicyFor — parent-domain match', () => {
       'https://www.alpha%2Eexample.test/',
       'https://www.alpha。example.test/',
       'https://www.alpha.example.test\\@evil.invalid/',
+      'https://.alpha.example.test/',
+      'https://a..www.alpha.example.test/',
     ]) {
       expect(registry.handsOffPolicyFor(url)?.siteId).toBe('alpha');
     }
@@ -202,10 +204,14 @@ describe('ExtractionRegistry.registerHandsOffPolicy — validation', () => {
     expect(registry.handsOffView()).toEqual([]);
   });
 
-  it('rejects a host that is not a string', () => {
+  it('rejects a host that is not a string, even one whose string form is a hostname', () => {
     const registry = createExtractionRegistry();
 
     expect(() => registry.registerHandsOffPolicy(policy({ hosts: [42 as unknown as string] }))).toThrow(/42/);
+    expect(() => registry.registerHandsOffPolicy(policy({ hosts: [['alpha.example.test'] as unknown as string] }))).toThrow(
+      '["alpha.example.test"] is not a DNS hostname'
+    );
+    expect(registry.handsOffView()).toEqual([]);
   });
 
   it('rejects a policy with no hosts, or hosts that is not an array', () => {
@@ -234,7 +240,9 @@ describe('ExtractionRegistry.registerHandsOffPolicy — validation', () => {
   it('rejects a value that is not an object', () => {
     const registry = createExtractionRegistry();
 
-    expect(() => registry.registerHandsOffPolicy(null as unknown as HandsOffPolicy)).toThrow(/policy/);
+    for (const value of [null, undefined, 'alpha.example.test']) {
+      expect(() => registry.registerHandsOffPolicy(value as unknown as HandsOffPolicy)).toThrow('hands-off policy: expected an object');
+    }
   });
 
   it('stores registered hosts normalised (case, trailing dot, IDNA) and matches on them', () => {
@@ -267,11 +275,16 @@ describe('ExtractionRegistry — a registered policy is a frozen snapshot', () =
     registry.registerHandsOffPolicy(policy());
     const got = registry.handsOffPolicyFor('https://alpha.example.test/')!;
 
+    // (The snapshot's arrays come from structuredClone, i.e. the host realm under jest, so their
+    // TypeError is not this vm's TypeError: assert the refusal and the unchanged state instead.)
     expect(() => { (got as { handsOff: boolean }).handsOff = false; }).toThrow(TypeError);
-    expect(() => got.hosts.push('late.example.test')).toThrow(TypeError);
-    expect(() => registry.robotsPinsFor('alpha')!.pop()).toThrow(TypeError);
+    expect(() => got.hosts.push('late.example.test')).toThrow(/not extensible/);
+    expect(() => registry.robotsPinsFor('alpha')!.pop()).toThrow(/Cannot delete/);
     expect(registry.handsOffPolicyFor('https://alpha.example.test/')?.handsOff).toBe(true);
+    expect(registry.handsOffPolicyFor('https://late.example.test/')).toBeUndefined();
+    expect(registry.robotsPinsFor('alpha')).toHaveLength(1);
   });
+
 });
 
 describe('ExtractionRegistry.robotsPinsFor', () => {
@@ -325,7 +338,9 @@ describe('ExtractionRegistry.robotsClassifier', () => {
 
     expect(() => registry.registerRobotsClassifier({ tokenListDate: '2026-09-29' } as unknown as RobotsClassifier)).toThrow(/classify/);
     expect(() => registry.registerRobotsClassifier({ classify: () => SUMMARY } as unknown as RobotsClassifier)).toThrow(/tokenListDate/);
-    expect(() => registry.registerRobotsClassifier(undefined as unknown as RobotsClassifier)).toThrow(/classifier/);
+    for (const value of [undefined, null, 'classify']) {
+      expect(() => registry.registerRobotsClassifier(value as unknown as RobotsClassifier)).toThrow('robots classifier: expected an object');
+    }
     expect(registry.robotsClassifier()).toBeUndefined();
   });
 });
@@ -391,10 +406,11 @@ describe('ExtractionRegistry.handsOffView', () => {
     ]);
   });
 
-  it('reports denied only for a literal true', () => {
+  it('reports denied only for a literal true (an untyped plugin may send "yes" or null)', () => {
     const registry = createExtractionRegistry();
     registry.registerHandsOffPolicy(policy({ denied: 'yes' as unknown as boolean }));
+    registry.registerHandsOffPolicy(policy({ siteId: 'beta', hosts: ['beta.example.test'], denied: null as unknown as boolean }));
 
-    expect(registry.handsOffView()[0].denied).toBe(false);
+    expect(registry.handsOffView().map(v => v.denied)).toEqual([false, false]);
   });
 });

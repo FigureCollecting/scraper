@@ -47,7 +47,10 @@
  *     jar's per-host view — cookie NAMES only, never a value; `stale` = the host still served a
  *     challenge with its stored cookies → re-mint; `sessionLost` = a login-gated image host answered
  *     as logged out, sticky until new cookie values load → re-mint the login), plus the flat
- *     `cookieSessionLost: [host]` it mirrors.
+ *     `cookieSessionLost: [host]` it mirrors,
+ *     and `handsOff: [{siteId, hosts, tier, handsOff, denied, policyVersion}]` (the hands-off
+ *     policies the rulesets plugin registered — the hosts Claude and its tools never contact — read
+ *     from our own system with zero upstream requests; `[]` when no plugin registered any).
  *     A browser-pool-health failure still degrades to 500, now carrying { status:'degraded',
  *     challengeCooldowns, cfCookies, error } — both lists survive (neither lister can throw).
  */
@@ -62,6 +65,7 @@ import type { ImageCaptureStats } from '../services/images/imageCaptureHook.js';
 import type { SessionCanaryView } from '../services/sessionCanary.js';
 import type { CpuThrottlingView } from '../services/cpuThrottling.js';
 import type { QueueStoreView } from '../services/scrapeQueue.js';
+import type { HandsOffView } from '../services/extractionRegistry.js';
 
 export interface HealthDeps {
   /** The service version (package.json). */
@@ -138,6 +142,13 @@ export interface HealthDeps {
    * right up to the next repin, which drops the crawler's batch as a coverage hole. Never throws.
    */
   getQueueStore: () => QueueStoreView;
+  /**
+   * The hands-off policies the plugins registered (ExtractionRegistryImpl.handsOffView()): per policy
+   * its siteId (null for a host-only entry), hosts, robots tier, the handsOff decision, the denied
+   * flag and the policy version — never the robots summary, pins or route samples. `[]` before the
+   * plugins load and when no plugin registered any. Never throws.
+   */
+  listHandsOff: () => HandsOffView[];
 }
 
 export function createHealthRoutes(deps: HealthDeps): Router {
@@ -177,6 +188,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         sessionCanary: deps.getSessionCanary(),
         mfcSessionStale: deps.getSessionCanary().stale,
         cpuThrottling: deps.getCpuThrottling(),
+        handsOff: deps.listHandsOff(),
         timestamp: new Date().toISOString(),
       });
     } catch (error) {
@@ -200,6 +212,8 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         // A throttled pod is exactly the pod whose browser pool is failing, so this
         // reading must survive the degraded response that reports it.
         cpuThrottling: deps.getCpuThrottling(),
+        // Which hosts are off limits matters most when the pod is sick and someone goes looking.
+        handsOff: deps.listHandsOff(),
         error: error instanceof Error ? error.message : 'Unknown error',
       });
     }

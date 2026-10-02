@@ -28,6 +28,7 @@ import { scraperDebug } from './utils/logger.js';
 // Import browser pool functionality
 import { browserLaneView, initializeBrowserPool, BrowserPool } from './services/genericScraper.js';
 import { bootstrapPlugins, shutdownPlugins } from './services/pluginBootstrap.js';
+import type { ExtractionRegistryImpl } from './services/extractionRegistry.js';
 import { getScrapeQueue } from './services/scrapeQueue.js';
 import { createQueueStore } from './services/queueStore.js';
 import { ScraperPlugin } from '@figurecollecting/scraper-plugin-contract';
@@ -66,6 +67,8 @@ app.use('/', createHealthRoutes({
   getSessionCanary: () => sessionCanaryView(),
   getCpuThrottling: () => cpuThrottlingView(),
   getQueueStore: () => getScrapeQueue().getQueueStoreView(),
+  // The registry exists once the plugins have loaded; until then (and with no plugin) the list is [].
+  listHandsOff: () => pluginRegistry?.handsOffView() ?? [],
 }));
 
 // Scraper routes (no /api prefix for consistency)
@@ -77,6 +80,8 @@ app.use('/', ingestRoutes);
 
 // Plugins loaded at boot (populated by startServer, read by gracefulShutdown)
 let loadedPlugins: ScraperPlugin[] = [];
+// The plugin registry (populated by startServer, read by /health/detailed's handsOff)
+let pluginRegistry: ExtractionRegistryImpl | undefined;
 
 // Discover + register plugins (mounting their routes) before accepting
 // connections, then start the server and initialize the browser pool.
@@ -96,6 +101,7 @@ async function startServer(): Promise<void> {
   try {
     const { registry, plugins } = await bootstrapPlugins(app);
     loadedPlugins = plugins;
+    pluginRegistry = registry;
     // Thread the plugin registry into the scrape queue so items whose URLs
     // resolve to a plugin ruleset take the ingest path (when INGEST_BASE_URL
     // is configured). The engine carries no extraction fallback — items with
