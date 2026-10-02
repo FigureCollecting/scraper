@@ -189,7 +189,8 @@ describe('discoverPluginCandidates', () => {
     const OK_PLUGIN = "module.exports = { name: 'ok-plugin', version: '1.0.0', register: async () => {} };";
     beforeEach(() => {
       dir = mkdtempSync(path.join(os.tmpdir(), 'plugin-loader-shape-'));
-      write('zz-ok-plugin', { name: 'ok-plugin', version: '1.0.0', main: 'index.js', keywords: ['scraper-ruleset'] }, OK_PLUGIN);
+      // No `main`: the entry file falls back to index.js.
+      write('zz-ok-plugin', { name: 'ok-plugin', version: '1.0.0', keywords: ['scraper-ruleset'] }, OK_PLUGIN);
     });
     afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
