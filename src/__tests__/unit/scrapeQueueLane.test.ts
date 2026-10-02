@@ -193,10 +193,12 @@ describe('ScrapeQueue lane — enqueue takes an optional lane', () => {
   // Neither REST nor the planned gRPC enum can send such a value; an in-process caller can. The door
   // promises "queued unlabelled with a warning" for ANY value outside the vocabulary, so printing the
   // value for that warning must never be what throws the enqueue away.
+  // The warning names the value by its type, so a function reads '<function>', not '<object>'.
   it.each([
-    ['a null-prototype object', () => Object.create(null) as unknown],
-    ['an object whose toString throws', () => ({ toString: () => { throw new Error('no text'); } }) as unknown],
-  ])('queues a lane that cannot even be printed (%s) as unlabelled, with a warning, never a throw', (_what, make) => {
+    ['a null-prototype object', () => Object.create(null) as unknown, '<object>'],
+    ['an object whose toString throws', () => ({ toString: () => { throw new Error('no text'); } }) as unknown, '<object>'],
+    ['a function whose toString throws', () => Object.assign(() => 0, { toString: () => { throw new Error('no text'); } }) as unknown, '<function>'],
+  ])('queues a lane that cannot even be printed (%s) as unlabelled, with a warning, never a throw', (_what, make, printed) => {
     const dir = tmpDir();
     const q = wired(openStore(dir));
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
@@ -208,7 +210,7 @@ describe('ScrapeQueue lane — enqueue takes an optional lane', () => {
     expect(diskLane(dir, 'a1')).toBeNull();
     expect(depth(q)).toEqual({ ...Z, other: 1 });
     const lines = warn.mock.calls.map((c) => String(c[0])).filter((l) => /Ignored lane/.test(l));
-    expect(lines).toEqual(["[SCRAPE QUEUE] Ignored lane '<object>' for a1: not one of new, company, gap; queued with no lane"]);
+    expect(lines).toEqual([`[SCRAPE QUEUE] Ignored lane '${printed}' for a1: not one of new, company, gap; queued with no lane`]);
   });
 
   it('carries a lane per item through a bulk enqueue', () => {
