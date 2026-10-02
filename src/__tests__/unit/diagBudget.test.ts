@@ -374,6 +374,7 @@ describe('the per-host rolling 24 h cap', () => {
     ['an empty label', 'store..example'],
     ['two trailing dots', 'store.example..'],
     ['a label starting with a hyphen', '-store.example'],
+    ['a label ending in a hyphen', 'store-.example'],
     ['an underscore', 'store_x.example'],
     ['a label of 64 characters', `${'a'.repeat(64)}.example`],
   ])('refuses %s (%j): a budget is booked against a bare DNS hostname only', (_label, host) => {
@@ -383,6 +384,44 @@ describe('the per-host rolling 24 h cap', () => {
     expect(() => b.remaining(host)).toThrow(/not a bare DNS hostname/);
     expect(rows(dir)).toHaveLength(0);
   });
+
+  it.each([
+    ['dotted decimal', '127.0.0.1'],
+    ['dotted decimal with a trailing dot', '127.0.0.1.'],
+    ['one decimal number', '2130706433'],
+    ['a hex first part', '0x7f.0.0.1'],
+    ['an octal first part', '0177.0.0.1'],
+    ['two parts', '127.1'],
+    ['one hex number', '0x7f000001'],
+    ['a hex last part', '127.0.0.0x1'],
+    ['a bare 0x last part', 'store.0x'],
+    ['an all-digit last label', 'store.123'],
+  ])('refuses a name that ends in a number (%s, %j): a URL parser reads it as an IPv4 address', (_label, host) => {
+    const dir = tmpDir();
+    const b = open(dir, 6);
+    expect(() => b.startCall({ probe: Probe.ROBOTS_SNAPSHOT, host, runId: 'r' })).toThrow(RangeError);
+    expect(() => b.remaining(host)).toThrow(/not a bare DNS hostname/);
+    expect(rows(dir)).toHaveLength(0);
+  });
+
+  it('one loopback address cannot be booked under five spellings, each with a cap of its own', () => {
+    const dir = tmpDir();
+    const b = open(dir, 1);
+    for (const host of ['127.0.0.1', '2130706433', '0x7f.0.0.1', '0177.0.0.1', '127.1']) {
+      expect(() => b.startCall({ probe: Probe.ROBOTS_SNAPSHOT, host, runId: 'r' })).toThrow(RangeError);
+    }
+    expect(rows(dir)).toHaveLength(0);
+  });
+
+  it.each(['1688.com', '0x7f.example', 'shop.xn--p1ai', 'shop.abc123', 'shop.3com', 'shop.0x7g'])(
+    'books %j: only the LAST label decides, and only when the whole label is a number',
+    (host) => {
+      const dir = tmpDir();
+      const b = open(dir, 1);
+      expect(b.startCall({ probe: Probe.ROBOTS_SNAPSHOT, host, runId: 'r' }).charge()).toBe(true);
+      expect(rows(dir).map((r) => r.host)).toEqual([host]);
+    }
+  );
 
   it('a hostname may be 253 characters, not 254', () => {
     const b = open(tmpDir(), 6);

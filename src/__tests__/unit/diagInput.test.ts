@@ -223,6 +223,70 @@ describe('robots-snapshot --origin (store-less first contact)', () => {
     expect(refusal({ probe: Probe.ROBOTS_SNAPSHOT, origin: 'https://[2001:db8::1]' }).reason).toMatch(/IP literal/);
   });
 
+  it.each([
+    ['https://93.184.215.14', '93.184.215.14'],
+    ['https://2130706433', '127.0.0.1'],
+    ['https://0x7f.0.0.1', '127.0.0.1'],
+    ['https://127.1', '127.0.0.1'],
+    ['https://0x7f000001', '127.0.0.1'],
+  ])('refuses %j for being an IP literal (%s), however the address is spelled', (origin, address) => {
+    expect(refusal({ probe: Probe.ROBOTS_SNAPSHOT, origin })).toEqual({
+      field: 'origin',
+      reason: `origin: '${address}' is an IP literal`,
+    });
+  });
+
+  it.each(['https://bücher.example.net', 'https://BÜCHER.example.net/'])(
+    'refuses %j and names the plain ASCII (xn--) spelling to give instead',
+    (origin) => {
+      expect(refusal({ probe: Probe.ROBOTS_SNAPSHOT, origin })).toEqual({
+        field: 'origin',
+        reason: `origin: '${origin}' must name the host in plain ASCII (xn-- punycode for a non-ASCII name): https://xn--bcher-kva.example.net`,
+      });
+    }
+  );
+
+  it.each(['https://ｐｕｂｌｉｃ.example.net', 'https://pub%6Cic.example.net'])(
+    'names the plain ASCII spelling for a host given in full-width letters or percent-escapes too (%j)',
+    (origin) => {
+      expect(refusal({ probe: Probe.ROBOTS_SNAPSHOT, origin }).reason).toMatch(/: https:\/\/public\.example\.net$/);
+    }
+  );
+
+  it.each([
+    'https://bücher.example.net:8443',
+    'https://bücher.example.net:443',
+    'https://bücher.example.net/robots.txt',
+    'https://bücher.example.net?',
+    'https://bücher.example.net#',
+    'https://bücher.example.net/?',
+    'https://user@bücher.example.net',
+  ])('refuses %j for its port, path, query, fragment or userinfo, not just for its spelling', (origin) => {
+    expect(refusal({ probe: Probe.ROBOTS_SNAPSHOT, origin }).reason).toMatch(
+      /must be exactly https:\/\/<host>: no port, path, query, fragment or userinfo$/
+    );
+  });
+
+  it('checks the www twin even against a registry that matches exact names only', () => {
+    const exact: DiagInputLookups = {
+      storeById: lookups.storeById,
+      storeIdForHost: (host) => (host === 'zeta.example.com' ? 'zeta' : undefined),
+      isDeniedHost: (host) => host === 'denied-exact.example.org',
+    };
+    const run = (origin: string) => validateRunProbeInput(req({ probe: Probe.ROBOTS_SNAPSHOT, origin }), exact);
+    expect(run('https://www.zeta.example.com')).toEqual({
+      ok: false,
+      field: 'origin',
+      reason: expect.stringContaining('use --store zeta'),
+    });
+    expect(run('https://www.denied-exact.example.org')).toEqual({
+      ok: false,
+      field: 'origin',
+      reason: expect.stringMatching(/denied by a registered policy$/),
+    });
+    expect(run('https://www.public.example.net').ok).toBe(true);
+  });
+
   it('a DNS label may be 63 characters, not 64', () => {
     const label = (n: number) => 'a'.repeat(n);
     expect(check({ probe: Probe.ROBOTS_SNAPSHOT, origin: `https://${label(63)}.example.net` }).ok).toBe(true);
