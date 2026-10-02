@@ -103,13 +103,13 @@ const label = (w: LaneWeights): string => `${w.new}/${w.company}/${w.gap}/${w.ot
 
 describe('LaneScheduler: backlogged shares', () => {
   it.each(WEIGHT_SETS.map((w) => [label(w), w] as const))(
-    '10,000 picks with every class backlogged land within 1 percentage point of %s',
+    '10,000 picks with every class backlogged land within 0.5 percentage points of %s',
     (_name, w) => {
       const s = new LaneScheduler(w);
       const counts = run(s, ALL, 10_000);
       const total = sumOver(w, LANE_CLASSES);
       for (const c of LANE_CLASSES) {
-        expect(Math.abs(counts[c] / 10_000 - w[c] / total)).toBeLessThanOrEqual(0.01);
+        expect(Math.abs(counts[c] / 10_000 - w[c] / total)).toBeLessThanOrEqual(0.005);
       }
     },
   );
@@ -504,7 +504,7 @@ describe('LaneScheduler: a class reported empty for single picks', () => {
     for (const back of ['company', 'gap', 'other'] as const) expect(flickerRatio(DEFAULT, back, oneIn(2), 2_200)).toBe(0);
     expect(flickerRatio(W(1, 1, 1, 1), 'gap', oneIn(3), 2_200)).toBe(0);
     expect(flickerRatio(W(100, 1, 1, 1), 'new', oneIn(3), 2_200)).toBe(0); // even the heaviest class
-    // not only 1 pick in k: any repeated omission pattern can do it
+    // not only 1 pick in k: other repeated omission patterns can do it too
     const twoInThree = (n: number): boolean => n % 3 < 2;
     const twoInFive = (n: number): boolean => n % 5 < 2;
     for (const back of ['company', 'gap'] as const) expect(flickerRatio(DEFAULT, back, twoInThree, 2_200)).toBe(0);
@@ -685,6 +685,14 @@ describe('share bases: Ross\'s three classes only while other has no work', () =
     expect(s.tally().all.other).toBe(2);
   });
 
+  it('a weight-0 other with work blanks the ross-three basis too, although it takes no share', () => {
+    const s = new LaneScheduler(W(40, 40, 20, 0));
+    const counts = run(s, ALL, 1_000); // other has work on every pick, but only as a filler
+    expect(counts.other).toBe(0);
+    expect(LANE_CLASSES.reduce((a, c) => a + s.tally().whileOtherIdle[c], 0)).toBe(0);
+    expect(s.shares('ross-three')).toEqual({ new: 0, company: 0, gap: 0 });
+  });
+
   it('before any pick, a charge assumes other is idle (the basis comes from the last pick)', () => {
     expect(new LaneScheduler(DEFAULT).charge('new')).toEqual({ cls: 'new', otherIdle: true });
   });
@@ -841,53 +849,120 @@ describe('parseLaneWeights', () => {
     expect(warn).not.toHaveBeenCalled();
   });
 
+  // Every refused entry names the guard that refused it, so each row proves the guard in its title.
+  const NO_HOST = 'names no valid host';
+  const KEEPS_TODAY = "that host keeps today's dispatch";
+  const WEIGHT = (c: LaneClass): string => `weight for ${c} must be a whole number 0-100`;
+  const UNKNOWN = (c: string): string => `unknown class "${c}" (expected new|company|gap|other)`;
+  const NO_WEIGHT = (pair: string): string => `"${pair}" has no weight (expected class:weight)`;
+
   it.each([
-    ['no "="', 'myfigurecollection.net:new:40'],
-    ['an empty host', '=new:40'],
-    ['a url, not a host', 'https://myfigurecollection.net=new:40'],
-    ['a host with a path', 'myfigurecollection.net/x=new:40'],
-    ['a host with a port', 'a.example:443=new:1'],
-    ['a host with a bad label', '-bad-.net=new:40'],
-    ['a host label over 63 characters', `${'a'.repeat(64)}.example=new:40`],
-    ['an underscore in the host', 'a_b.example=new:40'],
-    ['an unknown class', 'a.example=new:40,bogus:10'],
-    ['a class named twice', 'a.example=new:40,new:20'],
-    ['a letter in the weight', 'a.example=new:4O'],
-    ['a negative weight', 'a.example=new:-5'],
-    ['a fractional weight', 'a.example=new:2.5'],
-    ['an exponent', 'a.example=new:1e2'],
-    ['a hex weight', 'a.example=new:0x10'],
-    ['a plus sign', 'a.example=new:+40'],
-    ['a weight above 100', 'a.example=new:101'],
-    ['a huge weight', 'a.example=new:99999999999999999999'],
-    ['a class without a weight', 'a.example=new'],
-    ['an empty weight', 'a.example=new:'],
-    ['an empty class', 'a.example=:40'],
-    ['every weight 0', 'a.example=new:0,company:0'],
-    ['no classes at all', 'a.example='],
-  ])('drops an entry with %s, with a WARN naming it, and keeps the good hosts', (_name, bad) => {
+    ['no "="', 'myfigurecollection.net:new:40', 'expected host=class:weight,...'],
+    ['an empty host', '=new:40', 'not a host name'],
+    ['a url, not a host', 'https://myfigurecollection.net=new:40', 'not a host name'],
+    ['a host with a path', 'myfigurecollection.net/x=new:40', 'not a host name'],
+    ['a host with a port', 'a.example:443=new:1', 'not a host name'],
+    ['a host with a bad label', '-bad-.net=new:40', 'not a host name'],
+    ['a label that starts with a hyphen', '-bad.example=new:1', 'not a host name'],
+    ['a label that ends with a hyphen', 'bad-.example=new:1', 'not a host name'],
+    ['a trailing dot', 'a.example.=new:1', 'not a host name'],
+    ['a host label over 63 characters', `${'a'.repeat(64)}.example=new:40`, 'not a host name'],
+    ['an underscore in the host', 'a_b.example=new:40', 'not a host name'],
+  ])('drops an entry with %s, with a WARN that it names no host and so changes none; the good hosts still apply', (_name, bad, reason) => {
     const hosts = parseLaneWeights(`${bad};good.example=new:1,gap:1`);
     expect([...hosts.keys()]).toEqual(['good.example']);
     expect(hosts.get('good.example')).toEqual(W(1, 0, 1, 0));
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn.mock.calls[0][0]).toContain('SCRAPE_LANE_WEIGHTS');
-    expect(warn.mock.calls[0][1]).toEqual(expect.objectContaining({ entry: bad.trim() }));
+    expect(warn.mock.calls[0][0]).toContain(NO_HOST);
+    expect(warn.mock.calls[0][1]).toEqual({ entry: bad, reason });
   });
 
-  it('strips www. only as the first label of the host', () => {
-    expect([...parseLaneWeights('shop.www.example=new:1;wwwexample.org=gap:1').keys()]).toEqual([
+  it.each([
+    ['an unknown class', 'new:40,bogus:10', UNKNOWN('bogus')],
+    ['a class named twice', 'new:40,new:20', 'class "new" is named twice'],
+    ['a letter in the weight', 'new:4O', WEIGHT('new')],
+    ['a negative weight', 'new:-5', WEIGHT('new')],
+    ['a fractional weight', 'new:2.5', WEIGHT('new')],
+    ['an exponent', 'new:1e2', WEIGHT('new')],
+    ['a hex weight', 'new:0x10', WEIGHT('new')],
+    ['a plus sign', 'new:+40', WEIGHT('new')],
+    ['a weight above 100', 'new:101', WEIGHT('new')],
+    ['a huge weight', 'new:99999999999999999999', WEIGHT('new')],
+    ['a class without a weight', 'new', NO_WEIGHT('new')],
+    ['a class without a weight beside a good pair', 'new:40,gap', NO_WEIGHT('gap')],
+    ['an empty weight', 'new:', WEIGHT('new')],
+    ['an empty weight beside a good pair', 'new:40,gap:', WEIGHT('gap')],
+    ['an empty class', ':40', UNKNOWN('')],
+    ['every weight 0', 'new:0,company:0', 'no class has a positive weight'],
+    ['no classes at all', '', 'no class has a positive weight'],
+  ])('drops an entry with %s, with a WARN naming it and why, and keeps the good hosts', (_name, spec, reason) => {
+    const bad = `a.example=${spec}`;
+    const hosts = parseLaneWeights(`${bad};good.example=new:1,gap:1`);
+    expect([...hosts.keys()]).toEqual(['good.example']);
+    expect(hosts.get('good.example')).toEqual(W(1, 0, 1, 0));
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain('SCRAPE_LANE_WEIGHTS');
+    expect(warn.mock.calls[0][0]).toContain(KEEPS_TODAY);
+    expect(warn.mock.calls[0][1]).toEqual({ entry: bad, host: 'a.example', reason });
+  });
+
+  it('strips www. only as the first label of the host, and only once', () => {
+    expect([...parseLaneWeights('shop.www.example=new:1;wwwexample.org=gap:1;www.www.example=new:1').keys()]).toEqual([
       'shop.www.example',
       'wwwexample.org',
+      'www.example',
     ]);
     expect(warn).not.toHaveBeenCalled();
   });
 
-  it('a host named twice keeps the last entry, with a WARN', () => {
+  it('a host named twice in well-formed entries keeps the last one, with a WARN', () => {
     const hosts = parseLaneWeights(`${MFC}=new:1;www.${MFC}=gap:3`);
     expect(hosts.get(MFC)).toEqual(W(0, 0, 3, 0));
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn.mock.calls[0][0]).toContain('SCRAPE_LANE_WEIGHTS');
     expect(warn.mock.calls[0][1]).toEqual({ host: MFC });
+  });
+
+  // A host is laned by one whole entry or not at all: one malformed entry for it unlanes it, in any order.
+  const GOOD = `${MFC}=new:40,company:40,gap:20,other:10`;
+  const TYPO = `${MFC}=new:40,company:4O,gap:20`;
+
+  it.each([
+    ['a good entry, then a malformed one', [GOOD, TYPO]],
+    ['a good entry, then a malformed one written with www.', [GOOD, `www.${TYPO}`]],
+    ['a malformed entry, then a good one', [TYPO, GOOD]],
+    ['a malformed entry between two good ones', [GOOD, TYPO, GOOD]],
+    ['a malformed entry written with www., then a good one', [`www.${TYPO}`, GOOD]],
+  ])('a host with %s is unlaned, as its WARN says, and the other hosts still apply', (_name, entries) => {
+    const hosts = parseLaneWeights([...entries, 'good.example=gap:1'].join(';'));
+    expect([...hosts.keys()]).toEqual(['good.example']);
+    const texts = warn.mock.calls.map((call) => String(call[0]));
+    expect(texts.filter((t) => t.includes(KEEPS_TODAY))).toHaveLength(1);
+    expect(texts.some((t) => t.includes('the last entry wins'))).toBe(false);
+  });
+
+  it('a malformed entry after a good one for the same host drops the good one too, with one WARN', () => {
+    expect(parseLaneWeights(`${GOOD};${TYPO}`).has(MFC)).toBe(false);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][1]).toEqual({ entry: TYPO, host: MFC, reason: WEIGHT('company') });
+  });
+
+  it('a good entry after a malformed one for the same host is ignored too, with a WARN naming it', () => {
+    expect(parseLaneWeights(`${TYPO};www.${GOOD}`).has(MFC)).toBe(false);
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn.mock.calls[0][0]).toContain(KEEPS_TODAY);
+    expect(warn.mock.calls[0][1]).toEqual({ entry: TYPO, host: MFC, reason: WEIGHT('company') });
+    expect(warn.mock.calls[1][0]).toContain('SCRAPE_LANE_WEIGHTS');
+    expect(warn.mock.calls[1][0]).toContain('an earlier entry for that host was refused');
+    expect(warn.mock.calls[1][1]).toEqual({ entry: `www.${GOOD}`, host: MFC });
+  });
+
+  it('an entry that names no host cannot unlane one: a good entry for the host it meant still applies', () => {
+    const hosts = parseLaneWeights(`${MFC}:new:40;https://${MFC}=new:1;${GOOD}`);
+    expect(hosts.get(MFC)).toEqual(DEFAULT);
+    expect(warn).toHaveBeenCalledTimes(2);
+    for (const call of warn.mock.calls) expect(call[0]).toContain(NO_HOST);
   });
 
   it('the parsed weights are frozen', () => {
@@ -950,6 +1025,15 @@ describe('resolveLaneConfig / laneWeightsForHost: fail-safe', () => {
 
   it('a malformed weights entry leaves its host unlaned (today\'s dispatch), never half-configured', () => {
     const cfg = resolveLaneConfig({ SCRAPE_LANE_MODE: 'on', SCRAPE_LANE_WEIGHTS: `${MFC}=new:40,company:4O,gap:20` });
+    expect(laneWeightsForHost(cfg, MFC)).toBeUndefined();
+  });
+
+  it.each([
+    ['after', `${WEIGHTS};${MFC}=new:40,company:4O,gap:20`],
+    ['before', `${MFC}=new:40,company:4O,gap:20;${WEIGHTS}`],
+  ])('a malformed entry %s a good one for the same host leaves the host unlaned, as its WARN says', (_where, weights) => {
+    const cfg = resolveLaneConfig({ SCRAPE_LANE_MODE: 'on', SCRAPE_LANE_WEIGHTS: weights });
+    expect(warn.mock.calls[0][0]).toContain("that host keeps today's dispatch");
     expect(laneWeightsForHost(cfg, MFC)).toBeUndefined();
   });
 
