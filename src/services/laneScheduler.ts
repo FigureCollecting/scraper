@@ -370,11 +370,12 @@ function parseClassWeights(spec: string): LaneWeights | string {
  * list is malformed (an unknown or repeated class, a class without a weight, a weight that is not a
  * whole number 0-100, no positive weight) is DROPPED with a WARN naming it and why, and its host is
  * then unlaned for the whole setting: every other entry for that host, before or after it, is
- * ignored too, so the host dispatches exactly as today. An entry with no readable host (no '=', or
- * not a plain host name: a url, a port, a path, a bad label) is dropped with a WARN that it changes
- * no host's dispatch: it names no host, so it lanes none and cannot unlane the one it meant. The
- * other hosts' entries still apply. A host named twice in well-formed entries keeps its last
- * entry, with a WARN.
+ * ignored too, so the host dispatches exactly as today. An entry with no '=' (even one that is
+ * only a host name), or whose text before '=' is not a plain host name (a url, a port, a path, a
+ * trailing dot, a bad label), is dropped with a WARN that it is not read as any host's entry: it
+ * lanes no host and cannot unlane the one it meant. The other hosts' entries still apply. A host
+ * named twice in well-formed entries keeps its last entry, with a WARN as each one replaces the one
+ * before.
  */
 export function parseLaneWeights(raw: string | undefined): ReadonlyMap<string, LaneWeights> {
   const out = new Map<string, LaneWeights>();
@@ -383,11 +384,18 @@ export function parseLaneWeights(raw: string | undefined): ReadonlyMap<string, L
     const entry = segment.trim();
     if (entry === '') continue;
     const eq = entry.indexOf('=');
-    const host = eq === -1 ? '' : normalizeLaneHost(entry.slice(0, eq));
-    if (!SAFE_HOST.test(host)) {
-      logger.warn(`[SCRAPE LANES] ${LANE_WEIGHTS_ENV} entry ignored; it names no valid host, so it changes no host's dispatch`, {
+    if (eq === -1) {
+      logger.warn(`[SCRAPE LANES] ${LANE_WEIGHTS_ENV} entry ignored; it has no "=", so it is not read as any host's entry and changes no host's dispatch`, {
         entry,
-        reason: eq === -1 ? 'expected host=class:weight,...' : 'not a host name',
+        reason: 'expected host=class:weight,...',
+      });
+      continue;
+    }
+    const host = normalizeLaneHost(entry.slice(0, eq));
+    if (!SAFE_HOST.test(host)) {
+      logger.warn(`[SCRAPE LANES] ${LANE_WEIGHTS_ENV} entry ignored; the text before "=" is not a plain host name, so it is not read as any host's entry and changes no host's dispatch`, {
+        entry,
+        reason: 'not a plain host name',
       });
       continue;
     }
@@ -410,7 +418,7 @@ export function parseLaneWeights(raw: string | undefined): ReadonlyMap<string, L
       continue;
     }
     if (out.has(host)) {
-      logger.warn(`[SCRAPE LANES] ${LANE_WEIGHTS_ENV} names a host twice; the last entry wins`, { host });
+      logger.warn(`[SCRAPE LANES] ${LANE_WEIGHTS_ENV} names a host twice; this entry replaces the earlier one`, { host });
     }
     out.set(host, parsed);
   }
