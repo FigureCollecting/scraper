@@ -236,7 +236,7 @@ describe('robots-snapshot --origin (store-less first contact)', () => {
     });
   });
 
-  it.each(['https://bücher.example.net', 'https://BÜCHER.example.net/'])(
+  it.each(['https://bücher.example.net', 'https://BÜCHER.example.net/', 'HTTPS://Bücher.Example.NET'])(
     'refuses %j and names the plain ASCII (xn--) spelling to give instead',
     (origin) => {
       expect(refusal({ probe: Probe.ROBOTS_SNAPSHOT, origin })).toEqual({
