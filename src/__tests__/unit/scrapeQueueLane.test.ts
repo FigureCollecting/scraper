@@ -345,6 +345,48 @@ describe('ScrapeQueue lane — (f) the coalesce rule', () => {
     expect(depth(q)).toEqual({ ...Z, new: 1 });
   });
 
+  it.each([['pending'], ['parked']] as const)(
+    'a lane this build does not know (a %s row) is still a lane: kept on disk and in memory, counted as other',
+    (state) => {
+      const dir = tmpDir();
+      const first = openStore(dir);
+      first.put({ id: 'k-1', mfcId: 'k', url: urlFor('k'), priority: 'WARM', attempts: 0, maxRetries: 3, enqueuedAt: 1_000, state });
+      first.close();
+      const raw = new DatabaseSync(path.join(dir, QUEUE_DB_FILE));
+      raw.exec(`UPDATE queue_items SET lane = 'premium' WHERE id = 'k-1'`);
+      raw.close();
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      const q = wired(openStore(dir));
+      q.restoreFromStore(5_000);
+
+      const r = q.enqueue('k', { url: urlFor('k'), lane: 'new' });
+
+      expect(r.deduplicated).toBe(true);
+      expect('lane' in r).toBe(false);
+      expect(diskLane(dir, 'k')).toBe('premium');
+      expect(internals(q).pendingItems.get('k')?.lane).toBeUndefined();
+      expect(depth(q)).toEqual({ ...Z, other: 1 });
+      expect(depth(q, HOST, 'parked')).toEqual(Z);
+      const counts = q.getLaneCounts(HOST);
+      expect(QUEUE_LANE_CLASSES.map((c) => counts[c].relabeledLegacy)).toEqual([0, 0, 0, 0]);
+      expect(counts.other.coalescedCrossLane).toBe(1);
+    }
+  );
+
+  it('HOT + L onto an unlabelled WARM row: the lane settles on the row as it stood, THEN it is raised to HOT', () => {
+    const dir = tmpDir();
+    const q = wired(openStore(dir));
+    q.enqueue('k', { url: urlFor('k') });
+
+    const r = q.enqueue('k', { url: urlFor('k'), priority: 'HOT', lane: 'new' });
+
+    expect(internals(q).pendingItems.get('k')).toMatchObject({ priority: 'HOT', lane: 'new' });
+    expect(r.lane).toBe('new');
+    expect(diskLane(dir, 'k')).toBe('new');
+    expect(depth(q)).toEqual({ ...Z, new: 1 });
+    expect(q.getLaneCounts(HOST).new.relabeledLegacy).toBe(1);
+  });
+
   it('logs a relabel once, naming the lane the row adopted', () => {
     const log = jest.spyOn(console, 'log').mockImplementation(() => {});
     const q = wired();
@@ -420,6 +462,20 @@ describe('ScrapeQueue lane — per-(host, lane) depth', () => {
     expect(depth(q)).toEqual({ ...Z, gap: 1 });
   });
 
+  it('an IN-FLIGHT item raised by a later enqueue: resident depth still equals what the tiers hold', () => {
+    const q = wired(openStore(tmpDir()));
+    q.enqueue('k', { url: urlFor('k'), lane: 'new' });
+    const inFlight = internals(q).getNextProcessableItem(Date.now());
+    expect(inFlight?.mfcId).toBe('k');
+    expect(depth(q)).toEqual(Z);
+
+    q.enqueue('k', { url: urlFor('k'), priority: 'HOT' });
+
+    // The raise looks for the item in its old tier and does not find it (it is on the wire). Whatever
+    // the raise then does with the item, the counters must follow the tiers, never go below them.
+    expect(depth(q)).toEqual(recountResident(q, HOST));
+  });
+
   it('dispatch takes an item out of resident depth; a retry puts it back; success does not', () => {
     const q = wired(openStore(tmpDir()));
     q.enqueue('k1', { url: urlFor('k1'), lane: 'company' });
@@ -472,11 +528,12 @@ describe('ScrapeQueue lane — per-(host, lane) depth', () => {
     expect(depth(q, HOST, 'parked')).toEqual({ ...Z, company: 2, gap: 1 });
   });
 
-  it('never drifts from the tiers and the disk across a long mixed run', () => {
+  it('never drifts from the tiers and the disk across a long mixed run, with items held in flight and restarts', () => {
     process.env.SCRAPE_QUEUE_MAX_RESIDENT = '8';
     process.env.SCRAPE_QUEUE_MAX_RESIDENT_PER_HOST = '5';
-    const store = openStore(tmpDir());
-    const q = wired(store);
+    const dir = tmpDir();
+    let store = openStore(dir);
+    let q = wired(store);
     const hosts = [HOST, 'www.myfigurecollection.net', 'b.example', 'c.example'];
     const lanes: Array<QueueLane | undefined> = ['new', 'company', 'gap', undefined];
     let seed = 0x5eed;
@@ -487,8 +544,16 @@ describe('ScrapeQueue lane — per-(host, lane) depth', () => {
     let now = Date.now();
     const log = jest.spyOn(console, 'log').mockImplementation(() => {});
 
+    // Dispatched items are HELD on the wire across later operations (a raise, a cancel, a refill, a
+    // restart), not settled on the spot: that is where an item is in pendingItems but in no tier.
+    let inFlight: QueueItem[] = [];
+    const settle = (item: QueueItem): void => {
+      if (rnd(2) === 0) internals(q).handleSuccess(item, {});
+      else internals(q).handleFailure(item, new Error('NETWORK timeout reaching host'));
+    };
+
     for (let step = 0; step < 600; step++) {
-      const op = rnd(10);
+      const op = rnd(13);
       const key = `k${rnd(30)}`;
       if (op < 5) {
         const host = hosts[rnd(hosts.length)];
@@ -497,19 +562,31 @@ describe('ScrapeQueue lane — per-(host, lane) depth', () => {
         q.enqueue(key, { url: urlFor(key, host), priority, ...(lane ? { lane } : {}) });
       } else if (op < 6) {
         q.cancel(key);
-      } else if (op < 9) {
+      } else if (op < 8) {
         now += 60_000;
         const item = internals(q).getNextProcessableItem(now);
-        if (item) {
-          if (rnd(2) === 0) internals(q).handleSuccess(item, {});
-          else internals(q).handleFailure(item, new Error('NETWORK timeout reaching host'));
-        }
-      } else {
+        if (item) inFlight.push(item);
+      } else if (op < 10) {
+        const item = inFlight.shift();
+        if (item) settle(item);
+      } else if (op < 12) {
         q.refillWorkingSet(now);
+      } else {
+        q.stop();
+        store.close();
+        store = openStore(dir);
+        q = wired(store);
+        q.restoreFromStore(now);
+        inFlight = [];
       }
       for (const host of [HOST, 'b.example', 'c.example']) {
         expect({ step, host, resident: depth(q, host) }).toEqual({ step, host, resident: recountResident(q, host) });
         expect({ step, host, parked: depth(q, host, 'parked') }).toEqual({ step, host, parked: recountParked(store, host) });
+      }
+      // Memory and disk agree on every row's lane.
+      for (const [key2, item] of internals(q).pendingItems) {
+        const onDisk = diskLane(dir, key2);
+        if (onDisk !== undefined) expect({ step, key: key2, lane: onDisk }).toEqual({ step, key: key2, lane: item.lane ?? null });
       }
     }
     log.mockRestore();

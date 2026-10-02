@@ -227,16 +227,31 @@ describe('queueStore lane — (a) a fresh store has the lane column and a schema
     expect(inspect(dir, metaRows)).toEqual([{ key: 'queue_items.lane', value: '1', applied_at: 1_000 }]);
   });
 
-  it('rewrites a schema_meta record whose value is not the current step', () => {
+  it.each([['0'], ['x']])('raises a schema_meta record below the current step (%p)', (below) => {
     const dir = tmpDir();
     open(dir, () => 1_000).close();
     const raw = new DatabaseSync(path.join(dir, QUEUE_DB_FILE));
-    raw.exec(`UPDATE schema_meta SET value = '0' WHERE key = 'queue_items.lane'`);
+    raw.prepare(`UPDATE schema_meta SET value = ? WHERE key = 'queue_items.lane'`).run(below);
     raw.close();
 
     open(dir, () => 5_000).close();
 
     expect(inspect(dir, metaRows)).toEqual([{ key: 'queue_items.lane', value: '1', applied_at: 5_000 }]);
+  });
+
+  it('never lowers a record a NEWER build wrote: after a rollback it still says what the file has had', () => {
+    const dir = tmpDir();
+    open(dir, () => 1_000).close();
+    const raw = new DatabaseSync(path.join(dir, QUEUE_DB_FILE));
+    raw.exec(`UPDATE schema_meta SET value = '2', applied_at = 2_000 WHERE key = 'queue_items.lane'`);
+    raw.close();
+
+    const reopened = createQueueStore({ dir, now: () => 9_000 });
+    stores.push(reopened);
+    expect(reopened.reason).toBe('ok');
+    reopened.close();
+
+    expect(inspect(dir, metaRows)).toEqual([{ key: 'queue_items.lane', value: '2', applied_at: 2_000 }]);
   });
 });
 
@@ -417,6 +432,16 @@ describe('queueStore lane — carried through every path a row comes back by', (
 
     expect(store.restore(1_000).pending[0]).toMatchObject({ lane: 'company', attempts: 2, lastErrorClass: 'timeout', priority: 'WARM' });
   });
+
+  it('setLane labels only an UNLABELLED row: a lane already on the row is never overwritten', () => {
+    const dir = tmpDir();
+    const store = open(dir);
+    store.put(ITEM({ lane: 'company' }));
+    store.setLane('id-1', 'new');
+    store.close();
+
+    expect(inspect(dir, (db) => laneOnDisk(db, 'id-1'))).toBe('company');
+  });
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -457,6 +482,26 @@ describe('queueStore lane — (d) the salvage copy carries the lane', () => {
     expect(store.reason).toBe('open_failed_recovered');
     expect(store.restore(1_000).pending.map((i) => [i.id, i.lane])).toEqual([['old-a', undefined]]);
     expect(warn.mock.calls.filter((c) => /unknown lane/.test(String(c[0])))).toEqual([]);
+  });
+
+  it('a lane this build does not know is copied as it was, and still reads as unknown', () => {
+    const dir = tmpDir();
+    const first = open(dir);
+    first.put(ITEM({ id: 'a', mfcId: 'a', url: 'https://s.example/a', lane: 'new' }));
+    first.close();
+    const raw = new DatabaseSync(path.join(dir, QUEUE_DB_FILE));
+    raw.prepare('UPDATE queue_items SET lane = ? WHERE id = ?').run('promo', 'a');
+    raw.close();
+    fs.chmodSync(path.join(dir, QUEUE_DB_FILE), 0o444);
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const store = createQueueStore({ dir });
+    stores.push(store);
+    expect(store.reason).toBe('open_failed_recovered');
+    expect(store.restore(1_000).pending.map((i) => [i.id, i.lane, i.unknownLane])).toEqual([['a', undefined, 'promo']]);
+    store.close();
+
+    expect(inspect(dir, (db) => laneOnDisk(db, 'a'))).toBe('promo');
   });
 });
 
@@ -511,15 +556,38 @@ describe('queueStore lane — (e) a lane this build does not know reads as null,
     expect(warn.mock.calls.filter((c) => /unknown lane/.test(String(c[0])))).toEqual([]);
   });
 
-  it('leaves the unknown value on disk untouched (a newer build may know it)', () => {
+  it('hands an unknown value back as unknownLane, never as lane, on every read path', () => {
+    const dir = tmpDir();
+    seedUnknown(dir);
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = open(dir);
+
+    const restored = new Map(store.restore(1_000).pending.map((i) => [i.id, i]));
+    expect(restored.get('u1')?.unknownLane).toBe('promo');
+    expect(restored.get('u2')?.unknownLane).toBe('other');
+    expect('unknownLane' in (restored.get('u4') as object)).toBe(false);
+    expect(store.claimKey('u3')).toMatchObject({ unknownLane: 'toString' });
+    store.lease('u1', 5_000);
+    expect(store.reapExpiredLeases(6_000).map((i) => [i.id, i.lane, i.unknownLane])).toEqual([['u1', undefined, 'promo']]);
+  });
+
+  it('never rewrites an unknown value on disk: reads, a claim and setLane all leave it (a newer build may know it)', () => {
     const dir = tmpDir();
     seedUnknown(dir);
     jest.spyOn(console, 'warn').mockImplementation(() => {});
     const store = open(dir);
     store.restore(1_000);
+    store.countByHostLane('parked');
+    store.claimKey('u3');
+    store.setLane('u1', 'new');
+    store.setLane('u3', 'gap');
     store.close();
 
-    expect(inspect(dir, (db) => laneOnDisk(db, 'u1'))).toBe('promo');
+    expect(inspect(dir, (db) => [laneOnDisk(db, 'u1'), laneOnDisk(db, 'u2'), laneOnDisk(db, 'u3')])).toEqual([
+      'promo',
+      'other',
+      'toString',
+    ]);
   });
 
   it('counts unknown values as other in the per-(host, lane) reading', () => {
