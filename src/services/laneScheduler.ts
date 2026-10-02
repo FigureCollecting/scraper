@@ -363,19 +363,44 @@ function parseClassWeights(spec: string): LaneWeights | string {
 }
 
 /**
+ * Whether an entry with no '=' starts with a class name: its first non-empty comma-separated part,
+ * before any ':', is new, company, gap or other in any case. Such text is most likely a piece of a
+ * host's class list that a ';' typed for ',' cut off.
+ */
+function startsWithClass(entry: string): boolean {
+  const first = entry.split(',').map((part) => part.trim()).find((part) => part !== '') ?? '';
+  return isLaneClass(first.split(':')[0].trim().toLowerCase());
+}
+
+/**
  * `SCRAPE_LANE_WEIGHTS`: per host, hosts separated by ';', e.g.
  * `myfigurecollection.net=new:40,company:40,gap:20,other:10`. A class left out gets weight 0.
  *
- * Fail-safe: a host is laned by one whole, well-formed entry or not at all. An entry whose class
- * list is malformed (an unknown or repeated class, a class without a weight, a weight that is not a
- * whole number 0-100, no positive weight) is DROPPED with a WARN naming it and why, and its host is
- * then unlaned for the whole setting: every other entry for that host, before or after it, is
- * ignored too, so the host dispatches exactly as today. An entry with no '=' (even one that is
- * only a host name), or whose text before '=' is not a plain host name (a url, a port, a path, a
- * trailing dot, a bad label), is dropped with a WARN that it is not read as any host's entry: it
- * lanes no host and cannot unlane the one it meant. The other hosts' entries still apply. A host
- * named twice in well-formed entries keeps its last entry, with a WARN as each one replaces the one
- * before.
+ * Fail-safe: a host is laned by one whole, well-formed entry or not at all, except through the gap
+ * named at the end. An entry whose class list is malformed (an unknown or repeated class, a
+ * class without a weight, a weight that is not a whole number 0-100, no positive weight) is DROPPED
+ * with a WARN naming it and why, and its host is then unlaned for the whole setting: every other
+ * entry for that host, before or after it, is ignored too, so the host dispatches exactly as today.
+ *
+ * An entry with no '=' that starts with a class name (its first non-empty pair, before any ':', is
+ * new, company, gap or other in any case) refuses the WHOLE setting with a WARN: it is most likely a
+ * piece of a host's class list cut off by a ';' typed for ',', and which host it belongs to cannot
+ * be told, so no host is laned and the entries after it are not read. So a ';' typed for any one or
+ * more of the ',' in a well-formed class list never lanes a host by part of that list.
+ *
+ * Any other entry with no '=' (a host name alone, a host with ':' typed for '=', text that does not
+ * start with a class name), or one whose text before '=' is not a plain host name (a url, a port, a
+ * path, a trailing dot, a bad label, a non-ASCII letter), is dropped with a WARN that it is not read
+ * as any host's entry: the other entries are read as if it were not there, so it lanes no host and
+ * cannot unlane the one it meant.
+ *
+ * The gap: the refusal covers only a piece with no '=' that starts with a class name. A cut-off
+ * piece that does not (a ';' inserted inside a pair, as in `new:4;0,company:40`, or a piece that
+ * starts with a misspelt class; both are pinned in the tests) is only dropped, and its host is then
+ * laned by the part of its list before the ';'.
+ *
+ * A host named twice in well-formed entries keeps its last entry, with a WARN as each one replaces
+ * the one before, even an identical one.
  */
 export function parseLaneWeights(raw: string | undefined): ReadonlyMap<string, LaneWeights> {
   const out = new Map<string, LaneWeights>();
@@ -385,7 +410,14 @@ export function parseLaneWeights(raw: string | undefined): ReadonlyMap<string, L
     if (entry === '') continue;
     const eq = entry.indexOf('=');
     if (eq === -1) {
-      logger.warn(`[SCRAPE LANES] ${LANE_WEIGHTS_ENV} entry ignored; it has no "=", so it is not read as any host's entry and changes no host's dispatch`, {
+      if (startsWithClass(entry)) {
+        logger.warn(`[SCRAPE LANES] ${LANE_WEIGHTS_ENV} refused as a whole; an entry with no "=" starts with a class name, so it may be a piece of a host's class list cut off by a ";" typed for ",", and which host it belongs to cannot be told: no host is laned`, {
+          entry,
+          reason: 'starts with a class name but names no host',
+        });
+        return new Map();
+      }
+      logger.warn(`[SCRAPE LANES] ${LANE_WEIGHTS_ENV} entry ignored; it has no "=", so it is not read as any host's entry; the other entries are read as if it were not there`, {
         entry,
         reason: 'expected host=class:weight,...',
       });
@@ -393,7 +425,7 @@ export function parseLaneWeights(raw: string | undefined): ReadonlyMap<string, L
     }
     const host = normalizeLaneHost(entry.slice(0, eq));
     if (!SAFE_HOST.test(host)) {
-      logger.warn(`[SCRAPE LANES] ${LANE_WEIGHTS_ENV} entry ignored; the text before "=" is not a plain host name, so it is not read as any host's entry and changes no host's dispatch`, {
+      logger.warn(`[SCRAPE LANES] ${LANE_WEIGHTS_ENV} entry ignored; the text before "=" is not a plain host name, so it is not read as any host's entry; the other entries are read as if it were not there`, {
         entry,
         reason: 'not a plain host name',
       });

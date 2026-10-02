@@ -1055,6 +1055,10 @@ describe('parseLaneWeights', () => {
     expect(warn.mock.calls[0][1]).toEqual({ entry: piece, reason: PIECE });
   });
 
+  // Why this holds for any well-formed list, not only these three: 'host=' opens the list, so every
+  // piece a ';' cuts off comes after it and starts with the list's next pairs. In a well-formed list
+  // each non-empty pair names a known class, so the piece starts with a class name; a piece made only
+  // of empty pairs leaves every pair with the host.
   it('a ";" typed for any one or more of the "," in a well-formed class list refuses the whole setting', () => {
     const lists = ['new:40,company:40,gap:20,other:10', 'new:40,company:40,gap:20,other:0', 'gap:1, NEW : 3 ,,other:0'];
     let cases = 0;
