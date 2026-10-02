@@ -272,6 +272,24 @@ describe('POST /ingest/scrape', () => {
       expect(queue.isPending(FIXTURE_URL)).toBe(true);
     });
 
+    it('never forwards a lane: the REST route does not learn it (lanes arrive over gRPC only)', async () => {
+      const enqueueSpy = jest.spyOn(queue, 'enqueue');
+
+      const response = await request(makeApp(queue))
+        .post('/ingest/scrape')
+        .send({ url: FIXTURE_URL, lane: 'new' })
+        .expect(202);
+
+      expect(enqueueSpy).toHaveBeenCalledWith(FIXTURE_URL, { url: FIXTURE_URL });
+      expect(response.body).toEqual({
+        success: true,
+        itemId: expect.any(String),
+        deduplicated: false,
+        position: expect.any(Number),
+      });
+      expect(queue.getLaneCounts('figures.example.test').other.resident).toBe(1);
+    });
+
     it('deduplicates a repeat trigger for the same URL', async () => {
       const app = makeApp(queue);
       const first = await request(app).post('/ingest/scrape').send({ url: FIXTURE_URL }).expect(202);
