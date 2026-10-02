@@ -1047,8 +1047,28 @@ describe('ScrapeQueue — holding the durable store when the registry came up in
     expect(rows.leasedExpired.map(r => [r.id, r.attempts])).toEqual([['l1-1', 1]]);
     expect(errorSpy.mock.calls.map(c => String(c[0])).filter(l => l.includes('HELD'))).toEqual([
       `[SCRAPE QUEUE] durable queue HELD, not restored (plugin(s) refused at startup: rules): ` +
-        `1 pending, 1 leased, 1 parked left untouched in ${store.path} for the next start`,
+        `1 pending, 1 leased, 1 parked left in ${store.path} for the next start; ` +
+        `its open host cooldowns are not applied in this process`,
     ]);
+    errorSpy.mockRestore();
+  });
+
+  it('leaves the open host cooldowns in the file, and does not apply them in this process', () => {
+    const dir = tmpDir();
+    const first = openStore(dir);
+    first.saveCooldown({ host: HOST, until: Date.now() + 3_600_000, reason: 'challenge page', openedAt: Date.now() });
+    first.close();
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const cooldown = new ChallengeCooldown();
+    queue = new ScrapeQueue(true);
+    queue.setChallengeCooldown(cooldown);
+    queue.setQueueStore(openStore(dir));
+
+    queue.holdQueueStore('no plugin registered a store');
+
+    expect(cooldown.isOpen(HOST)).toBe(false);
+    expect(openStore(dir).restore(Date.now()).cooldowns.map(c => c.host)).toEqual([HOST]);
+    expect(String(errorSpy.mock.calls[0]?.[0])).toContain('its open host cooldowns are not applied in this process');
     errorSpy.mockRestore();
   });
 

@@ -4,11 +4,14 @@
  * actually mount and respond, and that shutdown hooks are wired correctly.
  */
 import path from 'path';
+import os from 'os';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import request from 'supertest';
 import express from 'express';
 import { jest } from '@jest/globals';
-import { bootstrapPlugins, durableQueueHold, pluginsView, shutdownPlugins } from '../../services/pluginBootstrap';
+import { bootstrapPlugins, durableQueueHold, pluginsView, settleDurableQueue, shutdownPlugins } from '../../services/pluginBootstrap';
 import { ScraperPlugin, ExtractionRegistry, PluginContext, ExpressRouter } from '@figurecollecting/scraper-plugin-contract';
+import type { ScrapeQueue } from '../../services/scrapeQueue';
 
 const FIXTURES_DIR = path.join(__dirname, '..', 'fixtures', 'plugins');
 
@@ -584,5 +587,126 @@ describe('durableQueueHold and pluginsView', () => {
 
   it('reports no plugins before the bootstrap has run', () => {
     expect(pluginsView(undefined)).toEqual({ loaded: [], refused: [] });
+  });
+
+  /**
+   * A candidate package that never became a plugin (its import threw, its entry file is missing, or
+   * its export failed the ScraperPlugin shape check) is refused too: the engine came up without it. So
+   * it is listed under refused and holds the queue, even beside a plugin whose stores did go live, and
+   * on its own it reads as refused rather than as "no plugin installed".
+   */
+  it('lists every candidate that failed to import or failed the shape check as refused, and holds the queue for them', async () => {
+    const result = await bootstrapPlugins(buildApp(), { nodeModulesDir: FIXTURES_DIR });
+
+    expect(result.plugins.map(p => p.name)).toContain('mock-scraper-ruleset');
+    expect(result.registry.allStores().map(s => s.siteId)).toContain('mock');
+    expect(pluginsView(result).refused.sort((a, b) => a.name.localeCompare(b.name))).toEqual([
+      { name: 'broken-plugin', version: '1.0.0' },
+      { name: 'missing-entry-plugin', version: '1.0.0' },
+      { name: 'throwing-entry-plugin', version: '4.0.0' },
+    ]);
+    const hold = durableQueueHold(result);
+    expect(hold).toMatch(/^plugin\(s\) refused at startup: /);
+    for (const name of ['broken-plugin', 'missing-entry-plugin', 'throwing-entry-plugin']) expect(hold).toContain(name);
+  });
+
+  it('lists a lone plugin that failed to import as refused, not as no plugin at all', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'plugin-bootstrap-'));
+    try {
+      mkdirSync(path.join(dir, 'lone-plugin'));
+      writeFileSync(
+        path.join(dir, 'lone-plugin', 'package.json'),
+        JSON.stringify({ name: 'lone-plugin', version: '0.9.32', main: 'gone.js', keywords: ['scraper-ruleset'] })
+      );
+
+      const result = await bootstrapPlugins(buildApp(), { nodeModulesDir: dir });
+
+      expect(pluginsView(result)).toEqual({ loaded: [], refused: [{ name: 'lone-plugin', version: '0.9.32' }] });
+      expect(durableQueueHold(result)).toBe('plugin(s) refused at startup: lone-plugin');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('lists the candidates that failed to load first (they fail as they are imported), then the plugins refused while they registered', async () => {
+    // a-refusing-plugin imports fine and throws in register(); zz-gone-plugin's entry file is missing.
+    // Discovery imports every candidate before any register() runs, so zz-gone failed first.
+    const result = await bootstrapPlugins(buildApp(), { nodeModulesDir: path.join(__dirname, '..', 'fixtures', 'plugin-sets', 'refused-order') });
+
+    expect(result.plugins).toEqual([]);
+    expect(pluginsView(result).refused).toEqual([
+      { name: 'zz-gone-plugin', version: '3.0.0' },
+      { name: 'a-refusing-plugin', version: '2.0.0' },
+    ]);
+    expect(durableQueueHold(result)).toBe('plugin(s) refused at startup: zz-gone-plugin, a-refusing-plugin');
+  });
+});
+
+/**
+ * The startup decision src/index.ts makes once the plugins have loaded: restore the durable queue into
+ * a registry that came up whole, or HOLD it. index.ts makes this one call, so every way to get it wrong
+ * (never holding, holding nothing when the bootstrap threw, always restoring, ignoring a refusal) is a
+ * failing test here rather than a burned row at the next boot.
+ */
+describe('settleDurableQueue', () => {
+  const site = (siteId: string) => ({
+    siteId,
+    name: siteId,
+    domains: [`${siteId}.example.test`],
+    rateLimit: { domain: `${siteId}.example.test`, baseDelayMs: 1000, minDelayMs: 500, maxDelayMs: 5000, backoffMultiplier: 1.5, recoveryDivisor: 1.5, successThreshold: 3 },
+    requiresBrowser: false,
+    allowedCookies: [],
+  });
+  const plugin = (name: string, sites: string[], refuse = false) =>
+    buildSpyPlugin({
+      name,
+      register: async (registry: ExtractionRegistry) => {
+        for (const siteId of sites) registry.registerSite(site(siteId));
+        if (refuse) throw new Error(`${name} failed`);
+      },
+    });
+  const fakeQueue = () => ({
+    restoreFromStore: jest.fn<ScrapeQueue['restoreFromStore']>(),
+    holdQueueStore: jest.fn<ScrapeQueue['holdQueueStore']>(),
+  });
+  let errorSpy: ReturnType<typeof jest.spyOn>;
+  beforeEach(() => {
+    errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+  });
+  afterEach(() => errorSpy.mockRestore());
+
+  it('restores, and holds nothing, when every plugin loaded and a store registered', async () => {
+    const queue = fakeQueue();
+    const result = await bootstrapPlugins(buildApp(), { discover: async () => [plugin('a', ['alpha'])] });
+
+    expect(settleDurableQueue(queue, result)).toBeUndefined();
+    expect(queue.restoreFromStore).toHaveBeenCalledTimes(1);
+    expect(queue.holdQueueStore).not.toHaveBeenCalled();
+  });
+
+  it('holds, and never restores, when a plugin was refused beside a whole one', async () => {
+    const queue = fakeQueue();
+    const result = await bootstrapPlugins(buildApp(), { discover: async () => [plugin('a', ['alpha']), plugin('broken', ['beta'], true)] });
+
+    expect(settleDurableQueue(queue, result)).toBe('plugin(s) refused at startup: broken');
+    expect(queue.holdQueueStore.mock.calls).toEqual([['plugin(s) refused at startup: broken']]);
+    expect(queue.restoreFromStore).not.toHaveBeenCalled();
+  });
+
+  it('holds, and never restores, when no store registered', async () => {
+    const queue = fakeQueue();
+    const result = await bootstrapPlugins(buildApp(), { discover: async () => [plugin('empty', [])] });
+
+    expect(settleDurableQueue(queue, result)).toBe('no plugin registered a store');
+    expect(queue.holdQueueStore.mock.calls).toEqual([['no plugin registered a store']]);
+    expect(queue.restoreFromStore).not.toHaveBeenCalled();
+  });
+
+  it('holds, and never restores, when the bootstrap did not complete', () => {
+    const queue = fakeQueue();
+
+    expect(settleDurableQueue(queue, undefined)).toBe('the plugin bootstrap did not complete');
+    expect(queue.holdQueueStore.mock.calls).toEqual([['the plugin bootstrap did not complete']]);
+    expect(queue.restoreFromStore).not.toHaveBeenCalled();
   });
 });

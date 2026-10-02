@@ -5,7 +5,7 @@
  * store's required cookie names. The engine only indexes and answers lookups: no engine file names
  * a store, a host or an AI token, so every host below is an example.test / .invalid placeholder.
  */
-import { createExtractionRegistry } from '../../services/extractionRegistry';
+import { createExtractionRegistry, isArrayOf } from '../../services/extractionRegistry';
 import type {
   AiBarSummary,
   HandsOffPolicy,
@@ -473,6 +473,71 @@ describe('ExtractionRegistry.registerHandsOffPolicy — the policy is read once,
     );
     expect(registry.handsOffView()).toEqual([]);
   });
+
+  it('stores a policy whose extra data is cyclic, frozen through the cycle, instead of overflowing the stack', () => {
+    const registry = createExtractionRegistry();
+    const note: Record<string, unknown> = { text: 'generated' };
+    note.self = note;
+    const summaryNote: Record<string, unknown> = {};
+    summaryNote.loop = [summaryNote];
+
+    registry.registerHandsOffPolicy({ ...policy({ summary: { ...SUMMARY, note: summaryNote } as AiBarSummary }), note } as HandsOffPolicy);
+
+    const stored = registry.handsOffPolicyFor('https://alpha.example.test/') as unknown as {
+      note: { self: unknown };
+      summary: { note: { loop: unknown[] } };
+    };
+    expect(stored.note.self).toBe(stored.note);
+    expect(Object.isFrozen(stored.note)).toBe(true);
+    expect(stored.summary.note.loop[0]).toBe(stored.summary.note);
+    expect(Object.isFrozen(stored.summary.note.loop)).toBe(true);
+  });
+});
+
+/**
+ * The array check stops at the first element that fails, a hole included, so a sparse array of any
+ * length costs one read rather than one per index (Array.from over a length of 2^32-1 runs out of memory).
+ */
+describe('isArrayOf', () => {
+  const isText = (value: unknown): value is string => typeof value === 'string';
+
+  /** A sparse array of the largest length that counts its index reads and refuses to go past the third. */
+  function countingSparse(fill: Record<number, unknown> = {}) {
+    const reads: string[] = [];
+    const target = new Array<unknown>(2 ** 32 - 1);
+    for (const [index, value] of Object.entries(fill)) target[Number(index)] = value;
+    const array = new Proxy(target, {
+      get(inner, key, receiver) {
+        if (typeof key === 'string' && /^\d+$/.test(key)) {
+          reads.push(key);
+          if (reads.length > 3) throw new Error(`read index ${key}: past the first failing element`);
+        }
+        return Reflect.get(inner, key, receiver);
+      },
+    });
+    return { array, reads };
+  }
+
+  it('stops at a leading hole', () => {
+    const { array, reads } = countingSparse();
+
+    expect(isArrayOf(array, isText)).toBe(false);
+    expect(reads).toEqual(['0']);
+  });
+
+  it('stops at the first hole after elements that pass', () => {
+    const { array, reads } = countingSparse({ 0: 'a', 1: 'b' });
+
+    expect(isArrayOf(array, isText)).toBe(false);
+    expect(reads).toEqual(['0', '1', '2']);
+  });
+
+  it('accepts a dense array whose every element passes, and refuses a non-array or a failing element', () => {
+    expect(isArrayOf(['a', 'b'], isText)).toBe(true);
+    expect(isArrayOf([], isText)).toBe(true);
+    expect(isArrayOf(['a', 1], isText)).toBe(false);
+    expect(isArrayOf({ length: 0 }, isText)).toBe(false);
+  });
 });
 
 describe('ExtractionRegistry.robotsPinsFor', () => {
@@ -561,12 +626,35 @@ describe('ExtractionRegistry.requiredCookiesFor', () => {
     expect(registry.requiredCookiesFor('beta.example.test')).toBeUndefined();
   });
 
-  it('answers undefined for a host no site covers, and for a non-array value from an untyped plugin', () => {
+  it('answers undefined for a host no site covers', () => {
     const registry = createExtractionRegistry();
-    registry.registerSite(site({ requiredCookies: 'cf_clearance' as unknown as string[] }));
+    registry.registerSite(site({ requiredCookies: ['cf_clearance'] }));
+
+    expect(registry.requiredCookiesFor('nowhere.example.test')).toBeUndefined();
+  });
+
+  it.each([
+    ['a string', 'cf_clearance'],
+    ['a name that is not a string', ['cf_clearance', 5]],
+    ['a hole', [, 'session']],
+    ['an object', { 0: 'cf_clearance', length: 1 }],
+  ])('refuses a site whose requiredCookies is %s, naming the site, and registers none of it', (_label, requiredCookies) => {
+    const registry = createExtractionRegistry();
+
+    expect(() => registry.registerSite(site({ requiredCookies: requiredCookies as unknown as string[] }))).toThrow(
+      'site "alpha": requiredCookies must be an array of cookie names (strings) when present'
+    );
+    expect(registry.requiredCookiesFor('alpha.example.test')).toBeUndefined();
+    expect(registry.getSiteConfigForUrl('https://alpha.example.test/')).toBeUndefined();
+  });
+
+  it('answers undefined when the plugin later swaps its own site object\'s requiredCookies for a non-array (the config is held as registered)', () => {
+    const registry = createExtractionRegistry();
+    const config = site({ requiredCookies: ['cf_clearance'] });
+    registry.registerSite(config);
+    (config as { requiredCookies: unknown }).requiredCookies = 'cf_clearance';
 
     expect(registry.requiredCookiesFor('alpha.example.test')).toBeUndefined();
-    expect(registry.requiredCookiesFor('nowhere.example.test')).toBeUndefined();
   });
 });
 

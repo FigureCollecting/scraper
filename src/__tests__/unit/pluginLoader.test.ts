@@ -1,7 +1,8 @@
 import path from 'path';
-import { promises as fsPromises } from 'fs';
+import os from 'os';
+import { promises as fsPromises, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { jest } from '@jest/globals';
-import { discoverPlugins, resolvePluginExport } from '../../services/pluginLoader';
+import { discoverPluginCandidates, discoverPlugins, resolvePluginExport } from '../../services/pluginLoader';
 
 const FIXTURES_DIR = path.join(__dirname, '..', 'fixtures', 'plugins');
 
@@ -99,6 +100,77 @@ describe('discoverPlugins', () => {
     expect(plugins.find(p => p.name === 'missing-entry-plugin')).toBeUndefined();
     // Sibling valid plugins are still discovered.
     expect(plugins.find(p => p.name === 'mock-scraper-ruleset')).toBeDefined();
+  });
+});
+
+/**
+ * A package that advertises the keyword but does not load is not simply absent: the engine came up
+ * WITHOUT a plugin it was given. discoverPluginCandidates returns those candidates beside the plugins,
+ * named from their package.json, so the bootstrap can list them as refused and hold the durable queue.
+ */
+describe('discoverPluginCandidates', () => {
+  it('returns the same plugins as discoverPlugins, and the candidates that did not load beside them', async () => {
+    const { plugins, failed } = await discoverPluginCandidates({ nodeModulesDir: FIXTURES_DIR });
+
+    expect(plugins.map(p => p.name).sort()).toEqual((await discoverPlugins({ nodeModulesDir: FIXTURES_DIR })).map(p => p.name).sort());
+    expect(failed.map(f => f.name).sort()).toEqual(['broken-plugin', 'missing-entry-plugin', 'throwing-entry-plugin']);
+    // A package without the keyword is not a candidate at all, so it is not a failed one either.
+    expect(failed.find(f => f.name === 'not-a-ruleset')).toBeUndefined();
+  });
+
+  it('reports a candidate whose entry file throws as it is imported', async () => {
+    const { failed } = await discoverPluginCandidates({ nodeModulesDir: FIXTURES_DIR });
+
+    expect(failed.find(f => f.name === 'throwing-entry-plugin')).toEqual({
+      name: 'throwing-entry-plugin',
+      version: '4.0.0',
+      dir: path.join(FIXTURES_DIR, 'throwing-entry-plugin'),
+      reason: 'import_failed',
+    });
+  });
+
+  it('reports a candidate whose entry file is missing', async () => {
+    const { failed } = await discoverPluginCandidates({ nodeModulesDir: FIXTURES_DIR });
+
+    expect(failed.find(f => f.name === 'missing-entry-plugin')).toEqual({
+      name: 'missing-entry-plugin',
+      version: '1.0.0',
+      dir: path.join(FIXTURES_DIR, 'missing-entry-plugin'),
+      reason: 'import_failed',
+    });
+  });
+
+  it('reports a candidate that imports but fails the ScraperPlugin shape check', async () => {
+    const { failed } = await discoverPluginCandidates({ nodeModulesDir: FIXTURES_DIR });
+
+    expect(failed.find(f => f.name === 'broken-plugin')).toEqual({
+      name: 'broken-plugin',
+      version: '1.0.0',
+      dir: path.join(FIXTURES_DIR, 'broken-plugin'),
+      reason: 'not_a_plugin',
+    });
+  });
+
+  it('names a candidate whose package.json has no usable name or version by its directory and "unknown"', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'plugin-loader-'));
+    try {
+      const write = (rel: string, pkg: Record<string, unknown>) => {
+        mkdirSync(path.join(dir, rel), { recursive: true });
+        writeFileSync(path.join(dir, rel, 'package.json'), JSON.stringify({ main: 'gone.js', keywords: ['scraper-ruleset'], ...pkg }));
+      };
+      write('nameless', {});
+      write(path.join('@anon', 'blank'), { name: '', version: 7 });
+
+      const { plugins, failed } = await discoverPluginCandidates({ nodeModulesDir: dir });
+
+      expect(plugins).toEqual([]);
+      expect(failed.map(({ name, version, reason }) => [name, version, reason]).sort()).toEqual([
+        ['@anon/blank', 'unknown', 'import_failed'],
+        ['nameless', 'unknown', 'import_failed'],
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
