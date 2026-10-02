@@ -50,7 +50,7 @@ describe('diag budget — four processes racing for one host', () => {
   });
 
   it('charges exactly the cap across processes, with no lock errors', async () => {
-    const cap = 50;
+    const cap = 24;
     const startAt = Date.now() + 4_000;
     const results = await Promise.all(
       Array.from({ length: 4 }, () => runChild([dir, String(cap), String(startAt), '40']))

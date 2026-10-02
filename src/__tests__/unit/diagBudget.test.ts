@@ -18,6 +18,7 @@ import {
   DEFAULT_DIAG_HOST_DAILY_CAP,
   DIAG_BUDGET_WINDOW_MS,
   DIAG_HOST_DAILY_CAP_ENV,
+  DIAG_HOST_DAILY_CAP_MAX,
   openDiagBudget,
   probeMaxRequests,
   resolveHostDailyCap,
@@ -131,6 +132,15 @@ describe('resolveHostDailyCap — DIAG_HOST_DAILY_CAP', () => {
     process.env[DIAG_HOST_DAILY_CAP_ENV] = '4';
     expect(resolveHostDailyCap()).toBe(4);
   });
+
+  it('has a ceiling of 24: 24 is read, anything above it is fatal and names the variable', () => {
+    expect(DIAG_HOST_DAILY_CAP_MAX).toBe(24);
+    expect(resolveHostDailyCap({ [DIAG_HOST_DAILY_CAP_ENV]: '24' })).toBe(24);
+    for (const raw of ['25', '1000000', '9007199254740991']) {
+      expect(() => resolveHostDailyCap({ [DIAG_HOST_DAILY_CAP_ENV]: raw })).toThrow(DIAG_HOST_DAILY_CAP_ENV);
+      expect(() => resolveHostDailyCap({ [DIAG_HOST_DAILY_CAP_ENV]: raw })).toThrow(/at most 24/);
+    }
+  });
 });
 
 describe('openDiagBudget — the diag_budget table in the queue sqlite', () => {
@@ -210,6 +220,23 @@ describe('openDiagBudget — the diag_budget table in the queue sqlite', () => {
 
   it.each([-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])('refuses hostDailyCap %p by name', (cap) => {
     expect(() => openDiagBudget({ dir: tmpDir(), hostDailyCap: cap })).toThrow(/hostDailyCap/);
+  });
+
+  it('the ceiling holds for a cap passed in code too: 24 opens, 25 is refused by name', () => {
+    expect(open(tmpDir(), 24).hostDailyCap).toBe(24);
+    expect(() => openDiagBudget({ dir: tmpDir(), hostDailyCap: 25 })).toThrow(/hostDailyCap must be at most 24/);
+  });
+
+  it('closes its handle when setting up the file fails after the open', () => {
+    const dir = tmpDir();
+    fs.writeFileSync(path.join(dir, QUEUE_DB_FILE), 'this is not a database, it is a long enough line of text '.repeat(40));
+    const close = jest.spyOn(DatabaseSync.prototype, 'close');
+    try {
+      expect(() => openDiagBudget({ dir, hostDailyCap: 6 })).toThrow(/not a database/);
+      expect(close).toHaveBeenCalledTimes(1);
+    } finally {
+      close.mockRestore();
+    }
   });
 
   it('throws when the file is not a database, and leaves it as it was', () => {
@@ -327,6 +354,42 @@ describe('the per-host rolling 24 h cap', () => {
     expect(b.remaining('www.STORE.example')).toBe(1);
     expect(rows(dir)[0].host).toBe('store.example');
     expect(() => b.remaining('')).toThrow(/host/);
+  });
+
+  it('a trailing dot names the same host: store.example. and store.example share one budget', () => {
+    const dir = tmpDir();
+    const b = open(dir, 1);
+    expect(b.startCall({ probe: Probe.ROBOTS_SNAPSHOT, host: 'store.example.', runId: 'r' }).charge()).toBe(true);
+    expect(b.remaining('store.example')).toBe(0);
+    expect(b.startCall({ probe: Probe.ROBOTS_SNAPSHOT, host: 'Store.Example', runId: 'r' }).charge()).toBe(false);
+    expect(rows(dir).map((r) => r.host)).toEqual(['store.example']);
+  });
+
+  it.each([
+    ['a port', 'store.example:443'],
+    ['a space inside', 'store .example'],
+    ['a non-ASCII spelling (book the punycode form)', 'störe.example'],
+    ['a URL', 'https://store.example'],
+    ['a path', 'store.example/robots.txt'],
+    ['an empty label', 'store..example'],
+    ['two trailing dots', 'store.example..'],
+    ['a label starting with a hyphen', '-store.example'],
+    ['an underscore', 'store_x.example'],
+    ['a label of 64 characters', `${'a'.repeat(64)}.example`],
+  ])('refuses %s (%j): a budget is booked against a bare DNS hostname only', (_label, host) => {
+    const dir = tmpDir();
+    const b = open(dir, 6);
+    expect(() => b.startCall({ probe: Probe.ROBOTS_SNAPSHOT, host, runId: 'r' })).toThrow(RangeError);
+    expect(() => b.remaining(host)).toThrow(/not a bare DNS hostname/);
+    expect(rows(dir)).toHaveLength(0);
+  });
+
+  it('a hostname may be 253 characters, not 254', () => {
+    const b = open(tmpDir(), 6);
+    const name = (n: number) => `${'c'.repeat(63)}.${'c'.repeat(63)}.${'c'.repeat(63)}.${'c'.repeat(n - 3 * 64)}`;
+    expect(name(253)).toHaveLength(253);
+    expect(b.remaining(name(253))).toBe(6);
+    expect(() => b.remaining(name(254))).toThrow(/not a bare DNS hostname/);
   });
 
   it('a cap lowered below what the window already holds reports 0 left, never a negative number', () => {

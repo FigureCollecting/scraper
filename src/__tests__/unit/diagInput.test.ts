@@ -9,8 +9,12 @@
  *   - store: a siteId the engine registry holds;
  *   - origin (store-less robots-snapshot only): https + a bare public DNS hostname. The engine runs
  *     INSIDE the cluster, so IP literals, localhost, *.local, *.svc, *.cluster.local, *.internal and
- *     single-label names are refused (SSRF guard); a host a registered store owns must use --store;
- *     a host a registered policy denies is refused;
+ *     single-label names are refused (SSRF guard), and so is any name whose top-level domain is not
+ *     an ICANN one (the cluster's short <svc>.<ns> form, home-network names like router.lan) or
+ *     that is a public suffix itself; a host a registered store owns must use --store; a host a
+ *     registered policy denies is refused;
+ *   - store: what the lookup returns must be the store asked for, and a store a policy denies is
+ *     refused in every mode;
  *   - ids (item-status only): at most the probe maximum (2), each a FULL match of the store's
  *     declared id pattern, digits-only when it declares none; pair needs exactly one id (the control).
  * The registry is injected, so this file names no store and no host.
@@ -27,6 +31,8 @@ const STORES: Record<string, DiagStoreInfo & { domains: string[] }> = {
   gamma: { siteId: 'gamma', domains: ['gamma.example.net'], idPattern: /[0-9]+/g },
   delta: { siteId: 'delta', domains: ['www.delta.example.com'], idPattern: /[a-z]{2}-[0-9]{3}/m },
   sticky: { siteId: 'sticky', domains: ['sticky.example.com'], idPattern: /[0-9]+/y },
+  epsilon: { siteId: 'epsilon', domains: ['epsilon.example.com'], idPattern: /[0-9]+|[a-z]{2}-[0-9]{3}/ },
+  omega: { siteId: 'omega', domains: ['omega.example.com'], denied: true },
 };
 const DENIED = ['denied.example.org', 'www.denied-www.example.org'];
 
@@ -73,6 +79,36 @@ describe('robots-snapshot --store', () => {
     expect(refusal({ probe: Probe.ROBOTS_SNAPSHOT, store: 'nope' })).toEqual({
       field: 'store',
       reason: expect.stringMatching(/not a registered store/),
+    });
+  });
+
+  it.each(['constructor', '__proto__', 'toString', 'hasOwnProperty'])(
+    'refuses store %j: a plain-object lookup answers a built-in property, not a store',
+    (store) => {
+      expect(refusal({ probe: Probe.ROBOTS_SNAPSHOT, store })).toEqual({
+        field: 'store',
+        reason: expect.stringMatching(/not a registered store/),
+      });
+      expect(refusal({ probe: Probe.ITEM_STATUS, store, ids: ['1'] }).field).toBe('store');
+    }
+  );
+
+  it('refuses a store when the lookup answers with a different store', () => {
+    const askedBeta: DiagInputLookups = { ...lookups, storeById: () => STORES.alpha };
+    const r1 = validateRunProbeInput(req({ probe: Probe.ROBOTS_SNAPSHOT, store: 'beta' }), askedBeta);
+    const r2 = validateRunProbeInput(req({ probe: Probe.ITEM_STATUS, store: 'beta', ids: ['1'] }), askedBeta);
+    expect(r1.ok || r1.field).toBe('store');
+    expect(r2.ok || r2.field).toBe('store');
+  });
+
+  it('refuses a store a registered policy denies, in robots-snapshot and in item-status', () => {
+    expect(refusal({ probe: Probe.ROBOTS_SNAPSHOT, store: 'omega' })).toEqual({
+      field: 'store',
+      reason: expect.stringMatching(/denied/),
+    });
+    expect(refusal({ probe: Probe.ITEM_STATUS, store: 'omega', ids: ['1'] })).toEqual({
+      field: 'store',
+      reason: expect.stringMatching(/denied/),
     });
   });
 
@@ -194,10 +230,57 @@ describe('robots-snapshot --origin (store-less first contact)', () => {
     expect(refusal({ probe: Probe.ROBOTS_SNAPSHOT, origin: `https://${name(254)}` }).reason).toMatch(/not a DNS hostname/);
   });
 
-  it('a name that only ends in the same letters as a reserved suffix is not refused for it', () => {
-    expect(check({ probe: Probe.ROBOTS_SNAPSHOT, origin: 'https://shop.contest' }).ok).toBe(true);
-    expect(check({ probe: Probe.ROBOTS_SNAPSHOT, origin: 'https://shop.glocal' }).ok).toBe(true);
+  it('a name that only ends in the same letters as a reserved suffix is not refused for that suffix', () => {
+    // Neither .contest nor .glocal is an ICANN top-level domain, so both are refused, but for that.
+    for (const [origin, suffix] of [
+      ['https://shop.contest', '.test'],
+      ['https://shop.glocal', '.local'],
+    ]) {
+      const { reason } = refusal({ probe: Probe.ROBOTS_SNAPSHOT, origin });
+      expect(reason).not.toContain(`(${suffix})`);
+      expect(reason).toMatch(/not under an ICANN top-level domain/);
+    }
   });
+
+  it.each([
+    ['a cluster service, short form', 'https://scraper.fc'],
+    ['a cluster service, short form', 'https://pg-spine.fc'],
+    ['the API server, short form', 'https://kubernetes.default'],
+    ['a cluster service, short form', 'https://openbao.openbao'],
+    ['a cluster service, short form', 'https://grafana.monitoring'],
+    ['a cluster name without .local', 'https://kubernetes.default.svc.cluster'],
+    ['a pod name', 'https://10-42-0-7.fc.pod'],
+    ['a home-network name', 'https://router.lan'],
+    ['a home-network name', 'https://nas.home'],
+    ['a private-use name', 'https://host.corp'],
+    ['a private-use name', 'https://host.intranet'],
+    ['a private-use name', 'https://host.private'],
+    ['a resolver default domain', 'https://host.localdomain'],
+  ])('refuses %s (%j): its top-level domain is not an ICANN one', (_label, origin) => {
+    const host = origin.slice('https://'.length);
+    const tld = host.slice(host.lastIndexOf('.'));
+    expect(refusal({ probe: Probe.ROBOTS_SNAPSHOT, origin })).toEqual({
+      field: 'origin',
+      reason: `origin: '${host}' is not under an ICANN top-level domain (${tld})`,
+    });
+  });
+
+  it.each(['https://co.uk', 'https://com.au', 'https://foo.kawasaki.jp'])(
+    'refuses %j, a public suffix itself rather than a host under one',
+    (origin) => {
+      expect(refusal({ probe: Probe.ROBOTS_SNAPSHOT, origin })).toEqual({
+        field: 'origin',
+        reason: expect.stringMatching(/is a public suffix, not a host/),
+      });
+    }
+  );
+
+  it.each(['https://shop.myshopify.com', 'https://pages.github.io', 'https://shop.example.co.uk', 'https://www.ck'])(
+    'accepts %j: a host under a privately run suffix or a multi-label ICANN suffix is still a public name',
+    (origin) => {
+      expect(check({ probe: Probe.ROBOTS_SNAPSHOT, origin }).ok).toBe(true);
+    }
+  );
 
   it.each(['https://denied.example.org', 'https://www.denied.example.org'])('refuses %j, a denied host', (origin) => {
     expect(refusal({ probe: Probe.ROBOTS_SNAPSHOT, origin })).toEqual({
@@ -276,6 +359,15 @@ describe('item-status', () => {
     expect(check({ probe: Probe.ITEM_STATUS, store: 'sticky', ids: ['42', '43'] }).ok).toBe(true);
   });
 
+  it('a declared pattern with an alternation must match the WHOLE id with either branch, never a part', () => {
+    for (const id of ['123', 'ab-123']) {
+      expect(check({ probe: Probe.ITEM_STATUS, store: 'epsilon', ids: [id] }).ok).toBe(true);
+    }
+    for (const id of ['1/../../admin', 'x/ab-123', '123/x', 'ab-123/../1']) {
+      expect(refusal({ probe: Probe.ITEM_STATUS, store: 'epsilon', ids: [id] }).field).toBe('ids');
+    }
+  });
+
   it('a declared pattern carrying the m flag cannot match one line of a multi-line id', () => {
     expect(check({ probe: Probe.ITEM_STATUS, store: 'delta', ids: ['ab-123'] }).ok).toBe(true);
     expect(refusal({ probe: Probe.ITEM_STATUS, store: 'delta', ids: ['ab-123\nzz'] }).field).toBe('ids');
@@ -300,6 +392,12 @@ describe('max_requests and run_id', () => {
     expect(r1.ok && r1.input.runId).toBeUndefined();
     const r2 = check({ ...base, runId: 'diag-robots-29341234.1' });
     expect(r2.ok && r2.input.runId).toBe('diag-robots-29341234.1');
+  });
+
+  it('a run_id may be 128 characters, not 129', () => {
+    const base = { probe: Probe.ROBOTS_SNAPSHOT, store: 'alpha' } as const;
+    expect(check({ ...base, runId: 'x'.repeat(128) }).ok).toBe(true);
+    expect(refusal({ ...base, runId: 'x'.repeat(129) }).field).toBe('run_id');
   });
 
   it.each(['../etc', 'a/b', '.hidden', '-flag', 'run\nid', 'run id', 'run:1', 'x'.repeat(129)])(
