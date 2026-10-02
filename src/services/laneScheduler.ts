@@ -374,7 +374,7 @@ function startsWithClass(entry: string): boolean {
 
 /**
  * `SCRAPE_LANE_WEIGHTS`: per host, hosts separated by ';', e.g.
- * `myfigurecollection.net=new:40,company:40,gap:20,other:10`. A class left out gets weight 0.
+ * `shop.example=new:40,company:40,gap:20,other:10`. A class left out gets weight 0.
  *
  * Fail-safe: a host is laned by one whole, well-formed entry or not at all, except through the gap
  * named at the end. An entry whose class list is malformed (an unknown or repeated class, a
