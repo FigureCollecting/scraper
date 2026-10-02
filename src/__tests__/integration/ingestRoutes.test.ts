@@ -272,6 +272,24 @@ describe('POST /ingest/scrape', () => {
       expect(queue.isPending(FIXTURE_URL)).toBe(true);
     });
 
+    it('never forwards a lane: the REST route does not learn it (lanes arrive over gRPC only)', async () => {
+      const enqueueSpy = jest.spyOn(queue, 'enqueue');
+
+      const response = await request(makeApp(queue))
+        .post('/ingest/scrape')
+        .send({ url: FIXTURE_URL, lane: 'new' })
+        .expect(202);
+
+      expect(enqueueSpy).toHaveBeenCalledWith(FIXTURE_URL, { url: FIXTURE_URL });
+      expect(response.body).toEqual({
+        success: true,
+        itemId: expect.any(String),
+        deduplicated: false,
+        position: expect.any(Number),
+      });
+      expect(queue.getLaneCounts('figures.example.test').other.resident).toBe(1);
+    });
+
     it('deduplicates a repeat trigger for the same URL', async () => {
       const app = makeApp(queue);
       const first = await request(app).post('/ingest/scrape').send({ url: FIXTURE_URL }).expect(202);
@@ -328,6 +346,49 @@ describe('POST /ingest/scrape', () => {
       // outcome observable via queue accounting (and completion log lines)
       await waitFor(() => queue.getStats().completed === 1);
       expect(queue.getStats().failed).toBe(0);
+    });
+
+    // The one case where this route's answer differs from develop 26c145a8 (QB-U1, recorded against
+    // plan acceptance g): a url already being fetched at COLD and triggered again at the default
+    // WARM. develop's raise queued a copy of the in-flight item in WARM, so it answered position 0
+    // and fetched the url a second time; the raise is now recorded on the item and nothing is queued.
+    it('a url being fetched at COLD, triggered again at the default WARM, answers position -1 and is fetched once', async () => {
+      const ruleset = makeRuleset();
+      const scraping = makeScrapingStub();
+      const send = jest.fn().mockResolvedValue(okWriteStats());
+      // The first fetch is held on the wire until the test releases it.
+      let release: () => void = () => {};
+      scraping.scrapePage.mockImplementationOnce(() => new Promise(resolve => {
+        release = () => resolve({ html: FIXTURE_HTML, url: FIXTURE_URL, title: 'Item', statusCode: 200 });
+      }));
+
+      queue = new ScrapeQueue(false);
+      queue.setPluginRegistry(makeRegistry(ruleset));
+      queue.setIngestEmitter({ send });
+      queue.setScrapingService(scraping);
+      const app = makeApp(queue);
+
+      await request(app).post('/ingest/scrape').send({ url: FIXTURE_URL, priority: 'COLD' }).expect(202);
+      await waitFor(() => scraping.scrapePage.mock.calls.length === 1);
+      const again = await request(app).post('/ingest/scrape').send({ url: FIXTURE_URL }).expect(202);
+      release();
+      // Idle: nothing queued in any tier, nothing on the wire, and the url no longer pending.
+      await waitFor(() => {
+        const stats = queue.getStats();
+        return stats.completed >= 1 && stats.total === 0 && stats.processing === 0 && !queue.isPending(FIXTURE_URL);
+      });
+
+      expect({
+        answer: again.body,
+        fetches: scraping.scrapePage.mock.calls.length,
+        emitted: send.mock.calls.length,
+        completed: queue.getStats().completed,
+      }).toEqual({
+        answer: { success: true, itemId: expect.any(String), deduplicated: true, position: -1 },
+        fetches: 1,
+        emitted: 1,
+        completed: 1,
+      });
     });
 
     it('logs a failure line when the triggered item permanently fails (smoke observability)', async () => {
