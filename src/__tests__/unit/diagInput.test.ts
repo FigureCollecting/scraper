@@ -173,6 +173,22 @@ describe('robots-snapshot --origin (store-less first contact)', () => {
     expect(refusal({ probe: Probe.ROBOTS_SNAPSHOT, origin }).field).toBe('origin');
   });
 
+  it.each([
+    ['https://app.localhost', 'localhost'],
+    ['https://printer.local', 'local'],
+    ['https://scraper.fc.svc', 'svc'],
+    ['https://scraper.fc.svc.cluster.local', 'local'],
+    ['https://metadata.google.internal', 'internal'],
+    ['https://shop.test', 'test'],
+    ['https://shop.example', 'example'],
+    ['https://shop.invalid', 'invalid'],
+    ['https://shop.onion', 'onion'],
+    ['https://router.home.arpa', 'arpa'],
+  ])('refuses %j for its reserved suffix (.%s), whatever the Public Suffix List says of that suffix', (origin, suffix) => {
+    const host = origin.slice('https://'.length);
+    expect(refusal({ probe: Probe.ROBOTS_SNAPSHOT, origin }).reason).toBe(`origin: '${host}' is not a public name (.${suffix})`);
+  });
+
   it.each(['https://alpha.example.com', 'https://cdn.alpha.example.com'])(
     'refuses %j, a host a registered store owns, and says to use --store',
     (origin) => {
