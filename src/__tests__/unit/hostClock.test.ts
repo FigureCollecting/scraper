@@ -108,6 +108,50 @@ describe('HostClock', () => {
     expect(clock.tryAcquire('hpoi.net', 10, 7000)).toBe(0);
   });
 
+  describe('settle (a blocking caller stamps its own slot with the instant it really sends)', () => {
+    it('moves its own booking to a late send, so the next request is spaced from when it really left', () => {
+      const clock = clockFor();
+      clock.tryAcquire(MFC, 0, 7000);
+      expect(clock.reserve(MFC, 100, 7000)).toBe(7000);
+      // The timer fired 600 ms late: the image really left at 7600, not at its slot.
+      expect(clock.settle('WWW.MyFigureCollection.net.', 7000, 7600)).toBe(true);
+      expect(clock.tryAcquire(MFC, 14_000, 7000)).toBe(600);
+      expect(clock.reserve(MFC, 8000, 7000)).toBe(14_600);
+    });
+
+    it('on time, changes nothing', () => {
+      const clock = clockFor();
+      clock.tryAcquire(MFC, 0, 7000);
+      clock.reserve(MFC, 100, 7000);
+      expect(clock.settle(MFC, 7000, 7000)).toBe(true);
+      expect(clock.tryAcquire(MFC, 13_999, 7000)).toBe(1);
+      expect(clock.tryAcquire(MFC, 14_000, 7000)).toBe(0);
+    });
+
+    it('refuses a send before its slot (an early timer) and never moves the booking earlier', () => {
+      const clock = clockFor();
+      clock.tryAcquire(MFC, 0, 7000);
+      clock.reserve(MFC, 100, 7000);
+      expect(clock.settle(MFC, 7000, 6999)).toBe(false);
+      expect(clock.tryAcquire(MFC, 13_999, 7000)).toBe(1);
+    });
+
+    it("refuses a slot that is no longer the host's latest booking, and changes nothing", () => {
+      const clock = clockFor();
+      expect(clock.reserve(MFC, 0, 7000)).toBe(0);
+      // The image slept through its slot; the queue took the host at 7000.
+      expect(clock.tryAcquire(MFC, 7000, 7000)).toBe(0);
+      expect(clock.settle(MFC, 0, 7100)).toBe(false);
+      expect(clock.tryAcquire(MFC, 13_999, 7000)).toBe(1);
+    });
+
+    it('refuses on a host with no booking', () => {
+      const clock = clockFor('all');
+      expect(clock.settle('hpoi.net', 0, 0)).toBe(false);
+      expect(clock.tryAcquire('hpoi.net', 0, 7000)).toBe(0);
+    });
+  });
+
   it('says which hosts are in scope', () => {
     const clock = clockFor();
     expect(clock.inScope('www.MyFigureCollection.net')).toBe(true);

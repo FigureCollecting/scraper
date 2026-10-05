@@ -11,6 +11,7 @@
  * does not cover keeps today's limiter pacing exactly. Fake clocks throughout, no network.
  */
 import { HostRateLimiter } from '../../driver/hostRateLimiter';
+import { ChallengeCooldown } from '../../services/challengeCooldown';
 import { HostClock, parseHostClockScope, setHostClock } from '../../services/hostClock';
 import { paceImageBytesByHost } from '../../services/images/imageBytesPacing';
 import type { ImageBytesResult } from '../../services/images/imageBytes';
@@ -176,6 +177,112 @@ describe('paceImageBytesByHost on the shared host clock (QB-U8)', () => {
     expect(calls).toEqual([0, 20_000]);
     // ...and the clock booked the limiter's later slot, not the floor's earlier one.
     expect(clock.tryAcquire(MFC, 26_999, FLOOR)).toBe(1);
+  });
+
+  describe('spacing is kept from when an image REALLY leaves (late and early timers, lost slots, cooldowns)', () => {
+    /** An MFC-scoped clock with a record dispatched at t=0, and a pacer whose sleeper the test scripts. */
+    function scripted(sleep: (ms: number, at: () => number, set: (t: number) => void) => void, cooldown = noCooldown as { remaining(host: string): number }) {
+      const clock = mfcClock();
+      expect(clock.tryAcquire(MFC, 0, FLOOR)).toBe(0);
+      let now = 500;
+      const calls: number[] = [];
+      const fetcher = jest.fn(async () => { calls.push(now); return ok(); });
+      const paced = paceImageBytesByHost(fetcher, new HostRateLimiter(() => undefined), {
+        now: () => now,
+        sleep: async (ms: number) => sleep(ms, () => now, t => { now = t; }),
+        cooldown,
+        hostClock: clock,
+      });
+      return { clock, paced, calls, fetcher };
+    }
+
+    it('a late timer: the next image and the next record wait a full floor after the image really left', async () => {
+      // The first wake-up is 600 ms late (an event loop busy with a big parse or a GC pause).
+      let late = 600;
+      const { clock, paced, calls } = scripted((ms, at, set) => { set(at() + ms + late); late = 0; });
+      // One after the other: this fake sleeper moves the shared time the moment a sleep begins.
+      await paced(nsp(1));
+      await paced(nsp(2));
+      expect(calls).toEqual([7600, 14_600]);
+      expect(clock.tryAcquire(MFC, 21_599, FLOOR)).toBe(1);
+    });
+
+    it('an early timer: an image never leaves before its slot', async () => {
+      // Node can fire a timer a millisecond before Date.now() reaches its due time.
+      let early = 1;
+      const { paced, calls } = scripted((ms, at, set) => { set(at() + ms - early); early = 0; });
+      await paced(nsp(1));
+      expect(calls).toEqual([FLOOR]);
+    });
+
+    it('a slot lost while asleep (the queue took the host first) is booked again behind that record', async () => {
+      const records = [0];
+      let first = true;
+      let clockRef!: HostClock;
+      const { clock, paced, calls } = scripted((ms, at, set) => {
+        if (first) {
+          first = false;
+          // The image's timer is so late that the queue polls at 14050 and dispatches record 2 first.
+          set(14_050);
+          if (clockRef.tryAcquire(MFC, 14_050, FLOOR) === 0) records.push(14_050);
+          set(14_100);
+          return;
+        }
+        set(at() + ms);
+      });
+      clockRef = clock;
+      await paced(nsp(1));
+      expect(records).toEqual([0, 14_050]);
+      expect(calls).toEqual([21_050]);
+      expect(minGap([...records, ...calls])).toBeGreaterThanOrEqual(FLOOR);
+    });
+
+    it('a challenge cooldown that opens while images wait their turn: they are refused, not fetched', async () => {
+      const cooldown = new ChallengeCooldown();
+      const { paced, fetcher } = scripted((ms, at, set) => {
+        set(at() + ms);
+        // e.g. the next record or a /lookup hit a Cloudflare challenge on the host meanwhile
+        if (!cooldown.isOpen(MFC)) cooldown.open(MFC, 'challenge page via impersonate transport');
+      }, cooldown);
+      const results = await Promise.all([paced(nsp(1)), paced(nsp(2))]);
+      expect(results.map(r => (r.ok ? 'fetched' : (r as { reason: string }).reason))).toEqual(['refused', 'refused']);
+      expect(fetcher).not.toHaveBeenCalled();
+    });
+
+    it('real timers: a busy event loop delays an image, and the next image and record still wait a full floor after it', async () => {
+      // A short floor and a fast limiter keep this to about a second; the clock is what binds.
+      const floor = 400;
+      const fast = { baseDelayMs: 50, minDelayMs: 50, maxDelayMs: 1000, backoffMultiplier: 2, recoveryDivisor: 2, successThreshold: 3 };
+      const clock = new HostClock(parseHostClockScope(MFC));
+      clock.setFloorSource(host => (host === MFC ? floor : undefined));
+      const sends: number[] = [];
+      const paced = paceImageBytesByHost(jest.fn(async () => { sends.push(Date.now()); return ok(); }), new HostRateLimiter(() => fast, fast), {
+        cooldown: noCooldown,
+        hostClock: clock,
+      });
+      const busy = (ms: number) => { const end = Date.now() + ms; while (Date.now() < end) { /* a long synchronous parse */ } };
+
+      const t0 = Date.now();
+      expect(clock.tryAcquire(MFC, t0, floor)).toBe(0); // record 1
+      sends.push(t0);
+      const images = Promise.all([paced(nsp(1)), paced(nsp(2))]);
+      setTimeout(() => busy(250), floor - 50); // the loop is blocked across image 1's slot
+      await images;
+      // Record 2, polled the way the queue polls: at the exact wait the clock names.
+      for (;;) {
+        const wait = clock.tryAcquire(MFC, Date.now(), floor);
+        if (wait === 0) break;
+        await new Promise(resolve => setTimeout(resolve, wait));
+      }
+      sends.push(Date.now());
+
+      expect(sends).toHaveLength(4);
+      expect(sends[1] - t0).toBeGreaterThanOrEqual(floor + 150); // image 1 really was late
+      // Date.now() counts whole milliseconds: a request stamped at the end of one millisecond can be
+      // measured in the next, so the measured gap may read one ms short of the floor (the exact
+      // guarantee is the fake-clock tests above). Without the fix the gap is ~200 ms short.
+      expect(minGap(sends)).toBeGreaterThanOrEqual(floor - 1);
+    });
   });
 
   describe('every other host keeps today\'s pacing exactly', () => {

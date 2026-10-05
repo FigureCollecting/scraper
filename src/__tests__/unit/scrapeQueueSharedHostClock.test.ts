@@ -33,7 +33,8 @@ jest.mock('../../services/webhookClient', () => ({
 
 import { ScrapeQueue, resetScrapeQueue } from '../../services/scrapeQueue';
 import { createExtractionRegistry, ExtractionRegistryImpl } from '../../services/extractionRegistry';
-import { HostClock, parseHostClockScope, setHostClock } from '../../services/hostClock';
+import { ChallengeCooldown } from '../../services/challengeCooldown';
+import { HostClock, getHostClock, parseHostClockScope, setHostClock } from '../../services/hostClock';
 import { HostRateLimiter } from '../../driver/hostRateLimiter';
 import { paceImageBytesByHost } from '../../services/images/imageBytesPacing';
 import type { ImageBytesFetcher, ImageBytesResult } from '../../services/images/imageBytes';
@@ -248,7 +249,8 @@ describe('ScrapeQueue on the shared host clock (QB-U8)', () => {
     const times = pageCalls.map(c => c.at);
     expect(times).toHaveLength(2);
     expect(times[1] - times[0]).toBe(1000);
-    expect(clock.tryAcquire('other.test', Date.now(), 1000)).toBe(0);
+    // At the very instant of o2's dispatch the clock still grants other.test: nothing was booked.
+    expect(clock.tryAcquire('other.test', times[1], 1000)).toBe(0);
   });
 
   it('with the clock OFF (the default process clock) records keep today\'s private floor and the clock books nothing', async () => {
@@ -259,6 +261,28 @@ describe('ScrapeQueue on the shared host clock (QB-U8)', () => {
     const times = mfcTimes(pageCalls);
     expect(times).toHaveLength(2);
     expect(times[1] - times[0]).toBe(FLOOR);
+    // At the very instant of m2's dispatch the process clock still grants the host: nothing was booked.
+    expect(getHostClock().tryAcquire(MFC, times[1], FLOOR)).toBe(0);
+  });
+
+  it("re-stamps a record's booking with the instant its fetch really leaves, so the next image is a full floor after the send", async () => {
+    const clock = new HostClock(parseHostClockScope(MFC));
+    const { pageCalls } = makeQueue(clock);
+    // Synchronous work between the dispatch decision and the transport call (a durable lease write, a
+    // long scan of the tiers) is modelled as 40 ms the fake clock moves while the queue checks the
+    // challenge cooldown, which it does after booking and before fetching.
+    const cooldown = new ChallengeCooldown();
+    const isOpen = cooldown.isOpen.bind(cooldown);
+    jest.spyOn(cooldown, 'isOpen').mockImplementation((host: string) => {
+      jest.setSystemTime(Date.now() + 40);
+      return isOpen(host);
+    });
+    queue.setChallengeCooldown(cooldown);
+    queue.enqueue('m1', { priority: 'WARM', url: `https://${MFC}/item/1` });
+    await advance(500);
+    const [sent] = mfcTimes(pageCalls);
+    expect(sent).toBeDefined();
+    expect(clock.reserve(MFC, Date.now(), FLOOR)).toBe(sent + FLOOR);
   });
 
   describe('behaviour: records and main-host images on one clock', () => {

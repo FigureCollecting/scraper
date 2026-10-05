@@ -1,6 +1,7 @@
 // Global test setup
 import { jest } from '@jest/globals';
 import { resetAllMocks } from './__mocks__/puppeteer';
+import { HOST_CLOCK_ENV, setHostClock } from '../services/hostClock';
 
 // Mock console methods to reduce test noise
 global.console = {
@@ -15,6 +16,9 @@ global.console = {
 // Set test environment variables
 process.env.NODE_ENV = 'test';
 process.env.PORT = '0'; // Use random port for tests
+// The shared host clock is process-wide and reads SCRAPE_HOST_CLOCK once: a value in the shell
+// that runs the tests must not put every queue suite on one clock that outlives each test.
+delete process.env[HOST_CLOCK_ENV];
 
 // Global test timeout
 jest.setTimeout(30000);
@@ -58,4 +62,6 @@ beforeEach(() => {
  */
 afterEach(() => {
   jest.useRealTimers();
+  // A booking on the process host clock must not pace the next test's first request.
+  setHostClock(null);
 });
