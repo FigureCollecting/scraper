@@ -12,6 +12,7 @@ import { createCatalogRoute } from './routes/catalog.js';
 import { createHealthRoutes } from './routes/health.js';
 import { getChallengeCooldown } from './services/challengeCooldown.js';
 import { getCfCookieStore } from './services/cookieJar.js';
+import { getHostClock } from './services/hostClock.js';
 import { residentialEgressView } from './services/residentialEgress.js';
 import { rawStoreView, flushRawCaptureSink } from './services/s3ObjectStore.js';
 import { imageCaptureView } from './services/images/assembleImageCapture.js';
@@ -117,6 +118,12 @@ async function startServer(): Promise<void> {
     // no matching ruleset fail cleanly through the queue's failure handling.
     queue.setPluginRegistry(registry);
     queueBootstrap = bootstrap;
+    // SHARED HOST CLOCK (SCRAPE_HOST_CLOCK, default off): a covered store host's own images are paced
+    // on the clock its records book, at the floor the queue paces that host by (QB-U8). Unbound, the
+    // image lane leaves every host on its own limiter. The boot line names each covered host's floor.
+    const hostClock = getHostClock();
+    hostClock.setFloorSource(host => queue.storeHostFloorMs(host));
+    console.log(hostClock.describe());
     // Mount the cross-store buy-decision search (GET /lookup) now that the registry is populated.
     // Each store fetches via the transport its `searchFetch` declares (http / impersonate / browser);
     // http + impersonate use the engine defaults, and the `browser` transport is backed here by the

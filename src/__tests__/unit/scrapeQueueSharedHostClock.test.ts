@@ -210,6 +210,20 @@ describe('ScrapeQueue on the shared host clock (QB-U8)', () => {
     expect(clock.tryAcquire(MFC, Date.now(), FLOOR)).toBeGreaterThan(6000);
   });
 
+  it("paces an in-scope host's records by the queue's own floor on the shared clock", async () => {
+    const clock = new HostClock(parseHostClockScope(MFC));
+    const { pageCalls } = makeQueue(clock);
+    queue.enqueue('m1', { priority: 'WARM', url: `https://${MFC}/item/1` });
+    queue.enqueue('m2', { priority: 'WARM', url: `https://${MFC}/item/2` });
+    queue.enqueue('m3', { priority: 'WARM', url: `https://${MFC}/item/3` });
+    await advance(15_000);
+    const times = mfcTimes(pageCalls);
+    expect(times).toHaveLength(3);
+    expect([times[1] - times[0], times[2] - times[1]]).toEqual([FLOOR, FLOOR]);
+    // ...and an image asking the clock with a smaller floor still waits the records' 7000.
+    expect(clock.reserve(MFC, times[2] + 10, 1000)).toBe(times[2] + FLOOR);
+  });
+
   it('holds the next record behind an image slot booked on the shared clock', async () => {
     const clock = new HostClock(parseHostClockScope(MFC));
     const { pageCalls } = makeQueue(clock);
@@ -301,9 +315,10 @@ describe('ScrapeQueue on the shared host clock (QB-U8)', () => {
       // other.test is never held behind MFC: its four records go at its own 1000 ms floor.
       expect(r.otherRecords).toHaveLength(4);
       expect(minGap(r.otherRecords)).toBe(1000);
-      // The static CDN keeps its own limiter (not the main host's floor).
+      // The static CDN is not on the main host's clock: each plate there goes straight after its
+      // record's main-host plates (its own limiter is long ready), closer to them than the floor.
       expect(r.staticImages).toHaveLength(8);
-      expect(minGap(r.staticImages)).toBeLessThan(FLOOR);
+      expect(minGap([...r.mainImages, ...r.staticImages])).toBeLessThan(FLOOR);
     });
 
     it('OFF (today): records keep 7000 ms but main-host images land closer to records and to each other', async () => {

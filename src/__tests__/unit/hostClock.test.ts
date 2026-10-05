@@ -17,6 +17,8 @@ describe('parseHostClockScope', () => {
     const inScope = parseHostClockScope(raw);
     expect(inScope(MFC)).toBe(false);
     expect(inScope('cdn.shopify.com')).toBe(false);
+    // `off` is the keyword, never a host named "off".
+    expect(inScope('off')).toBe(false);
   });
 
   it.each(['all', 'ALL', ' all '])('reads %p as every host', raw => {

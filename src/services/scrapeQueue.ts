@@ -29,6 +29,7 @@ import { createCapturingFetch, laneOf, ChallengePageError, FetchHeadersUnsupport
 import { evaluateRecordFetch, RecordFetchStatusError } from './recordFetchGate.js';
 import { observeMfcItemFetch } from './sessionCanary.js';
 import { getChallengeCooldown, ChallengeCooldownError, normalizeHost, type ChallengeCooldown } from './challengeCooldown.js';
+import { getHostClock, type HostClock } from './hostClock.js';
 import {
   createMemoryQueueStore,
   type PersistedQueueItem,
@@ -688,6 +689,9 @@ export class ScrapeQueue {
   // `currentDelay` (the GLOBAL lane): an item is only dispatched once BOTH the global lane AND
   // this per-host floor are satisfied.
   private hostLastDispatch: Map<string, number> = new Map();
+  // A host in SCRAPE_HOST_CLOCK's scope is paced on the SHARED per-host clock instead, the one the
+  // image lane books for that host's own images (QB-U8). Null = the process clock (off by default).
+  private hostClock: HostClock | null = null;
 
   // Ingest seams (engine plumbing, injected — see setters below).
   // When an emitter is configured (INGEST_BASE_URL) AND the registry resolves
@@ -1019,6 +1023,23 @@ export class ScrapeQueue {
    */
   setChallengeCooldown(cooldown: ChallengeCooldown | null): void {
     this.challengeCooldownStore = cooldown;
+  }
+
+  /**
+   * Override the shared per-host clock (tests / DI). Defaults to the process clock, which the image
+   * lane books too; it covers no host unless SCRAPE_HOST_CLOCK names it.
+   */
+  setHostClock(clock: HostClock | null): void {
+    this.hostClock = clock;
+  }
+
+  /**
+   * The floor (ms) this queue paces a STORE's host by, or undefined for a host no store declares (a
+   * CDN, an image subdomain). The composition root binds this as the shared clock's floor source,
+   * so a covered store's own images are paced by the very rule its records are.
+   */
+  storeHostFloorMs(host: string): number | undefined {
+    return this.profiles?.forHost(host) ? this.hostBaseDelayMs(host) : undefined;
   }
 
   /** The active challenge-cooldown register — the injected instance, else the shared singleton. */
@@ -2287,6 +2308,24 @@ export class ScrapeQueue {
     return Math.max(base, resolveHostHardFloorMs());
   }
 
+  /**
+   * The per-host floor check AND the dispatch record, in one synchronous step: 0 = dispatch now (the
+   * dispatch is recorded), else the ms still to wait (nothing recorded). A host on the shared clock
+   * books there, so its own images and its records keep the floor between them; any other host keeps
+   * the private map exactly as before.
+   */
+  private acquireHostSlot(host: string, now: number): number {
+    const clock = this.hostClock ?? getHostClock();
+    if (clock.inScope(host)) return clock.tryAcquire(host, now, this.hostBaseDelayMs(host));
+    const lastDispatch = this.hostLastDispatch.get(host);
+    if (lastDispatch !== undefined) {
+      const remaining = lastDispatch + this.hostBaseDelayMs(host) - now;
+      if (remaining > 0) return remaining;
+    }
+    this.hostLastDispatch.set(host, now);
+    return 0;
+  }
+
   private getNextProcessableItem(now: number): QueueItem | null {
     // Top the working set up from disk BEFORE scanning: reap leases a dead process never released,
     // and page in parked rows if the tiers have drained below the caps. A no-op on today's traffic.
@@ -2328,21 +2367,17 @@ export class ScrapeQueue {
         // the queue.
         const host = this.hostOf(item.url);
         if (host !== undefined) {
-          const lastDispatch = this.hostLastDispatch.get(host);
-          if (lastDispatch !== undefined) {
-            const remaining = lastDispatch + this.hostBaseDelayMs(host) - now;
-            if (remaining > 0) {
-              hostPacedCount++;
-              if (remaining < minHostWaitMs) minHostWaitMs = remaining;
-              continue;
-            }
+          const remaining = this.acquireHostSlot(host, now);
+          if (remaining > 0) {
+            hostPacedCount++;
+            if (remaining < minHostWaitMs) minHostWaitMs = remaining;
+            continue;
           }
         }
 
-        // This item is processable - remove from queue, record its host dispatch, and return
+        // This item is processable (its host dispatch is already recorded) - remove it and return
         queue.splice(i, 1);
         this.laneCounters.adjust(host, item.lane, 'resident', -1);
-        if (host !== undefined) this.hostLastDispatch.set(host, now);
         // LEASE it: the row stays on disk, marked as in-flight with an expiry. A crash here (the
         // `kill -9` / OOM case) leaves a lease that the next process's reaper re-drives, instead of
         // an item that simply vanished mid-navigation.

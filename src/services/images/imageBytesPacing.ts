@@ -13,8 +13,14 @@
  * CHALLENGE COOLDOWN: a host that has just served a challenge is not fetched at all. (The cooldown
  * on the STORE's host is the caller's gate, exactly as it is for the page lanes; this one covers the
  * image host, which for many stores is the store host itself.)
+ *
+ * A store's MAIN host on the shared per-host clock (`SCRAPE_HOST_CLOCK`, see hostClock.ts) is paced
+ * on that clock too, at the store's floor: the queue's record dispatch books the same clock, so an
+ * image never leaves closer than the floor to a record or to another image of that host (QB-U8). The
+ * limiter still applies on top; every host the clock does not cover is paced exactly as before.
  */
 import { getChallengeCooldown } from '../challengeCooldown.js';
+import { getHostClock, type HostClock } from '../hostClock.js';
 import type { HostRateLimiter } from '../../driver/hostRateLimiter.js';
 import type { ImageBytesFailure, ImageBytesFetcher, ImageFetchOptions, ImageBytesResult } from './imageBytes.js';
 
@@ -53,6 +59,8 @@ export interface ImageBytesPacingDeps {
   sleep?: (ms: number) => Promise<void>;
   /** Default: the process-wide challenge cooldown register the queue and the lookup fan-out share. */
   cooldown?: ChallengeCooldownLike;
+  /** Default: the process-wide host clock the queue's record dispatch books (off unless scoped). */
+  hostClock?: Pick<HostClock, 'floorFor' | 'reserve'>;
 }
 
 /**
@@ -85,6 +93,7 @@ export function paceImageBytesByHost(
   const now = deps.now ?? Date.now;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
   const cooldown = deps.cooldown ?? getChallengeCooldown();
+  const hostClock = deps.hostClock ?? getHostClock();
   // One PROLOGUE at a time per host. The wait and the dispatch record are separated by an await, so
   // without this every concurrent caller reads the same msUntilReady before any of them records and
   // they all wake together — a PDP's dozen images arriving at a shared CDN in one burst, which is
@@ -94,7 +103,14 @@ export function paceImageBytesByHost(
   const awaitTurn = (host: string): Promise<void> => {
     const tail = prologues.get(host) ?? Promise.resolve();
     const prologue = tail.then(async () => {
-      const wait = limiter.msUntilReady(host, now());
+      let wait = limiter.msUntilReady(host, now());
+      // A host on the shared clock books its slot NOW, at the later of the limiter's ready time and
+      // the clock's floor, so the queue sees it while this image is still asleep.
+      const floor = hostClock.floorFor(host);
+      if (floor !== undefined) {
+        const at = now();
+        wait = hostClock.reserve(host, at + wait, floor) - at;
+      }
       if (wait > 0) await sleep(wait);
       limiter.recordDispatch(host, now());
     });
