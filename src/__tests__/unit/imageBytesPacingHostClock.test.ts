@@ -1,0 +1,248 @@
+/**
+ * QB-U8 (Ross QB-4 "yes", 2026-10-04): MFC main-host image fetches on the SHARED per-host clock.
+ *
+ * The defect: the image lane builds `new HostRateLimiter(() => undefined)`, so myfigurecollection.net
+ * (explicit items' plates ride the main host's `?_tb=commit&commit=nsp` route) is paced by the
+ * limiter's DEFAULT config: 2067 ms, recovering /1.4 every 3 successes down to 274 ms. After about 18
+ * clean GETs the image gap is ~274 ms while MFC records are 7 s apart.
+ *
+ * The fix under test: a host the clock covers (SCRAPE_HOST_CLOCK scope + a store floor) books every
+ * image on the same clock as the queue's record dispatch, at the store's floor. Everything the clock
+ * does not cover keeps today's limiter pacing exactly. Fake clocks throughout, no network.
+ */
+import { HostRateLimiter } from '../../driver/hostRateLimiter';
+import { HostClock, parseHostClockScope, setHostClock } from '../../services/hostClock';
+import { paceImageBytesByHost } from '../../services/images/imageBytesPacing';
+import type { ImageBytesResult } from '../../services/images/imageBytes';
+
+const MFC = 'myfigurecollection.net';
+const FLOOR = 7000;
+const nsp = (id: number) => `https://${MFC}/?_tb=commit&commit=nsp&objectType=item&objectId=${id}&size=1`;
+const noCooldown = { remaining: () => 0 };
+
+const ok = (): ImageBytesResult => ({
+  ok: true,
+  bytes: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  contentType: 'image/png',
+  status: 200,
+  finalUrl: nsp(1),
+  headers: {},
+});
+const throttled = (): ImageBytesResult => ({ ok: false, reason: 'http-status', status: 429, detail: 'HTTP 429' });
+
+/** An MFC-scoped clock whose floor source knows the main host as a store host at 7000 ms. */
+function mfcClock(scope = MFC): HostClock {
+  const clock = new HostClock(parseHostClockScope(scope));
+  clock.setFloorSource(host => (host === MFC ? FLOOR : undefined));
+  return clock;
+}
+
+/** The smallest gap between consecutive times (Infinity for fewer than two). */
+function minGap(times: number[]): number {
+  const sorted = [...times].sort((a, b) => a - b);
+  let min = Infinity;
+  for (let i = 1; i < sorted.length; i++) min = Math.min(min, sorted[i] - sorted[i - 1]);
+  return min;
+}
+
+/**
+ * The production limiter (DEFAULT config, as assembleImageCapture builds it), a scripted fetcher that
+ * stamps each call with the fake time, and a sleeper that advances that time.
+ */
+function harness(hostClock: HostClock, script: (url: string, n: number) => ImageBytesResult = () => ok()) {
+  let now = 0;
+  const calls: Array<{ url: string; at: number }> = [];
+  const slept: number[] = [];
+  const fetcher = jest.fn(async (url: string) => {
+    calls.push({ url, at: now });
+    return script(url, calls.length);
+  });
+  const paced = paceImageBytesByHost(fetcher, new HostRateLimiter(() => undefined), {
+    now: () => now,
+    sleep: async (ms: number) => { slept.push(ms); now += ms; },
+    cooldown: noCooldown,
+    hostClock,
+  });
+  return { paced, calls, slept, fetcher, advance: (ms: number) => { now += ms; }, now: () => now };
+}
+
+describe('paceImageBytesByHost on the shared host clock (QB-U8)', () => {
+  it('never lets two MFC main-host images closer than the 7000 ms floor through successes, failures and recovery', async () => {
+    // 20 clean GETs (the limiter alone would recover toward 274 ms), 5 throttles (backoff), 15 clean
+    // again (recovery): the clock's floor must hold at every step.
+    const outcome = (n: number) => (n > 20 && n <= 25 ? throttled() : ok());
+    const { paced, calls } = harness(mfcClock(), (_url, n) => outcome(n));
+
+    for (let id = 1; id <= 40; id++) await paced(nsp(id));
+
+    expect(calls).toHaveLength(40);
+    expect(minGap(calls.map(c => c.at))).toBeGreaterThanOrEqual(FLOOR);
+  });
+
+  it('shares the clock with record dispatch: the merged MFC timeline has no gap under the floor', async () => {
+    const clock = mfcClock();
+    const { paced, calls, advance, now } = harness(clock, (_url, n) => (n % 7 === 0 ? throttled() : ok()));
+    const records: number[] = [];
+    // The queue polls without blocking; an image books its slot and waits for it. Every third poll
+    // comes after the floor has passed, so records and images genuinely interleave.
+    for (let id = 1; id <= 25; id++) {
+      advance(id % 3 === 0 ? 9000 : 1500);
+      if (clock.tryAcquire(MFC, now(), FLOOR) === 0) records.push(now());
+      await paced(nsp(id));
+    }
+
+    expect(records.length).toBeGreaterThanOrEqual(8);
+    expect(calls).toHaveLength(25);
+    expect(minGap([...records, ...calls.map(c => c.at)])).toBeGreaterThanOrEqual(FLOOR);
+  });
+
+  it('books the image slot BEFORE it waits, so a record poll during the wait is refused', async () => {
+    const clock = mfcClock();
+    expect(clock.tryAcquire(MFC, 0, FLOOR)).toBe(0); // a record dispatched at t=0
+    let release!: () => void;
+    let now = 1000;
+    const paced = paceImageBytesByHost(jest.fn(async () => ok()), new HostRateLimiter(() => undefined), {
+      now: () => now,
+      sleep: () => new Promise<void>(resolve => { release = () => { now = 7000; resolve(); }; }),
+      cooldown: noCooldown,
+      hostClock: clock,
+    });
+
+    const pending = paced(nsp(1));
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    // The image is asleep until 7000 and already holds that slot: the next record waits to 14000.
+    expect(clock.tryAcquire(MFC, 2000, FLOOR)).toBe(12_000);
+    release();
+    await pending;
+    expect(clock.tryAcquire(MFC, 13_999, FLOOR)).toBe(1);
+  });
+
+  it('serialises concurrent main-host images on the floor (real timers faked, default sleep)', async () => {
+    jest.useFakeTimers();
+    try {
+      jest.setSystemTime(0);
+      const calls: number[] = [];
+      const paced = paceImageBytesByHost(jest.fn(async () => { calls.push(Date.now()); return ok(); }), new HostRateLimiter(() => undefined), {
+        cooldown: noCooldown,
+        hostClock: mfcClock(),
+      });
+      const all = Promise.all([1, 2, 3, 4, 5].map(id => paced(nsp(id))));
+      await jest.advanceTimersByTimeAsync(40_000);
+      await all;
+      expect(calls).toEqual([0, 7000, 14_000, 21_000, 28_000]);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('keeps the booking when the fetch throws: the next image still waits the floor', async () => {
+    const { paced, calls } = harness(mfcClock(), (_url, n) => {
+      if (n === 1) throw new Error('socket hang up');
+      return ok();
+    });
+    await expect(paced(nsp(1))).rejects.toThrow('socket hang up');
+    await paced(nsp(2));
+    expect(calls.map(c => c.at)).toEqual([0, 7000]);
+  });
+
+  it('books nothing for a host cooling from a challenge', async () => {
+    const clock = mfcClock();
+    const fetcher = jest.fn(async () => ok());
+    const paced = paceImageBytesByHost(fetcher, new HostRateLimiter(() => undefined), {
+      now: () => 0,
+      sleep: async () => undefined,
+      cooldown: { remaining: host => (host === MFC ? 60_000 : 0) },
+      hostClock: clock,
+    });
+    const result = await paced(nsp(1));
+    expect(result.ok).toBe(false);
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(clock.tryAcquire(MFC, 0, FLOOR)).toBe(0);
+  });
+
+  it('waits the longer of the limiter and the clock: a backed-off limiter still governs past the floor', async () => {
+    const clock = mfcClock();
+    let now = 0;
+    const calls: number[] = [];
+    const slow = { baseDelayMs: 20_000, minDelayMs: 20_000, maxDelayMs: 60_000, backoffMultiplier: 2, recoveryDivisor: 2, successThreshold: 3 };
+    const paced = paceImageBytesByHost(jest.fn(async () => { calls.push(now); return ok(); }), new HostRateLimiter(() => slow, slow), {
+      now: () => now,
+      sleep: async (ms: number) => { now += ms; },
+      cooldown: noCooldown,
+      hostClock: clock,
+    });
+    await paced(nsp(1));
+    await paced(nsp(2));
+    expect(calls).toEqual([0, 20_000]);
+    // ...and the clock booked the limiter's later slot, not the floor's earlier one.
+    expect(clock.tryAcquire(MFC, 26_999, FLOOR)).toBe(1);
+  });
+
+  describe('every other host keeps today\'s pacing exactly', () => {
+    /** Run the same script through a wrapper on an OFF clock and on the MFC-scoped clock. */
+    async function compare(urls: string[], scope = MFC) {
+      const script = (_url: string, n: number) => (n % 5 === 0 ? throttled() : ok());
+      const today = harness(new HostClock(parseHostClockScope(undefined)), script);
+      const scoped = harness(mfcClock(scope), script);
+      for (const url of urls) {
+        await today.paced(url);
+        await scoped.paced(url);
+      }
+      return { today, scoped };
+    }
+
+    it.each([
+      ['static.myfigurecollection.net (the image CDN)', 'https://static.myfigurecollection.net/upload/items/1/1-abc.jpg'],
+      ['a shared CDN', 'https://cdn.shopify.com/s/files/1.png'],
+      ['another store host', 'https://www.hpoi.net/pictures/1.jpg'],
+    ])('%s', async (_label, url) => {
+      const urls = Array.from({ length: 30 }, (_v, i) => `${url}?n=${i}`);
+      const { today, scoped } = await compare(urls);
+      expect(scoped.slept).toEqual(today.slept);
+      expect(scoped.calls.map(c => c.at)).toEqual(today.calls.map(c => c.at));
+      // Sanity: today's limiter really does recover well under the MFC floor on these hosts.
+      expect(minGap(today.calls.map(c => c.at))).toBeLessThan(FLOOR);
+    });
+
+    it('a host in an ALL scope that is not a store host (a CDN) stays on its limiter', async () => {
+      const urls = Array.from({ length: 30 }, (_v, i) => `https://cdn.shopify.com/s/files/${i}.png`);
+      const { today, scoped } = await compare(urls, 'all');
+      expect(scoped.slept).toEqual(today.slept);
+    });
+
+    it('MFC main-host images too, while the clock is OFF (the default)', async () => {
+      const urls = Array.from({ length: 30 }, (_v, i) => nsp(i));
+      const off = harness(new HostClock(parseHostClockScope(undefined)));
+      for (const url of urls) await off.paced(url);
+      // Today's defect, unchanged with the knob off: the limiter recovers to its 274 ms minimum.
+      expect(minGap(off.calls.map(c => c.at))).toBe(274);
+    });
+
+    it('an in-scope host with no bound floor source stays on its limiter', async () => {
+      const unbound = new HostClock(parseHostClockScope(MFC));
+      const { paced, calls } = harness(unbound);
+      for (let id = 1; id <= 30; id++) await paced(nsp(id));
+      expect(minGap(calls.map(c => c.at))).toBe(274);
+      expect(unbound.tryAcquire(MFC, 0, FLOOR)).toBe(0);
+    });
+  });
+
+  it('uses the process clock when none is injected', async () => {
+    const clock = mfcClock();
+    setHostClock(clock);
+    try {
+      let now = 0;
+      const calls: number[] = [];
+      const paced = paceImageBytesByHost(jest.fn(async () => { calls.push(now); return ok(); }), new HostRateLimiter(() => undefined), {
+        now: () => now,
+        sleep: async (ms: number) => { now += ms; },
+        cooldown: noCooldown,
+      });
+      clock.tryAcquire(MFC, 0, FLOOR);
+      await paced(nsp(1));
+      expect(calls).toEqual([FLOOR]);
+    } finally {
+      setHostClock(null);
+    }
+  });
+});
