@@ -42,4 +42,10 @@ describe('braces advisory GHSA-vfj7-8cjw-p6xm', () => {
 
     expect(shipped.map(([location, entry]) => `${location}@${entry.version}`)).toEqual([]);
   });
+
+  it('installs no affected braces in the dev tree either (the builder and dev images)', () => {
+    const anywhere = lockedBraces.filter(([, entry]) => isAffected(entry.version));
+
+    expect(anywhere.map(([location, entry]) => `${location}@${entry.version}`)).toEqual([]);
+  });
 });
