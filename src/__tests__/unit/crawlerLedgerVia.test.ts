@@ -317,11 +317,19 @@ describe('ledger via — FIRST WRITER WINS; a re-write records lastVia', () => {
   it('a LEGACY entry (no via) re-observed by the tap keeps via ABSENT and gains lastVia', async () => {
     const fake = makeFake({ listing: { mfc: { 1: ['201'] } } });
     const ledgers = createMemoryLedgerStore({ mfc: ledgerWith('mfc', { '201': entry('mfc', '201', 50) }) });
+    // ABSENT at the store boundary, not merely dropped by a JSON round trip: `via: undefined` is a key.
+    const handed: boolean[] = [];
+    const save = ledgers.save;
+    ledgers.save = async (l) => {
+      handed.push(Object.prototype.hasOwnProperty.call(l.enqueued['201'], 'via'));
+      return save(l);
+    };
     await run(mkCfg({ reobserveAfterMs: 24 * HOUR_MS }), fake, ledgers);
 
     const e = saved(ledgers, 'mfc').enqueued['201'];
     expect(e).toEqual({ at: iso(T0), collectUrl: item('mfc', '201'), lastVia: 'tap' });
-    expect(Object.prototype.hasOwnProperty.call(e, 'via')).toBe(false);
+    expect(handed.length).toBeGreaterThan(0);
+    expect(handed).not.toContain(true);
   });
 
   it('a later re-observation overwrites lastVia and still keeps the first via', async () => {
