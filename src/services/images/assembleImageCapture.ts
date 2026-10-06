@@ -170,7 +170,8 @@ export function createImageCaptureHookFromEnv(
         gated: lazyGatedLane(deps.browserLane ?? (() => createCapturingScrapingService())),
       }),
       // An unmapped image host gets the limiter's own default gap: a CDN is not in the store profile
-      // index, so there is nothing store-specific to look up, and there should not be.
+      // index, so there is nothing store-specific to look up, and there should not be. A store's MAIN
+      // host on the shared clock (SCRAPE_HOST_CLOCK) is also held to its store floor there (QB-U8).
       new HostRateLimiter(() => undefined),
     );
   const reporter = createFailureReporterFromEnv(env);

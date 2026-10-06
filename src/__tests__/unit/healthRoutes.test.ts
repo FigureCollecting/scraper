@@ -44,6 +44,7 @@ const build = (over: Partial<HealthDeps> = {}) => {
     }),
     listHandsOff: () => [],
     listPlugins: () => ({ loaded: [], refused: [] }),
+    getHostClock: () => ({ mode: 'off', hosts: [] }),
     ...over,
   }));
   return app;
@@ -818,5 +819,37 @@ describe('createHealthRoutes — plugins', () => {
 
     expect(res.status).toBe(500);
     expect(res.body.plugins).toEqual(VIEW);
+  });
+});
+
+/**
+ * The shared host clock's SEND-TIME observer (QB-U30a): per store host, the sends of the trailing hour
+ * by caller, the smallest gap between two sends and how many gaps were under the floor. It reads the
+ * same whether the clock is on or off (off = the live negative control).
+ */
+describe('createHealthRoutes — hostClock', () => {
+  const VIEW = {
+    mode: 'hosts' as const,
+    hosts: [{
+      host: 'myfigurecollection.net', floorMs: 7000, clocked: true,
+      sends60m: { queue: 3, image: 6 }, minGapMs60m: 7000, underFloor60m: 0, lastSendAt: '2026-10-06T05:00:00.000Z',
+    }],
+  };
+
+  it('GET /health/detailed carries the hostClock block', async () => {
+    const res = await request(build({ getHostClock: () => VIEW })).get('/health/detailed');
+
+    expect(res.status).toBe(200);
+    expect(res.body.hostClock).toEqual(VIEW);
+  });
+
+  it('keeps hostClock on the degraded (500) response', async () => {
+    const res = await request(build({
+      getBrowserPoolHealth: async () => { throw new Error('pool down'); },
+      getHostClock: () => VIEW,
+    })).get('/health/detailed');
+
+    expect(res.status).toBe(500);
+    expect(res.body.hostClock).toEqual(VIEW);
   });
 });

@@ -12,6 +12,7 @@ import { createCatalogRoute } from './routes/catalog.js';
 import { createHealthRoutes } from './routes/health.js';
 import { getChallengeCooldown } from './services/challengeCooldown.js';
 import { getCfCookieStore } from './services/cookieJar.js';
+import { getHostClock, startHostClockSummary } from './services/hostClock.js';
 import { residentialEgressView } from './services/residentialEgress.js';
 import { rawStoreView, flushRawCaptureSink } from './services/s3ObjectStore.js';
 import { imageCaptureView } from './services/images/assembleImageCapture.js';
@@ -71,6 +72,8 @@ app.use('/', createHealthRoutes({
   listHandsOff: () => pluginRegistry?.handsOffView() ?? [],
   // Which plugins loaded and which were refused; both empty until the bootstrap has run.
   listPlugins: () => pluginsView(pluginBootstrap),
+  // The shared host clock's send-time observer (QB-U30a): reads the same with the clock off.
+  getHostClock: () => getHostClock().view(Date.now()),
 }));
 
 // Scraper routes (no /api prefix for consistency)
@@ -117,6 +120,16 @@ async function startServer(): Promise<void> {
     // no matching ruleset fail cleanly through the queue's failure handling.
     queue.setPluginRegistry(registry);
     queueBootstrap = bootstrap;
+    // SHARED HOST CLOCK (SCRAPE_HOST_CLOCK, default off): a covered store host's own images are paced
+    // on the clock its records book, at the floor the queue paces that host by (QB-U30a). Unbound, the
+    // image lane leaves every host on its own limiter. The boot line names each covered host's floor,
+    // a WARN names each listed entry the scope ignores, and the send-time observer (which reads the
+    // same floor source, clock on or off) logs a summary line per host every 10 minutes.
+    const hostClock = getHostClock();
+    hostClock.setFloorSource(host => queue.storeHostFloorMs(host));
+    for (const warning of hostClock.warnings()) console.warn(warning);
+    console.log(hostClock.describe());
+    startHostClockSummary(hostClock);
     // Mount the cross-store buy-decision search (GET /lookup) now that the registry is populated.
     // Each store fetches via the transport its `searchFetch` declares (http / impersonate / browser);
     // http + impersonate use the engine defaults, and the `browser` transport is backed here by the
