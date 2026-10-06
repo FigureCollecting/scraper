@@ -347,7 +347,9 @@ describe('ScrapeQueue on the shared host clock (QB-U8)', () => {
       expect(pageCalls).toEqual([]);
       await advance(1000);
       expect(mfcTimes(pageCalls)).toEqual([imageAt + FLOOR]);
-      expect(checks).toEqual([imageAt - 40, imageAt + FLOOR]);
+      // Checked at the dispatch, again after the wait, then once more after the fetch (the clean-body
+      // check that clears an expired cooldown, unchanged).
+      expect(checks).toEqual([imageAt - 40, imageAt + FLOOR, imageAt + FLOOR]);
     });
 
     it('a challenge cooldown that opens while the record waits at the gate fails it fast, with no fetch', async () => {
@@ -461,7 +463,7 @@ describe('ScrapeQueue on the shared host clock (QB-U8)', () => {
       expect(mfc?.underFloor60m).toBe(gapsUnder(truth, FLOOR));
       expect(mfc?.underFloor60m).toBeGreaterThan(0);
       // The static CDN is no store host: not observed.
-      expect(view.hosts.map(h => h.host)).toEqual(['other.test', MFC]);
+      expect(view.hosts.map(h => h.host)).toEqual([MFC, 'other.test']);
     });
 
     it('the observer, clock ON: both callers counted, no gap under the floor, the smallest gap is the true one', async () => {

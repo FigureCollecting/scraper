@@ -158,6 +158,15 @@ describe('HostClock', () => {
       expect(clock.tryAcquire(MFC, 14_599, 7000)).toBe(1);
     });
 
+    it('keeps the larger floor when one instant is stamped twice', () => {
+      const clock = clockFor();
+      clock.settle(MFC, 0, 7000);
+      clock.settle(MFC, 0, 1000);
+      expect(clock.tryAcquire(MFC, 6999, 1000)).toBe(1);
+      clock.settle(MFC, 0, 9000);
+      expect(clock.tryAcquire(MFC, 8999, 1000)).toBe(1);
+    });
+
     it("stamps with the host's booked floor when none is given", () => {
       const clock = clockFor();
       clock.tryAcquire(MFC, 0, 7000);
@@ -297,6 +306,11 @@ describe('HostClock', () => {
       );
     });
 
+    it('names a host listed twice (two spellings) once', () => {
+      const raw = 'myfigurecollection.net, www.MyFigureCollection.net.';
+      expect(new HostClock(parseHostClockScope(raw), raw).describe()).toMatch(/images; myfigurecollection\.net no store floor \(queue only\)$/);
+    });
+
     it('a list of nothing but ignored entries is off', () => {
       const raw = 'https://mock.example.test';
       const clock = new HostClock(parseHostClockScope(raw), raw);
@@ -397,6 +411,29 @@ describe('HostClock', () => {
         `[HOST-CLOCK] summary host=${MFC} sends=${mfc.sends60m.queue + mfc.sends60m.image} minGapMs=${mfc.minGapMs60m} underFloor=${mfc.underFloor60m}`,
       ]);
       expect(clock.summaryLines(13_000)).toEqual([`[HOST-CLOCK] summary host=${MFC} sends=3 minGapMs=5000 underFloor=1`]);
+    });
+
+    it('a host whose floor source has gone reads floorMs 0, so no gap is under it', () => {
+      const clock = observed();
+      clock.recordSend(MFC, 'queue', 0);
+      clock.recordSend(MFC, 'image', 10);
+      clock.setFloorSource(null);
+      expect(clock.view(10).hosts).toEqual([{
+        host: MFC, floorMs: 0, clocked: true, sends60m: { queue: 1, image: 1 }, minGapMs60m: 10, underFloor60m: 0,
+        lastSendAt: new Date(10).toISOString(),
+      }]);
+    });
+
+    it('startHostClockSummary logs to console.log by default', () => {
+      jest.useFakeTimers();
+      jest.setSystemTime(0);
+      const clock = observed();
+      clock.recordSend(MFC, 'queue', 0);
+      const log = jest.spyOn(console, 'log');
+      const stop = startHostClockSummary(clock);
+      jest.advanceTimersByTime(10 * MIN);
+      stop();
+      expect(log).toHaveBeenCalledWith(`[HOST-CLOCK] summary host=${MFC} sends=1 minGapMs=0 underFloor=0`);
     });
 
     it('startHostClockSummary logs the summary every 10 minutes until stopped', () => {

@@ -33,7 +33,7 @@ const throttled = (): ImageBytesResult => ({ ok: false, reason: 'http-status', s
 
 /** An MFC-scoped clock whose floor source knows the main host as a store host at 7000 ms. */
 function mfcClock(scope = MFC): HostClock {
-  const clock = new HostClock(parseHostClockScope(scope));
+  const clock = new HostClock(parseHostClockScope(scope), scope);
   clock.setFloorSource(host => (host === MFC ? FLOOR : undefined));
   return clock;
 }
@@ -219,6 +219,7 @@ describe('paceImageBytesByHost on the shared host clock (QB-U8)', () => {
     it('a slot lost while asleep (the queue took the host first) is booked again behind that record', async () => {
       const records = [0];
       let first = true;
+      let pollOnNewSlot = -1;
       let clockRef!: HostClock;
       const { clock, paced, calls } = scripted((ms, at, set) => {
         if (first) {
@@ -233,11 +234,14 @@ describe('paceImageBytesByHost on the shared host clock (QB-U8)', () => {
           set(14_100);
           return;
         }
+        // Asleep again on its NEW booking, which the queue sees: a poll at that slot is refused.
+        pollOnNewSlot = clockRef.tryAcquire(MFC, 21_050, FLOOR);
         set(at() + ms);
       });
       clockRef = clock;
       await paced(nsp(1));
       expect(records).toEqual([0, 14_050]);
+      expect(pollOnNewSlot).toBe(FLOOR);
       expect(calls).toEqual([21_050]);
       expect(minGap([...records, ...calls])).toBeGreaterThanOrEqual(FLOOR);
     });

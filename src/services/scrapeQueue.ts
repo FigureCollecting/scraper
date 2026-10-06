@@ -2012,10 +2012,19 @@ export class ScrapeQueue {
     // retried, never the cookie-session-pause path). Expiry: once `until` passes, isOpen is false and
     // the fetch below proceeds normally.
     const cooldown = this.getChallengeCooldownStore();
-    if (host !== undefined && cooldown.isOpen(host)) {
-      const minsLeft = Math.max(1, Math.ceil(cooldown.remaining(host) / 60_000));
-      console.warn(`[COOLDOWN] skipped ${sanitizeForLog(item.url)} (${host} cooling, ${minsLeft} min left)`);
-      throw new ChallengeCooldownError(host, cooldown.remaining(host));
+    for (;;) {
+      if (host !== undefined && cooldown.isOpen(host)) {
+        const minsLeft = Math.max(1, Math.ceil(cooldown.remaining(host) / 60_000));
+        console.warn(`[COOLDOWN] skipped ${sanitizeForLog(item.url)} (${host} cooling, ${minsLeft} min left)`);
+        throw new ChallengeCooldownError(host, cooldown.remaining(host));
+      }
+      // THE TRANSPORT HAND-OFF (QB-U30a): the capturing fetch below hands the record's request to its
+      // transport synchronously, so the send-time gate and the send stamp here, the cooldown check
+      // above and that call are one synchronous step. Should the gate be shut (another caller sent
+      // on this clocked host since the dispatch decision), wait the rest and check everything again.
+      const wait = this.sendRecordOrWait(host);
+      if (wait === 0) break;
+      await new Promise<void>(resolve => setTimeout(resolve, wait));
     }
     const page = await this.getCapturingFetch()(item.url, searchFetch, { cookies: item.cookies });
     // A clean (non-challenge) body proves this host serves real pages again — clear a lingering,
@@ -2311,8 +2320,9 @@ export class ScrapeQueue {
   /**
    * The per-host floor check AND the dispatch record, in one synchronous step: 0 = dispatch now (the
    * dispatch is recorded), else the ms still to wait (nothing recorded). A host on the shared clock
-   * books there, so its own images and its records keep the floor between them; any other host keeps
-   * the private map exactly as before.
+   * books there, so its own images and its records keep the floor between them (and the send itself
+   * is stamped at the transport hand-off, sendRecordOrWait); any other host keeps the private map
+   * exactly as before.
    */
   private acquireHostSlot(host: string, now: number): number {
     const clock = this.hostClock ?? getHostClock();
@@ -2323,6 +2333,28 @@ export class ScrapeQueue {
       if (remaining > 0) return remaining;
     }
     this.hostLastDispatch.set(host, now);
+    return 0;
+  }
+
+  /**
+   * A record is about to be handed to its transport: 0 = go, and the send is stamped now on the
+   * shared clock (a host in scope, via its send-time gate) and on the clock's send-time observer
+   * (every store host, whatever the scope says); otherwise the ms before the gate opens, nothing
+   * stamped. The queue's own slot is its grant, already behind it, so only a send by another caller
+   * since then can shut the gate. A host off the clock never waits here: its private floor paced the
+   * dispatch, exactly as before.
+   */
+  private sendRecordOrWait(host: string | undefined): number {
+    if (host === undefined) return 0;
+    const clock = this.hostClock ?? getHostClock();
+    const sentAt = Date.now();
+    if (clock.inScope(host)) {
+      const floorMs = this.hostBaseDelayMs(host);
+      const wait = clock.msUntilSendable(host, sentAt, sentAt, floorMs);
+      if (wait > 0) return wait;
+      clock.settle(host, sentAt, floorMs);
+    }
+    clock.recordSend(host, 'queue', sentAt);
     return 0;
   }
 
