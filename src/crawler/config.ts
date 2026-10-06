@@ -278,6 +278,22 @@ const parseStoreCaps = (raw: string | undefined, envName: string): Record<string
   return out;
 };
 
+/**
+ * Parse a csv of siteIds (`CRAWLER_LISTS_ALTERNATE`). Each entry must be a SAFE_SITE_ID, exactly like the
+ * per-store caps: a malformed one is DROPPED with a WARN naming it and the var, and a repeat is kept once.
+ */
+const parseSiteIds = (raw: string | undefined, envName: string): string[] => {
+  const out: string[] = [];
+  for (const entry of csv(raw ?? '')) {
+    if (!SAFE_SITE_ID.test(entry)) {
+      logger.warn(`[CRAWLER] ${envName} entry ignored (expected a siteId)`, { entry });
+      continue;
+    }
+    if (!out.includes(entry)) out.push(entry);
+  }
+  return out;
+};
+
 /** The env-var suffix for a store's range frontier seed: uppercased, every non-alphanumeric → `_`. */
 export const rangeFrontierEnvName = (siteId: string): string =>
   `CRAWLER_RANGE_FRONTIER_${siteId.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
@@ -480,5 +496,6 @@ export function loadCrawlerConfig(env: Env = process.env, argv: string[] = proce
     listsIntervalMs: posInt(env.CRAWLER_LISTS_INTERVAL_H, DEFAULTS.listsIntervalH) * 60 * 60 * 1000,
     listsDrainCaps: parseStoreCaps(env.CRAWLER_LISTS_DRAIN_CAPS, 'CRAWLER_LISTS_DRAIN_CAPS'),
     listsSpacingMs: flooredNonNegInt(env.CRAWLER_LISTS_SPACING_MS, DEFAULTS.listsSpacingMs, MIN_LISTS_SPACING_MS, 'CRAWLER_LISTS_SPACING_MS'),
+    listsAlternate: parseSiteIds(env.CRAWLER_LISTS_ALTERNATE, 'CRAWLER_LISTS_ALTERNATE'),
   };
 }

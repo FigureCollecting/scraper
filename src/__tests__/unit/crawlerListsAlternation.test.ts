@@ -61,6 +61,12 @@ describe('lists alternation — knob empty is today, request for request', () =>
     expect(named.slice(0, 3)).toEqual(['hpoi', 'orzgk', 'ghost']);
   });
 
+  it('a store with a lists step that is not crawled this pass is named in a WARN too', async () => {
+    const { passes } = await simulate(simConfig({ stores: ['hpoi', 'orzgk'], listsAlternate: ['mfc'] }), { passes: 1, from: at(0, 16) });
+    expect(passes[0].calls.filter((c) => c.store === 'mfc')).toEqual([]);
+    expect(alternationWarns().map((c) => c[1])).toEqual([{ siteId: 'mfc' }]);
+  });
+
   it('every store summary reads alternation off when the knob is empty', async () => {
     const { passes } = await simulate(simConfig(), { passes: 1, from: at(0, 16) });
     expect(passes[0].stores.map((s) => s.alternation)).toEqual(['off', 'off', 'off']);
@@ -77,7 +83,9 @@ describe('lists alternation — knob empty is today, request for request', () =>
 });
 
 describe('lists alternation — mfc over two nights of hourly passes', () => {
-  const cfg = simConfig({ listsAlternate: ['mfc'] });
+  // A discovery cap the tap cannot spend alone, so a tap pass's backfill page is visible too.
+  const caps = { storeEnqueueCaps: { mfc: 10 } };
+  const cfg = simConfig({ ...caps, listsAlternate: ['mfc'] });
   const nightIdx = (day: number): number[] => [15, 16, 17, 18, 19, 20, 21].map((h) => day * 24 + h);
   let alt: Awaited<ReturnType<typeof simulate>>;
   let today: Awaited<ReturnType<typeof simulate>>;
@@ -85,7 +93,7 @@ describe('lists alternation — mfc over two nights of hourly passes', () => {
     jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
     jest.spyOn(logger, 'info').mockImplementation(() => undefined);
     alt = await simulate(cfg, { passes: 48 });
-    today = await simulate(simConfig(), { passes: 48 });
+    today = await simulate(simConfig(caps), { passes: 48 });
     jest.restoreAllMocks();
   });
 
@@ -360,6 +368,18 @@ describe('lists alternation — a window that wraps midnight', () => {
   });
 });
 
+describe('lists alternation — no lists window at all', () => {
+  it('alternates nothing: every pass taps, no list is asked for (window-off), alternation reads off', async () => {
+    const { passes } = await simulate(simConfig({ listsAlternate: ['mfc'], listsWindow: null }), { passes: 3, from: at(0, 15) });
+    for (const p of passes) {
+      expect(storeOf(p, 'mfc').alternation).toBe('off');
+      expect(storeOf(p, 'mfc').listsSkipped).toBe('window-off');
+      expect(mfc(p, 'listing')[0]?.page).toBe(1);
+      expect(mfc(p, 'decl')).toEqual([]);
+    }
+  });
+});
+
 describe('lists alternation — a pass that starts outside the window', () => {
   it('fetches no list even when a slow tap carries it into the window (never both in one pass)', async () => {
     const run = async (listsAlternate: string[]) => {
@@ -380,8 +400,10 @@ describe('lists alternation — a pass that starts outside the window', () => {
     const after = await run(['mfc']);
     expect(after.s.alternation).toBe('outside-window');
     expect(after.s.listsSkipped).toBe('outside-window');
+    // Everything else is today's pass: the same tap, drain and descent, only the rotation is gone.
     expect(after.calls.filter((x) => x.kind === 'decl' || x.kind === 'list')).toEqual([]);
-    expect(after.calls.filter((x) => x.kind === 'listing')).toHaveLength(2);
+    expect(after.calls.map((x) => x.line)).toEqual(before.calls.filter((x) => x.kind !== 'decl' && x.kind !== 'list').map((x) => x.line));
+    expect(after.calls.filter((x) => x.kind === 'listing')).not.toEqual([]);
   });
 });
 
@@ -395,7 +417,7 @@ describe('lists alternation — a lists state that cannot be read at pass start'
     warn.mockClear();
     const after = await run(['mfc']);
     for (const [i, p] of after.passes.entries()) {
-      expect(p.calls.map((c) => c.line)).toEqual(before.passes[i].calls.map((c) => c.line));
+      for (const store of ['mfc', 'hpoi', 'orzgk']) expect(linesOf(p, store)).toEqual(linesOf(before.passes[i], store));
       expect(storeOf(p, 'mfc').alternation).toBe('off');
       expect(storeOf(p, 'mfc').listsSkipped).toBe('state-corrupt');
     }
@@ -430,8 +452,11 @@ describe('lists alternation — a lists state that cannot be read at pass start'
       },
     });
     for (const [i, p] of after.passes.entries()) {
-      expect(p.calls.map((c) => c.line)).toEqual(before.passes[i].calls.map((c) => c.line));
+      // Store by store: the failed read is one more await before mfc's tap, which may reorder how the
+      // stores' requests interleave on the shared gate, never what any store asks for.
+      for (const store of ['mfc', 'hpoi', 'orzgk']) expect(linesOf(p, store)).toEqual(linesOf(before.passes[i], store));
       expect(storeOf(p, 'mfc').alternation).toBe('off');
+      expect(mfc(p, 'list')).toHaveLength(1);
     }
     expect(alternationWarns()).toHaveLength(3);
   });
