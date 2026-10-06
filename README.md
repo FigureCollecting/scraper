@@ -684,6 +684,7 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
 | `CRAWLER_LISTS_WINDOW_UTC` | *(none = no list fetched)* | Company lists: `HH:MM-HH:MM` UTC window (may wrap midnight) in which ONE group may be fetched per pass. Malformed or zero-width = off, with a WARN. The backlog drains outside it |
 | `CRAWLER_LISTS_INTERVAL_H` | `160` | Company lists: a group is fetched at most once per this many hours. In-window passes per day × interval days should cover the group count (7 × 6.67 ≈ 46 < 54 for mfc); below that the least-recently-polled rotation stretches the cycle to groups ÷ passes per day days |
 | `CRAWLER_LISTS_SPACING_MS` | `10000` | Company lists: wait between two lists of one group; never below `10000` (raised with a WARN) |
+| `CRAWLER_LISTS_ALTERNATE` | *(none)* | Company lists: csv of siteIds whose passes that START inside `CRAWLER_LISTS_WINDOW_UTC` fetch EITHER the Latest Additions tap OR one company group, never both; each window opens with a lists pass (7 in-window passes = L T L T L T L, 4 groups a night). Only a store with a lists step (`CRAWLER_LISTS_DRAIN_CAPS`) and a mode running recent and backfill; any other name is ignored with a WARN. Empty = today's pass |
 | `CRAWLER_REOBSERVE_MIN_AGE_H` | `12` | Re-observation lane: an id is eligible once its last observation is this many hours old. The SAME value is the backoff window for an id whose last re-observation was refused, so `0` means both "age is no bar" and "no backoff at all" — a refused id is retried on the very next run |
 | `CRAWLER_MAX_REOBSERVE_PER_STORE` | `0` | Re-observation lane: global per-store ceiling on re-observations per run. `0` = the lane is OFF unless a store opts in below |
 | `CRAWLER_STORE_REOBSERVE_CAPS` | *(none)* | csv of `siteId:cap` (`goodsmileus:50,bbts:20`) — the lane's per-store budget, SEPARATE from `CRAWLER_STORE_ENQUEUE_CAPS`, so neither lane starves the other. A malformed entry is ignored with a WARN; the rest still apply |
@@ -897,8 +898,24 @@ a stop in one lane (cooldown, challenge, sick scraper) stops every lane below it
   `interrupted`), `listsFetched`, `listsFailed`, `listsIdsSeen`, `listsIdsNew`, `listsEnqueued` (kept
   out of `enqueued`), `listsPending`, `listsDrainApplied`, `listsSkipped` (`not-configured`, `not-run`,
   `store-stopped`, `state-corrupt`, `state-failed`, `window-off`, `outside-window`, `paused`,
-  `none-due`, `unsupported`, `cooldown`, `budget`, `failed`; `null` when a group was fetched) and
+  `none-due`, `alternation-tap`, `unsupported`, `cooldown`, `budget`, `failed`; `null` when a group was fetched) and
   `listsDrainStopped`. Run level: `totalListsEnqueued`.
+- **Alternation** (`CRAWLER_LISTS_ALTERNATE`; Ross MS 2026-10-04) — for a named store, the kind of a pass
+  that starts inside the window is decided once, before the tap, from the lists state's `alternation`
+  marker `{lastInWindowKind, windowStart, at}`: no marker, or one from another window, = a LISTS pass (so
+  every window opens with lists, every night); otherwise the opposite of the last kind. A LISTS pass skips
+  the store's recent and backfill phases (both read the Latest Additions listing) and rotates as above; if
+  it issued no list GET (`none-due`, `paused`, `unsupported`, past the window) and the store is not stopped,
+  it taps after the id-range phase instead (`fallback-tap`); a list GET that was issued, answered or not,
+  costs the pass's tap. A TAP pass runs recent and backfill and asks for no group (`listsSkipped:
+  "alternation-tap"`). Both drain the backlog. The marker records the INTENDED kind (`lists` after a
+  fallback tap) and only the lists step's own save writes it, so a pass whose lists step did not run
+  (store stopped first) repeats its kind next pass: a tap pass stopped on its tap costs that night a
+  group. A pass that starts outside the window taps as today and never asks for a group, even if it
+  reaches the lists step inside the window; the marker is untouched. A lists state that cannot be read at
+  pass start turns alternation off for that pass (one WARN; today's pass). The marker is not validated on
+  load: a build without this knob keeps it, and a malformed one counts as absent. Store summary:
+  `alternation` = `off`, `outside-window`, `lists`, `tap` or `fallback-tap`.
 - **Stop switch** — remove the store from `CRAWLER_LISTS_DRAIN_CAPS` (no fetch, no drain); unset
   `CRAWLER_LISTS_WINDOW_UTC` to stop fetching while the backlog drains. A crawler on this version
   against an older engine loses only the priority (the old `/ingest/scrape` reads `url` alone), so every

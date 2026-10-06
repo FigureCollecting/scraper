@@ -175,6 +175,12 @@ export interface CrawlerConfig {
   listsDrainCaps?: Record<string, number>;
   /** LISTS: wait between two lists of one group (`CRAWLER_LISTS_SPACING_MS`), never below 10 s. */
   listsSpacingMs?: number;
+  /**
+   * LISTS ALTERNATION (`CRAWLER_LISTS_ALTERNATE`, csv of siteIds; Ross MS 2026-10-04): for these stores a
+   * pass that starts inside the lists window fetches EITHER the Latest Additions tap OR one company-list
+   * group, never both; each window opens with a lists pass. Empty (the default) or absent = today's pass.
+   */
+  listsAlternate?: string[];
 }
 
 /** A UTC time-of-day window in minutes after midnight; `endMin < startMin` means it wraps past midnight. */
@@ -279,6 +285,22 @@ const parseStoreCaps = (raw: string | undefined, envName: string): Record<string
       continue;
     }
     out[siteId] = cap;
+  }
+  return out;
+};
+
+/**
+ * Parse a csv of siteIds (`CRAWLER_LISTS_ALTERNATE`). Each entry must be a SAFE_SITE_ID, exactly like the
+ * per-store caps: a malformed one is DROPPED with a WARN naming it and the var, and a repeat is kept once.
+ */
+const parseSiteIds = (raw: string | undefined, envName: string): string[] => {
+  const out: string[] = [];
+  for (const entry of csv(raw ?? '')) {
+    if (!SAFE_SITE_ID.test(entry)) {
+      logger.warn(`[CRAWLER] ${envName} entry ignored (expected a siteId)`, { entry });
+      continue;
+    }
+    if (!out.includes(entry)) out.push(entry);
   }
   return out;
 };
@@ -486,5 +508,6 @@ export function loadCrawlerConfig(env: Env = process.env, argv: string[] = proce
     listsIntervalMs: posInt(env.CRAWLER_LISTS_INTERVAL_H, DEFAULTS.listsIntervalH) * 60 * 60 * 1000,
     listsDrainCaps: parseStoreCaps(env.CRAWLER_LISTS_DRAIN_CAPS, 'CRAWLER_LISTS_DRAIN_CAPS'),
     listsSpacingMs: flooredNonNegInt(env.CRAWLER_LISTS_SPACING_MS, DEFAULTS.listsSpacingMs, MIN_LISTS_SPACING_MS, 'CRAWLER_LISTS_SPACING_MS'),
+    listsAlternate: parseSiteIds(env.CRAWLER_LISTS_ALTERNATE, 'CRAWLER_LISTS_ALTERNATE'),
   };
 }
