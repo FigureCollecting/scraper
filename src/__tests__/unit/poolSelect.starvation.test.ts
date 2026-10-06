@@ -13,7 +13,15 @@
  */
 
 import { DEFAULT_ID_PARAMS, deriveStream, type Params, type Rng } from '../../services/poolSelect';
-import { adversarialRng, refMulberry32, runClassSim, type ClassSimResult, type SimItemSpec } from '../helpers/poolSim';
+import {
+  adversarialRng,
+  formatQueueResult,
+  refMulberry32,
+  runClassSim,
+  runQueueScenario,
+  type ClassSimResult,
+  type SimItemSpec,
+} from '../helpers/poolSim';
 
 const report = (line: string) => {
   if (process.env.POOL_SIM_REPORT === '1') process.stdout.write(`${line}\n`);
@@ -228,4 +236,35 @@ describe('200 seeded adversarial scenarios: the bound holds for every item, for 
     expect(totals.maxRatio).toBeLessThanOrEqual(1);
     report(`starvation 200 scenarios x 2 rngs: ${JSON.stringify(totals)}`);
   }, 300_000);
+});
+
+/**
+ * The overloaded queue run of the SLO harness (agingfix.py set-up: backlog 3,000, 14 days at 350
+ * picks/h, ageCap 12 h, H 24 h, pAged 0.9, tap-like ids): growing, inflow 1.17x. No order bounds the
+ * wait of a queue whose load exceeds its capacity, so its waits are reported only; what must hold is
+ * the theorem bound, for every item, through the hard-aged regime it spends most of its time in.
+ */
+describe('overloaded queue (reported): the bound holds for every item', () => {
+  it('growing (inflow 1.17)', () => {
+    const started = Date.now();
+    const r = runQueueScenario({
+      name: 'growing 350/h',
+      initialBacklog: 3000,
+      inflowPerPick: 1.17,
+      days: 14,
+      picksPerHour: 350,
+      ageCapH: 12,
+      hardCapH: 24,
+      pAged: 0.9,
+      ids: 'tap',
+      seed: 1,
+    });
+    report(`${formatQueueResult(r)} runtime=${((Date.now() - started) / 1000).toFixed(1)} s`);
+    expect(r.brokenPicks).toBe(0);
+    expect(r.picks).toBe(350 * 24 * 14);
+    expect(r.theoremChecked).toBeGreaterThan(10_000);
+    expect(r.forcedPicks).toBeGreaterThan(0); // the hard-aged regime is really reached
+    expect(r.theoremViolations).toBe(0);
+    expect(r.maxTheoremRatio).toBeLessThanOrEqual(1);
+  }, 180_000);
 });

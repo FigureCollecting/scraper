@@ -24,14 +24,17 @@ import {
   type Rng,
 } from '../../services/poolSelect';
 
+// Builtins bound once: global lookups inside jest's vm context are slow, and these run per pick.
+const { abs, floor, imul, min } = Math;
+
 /** Reference mulberry32 (the published one-liner), for scenario generation and as a test oracle. */
 export function refMulberry32(seed: number): Rng {
   let a = seed >>> 0;
   return () => {
     a = (a + 0x6d2b79f5) | 0;
     let t = a;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    t = imul(t ^ (t >>> 15), t | 1);
+    t ^= t + imul(t ^ (t >>> 7), t | 61);
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
@@ -41,7 +44,7 @@ export function refFnv1a32(text: string): number {
   let h = 0x811c9dc5;
   for (const byte of Buffer.from(text, 'utf8')) {
     h ^= byte;
-    h = Math.imul(h, 0x01000193) >>> 0;
+    h = imul(h, 0x01000193) >>> 0;
   }
   return h >>> 0;
 }
@@ -55,12 +58,12 @@ export function antiSeqOk(
   runStep: number,
 ): boolean {
   if (id === undefined || prev === undefined) return true;
-  if (Math.abs(id - prev) <= minIdDistance) return false;
+  if (abs(id - prev) <= minIdDistance) return false;
   if (prev2 !== undefined) {
     const s1 = prev - prev2;
     const s2 = id - prev;
     const sameDirection = (s1 > 0 && s2 > 0) || (s1 < 0 && s2 < 0);
-    if (sameDirection && Math.abs(s1) <= runStep && Math.abs(s2) <= runStep) return false;
+    if (sameDirection && abs(s1) <= runStep && abs(s2) <= runStep) return false;
   }
   return true;
 }
@@ -259,7 +262,7 @@ export function runClassSim(opts: ClassSimOptions & { logPicks?: boolean }): Cla
   // Running sums over the pending items, for B(a) and A(a) at each arrival.
   let sumReal = 0;
   let sumCap = 0;
-  const firstTick = Math.min(0, specs.length > 0 ? specs[0].ceaTick : 0);
+  const firstTick = min(0, specs.length > 0 ? specs[0].ceaTick : 0);
   const ok = (id: number | undefined) => antiSeqOk(id, prev, prev2, params.minIdDistance, params.runStep);
 
   for (let t = firstTick; ; t++) {
@@ -414,7 +417,7 @@ export function runClassSim(opts: ClassSimOptions & { logPicks?: boolean }): Cla
 
 /** Quantile as the Python sims take it: sorted[min(len-1, floor(p*len))]. */
 export function quantile(sorted: number[], p: number): number {
-  return sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))];
+  return sorted[min(sorted.length - 1, floor(p * sorted.length))];
 }
 
 export interface QueueScenario {
@@ -469,7 +472,7 @@ export function runQueueScenario(s: QueueScenario): QueueResult {
   let seq = 0;
   let id = 1_000_000;
   const add = (tick: number) => {
-    id += 1 + Math.floor(gen() * 47);
+    id += 1 + floor(gen() * 47);
     let fails = 0;
     const fr = s.failRate ?? 0;
     while (fails < 3 && gen() < fr) fails++;

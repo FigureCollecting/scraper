@@ -3,12 +3,12 @@
  *
  * Queue scenarios port challenger-r2 agingfix.py / agingsim.py and challenger poolsim.py: initial
  * backlog 3,000, 14 days at 350 picks/h, ageCap 12 h, hard cap H 24 h, pAged 0.9; steady = inflow
- * 1.0 per pick, draining = 0.8, growing = 1.17 (reported only). Items carry tap-like increasing ids
+ * 1.0 per pick, draining = 0.8. Items carry tap-like increasing ids
  * (spacing 1..47), so anti-sequence is live, as it will be on MFC. SLO: steady and draining p99 wait
  * <= ageCap + 2 h, max <= 2 x ageCap, forcedPicks 0, and agedShare within 3 pp of 0.69 at steady
- * (review 2 measured 0.686 at pAged 0.9). A steady run with 10 % retryable failures, the growing run
- * and steady/draining at the realised 305 picks/h are reported and must stay inside the starvation
- * theorem's bound for every item.
+ * (review 2 measured 0.686 at pAged 0.9). Steady and draining at the realised 305 picks/h are
+ * reported, and so is a steady run with 10 % retryable failures; both must stay inside the
+ * starvation theorem's bound for every item. The growing run (1.17x) is in poolSelect.starvation.test.ts.
  *
  * Also: the tiered rank share (residuesim.py's three hole runs as the lowest tier under stocked higher
  * tiers), an implicit pool of 120k id ranges that is never materialised, and deterministic ties.
@@ -31,12 +31,14 @@ const base: Omit<QueueScenario, 'name' | 'inflowPerPick' | 'picksPerHour'> = {
   seed: 1,
 };
 
-function scenario(name: string, inflowPerPick: number, picksPerHour: number, extra: Partial<QueueScenario> = {}): QueueResult {
+function scenario(name: string, inflowPerPick: number, picksPerHour: number, failRate?: number): QueueResult {
   const started = Date.now();
-  const r = runQueueScenario({ ...base, name, inflowPerPick, picksPerHour, ...extra });
+  const r = runQueueScenario({ ...base, name, inflowPerPick, picksPerHour, failRate });
   report(`${formatQueueResult(r)} runtime=${((Date.now() - started) / 1000).toFixed(1)} s`);
   expect(r.brokenPicks).toBe(0);
-  expect(r.picks).toBe(picksPerHour * 24 * base.days);
+  // One pick per tick while the queue has an item (a drained queue skips the tick, as agingsim.py).
+  expect(r.picks).toBeLessThanOrEqual(picksPerHour * 24 * base.days);
+  if (inflowPerPick >= 1) expect(r.picks).toBe(picksPerHour * 24 * base.days);
   expect(r.theoremViolations).toBe(0);
   return r;
 }
@@ -58,14 +60,11 @@ describe('queue SLO at 350 picks/h (agingfix.py scenarios)', () => {
     expect(r.forcedPicks).toBe(0);
   }, 120_000);
 
-  it('steady with 10 % retryable failures: reported, inside the theorem bound for every item', () => {
-    const r = scenario('steady 350/h, 10 % retryable failures', 1.0, 350, { failRate: 0.1 });
-    expect(r.theoremChecked).toBeGreaterThan(0);
-    expect(r.maxTheoremRatio).toBeLessThanOrEqual(1);
-  }, 180_000);
-
-  it('growing (inflow 1.17): reported only, inside the theorem bound for every item', () => {
-    const r = scenario('growing 350/h', 1.17, 350);
+  it('steady with 10 % retryable failures (re-queued at once, classEnteredAt kept): reported, inside the theorem bound', () => {
+    // 10 % of attempts fail, so the load is ~1.11x capacity: the backlog grows and R1 carries it.
+    const r = scenario('steady 350/h, 10 % retryable failures', 1.0, 350, 0.1);
+    expect(r.theoremChecked).toBeGreaterThan(10_000);
+    expect(r.forcedPicks).toBeGreaterThan(0);
     expect(r.maxTheoremRatio).toBeLessThanOrEqual(1);
   }, 180_000);
 });
@@ -127,14 +126,27 @@ describe('tiered rank: the lowest tier gets the share its bucket weights and the
     }
     const theory = 0.9 * r3Share + 0.1 * (holes.size / n);
 
+    // The shuffled input picks exactly as the ranked one (checked on a prefix: an unranked pool is
+    // sorted on every call, which is too slow for 20k picks of 4,644).
+    const ranked = [...pool].sort(refRankCmp);
+    const a = mulberry32(31);
+    const b = mulberry32(31);
+    for (let i = 0; i < 300; i++) {
+      const pa = select({ kind: 'explicit', candidates: ranked }, DEFAULT_ID_PARAMS, { rng: a, nowMs: 0, history: {} });
+      const pb = select({ kind: 'explicit', candidates: pool }, DEFAULT_ID_PARAMS, { rng: b, nowMs: 0, history: {} });
+      expect(pb?.candidate).toBe(pa?.candidate);
+      expect(pb?.rank).toBe(pa?.rank);
+    }
     const rng = mulberry32(31);
     const picks = 20_000;
     let holePicks = 0;
+    let nulls = 0;
     for (let i = 0; i < picks; i++) {
-      const p = select({ kind: 'explicit', candidates: pool }, DEFAULT_ID_PARAMS, { rng, nowMs: 0, history: {} });
-      expect(p).not.toBeNull();
-      if (p!.candidate.tier === 3) holePicks++;
+      const p = select({ kind: 'explicit', candidates: ranked }, DEFAULT_ID_PARAMS, { rng, nowMs: 0, history: {} });
+      if (p === null) nulls++;
+      else if (p.candidate.tier === 3) holePicks++;
     }
+    expect(nulls).toBe(0);
     const share = holePicks / picks;
     report(`tiered rank: hole tier share ${share.toFixed(4)} vs theory ${theory.toFixed(4)} (n=${n}, holes=${holes.size})`);
     expect(Math.abs(share - theory)).toBeLessThan(0.02);

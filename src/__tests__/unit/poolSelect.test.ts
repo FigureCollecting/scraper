@@ -166,13 +166,19 @@ describe('passesAntiSequence', () => {
   it('agrees with the antiseq.py oracle on 200k random triples', () => {
     const r = refMulberry32(99);
     const small = () => Math.floor(r() * 120);
+    const mismatches: string[] = [];
+    let rejected = 0;
     for (let i = 0; i < 200_000; i++) {
       const params = i % 2 === 0 ? DEFAULT_ID_PARAMS : { minIdDistance: Math.floor(r() * 4), runStep: Math.floor(r() * 40) };
       const id = r() < 0.05 ? undefined : small();
       const prev = r() < 0.05 ? undefined : small();
       const prev2 = r() < 0.2 ? undefined : small();
-      expect(passesAntiSequence(id, { prev, prev2 }, params)).toBe(antiSeqOk(id, prev, prev2, params.minIdDistance, params.runStep));
+      const want = antiSeqOk(id, prev, prev2, params.minIdDistance, params.runStep);
+      if (!want) rejected++;
+      if (passesAntiSequence(id, { prev, prev2 }, params) !== want) mismatches.push(JSON.stringify({ id, prev, prev2, params }));
     }
+    expect(mismatches.slice(0, 5)).toEqual([]);
+    expect(rejected).toBeGreaterThan(20_000);
   });
 });
 
@@ -317,6 +323,36 @@ describe('rank order (tier asc, recency desc, key asc)', () => {
   });
 });
 
+describe('full duplicates (a caller bug: keys must be unique) stay deterministic', () => {
+  it('keep their input order in the rank order and in the age order', () => {
+    const z = cand('z', { recency: 1 });
+    const dupA = cand('d', { recency: 5, classEnteredAtMs: 0, numId: 101 });
+    const dupB = cand('d', { recency: 5, classEnteredAtMs: 0, numId: 102 });
+    const pool = explicit([z, dupA, dupB]); // not in rank order: sorted once, ties by input position
+    expect(run(pool, DEFAULT_ID_PARAMS, seq(0, 0.1))?.candidate).toBe(dupA);
+    expect(run(pool, DEFAULT_ID_PARAMS, seq(0, 0.5))?.candidate).toBe(dupB);
+    expect(run(pool, DEFAULT_ID_PARAMS, seq(0, 0.9))?.candidate).toBe(z);
+    // R2: both duplicates are aged and too close to prev; the age-order scan meets the tie, then the
+    // whole-pool scan takes z.
+    const params: Params = { ...DEFAULT_ID_PARAMS, ageCapMs: 500 };
+    const pick = run(pool, params, seq(0.5, ...new Array(9).fill(0.3)), { prev: 100 }, 10_000);
+    expect(pick).toMatchObject({ candidate: z, rule: 'scan', stage: 'R3' });
+    // R2 fallback: nothing passes and the duplicates tie on distance: the first one wins.
+    const flat = explicit([cand('z', { recency: 1, numId: 100 }), { ...dupA, numId: 101 }, { ...dupB, numId: 99 }]);
+    const fb = run(flat, params, seq(0.5, ...new Array(9).fill(0.3)), { prev: 100 }, 10_000);
+    expect(fb).toMatchObject({ rule: 'fallback', stage: 'R2', candidate: { numId: 101 } });
+    // R1: two hard-aged duplicates that both pass: the first in input order is the oldest.
+    const r1 = run(pool, { ...DEFAULT_ID_PARAMS, hardCapMs: 500 }, noDraws, {}, 10_000);
+    expect(r1).toMatchObject({ candidate: dupA, rule: 'R1' });
+  });
+
+  it('a pool in tier and recency order with one key inversion is still re-ranked by key', () => {
+    const k2 = cand('k2', { recency: 5 });
+    const k1 = cand('k1', { recency: 5 });
+    expect(run(explicit([k2, k1]), DEFAULT_ID_PARAMS, seq(0, 0.1))?.candidate).toBe(k1);
+  });
+});
+
 describe('R3 bucket draw', () => {
   const flat: Params = { ...R3_ONLY, bucketDecay: 1 };
   const many = (n: number) => Array.from({ length: n }, (_, i) => cand(`k${String(i).padStart(6, '0')}`, { recency: n - i }));
@@ -357,6 +393,13 @@ describe('R3 bucket draw', () => {
     expect(Math.abs(tail / picks - 0.2)).toBeLessThan(0.01);
   });
 
+  it('a coin equal to uniformFloor is not a uniform pick; a negative draw stays inside the pool', () => {
+    const pool = explicit(many(400));
+    expect(run(pool, DEFAULT_ID_PARAMS, seq(0.1, 0, 0))).toMatchObject({ rank: 0, rule: 'R3' });
+    expect(run(pool, DEFAULT_ID_PARAMS, seq(0.0999999, 0.5))).toMatchObject({ rank: 200, rule: 'uniform' });
+    expect(run(pool, DEFAULT_ID_PARAMS, seq(0, -0.5))).toMatchObject({ rank: 0, rule: 'uniform' });
+  });
+
   it('a draw of exactly 1 stays inside the pool', () => {
     const pool = explicit(many(400));
     expect(run(pool, R3_ONLY, seq(0.5, 1, 1))?.rank).toBe(399);
@@ -389,6 +432,13 @@ describe('R3 bucket draw', () => {
         countsR3[b]++;
       }
     }
+    if (process.env.POOL_SIM_REPORT === '1') {
+      process.stdout.write(
+        `static pool 1,000 x 10k picks: uniform share ${(uniform / picks).toFixed(4)} (0.1000); bucket-0 share of R3 picks ` +
+          `${(countsR3[0] / r3).toFixed(4)} (theory ${theoryR3[0].toFixed(4)}); bucket shares ${counts.map((c) => (c / picks).toFixed(4)).join(' ')} ` +
+          `(theory ${theoryAll.map((t) => t.toFixed(4)).join(' ')})\n`,
+      );
+    }
     expect(Math.abs(uniform / picks - 0.1)).toBeLessThan(0.01);
     expect(Math.abs(countsR3[0] / r3 - theoryR3[0])).toBeLessThan(0.02);
     expect(Math.abs(counts[0] / picks - theoryAll[0])).toBeLessThan(0.02);
@@ -416,6 +466,13 @@ describe('R3 anti-sequence: redraw, scan, fallback', () => {
     expect(pick).toMatchObject({ rank: 5, rule: 'scan', stage: 'R3', redraws: 8 });
   });
 
+  it('the last allowed redraw (the ninth draw) still counts', () => {
+    const draws: number[] = [];
+    for (let i = 0; i < DEFAULT_ID_PARAMS.maxRedraws; i++) draws.push(0, atRank(3));
+    draws.push(0, atRank(1));
+    expect(run(pool, DEFAULT_ID_PARAMS, seq(...draws), { prev: 100 })).toMatchObject({ rank: 1, rule: 'uniform', redraws: 8 });
+  });
+
   it('maxRedraws 0 scans after one draw', () => {
     const pick = run(pool, { ...DEFAULT_ID_PARAMS, maxRedraws: 0 }, seq(0, atRank(3)), { prev: 100 });
     expect(pick).toMatchObject({ rank: 0, rule: 'scan', redraws: 0 });
@@ -438,6 +495,11 @@ describe('R3 anti-sequence: redraw, scan, fallback', () => {
     // Strictly larger wins over an earlier smaller one.
     const mixed = explicit([101, 103, 99].map((id, i) => cand(`m${id}`, { numId: id, recency: -i })));
     expect(run(mixed, DEFAULT_ID_PARAMS, refMulberry32(4), { prev: 100 })).toMatchObject({ candidate: { numId: 103 }, rank: 1 });
+  });
+
+  it('falls back even when every candidate sits exactly on prev (distance 0)', () => {
+    const same = explicit([cand('s1', { numId: 100, recency: 2 }), cand('s2', { numId: 100, recency: 1 })]);
+    expect(run(same, DEFAULT_ID_PARAMS, refMulberry32(2), { prev: 100 })).toMatchObject({ candidate: { key: 's1' }, rank: 0, rule: 'fallback' });
   });
 
   it('a candidate without numId is always acceptable', () => {
@@ -483,6 +545,14 @@ describe('R1 hard aging', () => {
     ]);
     const pick = run(pool, params, noDraws, { prev: 100 }, now);
     expect(pick).toMatchObject({ candidate: { key: 'olderOk' }, rule: 'R1', markSkip: 'o' });
+  });
+
+  it('the skip pick counts a candidate aged exactly hardCapMs as hard-aged', () => {
+    const pool = explicit([
+      cand('o', { numId: 101, recency: 1, classEnteredAtMs: now - 9000 }),
+      cand('edge', { numId: 900, recency: 2, classEnteredAtMs: now - H }),
+    ]);
+    expect(run(pool, params, noDraws, { prev: 100 }, now)).toMatchObject({ candidate: { key: 'edge' }, rule: 'R1', markSkip: 'o' });
   });
 
   it('dispatches the marked oldest item itself when no hard-aged item passes', () => {
@@ -560,6 +630,11 @@ describe('R2 soft aging', () => {
     expect(run(pool, params, seq(0.5, inA(1), inA(0)), { prev: 2002 }, now)).toMatchObject({ candidate: { key: 'a0' }, rule: 'R2', redraws: 1 });
   });
 
+  it('the last allowed redraw (the ninth draw) still counts', () => {
+    const draws = [0.5, ...new Array(8).fill(inA(0)), inA(1)];
+    expect(run(pool, params, seq(...draws), { prev2: 2950, prev: 2990 }, now)).toMatchObject({ candidate: { key: 'a1' }, rule: 'R2', redraws: 8 });
+  });
+
   it('after maxRedraws failures scans the aged set oldest first', () => {
     // prev2 2950 -> prev 2990: a0 (3000) is too close; draws all hit a0. Oldest first: a2 (1000) passes.
     const draws = [0.5, ...new Array(9).fill(inA(0))];
@@ -578,7 +653,8 @@ describe('R2 soft aging', () => {
       cand('a1', { numId: 99, recency: 4, classEnteredAtMs: now - 600 }),
     ]);
     const draws = [0.5, ...new Array(9).fill(0.1)];
-    expect(run(tight, params, seq(...draws), { prev: 100 }, now)).toMatchObject({ candidate: { key: 'f0' }, rule: 'scan', stage: 'R2' });
+    // Stage R3: the pick is not an aged one, so it must not count toward the aged share.
+    expect(run(tight, params, seq(...draws), { prev: 100 }, now)).toMatchObject({ candidate: { key: 'f0' }, rule: 'scan', stage: 'R3' });
   });
 
   it('when nothing in the pool is acceptable, falls back to the largest |id - prev| in the aged set, ties to the oldest', () => {
