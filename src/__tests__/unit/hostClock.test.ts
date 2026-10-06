@@ -390,6 +390,15 @@ describe('HostClock', () => {
       expect(clock.view(120 * MIN + 500).hosts[0]).toEqual({ host: MFC, floorMs: 7000, clocked: true, ...idle, lastSendAt: new Date(60 * MIN + 500).toISOString() });
     });
 
+    it('keeps only the trailing hour of sends in memory', () => {
+      const clock = observed();
+      for (let i = 0; i < 100; i++) clock.recordSend(MFC, 'queue', i * 1000);
+      clock.recordSend(MFC, 'image', 120 * MIN);
+      // White-box on purpose: the window filter alone would hide an unbounded log from the view.
+      expect((clock as unknown as { observed: Map<string, unknown[]> }).observed.get(MFC)).toHaveLength(1);
+      expect(clock.view(120 * MIN).hosts[0]).toMatchObject({ sends60m: { queue: 0, image: 1 }, minGapMs60m: 120 * MIN - 99_000 });
+    });
+
     it('lists every store host that sent, sorted, each line under 1 KB', () => {
       const clock = observed('all');
       for (let i = 0; i < 2000; i++) clock.recordSend(i % 2 ? MFC : 'hpoi.net', i % 3 ? 'queue' : 'image', i * 1000);
