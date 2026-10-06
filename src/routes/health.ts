@@ -53,7 +53,11 @@
  *     from our own system with zero upstream requests; `[]` when no plugin registered any), and
  *     `plugins: {loaded: [{name, version}], refused: [{name, version}]}` (which plugins loaded at
  *     startup and which were refused — it tells a plugin with no policy from a refused plugin, and
- *     explains a queueStore `held`; why a plugin was refused stays in the pod log).
+ *     explains a queueStore `held`; why a plugin was refused stays in the pod log), and
+ *     `hostClock: {mode, hosts: [{host, floorMs, clocked, sends60m: {queue, image}, minGapMs60m,
+ *     underFloor60m, lastSendAt}]}` (the shared host clock's send-time observer: per store host, the
+ *     trailing hour of requests measured at the instant each was handed to its transport — with the
+ *     clock off too, so it is the live negative control for SCRAPE_HOST_CLOCK).
  *     A browser-pool-health failure still degrades to 500, now carrying { status:'degraded',
  *     challengeCooldowns, cfCookies, error } — both lists survive (neither lister can throw).
  */
@@ -70,6 +74,7 @@ import type { CpuThrottlingView } from '../services/cpuThrottling.js';
 import type { QueueStoreView } from '../services/scrapeQueue.js';
 import type { HandsOffView } from '../services/extractionRegistry.js';
 import type { PluginsView } from '../services/pluginBootstrap.js';
+import type { HostClockView } from '../services/hostClock.js';
 
 export interface HealthDeps {
   /** The service version (package.json). */
@@ -158,6 +163,14 @@ export interface HealthDeps {
    * versions only. Both lists empty before the plugins load. Never throws.
    */
   listPlugins: () => PluginsView;
+  /**
+   * The shared host clock's send-time observer (getHostClock().view(now), QB-U30a): `mode` (off | all
+   * | hosts) and, per store host, `{host, floorMs, clocked, sends60m: {queue, image}, minGapMs60m,
+   * underFloor60m, lastSendAt}` over the trailing hour, measured at the instant each request was
+   * handed to its transport. It reads the same with the clock off (the live negative control).
+   * Counters only, under 1 KB per host; never throws.
+   */
+  getHostClock: () => HostClockView;
 }
 
 export function createHealthRoutes(deps: HealthDeps): Router {
@@ -199,6 +212,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         cpuThrottling: deps.getCpuThrottling(),
         handsOff: deps.listHandsOff(),
         plugins: deps.listPlugins(),
+        hostClock: deps.getHostClock(),
         timestamp: new Date().toISOString(),
       });
     } catch (error) {
@@ -225,6 +239,8 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         // Which hosts are off limits matters most when the pod is sick and someone goes looking.
         handsOff: deps.listHandsOff(),
         plugins: deps.listPlugins(),
+        // Whether MFC is being sent to under its floor matters most when the pod is sick, too.
+        hostClock: deps.getHostClock(),
         error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
