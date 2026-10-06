@@ -77,7 +77,7 @@ import { logger } from '../utils/logger.js';
 import { classifyFetchFailure } from '../services/failureClassifier.js';
 import type { FetchFailureReport, ReportFetchFailure } from '../services/failureReporter.js';
 import type { CrawlerConfig, CrawlerMode } from './config.js';
-import type { Ledger, LedgerGapBand, LedgerGapOrigin, LedgerRange, LedgerStore } from './ledger.js';
+import type { Ledger, LedgerEntry, LedgerGapBand, LedgerGapOrigin, LedgerRange, LedgerStore, LedgerVia } from './ledger.js';
 import { isSafeRotatingName } from '../utils/rotatingName.js';
 import {
   createFileListsStateStore,
@@ -443,6 +443,27 @@ interface LaneBudget {
 }
 
 type Phase = 'recent' | 'backfill' | 'range' | 'gap' | 'seed' | 'reobserve' | 'lists';
+
+/**
+ * The ledger `via` each phase stamps, for every phase except 'recent' (see `viaFor`). 'range' is the
+ * id-range DESCENT. Typed over every Phase, so a new phase cannot ship without naming its source.
+ */
+const VIA_BY_PHASE: Record<Exclude<Phase, 'recent'>, LedgerVia> = {
+  backfill: 'backfill',
+  range: 'descent',
+  gap: 'gap',
+  seed: 'seed',
+  reobserve: 'reobserve',
+  lists: 'lists',
+};
+
+/**
+ * FIRST WRITER WINS. A write that CREATES an entry records its source as `via`; a write to an id that
+ * already has an entry keeps that `via` (an unknown one included), or keeps it ABSENT on an entry
+ * written before `via` existed, and records itself as `lastVia`.
+ */
+const viaStamp = (prior: LedgerEntry | undefined, via: LedgerVia): Pick<LedgerEntry, 'via' | 'lastVia'> =>
+  prior ? { ...(prior.via !== undefined ? { via: prior.via } : {}), lastVia: via } : { via };
 
 /** What a lane hands `processPage` beyond the items: its own budget, its band origin, its queue priority. */
 interface LaneOptions {
@@ -1016,6 +1037,15 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
   };
 
   /**
+   * The source a `processPage` write stamps as the entry's `via`. THE TAP RULE: the RECENT phase of a
+   * store in config.rangeStores is that store's Latest Additions TAP (for mfc the recent listing,
+   * /item/browse/figure/ page 1, IS the tap), so it stamps 'tap'; every other store's recent listing
+   * stamps 'recent'. This is what lets the hole detection tell the tap's evidence from the rest.
+   */
+  const viaFor = (st: StoreState, phase: Phase): LedgerVia =>
+    phase === 'recent' ? (config.rangeStores.includes(st.siteId) ? 'tap' : 'recent') : VIA_BY_PHASE[phase];
+
+  /**
    * Enqueue the page's new items sequentially. Returns how many were NEW (for recent's
    * stop rule) and whether every new item was actually attempted (for backfill's advance rule).
    */
@@ -1084,7 +1114,14 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       switch (outcome) {
         case 'accepted':
         case 'accepted-dedup':
-          ledger.enqueued[item.itemId] = { at: iso(), collectUrl: item.collectUrl, ...(sweptFrom ? { sweptFrom } : {}) };
+          // Rebuilt WHOLE, as before; only the source stamp carries over from an existing entry (the
+          // recent phase's re-observation): see viaStamp.
+          ledger.enqueued[item.itemId] = {
+            at: iso(),
+            collectUrl: item.collectUrl,
+            ...(sweptFrom ? { sweptFrom } : {}),
+            ...viaStamp(ledger.enqueued[item.itemId], viaFor(st, phase)),
+          };
           accepted++;
           // The SWEEP's landings are the sweep's own number. `enqueued` is what `capApplied` bounds,
           // and `deduplicated` is "of `enqueued`" — a sweep POST in either would make a store summary
@@ -2390,6 +2427,10 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
             // The observation time IS the ledger's ordering key: stamping it sends the id to the back
             // of the oldest-first queue, which is what makes the lane rotate through a catalog.
             entry.at = iso();
+            // FIRST WRITER WINS: `via` stays whatever created the entry (absent on a legacy one); this
+            // lane records itself only as the last observer. A refusal below observed nothing, so it
+            // leaves both alone.
+            entry.lastVia = VIA_BY_PHASE.reobserve;
             delete entry.reobserveFailedAt;
             delete entry.reobserveFailures;
             // The lane's landing is the lane's OWN number. `enqueued` and `deduplicated` stay the

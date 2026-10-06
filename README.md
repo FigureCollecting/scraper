@@ -698,7 +698,8 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
   "version": 1,
   "siteId": "orzgk",
   "enqueued": { "<itemId>": { "at": "2026-09-06T12:00:00.000Z", "collectUrl": "https://...",
-                              "reobserveFailedAt": "...", "reobserveFailures": 1 } },
+                              "reobserveFailedAt": "...", "reobserveFailures": 1,
+                              "via": "tap", "lastVia": "reobserve" } },
   "backfill": {
     "cursor": 12,
     "exhaustCandidateCursor": 12, "exhaustCandidateAt": "...",
@@ -715,6 +716,16 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
 simply has no `range` and is neither corrupt nor migrated (the file stays `version: 1`). A `range`
 that IS present must be well formed — a malformed cursor or frontier is **corrupt**, never a silent
 reset that would re-walk the whole id space nor a non-number reported as one.
+
+`via` names the source whose accepted POST CREATED the entry: `tap` (the recent listing of a store
+in `CRAWLER_RANGE_STORES`; for mfc that listing IS the Latest Additions tap), `recent` (any other
+store's recent listing), `backfill`, `descent` (the id-range walk), `gap`, `lists` or `seed`;
+`reobserve` only ever appears as a `lastVia`, and `target` is reserved. FIRST WRITER WINS: a later
+write to the same id (a recent re-observation, the re-observation lane) keeps `via`, or keeps it
+absent on an entry written before the field existed, and records itself as `lastVia`. Both are
+optional and the file stays `version: 1`. Entries are not validated on load, so any build loads and
+saves back a value it does not know untouched (an older build's recent re-observation still rebuilds
+the entry whole and drops both).
 
 A missing file is a fresh ledger. Unparseable JSON, a wrong `version`, a wrong `siteId`, or a
 malformed section is **corrupt**: the store is refused for the run (counted as an error) and the

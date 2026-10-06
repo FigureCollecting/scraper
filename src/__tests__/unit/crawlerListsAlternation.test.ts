@@ -27,7 +27,11 @@ import {
   type Reply,
 } from '../helpers/crawlerAlternationSim';
 
-/** Recorded from upstream develop 1afae8ba (before this change) with the same simulation. */
+/**
+ * Recorded from upstream develop 1afae8ba (before this change) with the same simulation. Each `stateAfter`
+ * hashes the whole ledgers and lists state, every ledger entry field included, so a new entry field moves
+ * it with no request changed: QB-U27's `via` stamp re-recorded them; every `calls` line is as recorded.
+ */
 const GOLDEN = JSON.parse(fsNode.readFileSync(path.join(__dirname, '../fixtures/crawler/listsAlternationGolden.json'), 'utf8'));
 
 const at = (day: number, hh: number, mm = 30): number => Date.parse(`2026-10-${String(6 + day).padStart(2, '0')}T${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}:00.000Z`);
