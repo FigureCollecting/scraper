@@ -165,6 +165,12 @@ export interface CrawlerConfig {
   listsDrainCaps?: Record<string, number>;
   /** LISTS: wait between two lists of one group (`CRAWLER_LISTS_SPACING_MS`), never below 10 s. */
   listsSpacingMs?: number;
+  /**
+   * LISTS ALTERNATION (`CRAWLER_LISTS_ALTERNATE`, csv of siteIds; Ross MS 2026-10-04): for these stores a
+   * pass that starts inside the lists window fetches EITHER the Latest Additions tap OR one company-list
+   * group, never both; each window opens with a lists pass. Empty (the default) or absent = today's pass.
+   */
+  listsAlternate?: string[];
 }
 
 /** A UTC time-of-day window in minutes after midnight; `endMin < startMin` means it wraps past midnight. */

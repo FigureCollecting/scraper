@@ -430,6 +430,26 @@ describe('loadCrawlerConfig — the rotating company-lists step', () => {
     }
   });
 
+  it('CRAWLER_LISTS_ALTERNATE is empty by default: no store alternates the tap and the lists', () => {
+    expect(loadCrawlerConfig({}).listsAlternate).toEqual([]);
+    expect(loadCrawlerConfig({ CRAWLER_LISTS_ALTERNATE: '' }).listsAlternate).toEqual([]);
+  });
+
+  it('parses CRAWLER_LISTS_ALTERNATE as a csv of siteIds, once each, dropping an unsafe entry with a WARN naming the var', () => {
+    const warn = quiet();
+    try {
+      expect(loadCrawlerConfig({ CRAWLER_LISTS_ALTERNATE: ' mfc ,hpoi,mfc' }).listsAlternate).toEqual(['mfc', 'hpoi']);
+      expect(warn).not.toHaveBeenCalled();
+      expect(loadCrawlerConfig({ CRAWLER_LISTS_ALTERNATE: 'mfc,../etc,mfc:1,a b' }).listsAlternate).toEqual(['mfc']);
+      expect(warn).toHaveBeenCalledTimes(3);
+      for (const entry of ['../etc', 'mfc:1', 'a b']) {
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining('CRAWLER_LISTS_ALTERNATE'), { entry });
+      }
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('CRAWLER_LISTS_SPACING_MS may widen the gap between one group lists but never below 10 s', () => {
     const warn = quiet();
     try {

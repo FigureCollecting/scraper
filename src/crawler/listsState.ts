@@ -50,6 +50,20 @@ export interface ListsPendingEntry {
   group: string;
 }
 
+/**
+ * The LISTS ALTERNATION marker (CRAWLER_LISTS_ALTERNATE): the kind the store's last in-window pass was
+ * meant to be, and the window it belonged to. Deliberately NOT validated on load — coerceListsState hands
+ * the document back as it is, so a build that predates the marker keeps it through its own save, and the
+ * crawler reads it defensively (a malformed one is treated as absent).
+ */
+export interface ListsAlternationMarker {
+  lastInWindowKind: 'lists' | 'tap';
+  /** ISO-8601 UTC start of the window holding that pass; a different start resets to a lists pass. */
+  windowStart: string;
+  /** ISO-8601 UTC start of that pass. */
+  at: string;
+}
+
 export interface ListsState {
   version: typeof LISTS_STATE_VERSION;
   siteId: string;
@@ -57,6 +71,8 @@ export interface ListsState {
   pending: ListsPendingEntry[];
   /** After a blocked answer, the end of that pass's window: no list is fetched before it (the backlog still drains). */
   pausedUntil?: string;
+  /** The alternation marker of a store named in CRAWLER_LISTS_ALTERNATE; absent for every other store. */
+  alternation?: ListsAlternationMarker;
   updatedAt?: string;
 }
 

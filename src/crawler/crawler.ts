@@ -251,6 +251,13 @@ export interface CrawlerStoreSummary {
   /** LISTS: why the drain stopped short, `null` when it did not. */
   listsDrainStopped: ListsDrainStopReason | null;
   /**
+   * LISTS ALTERNATION (CRAWLER_LISTS_ALTERNATE): what this pass was for the store — `lists` (company lists,
+   * no tap), `tap` (the tap, no list), `fallback-tap` (a lists pass that fetched no list, so it tapped after
+   * the lists step), `outside-window` (the pass started outside the lists window: tap, no list), or `off`
+   * (the store is not alternated, or its lists state could not be read at pass start).
+   */
+  alternation: ListsAlternation;
+  /**
    * Per-list stats for a `seed`-mode run, in the order the lists were polled. Empty in every other
    * mode, and empty for a store whose seed pass never got a list (no declaration, or a stop).
    */
@@ -388,11 +395,16 @@ export type ListsSkipReason =
   | 'paused'
   /** Every declared group was attempted within the interval. */
   | 'none-due'
+  /** CRAWLER_LISTS_ALTERNATE: an in-window TAP pass, so no group is fetched (the backlog still drains). */
+  | 'alternation-tap'
   /** The engine does not serve rotating lists (404), or the store declares none (422). */
   | 'unsupported'
   | 'cooldown'
   | 'budget'
   | 'failed';
+
+/** What a pass was for an alternated store (see `CrawlerStoreSummary.alternation`). */
+export type ListsAlternation = 'off' | 'outside-window' | 'lists' | 'tap' | 'fallback-tap';
 
 /** Why the lists DRAIN stopped short. */
 export type ListsDrainStopReason = StopReason | 'store-stopped';
@@ -647,6 +659,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       listsDrainApplied: 0,
       listsSkipped: listsCapFor(siteId) > 0 ? 'not-run' : 'not-configured',
       listsDrainStopped: null,
+      alternation: 'off',
       seedLists: [],
       seedStopped: null,
       backfillCursor: null,
