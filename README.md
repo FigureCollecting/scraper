@@ -907,9 +907,10 @@ a stop in one lane (cooldown, challenge, sick scraper) stops every lane below it
   it issued no list GET (`none-due`, `paused`, `unsupported`, past the window) and the store is not stopped,
   it taps after the id-range phase instead (`fallback-tap`); a list GET that was issued, answered or not,
   costs the pass's tap. A TAP pass runs recent and backfill and asks for no group (`listsSkipped:
-  "alternation-tap"`). Both drain the backlog. The marker records the INTENDED kind and is written by the
-  lists step's own save, so a pass whose lists step did not run (store stopped first) repeats its kind
-  next pass. A pass that starts outside the window taps as today and never asks for a group, even if it
+  "alternation-tap"`). Both drain the backlog. The marker records the INTENDED kind (`lists` after a
+  fallback tap) and only the lists step's own save writes it, so a pass whose lists step did not run
+  (store stopped first) repeats its kind next pass: a tap pass stopped on its tap costs that night a
+  group. A pass that starts outside the window taps as today and never asks for a group, even if it
   reaches the lists step inside the window; the marker is untouched. A lists state that cannot be read at
   pass start turns alternation off for that pass (one WARN; today's pass). The marker is not validated on
   load: a build without this knob keeps it, and a malformed one counts as absent. Store summary:

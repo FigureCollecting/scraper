@@ -51,10 +51,12 @@ export interface ListsPendingEntry {
 }
 
 /**
- * The LISTS ALTERNATION marker (CRAWLER_LISTS_ALTERNATE): the kind the store's last in-window pass was
- * meant to be, and the window it belonged to. Deliberately NOT validated on load — coerceListsState hands
- * the document back as it is, so a build that predates the marker keeps it through its own save, and the
- * crawler reads it defensively (a malformed one is treated as absent).
+ * The LISTS ALTERNATION marker (CRAWLER_LISTS_ALTERNATE): the kind of the store's last in-window pass that
+ * reached its lists step (`lists` even when it fell back to the tap), and the window it belonged to. Only
+ * that step's save writes it, so a pass stopped before the step writes none and the next pass repeats its
+ * kind. Deliberately NOT validated on load — coerceListsState hands the document back as it is, so a build
+ * that predates the marker keeps it through its own save, and the crawler reads it defensively (a malformed
+ * one is treated as absent).
  */
 export interface ListsAlternationMarker {
   lastInWindowKind: 'lists' | 'tap';
