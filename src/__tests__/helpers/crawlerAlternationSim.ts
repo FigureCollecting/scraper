@@ -60,6 +60,8 @@ export interface EngineOpts {
   list?: (listId: string) => Reply;
   /** Called on every listing GET (the tap or a backfill page) before it answers: a slow page moves the clock. */
   onListing?: (store: string, page: number) => void;
+  /** A listing or id-range GET: a reply that replaces its normal answer (a cooldown, say); undefined = the normal answer. */
+  reply?: (call: Call) => Reply | undefined;
 }
 
 /**
@@ -97,6 +99,8 @@ export const makeEngine = (now: () => number, opts: EngineOpts = {}) => {
     }
     if (u.searchParams.get('range') === '1') {
       calls.push({ at: now(), method, store, kind: 'range', line });
+      const over = opts.reply?.(calls[calls.length - 1]);
+      if (over) return resp(over.status, over.body ?? {});
       const from = Number(u.searchParams.get('from'));
       const count = Number(u.searchParams.get('count'));
       const ids: number[] = [];
@@ -106,6 +110,8 @@ export const makeEngine = (now: () => number, opts: EngineOpts = {}) => {
     const page = Number(u.searchParams.get('page'));
     calls.push({ at: now(), method, store, kind: 'listing', line, page });
     opts.onListing?.(store, page);
+    const over = opts.reply?.(calls[calls.length - 1]);
+    if (over) return resp(over.status, over.body ?? {});
     const hour = Math.floor((now() - DAY0) / HOUR_MS);
     const top = LISTING_BASE[store] + 10 + 2 * hour - 4 * (page - 1);
     const ids = [0, 1, 2, 3].map((k) => top - k);

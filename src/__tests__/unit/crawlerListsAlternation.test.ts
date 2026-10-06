@@ -24,6 +24,7 @@ import {
   storeOf,
   type Call,
   type PassTrace,
+  type Reply,
 } from '../helpers/crawlerAlternationSim';
 
 /** Recorded from upstream develop 1afae8ba (before this change) with the same simulation. */
@@ -79,6 +80,22 @@ describe('lists alternation — knob empty is today, request for request', () =>
     expect(mfc(passes[0], 'list')).toHaveLength(1);
     expect(alternationWarns()).toHaveLength(1);
     expect(alternationWarns()[0][1]).toEqual(expect.objectContaining({ siteId: 'mfc' }));
+  });
+
+  it('CRAWLER_MODE=recent (no backfill, so no lists step) ignores the knob with a WARN: mfc taps every in-window pass as today', async () => {
+    const recent = { mode: 'recent' as const, phases: ['recent' as const] };
+    const today = await simulate(simConfig(recent), { passes: 2, from: at(0, 15) });
+    warn.mockClear();
+    const { passes } = await simulate(simConfig({ ...recent, listsAlternate: ['mfc'] }), { passes: 2, from: at(0, 15) });
+    for (const [i, p] of passes.entries()) {
+      expect(storeOf(p, 'mfc').alternation).toBe('off');
+      expect(mfc(p, 'listing').map((c) => c.page)).toEqual([1]);
+      expect(linesOf(p, 'mfc')).toEqual(linesOf(today.passes[i], 'mfc'));
+    }
+    expect(alternationWarns().map((c) => c[1])).toEqual([
+      { siteId: 'mfc', mode: 'recent' },
+      { siteId: 'mfc', mode: 'recent' },
+    ]);
   });
 });
 
@@ -197,7 +214,8 @@ describe('lists alternation — the marker, pass by pass', () => {
 });
 
 describe('lists alternation — a lists pass that fetched no list falls back to the tap', () => {
-  const cfg = simConfig({ listsAlternate: ['mfc'] });
+  // A discovery cap the tap cannot spend alone (the default 3 can), so a backfill page in the fallback would show.
+  const cfg = simConfig({ storeEnqueueCaps: { mfc: 10 }, listsAlternate: ['mfc'] });
   const allSpent = (): ListsState => {
     const s = backlogState(10);
     for (let n = 1; n <= GROUP_COUNT; n++) {
@@ -220,8 +238,13 @@ describe('lists alternation — a lists pass that fetched no list falls back to 
     expect(decl).toBeGreaterThanOrEqual(0);
     expect(tap).toBeGreaterThan(decl);
     expect(storeOf(first, 'mfc').recentPages).toBe(1);
+    expect(storeOf(first, 'mfc').backfillPages).toBe(0);
     expect(storeOf(second, 'mfc').alternation).toBe('tap');
+    // The control: under the same cap, a TAP pass does read its backfill page.
+    expect(mfc(second, 'listing').map((c) => c.page)).toEqual([1, expect.any(Number)]);
+    expect(storeOf(second, 'mfc').backfillPages).toBe(1);
     expect(storeOf(third, 'mfc').alternation).toBe('fallback-tap');
+    expect(mfc(third, 'listing').map((c) => c.page)).toEqual([1]);
   });
 
   it('paused: no rotation request at all, the tap runs, and the marker still records a lists pass', async () => {
@@ -339,7 +362,15 @@ describe('lists alternation — restarts and the state other builds write', () =
   });
 
   it('a malformed marker is no marker: the pass is a lists pass, the state is not refused, and the marker is rewritten', async () => {
-    for (const junk of [{ lastInWindowKind: 'list', windowStart: '2026-10-06T15:30:00.000Z', at: 'x' }, { lastInWindowKind: 'lists', windowStart: 'yesterday' }, 'lists', null]) {
+    const junks = [
+      { lastInWindowKind: 'list', windowStart: '2026-10-06T15:30:00.000Z', at: 'x' },
+      { lastInWindowKind: 'lists', windowStart: 'yesterday' },
+      // Not a string, though Date.parse would coerce it to this window's start.
+      { lastInWindowKind: 'lists', windowStart: ['2026-10-06T15:30:00.000Z'] },
+      'lists',
+      null,
+    ];
+    for (const junk of junks) {
       const lists = createMemoryListsStateStore({ mfc: { ...backlogState(4), alternation: junk } as unknown as ListsState });
       const { passes } = await simulate(simConfig({ listsAlternate: ['mfc'] }), { passes: 1, from: at(0, 17), lists });
       expect(storeOf(passes[0], 'mfc').alternation).toBe('lists');
@@ -353,6 +384,60 @@ describe('lists alternation — restarts and the state other builds write', () =
     const lists = createMemoryListsStateStore({ mfc: { ...backlogState(4), alternation: stale } as unknown as ListsState });
     const { passes } = await simulate(simConfig({ listsAlternate: ['mfc'] }), { passes: 2, from: at(0, 15), lists });
     expect(passes.map((p) => storeOf(p, 'mfc').alternation)).toEqual(['lists', 'tap']);
+  });
+});
+
+describe('lists alternation — a pass stopped before its lists step writes no marker, so the next pass repeats its kind', () => {
+  // The marker rides the lists step's own save. The trade-off: a tap pass stopped on its tap costs that night a company group.
+  const cooldown: Reply = { status: 503, body: { error: 'cooldown', remainingMs: 600_000 } };
+  const window15 = { lastInWindowKind: 'lists', windowStart: '2026-10-06T15:30:00.000Z' };
+
+  it('a TAP pass stopped by a cooldown on its tap: the 15:30 lists marker stays, so 17:30 taps again', async () => {
+    let cool = false;
+    const seen: unknown[] = [];
+    const lists = createMemoryListsStateStore({ mfc: backlogState(30) });
+    const { passes } = await simulate(simConfig({ listsAlternate: ['mfc'] }), {
+      passes: 4,
+      from: at(0, 15),
+      lists,
+      engine: { reply: (c) => (cool && c.store === 'mfc' && c.kind === 'listing' ? cooldown : undefined) },
+      beforePass: (i) => {
+        cool = i === 1;
+        if (i === 2) seen.push(marker(lists));
+      },
+    });
+    expect(passes.map((p) => storeOf(p, 'mfc').alternation)).toEqual(['lists', 'tap', 'tap', 'lists']);
+    expect(storeOf(passes[1], 'mfc').listsSkipped).toBe('store-stopped');
+    expect(mfc(passes[1], 'listing')).toHaveLength(1);
+    expect(seen).toEqual([{ ...window15, at: '2026-10-06T15:30:00.000Z' }]);
+    expect(passes.map((p) => mfc(p, 'list').length)).toEqual([1, 0, 0, 1]);
+  });
+
+  it('a LISTS pass stopped by a cooldown on its recent-gap sweep (before the lists): no list, no tap, and 18:30 is a lists pass again', async () => {
+    const seeded = seedLedgers();
+    const gap = { from: 1001, to: 1100, next: 1001, origin: 'reanchor' as const, createdAt: iso(at(0, 14)) };
+    const ledgers = createMemoryLedgerStore({ ...seeded, mfc: { ...seeded.mfc, range: { cursor: 500, frontier: 1000, gaps: [gap] } } });
+    let cool = false;
+    const seen: unknown[] = [];
+    const lists = createMemoryListsStateStore({ mfc: backlogState(30) });
+    const { passes } = await simulate(simConfig({ listsAlternate: ['mfc'], rangeGapBudget: 2 }), {
+      passes: 4,
+      from: at(0, 15),
+      lists,
+      ledgers,
+      engine: { reply: (c) => (cool && c.store === 'mfc' && c.kind === 'range' ? cooldown : undefined) },
+      beforePass: (i) => {
+        cool = i === 2;
+        if (i === 3) seen.push(marker(lists));
+      },
+    });
+    expect(passes.map((p) => storeOf(p, 'mfc').alternation)).toEqual(['lists', 'tap', 'lists', 'lists']);
+    expect(storeOf(passes[2], 'mfc').listsSkipped).toBe('store-stopped');
+    expect(mfc(passes[2], 'range')).toHaveLength(1);
+    expect(mfc(passes[2], 'list')).toEqual([]);
+    expect(mfc(passes[2], 'listing')).toEqual([]);
+    expect(seen).toEqual([{ lastInWindowKind: 'tap', windowStart: '2026-10-06T15:30:00.000Z', at: '2026-10-06T16:30:00.000Z' }]);
+    expect(passes.map((p) => mfc(p, 'list').length)).toEqual([1, 0, 0, 1]);
   });
 });
 
