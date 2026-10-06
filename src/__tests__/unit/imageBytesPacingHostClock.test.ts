@@ -187,13 +187,14 @@ describe('paceImageBytesByHost on the shared host clock (QB-U8)', () => {
       let now = 500;
       const calls: number[] = [];
       const fetcher = jest.fn(async () => { calls.push(now); return ok(); });
-      const paced = paceImageBytesByHost(fetcher, new HostRateLimiter(() => undefined), {
+      const limiter = new HostRateLimiter(() => undefined);
+      const paced = paceImageBytesByHost(fetcher, limiter, {
         now: () => now,
         sleep: async (ms: number) => sleep(ms, () => now, t => { now = t; }),
         cooldown,
         hostClock: clock,
       });
-      return { clock, paced, calls, fetcher };
+      return { clock, paced, calls, fetcher, limiter };
     }
 
     it('a late timer: the next image and the next record wait a full floor after the image really left', async () => {
@@ -222,9 +223,13 @@ describe('paceImageBytesByHost on the shared host clock (QB-U8)', () => {
       const { clock, paced, calls } = scripted((ms, at, set) => {
         if (first) {
           first = false;
-          // The image's timer is so late that the queue polls at 14050 and dispatches record 2 first.
+          // The image's timer is so late that the queue polls at 14050 and dispatches record 2 first,
+          // stamping it at its transport hand-off as the queue does.
           set(14_050);
-          if (clockRef.tryAcquire(MFC, 14_050, FLOOR) === 0) records.push(14_050);
+          if (clockRef.tryAcquire(MFC, 14_050, FLOOR) === 0) {
+            clockRef.settle(MFC, 14_050, FLOOR);
+            records.push(14_050);
+          }
           set(14_100);
           return;
         }
@@ -247,6 +252,53 @@ describe('paceImageBytesByHost on the shared host clock (QB-U8)', () => {
       const results = await Promise.all([paced(nsp(1)), paced(nsp(2))]);
       expect(results.map(r => (r.ok ? 'fetched' : (r as { reason: string }).reason))).toEqual(['refused', 'refused']);
       expect(fetcher).not.toHaveBeenCalled();
+    });
+
+    it('stamps the clock and the observer with the instant the image really leaves (booked 7000, timer 600 ms late: 7600)', async () => {
+      let late = 600;
+      const { clock, paced, calls } = scripted((ms, at, set) => { set(at() + ms + late); late = 0; });
+      const settle = jest.spyOn(clock, 'settle');
+      const recordSend = jest.spyOn(clock, 'recordSend');
+      await paced(nsp(1));
+      expect(calls).toEqual([7600]);
+      expect(settle.mock.calls).toEqual([[MFC, 7600, FLOOR]]);
+      expect(recordSend.mock.calls).toEqual([[MFC, 'image', 7600]]);
+      expect(clock.view(7600).hosts).toEqual([{
+        host: MFC, floorMs: FLOOR, clocked: true, sends60m: { queue: 0, image: 1 }, minGapMs60m: 0, underFloor60m: 0,
+        lastSendAt: new Date(7600).toISOString(),
+      }]);
+    });
+
+    it('the send is stamped before the transport is called: inside the fetch the gate is already shut for a floor', async () => {
+      const clock = mfcClock();
+      const gateInsideFetch: number[] = [];
+      const paced = paceImageBytesByHost(jest.fn(async () => { gateInsideFetch.push(clock.msUntilSendable(MFC, 0, 0, FLOOR)); return ok(); }), new HostRateLimiter(() => undefined), {
+        now: () => 0,
+        sleep: async () => undefined,
+        cooldown: noCooldown,
+        hostClock: clock,
+      });
+      await paced(nsp(1));
+      expect(gateInsideFetch).toEqual([FLOOR]);
+    });
+
+    it('an image refused after its wait stamps nothing, records nothing and books no limiter dispatch', async () => {
+      const cooldown = new ChallengeCooldown();
+      const { clock, paced, fetcher, limiter } = scripted((ms, at, set) => {
+        set(at() + ms);
+        if (!cooldown.isOpen(MFC)) cooldown.open(MFC, 'challenge page via impersonate transport');
+      }, cooldown);
+      const settle = jest.spyOn(clock, 'settle');
+      const recordSend = jest.spyOn(clock, 'recordSend');
+      const result = await paced(nsp(1));
+      expect(result).toMatchObject({ ok: false, reason: 'refused' });
+      expect((result as { detail: string }).detail).toMatch(/myfigurecollection\.net began cooling from a Cloudflare challenge while this image waited; another \d+s/);
+      expect(fetcher).not.toHaveBeenCalled();
+      expect(settle).not.toHaveBeenCalled();
+      expect(recordSend).not.toHaveBeenCalled();
+      expect(clock.view(7000).hosts[0].sends60m).toEqual({ queue: 0, image: 0 });
+      // The limiter never saw a dispatch either: the host is still "never dispatched" there.
+      expect(limiter.msUntilReady(MFC, 7000)).toBe(0);
     });
 
     it('real timers: a busy event loop delays an image, and the next image and record still wait a full floor after it', async () => {
@@ -323,6 +375,22 @@ describe('paceImageBytesByHost on the shared host clock (QB-U8)', () => {
       for (const url of urls) await off.paced(url);
       // Today's defect, unchanged with the knob off: the limiter recovers to its 274 ms minimum.
       expect(minGap(off.calls.map(c => c.at))).toBe(274);
+    });
+
+    it('with the clock OFF the observer still records each main-host image at the instant it is handed to the transport', async () => {
+      const off = new HostClock(parseHostClockScope(undefined));
+      off.setFloorSource(host => (host === MFC ? FLOOR : undefined));
+      const { paced, calls } = harness(off);
+      for (let id = 1; id <= 4; id++) await paced(nsp(id));
+      await paced('https://static.myfigurecollection.net/upload/items/1/1-abc.jpg');
+      const times = calls.filter(c => new URL(c.url).hostname === MFC).map(c => c.at);
+      expect(times).toHaveLength(4);
+      // Today's limiter pacing, untouched: the first gap is its 2067 ms default.
+      expect(times[1] - times[0]).toBe(2067);
+      expect(off.view(times[3])).toEqual({ mode: 'off', hosts: [{
+        host: MFC, floorMs: FLOOR, clocked: false, sends60m: { queue: 0, image: 4 }, minGapMs60m: minGap(times), underFloor60m: 3,
+        lastSendAt: new Date(times[3]).toISOString(),
+      }] });
     });
 
     it('an in-scope host with no bound floor source stays on its limiter', async () => {

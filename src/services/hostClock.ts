@@ -62,6 +62,26 @@ interface Booking {
   floorMs: number;
 }
 
+/** The lane that handed a request to the transport (QB-U30b adds the other callers). */
+export type HostClockCaller = 'queue' | 'image';
+
+/** One store host in /health/detailed's hostClock block: its sends in the trailing 60 minutes. */
+export interface HostClockHostView {
+  host: string;
+  floorMs: number;
+  clocked: boolean;
+  sends60m: Record<HostClockCaller, number>;
+  minGapMs60m: number;
+  underFloor60m: number;
+  lastSendAt: string | null;
+}
+
+/** /health/detailed's hostClock block. */
+export interface HostClockView {
+  mode: 'off' | 'all' | 'hosts';
+  hosts: HostClockHostView[];
+}
+
 export class HostClock {
   private readonly bookings = new Map<string, Booking>();
   private floorSource: HostFloorSource | null = null;
@@ -123,6 +143,32 @@ export class HostClock {
     return readyAt;
   }
 
+  /** STUB (tests first): stamps nothing yet. */
+  settle(_host: string, _sentAt: number, _floorMs?: number): void {}
+
+  /** STUB (tests first): the gate is always open. */
+  msUntilSendable(_host: string, _slot: number, _now: number, _floorMs: number): number {
+    return 0;
+  }
+
+  /** STUB (tests first): records nothing. */
+  recordSend(_host: string, _caller: HostClockCaller, _sentAt: number): void {}
+
+  /** STUB (tests first): an empty block. */
+  view(_now: number): HostClockView {
+    return { mode: 'off', hosts: [] };
+  }
+
+  /** STUB (tests first): no lines. */
+  summaryLines(_now: number): string[] {
+    return [];
+  }
+
+  /** STUB (tests first): no warnings. */
+  warnings(): string[] {
+    return [];
+  }
+
   /** One boot log line: what the clock covers and, per listed host, the floor its images get. */
   describe(): string {
     const scope = this.rawScope.trim();
@@ -158,4 +204,9 @@ export function getHostClock(): HostClock {
 /** Test seam: replace (or with `null`, forget) the process clock. */
 export function setHostClock(clock: HostClock | null): void {
   shared = clock ?? undefined;
+}
+
+/** STUB (tests first): logs nothing. */
+export function startHostClockSummary(_clock: HostClock, _log: (line: string) => void = console.log): () => void {
+  return () => undefined;
 }

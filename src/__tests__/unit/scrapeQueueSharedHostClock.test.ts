@@ -34,7 +34,7 @@ jest.mock('../../services/webhookClient', () => ({
 import { ScrapeQueue, resetScrapeQueue } from '../../services/scrapeQueue';
 import { createExtractionRegistry, ExtractionRegistryImpl } from '../../services/extractionRegistry';
 import { ChallengeCooldown } from '../../services/challengeCooldown';
-import { HostClock, getHostClock, parseHostClockScope, setHostClock } from '../../services/hostClock';
+import { HostClock, getHostClock, parseHostClockScope, setHostClock, type HostFloorSource } from '../../services/hostClock';
 import { HostRateLimiter } from '../../driver/hostRateLimiter';
 import { paceImageBytesByHost } from '../../services/images/imageBytesPacing';
 import type { ImageBytesFetcher, ImageBytesResult } from '../../services/images/imageBytes';
@@ -112,6 +112,19 @@ function minGap(times: number[]): number {
   return min;
 }
 
+/** How many consecutive gaps (sorted times) are under the floor. */
+function gapsUnder(times: number[], floor: number): number {
+  const sorted = [...times].sort((a, b) => a - b);
+  let n = 0;
+  for (let i = 1; i < sorted.length; i++) if (sorted[i] - sorted[i - 1] < floor) n++;
+  return n;
+}
+
+/** The registry's floors, as a floor source the test owns (the observer reads it as index.ts's binding would). */
+const FLOORS: HostFloorSource = host => ({ [MFC]: FLOOR, 'other.test': 1000 } as Record<string, number | undefined>)[host];
+
+const nspUrl = (id: string | number, size: number) => `https://${MFC}/?_tb=commit&commit=nsp&objectType=item&objectId=${id}&size=${size}`;
+
 /** A capture hook that fetches the given image urls for each record through the paced fetcher. */
 function pacedHook(paced: ImageBytesFetcher, imagesFor: (request: ImageCaptureRequest) => string[]): ImageCaptureHook {
   const inFlight: Promise<void>[] = [];
@@ -176,7 +189,7 @@ describe('ScrapeQueue on the shared host clock (QB-U8)', () => {
     queue.setPluginRegistry(makeRegistry(SITES));
     queue.setIngestEmitter({ send: jest.fn().mockResolvedValue(okWriteStats()) });
     queue.setScrapingService(scraping);
-    if (clock) queue.setHostClock(clock);
+    if (clock) setHostClock(clock);
     return { pageCalls };
   }
 
@@ -278,11 +291,91 @@ describe('ScrapeQueue on the shared host clock (QB-U8)', () => {
       return isOpen(host);
     });
     queue.setChallengeCooldown(cooldown);
+    const settle = jest.spyOn(clock, 'settle');
+    const recordSend = jest.spyOn(clock, 'recordSend');
     queue.enqueue('m1', { priority: 'WARM', url: `https://${MFC}/item/1` });
     await advance(500);
     const [sent] = mfcTimes(pageCalls);
-    expect(sent).toBeDefined();
+    expect(sent).toBe(1_000_040);
+    // The send, not the dispatch decision 40 ms earlier, is what the clock and the observer stamp.
+    expect(settle.mock.calls).toEqual([[MFC, sent, FLOOR]]);
+    expect(recordSend.mock.calls).toEqual([[MFC, 'queue', sent]]);
     expect(clock.reserve(MFC, Date.now(), FLOOR)).toBe(sent + FLOOR);
+  });
+
+  it('an injected clock on the queue (DI) wins over the process clock', async () => {
+    const clock = new HostClock(parseHostClockScope(MFC));
+    const { pageCalls } = makeQueue();
+    queue.setHostClock(clock);
+    queue.enqueue('m1', { priority: 'WARM', url: `https://${MFC}/item/1` });
+    await advance(500);
+    expect(mfcTimes(pageCalls)).toHaveLength(1);
+    expect(clock.tryAcquire(MFC, Date.now(), FLOOR)).toBeGreaterThan(6000);
+    expect(getHostClock().tryAcquire(MFC, Date.now(), FLOOR)).toBe(0);
+  });
+
+  describe('the send-time gate at the transport hand-off', () => {
+    /**
+     * Whatever runs between the queue's dispatch decision and its transport call is modelled inside
+     * the challenge-cooldown check, the last step before the fetch: `between(n)` runs on the n-th check.
+     */
+    function gated(clock: HostClock, between: (n: number, cooldown: ChallengeCooldown) => void) {
+      const { pageCalls } = makeQueue(clock);
+      const cooldown = new ChallengeCooldown();
+      const isOpen = cooldown.isOpen.bind(cooldown);
+      const checks: number[] = [];
+      jest.spyOn(cooldown, 'isOpen').mockImplementation((host: string) => {
+        checks.push(Date.now());
+        between(checks.length, cooldown);
+        return isOpen(host);
+      });
+      queue.setChallengeCooldown(cooldown);
+      return { pageCalls, checks };
+    }
+
+    it('an image that left after the dispatch decision holds the record a full floor after it; the cooldown is checked again before the send', async () => {
+      const clock = new HostClock(parseHostClockScope(MFC), MFC);
+      let imageAt = -1;
+      const { pageCalls, checks } = gated(clock, n => {
+        if (n !== 1) return;
+        jest.setSystemTime(Date.now() + 40);
+        imageAt = Date.now();
+        clock.settle(MFC, imageAt, FLOOR);
+      });
+      queue.enqueue('m1', { priority: 'WARM', url: `https://${MFC}/item/1` });
+      await advance(FLOOR - 250);
+      expect(pageCalls).toEqual([]);
+      await advance(1000);
+      expect(mfcTimes(pageCalls)).toEqual([imageAt + FLOOR]);
+      expect(checks).toEqual([imageAt - 40, imageAt + FLOOR]);
+    });
+
+    it('a challenge cooldown that opens while the record waits at the gate fails it fast, with no fetch', async () => {
+      const clock = new HostClock(parseHostClockScope(MFC), MFC);
+      const { pageCalls, checks } = gated(clock, (n, cooldown) => {
+        if (n === 1) clock.settle(MFC, Date.now(), FLOOR);
+        if (n === 2) cooldown.open(MFC, 'challenge page via impersonate transport');
+      });
+      const settle = jest.spyOn(clock, 'settle');
+      queue.enqueue('m1', { priority: 'WARM', url: `https://${MFC}/item/1` });
+      await advance(FLOOR + 1000);
+      expect(checks).toHaveLength(2);
+      expect(pageCalls).toEqual([]);
+      // Only the test's own stamp: the refused record stamped nothing.
+      expect(settle).toHaveBeenCalledTimes(1);
+    });
+
+    it('a host off the clock never waits at the gate, and the observer still stamps its send', async () => {
+      const off = new HostClock(parseHostClockScope(undefined));
+      off.setFloorSource(FLOORS);
+      const { pageCalls } = gated(off, n => {
+        if (n === 1) off.settle(MFC, Date.now(), FLOOR);
+      });
+      queue.enqueue('m1', { priority: 'WARM', url: `https://${MFC}/item/1` });
+      await advance(500);
+      expect(mfcTimes(pageCalls)).toEqual([1_000_000]);
+      expect(off.view(Date.now()).hosts[0]).toMatchObject({ host: MFC, clocked: false, sends60m: { queue: 1, image: 0 }, lastSendAt: new Date(1_000_000).toISOString() });
+    });
   });
 
   describe('behaviour: records and main-host images on one clock', () => {
@@ -291,7 +384,7 @@ describe('ScrapeQueue on the shared host clock (QB-U8)', () => {
      * static CDN; each `other.test` record one image on its own host. Every fourth image GET is
      * throttled (429), the rest succeed, so the image limiter backs off and recovers along the way.
      */
-    async function run(clock: HostClock | undefined) {
+    async function run(clock: HostClock | undefined, floorSource?: HostFloorSource) {
       const imageCalls: Array<{ url: string; at: number }> = [];
       let n = 0;
       const fetcher: ImageBytesFetcher = async (url: string) => {
@@ -299,12 +392,14 @@ describe('ScrapeQueue on the shared host clock (QB-U8)', () => {
         n += 1;
         return n % 4 === 0 ? throttled() : ok();
       };
+      const { pageCalls } = makeQueue(clock);
+      // index.ts's binding, unless the test brings its own source.
+      getHostClock().setFloorSource(floorSource ?? (host => queue.storeHostFloorMs(host)));
+      // The image lane takes the process clock when it is built, as in production (assembleImageCapture
+      // injects none), so it is built after makeQueue has installed the test's clock.
       const paced = paceImageBytesByHost(fetcher, new HostRateLimiter(() => undefined), {
         cooldown: { remaining: () => 0 },
-        ...(clock ? { hostClock: clock } : {}),
       });
-      const { pageCalls } = makeQueue(clock);
-      if (clock) clock.setFloorSource(host => queue.storeHostFloorMs(host));
       queue.setImageCaptureHook(
         pacedHook(paced, request => {
           const id = request.itemId;
@@ -352,6 +447,160 @@ describe('ScrapeQueue on the shared host clock (QB-U8)', () => {
       expect(minGap(r.records)).toBeGreaterThanOrEqual(FLOOR);
       expect(r.mainImages).toHaveLength(16);
       expect(minGap([...r.records, ...r.mainImages])).toBeLessThan(FLOOR);
+    });
+
+    it('the observer, clock OFF (the live negative control): it measures where records and images really left, under the floor', async () => {
+      const r = await run(undefined, FLOORS);
+      const view = getHostClock().view(Date.now());
+      const truth = [...r.records, ...r.mainImages];
+
+      expect(view.mode).toBe('off');
+      const mfc = view.hosts.find(h => h.host === MFC);
+      expect(mfc).toMatchObject({ floorMs: FLOOR, clocked: false, sends60m: { queue: 8, image: 16 } });
+      expect(mfc?.minGapMs60m).toBe(minGap(truth));
+      expect(mfc?.underFloor60m).toBe(gapsUnder(truth, FLOOR));
+      expect(mfc?.underFloor60m).toBeGreaterThan(0);
+      // The static CDN is no store host: not observed.
+      expect(view.hosts.map(h => h.host)).toEqual(['other.test', MFC]);
+    });
+
+    it('the observer, clock ON: both callers counted, no gap under the floor, the smallest gap is the true one', async () => {
+      const clock = new HostClock(parseHostClockScope(MFC), MFC);
+      const r = await run(clock, FLOORS);
+      const view = clock.view(Date.now());
+      const mfc = view.hosts.find(h => h.host === MFC);
+
+      expect(view.mode).toBe('hosts');
+      expect(mfc).toMatchObject({ floorMs: FLOOR, clocked: true, sends60m: { queue: 8, image: 16 }, underFloor60m: 0 });
+      expect(mfc?.minGapMs60m).toBeGreaterThanOrEqual(FLOOR);
+      expect(mfc?.minGapMs60m).toBe(minGap([...r.records, ...r.mainImages]));
+      expect(clock.summaryLines(Date.now())).toContain(`[HOST-CLOCK] summary host=${MFC} sends=24 minGapMs=${mfc?.minGapMs60m} underFloor=0`);
+      // other.test is observed but not clocked: its records keep their own 1000 ms floor.
+      expect(view.hosts.find(h => h.host === 'other.test')).toMatchObject({ clocked: false, sends60m: { queue: 4, image: 4 }, floorMs: 1000 });
+    });
+  });
+
+  describe('injected hand-off delays (review 6\'s R6 harness on a fake clock: floor 2500, 5 records x 2 main-host images)', () => {
+    const R6_FLOOR = 2500;
+
+    /**
+     * A record fetch takes 150 ms and an image 80 ms on the wire. `stallMs` of synchronous work lands
+     * either in the 3rd emission (extraction/emit, while earlier images sleep: their timers fire late)
+     * or in the 3rd MFC record's hand-off (between its dispatch decision and its transport call).
+     */
+    async function r6(stallMs: number, where: 'emit' | 'handoff', clockOn: boolean) {
+      const clock = clockOn ? new HostClock(parseHostClockScope(MFC), MFC) : new HostClock(parseHostClockScope(undefined));
+      clock.setFloorSource(host => (host === MFC ? R6_FLOOR : undefined));
+      setHostClock(clock);
+      const sends: number[] = [];
+      const scraping = {
+        scrapePage: jest.fn().mockImplementation(async (url: string) => {
+          sends.push(Date.now());
+          await new Promise(resolve => setTimeout(resolve, 150));
+          return { html: '<html></html>', url, title: 'Item', statusCode: 200 };
+        }),
+        scrapePageStealth: jest.fn(),
+      };
+      const paced = paceImageBytesByHost(async () => {
+        sends.push(Date.now());
+        await new Promise(resolve => setTimeout(resolve, 80));
+        return ok();
+      }, new HostRateLimiter(() => undefined), { cooldown: { remaining: () => 0 } });
+      queue = new ScrapeQueue(false);
+      queue.setPluginRegistry(makeRegistry([{ siteId: 'mfc', domain: MFC, baseDelayMs: R6_FLOOR }]));
+      let emits = 0;
+      queue.setIngestEmitter({ send: jest.fn().mockImplementation(async () => {
+        emits += 1;
+        if (where === 'emit' && emits === 3) jest.setSystemTime(Date.now() + stallMs);
+        return okWriteStats();
+      }) });
+      const cooldown = new ChallengeCooldown();
+      const isOpen = cooldown.isOpen.bind(cooldown);
+      let checks = 0;
+      jest.spyOn(cooldown, 'isOpen').mockImplementation((host: string) => {
+        checks += 1;
+        if (where === 'handoff' && checks === 3) jest.setSystemTime(Date.now() + stallMs);
+        return isOpen(host);
+      });
+      queue.setChallengeCooldown(cooldown);
+      queue.setScrapingService(scraping);
+      queue.setImageCaptureHook(pacedHook(paced, request => [nspUrl(request.itemId, 1), nspUrl(request.itemId, 2)]));
+      for (let i = 1; i <= 5; i++) queue.enqueue(`m${i}`, { priority: 'WARM', url: `https://${MFC}/item/${i}` });
+      await advance(60_000);
+      return { sends, mfc: clock.view(Date.now()).hosts.find(h => h.host === MFC) };
+    }
+
+    it.each([
+      [1, 'emit'],
+      [1500, 'emit'],
+      [1, 'handoff'],
+      [1500, 'handoff'],
+    ] as const)('clock ON, a %i ms stall in the %s path: every send gap >= the floor and underFloor60m 0', async (stallMs, where) => {
+      const { sends, mfc } = await r6(stallMs, where, true);
+      expect(sends).toHaveLength(15);
+      expect(minGap(sends)).toBeGreaterThanOrEqual(R6_FLOOR);
+      expect(mfc).toMatchObject({ sends60m: { queue: 5, image: 10 }, underFloor60m: 0, minGapMs60m: minGap(sends) });
+    });
+
+    it('clock OFF, the same 1500 ms stall: the observer sees gaps under the floor (the harness can fail)', async () => {
+      const { sends, mfc } = await r6(1500, 'emit', false);
+      expect(sends).toHaveLength(15);
+      expect(mfc?.underFloor60m).toBe(gapsUnder(sends, R6_FLOOR));
+      expect(mfc?.underFloor60m).toBeGreaterThan(0);
+      expect(mfc?.minGapMs60m).toBe(minGap(sends));
+    });
+  });
+
+  describe('real timers (no fake clock): the real queue and the real image pacer under a busy event loop', () => {
+    const savedHardFloor = process.env.SCRAPER_HOST_HARD_FLOOR_MS;
+    beforeEach(() => {
+      jest.useRealTimers();
+      process.env.SCRAPER_HOST_HARD_FLOOR_MS = '50';
+    });
+    afterEach(() => {
+      if (savedHardFloor === undefined) delete process.env.SCRAPER_HOST_HARD_FLOOR_MS;
+      else process.env.SCRAPER_HOST_HARD_FLOOR_MS = savedHardFloor;
+    });
+
+    it('a 400 ms block of the loop across an image slot: every MFC send is still >= the 300 ms floor after the previous one', async () => {
+      const floor = 300;
+      // A fast limiter, so the clock (not the limiter's 2067 ms default) is what spaces the images.
+      const fast = { baseDelayMs: 50, minDelayMs: 50, maxDelayMs: 1000, backoffMultiplier: 2, recoveryDivisor: 2, successThreshold: 3 };
+      const clock = new HostClock(parseHostClockScope(MFC), MFC);
+      clock.setFloorSource(host => (host === MFC ? floor : undefined));
+      setHostClock(clock);
+      const sends: number[] = [];
+      const busy = (ms: number) => { const end = Date.now() + ms; while (Date.now() < end) { /* a long synchronous parse */ } };
+      const paced = paceImageBytesByHost(async () => {
+        sends.push(Date.now());
+        await new Promise(resolve => setTimeout(resolve, 20));
+        return ok();
+      }, new HostRateLimiter(() => fast, fast), { cooldown: { remaining: () => 0 } });
+      queue = new ScrapeQueue(false);
+      queue.setPluginRegistry(makeRegistry([{ siteId: 'mfc', domain: MFC, baseDelayMs: floor }]));
+      queue.setIngestEmitter({ send: jest.fn().mockResolvedValue(okWriteStats()) });
+      let records = 0;
+      queue.setScrapingService({
+        scrapePage: jest.fn().mockImplementation(async (url: string) => {
+          sends.push(Date.now());
+          records += 1;
+          // Record 1's first image sleeps toward its slot a floor later; the loop is blocked across it.
+          if (records === 1) setTimeout(() => busy(400), floor - 50);
+          await new Promise(resolve => setTimeout(resolve, 30));
+          return { html: '<html></html>', url, title: 'Item', statusCode: 200 };
+        }),
+        scrapePageStealth: jest.fn(),
+      });
+      queue.setImageCaptureHook(pacedHook(paced, request => [nspUrl(request.itemId, 1), nspUrl(request.itemId, 2)]));
+      for (let i = 1; i <= 3; i++) queue.enqueue(`m${i}`, { priority: 'WARM', url: `https://${MFC}/item/${i}` });
+      const t0 = Date.now();
+      while (sends.length < 9 && Date.now() - t0 < 15_000) await new Promise(resolve => setTimeout(resolve, 50));
+
+      expect(sends).toHaveLength(9);
+      // Whole milliseconds on both sides of each stamp: a gap may read one ms short of the floor.
+      expect(minGap(sends)).toBeGreaterThanOrEqual(floor - 1);
+      const mfc = clock.view(Date.now()).hosts.find(h => h.host === MFC);
+      expect(mfc).toMatchObject({ sends60m: { queue: 3, image: 6 }, underFloor60m: 0 });
     });
   });
 });

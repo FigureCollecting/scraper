@@ -62,6 +62,8 @@ beforeEach(() => {
  */
 afterEach(() => {
   jest.useRealTimers();
-  // A booking on the process host clock must not pace the next test's first request.
+  // A booking on the process host clock must not pace the next test's first request, and a scope a
+  // test set must not reach the next one's process clock.
+  delete process.env[HOST_CLOCK_ENV];
   setHostClock(null);
 });
