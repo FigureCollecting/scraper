@@ -97,6 +97,16 @@ export interface CrawlerConfig {
    */
   rangeIdsPerRun: number;
   /**
+   * ID-RANGE DESCENT: per-store ceilings on the ids the DESCENT walks per run, from
+   * `CRAWLER_RANGE_DESCENT_CAPS` (`siteId:n`, the same csv shape as the other per-store caps). A cap only
+   * LOWERS `rangeIdsPerRun` for its store, and a store absent from it keeps `rangeIdsPerRun`. An explicit
+   * 0 turns that store's descent OFF and leaves its cursor, frontier and seed untouched, while its
+   * re-anchor, both gap sweeps and the lists step run as before and every other range store keeps
+   * walking (Ross QB-2, 2026-10-04: no blind id walking). loadCrawlerConfig always sets it; absent on a
+   * hand-built config = no caps.
+   */
+  rangeDescentCaps?: Record<string, number>;
+  /**
    * Seed frontiers per siteId, from `CRAWLER_RANGE_FRONTIER_<SITEID>`, used ONLY when the store's
    * ledger has no numeric itemId of its own to start from. `<SITEID>` is the siteId uppercased with
    * every non-alphanumeric character replaced by `_` (`good-smile` → `CRAWLER_RANGE_FRONTIER_GOOD_SMILE`).

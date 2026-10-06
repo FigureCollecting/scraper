@@ -344,6 +344,8 @@ export type RangeSkipReason =
   | 'not-run'
   | 'store-stopped'
   | 'cap'
+  /** CRAWLER_RANGE_DESCENT_CAPS is 0 for this store: no window, and its cursor, frontier and seed untouched. */
+  | 'descent-cap'
   | 'no-frontier'
   | 'floor'
   | 'window-malformed'
