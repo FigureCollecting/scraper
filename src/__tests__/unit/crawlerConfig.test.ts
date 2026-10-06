@@ -465,3 +465,32 @@ describe('loadCrawlerConfig — the rotating company-lists step', () => {
     }
   });
 });
+
+describe('loadCrawlerConfig — the per-store descent caps (CRAWLER_RANGE_DESCENT_CAPS)', () => {
+  it('is empty when unset or blank: every store keeps CRAWLER_RANGE_IDS_PER_RUN', () => {
+    expect(loadCrawlerConfig({}).rangeDescentCaps).toEqual({});
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_DESCENT_CAPS: '' }).rangeDescentCaps).toEqual({});
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_DESCENT_CAPS: ' , ' }).rangeDescentCaps).toEqual({});
+  });
+
+  it('parses a csv of siteId:n, trimming whitespace and honouring 0 (the descent off)', () => {
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_DESCENT_CAPS: 'mfc:0' }).rangeDescentCaps).toEqual({ mfc: 0 });
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_DESCENT_CAPS: ' mfc:0 , hpoi:5 ' }).rangeDescentCaps).toEqual({ mfc: 0, hpoi: 5 });
+  });
+
+  it.each(['mfc:-1', 'mfc:x', 'mfc'])('drops a malformed %j with a WARN naming the var, and the other entries still apply', (bad) => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      expect(loadCrawlerConfig({ CRAWLER_RANGE_DESCENT_CAPS: `${bad},hpoi:5` }).rangeDescentCaps).toEqual({ hpoi: 5 });
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('CRAWLER_RANGE_DESCENT_CAPS'), { entry: bad });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('a repeated siteId takes its LAST value, in either direction', () => {
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_DESCENT_CAPS: 'mfc:0,mfc:5' }).rangeDescentCaps).toEqual({ mfc: 5 });
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_DESCENT_CAPS: 'mfc:5,mfc:0' }).rangeDescentCaps).toEqual({ mfc: 0 });
+  });
+});

@@ -41,6 +41,7 @@ async function main(): Promise<void> {
     exhaustedRecheckMs: config.exhaustedRecheckMs,
     rangeStores: config.rangeStores,
     rangeIdsPerRun: config.rangeIdsPerRun,
+    rangeDescentCaps: config.rangeDescentCaps,
     rangeFrontiers: config.rangeFrontiers,
     reobserveMinAgeH: config.reobserveMinAgeMs / 3_600_000,
     maxReobservePerStore: config.maxReobservePerStore,
