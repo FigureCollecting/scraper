@@ -79,7 +79,10 @@ const DECL = [
 ];
 const LISTS: Record<string, string[]> = { 'c1-d9': ['101', '102'], 'c1-d1': ['102', '103'] };
 
-const makeFake = () => {
+/** Overrides one id-range window's answer; undefined = the synthesised descending run. */
+type RangeOverride = (siteId: string, from: number) => { status: number; body: unknown } | undefined;
+
+const makeFake = (rangeOverride: RangeOverride = () => undefined) => {
   const calls: Call[] = [];
   const resp = (status: number, body: unknown): HttpResponseLike => ({
     ok: status >= 200 && status < 300,
@@ -102,6 +105,8 @@ const makeFake = () => {
     if (u.pathname === '/catalog' && u.searchParams.get('range') === '1') {
       const from = Number(u.searchParams.get('from'));
       const count = Number(u.searchParams.get('count'));
+      const override = rangeOverride(siteId, from);
+      if (override) return resp(override.status, override.body);
       const walked = ids(from, count).filter((id) => Number(id) >= 1);
       return resp(200, {
         siteId,
@@ -152,8 +157,9 @@ const run = async (
   cfg: CrawlerConfig,
   ledgerStore: ReturnType<typeof createMemoryLedgerStore> = ledgers(),
   listsStore: ReturnType<typeof createMemoryListsStateStore> = createMemoryListsStateStore(),
+  rangeOverride?: RangeOverride,
 ) => {
-  const fake = makeFake();
+  const fake = makeFake(rangeOverride);
   let t = T0;
   const summary = await runCrawlerPass(cfg, {
     fetch: fake.fetch,
@@ -322,6 +328,20 @@ describe("'mfc:0' — no mfc descent, and nothing the descent owns is touched", 
     expect(lanes(capped.mfc)).toEqual(lanes(base.mfc));
     expect(capped.mfc).toMatchObject({ rangeSkipped: 'descent-cap', rangeWalked: 0 });
     expect(capped.hpoi).toEqual(base.hpoi);
+  });
+});
+
+describe('the 0 cap is checked FIRST', () => {
+  it('a store a lane above stopped (a cooldown on the gap window) reports descent-cap, not store-stopped', async () => {
+    const seeded = () => ledgers(walkedLedger('mfc', { cursor: 900, frontier: 1000 }, ['1004']));
+    const cooldown: RangeOverride = (siteId, from) =>
+      siteId === 'mfc' && from > 1000 ? { status: 503, body: { error: 'cooldown', siteId, host: 'mfc.test', remainingMs: 60_000 } } : undefined;
+    const cfg = (over: Partial<CrawlerConfig> = {}) => mkCfg({ rangeGapBudget: 5, ...over });
+    const today = await run(cfg(), seeded(), undefined, cooldown);
+    expect(today.mfc.rangeSkipped).toBe('store-stopped');
+    const r = await run(cfg({ rangeDescentCaps: { mfc: 0 } }), seeded(), undefined, cooldown);
+    expect(r.mfc.rangeSkipped).toBe('descent-cap');
+    expect(r.mfc.gapSkipped).toBe(today.mfc.gapSkipped);
   });
 });
 

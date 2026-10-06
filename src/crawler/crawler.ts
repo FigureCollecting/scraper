@@ -544,6 +544,14 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       logger.warn('[CRAWLER] CRAWLER_RANGE_GAPS names a store that is not id-range walked — no band adopted', { siteId });
     }
   }
+  // A descent cap likewise only means something on a store that walks its id space; anywhere else it
+  // would read as a throttle in force while doing nothing.
+  const descentCaps = config.rangeDescentCaps ?? {};
+  for (const siteId of Object.keys(descentCaps)) {
+    if (!stores.includes(siteId) || !config.rangeStores.includes(siteId)) {
+      logger.warn('[CRAWLER] CRAWLER_RANGE_DESCENT_CAPS names a store that is not id-range walked — ignored', { siteId });
+    }
+  }
   // The lists step lives inside the id-range phase, so a drain cap anywhere else would do nothing.
   const listsDrainCaps = config.listsDrainCaps ?? {};
   const listsCapFor = (siteId: string): number =>
@@ -1599,6 +1607,11 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     const skip = (reason: RangeSkipReason): void => {
       st.summary.rangeSkipped = reason;
     };
+    // CRAWLER_RANGE_DESCENT_CAPS=<store>:0 turns this store's descent OFF (Ross QB-2, 2026-10-04: no
+    // blind id walking). Checked FIRST, before any ledger, cursor, frontier or seed work, so the
+    // phase writes nothing at all: a fresh ledger does not even get its frontier initialised.
+    const descentCap: number | undefined = descentCaps[st.siteId];
+    if (descentCap === 0) return skip('descent-cap');
     // A lane above it (a gap sweep, the lists step) stopped the store: same store, same egress.
     if (st.stopped) return skip('store-stopped');
     // The walk shares the store's enqueue cap and runs LAST, so a listing that spends the whole cap
@@ -1638,7 +1651,8 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       return skip('floor');
     }
 
-    const count = Math.min(config.rangeIdsPerRun, cursor);
+    // A descent cap only ever LOWERS the window; a store without one keeps CRAWLER_RANGE_IDS_PER_RUN.
+    const count = Math.min(descentCap ?? config.rangeIdsPerRun, config.rangeIdsPerRun, cursor);
     const out = await fetchCatalog(st, rangeUrl(st.siteId, cursor, count), { from: cursor, count }, 'range');
     if (out.kind !== 'page') return skip(out.reason);
     st.summary.rangeSkipped = null;

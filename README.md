@@ -673,6 +673,7 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
 | `CRAWLER_EXHAUSTED_RECHECK_MS` | `604800000` (7d) | Re-check an exhausted store's last cursor after this long |
 | `CRAWLER_RANGE_STORES` | *(none)* | csv of siteIds that walk their sequential id space; empty = no id-range walking at all |
 | `CRAWLER_RANGE_IDS_PER_RUN` | `50` | Max ids walked per store per run (the window asked of `/catalog?range=1`); clamped to the engine's `200`-id ceiling with a WARN |
+| `CRAWLER_RANGE_DESCENT_CAPS` | *(none)* | csv of `siteId:n` (`mfc:0`) lowering one store's DESCENT window below `CRAWLER_RANGE_IDS_PER_RUN`; a cap never raises it, and a store absent keeps it. `0` = no descent for that store: no window GET, no POST, its `range.cursor`, `range.frontier` and `range.seed` untouched (`rangeSkipped: "descent-cap"`), while the re-anchor, both gap sweeps and the lists step run as before. A malformed entry is ignored with a WARN naming it; an entry naming a store that is not id-range walked is ignored with a WARN |
 | `CRAWLER_RANGE_FRONTIER_<SITEID>` | *(none)* | Seed frontier for a store whose ledger has no numeric itemId yet; CHANGING it later re-seeds the walk from the new top. `<SITEID>` = the siteId uppercased with every non-alphanumeric character replaced by `_` |
 | `CRAWLER_RANGE_REANCHOR_H` | `24` | How often the frontier is moved up to the newest id the ledger has seen (never one the gap sweep wrote), recording the band it skipped as a KNOWN GAP. `0` = every run |
 | `CRAWLER_RANGE_REANCHOR_MAX_DELTA` | `50000` | The widest move one re-anchor may make. A wider one is refused with a WARN naming this knob and reported as `rangeReanchorRefused`, and it is tried again every run until the ledger or the knob changes. Raise it for a frontier frozen a long time. `0` refuses every move |
@@ -781,7 +782,7 @@ because the newest ids always outrank the deep id space for the run's budget.
   already gone, does not walk at all. Size them for it: `CRAWLER_MAX_REQUESTS` must cover the listing
   phases plus, per range store, one window GET and up to `CRAWLER_RANGE_IDS_PER_RUN` POSTs, and the
   store's cap must have that much headroom left. When it does not, `rangeSkipped` on the store
-  summary says which — `cap`, `budget`, `no-frontier`, `floor`, `cooldown`, `unsupported`, `failed`,
+  summary says which — `descent-cap`, `cap`, `budget`, `no-frontier`, `floor`, `cooldown`, `unsupported`, `failed`,
   `window-malformed`, `window-rejected`, `store-stopped`, `not-run`, `not-configured` — and it is `null` on a run that
   actually asked for a window. The window GET itself is synthesized (no upstream fetch) but is still
   charged one slot of the global budget and one spacing interval.
