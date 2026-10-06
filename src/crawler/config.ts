@@ -97,6 +97,16 @@ export interface CrawlerConfig {
    */
   rangeIdsPerRun: number;
   /**
+   * ID-RANGE DESCENT: per-store ceilings on the ids the DESCENT walks per run, from
+   * `CRAWLER_RANGE_DESCENT_CAPS` (`siteId:n`, the same csv shape as the other per-store caps). A cap only
+   * LOWERS `rangeIdsPerRun` for its store, and a store absent from it keeps `rangeIdsPerRun`. An explicit
+   * 0 turns that store's descent OFF and leaves its cursor, frontier and seed untouched, while its
+   * re-anchor, both gap sweeps and the lists step run as before and every other range store keeps
+   * walking (Ross QB-2, 2026-10-04: no blind id walking). loadCrawlerConfig always sets it; absent on a
+   * hand-built config = no caps.
+   */
+  rangeDescentCaps?: Record<string, number>;
+  /**
    * Seed frontiers per siteId, from `CRAWLER_RANGE_FRONTIER_<SITEID>`, used ONLY when the store's
    * ledger has no numeric itemId of its own to start from. `<SITEID>` is the siteId uppercased with
    * every non-alphanumeric character replaced by `_` (`good-smile` → `CRAWLER_RANGE_FRONTIER_GOOD_SMILE`).
@@ -251,7 +261,8 @@ const nonNegInt = (raw: string | undefined, fallback: number): number => {
 const SAFE_SITE_ID = /^[A-Za-z0-9_-]+$/;
 
 /**
- * Parse a per-store cap var — `CRAWLER_STORE_ENQUEUE_CAPS` or `CRAWLER_STORE_REOBSERVE_CAPS` — a csv
+ * Parse a per-store cap var — `CRAWLER_STORE_ENQUEUE_CAPS`, `CRAWLER_STORE_REOBSERVE_CAPS` or
+ * `CRAWLER_RANGE_DESCENT_CAPS` — a csv
  * of `siteId:cap` pairs. Every entry is validated on its own: a malformed one is DROPPED with a WARN
  * naming it AND the var it came from, and the well-formed entries still apply, so one typo can never
  * silently unthrottle a store nor void the whole declaration. A repeated siteId takes its LAST value.
@@ -453,6 +464,7 @@ export function loadCrawlerConfig(env: Env = process.env, argv: string[] = proce
     exhaustedRecheckMs: posInt(env.CRAWLER_EXHAUSTED_RECHECK_MS, DEFAULTS.exhaustedRecheckMs),
     rangeStores: csv(env.CRAWLER_RANGE_STORES ?? ''),
     rangeIdsPerRun: clampedPosInt(env.CRAWLER_RANGE_IDS_PER_RUN, DEFAULTS.rangeIdsPerRun, MAX_RANGE_IDS_PER_RUN, 'CRAWLER_RANGE_IDS_PER_RUN'),
+    rangeDescentCaps: parseStoreCaps(env.CRAWLER_RANGE_DESCENT_CAPS, 'CRAWLER_RANGE_DESCENT_CAPS'),
     rangeFrontiers: parseFrontiers(env, stores),
     // Hours, not ms: the operator reasons about this window in hours ("re-price nothing twice in a
     // shift"), and an explicit 0 is honoured — it means "age is no bar", not "revert to 12 h".
