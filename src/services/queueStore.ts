@@ -119,7 +119,11 @@ export interface PersistedQueueItem {
   maxRetries: number;
   /** `QueueItem.queuedAt` (epoch ms). */
   enqueuedAt: number;
-  /** STUB (QB-U19 red commit). */
+  /**
+   * When the item entered its DISPATCH CLASS (host + tier; QB-U19), epoch ms: its enqueue, re-stamped by
+   * a priority raise, never by a retry or a dedup enqueue. Absent = `enqueuedAt` (the row never changed
+   * class, or an older build wrote it and left the column NULL). POOL-SELECT ages R1 and R2 from it.
+   */
   classEnteredAt?: number;
   state: QueueItemState;
   /** Epoch ms at which a lease expires. Only meaningful while state === 'leased'. */
@@ -224,9 +228,17 @@ export interface ScrapeQueueStore {
    * a fresh retry budget.
    */
   claimKey(mfcId: string): PersistedQueueItem | null;
-  /** Record a priority upgrade, so a restored item comes back at the priority it was raised to. */
+  /**
+   * Record a priority upgrade, so a restored item comes back at the priority it was raised to. A raise
+   * moves the row into another dispatch class, so the queue passes the instant it entered it
+   * (class_entered_at); without one the stamp is left as it is.
+   */
   setPriority(id: string, priority: QueuePriority, classEnteredAt?: number): void;
-  /** STUB (QB-U19 red commit). */
+  /**
+   * One dispatch class's PARKED rows (normalized host + priority), oldest class entry first (then dedup
+   * key). Pool dispatch reads them so R1 and R2 see the whole class, not only the resident working set
+   * (QB-U19); idx_queue_class_age serves it. [] on the fallback and after close.
+   */
   listParked(host: string, priority: QueuePriority): PersistedQueueItem[];
   /**
    * Label an UNLABELLED row (the queue's coalesce rule), so a restored item keeps the lane it adopted.
@@ -306,6 +318,8 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 
 /** The `schema_meta` record for the lane step. */
 const LANE_STEP = { key: 'queue_items.lane', value: '1' } as const;
+/** The `schema_meta` record for the class-entry step (QB-U19). */
+const CLASS_ENTRY_STEP = { key: 'queue_items.class_entered_at', value: '1' } as const;
 
 /**
  * QB-U1: a nullable `lane` on every queue row, and the index the lane scheduler pages and counts
@@ -320,11 +334,19 @@ function applySchemaSteps(db: DatabaseSync, now: number): void {
     db.exec('ALTER TABLE queue_items ADD COLUMN lane TEXT');
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_queue_host_lane ON queue_items(state, host, lane, priority, enqueued_at)');
-  db.prepare(
+  // QB-U19: when the row entered its dispatch class (POOL-SELECT ages from it). Nullable: a row an older
+  // build writes leaves it NULL, and a NULL reads as the row's enqueued_at.
+  if (!columns.some((c) => c.name === 'class_entered_at')) {
+    db.exec('ALTER TABLE queue_items ADD COLUMN class_entered_at INTEGER');
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_queue_class_age ON queue_items(state, host, lane, priority, class_entered_at)');
+  const record = db.prepare(
     `INSERT INTO schema_meta (key, value, applied_at) VALUES (?, ?, ?)
      ON CONFLICT(key) DO UPDATE SET value = excluded.value, applied_at = excluded.applied_at
      WHERE CAST(schema_meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)`
-  ).run(LANE_STEP.key, LANE_STEP.value, now);
+  );
+  record.run(LANE_STEP.key, LANE_STEP.value, now);
+  record.run(CLASS_ENTRY_STEP.key, CLASS_ENTRY_STEP.value, now);
 }
 
 /**
@@ -387,6 +409,8 @@ interface ItemRow {
   last_error_class: string | null;
   /** Absent altogether when salvage reads a file written before the column existed. */
   lane?: unknown;
+  /** NULL when an older build wrote the row; absent when salvage reads a file without the column. */
+  class_entered_at?: number | null;
 }
 
 /**
@@ -432,6 +456,10 @@ function rowToItem(row: ItemRow, onUnknownLane: (value: string) => void): Persis
     ...(row.lease_until !== null ? { leaseUntil: row.lease_until } : {}),
     ...(row.last_error_class !== null ? { lastErrorClass: row.last_error_class } : {}),
     ...laneFromDisk(row.lane, onUnknownLane),
+    // NULL or absent (an older build's row) = the enqueue; carried only when the row changed class.
+    ...(typeof row.class_entered_at === 'number' && row.class_entered_at !== row.enqueued_at
+      ? { classEnteredAt: row.class_entered_at }
+      : {}),
   };
 }
 
@@ -527,8 +555,8 @@ function openSqliteStore(opts: OpenQueueStoreOptions, onUnknownLane: (value: str
   const stmt = {
     put: db.prepare(
       `INSERT INTO queue_items
-         (id, mfc_id, url, host, priority, status, session_id, attempts, max_retries, enqueued_at, state, lease_until, last_error_class, lane)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         (id, mfc_id, url, host, priority, status, session_id, attempts, max_retries, enqueued_at, state, lease_until, last_error_class, lane, class_entered_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
        ON CONFLICT DO NOTHING`
     ),
     lease: db.prepare(`UPDATE queue_items SET state = 'leased', lease_until = ? WHERE id = ?`),
@@ -558,7 +586,11 @@ function openSqliteStore(opts: OpenQueueStoreOptions, onUnknownLane: (value: str
     dropExpiredCooldowns: db.prepare('DELETE FROM host_cooldowns WHERE until <= ?'),
     hasKey: db.prepare('SELECT 1 AS hit FROM queue_items WHERE mfc_id = ? LIMIT 1'),
     selKey: db.prepare('SELECT * FROM queue_items WHERE mfc_id = ? ORDER BY enqueued_at ASC LIMIT 1'),
-    setPriority: db.prepare('UPDATE queue_items SET priority = ? WHERE id = ?'),
+    setPriority: db.prepare('UPDATE queue_items SET priority = ?, class_entered_at = COALESCE(?, class_entered_at) WHERE id = ?'),
+    listParked: db.prepare(
+      `SELECT * FROM queue_items WHERE state = 'parked' AND host = ? AND priority = ?
+       ORDER BY COALESCE(class_entered_at, enqueued_at) ASC, mfc_id ASC`
+    ),
     setLane: db.prepare('UPDATE queue_items SET lane = ? WHERE id = ? AND lane IS NULL'),
     countByHostLane: db.prepare('SELECT host, lane, COUNT(*) AS n FROM queue_items WHERE state = ? GROUP BY host, lane'),
     clearItems: db.prepare('DELETE FROM queue_items'),
@@ -727,7 +759,8 @@ function openSqliteStore(opts: OpenQueueStoreOptions, onUnknownLane: (value: str
         item.state,
         item.leaseUntil ?? null,
         item.lastErrorClass ?? null,
-        item.lane ?? item.unknownLane ?? null
+        item.lane ?? item.unknownLane ?? null,
+        item.classEnteredAt ?? item.enqueuedAt
       ));
     },
 
@@ -764,16 +797,16 @@ function openSqliteStore(opts: OpenQueueStoreOptions, onUnknownLane: (value: str
       return { ...toItem(row), state: 'pending' as const, leaseUntil: undefined };
     },
 
-    setPriority(id: string, priority: QueuePriority): void {
-      write(() => stmt.setPriority.run(priority, id));
+    setPriority(id: string, priority: QueuePriority, classEnteredAt?: number): void {
+      write(() => stmt.setPriority.run(priority, classEnteredAt ?? null, id));
     },
 
     setLane(id: string, lane: QueueLane): void {
       write(() => stmt.setLane.run(lane, id));
     },
 
-    listParked(): PersistedQueueItem[] {
-      return [];
+    listParked(host: string, priority: QueuePriority): PersistedQueueItem[] {
+      return read(() => (stmt.listParked.all(host, priority) as unknown as ItemRow[]).map(toItem), []);
     },
 
     countByHostLane(state: QueueItemState): HostLaneRow[] {
