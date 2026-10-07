@@ -41,6 +41,7 @@ async function main(): Promise<void> {
     exhaustedRecheckMs: config.exhaustedRecheckMs,
     rangeStores: config.rangeStores,
     rangeIdsPerRun: config.rangeIdsPerRun,
+    rangeDescentCaps: config.rangeDescentCaps,
     rangeFrontiers: config.rangeFrontiers,
     reobserveMinAgeH: config.reobserveMinAgeMs / 3_600_000,
     maxReobservePerStore: config.maxReobservePerStore,
@@ -50,6 +51,7 @@ async function main(): Promise<void> {
     listsIntervalH: (config.listsIntervalMs ?? 0) / 3_600_000,
     listsDrainCaps: config.listsDrainCaps,
     listsSpacingMs: config.listsSpacingMs,
+    listsAlternate: config.listsAlternate,
   });
   // The durable fetch-failure ledger (INGEST_BASE_URL + REPORT_FETCH_FAILURES). Null = off, and
   // every emit point in the pass is a no-op.

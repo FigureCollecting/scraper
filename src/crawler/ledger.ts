@@ -7,7 +7,8 @@
  *     siteId,
  *     enqueued: { [itemId]: { at: ISO-8601, collectUrl,       // v1: enqueued-is-done, `at` = last observation
  *                             reobserveFailedAt?, reobserveFailures?,
- *                             sweptFrom? } },                   // set only by the gap sweep
+ *                             sweptFrom?,                       // set only by the gap sweep
+ *                             via?, lastVia? } },               // which source wrote it first / last (LedgerVia)
  *     backfill: { cursor: number|null,                          // next page to backfill
  *                 exhaustCandidateCursor?, exhaustCandidateAt?, // one empty sighting (unconfirmed)
  *                 exhaustedAt?, updatedAt? },                   // confirmed end-of-catalog
@@ -30,6 +31,16 @@ import { promises as nodeFs } from 'fs';
 import * as path from 'path';
 
 export const LEDGER_VERSION = 1 as const;
+
+/**
+ * WHICH SOURCE wrote a ledger entry. Stamped by the crawler on every accepted write, so a later reader
+ * can tell the Latest Additions TAP's evidence from everything else. 'tap' is the RECENT listing of a
+ * store in CRAWLER_RANGE_STORES (for mfc that listing IS the Latest Additions tap); 'recent' is any other
+ * store's recent listing; 'descent' is the id-range walk; 'target' is reserved for a later lane and has
+ * no write path yet. The entries are stored WHOLE and never validated on load, so a value this build
+ * does not know (a newer build's) loads untouched and is never 'corrupt'.
+ */
+export type LedgerVia = 'tap' | 'recent' | 'backfill' | 'lists' | 'seed' | 'gap' | 'descent' | 'reobserve' | 'target';
 
 export interface LedgerEntry {
   /** ISO-8601 instant of the last accepted enqueue (202) — the item's LAST OBSERVATION. */
@@ -55,6 +66,14 @@ export interface LedgerEntry {
    * a synthesized byId window, not from anything the store listed, so it can never become the frontier.
    */
   sweptFrom?: LedgerGapOrigin;
+  /**
+   * The source whose accepted write CREATED this entry. FIRST WRITER WINS: a later write to the same id
+   * (a recent-phase re-observation, the re-observation lane) never changes it, and an entry written
+   * before this field existed keeps it ABSENT rather than being credited to whoever touches it next.
+   */
+  via?: LedgerVia;
+  /** The source of the LAST accepted re-observation of an entry that already existed (absent until one lands). */
+  lastVia?: LedgerVia;
 }
 
 export interface LedgerBackfill {

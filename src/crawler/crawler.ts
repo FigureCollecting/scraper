@@ -35,6 +35,9 @@
  *   LISTS   — inside the id-range phase (recent gaps → lists → older gaps → descent), for a store
  *             with a CRAWLER_LISTS_DRAIN_CAPS entry: at most ONE rotating company-list group per pass
  *             (in the UTC window, once per interval); its new ids drain COLD on their own budget.
+ *             A store also named in CRAWLER_LISTS_ALTERNATE never fetches the tap and a list in one pass:
+ *             each pass that starts in the window is EITHER a lists pass (no recent, no backfill page) OR
+ *             a tap pass (no group), the window opening with lists (decideAlternation).
  *   BACKFILL — resume the store's durable page cursor and walk forward up to
  *             backfillPagesPerRun pages, enqueuing NEW ids only (never re-observing).
  *             The cursor advances ONLY when the page reported `hasMore: true` AND every
@@ -74,9 +77,17 @@ import { logger } from '../utils/logger.js';
 import { classifyFetchFailure } from '../services/failureClassifier.js';
 import type { FetchFailureReport, ReportFetchFailure } from '../services/failureReporter.js';
 import type { CrawlerConfig, CrawlerMode } from './config.js';
-import type { Ledger, LedgerGapBand, LedgerGapOrigin, LedgerRange, LedgerStore } from './ledger.js';
+import type { Ledger, LedgerEntry, LedgerGapBand, LedgerGapOrigin, LedgerRange, LedgerStore, LedgerVia } from './ledger.js';
 import { isSafeRotatingName } from '../utils/rotatingName.js';
-import { createFileListsStateStore, setListsGroup, type ListsGroupOutcome, type ListsGroupState, type ListsState, type ListsStateStore } from './listsState.js';
+import {
+  createFileListsStateStore,
+  setListsGroup,
+  type ListsAlternationMarker,
+  type ListsGroupOutcome,
+  type ListsGroupState,
+  type ListsState,
+  type ListsStateStore,
+} from './listsState.js';
 
 export type { CrawlerConfig, CrawlerMode } from './config.js';
 
@@ -251,6 +262,13 @@ export interface CrawlerStoreSummary {
   /** LISTS: why the drain stopped short, `null` when it did not. */
   listsDrainStopped: ListsDrainStopReason | null;
   /**
+   * LISTS ALTERNATION (CRAWLER_LISTS_ALTERNATE): what this pass was for the store — `lists` (company lists,
+   * no tap), `tap` (the tap, no list), `fallback-tap` (a lists pass that fetched no list, so it tapped after
+   * the lists step), `outside-window` (the pass started outside the lists window: tap, no list), or `off`
+   * (the store is not alternated, or its lists state could not be read at pass start).
+   */
+  alternation: ListsAlternation;
+  /**
    * Per-list stats for a `seed`-mode run, in the order the lists were polled. Empty in every other
    * mode, and empty for a store whose seed pass never got a list (no declaration, or a stop).
    */
@@ -344,6 +362,8 @@ export type RangeSkipReason =
   | 'not-run'
   | 'store-stopped'
   | 'cap'
+  /** CRAWLER_RANGE_DESCENT_CAPS is 0 for this store: no window, and its cursor, frontier and seed untouched. */
+  | 'descent-cap'
   | 'no-frontier'
   | 'floor'
   | 'window-malformed'
@@ -388,11 +408,16 @@ export type ListsSkipReason =
   | 'paused'
   /** Every declared group was attempted within the interval. */
   | 'none-due'
+  /** CRAWLER_LISTS_ALTERNATE: an in-window TAP pass, so no group is fetched (the backlog still drains). */
+  | 'alternation-tap'
   /** The engine does not serve rotating lists (404), or the store declares none (422). */
   | 'unsupported'
   | 'cooldown'
   | 'budget'
   | 'failed';
+
+/** What a pass was for an alternated store (see `CrawlerStoreSummary.alternation`). */
+export type ListsAlternation = 'off' | 'outside-window' | 'lists' | 'tap' | 'fallback-tap';
 
 /** Why the lists DRAIN stopped short. */
 export type ListsDrainStopReason = StopReason | 'store-stopped';
@@ -418,6 +443,27 @@ interface LaneBudget {
 }
 
 type Phase = 'recent' | 'backfill' | 'range' | 'gap' | 'seed' | 'reobserve' | 'lists';
+
+/**
+ * The ledger `via` each phase stamps, for every phase except 'recent' (see `viaFor`). 'range' is the
+ * id-range DESCENT. Typed over every Phase, so a new phase cannot ship without naming its source.
+ */
+const VIA_BY_PHASE: Record<Exclude<Phase, 'recent'>, LedgerVia> = {
+  backfill: 'backfill',
+  range: 'descent',
+  gap: 'gap',
+  seed: 'seed',
+  reobserve: 'reobserve',
+  lists: 'lists',
+};
+
+/**
+ * FIRST WRITER WINS. A write that CREATES an entry records its source as `via`; a write to an id that
+ * already has an entry keeps that `via` (an unknown one included), or keeps it ABSENT on an entry
+ * written before `via` existed, and records itself as `lastVia`.
+ */
+const viaStamp = (prior: LedgerEntry | undefined, via: LedgerVia): Pick<LedgerEntry, 'via' | 'lastVia'> =>
+  prior ? { ...(prior.via !== undefined ? { via: prior.via } : {}), lastVia: via } : { via };
 
 /** What a lane hands `processPage` beyond the items: its own budget, its band origin, its queue priority. */
 interface LaneOptions {
@@ -457,6 +503,15 @@ interface StoreState {
   listingUnsupported: boolean;
   /** Deepest listing page the recent phase fetched this run (backfill starts after it). */
   deepestRecentPage: number;
+  /**
+   * LISTS ALTERNATION, decided once at pass start: `lists` or `tap` for a pass that started inside the
+   * lists window, `outside-window` for one that did not, null when the store is not alternated this pass.
+   */
+  passKind: 'lists' | 'tap' | 'outside-window' | null;
+  /** The alternation marker the lists step saves for an in-window pass. */
+  alternationMarker?: ListsAlternationMarker;
+  /** A company-list GET was issued this pass, answered or not: a lists pass then never falls back to the tap. */
+  listFetchIssued: boolean;
 }
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -542,6 +597,14 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       logger.warn('[CRAWLER] CRAWLER_RANGE_GAPS names a store that is not id-range walked — no band adopted', { siteId });
     }
   }
+  // A descent cap likewise only means something on a store that walks its id space; anywhere else it
+  // would read as a throttle in force while doing nothing.
+  const descentCaps = config.rangeDescentCaps ?? {};
+  for (const siteId of Object.keys(descentCaps)) {
+    if (!stores.includes(siteId) || !config.rangeStores.includes(siteId)) {
+      logger.warn('[CRAWLER] CRAWLER_RANGE_DESCENT_CAPS names a store that is not id-range walked — ignored', { siteId });
+    }
+  }
   // The lists step lives inside the id-range phase, so a drain cap anywhere else would do nothing.
   const listsDrainCaps = config.listsDrainCaps ?? {};
   const listsCapFor = (siteId: string): number =>
@@ -552,6 +615,17 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     }
   }
   const listsStore = deps.listsStore ?? createFileListsStateStore(config.ledgerDir);
+  // LISTS ALTERNATION (QB-U21): only a store whose lists step runs can alternate it with the tap, and only
+  // in a pass that runs both (recent = the tap, backfill = the lists step). A name that can do neither did
+  // nothing, so it says so rather than reading as a pacing change in force.
+  const alternated = new Set<string>();
+  for (const siteId of config.listsAlternate ?? []) {
+    if (!stores.includes(siteId) || listsCapFor(siteId) <= 0) {
+      logger.warn('[CRAWLER] CRAWLER_LISTS_ALTERNATE names a store with no lists step (not crawled, not id-range walked, or no CRAWLER_LISTS_DRAIN_CAPS entry) — ignored', { siteId });
+    } else if (!config.phases.includes('recent') || !config.phases.includes('backfill')) {
+      logger.warn('[CRAWLER] CRAWLER_LISTS_ALTERNATE needs a pass that runs both recent and backfill — ignored', { siteId, mode: config.mode });
+    } else alternated.add(siteId);
+  }
 
   /**
    * Fire ONE ledger row. Best effort: no reporter is a no-op, and neither a synchronous throw nor a
@@ -647,6 +721,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       listsDrainApplied: 0,
       listsSkipped: listsCapFor(siteId) > 0 ? 'not-run' : 'not-configured',
       listsDrainStopped: null,
+      alternation: 'off',
       seedLists: [],
       seedStopped: null,
       backfillCursor: null,
@@ -666,6 +741,8 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     pulledOut: Object.prototype.hasOwnProperty.call(capOverrides, siteId) && capOverrides[siteId] === 0,
     listingUnsupported: false,
     deepestRecentPage: 0,
+    passKind: null,
+    listFetchIssued: false,
   }));
 
   let budgetExhausted = false;
@@ -960,6 +1037,15 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
   };
 
   /**
+   * The source a `processPage` write stamps as the entry's `via`. THE TAP RULE: the RECENT phase of a
+   * store in config.rangeStores is that store's Latest Additions TAP (for mfc the recent listing,
+   * /item/browse/figure/ page 1, IS the tap), so it stamps 'tap'; every other store's recent listing
+   * stamps 'recent'. This is what lets the hole detection tell the tap's evidence from the rest.
+   */
+  const viaFor = (st: StoreState, phase: Phase): LedgerVia =>
+    phase === 'recent' ? (config.rangeStores.includes(st.siteId) ? 'tap' : 'recent') : VIA_BY_PHASE[phase];
+
+  /**
    * Enqueue the page's new items sequentially. Returns how many were NEW (for recent's
    * stop rule) and whether every new item was actually attempted (for backfill's advance rule).
    */
@@ -1028,7 +1114,14 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       switch (outcome) {
         case 'accepted':
         case 'accepted-dedup':
-          ledger.enqueued[item.itemId] = { at: iso(), collectUrl: item.collectUrl, ...(sweptFrom ? { sweptFrom } : {}) };
+          // Rebuilt WHOLE, as before; only the source stamp carries over from an existing entry (the
+          // recent phase's re-observation): see viaStamp.
+          ledger.enqueued[item.itemId] = {
+            at: iso(),
+            collectUrl: item.collectUrl,
+            ...(sweptFrom ? { sweptFrom } : {}),
+            ...viaStamp(ledger.enqueued[item.itemId], viaFor(st, phase)),
+          };
           accepted++;
           // The SWEEP's landings are the sweep's own number. `enqueued` is what `capApplied` bounds,
           // and `deduplicated` is "of `enqueued`" — a sweep POST in either would make a store summary
@@ -1597,6 +1690,11 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     const skip = (reason: RangeSkipReason): void => {
       st.summary.rangeSkipped = reason;
     };
+    // CRAWLER_RANGE_DESCENT_CAPS=<store>:0 turns this store's descent OFF (Ross QB-2, 2026-10-04: no
+    // blind id walking). Checked FIRST, before any ledger, cursor, frontier or seed work, so the
+    // phase writes nothing at all: a fresh ledger does not even get its frontier initialised.
+    const descentCap: number | undefined = descentCaps[st.siteId];
+    if (descentCap === 0) return skip('descent-cap');
     // A lane above it (a gap sweep, the lists step) stopped the store: same store, same egress.
     if (st.stopped) return skip('store-stopped');
     // The walk shares the store's enqueue cap and runs LAST, so a listing that spends the whole cap
@@ -1636,7 +1734,8 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       return skip('floor');
     }
 
-    const count = Math.min(config.rangeIdsPerRun, cursor);
+    // A descent cap only ever LOWERS the window; a store without one keeps CRAWLER_RANGE_IDS_PER_RUN.
+    const count = Math.min(descentCap ?? config.rangeIdsPerRun, config.rangeIdsPerRun, cursor);
     const out = await fetchCatalog(st, rangeUrl(st.siteId, cursor, count), { from: cursor, count }, 'range');
     if (out.kind !== 'page') return skip(out.reason);
     st.summary.rangeSkipped = null;
@@ -1802,6 +1901,13 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     return w.startMin > w.endMin && atMs - midnight >= w.startMin * 60_000 ? end + 86_400_000 : end;
   };
 
+  /** The instant the window holding `atMs` opened, mirroring windowEndMs: a window that wraps opened the day before. */
+  const windowStartMs = (w: { startMin: number; endMin: number }, atMs: number): number => {
+    const midnight = atMs - (((atMs % 86_400_000) + 86_400_000) % 86_400_000);
+    const start = midnight + w.startMin * 60_000;
+    return w.startMin > w.endMin && atMs - midnight < w.endMin * 60_000 ? start - 86_400_000 : start;
+  };
+
   /** A transient failure is retried on the next pass, at most this many times before the slot is spent. */
   const MAX_LIST_RETRIES = 3;
   /** Consecutive blocked passes before a group's slot is spent, so one refused list cannot freeze the rotation. */
@@ -1893,6 +1999,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     let stop: 'transient' | 'blocked' | 'cooldown' | 'budget' | undefined;
     for (const [i, listId] of lists.filter((id) => !Object.hasOwn(answered, id)).entries()) {
       if (i > 0) await sleep(config.listsSpacingMs ?? 10_000);
+      st.listFetchIssued = true;
       const out = await fetchRotatingList(st, listId);
       if (out.kind === 'budget' || out.kind === 'cooldown') {
         st.stopped = true;
@@ -2037,7 +2144,13 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     }
     const state = loaded;
     st.summary.listsDrainApplied = budget.cap;
-    st.summary.listsSkipped = await rotate(st, state);
+    // The alternation marker rides this step's own saves; only an in-window pass writes one.
+    if (st.alternationMarker) state.alternation = st.alternationMarker;
+    // An alternated store's TAP pass, and its pass that started outside the window, ask for no group at all —
+    // not even the declaration — so no pass of it fetches the tap and a list. The backlog drains either way.
+    if (st.passKind === 'tap') st.summary.listsSkipped = 'alternation-tap';
+    else if (st.passKind === 'outside-window') st.summary.listsSkipped = 'outside-window';
+    else st.summary.listsSkipped = await rotate(st, state);
     st.summary.listsPending = state.pending.length;
     if (!(await saveLists(st, state))) {
       st.summary.listsDrainStopped = 'failed';
@@ -2068,6 +2181,58 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     }
     st.summary.listsPending = state.pending.length;
     await saveLists(st, state);
+  };
+
+  /**
+   * LISTS ALTERNATION (QB-U21; Ross MS 2026-10-04): decide, once and before the tap, what this pass is for
+   * an alternated store. Inside the lists window the first pass of each window is a LISTS pass and the rest
+   * alternate off the marker its lists state carries; a pass that started outside the window taps as today.
+   * The read is read-only: the lists step saves the marker. An unreadable state turns the store's
+   * alternation off for the pass, which then runs exactly as it would without the knob.
+   */
+  const decideAlternation = async (st: StoreState): Promise<void> => {
+    // A store the pass does not run (pulled out, ledger refused) has nothing to alternate.
+    if (!alternated.has(st.siteId) || !st.ledger || st.stopped) return;
+    const window = config.listsWindow ?? null;
+    // No window = no list is ever fetched: there is nothing to alternate the tap with (listsSkipped says window-off).
+    if (!window) return;
+    if (!inWindow(window, startedAtMs)) {
+      st.passKind = 'outside-window';
+      st.summary.alternation = 'outside-window';
+      return;
+    }
+    let loaded: ListsState | 'corrupt';
+    try {
+      loaded = await listsStore.load(st.siteId);
+    } catch (error) {
+      logger.warn('[CRAWLER] lists state load failed at pass start — no alternation this pass', { siteId: st.siteId, error: errMsg(error) });
+      return;
+    }
+    if (loaded === 'corrupt') {
+      logger.warn('[CRAWLER] lists state corrupt at pass start — no alternation this pass', { siteId: st.siteId });
+      return;
+    }
+    const windowStart = windowStartMs(window, startedAtMs);
+    // Read defensively: the marker is not validated on load, and anything malformed counts as absent.
+    const m: unknown = loaded.alternation;
+    const sameWindow = isPlainObject(m) && typeof m.windowStart === 'string' && Date.parse(m.windowStart) === windowStart;
+    // A new window (or no marker) opens with lists, so every night is L T L T L T L — never 4 and 3 on alternate nights.
+    const kind = sameWindow && m.lastInWindowKind === 'lists' ? 'tap' : 'lists';
+    st.passKind = kind;
+    st.summary.alternation = kind;
+    st.alternationMarker = { lastInWindowKind: kind, windowStart: new Date(windowStart).toISOString(), at: new Date(startedAtMs).toISOString() };
+  };
+
+  /**
+   * After a LISTS pass's id-range phase: a lists step that issued no list GET (none due, paused, the engine
+   * has no rotation, the pass ran past the window) leaves the store's listing unread this pass, so it taps
+   * instead. A list GET that was issued — answered or failed — costs this pass's tap.
+   */
+  const rangeThenFallbackTap = async (st: StoreState): Promise<void> => {
+    await rangePhase(st);
+    if (st.listFetchIssued || st.stopped) return;
+    st.summary.alternation = 'fallback-tap';
+    await recentPhase(st);
   };
 
   /**
@@ -2262,6 +2427,10 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
             // The observation time IS the ledger's ordering key: stamping it sends the id to the back
             // of the oldest-first queue, which is what makes the lane rotate through a catalog.
             entry.at = iso();
+            // FIRST WRITER WINS: `via` stays whatever created the entry (absent on a legacy one); this
+            // lane records itself only as the last observer. A refusal below observed nothing, so it
+            // leaves both alone.
+            entry.lastVia = VIA_BY_PHASE.reobserve;
             delete entry.reobserveFailedAt;
             delete entry.reobserveFailures;
             // The lane's landing is the lane's OWN number. `enqueued` and `deduplicated` stay the
@@ -2340,14 +2509,18 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     return summary;
   }
 
+  // LISTS ALTERNATION: each alternated store's pass kind, decided before its tap. No knob, no extra step.
+  if (alternated.size > 0) await Promise.all(states.map((st) => decideAlternation(st)));
+
+  // A LISTS pass skips the tap AND the backfill page: both read the Latest Additions listing.
   if (config.phases.includes('recent')) {
-    await Promise.all(states.map((st) => recentPhase(st)));
+    await Promise.all(states.map((st) => (st.passKind === 'lists' ? undefined : recentPhase(st))));
   }
   if (config.phases.includes('backfill')) {
-    await Promise.all(states.map((st) => backfillPhase(st)));
+    await Promise.all(states.map((st) => (st.passKind === 'lists' ? undefined : backfillPhase(st))));
     // The id-range walk goes LAST of the discovery phases: the newest ids (listing) always outrank the
     // deep id space for the run's budget, and a store may serve this axis while serving no listing at all.
-    await Promise.all(states.map((st) => rangePhase(st)));
+    await Promise.all(states.map((st) => (st.passKind === 'lists' ? rangeThenFallbackTap(st) : rangePhase(st))));
   }
   // The RE-OBSERVATION lane runs after EVERY discovery phase, on its own per-store budget: discovery's
   // priority over the global request budget is therefore exactly what it was before this lane existed.
