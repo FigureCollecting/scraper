@@ -15,8 +15,15 @@
  *    starved, whatever the caps. A pooled dispatch now vacates the head's place, as FIFO would.
  *
  * Each scenario runs once under 'off' and once under 'all,-myfigurecollection.net' and compares the MFC
- * dispatch log: identical where the working set does not tie MFC to the other hosts' rows, and never
- * later (no fewer dispatches, the same items) where 'off' itself ties MFC to them.
+ * dispatch log: identical in the first three scenarios below; in the fourth (where 'off' itself ties MFC
+ * to the other hosts' rows in the shared working set) the same items in the same order, none later.
+ *
+ * That is all these four scenarios prove; it does NOT hold in general. With only the per-host cap binding
+ * and the slot saturated, a pooled host is not paged in, so it stays under its per-host cap and its new
+ * arrivals go straight into the tier (under off they park), scored above MFC's paged-in rows (a waiting
+ * user), and can take the slot when MFC's floor clears. In the closeout i2 fuzz (60 seeds, all WARM, per-host
+ * cap binding, 1.5 s fetch, global cap unbound) MFC matched off exactly in 26, went later in 20 and
+ * dispatched fewer in 5 (the off-vs-off and pooled-vs-pooled controls identical in 60 of 60).
  */
 jest.mock('../../services/genericScraper', () => ({
   BrowserPool: { getStealthBrowser: jest.fn(), getBrowser: jest.fn(), returnBrowser: jest.fn(), getPoolSize: jest.fn().mockReturnValue(2), getPoolCapacity: jest.fn().mockReturnValue(3), reset: jest.fn() },

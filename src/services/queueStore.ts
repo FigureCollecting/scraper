@@ -170,6 +170,16 @@ export interface QueueCounts {
   parked: number;
 }
 
+/** What {@link ScrapeQueueStore.pageIn} takes: every parked row unless narrowed. */
+export interface PageInOptions {
+  /** Leave these hosts' rows parked. */
+  skipHosts?: readonly string[];
+  /** Only this host's rows. */
+  host?: string;
+  /** Only rows of these priorities (an empty list: none). */
+  priorities?: readonly QueuePriority[];
+}
+
 export interface ScrapeQueueStore {
   /**
    * False for the no-op fallback: nothing is persisted and the queue must not park anything. Can flip
@@ -211,9 +221,10 @@ export interface ScrapeQueueStore {
   park(id: string): void;
   /**
    * Flip up to `limit` parked rows back to pending and return them, highest priority then oldest first.
-   * `skipHosts` leaves those hosts' rows parked; `host` takes only that host's rows.
+   * `skipHosts` leaves those hosts' rows parked; `host` takes only that host's rows; `priorities` only
+   * rows of those priorities (none for an empty list).
    */
-  pageIn(limit: number, opts?: { skipHosts?: readonly string[]; host?: string }): PersistedQueueItem[];
+  pageIn(limit: number, opts?: PageInOptions): PersistedQueueItem[];
   /**
    * Whether ANY row (pending, leased or parked) holds this dedup key. The queue's dedup path asks
    * this instead of holding a Set of parked ids — the whole point of parking is that depth lives on
@@ -710,17 +721,18 @@ function openSqliteStore(opts: OpenQueueStoreOptions, onUnknownLane: (value: str
   };
 
   const PRIORITY_RANK = "CASE priority WHEN 'HOT' THEN 0 WHEN 'WARM' THEN 1 ELSE 2 END";
-  const pageInStmt = (limit: number, skipHosts: readonly string[], host: string | undefined): PersistedQueueItem[] => {
+  const pageInStmt = (limit: number, skipHosts: readonly string[], host: string | undefined, priorities: readonly QueuePriority[] | undefined): PersistedQueueItem[] => {
     // A host already at its in-memory cap is skipped IN SQL, so a capped host's backlog never
     // consumes the page-in budget only to be re-parked.
     const placeholders = skipHosts.map(() => '?').join(',');
-    const where =
+    const hostWhere =
       host !== undefined
         ? `state = 'parked' AND host = ?`
         : skipHosts.length
           ? `state = 'parked' AND (host IS NULL OR host NOT IN (${placeholders}))`
           : `state = 'parked'`;
-    const params = host !== undefined ? [host] : skipHosts;
+    const where = priorities !== undefined ? `${hostWhere} AND priority IN (${priorities.map(() => '?').join(',')})` : hostWhere;
+    const params = [...(host !== undefined ? [host] : skipHosts), ...(priorities ?? [])];
     const rows = read(
       () =>
         db
@@ -788,9 +800,9 @@ function openSqliteStore(opts: OpenQueueStoreOptions, onUnknownLane: (value: str
       write(() => stmt.park.run(id));
     },
 
-    pageIn(limit: number, opts?: { skipHosts?: readonly string[]; host?: string }): PersistedQueueItem[] {
+    pageIn(limit: number, opts?: PageInOptions): PersistedQueueItem[] {
       if (closed || limit <= 0) return [];
-      return pageInStmt(limit, opts?.skipHosts ?? [], opts?.host);
+      return pageInStmt(limit, opts?.skipHosts ?? [], opts?.host, opts?.priorities);
     },
 
     hasKey(mfcId: string): boolean {

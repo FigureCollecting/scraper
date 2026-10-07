@@ -421,6 +421,9 @@ const DEFAULT_QUEUE_LEASE_MS = 10 * 60_000;
  * against a ~600/hour drain), so on today's traffic NOTHING parks and the behaviour is byte-for-byte
  * what it is now. Parking is a ceiling, not a new normal.
  */
+/** The tiers in dispatch order: the scan, the page-in and a pooled host's anchors go HOT, WARM, COLD. */
+const TIERS: readonly QueuePriority[] = ['HOT', 'WARM', 'COLD'];
+
 const QUEUE_MAX_RESIDENT_ENV = 'SCRAPE_QUEUE_MAX_RESIDENT';
 const DEFAULT_QUEUE_MAX_RESIDENT = 1000;
 
@@ -1777,8 +1780,8 @@ export class ScrapeQueue {
    * its parked rows itself, so paging them in buys it nothing, and a pick of a parked row frees no
    * place: under one shared budget the pooled hosts kept the places and a FIFO host (the excluded
    * MFC) drained. So the budget counts FIFO rows only, the pooled hosts are skipped, and a pooled host
-   * with parked rows but no dispatchable resident row (the scan reaches a host only through one) gets
-   * ONE anchor row, its first in page-in order, whatever the caps. Knob off: exactly as before.
+   * with parked rows in a tier above every dispatchable resident row it holds gets ONE anchor row of
+   * those tiers, whatever the caps (pageInAnchors): HOT first, tiers in order. Knob off: exactly as before.
    */
   refillWorkingSet(now: number = Date.now()): number {
     if (!this.store.durable) return 0;
@@ -1838,17 +1841,27 @@ export class ScrapeQueue {
   }
 
   /**
-   * One row, its first in page-in order, for each pooled host the dispatch scan cannot reach: it has no
-   * resident row that is dispatchable (rows held by a paused or cooling session are not).
+   * Anchor rows for the pooled hosts. The dispatch scan reaches a host only through a dispatchable
+   * resident row (rows held by a paused or cooling session are not), tier by tier, and a pooled pick
+   * serves the tier of the row the scan reached. So a pooled host's parked rows of a tier ABOVE every
+   * dispatchable resident row it holds (all of them when it holds none) would wait for that lower row,
+   * behind every other host's rows of the tiers between: a parked HOT row behind the WARM backlog. Such a
+   * host gets ONE row, its first in page-in order among those tiers (HOT, then WARM, then the oldest),
+   * whatever the caps: HOT always first, tiers in order.
    */
   private pageInAnchors(pooled: readonly string[]): PersistedQueueItem[] {
-    const reachable = new Set<string | undefined>();
-    for (const queue of [this.hotQueue, this.warmQueue, this.coldQueue]) {
-      for (const item of queue) if (!this.heldBySession(item)) reachable.add(this.hostOf(item.url));
-    }
+    // Each host's highest tier with a dispatchable resident row, as an index into TIERS.
+    const reachable = new Map<string | undefined, number>();
+    [this.hotQueue, this.warmQueue, this.coldQueue].forEach((queue, rank) => {
+      for (const item of queue) {
+        const host = this.hostOf(item.url);
+        if (!reachable.has(host) && !this.heldBySession(item)) reachable.set(host, rank);
+      }
+    });
     const anchors: PersistedQueueItem[] = [];
     for (const host of pooled) {
-      if (!reachable.has(host)) anchors.push(...this.store.pageIn(1, { host }));
+      const above = TIERS.slice(0, reachable.get(host) ?? TIERS.length);
+      if (above.length > 0) anchors.push(...this.store.pageIn(1, { host, priorities: above }));
     }
     return anchors;
   }
@@ -2669,10 +2682,10 @@ export class ScrapeQueue {
   }
 
   /**
-   * POOL-SELECT over one class of a pooled host, or null (the caller falls back to the FIFO head).
-   * HOT stays first: a HOT row of the host parked over the per-host cap is claimed before any pooled
-   * pick. Tiers stay ordered: scanning a COLD head while the host has WARM rows parked, the WARM class
-   * is served. A parked pick is claimed (paged in) and dispatched straight away.
+   * POOL-SELECT over one class of a pooled host, or null (the caller falls back to the FIFO head). The
+   * class is the head's tier: the host has no row parked in a tier above it, since the refill gives
+   * such rows an anchor (pageInAnchors), which the scan would have reached first. A parked pick is
+   * claimed (paged in) and dispatched straight away.
    *
    * Whatever is picked, the HEAD's place in the tier is vacated, exactly as a FIFO dispatch would
    * vacate it: a resident pick takes the head's place and the head takes the pick's; after a parked
@@ -2682,21 +2695,10 @@ export class ScrapeQueue {
    */
   private pickPooled(pool: PoolDispatch, host: string, queue: QueueItem[], i: number, now: number): QueueItem | null {
     const head = queue[i];
-    const tier = head.priority;
-    const hotParked = this.store.listParked(host, 'HOT');
-    if (hotParked.length > 0) return this.claimParkedForHead(hotParked[0], queue, i);
-    let cls = tier;
-    let parked = this.store.listParked(host, tier);
-    if (tier === 'COLD') {
-      const warmParked = this.store.listParked(host, 'WARM');
-      if (warmParked.length > 0) {
-        cls = 'WARM';
-        parked = warmParked;
-      }
-    }
-    // Resident candidates sit in the head's own tier: a dispatchable resident row of a higher tier would
-    // have been scanned (and been the head) first. Serving WARM from a COLD head, the WARM rows are parked.
-    const resident = cls === tier ? queue.filter((item) => this.hostOf(item.url) === host && !this.heldBySession(item)) : [];
+    const cls = head.priority;
+    const parked = this.store.listParked(host, cls);
+    // A dispatchable resident row of a higher tier would have been scanned (and been the head) first.
+    const resident = queue.filter((item) => this.hostOf(item.url) === host && !this.heldBySession(item));
     const candidates: PoolCandidate[] = [
       ...resident.map((item) => poolCandidate(item.mfcId, item.url, item.queuedAt, item.classEnteredAt, item.retryCount)),
       ...parked.map((row) => poolCandidate(row.mfcId, row.url, row.enqueuedAt, row.classEnteredAt ?? row.enqueuedAt, row.attempts)),

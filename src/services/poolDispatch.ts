@@ -14,8 +14,9 @@
  * never when or how often the host is sent to.
  *
  * What lives here:
- *  - SCRAPE_POOL_SELECT, read with the host-scope grammar (hostScope.ts): off | host,host | all |
- *    all,-host[,-host]; default off; malformed = off plus one boot warning. Membership is asked per
+ *  - SCRAPE_POOL_SELECT, read with the shared host-select grammar (hostSelect.ts, the one SCRAPE_HOST_CLOCK
+ *    reads; strict lists): off | host,host | all | all,-host[,-host]; default off; malformed (a blank
+ *    token beside 'all' included: 'all,', ',all') = off plus one boot warning. Membership is asked per
  *    dispatch, so 'all,-host' covers a host first seen after boot. Per-host mode pool | fifo-excluded |
  *    fifo-off.
  *  - SCRAPE_POOL_AGE_CAP_H / SCRAPE_POOL_HARD_CAP_H: host=hours csv; the age cap (R2) defaults to 12 h,
@@ -36,7 +37,7 @@
  */
 import { randomInt } from 'node:crypto';
 import { DEFAULT_ID_PARAMS, deriveStream, select, type Candidate, type History, type Pick as PoolSelectPick, type PickRule, type PickStage, type Rng } from './poolSelect.js';
-import { bareScopeHost, normalizeScopeHost, parseHostScope, type HostScope, type HostScopeKind } from './hostScope.js';
+import { hostSelected, isBareHostname, normalizeSelectHost, parseHostSelect, type HostSelect, type HostSelectMode } from './hostSelect.js';
 import { sanitizeForLog } from '../utils/security.js';
 
 export const POOL_SELECT_ENV = 'SCRAPE_POOL_SELECT';
@@ -127,7 +128,7 @@ export interface PoolHostView {
 /** /health/detailed's pool block. */
 export interface PoolView {
   /** SCRAPE_POOL_SELECT as parsed ('off' also when it was malformed). */
-  scope: HostScopeKind;
+  scope: HostSelectMode;
   malformed: boolean;
   hosts: PoolHostView[];
 }
@@ -192,7 +193,8 @@ function parseCaps(raw: string | undefined, envName: string, warnings: string[])
   for (const entry of value.split(',').map((e) => e.trim())) {
     if (entry === '') continue;
     const eq = entry.indexOf('=');
-    const host = eq > 0 ? bareScopeHost(entry.slice(0, eq)) : null;
+    const key = eq > 0 ? normalizeSelectHost(entry.slice(0, eq)) : '';
+    const host = isBareHostname(key) ? key : null;
     const text = eq > 0 ? entry.slice(eq + 1).trim() : '';
     const hours = Number(text);
     // Number('') is 0, so an empty value is refused by hours <= 0 like a zero.
@@ -208,7 +210,7 @@ function parseCaps(raw: string | undefined, envName: string, warnings: string[])
 export class PoolDispatch {
   readonly seed: number;
   private readonly rawSelect: string;
-  private readonly scope: HostScope;
+  private readonly scope: HostSelect;
   private readonly ageCapsH: Map<string, number>;
   private readonly hardCapsH: Map<string, number>;
   private readonly bootWarnings: string[] = [];
@@ -220,8 +222,9 @@ export class PoolDispatch {
 
   constructor(opts: PoolDispatchOptions = {}) {
     this.rawSelect = (opts.select ?? process.env[POOL_SELECT_ENV] ?? '').trim();
-    this.scope = parseHostScope(this.rawSelect, POOL_SELECT_ENV);
-    if (this.scope.warning !== null) this.bootWarnings.push(`[POOL] ${this.scope.warning}`);
+    this.scope = parseHostSelect(this.rawSelect, { envName: POOL_SELECT_ENV, tag: '[POOL]', listEntries: 'strict' });
+    // The value is named as given: one log line whatever it holds.
+    this.bootWarnings.push(...this.scope.warnings.map((warning) => sanitizeForLog(warning)));
     this.ageCapsH = parseCaps(opts.ageCaps ?? process.env[POOL_AGE_CAP_ENV], POOL_AGE_CAP_ENV, this.bootWarnings);
     this.hardCapsH = parseCaps(opts.hardCaps ?? process.env[POOL_HARD_CAP_ENV], POOL_HARD_CAP_ENV, this.bootWarnings);
     for (const [host, hard] of [...this.hardCapsH]) {
@@ -244,12 +247,12 @@ export class PoolDispatch {
 
   /** Whether the queue pools this host (asked per dispatch, never from a boot-time list). */
   modeFor(host: string): PoolHostMode {
-    const membership = this.scope.membership(host);
-    return membership === 'in' ? 'pool' : membership === 'excluded' ? 'fifo-excluded' : 'fifo-off';
+    if (hostSelected(this.scope, host)) return 'pool';
+    return this.scope.mode === 'all-except' ? 'fifo-excluded' : 'fifo-off';
   }
 
   capsFor(host: string): { ageCapMs: number; hardCapMs: number } {
-    const key = normalizeScopeHost(host);
+    const key = normalizeSelectHost(host);
     const ageH = this.ageCapsH.get(key) ?? DEFAULT_POOL_AGE_CAP_H;
     const hardH = this.hardCapsH.get(key) ?? 2 * ageH;
     return { ageCapMs: ageH * HOUR_MS, hardCapMs: hardH * HOUR_MS };
@@ -281,7 +284,7 @@ export class PoolDispatch {
     if (markSkip !== undefined) cls.skips.add(markSkip);
     cls.history = { prev: chosen.numId, prev2: cls.history.prev };
     const waitMs = nowMs - chosen.classEnteredAtMs;
-    this.record(normalizeScopeHost(host), {
+    this.record(normalizeSelectHost(host), {
       at: nowMs,
       stage: picked.stage,
       rule: picked.rule,
@@ -320,7 +323,7 @@ export class PoolDispatch {
 
   /** One host's picks over the trailing hour (zeros when it made none). */
   hostStats(host: string, nowMs: number): PoolHostStats {
-    const recent = this.windowOf(normalizeScopeHost(host), nowMs);
+    const recent = this.windowOf(normalizeSelectHost(host), nowMs);
     if (recent.length === 0) return { ...ZERO_STATS };
     let uniform = 0;
     let aged = 0;
@@ -366,8 +369,13 @@ export class PoolDispatch {
     return [...this.picks.keys()].filter((host) => this.windowOf(host, nowMs).length > 0).sort();
   }
 
-  scopeView(): { scope: HostScopeKind; malformed: boolean; hosts: readonly string[] } {
-    return { scope: this.scope.kind, malformed: this.scope.malformed, hosts: [...this.scope.hosts] };
+  scopeView(): { scope: HostSelectMode; malformed: boolean; hosts: readonly string[] } {
+    return { scope: this.scope.mode, malformed: this.scope.malformed, hosts: this.scopeHosts() };
+  }
+
+  /** The hosts the knob names: the excluded ones ('all,-host'), else the listed ones. */
+  private scopeHosts(): string[] {
+    return [...(this.scope.mode === 'all-except' ? this.scope.excluded : this.scope.hosts)];
   }
 
   /** The boot warnings: a malformed SCRAPE_POOL_SELECT, bad cap entries. Logged once at boot. */
@@ -377,7 +385,8 @@ export class PoolDispatch {
 
   /** The boot line: the knob as given, what it means, the caps and the seed (to replay picks). */
   describe(): string {
-    const { kind, malformed, hosts } = this.scope;
+    const { mode: kind, malformed } = this.scope;
+    const hosts = this.scopeHosts();
     const meaning = malformed
       ? ' (malformed: treated as off)'
       : kind === 'all-except'
@@ -409,7 +418,7 @@ export class PoolDispatch {
   }
 
   private rngOf(host: string): Rng {
-    const key = normalizeScopeHost(host);
+    const key = normalizeSelectHost(host);
     let rng = this.rngs.get(key);
     if (rng === undefined) {
       rng = this.rngFor !== undefined ? this.rngFor(key) : deriveStream(this.seed, key, 'pick');
