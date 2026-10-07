@@ -440,6 +440,10 @@ describe('readVisited never trusts a page outside [1, MAX_LEDGER_PAGE]', () => {
     expect(readVisited({ visited: [], drift: { ids: 2 ** 53 - 1, pageSize: 2 ** 53 - 1 } }, 1, NOW, TTL).malformed).toBe(false);
   });
 
+  it('a mark whose top alone is above MAX_LEDGER_PAGE is malformed (its bottom is a ledger page)', () => {
+    expect(readVisited({ visited: [[MAX_LEDGER_PAGE - 1, MAX_LEDGER_PAGE + 1, at]] }, 1, NOW, TTL).malformed).toBe(true);
+  });
+
   it('a mark ending at MAX_LEDGER_PAGE is accepted', () => {
     const { visited, malformed } = readVisited({ visited: [[MAX_LEDGER_PAGE - 1, MAX_LEDGER_PAGE, at]] }, 1, NOW, TTL);
     expect(malformed).toBe(false);

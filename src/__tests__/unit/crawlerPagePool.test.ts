@@ -930,6 +930,17 @@ describe('corrupt page values in the ledger: one validator, one WARN, the pass f
     expect(corruptWarns(warn)).toEqual(oneWarn(['cursor']));
   });
 
+  it.each([['null', null], ['absent', undefined]])('a cursor that is %s (a store not walked yet) is not corrupt: no WARN, the walk starts past the recent read', async (_label, v) => {
+    const warn = jest.spyOn(logger, 'warn');
+    const engine = makePagedEngine({ orzgk: catalog(30) });
+    const l = ledgerAt(engine.items('orzgk'), 10);
+    if (v === null) l.backfill.cursor = null;
+    else delete (l.backfill as Partial<Ledger['backfill']>).cursor;
+    const p = await runBounded(mkCfg(POOLED), engine, createMemoryLedgerStore({ orzgk: l }), T0, 3);
+    expect(sorted(p.backfillGets())).toEqual([2, 3, 4, 5, 6]);
+    expect(corruptWarns(warn)).toEqual([]);
+  });
+
   it('such a cursor reaches the pool through the real file store (the ledger load accepts any positive integer)', async () => {
     const files = new Map<string, string>();
     const fsLike: FsLike = {
