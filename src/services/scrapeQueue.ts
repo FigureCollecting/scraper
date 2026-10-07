@@ -1700,18 +1700,29 @@ export class ScrapeQueue {
   /**
    * Whether this enqueue must go to disk instead of a tier. Never on the fallback: parking without a
    * disk behind it would DELETE the item, which is precisely the bug this whole change exists to fix.
+   * A full working set parks a pooled host's enqueue; a FIFO host's only once FIFO rows fill it (QB-U19).
    */
   private shouldPark(item: QueueItem): boolean {
     if (!this.store.durable || !this.persistable(item)) return false;
     const resident = this.residentCount();
     const perHost = resolveMaxResidentPerHost();
-    if (resident >= resolveMaxResident()) return true;
+    if (resident >= resolveMaxResident() && this.countsAgainstCap(item)) return true;
     // A single host cannot be over its own cap while the WHOLE working set is under it, so the
     // O(n) per-host scan below is skipped entirely on the normal path.
     if (resident < perHost) return false;
     const host = this.hostOf(item.url);
     if (host === undefined) return false;
     return this.residentForHost(host) >= perHost;
+  }
+
+  /**
+   * The working set is full (all rows counted): does that park this enqueue? A pooled host's, yes. A FIFO
+   * host's only if the FIFO rows alone fill it, so pooled rows never take a FIFO host's places (QB-U19).
+   */
+  private countsAgainstCap(item: QueueItem): boolean {
+    const host = this.hostOf(item.url);
+    if (host !== undefined && this.pool().modeFor(host) === 'pool') return true;
+    return this.fifoResidentCount() >= resolveMaxResident();
   }
 
   /**
@@ -1761,6 +1772,13 @@ export class ScrapeQueue {
    *
    * Called before each dispatch scan. On today's traffic both halves are no-ops — the reaper is
    * throttled to once a minute and there is nothing parked below the 1000-item cap.
+   *
+   * With pool dispatch on (QB-U19), the page-in is the FIFO hosts' alone. A pooled host's pick reads
+   * its parked rows itself, so paging them in buys it nothing, and a pick of a parked row frees no
+   * place: under one shared budget the pooled hosts kept the places and a FIFO host (the excluded
+   * MFC) drained. So the budget counts FIFO rows only, the pooled hosts are skipped, and a pooled host
+   * with parked rows but no dispatchable resident row (the scan reaches a host only through one) gets
+   * ONE anchor row, its first in page-in order, whatever the caps. Knob off: exactly as before.
    */
   refillWorkingSet(now: number = Date.now()): number {
     if (!this.store.durable) return 0;
@@ -1776,10 +1794,12 @@ export class ScrapeQueue {
     }
 
     if (this.parkedCount > 0) {
-      const budget = resolveMaxResident() - this.residentCount();
-      if (budget > 0) {
-        const skipHosts = this.hostsAtCap(resolveMaxResidentPerHost());
-        const paged = this.store.pageIn(budget, { skipHosts });
+      const pooled = this.pooledParkedHosts();
+      const anchors = pooled.length > 0 ? this.pageInAnchors(pooled) : [];
+      const budget = resolveMaxResident() - this.fifoResidentCount();
+      if (budget > 0 || anchors.length > 0) {
+        const skipHosts = [...this.hostsAtCap(resolveMaxResidentPerHost()), ...pooled];
+        const paged = [...anchors, ...this.store.pageIn(budget, { skipHosts })];
         for (const row of paged) {
           if (this.adoptPersisted(row, false)) loaded++;
         }
@@ -1790,6 +1810,47 @@ export class ScrapeQueue {
       }
     }
     return loaded;
+  }
+
+  /** Hosts with parked rows that pool dispatch serves, from the lane counters ([] when the knob is off). */
+  private pooledParkedHosts(): string[] {
+    const pool = this.pool();
+    return this.laneCounters
+      .hosts()
+      .filter((host) => Object.values(this.laneCounters.forHost(host)).some((c) => c.parked > 0) && pool.modeFor(host) === 'pool')
+      .sort();
+  }
+
+  /** Resident rows of pooled hosts (0 when the knob is off). */
+  private pooledResidentCount(): number {
+    const pool = this.pool();
+    let n = 0;
+    for (const host of this.laneCounters.hosts()) {
+      if (pool.modeFor(host) !== 'pool') continue;
+      for (const c of Object.values(this.laneCounters.forHost(host))) n += c.resident;
+    }
+    return n;
+  }
+
+  /** Resident rows the FIFO hosts' working-set cap counts: all of them less the pooled hosts'. */
+  private fifoResidentCount(): number {
+    return this.residentCount() - this.pooledResidentCount();
+  }
+
+  /**
+   * One row, its first in page-in order, for each pooled host the dispatch scan cannot reach: it has no
+   * resident row that is dispatchable (rows held by a paused or cooling session are not).
+   */
+  private pageInAnchors(pooled: readonly string[]): PersistedQueueItem[] {
+    const reachable = new Set<string | undefined>();
+    for (const queue of [this.hotQueue, this.warmQueue, this.coldQueue]) {
+      for (const item of queue) if (!this.heldBySession(item)) reachable.add(this.hostOf(item.url));
+    }
+    const anchors: PersistedQueueItem[] = [];
+    for (const host of pooled) {
+      if (!reachable.has(host)) anchors.push(...this.store.pageIn(1, { host }));
+    }
+    return anchors;
   }
 
   private addToQueue(item: QueueItem): void {
@@ -2560,7 +2621,8 @@ export class ScrapeQueue {
    * class (host + tier), and the host's floor (or the shared host clock) has granted the dispatch. Which
    * item of the class goes is decided here: FIFO (the head itself, exactly as before) unless the host
    * is pooled (SCRAPE_POOL_SELECT) and the tier is not HOT, in which case POOL-SELECT picks over the
-   * class's dispatchable rows, resident AND parked. QB-U3 passes host + lane through the same seam.
+   * class's dispatchable rows, resident AND parked, and the head's place is vacated as FIFO would vacate
+   * it (pickPooled). QB-U3 passes host + lane through the same seam.
    */
   private takeFromClass(queue: QueueItem[], i: number, host: string | undefined, now: number): QueueItem {
     const head = queue[i];
@@ -2569,7 +2631,7 @@ export class ScrapeQueue {
       if (pool.modeFor(host) === 'pool') {
         let picked: QueueItem | null = null;
         try {
-          picked = this.pickPooled(pool, host, head.priority, now);
+          picked = this.pickPooled(pool, host, queue, i, now);
         } catch (error) {
           // Fail safe: a pick that throws must not stop the queue. This dispatch goes FIFO (today's order).
           console.warn(
@@ -2591,10 +2653,18 @@ export class ScrapeQueue {
    * HOT stays first: a HOT row of the host parked over the per-host cap is claimed before any pooled
    * pick. Tiers stay ordered: scanning a COLD head while the host has WARM rows parked, the WARM class
    * is served. A parked pick is claimed (paged in) and dispatched straight away.
+   *
+   * Whatever is picked, the HEAD's place in the tier is vacated, exactly as a FIFO dispatch would
+   * vacate it: a resident pick takes the head's place and the head takes the pick's; after a parked
+   * pick the head moves to the back of its tier. So a pooled host never holds a place in the dispatch
+   * scan ahead of another host that FIFO would not have given it: it does not keep its old rows at the
+   * front while it sends newer ones.
    */
-  private pickPooled(pool: PoolDispatch, host: string, tier: QueuePriority, now: number): QueueItem | null {
+  private pickPooled(pool: PoolDispatch, host: string, queue: QueueItem[], i: number, now: number): QueueItem | null {
+    const head = queue[i];
+    const tier = head.priority;
     const hotParked = this.store.listParked(host, 'HOT');
-    if (hotParked.length > 0) return this.claimParked(hotParked[0]);
+    if (hotParked.length > 0) return this.claimParkedForHead(hotParked[0], queue, i);
     let cls = tier;
     let parked = this.store.listParked(host, tier);
     if (tier === 'COLD') {
@@ -2604,23 +2674,29 @@ export class ScrapeQueue {
         parked = warmParked;
       }
     }
-    const tierQueue = this.getQueueForPriority(cls);
-    const resident = tierQueue.filter((item) => this.hostOf(item.url) === host && !this.heldBySession(item));
+    // Resident candidates sit in the head's own tier: a dispatchable resident row of a higher tier would
+    // have been scanned (and been the head) first. Serving WARM from a COLD head, the WARM rows are parked.
+    const resident = cls === tier ? queue.filter((item) => this.hostOf(item.url) === host && !this.heldBySession(item)) : [];
     const candidates: PoolCandidate[] = [
       ...resident.map((item) => poolCandidate(item.mfcId, item.url, item.queuedAt, item.classEnteredAt, item.retryCount)),
       ...parked.map((row) => poolCandidate(row.mfcId, row.url, row.enqueuedAt, row.classEnteredAt ?? row.enqueuedAt, row.attempts)),
     ];
     const index = pool.pick(host, `${host}|${cls}`, candidates, now);
     if (index < 0) return null;
-    if (index >= resident.length) return this.claimParked(parked[index - resident.length]);
+    if (index >= resident.length) return this.claimParkedForHead(parked[index - resident.length], queue, i);
     const item = resident[index];
-    tierQueue.splice(tierQueue.indexOf(item), 1);
+    // The head takes the pick's place and the head's own place goes, as a FIFO dispatch would leave it.
+    queue[queue.indexOf(item)] = head;
+    queue.splice(i, 1);
     this.laneCounters.adjust(host, item.lane, 'resident', -1);
     return item;
   }
 
-  /** Claim a parked row for dispatch (parked -> pending, attempts and class entry kept), or null if it is gone. */
-  private claimParked(row: PersistedQueueItem): QueueItem | null {
+  /**
+   * Claim a parked row for dispatch in the head's stead, or null if it is gone. The head leaves its place
+   * for the back of its tier, behind every row already waiting there (FIFO would have sent it).
+   */
+  private claimParkedForHead(row: PersistedQueueItem, queue: QueueItem[], i: number): QueueItem | null {
     const claimed = this.store.claimKey(row.mfcId);
     if (claimed === null) return null;
     const item = this.itemFromPersisted(claimed);
@@ -2628,6 +2704,8 @@ export class ScrapeQueue {
     this.pendingItems.set(claimed.mfcId, item);
     this.parkedCount = this.store.counts().parked;
     this.resyncParkedLanes();
+    const [head] = queue.splice(i, 1);
+    queue.push(head);
     return item;
   }
 

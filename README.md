@@ -1439,6 +1439,7 @@ See `.env.example` for complete configuration template.
 - `SCRAPE_QUEUE_MAX_RESIDENT`: Cap on items held in the in-memory priority tiers; the overflow is written to disk as `parked` and paged back in as the tiers drain
   - Bounds both heap and the queue's O(n) work — `addToQueue` scores every item in a lane to place one, and the dispatch scan walks the lanes each time
   - The default sits ABOVE today's observed depth (normally < 500 at ~520–620 enqueues/hour against a ~600/hour drain), so on today's traffic nothing parks and behaviour is unchanged. It is a ceiling, not a new normal
+  - With `SCRAPE_POOL_SELECT` on, the cap counts the FIFO hosts' rows and the pooled hosts' rows apart: a pooled host's enqueue parks once the whole set is full, a FIFO host's only once FIFO rows fill it, so pooled rows never take a FIFO host's places. Pooled hosts read their parked rows at each pick and are not paged in (one anchor row each keeps them in the dispatch scan), so the set can hold up to about twice the cap (plus one anchor per pooled host)
   - Unset/invalid → default
   - Default: `1000`
 - `SCRAPE_QUEUE_MAX_RESIDENT_PER_HOST`: Cap on RESIDENT items for one host
