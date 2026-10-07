@@ -148,6 +148,10 @@ describe('a pooled backfill pass is a permutation of the sequential one', () => 
         expect(p.store().pagePicks).toEqual(picks);
         bad += violations(picks);
         expect(p.store().backfillCursor).toBe(cursor + 5);
+        // Every listing GET is counted, recent and backfill alike, as the sequential pass counts them.
+        expect(p.store().pagesFetched).toBe(p.gets().length);
+        expect(p.store().pagesFetched).toBe(seq.store().pagesFetched);
+        expect(p.store().backfillPages).toBe(5);
         expect(sorted(p.posts().map((x) => x.length))).toEqual(sorted(seq.posts().map((x) => x.length)));
         expect(new Set(p.posts())).toEqual(new Set(seq.posts()));
         expect(ledgers.files.get('orzgk')!.recent.pagePool).toEqual({ visited: [] });
@@ -472,6 +476,53 @@ describe('edges of the stop rules', () => {
   });
 });
 
+describe('the end rules match the sequential walk', () => {
+  const emptyPage = (page: number): EngineReply => ({ status: 200, body: { siteId: 'orzgk', page, url: 'x', items: [], collectUrls: [], hasMore: false, count: 0 } });
+
+  it.each([1, 2, 3, 4, 5, 6, 7, 8])('seed %i: an exhaustion signal BELOW a standing candidate is a new candidate, never a confirmation', async (seed) => {
+    // Cursor 12 and a candidate at 15 from an earlier run; this run pages 13-15 answer empty (a status-blind
+    // transient) and page 12 is real. The sequential walk records a candidate at 13 and confirms nothing.
+    const engine = makePagedEngine({ orzgk: catalog(30) }, { reply: (_s, page) => (page >= 13 && page <= 15 ? emptyPage(page) : undefined) });
+    const ledger = () => ledgerAt(engine.items('orzgk'), 12, { exhaustCandidateCursor: 15, exhaustCandidateAt: iso(T0 - HOUR_MS) });
+    const seqLedgers = createMemoryLedgerStore({ orzgk: ledger() });
+    await runPass(mkCfg(), engine, seqLedgers, T0, seed);
+    expect(seqLedgers.files.get('orzgk')!.backfill).toMatchObject({ cursor: 13, exhaustCandidateCursor: 13 });
+    expect(seqLedgers.files.get('orzgk')!.backfill.exhaustedAt).toBeUndefined();
+    const ledgers = createMemoryLedgerStore({ orzgk: ledger() });
+    const p = await runPass(mkCfg(POOLED), engine, ledgers, T0, seed);
+    expect(p.store().exhausted).toBe(false);
+    expect(ledgers.files.get('orzgk')!.backfill.exhaustedAt).toBeUndefined();
+    expect(ledgers.files.get('orzgk')!.backfill).toMatchObject({ cursor: 13, exhaustCandidateCursor: 13 });
+  });
+
+  it.each([1, 2, 3, 4, 5, 6])('seed %i: a due re-check that finds the catalog grew by one page records the new end as a CANDIDATE, as the sequential walk does', async (seed) => {
+    const run = async (pool: boolean) => {
+      const engine = makePagedEngine({ orzgk: catalog(13) });
+      const ledgers = createMemoryLedgerStore({ orzgk: ledgerAt(engine.items('orzgk'), 12, { exhaustedAt: iso(T0 - 8 * DAY_MS) }) });
+      const p = await runPass(mkCfg(pool ? POOLED : {}), engine, ledgers, T0, seed);
+      return { p, b: ledgers.files.get('orzgk')!.backfill };
+    };
+    const seq = await run(false);
+    expect(seq.b).toMatchObject({ cursor: 13, exhaustCandidateCursor: 13 });
+    expect(seq.b.exhaustedAt).toBeUndefined();
+    const pooled = await run(true);
+    expect(pooled.p.store().exhausted).toBe(false);
+    expect(pooled.b.exhaustedAt).toBeUndefined();
+    expect(pooled.b).toMatchObject({ cursor: 13, exhaustCandidateCursor: 13 });
+  });
+
+  it.each([false, true])('pooled=%p: the ids a cut-short LAST page enqueued are in the saved ledger, so the next pass never POSTs them again', async (pool) => {
+    // Page 12 is the catalogue's last (hasMore false) and holds ten new ids; the cap allows four.
+    const engine = makePagedEngine({ orzgk: catalog(12) });
+    const ledgers = createMemoryLedgerStore({ orzgk: ledgerAt(engine.items('orzgk'), 12) });
+    const p = await runPass(mkCfg({ maxEnqueuePerStore: 4, ...(pool ? POOLED : {}) }), engine, ledgers, T0, 1);
+    const posted = p.posts().map((line) => line.slice(line.lastIndexOf('/') + 1));
+    expect(posted).toHaveLength(4);
+    const saved = ledgers.files.get('orzgk')!;
+    for (const id of posted) expect(saved.enqueued[id]).toBeDefined();
+  });
+});
+
 describe('ledger.recent.pagePool', () => {
   const cutShortLedger = async (seed: number) => {
     const engine = makePagedEngine({ orzgk: catalog(60) });
@@ -591,12 +642,24 @@ describe('listing drift (k ids prepended per pass)', () => {
     for (let seed = 0; seed < 10; seed++) expect(await coverage(k, true, seed, o)).toBeGreaterThanOrEqual(seq - 0.01);
   });
 
+  /**
+   * More than a page of new ids a pass (the hourly production pass with caps of 15-50 meets this on a busy
+   * store): an unvisited page's unread tail then slides past the bottom page of the visited run above it.
+   */
+  it.each([25, 45])('k = %i (more than one 20-id page), a cap that cuts every pass short, walked to the end: pooled coverage within 1 pp of sequential', async (k) => {
+    const o = { cap: 90, pageSize: 20, items: 1000, passes: 60 };
+    const seq = await coverage(k, false, 0, o);
+    expect(seq).toBe(1);
+    for (let seed = 0; seed < 10; seed++) expect(await coverage(k, true, seed, o)).toBeGreaterThanOrEqual(seq - 0.01);
+  });
+
   describe('the bottom visited page above an unvisited one is read again when the listing moved', () => {
     /** cursor 20; pages 22-23 visited an hour ago; page 21 unvisited (the run sits on it). */
-    const setFor = async (o: { prepend: number; phases?: CrawlerConfig['phases'] }) => {
+    const setFor = async (o: { prepend: number; phases?: CrawlerConfig['phases']; run?: [number, number] }) => {
       const engine = makePagedEngine({ orzgk: catalog(60) });
       const l = ledgerAt(engine.items('orzgk'), 20);
-      l.recent.pagePool = { visited: [[22, 23, iso(T0 - HOUR_MS)]] };
+      const [from, to] = o.run ?? [22, 23];
+      l.recent.pagePool = { visited: [[from, to, iso(T0 - HOUR_MS)]] };
       if (o.prepend > 0) engine.prepend('orzgk', idRun('n', 900_000, o.prepend));
       const p = await runPass(mkCfg({ ...POOLED, ...(o.phases ? { phases: o.phases } : {}) }), engine, createMemoryLedgerStore({ orzgk: l }), T0, 11);
       return sorted(p.backfillGets());
@@ -612,6 +675,18 @@ describe('listing drift (k ids prepended per pass)', () => {
 
     it('no recent read this pass (backfill-only mode): the drift is unknown, so page 22 is read again', async () => {
       expect(await setFor({ prepend: 0, phases: ['backfill'] })).toEqual([20, 21, 22, 24, 25]);
+    });
+
+    /**
+     * A longer run, pages 22-26, over the unvisited page 21: k new ids on top move page 21's unread ids
+     * down by k, onto the bottom ceil(k / page size) pages of the run (page size = the recent read's page 1).
+     */
+    it.each([
+      [10, [20, 21, 22, 27, 28]],
+      [11, [20, 21, 22, 23, 27]],
+      [25, [20, 21, 22, 23, 24]],
+    ])('k = %i new ids on top of 10-id pages: the bottom ceil(k / 10) pages of the run are read again', async (k, expected) => {
+      expect(await setFor({ prepend: k as number, run: [22, 26] })).toEqual(expected);
     });
   });
 });

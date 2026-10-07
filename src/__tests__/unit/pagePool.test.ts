@@ -127,26 +127,41 @@ describe('dropExposedMarks (after listing drift)', () => {
 
   it('forgets the bottom page of every visited run that sits on an unvisited page, and nothing else', () => {
     const visited = v(12, 13, 14, 17);
-    dropExposedMarks(visited, 10);
+    dropExposedMarks(visited, 10, 1);
     expect([...visited.keys()]).toEqual([13, 14]);
   });
 
   it('a run right above the cursor is exposed (the cursor page is unvisited)', () => {
     const visited = v(11, 12);
-    dropExposedMarks(visited, 10);
+    dropExposedMarks(visited, 10, 1);
     expect([...visited.keys()]).toEqual([12]);
   });
 
   it('a page at the cursor sits on visited ground (everything below the cursor is visited)', () => {
     const visited = v(10, 11);
-    dropExposedMarks(visited, 10);
+    dropExposedMarks(visited, 10, 1);
     expect([...visited.keys()]).toEqual([10, 11]);
   });
 
-  it('only the bottom of a run goes, even when the run is long (one pass of drift moves less than a page)', () => {
+  it('a drift of at most one page: only the bottom of a run goes, even when the run is long', () => {
     const visited = v(30, 31, 32, 33);
-    dropExposedMarks(visited, 20);
+    dropExposedMarks(visited, 20, 1);
     expect([...visited.keys()]).toEqual([31, 32, 33]);
+  });
+
+  it('a drift of `depth` pages: the bottom `depth` pages of every exposed run go (a shorter run goes whole)', () => {
+    const visited = v(12, 13, 14, 15, 17, 18, 21);
+    dropExposedMarks(visited, 10, 2);
+    expect([...visited.keys()]).toEqual([14, 15]);
+  });
+
+  it('depth 0 (no drift) forgets nothing; a run at the cursor stays whatever the depth', () => {
+    const none = v(12, 13, 17);
+    dropExposedMarks(none, 10, 0);
+    expect([...none.keys()]).toEqual([12, 13, 17]);
+    const atCursor = v(10, 11, 12, 14, 15, 16);
+    dropExposedMarks(atCursor, 10, 3);
+    expect([...atCursor.keys()]).toEqual([10, 11, 12]);
   });
 });
 

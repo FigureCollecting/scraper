@@ -1350,7 +1350,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     const visited = read.visited;
     // DRIFT: when the listing may have moved since the last pass (the recent read met ids the ledger did not
     // hold, or there was no recent read), re-read the bottom page of every visited run above an unvisited page.
-    if (st.summary.recentPages === 0 || st.recentUnseen > 0) dropExposedMarks(visited, start);
+    if (st.summary.recentPages === 0 || st.recentUnseen > 0) dropExposedMarks(visited, start, 1);
     // What the ledger said about the end when the pass began. A candidate BELOW the cursor is stale (nothing
     // writes one) and bounds nothing; it is cleared at the first save, as a real page clears it today.
     let priorExhausted = b.exhaustedAt !== undefined;

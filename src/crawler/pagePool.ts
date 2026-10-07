@@ -76,7 +76,8 @@ export function readVisited(raw: unknown, cursor: number, nowMs: number, ttlMs: 
  * visited). After new ids land on top, that page holds the slid-down tail of the unvisited page below it,
  * which nothing has read; the pages above it in the run only took ids from visited pages. Mutates `visited`.
  */
-export function dropExposedMarks(visited: Map<number, number>, cursor: number): void {
+export function dropExposedMarks(visited: Map<number, number>, cursor: number, depth: number): void {
+  void depth; // API stub (red commit): the depth rule lands with the fix.
   const exposed = [...visited.keys()].filter((page) => page > cursor && !visited.has(page - 1));
   for (const page of exposed) visited.delete(page);
 }
