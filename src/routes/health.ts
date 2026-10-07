@@ -60,7 +60,11 @@
  *     observer: per store host, the trailing hour of requests measured at the instant each was handed
  *     to its transport — with the clock off too, so it is the live negative control for
  *     SCRAPE_HOST_CLOCK; callers queue, image, catalogListing, catalogSeed, catalogRotating, resolve,
- *     scrape, lookup, fetchBody, sessionPrime, pluginRoute).
+ *     scrape, lookup, fetchBody, sessionPrime, pluginRoute), and
+ *     `pool: {scope, malformed, hosts: [{host, mode, picks60m, topBucketShare60m, uniformPicks60m,
+ *     agedPicks60m, agedShare60m, forcedPicks60m, agedCount, p99WaitH60m, maxWaitH60m, redraws60m,
+ *     scanFallbacks60m, retryPicks60m}]}` (the queue's POOL-SELECT dispatch per host, QB-U19: which
+ *     hosts SCRAPE_POOL_SELECT pools, and the trailing hour of their picks; zeros when off).
  *     A browser-pool-health failure still degrades to 500, now carrying { status:'degraded',
  *     challengeCooldowns, cfCookies, error } — both lists survive (neither lister can throw).
  */
@@ -78,6 +82,7 @@ import type { QueueStoreView } from '../services/scrapeQueue.js';
 import type { HandsOffView } from '../services/extractionRegistry.js';
 import type { PluginsView } from '../services/pluginBootstrap.js';
 import type { HostClockView } from '../services/hostClock.js';
+import type { PoolView } from '../services/poolDispatch.js';
 
 export interface HealthDeps {
   /** The service version (package.json). */
@@ -175,6 +180,14 @@ export interface HealthDeps {
    * live negative control). Counters only, under 1 KB per host; never throws.
    */
   getHostClock: () => HostClockView;
+  /**
+   * The queue's POOL-SELECT dispatch (getScrapeQueue().getPoolView(now), QB-U19): SCRAPE_POOL_SELECT as
+   * parsed (`scope`, `malformed`) and, per host, `{host, mode: pool | fifo-excluded | fifo-off,
+   * picks60m, topBucketShare60m, uniformPicks60m, agedPicks60m, agedShare60m, forcedPicks60m, agedCount,
+   * p99WaitH60m, maxWaitH60m, redraws60m, scanFallbacks60m, retryPicks60m}` over the trailing hour.
+   * Zeros for a FIFO host (and every host when the knob is off). Counters only, never throws.
+   */
+  getPool: () => PoolView;
 }
 
 export function createHealthRoutes(deps: HealthDeps): Router {
@@ -217,6 +230,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         handsOff: deps.listHandsOff(),
         plugins: deps.listPlugins(),
         hostClock: deps.getHostClock(),
+        pool: deps.getPool(),
         timestamp: new Date().toISOString(),
       });
     } catch (error) {
@@ -245,6 +259,8 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         plugins: deps.listPlugins(),
         // Whether MFC is being sent to under its floor matters most when the pod is sick, too.
         hostClock: deps.getHostClock(),
+        // So do waits past the age cap and forced picks (the starvation alarm's inputs).
+        pool: deps.getPool(),
         error: error instanceof Error ? error.message : 'Unknown error',
       });
     }

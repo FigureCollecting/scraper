@@ -46,6 +46,7 @@ const build = (over: Partial<HealthDeps> = {}) => {
     listHandsOff: () => [],
     listPlugins: () => ({ loaded: [], refused: [] }),
     getHostClock: () => ({ mode: 'off', hosts: [] }),
+    getPool: () => ({ scope: 'off', malformed: false, hosts: [] }),
     ...over,
   }));
   return app;
@@ -852,5 +853,51 @@ describe('createHealthRoutes — hostClock', () => {
 
     expect(res.status).toBe(500);
     expect(res.body.hostClock).toEqual(VIEW);
+  });
+});
+
+/**
+ * The queue's POOL-SELECT dispatch (QB-U19): per host its mode (pool | fifo-excluded | fifo-off) and the
+ * trailing hour's pick counters, plus agedCount. Present with zeros when SCRAPE_POOL_SELECT is off.
+ */
+describe('createHealthRoutes — pool', () => {
+  const VIEW = {
+    scope: 'all-except' as const,
+    malformed: false,
+    hosts: [
+      {
+        host: 'hpoi.net', mode: 'pool' as const, picks60m: 300, topBucketShare60m: 0.5, uniformPicks60m: 9, agedPicks60m: 200,
+        agedShare60m: 0.667, forcedPicks60m: 0, agedCount: 4, p99WaitH60m: 12.2, maxWaitH60m: 14.1, redraws60m: 30,
+        scanFallbacks60m: 2, retryPicks60m: 7,
+      },
+      {
+        host: 'myfigurecollection.net', mode: 'fifo-excluded' as const, picks60m: 0, topBucketShare60m: 0, uniformPicks60m: 0,
+        agedPicks60m: 0, agedShare60m: 0, forcedPicks60m: 0, agedCount: 0, p99WaitH60m: 0, maxWaitH60m: 0, redraws60m: 0,
+        scanFallbacks60m: 0, retryPicks60m: 0,
+      },
+    ],
+  };
+
+  it('GET /health/detailed carries the pool block', async () => {
+    const res = await request(build({ getPool: () => VIEW })).get('/health/detailed');
+
+    expect(res.status).toBe(200);
+    expect(res.body.pool).toEqual(VIEW);
+  });
+
+  it('keeps the pool block on the degraded (500) response', async () => {
+    const res = await request(build({
+      getBrowserPoolHealth: async () => { throw new Error('pool down'); },
+      getPool: () => VIEW,
+    })).get('/health/detailed');
+
+    expect(res.status).toBe(500);
+    expect(res.body.pool).toEqual(VIEW);
+  });
+
+  it('off: the block is present with an off scope', async () => {
+    const res = await request(build()).get('/health/detailed');
+
+    expect(res.body.pool).toEqual({ scope: 'off', malformed: false, hosts: [] });
   });
 });

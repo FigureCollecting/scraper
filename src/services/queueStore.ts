@@ -119,6 +119,12 @@ export interface PersistedQueueItem {
   maxRetries: number;
   /** `QueueItem.queuedAt` (epoch ms). */
   enqueuedAt: number;
+  /**
+   * When the item entered its DISPATCH CLASS (host + tier; QB-U19), epoch ms: its enqueue, re-stamped by
+   * a priority raise, never by a retry or a dedup enqueue. Absent = `enqueuedAt` (the row never changed
+   * class, or an older build wrote it and left the column NULL). POOL-SELECT ages R1 and R2 from it.
+   */
+  classEnteredAt?: number;
   state: QueueItemState;
   /** Epoch ms at which a lease expires. Only meaningful while state === 'leased'. */
   leaseUntil?: number;
@@ -164,6 +170,16 @@ export interface QueueCounts {
   parked: number;
 }
 
+/** What {@link ScrapeQueueStore.pageIn} takes: every parked row unless narrowed. */
+export interface PageInOptions {
+  /** Leave these hosts' rows parked. */
+  skipHosts?: readonly string[];
+  /** Only this host's rows. */
+  host?: string;
+  /** Only rows of these priorities (an empty list: none). */
+  priorities?: readonly QueuePriority[];
+}
+
 export interface ScrapeQueueStore {
   /**
    * False for the no-op fallback: nothing is persisted and the queue must not park anything. Can flip
@@ -203,8 +219,12 @@ export interface ScrapeQueueStore {
   remove(id: string): void;
   /** Move a resident row out of the working set without losing it. */
   park(id: string): void;
-  /** Flip up to `limit` parked rows back to pending and return them, highest priority then oldest first. */
-  pageIn(limit: number, opts?: { skipHosts?: readonly string[] }): PersistedQueueItem[];
+  /**
+   * Flip up to `limit` parked rows back to pending and return them, highest priority then oldest first.
+   * `skipHosts` leaves those hosts' rows parked; `host` takes only that host's rows; `priorities` only
+   * rows of those priorities (none for an empty list).
+   */
+  pageIn(limit: number, opts?: PageInOptions): PersistedQueueItem[];
   /**
    * Whether ANY row (pending, leased or parked) holds this dedup key. The queue's dedup path asks
    * this instead of holding a Set of parked ids — the whole point of parking is that depth lives on
@@ -222,8 +242,19 @@ export interface ScrapeQueueStore {
    * a fresh retry budget.
    */
   claimKey(mfcId: string): PersistedQueueItem | null;
-  /** Record a priority upgrade, so a restored item comes back at the priority it was raised to. */
-  setPriority(id: string, priority: QueuePriority): void;
+  /**
+   * Record a priority upgrade, so a restored item comes back at the priority it was raised to. A raise
+   * moves the row into another dispatch class, so the queue passes the instant it entered it
+   * (class_entered_at); without one the stamp is left as it is.
+   */
+  setPriority(id: string, priority: QueuePriority, classEnteredAt?: number): void;
+  /**
+   * One dispatch class's PARKED rows (normalized host + priority), oldest class entry first (then dedup
+   * key). Pool dispatch reads them so R1 and R2 see the whole class, not only the resident working set
+   * (QB-U19). idx_queue_class_age finds the class's rows (state, host); the order is a sort over them,
+   * so a call costs O(parked rows of the host). [] on the fallback and after close.
+   */
+  listParked(host: string, priority: QueuePriority): PersistedQueueItem[];
   /**
    * Label an UNLABELLED row (the queue's coalesce rule), so a restored item keeps the lane it adopted.
    * A row that already carries a lane, one this build knows or not, is left as it is.
@@ -302,6 +333,8 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 
 /** The `schema_meta` record for the lane step. */
 const LANE_STEP = { key: 'queue_items.lane', value: '1' } as const;
+/** The `schema_meta` record for the class-entry step (QB-U19). */
+const CLASS_ENTRY_STEP = { key: 'queue_items.class_entered_at', value: '1' } as const;
 
 /**
  * QB-U1: a nullable `lane` on every queue row, and the index the lane scheduler pages and counts
@@ -316,11 +349,19 @@ function applySchemaSteps(db: DatabaseSync, now: number): void {
     db.exec('ALTER TABLE queue_items ADD COLUMN lane TEXT');
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_queue_host_lane ON queue_items(state, host, lane, priority, enqueued_at)');
-  db.prepare(
+  // QB-U19: when the row entered its dispatch class (POOL-SELECT ages from it). Nullable: a row an older
+  // build writes leaves it NULL, and a NULL reads as the row's enqueued_at.
+  if (!columns.some((c) => c.name === 'class_entered_at')) {
+    db.exec('ALTER TABLE queue_items ADD COLUMN class_entered_at INTEGER');
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_queue_class_age ON queue_items(state, host, lane, priority, class_entered_at)');
+  const record = db.prepare(
     `INSERT INTO schema_meta (key, value, applied_at) VALUES (?, ?, ?)
      ON CONFLICT(key) DO UPDATE SET value = excluded.value, applied_at = excluded.applied_at
      WHERE CAST(schema_meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)`
-  ).run(LANE_STEP.key, LANE_STEP.value, now);
+  );
+  record.run(LANE_STEP.key, LANE_STEP.value, now);
+  record.run(CLASS_ENTRY_STEP.key, CLASS_ENTRY_STEP.value, now);
 }
 
 /**
@@ -383,6 +424,8 @@ interface ItemRow {
   last_error_class: string | null;
   /** Absent altogether when salvage reads a file written before the column existed. */
   lane?: unknown;
+  /** NULL when an older build wrote the row; absent when salvage reads a file without the column. */
+  class_entered_at?: number | null;
 }
 
 /**
@@ -428,6 +471,10 @@ function rowToItem(row: ItemRow, onUnknownLane: (value: string) => void): Persis
     ...(row.lease_until !== null ? { leaseUntil: row.lease_until } : {}),
     ...(row.last_error_class !== null ? { lastErrorClass: row.last_error_class } : {}),
     ...laneFromDisk(row.lane, onUnknownLane),
+    // NULL or absent (an older build's row) = the enqueue; carried only when the row changed class.
+    ...(typeof row.class_entered_at === 'number' && row.class_entered_at !== row.enqueued_at
+      ? { classEnteredAt: row.class_entered_at }
+      : {}),
   };
 }
 
@@ -523,8 +570,8 @@ function openSqliteStore(opts: OpenQueueStoreOptions, onUnknownLane: (value: str
   const stmt = {
     put: db.prepare(
       `INSERT INTO queue_items
-         (id, mfc_id, url, host, priority, status, session_id, attempts, max_retries, enqueued_at, state, lease_until, last_error_class, lane)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         (id, mfc_id, url, host, priority, status, session_id, attempts, max_retries, enqueued_at, state, lease_until, last_error_class, lane, class_entered_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
        ON CONFLICT DO NOTHING`
     ),
     lease: db.prepare(`UPDATE queue_items SET state = 'leased', lease_until = ? WHERE id = ?`),
@@ -554,7 +601,11 @@ function openSqliteStore(opts: OpenQueueStoreOptions, onUnknownLane: (value: str
     dropExpiredCooldowns: db.prepare('DELETE FROM host_cooldowns WHERE until <= ?'),
     hasKey: db.prepare('SELECT 1 AS hit FROM queue_items WHERE mfc_id = ? LIMIT 1'),
     selKey: db.prepare('SELECT * FROM queue_items WHERE mfc_id = ? ORDER BY enqueued_at ASC LIMIT 1'),
-    setPriority: db.prepare('UPDATE queue_items SET priority = ? WHERE id = ?'),
+    setPriority: db.prepare('UPDATE queue_items SET priority = ?, class_entered_at = COALESCE(?, class_entered_at) WHERE id = ?'),
+    listParked: db.prepare(
+      `SELECT * FROM queue_items WHERE state = 'parked' AND host = ? AND priority = ?
+       ORDER BY COALESCE(class_entered_at, enqueued_at) ASC, mfc_id ASC`
+    ),
     setLane: db.prepare('UPDATE queue_items SET lane = ? WHERE id = ? AND lane IS NULL'),
     countByHostLane: db.prepare('SELECT host, lane, COUNT(*) AS n FROM queue_items WHERE state = ? GROUP BY host, lane'),
     clearItems: db.prepare('DELETE FROM queue_items'),
@@ -670,19 +721,24 @@ function openSqliteStore(opts: OpenQueueStoreOptions, onUnknownLane: (value: str
   };
 
   const PRIORITY_RANK = "CASE priority WHEN 'HOT' THEN 0 WHEN 'WARM' THEN 1 ELSE 2 END";
-  const pageInStmt = (limit: number, skipHosts: readonly string[]): PersistedQueueItem[] => {
+  const pageInStmt = (limit: number, skipHosts: readonly string[], host: string | undefined, priorities: readonly QueuePriority[] | undefined): PersistedQueueItem[] => {
     // A host already at its in-memory cap is skipped IN SQL, so a capped host's backlog never
     // consumes the page-in budget only to be re-parked.
     const placeholders = skipHosts.map(() => '?').join(',');
-    const where = skipHosts.length
-      ? `state = 'parked' AND (host IS NULL OR host NOT IN (${placeholders}))`
-      : `state = 'parked'`;
+    const hostWhere =
+      host !== undefined
+        ? `state = 'parked' AND host = ?`
+        : skipHosts.length
+          ? `state = 'parked' AND (host IS NULL OR host NOT IN (${placeholders}))`
+          : `state = 'parked'`;
+    const where = priorities !== undefined ? `${hostWhere} AND priority IN (${priorities.map(() => '?').join(',')})` : hostWhere;
+    const params = [...(host !== undefined ? [host] : skipHosts), ...(priorities ?? [])];
     const rows = read(
       () =>
         db
           // Priority before age: a parked WARM row must not wait behind every older parked COLD one.
           .prepare(`SELECT * FROM queue_items WHERE ${where} ORDER BY ${PRIORITY_RANK}, enqueued_at ASC LIMIT ?`)
-          .all(...skipHosts, limit) as unknown as ItemRow[],
+          .all(...params, limit) as unknown as ItemRow[],
       [] as ItemRow[]
     );
     if (rows.length === 0) return [];
@@ -723,7 +779,8 @@ function openSqliteStore(opts: OpenQueueStoreOptions, onUnknownLane: (value: str
         item.state,
         item.leaseUntil ?? null,
         item.lastErrorClass ?? null,
-        item.lane ?? item.unknownLane ?? null
+        item.lane ?? item.unknownLane ?? null,
+        item.classEnteredAt ?? item.enqueuedAt
       ));
     },
 
@@ -743,9 +800,9 @@ function openSqliteStore(opts: OpenQueueStoreOptions, onUnknownLane: (value: str
       write(() => stmt.park.run(id));
     },
 
-    pageIn(limit: number, opts?: { skipHosts?: readonly string[] }): PersistedQueueItem[] {
+    pageIn(limit: number, opts?: PageInOptions): PersistedQueueItem[] {
       if (closed || limit <= 0) return [];
-      return pageInStmt(limit, opts?.skipHosts ?? []);
+      return pageInStmt(limit, opts?.skipHosts ?? [], opts?.host, opts?.priorities);
     },
 
     hasKey(mfcId: string): boolean {
@@ -760,12 +817,16 @@ function openSqliteStore(opts: OpenQueueStoreOptions, onUnknownLane: (value: str
       return { ...toItem(row), state: 'pending' as const, leaseUntil: undefined };
     },
 
-    setPriority(id: string, priority: QueuePriority): void {
-      write(() => stmt.setPriority.run(priority, id));
+    setPriority(id: string, priority: QueuePriority, classEnteredAt?: number): void {
+      write(() => stmt.setPriority.run(priority, classEnteredAt ?? null, id));
     },
 
     setLane(id: string, lane: QueueLane): void {
       write(() => stmt.setLane.run(lane, id));
+    },
+
+    listParked(host: string, priority: QueuePriority): PersistedQueueItem[] {
+      return read(() => (stmt.listParked.all(host, priority) as unknown as ItemRow[]).map(toItem), []);
     },
 
     countByHostLane(state: QueueItemState): HostLaneRow[] {
@@ -917,6 +978,7 @@ export function createMemoryQueueStore(
     claimKey: () => null,
     setPriority: () => {},
     setLane: () => {},
+    listParked: () => [],
     countByHostLane: () => [],
     releaseLeases: () => 0,
     reapExpiredLeases: () => [],
