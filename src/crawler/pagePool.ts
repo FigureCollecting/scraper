@@ -124,12 +124,14 @@ export function addDrift(raw: LedgerPagePool | undefined, ids: number, pageSize:
  * below a run now sit up to ceil(k / page size) pages higher: on the run's bottom `depth` pages when the
  * caller passes that ceiling. A page further up the run only took ids from visited pages. A run shorter than
  * `depth` goes whole (what spills past its top lands on an unvisited page, or on a run that is itself
- * exposed). `depth` 0 forgets nothing. Mutates `visited`.
+ * exposed). `depth` 0 forgets nothing. The drop stops at the run's top: `depth` comes from the ledger's
+ * carried drift, which a corrupt ledger can make any integer (1e300), and every run is already in `exposed`.
+ * Mutates `visited`.
  */
 export function dropExposedMarks(visited: Map<number, number>, cursor: number, depth: number): void {
   const exposed = [...visited.keys()].filter((page) => page > cursor && !visited.has(page - 1));
   for (const bottom of exposed) {
-    for (let page = bottom; page < bottom + depth; page++) visited.delete(page);
+    for (let page = bottom; page < bottom + depth && visited.has(page); page++) visited.delete(page);
   }
 }
 
