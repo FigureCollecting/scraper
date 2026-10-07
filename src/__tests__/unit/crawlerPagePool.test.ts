@@ -781,6 +781,13 @@ describe('drift from a pass whose backfill never saved is carried to the next pa
     expect(sorted(c.backfillGets())).toEqual([22, 27]);
   });
 
+  it('a recent read that meets no new ids leaves the pool state as it was (no zero drift written)', async () => {
+    const s = setup();
+    const before = structuredClone(s.ledgers.files.get('orzgk')!.recent.pagePool);
+    await runPass(mkCfg({ ...POOLED, phases: ['recent'] }), s.engine, s.ledgers, T0, 11);
+    expect(s.ledgers.files.get('orzgk')!.recent.pagePool).toEqual(before);
+  });
+
   it('an unpooled store writes no page pool state in a pass whose backfill never ran', async () => {
     const s = setup();
     delete s.ledgers.files.get('orzgk')!.recent.pagePool;
