@@ -312,6 +312,63 @@ describe('sendOnHostClock', () => {
     });
   });
 
+  describe("the caller's own budget (closeout round 1: /lookup's 15 s / 35 s budget against the catalog's 60 s)", () => {
+    const ANITOYS = 'anitoys.example';
+    const clock = () => clockOn('all', { blockingBudgetMs: 60_000 }, { [ANITOYS]: 20_000 });
+
+    it('a host the caller cannot wait for and keep its minimum fetch is RECORDED: sent at once with the whole budget, the queue then waits a full floor', async () => {
+      const c = clock();
+      const tl = timeline(1_000_000);
+      c.tryAcquire(ANITOYS, 1_000_000, 20_000);
+      c.settle(ANITOYS, 1_000_000, 20_000);
+      tl.set(1_000_500);
+      const invoke = jest.fn(async (timeoutMs: number | undefined) => timeoutMs);
+      // 15 s budget, 15 s minimum fetch: 15000 - 3000 - 15000 < 20000, so /lookup does not wait here.
+      const result = await sendOnHostClock({ host: ANITOYS, caller: 'lookup', budgetMs: 15_000, minFetchMs: 15_000 }, invoke, tl.deps(c));
+      expect(result).toEqual({ sent: true, value: 15_000, waitedMs: 0 });
+      expect(tl.sleeps).toEqual([]);
+      expect(c.tryAcquire(ANITOYS, 1_020_499, 20_000)).toBe(1);
+      expect(c.tryAcquire(ANITOYS, 1_020_500, 20_000)).toBe(0);
+      expect(c.view(1_020_500).hosts[0].sends60m.lookup).toBe(1);
+    });
+
+    it('the same host with a budget that keeps the minimum fetch after the cap is clocked: it waits, and the fetch gets the budget minus the wait', async () => {
+      const c = clock();
+      const tl = timeline(1_000_000);
+      c.tryAcquire(ANITOYS, 1_000_000, 20_000);
+      c.settle(ANITOYS, 1_000_000, 20_000);
+      tl.set(1_000_500);
+      // 45000 - 3000 - 15000 = 27000 >= 20000: clocked.
+      const result = await sendOnHostClock({ host: ANITOYS, caller: 'lookup', budgetMs: 45_000, minFetchMs: 15_000 }, async t => t, tl.deps(c));
+      expect(result).toEqual({ sent: true, value: 45_000 - 19_500, waitedMs: 19_500 });
+    });
+
+    it("without a minimum fetch of its own a caller keeps the clock's (SCRAPE_CATALOG_MIN_FETCH_MS): its budget alone decides", async () => {
+      const c = clockOn('all', { blockingBudgetMs: 60_000, minFetchMs: 30_000 }, { [ANITOYS]: 20_000 });
+      const tl = timeline(0);
+      c.tryAcquire(ANITOYS, 0, 20_000);
+      // 35000 - 3000 - 30000 = 2000 < 20000: recorded, at once.
+      const result = await sendOnHostClock({ host: ANITOYS, caller: 'catalogListing', budgetMs: 35_000 }, async t => t, tl.deps(c));
+      expect(result).toEqual({ sent: true, value: 35_000, waitedMs: 0 });
+    });
+
+    it('a send whose wait would leave the fetch no time at all is refused at the gate, never invoked with a timeout <= 0', async () => {
+      // slack 0 and min fetch 0: the cap (floor) equals the budget, so a full-floor wait leaves 0 ms.
+      const c = clockOn(MFC, { waitSlackMs: 0, minFetchMs: 0, blockingBudgetMs: 60_000 });
+      const tl = timeline(0);
+      c.tryAcquire(MFC, 0, FLOOR);
+      c.settle(MFC, 0, FLOOR);
+      const invoke = jest.fn(async (t: number | undefined) => t);
+      const result = await sendOnHostClock({ host: MFC, caller: 'lookup', budgetMs: FLOOR, minFetchMs: 0 }, invoke, tl.deps(c));
+      expect(result).toEqual({ sent: false, refused: true, waitMs: FLOOR });
+      expect(invoke).not.toHaveBeenCalled();
+      expect(c.view(FLOOR).hosts[0].clockRefusals60m.lookup).toBe(1);
+      // One ms more budget: sent with 1 ms (behind the refused send's booking, a floor later).
+      const sent = await sendOnHostClock({ host: MFC, caller: 'lookup', budgetMs: FLOOR + 1, minFetchMs: 0 }, invoke, tl.deps(c));
+      expect(sent).toEqual({ sent: true, value: 1, waitedMs: FLOOR });
+    });
+  });
+
   it("notes the caller's whole latency (wait + fetch) for the listing and /lookup percentiles, success or failure", async () => {
     const clock = clockOn('all', {}, { [MFC]: FLOOR, 'shop.example': 1000 });
     const tl = timeline(0);
@@ -351,6 +408,34 @@ describe('processHostClockPacer (a transport that sends more than one request pe
   it('send() on an unparseable url just invokes', async () => {
     setHostClock(clockOn());
     await expect(processHostClockPacer().send('not a url', 'sessionPrime', async () => 'y')).resolves.toBe('y');
+  });
+
+  it('holds(url) answers whether the clock covers the url\'s host; holds() whether it covers any host', () => {
+    setHostClock(clockOn(MFC));
+    const pacer = processHostClockPacer();
+    expect(pacer.holds(`https://www.${MFC}/item/1`)).toBe(true);
+    expect(pacer.holds('https://hpoi.net/x')).toBe(false);
+    expect(pacer.holds('not a url')).toBe(false);
+    expect(pacer.holds()).toBe(true);
+    setHostClock(clockOn('all,-hpoi.net'));
+    expect(pacer.holds('https://hpoi.net/x')).toBe(false);
+    expect(pacer.holds('https://late.example/x')).toBe(true);
+    expect(pacer.holds()).toBe(true);
+    setHostClock(clockOn('off'));
+    expect(pacer.holds(`https://${MFC}/`)).toBe(false);
+    expect(pacer.holds()).toBe(false);
+  });
+
+  it('observe() feeds the observer at its instant, waiting and booking nothing', () => {
+    const clock = clockOn('off');
+    setHostClock(clock);
+    const pacer = processHostClockPacer({ now: () => 4000 });
+    pacer.observe(`https://${MFC}/item/1`, 'pluginRoute');
+    pacer.observe('not a url', 'pluginRoute');
+    const [mfc] = clock.view(4000).hosts;
+    expect(mfc.sends60m.pluginRoute).toBe(1);
+    expect(mfc.lastSendAt).toBe(new Date(4000).toISOString());
+    expect(clock.tryAcquire(MFC, 4000, FLOOR)).toBe(0);
   });
 
   it('first() raises the last send to the instant the first request of a call really leaves', () => {

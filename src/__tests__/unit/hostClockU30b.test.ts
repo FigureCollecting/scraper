@@ -168,6 +168,18 @@ describe('dispatch jitter (QB-U30b (a))', () => {
     expect(rng).not.toHaveBeenCalled();
   });
 
+  it('the default stream is kept per host: two sends draw two consecutive values of it, not its first value twice', () => {
+    const seed = 20_261_007;
+    const clock = clockWith(MFC, { jitterMs: () => 2000, seed });
+    const stream = deriveStream(seed, MFC, 'jitter');
+    const [d1, d2] = [Math.floor(stream() * 2000), Math.floor(stream() * 2000)];
+    expect(d1).not.toBe(d2);
+    clock.settle(MFC, 0, FLOOR);
+    expect(clock.nextSlot(MFC, 0, FLOOR)).toBe(FLOOR + d1);
+    clock.settle(MFC, FLOOR + d1, FLOOR);
+    expect(clock.nextSlot(MFC, 0, FLOOR)).toBe(2 * FLOOR + d1 + d2);
+  });
+
   it("defaults to one mulberry32 stream per host, derived from the seed with (host, 'jitter')", () => {
     const seed = 123_456;
     const a = clockWith(MFC, { jitterMs: () => 2000, seed });
@@ -255,6 +267,18 @@ describe('record (a send that did not pass the gate) and markSent (the after-inv
     expect(clock.view(2000).hosts[0].sends60m).toEqual(callers({ lookup: 1 }));
   });
 
+  it('RECORD RULE with jitter (closeout round 1): a send recorded within J of the last one never pulls the next allowed time earlier', () => {
+    const host = 'sugotoys.example';
+    const clock = clockWith('all', { jitterMs: () => 2000, jitterRng: () => script(0.9995, 0) }, { [host]: 45_000 });
+    expect(clock.tryAcquire(host, 0, 45_000)).toBe(0);
+    clock.settle(host, 0, 45_000); // the queue's send at 0 draws 1999: next allowed 46999
+    expect(clock.nextSlot(host, 0, 45_000)).toBe(46_999);
+    clock.record(host, 1, 'lookup'); // a /lookup recorded 1 ms later draws 0: 45001 would be earlier
+    expect(clock.nextSlot(host, 0, 45_000)).toBe(46_999);
+    clock.record(host, 3000, 'lookup'); // later than that: 48000, the later of the two
+    expect(clock.nextSlot(host, 0, 45_000)).toBe(48_000);
+  });
+
   it("record spaces the queue's next record a full floor after it (the store's floor from the floor source)", () => {
     const clock = clockWith('all', {}, { 'sugotoys.example': 45_000 });
     clock.record('sugotoys.example', 1000, 'lookup');
@@ -312,6 +336,29 @@ describe('the blocking-caller role, wait cap and ceiling (design.host_clock.wait
     expect(scoped.blockingRole('anitoys.example')).toBe('off');
   });
 
+  it("a caller's own budget and minimum fetch set its ceiling (closeout round 1: /lookup at 15 s and 35 s)", () => {
+    const c = clock();
+    expect(c.ceilingMs(35_000, 15_000)).toBe(17_000);
+    expect(c.ceilingMs(15_000, 15_000)).toBe(-3000);
+    expect(c.ceilingMs(35_000)).toBe(2000);
+    expect(c.blockingRole('anitoys.example', 35_000, 15_000)).toBe('recorded');
+    expect(c.blockingRole('edge.example', 45_000, 15_000)).toBe('clocked');
+    expect(c.blockingRole(MFC, 35_000, 15_000)).toBe('clocked');
+    expect(c.blockingRole(MFC, 15_000, 15_000)).toBe('recorded');
+    // 9000 + 3000 + 15000 = 27000: the boundary is clocked.
+    expect(c.blockingRole(MFC, 27_000, 15_000)).toBe('clocked');
+    expect(c.blockingRole(MFC, 26_999, 15_000)).toBe('recorded');
+    expect(c.blockingRole('cdn.example', 35_000, 15_000)).toBe('off');
+  });
+
+  it('isOn: whether the configured scope names any host', () => {
+    expect(clockWith('off').isOn()).toBe(false);
+    expect(clockWith('').isOn()).toBe(false);
+    expect(clockWith(MFC).isOn()).toBe(true);
+    expect(clockWith('all').isOn()).toBe(true);
+    expect(clockWith('all,-hpoi.net').isOn()).toBe(true);
+  });
+
   it('the jitter counts toward the ceiling', () => {
     const c = clockWith('all', { jitterMs: () => 1, blockingBudgetMs: 60_000, waitSlackMs: 3000, minFetchMs: 30_000 }, { 'edge.example': 27_000 });
     expect(c.blockingRole('edge.example')).toBe('recorded');
@@ -329,6 +376,17 @@ describe('the blocking-caller role, wait cap and ceiling (design.host_clock.wait
       `[HOST-CLOCK] jitter SCRAPE_DISPATCH_JITTER_MS: ${MFC} 0-1999 ms; process seed 42, one stream per (host, 'jitter')`,
       '[HOST-CLOCK] blocking callers wait at most floor + jitter + 3000 ms; hosts above the 27000 ms ceiling are recorded only: over.example (floor 27001 ms), sugotoys.example (floor 45000 ms)',
     ]);
+  });
+
+  it("bootLines name /lookup's own ceiling and the store hosts it records only, when given its budget", () => {
+    const c = clockWith('all', { blockingBudgetMs: 60_000 }, floors);
+    expect(c.bootLines([MFC, 'anitoys.example', 'sugotoys.example'], { budgetMs: 35_000, minFetchMs: 15_000 })[2]).toBe(
+      '[HOST-CLOCK] /lookup (budget 35000 ms, min fetch 15000 ms) waits only where floor + jitter <= 17000 ms; recorded only: anitoys.example (floor 20000 ms), sugotoys.example (floor 45000 ms)',
+    );
+    expect(c.bootLines([MFC], { budgetMs: 35_000, minFetchMs: 15_000 })[2]).toBe(
+      '[HOST-CLOCK] /lookup (budget 35000 ms, min fetch 15000 ms) waits only where floor + jitter <= 17000 ms; recorded only: none',
+    );
+    expect(c.bootLines([MFC])).toHaveLength(2);
   });
 
   it('bootLines when nothing is jittered or excluded', () => {
@@ -477,6 +535,33 @@ describe('the process clock and the process seed', () => {
     clock.setFloorSource(host => (host === MFC ? FLOOR : undefined));
     expect(clock.capMsFor(MFC)).toBe(10_000);
     expect(clock.ceilingMs()).toBe(27_000);
+  });
+
+  it('a slack or min fetch of 0 is used as 0, a blank value is the default (closeout round 1)', () => {
+    process.env.SCRAPE_HOST_CLOCK = 'all';
+    process.env.SCRAPE_CATALOG_CLOCK_WAIT_SLACK_MS = '0';
+    process.env.SCRAPE_CATALOG_MIN_FETCH_MS = '0';
+    process.env.CATALOG_STORE_TIMEOUT_MS = '60000';
+    const zero = getHostClock();
+    zero.setFloorSource(host => (host === MFC ? FLOOR : undefined));
+    expect(zero.capMsFor(MFC)).toBe(FLOOR);
+    expect(zero.ceilingMs()).toBe(60_000);
+    setHostClock(null);
+    process.env.SCRAPE_CATALOG_CLOCK_WAIT_SLACK_MS = '';
+    process.env.SCRAPE_CATALOG_MIN_FETCH_MS = '   ';
+    const blank = getHostClock();
+    blank.setFloorSource(host => (host === MFC ? FLOOR : undefined));
+    expect(blank.capMsFor(MFC)).toBe(FLOOR + 3000);
+    expect(blank.ceilingMs()).toBe(27_000);
+  });
+
+  it("SCRAPE_DISPATCH_JITTER_MS='0' (or 'off', or blank) is no jitter anywhere, with no WARN", () => {
+    for (const raw of ['0', ' 0 ', 'off', 'OFF', '', '  ']) {
+      expect(parseJitterMs(raw)).toEqual({ byHost: new Map(), warnings: [] });
+    }
+    process.env.SCRAPE_HOST_CLOCK = 'all';
+    process.env.SCRAPE_DISPATCH_JITTER_MS = '0';
+    expect(getHostClock().warnings()).toEqual([]);
   });
 
   it('with CATALOG_STORE_TIMEOUT_MS unset the budget is the catalog default (30 s), so every host is recorded only', () => {

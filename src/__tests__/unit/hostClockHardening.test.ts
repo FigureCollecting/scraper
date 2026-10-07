@@ -7,7 +7,6 @@ import { HostClock, parseHostClockScope } from '../../services/hostClock';
 import { HostRateLimiter } from '../../driver/hostRateLimiter';
 import { paceImageBytesByHost } from '../../services/images/imageBytesPacing';
 import type { ImageBytesResult } from '../../services/images/imageBytes';
-import * as lookupModule from '../../driver/assembleLookup';
 import { assembleLookup } from '../../driver/assembleLookup';
 import { ProfileRegistry } from '../../driver/profileRegistry';
 import type { ExtractionRuleset, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
@@ -64,11 +63,17 @@ it("the image lane's WAIT RULE: a valid slot whose gate the queue's late send pu
 });
 
 describe('/lookup on a clocked host: the fetch gets the store timeout minus the clock wait', () => {
+  const saved = { ...process.env };
   beforeEach(() => {
     jest.useFakeTimers();
     jest.setSystemTime(1_000_000);
+    // The deployed /lookup budget: it waits for a 7000 ms floor and keeps its 15 s minimum fetch.
+    process.env.LOOKUP_STORE_TIMEOUT_MS = '35000';
   });
-  afterEach(() => jest.useRealTimers());
+  afterEach(() => {
+    jest.useRealTimers();
+    process.env = { ...saved };
+  });
 
   it('waits the slot, then gives the fetch the store timeout minus the wait', async () => {
     const shop: StoreCapabilities = {
@@ -99,7 +104,7 @@ describe('/lookup on a clocked host: the fetch gets the store timeout minus the 
       void pending.then(() => { settled = true; });
       await jest.advanceTimersByTimeAsync(FLOOR);
       expect(sentAt).toEqual([1_000_000 + FLOOR]);
-      const budgetLeft = lookupModule.resolveLookupStoreTimeoutMs(process.env) - FLOOR;
+      const budgetLeft = 35_000 - FLOOR;
       await jest.advanceTimersByTimeAsync(budgetLeft - 1);
       expect(settled).toBe(false);
       await jest.advanceTimersByTimeAsync(1);

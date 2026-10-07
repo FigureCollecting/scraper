@@ -32,7 +32,7 @@ describe.each([['clock', CLOCK], ['pool', POOL]] as const)('parseHostSelect (%s 
     expect(hostSelected(select, 'off')).toBe(false);
   });
 
-  it.each(['all', 'ALL', ' all ', 'all,', ', all ,'])('reads %p as every host', raw => {
+  it.each(['all', 'ALL', ' all '])('reads %p as every host', raw => {
     const select = parseHostSelect(raw, grammar);
     expect(select.mode).toBe('all');
     expect(hostSelected(select, MFC)).toBe(true);
@@ -80,6 +80,34 @@ describe.each([['clock', CLOCK], ['pool', POOL]] as const)('parseHostSelect (%s 
 
   it('hostSelected on a malformed or off value is false for every host', () => {
     expect(hostSelected({ mode: 'off', hosts: [MFC], excluded: [], warnings: [], malformed: false }, MFC)).toBe(false);
+  });
+});
+
+describe("'all' with blank tokens around it is not 'all' alone (closeout round 1: fail safe, as QB-U30a and QB-U19 read it)", () => {
+  it.each(['all,', ',all', 'all, ', 'all,,', ', all ,'])('the clock reads %p as a list holding only the keyword: off, one WARN', raw => {
+    const select = parseHostSelect(raw, CLOCK);
+    expect(select).toEqual({
+      mode: 'off',
+      hosts: [],
+      excluded: [],
+      warnings: ['[HOST-CLOCK] WARN SCRAPE_HOST_CLOCK entry "all" is a keyword, not a host, inside a host list; ignored'],
+      malformed: false,
+    });
+    expect(hostSelected(select, MFC)).toBe(false);
+  });
+
+  it.each(['all,', ',all', 'all,,'])('the pool knob reads %p as malformed: off', raw => {
+    expect(parseHostSelect(raw, POOL)).toEqual({
+      mode: 'off',
+      hosts: [],
+      excluded: [],
+      warnings: [`[POOL] WARN SCRAPE_POOL_SELECT="${raw}" is malformed (entry "all" is a keyword, not a host, inside a host list); treated as off`],
+      malformed: true,
+    });
+  });
+
+  it("blank tokens inside an exclusion list stay skipped: 'all,-x.com,' excludes x.com", () => {
+    expect(parseHostSelect('all,-x.com,', CLOCK)).toMatchObject({ mode: 'all-except', excluded: ['x.com'], malformed: false });
   });
 });
 

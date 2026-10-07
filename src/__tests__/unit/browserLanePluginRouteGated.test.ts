@@ -1,8 +1,8 @@
 /**
- * The plugin service's clock-paced page (QB-U30b caller 'pluginRoute') on the GATED lane: the page
- * the navigation runs on is a Proxy of the real tab, and the gated runner still reads the challenge
- * outcome off the real tab, so the first-navigation retry (the 2026-09-11 fix) works for plugin
- * routes too. Puppeteer is mocked; fixture host only.
+ * The plugin service on the host clock (QB-U30b caller 'pluginRoute') on the GATED lane: each tab's
+ * page-level requests pass the clock at the request (interception on the tab), and the gated runner
+ * still reads the challenge outcome off the tab, so the first-navigation retry (the 2026-09-11 fix)
+ * works for plugin routes too. Puppeteer is mocked; fixture host only.
  */
 import { jest } from '@jest/globals';
 import puppeteer from 'puppeteer';
@@ -11,38 +11,34 @@ import { BrowserPool } from '../../services/genericScraper';
 import { createScrapingService } from '../../services/engineServices/scrapingService';
 import { clearChallengeGates } from '../../services/browserChallenge';
 import { resetHostConcurrency } from '../../services/gatedBrowsers';
-import type { HostClockPacer } from '../../services/hostClockSend';
+import type { PageRequestPacer } from '../../services/hostClockSend';
+import { requestModelPage } from '../helpers/requestModelPage';
 
 const PROXY = 'socks5://127.0.0.1:1055';
 const GATED = 'https://gated.example.test/item/1';
 
 describe('plugin service on the gated lane', () => {
   const savedMode = process.env.BROWSER_LAUNCH_MODE;
-  let gotos: string[];
+  let models: Array<ReturnType<typeof requestModelPage>>;
 
-  const newMockPage = (stuck: boolean): jest.Mocked<Page> =>
-    ({
-      goto: jest.fn<(...a: any[]) => any>().mockImplementation(async (url: any) => {
-        gotos.push(String(url));
-        return {
-          status: () => 200,
-          url: () => String(url),
-          headers: () => (stuck ? { 'content-type': 'text/html', 'cf-mitigated': 'challenge' } : { 'content-type': 'text/html' }),
-        };
+  /** A tab that models request issue and interception; the first one stays on the interstitial. */
+  const newMockPage = (stuck: boolean): jest.Mocked<Page> => {
+    const model = requestModelPage({
+      respond: url => ({
+        status: () => 200,
+        url: () => url,
+        headers: () => (stuck ? { 'content-type': 'text/html', 'cf-mitigated': 'challenge' } : { 'content-type': 'text/html' }),
       }),
-      title: jest.fn<(...a: any[]) => any>().mockResolvedValue(stuck ? 'Just a moment...' : 'Lucy'),
-      content: jest.fn<(...a: any[]) => any>().mockResolvedValue(stuck ? '<html>interstitial</html>' : '<html>store</html>'),
-      evaluate: jest.fn<(...a: any[]) => any>().mockResolvedValue('body'),
-      emulateTimezone: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
-      setViewport: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
-      setUserAgent: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
-      setExtraHTTPHeaders: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
-      setCookie: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
-      close: jest.fn<(...a: any[]) => any>().mockResolvedValue(undefined),
-      on: jest.fn(),
-      off: jest.fn(),
-      mainFrame: jest.fn(() => ({ id: 'main' })),
-    }) as unknown as jest.Mocked<Page>;
+      extra: {
+        title: jest.fn<(...a: any[]) => any>().mockResolvedValue(stuck ? 'Just a moment...' : 'Lucy'),
+        content: jest.fn<(...a: any[]) => any>().mockResolvedValue(stuck ? '<html>interstitial</html>' : '<html>store</html>'),
+        evaluate: jest.fn<(...a: any[]) => any>().mockResolvedValue('body'),
+      },
+    });
+    models.push(model);
+    return model.page;
+  };
+  const gotos = () => models.flatMap(m => m.wire.map(w => w.url));
 
   beforeEach(async () => {
     jest.clearAllMocks();
@@ -51,7 +47,7 @@ describe('plugin service on the gated lane', () => {
     clearChallengeGates();
     resetHostConcurrency();
     process.env.BROWSER_LAUNCH_MODE = 'clean-headful';
-    gotos = [];
+    models = [];
     let opened = 0;
     jest.mocked(puppeteer.launch).mockImplementation(async () => ({
       // The first tab stays on the interstitial; the retry's tab clears.
@@ -75,12 +71,14 @@ describe('plugin service on the gated lane', () => {
 
   it('retries the first navigation once through the paced page, each navigation passing the clock', async () => {
     const events: string[] = [];
-    const pacer: HostClockPacer = {
+    const pacer: PageRequestPacer = {
       first: url => { events.push(`first ${url}`); },
       send: async (url, caller, invoke) => {
         events.push(`send ${caller} ${url}`);
         return invoke();
       },
+      holds: () => true,
+      observe: (url, caller) => { events.push(`observe ${caller} ${url}`); },
     };
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
     jest.useFakeTimers();
@@ -89,7 +87,8 @@ describe('plugin service on the gated lane', () => {
       const fetching = service.browserFetch(GATED, { challengeGated: true, proxyServer: PROXY });
       await jest.advanceTimersByTimeAsync(40_000);
       expect(await fetching).toBe('<html>store</html>');
-      expect(gotos).toEqual([GATED, GATED]);
+      expect(gotos()).toEqual([GATED, GATED]);
+      expect(models.map(m => m.interception)).toEqual([[true], [true]]);
       expect(events).toEqual([`send pluginRoute ${GATED}`, `send pluginRoute ${GATED}`]);
       expect(BrowserPool.gatedLaneStats('residential').firstNavigationRetries).toBe(1);
     } finally {

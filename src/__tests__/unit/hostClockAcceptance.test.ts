@@ -341,6 +341,12 @@ describe('QB-U30b: every caller on one per-host clock, spacing measured at the t
     const all = gaps(wire.map(w => w.at));
     expect(Math.min(...all)).toBeGreaterThanOrEqual(7000);
     expect(Math.max(...all)).toBeLessThan(9000);
+    // Random, not a fixed offset (closeout round 1): the gaps spread over the jitter range. A uniform
+    // draw over [0, 2000) has a standard deviation of ~577 ms; a constant offset has 0 and one value.
+    expect(new Set(all).size).toBeGreaterThanOrEqual(50);
+    const mean = all.reduce((a, b) => a + b, 0) / all.length;
+    const sd = Math.sqrt(all.reduce((a, b) => a + (b - mean) ** 2, 0) / all.length);
+    expect(sd).toBeGreaterThan(400);
     const [mfc] = r.clock.view(Date.now()).hosts;
     expect(mfc.constrainedGaps60m).toBeGreaterThan(100);
     expect(Math.abs(mfc.meanConstrainedGapMs60m - 8000)).toBeLessThanOrEqual(400);
@@ -379,7 +385,65 @@ describe('QB-U30b: every caller on one per-host clock, spacing measured at the t
     const times = r.wire.filter(w => new URL(w.url).hostname === 'shop.example');
     expect(times.map(w => w.caller)).toEqual(['queue', 'lookup']);
     expect(times[1].at - times[0].at).toBe(FLOOR);
-    expect(r.clock.view(Date.now()).hosts[0].sends60m.lookup).toBe(1);
+    const [shopView] = r.clock.view(Date.now()).hosts;
+    expect(shopView.sends60m.lookup).toBe(1);
+    // AC-R2: the lookup's wait + fetch feeds the /lookup p95, never the listing p99 (AC-R1).
+    expect(shopView.lookupP95Ms60m).toBe(times[1].at - (START + 500));
+    expect(shopView.lookupP95Ms60m).toBeGreaterThan(0);
+    expect(shopView.listingFetchP99Ms60m).toBe(0);
+  });
+
+  it('AC-R1 is the /catalog LISTING fetches only: seed and rotating fetches that waited leave the listing p99 at 0', async () => {
+    const r = rig();
+    r.q.enqueue('m1', { priority: 'WARM', url: `https://${MFC}/item/1` });
+    await advance(500);
+    await drive(r.catalog.seed('mfc', 'top'), 20_000);
+    await drive(r.catalog.rotatingSeed('mfc', 'co-1'), 20_000);
+    const waited = r.wire.filter(w => w.caller === 'catalogSeed' || w.caller === 'catalogRotating');
+    expect(waited).toHaveLength(2);
+    let [mfc] = r.clock.view(Date.now()).hosts;
+    expect(mfc.constrainedGaps60m).toBe(2);
+    expect(mfc.listingFetchP99Ms60m).toBe(0);
+    expect(mfc.lookupP95Ms60m).toBe(0);
+    const before = Date.now();
+    await drive(r.catalog.catalog('mfc', 1), 20_000);
+    const listing = r.wire.find(w => w.caller === 'catalogListing')!;
+    [mfc] = r.clock.view(Date.now()).hosts;
+    expect(mfc.listingFetchP99Ms60m).toBe(listing.at - before);
+    expect(mfc.listingFetchP99Ms60m).toBeGreaterThan(0);
+  });
+
+  it("/lookup's budget is its own (closeout round 1): an anitoys-like bySearch host (floor 20000) that LOOKUP_STORE_TIMEOUT_MS 35000 cannot wait for and keep the 15 s minimum fetch is RECORDED, fetched at once with the whole 35 s", async () => {
+    const anitoys = store('anitoys', 'anitoys.example', 20_000, { bySearch: { urlTemplate: 'https://anitoys.example/search?q={q}' } });
+    const r = rig({ scope: 'all', stores: [anitoys] });
+    r.q.enqueue('a1', { priority: 'WARM', url: 'https://anitoys.example/item/1' });
+    await advance(500);
+    const timeouts: number[] = [];
+    const withTimeout = lookupModule.withTimeout;
+    const spy = jest.spyOn(lookupModule, 'withTimeout').mockImplementation((work, ms, what) => {
+      timeouts.push(ms);
+      return withTimeout(work, ms, what);
+    });
+    try {
+      const out = await drive(r.lookup.lookup('figure'), 1000);
+      expect(out.results).toHaveLength(1);
+      expect(out.failed).toEqual([]);
+      expect(out.cooldown).toEqual([]);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(timeouts).toEqual([35_000]);
+    r.q.enqueue('a2', { priority: 'WARM', url: 'https://anitoys.example/item/2' });
+    await advance(30_000);
+    const times = r.wire.filter(w => new URL(w.url).hostname === 'anitoys.example');
+    expect(times.map(w => w.caller)).toEqual(['queue', 'lookup', 'queue']);
+    expect(times[1].at - times[0].at).toBe(500);
+    // ... and the queue's next record waited a full floor after the recorded lookup.
+    expect(times[2].at - times[1].at).toBe(20_000);
+    const [host] = r.clock.view(Date.now()).hosts;
+    expect(host.clockRefusals60m.lookup).toBe(0);
+    // Named at boot: /lookup records this host rather than wait for it.
+    expect(r.clock.bootLines(['anitoys.example'], { budgetMs: 35_000, minFetchMs: lookupModule.LOOKUP_MIN_FETCH_MS })[2]).toContain('recorded only: anitoys.example (floor 20000 ms)');
   });
 
   it('an anitoys-like host (floor 20000, J 0) with a busy queue: every listing page of the pass, zero refusals, wait + fetch timeout <= 60000 on every call', async () => {

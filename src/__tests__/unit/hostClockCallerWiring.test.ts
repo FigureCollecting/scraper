@@ -70,7 +70,10 @@ function services(clock: HostClock, fetch: jest.Mock, cooldown = new ChallengeCo
 
 describe('refusal = the caller\'s existing non-page outcome, no request', () => {
   const saved = { ...process.env };
-  beforeEach(() => { process.env.CATALOG_STORE_TIMEOUT_MS = '60000'; });
+  beforeEach(() => {
+    process.env.CATALOG_STORE_TIMEOUT_MS = '60000';
+    process.env.LOOKUP_STORE_TIMEOUT_MS = '35000';
+  });
   afterEach(() => { process.env = { ...saved }; setHostClock(null); });
 
   it('/catalog listing, seed and rotating answer cooldown (the crawler stops the store for the pass), counted per caller', async () => {
@@ -148,6 +151,7 @@ describe('a challenge cooldown that opens while a caller waits for its slot veto
     jest.useFakeTimers();
     jest.setSystemTime(1_000_000);
     process.env.CATALOG_STORE_TIMEOUT_MS = '60000';
+    process.env.LOOKUP_STORE_TIMEOUT_MS = '35000';
   });
   afterEach(() => {
     jest.useRealTimers();
