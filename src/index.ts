@@ -13,6 +13,7 @@ import { createHealthRoutes } from './routes/health.js';
 import { getChallengeCooldown } from './services/challengeCooldown.js';
 import { getCfCookieStore } from './services/cookieJar.js';
 import { getHostClock, startHostClockSummary } from './services/hostClock.js';
+import { getMaxPagesGuard } from './services/maxPagesGuard.js';
 import { announcePoolDispatch, getPoolDispatch } from './services/poolDispatch.js';
 import { LOOKUP_MIN_FETCH_MS, resolveLookupStoreTimeoutMs } from './driver/assembleLookup.js';
 import { residentialEgressView } from './services/residentialEgress.js';
@@ -76,6 +77,8 @@ app.use('/', createHealthRoutes({
   listPlugins: () => pluginsView(pluginBootstrap),
   // The shared host clock's send-time observer (QB-U30a): reads the same with the clock off.
   getHostClock: () => getHostClock().view(Date.now()),
+  // The engine's maxPages guard (QB-U24): the /catalog pages it answered without a store fetch.
+  getMaxPagesGuard: () => getMaxPagesGuard().view(Date.now()),
   // The queue's POOL-SELECT dispatch per host (QB-U19): zeros while SCRAPE_POOL_SELECT is off.
   getPool: () => getScrapeQueue().getPoolView(Date.now()),
 }));
@@ -156,7 +159,11 @@ async function startServer(): Promise<void> {
     })));
     // GET /catalog — one page of a store's newest-first catalog listing (the crawler's enumeration
     // feed). Same registry and transports as /lookup: the browser lane rides the same pooled,
-    // capture-sink-backed ScrapingService.
+    // capture-sink-backed ScrapingService. The maxPages guard (SCRAPE_CATALOG_MAX_PAGES_GUARD, default
+    // off) names its scope at boot, with a WARN per listed entry it ignores.
+    const pagesGuard = getMaxPagesGuard();
+    for (const warning of pagesGuard.warnings()) console.warn(warning);
+    console.log(pagesGuard.describe());
     app.use('/', createCatalogRoute(createEngineCatalog(registry, {
       browser: (url, opts) => lookupScraping.browserFetch(url, opts),
     })));

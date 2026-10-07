@@ -31,6 +31,7 @@ import { getCfCookieStore, markStaleIfStored, markFreshIfStored } from '../servi
 import { observeGate, gateOutcomeOf, gateFailureReason } from '../services/gateSignal.js';
 import type { ListingPage, RetrievalCapability, RotatingSeedList, SearchFetch, SeedList } from '@figurecollecting/scraper-plugin-contract';
 import type { FetchBodyOutcome } from '../services/engineServices/capturingFetch.js';
+import { declaredLastPage, getMaxPagesGuard, type MaxPagesGuard } from '../services/maxPagesGuard.js';
 import { sendOnHostClock, type ClockedSendResult } from '../services/hostClockSend.js';
 import type { HostClockCaller } from '../services/hostClock.js';
 import { resolveCatalogStoreTimeoutMs } from './catalogStoreTimeout.js';
@@ -42,7 +43,13 @@ export { resolveCatalogStoreTimeoutMs } from './catalogStoreTimeout.js';
  * (`fetchSearchDetail`). Every catalog axis reads it when present: the gate needs the status, and
  * the declared-page axes tell a store's 4xx (spend the slot) from its 5xx (retry) with it.
  */
-export type CatalogServices = LookupServices;
+export type CatalogServices = LookupServices & {
+  /**
+   * The maxPages guard (SCRAPE_CATALOG_MAX_PAGES_GUARD, QB-U24). Optional — defaults to the process-wide
+   * guard, read from the env once; tests inject one.
+   */
+  maxPagesGuard?: MaxPagesGuard;
+};
 
 /** A listed item as /catalog returns it: the contract's listing item plus the engine-derived `collectUrl`. */
 export type CatalogItem = ListingPage['items'][number] & { collectUrl?: string };
@@ -261,6 +268,7 @@ export function assembleCatalog(services: CatalogServices): Catalog {
   const timeoutMs = resolveCatalogStoreTimeoutMs(process.env);
   const cd = services.challengeCooldown ?? getChallengeCooldown();
   const cfStore = services.cfCookieStore ?? getCfCookieStore();
+  const pagesGuard = services.maxPagesGuard ?? getMaxPagesGuard();
 
   /**
    * THE HOST CLOCK (QB-U30b): every listing, seed and rotating fetch reserves the host's next slot on
@@ -491,6 +499,15 @@ export function assembleCatalog(services: CatalogServices): Catalog {
       }
       const ruleset = services.getRulesetForUrl(url);
       if (!ruleset?.extractListing) return { status: 'unsupported', siteId, reason: 'ruleset has no extractListing parser' };
+
+      // MAXPAGES GUARD (SCRAPE_CATALOG_MAX_PAGES_GUARD, QB-U24): a page above the last page the profile
+      // declares is answered with the existing exhausted page and NO store fetch, for a guarded store. It is
+      // a fact about the declaration, not about the host, so it is answered ahead of the cooldown gate.
+      const lastPage = declaredLastPage(byListing);
+      if (lastPage !== undefined && pageNo > lastPage && pagesGuard.covers(siteId)) {
+        pagesGuard.record(siteId, Date.now());
+        return { status: 'ok', siteId, page: pageNo, url, items: [], collectUrls: [], hasMore: false, count: 0 };
+      }
 
       // CHALLENGE COOLDOWN gate, keyed by the host actually fetched (a sibling api. host cools on its
       // own): a cooling host is skipped WITHOUT fetching — a challenge fetch degrades the egress IP's

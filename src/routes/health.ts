@@ -61,6 +61,9 @@
  *     to its transport — with the clock off too, so it is the live negative control for
  *     SCRAPE_HOST_CLOCK; callers queue, image, catalogListing, catalogSeed, catalogRotating, resolve,
  *     scrape, lookup, fetchBody, sessionPrime, pluginRoute), and
+ *     `maxPagesGuard: {mode, stores: [{siteId, maxPagesGuarded60m, lastGuardedAt}]}` (the engine's
+ *     SCRAPE_CATALOG_MAX_PAGES_GUARD: per store, the /catalog pages above the profile's maxPages it answered
+ *     exhausted WITHOUT a store fetch in the trailing hour), and
  *     `pool: {scope, malformed, hosts: [{host, mode, picks60m, topBucketShare60m, uniformPicks60m,
  *     agedPicks60m, agedShare60m, forcedPicks60m, agedCount, p99WaitH60m, maxWaitH60m, redraws60m,
  *     scanFallbacks60m, retryPicks60m}]}` (the queue's POOL-SELECT dispatch per host, QB-U19: which
@@ -82,6 +85,7 @@ import type { QueueStoreView } from '../services/scrapeQueue.js';
 import type { HandsOffView } from '../services/extractionRegistry.js';
 import type { PluginsView } from '../services/pluginBootstrap.js';
 import type { HostClockView } from '../services/hostClock.js';
+import type { MaxPagesGuardView } from '../services/maxPagesGuard.js';
 import type { PoolView } from '../services/poolDispatch.js';
 
 export interface HealthDeps {
@@ -181,6 +185,12 @@ export interface HealthDeps {
    */
   getHostClock: () => HostClockView;
   /**
+   * The engine's maxPages guard (getMaxPagesGuard().view(now), QB-U24): `mode` (off | all | stores) and, per
+   * store, `{siteId, maxPagesGuarded60m, lastGuardedAt}` — the listing pages above the profile's maxPages
+   * answered exhausted without a store fetch in the trailing hour. Counters only; never throws.
+   */
+  getMaxPagesGuard: () => MaxPagesGuardView;
+  /**
    * The queue's POOL-SELECT dispatch (getScrapeQueue().getPoolView(now), QB-U19): SCRAPE_POOL_SELECT as
    * parsed (`scope`, `malformed`) and, per host, `{host, mode: pool | fifo-excluded | fifo-off,
    * picks60m, topBucketShare60m, uniformPicks60m, agedPicks60m, agedShare60m, forcedPicks60m, agedCount,
@@ -230,6 +240,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         handsOff: deps.listHandsOff(),
         plugins: deps.listPlugins(),
         hostClock: deps.getHostClock(),
+        maxPagesGuard: deps.getMaxPagesGuard(),
         pool: deps.getPool(),
         timestamp: new Date().toISOString(),
       });
@@ -259,6 +270,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         plugins: deps.listPlugins(),
         // Whether MFC is being sent to under its floor matters most when the pod is sick, too.
         hostClock: deps.getHostClock(),
+        maxPagesGuard: deps.getMaxPagesGuard(),
         // So do waits past the age cap and forced picks (the starvation alarm's inputs).
         pool: deps.getPool(),
         error: error instanceof Error ? error.message : 'Unknown error',

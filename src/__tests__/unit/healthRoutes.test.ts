@@ -46,6 +46,7 @@ const build = (over: Partial<HealthDeps> = {}) => {
     listHandsOff: () => [],
     listPlugins: () => ({ loaded: [], refused: [] }),
     getHostClock: () => ({ mode: 'off', hosts: [] }),
+    getMaxPagesGuard: () => ({ mode: 'off', stores: [] }),
     getPool: () => ({ scope: 'off', malformed: false, hosts: [] }),
     ...over,
   }));
@@ -853,6 +854,35 @@ describe('createHealthRoutes — hostClock', () => {
 
     expect(res.status).toBe(500);
     expect(res.body.hostClock).toEqual(VIEW);
+  });
+});
+
+/**
+ * The engine's maxPages guard (QB-U24, SCRAPE_CATALOG_MAX_PAGES_GUARD): per guarded store, how many
+ * /catalog pages above the profile's maxPages it answered exhausted WITHOUT a store fetch in the trailing
+ * hour. QB-U26's acceptance reads `maxPagesGuarded60m` here.
+ */
+describe('createHealthRoutes — maxPagesGuard', () => {
+  const VIEW = {
+    mode: 'stores' as const,
+    stores: [{ siteId: 'mfc', maxPagesGuarded60m: 1, lastGuardedAt: '2026-10-07T03:30:00.000Z' }],
+  };
+
+  it('GET /health/detailed carries the maxPagesGuard block', async () => {
+    const res = await request(build({ getMaxPagesGuard: () => VIEW })).get('/health/detailed');
+
+    expect(res.status).toBe(200);
+    expect(res.body.maxPagesGuard).toEqual(VIEW);
+  });
+
+  it('keeps maxPagesGuard on the degraded (500) response', async () => {
+    const res = await request(build({
+      getBrowserPoolHealth: async () => { throw new Error('pool down'); },
+      getMaxPagesGuard: () => VIEW,
+    })).get('/health/detailed');
+
+    expect(res.status).toBe(500);
+    expect(res.body.maxPagesGuard).toEqual(VIEW);
   });
 });
 

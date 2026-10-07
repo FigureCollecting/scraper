@@ -609,7 +609,21 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
 - **backfill** — resume the store's saved page cursor for up to `CRAWLER_BACKFILL_PAGES_PER_RUN`
   pages, new ids only. The cursor advances only when the page reported `hasMore: true` AND every
   new item on it was attempted (`nextPage` is ignored); a page cut short by the per-store cap, the
-  global budget, or a 5xx from `/ingest/scrape` is re-fetched next run.
+  global budget, or a 5xx from `/ingest/scrape` is re-fetched next run. A store named in
+  `CRAWLER_PAGE_POOL` (QB-U24) fetches the same pages in a pooled order instead of cursor, cursor+1, ...:
+  the L lowest UNVISITED pages at or above the cursor (L = `CRAWLER_PAGE_POOL_LOOKAHEAD`), picked by
+  POOL-SELECT with lower pages favoured, never two adjacent pages in a row and no monotone run; page 1
+  and the recent read stay first and sequential. The stop rules are unchanged (a cap or a stop ends the
+  pass, a cut-short page is re-read, an end is confirmed only on a later run, a confirmed end issues no
+  GET until its re-check is due). A page a cut-short pass finished above the cursor is kept as a visited
+  mark in `recent.pagePool` (expiring after `CRAWLER_PAGE_POOL_VISITED_TTL_H`); after k new ids arrive on
+  top (counted by the recent read, and carried in `recent.pagePool.drift` until a backfill saves, so a pass
+  stopped before its backfill hands it on), the bottom ceil(k / page size) marks of a run sitting on an
+  unvisited page are read again (one mark more when the pass had no recent read). Each pooled store's summary
+  carries `pagePicks`, the pages requested in order; the pass logs its seed. Every page number the pool
+  reads from the ledger (the marks, the cursor, the end candidate) must be an integer in [1, 100000]
+  (`MAX_LEDGER_PAGE`, 20 x the deepest declared listing); one that is not is dropped with ONE WARN per
+  store naming it (the cursor walks again from the top, the pool state is ignored, the candidate is cleared).
 - **id-range backfill** — for the stores named in `CRAWLER_RANGE_STORES` only: walk the store's
   SEQUENTIAL id space downward through `GET /catalog?store=&range=1&from=&count=`, up to
   `CRAWLER_RANGE_IDS_PER_RUN` ids per run. See *Id-range backfill* below.
@@ -684,6 +698,9 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
 | `CRAWLER_LISTS_WINDOW_UTC` | *(none = no list fetched)* | Company lists: `HH:MM-HH:MM` UTC window (may wrap midnight) in which ONE group may be fetched per pass. Malformed or zero-width = off, with a WARN. The backlog drains outside it |
 | `CRAWLER_LISTS_INTERVAL_H` | `160` | Company lists: a group is fetched at most once per this many hours. In-window passes per day × interval days should cover the group count (7 × 6.67 ≈ 46 < 54 for mfc); below that the least-recently-polled rotation stretches the cycle to groups ÷ passes per day days |
 | `CRAWLER_LISTS_SPACING_MS` | `10000` | Company lists: wait between two lists of one group; never below `10000` (raised with a WARN) |
+| `CRAWLER_PAGE_POOL` | *(none)* | Backfill page pool (QB-U24): `all`, or a csv of siteIds, whose backfill pass fetches its pages in a POOL-SELECT order (see **backfill** above). Empty or `off` = every store walks its cursor exactly as before. A malformed entry, or `all` / `off` inside a list, is ignored with a WARN; a store not crawled is ignored with a WARN |
+| `CRAWLER_PAGE_POOL_LOOKAHEAD` | `CRAWLER_BACKFILL_PAGES_PER_RUN` | Backfill page pool: how many of the lowest unvisited pages one pass shuffles and fetches. Never larger than `CRAWLER_BACKFILL_PAGES_PER_RUN` (lowered with a WARN): wider shuffles lose coverage under listing drift |
+| `CRAWLER_PAGE_POOL_VISITED_TTL_H` | `72` | Backfill page pool: hours a visited mark above the cursor is trusted |
 | `CRAWLER_LISTS_ALTERNATE` | *(none)* | Company lists: csv of siteIds whose passes that START inside `CRAWLER_LISTS_WINDOW_UTC` fetch EITHER the Latest Additions tap OR one company group, never both; each window opens with a lists pass (7 in-window passes = L T L T L T L, 4 groups a night). Only a store with a lists step (`CRAWLER_LISTS_DRAIN_CAPS`) and a mode running recent and backfill; any other name is ignored with a WARN. Empty = today's pass |
 | `CRAWLER_REOBSERVE_MIN_AGE_H` | `12` | Re-observation lane: an id is eligible once its last observation is this many hours old. The SAME value is the backoff window for an id whose last re-observation was refused, so `0` means both "age is no bar" and "no backoff at all" — a refused id is retried on the very next run |
 | `CRAWLER_MAX_REOBSERVE_PER_STORE` | `0` | Re-observation lane: global per-store ceiling on re-observations per run. `0` = the lane is OFF unless a store opts in below |
@@ -1509,6 +1526,11 @@ See `.env.example` for complete configuration template.
   - A catalog page is far larger than a search hit (orzgk pages run 1.5–2 MB), so it gets its own window
   - Unset/invalid → default; any value is clamped to `[1000, 120000]`
   - Default: `30000`
+
+- `SCRAPE_CATALOG_MAX_PAGES_GUARD`: `off` (default) | `all` | a csv of siteIds (QB-U24)
+  - For a guarded store, `GET /catalog?store=&page=p` with `p` above the last page the profile's `byListing.maxPages` allows (counted from `pageStart`) answers the usual exhausted page (`items: []`, `hasMore: false`) WITHOUT a store fetch, so the crawler confirms the end at zero store GETs (mfc, `maxPages: 1`: no more weekly page-2 GET)
+  - A store whose profile declares no usable `maxPages` is never guarded; a malformed entry, or a keyword inside a list, is ignored with a boot WARN
+  - The answers of the trailing hour are published per store as `maxPagesGuard.stores[].maxPagesGuarded60m` on `GET /health/detailed`
 
 - `IMAGE_HOST_POLICY_JSON`: Inline `{ host: rule }` table saying how each IMAGE host is fetched — see **Image bytes lanes** below
   - Unset/blank (default): the built-in table, which is the permaban alone
