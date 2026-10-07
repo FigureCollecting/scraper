@@ -103,8 +103,12 @@ export function resolveLookupStoreTimeoutMs(env: NodeJS.ProcessEnv): number {
   return Math.min(MAX_STORE_TIMEOUT_MS, Math.max(MIN_STORE_TIMEOUT_MS, n));
 }
 
-/** Per-store search-fetch timeout applied to every fan-out fetch. Resolved ONCE at module load. */
-const STORE_TIMEOUT_MS = resolveLookupStoreTimeoutMs(process.env);
+/**
+ * The fetch time a /lookup store fetch keeps after waiting for the host clock (QB-U30b): the default
+ * per-store search timeout, as the catalog keeps its own default (SCRAPE_CATALOG_MIN_FETCH_MS 30 s).
+ * A host the lookup budget cannot wait for and still keep this much is RECORDED, not waited for.
+ */
+export const LOOKUP_MIN_FETCH_MS = DEFAULT_STORE_TIMEOUT_MS;
 
 /**
  * Bound a per-store fetch: resolve with its value if it wins, else REJECT once `ms` elapses so a
@@ -254,6 +258,9 @@ function parseOrClassified(err: unknown): FetchFailureReport['reasonClass'] {
 const identityLabel = (identity: IdentityQuery): string => identity.gtin14 ?? composeNameQuery(identity) ?? '';
 
 export function assembleLookup(services: LookupServices): Lookup {
+  // Per-store search-fetch timeout applied to every fan-out fetch. Resolved ONCE per assembly (index.ts
+  // assembles once at boot), like the catalog's: the host clock's role for /lookup reads it too.
+  const STORE_TIMEOUT_MS = resolveLookupStoreTimeoutMs(process.env);
   const runFanout = async (
     plan: ReturnType<typeof planRetrieval>,
     mode: LookupMode,
@@ -342,8 +349,9 @@ export function assembleLookup(services: LookupServices): Lookup {
           const transport = services.profiles.searchTransportFor(p.host);
           // THE HOST CLOCK (QB-U30b): on a clocked bySearch host the fetch reserves the host's next
           // slot, waits for it and runs the send block, with STORE_TIMEOUT_MS minus the wait left for
-          // the fetch. A host above the ceiling is sent at once and RECORDED (the queue's next record
-          // waits a full floor after it). MFC declares no bySearch axis, so /lookup never reaches it.
+          // the fetch. A host whose wait cap would leave the fetch less than LOOKUP_MIN_FETCH_MS of
+          // STORE_TIMEOUT_MS is sent at once and RECORDED (the queue's next record waits a full floor
+          // after it). MFC declares no bySearch axis, so /lookup never reaches it.
           // A refused slot (past the wait cap) or a cooldown that opened while waiting leaves the
           // store in `cooldown`, unfetched, like a cooling host (no failure report: nothing failed).
           const sent = await sendOnHostClock(
@@ -351,6 +359,7 @@ export function assembleLookup(services: LookupServices): Lookup {
               host: p.host,
               caller: 'lookup',
               budgetMs: STORE_TIMEOUT_MS,
+              minFetchMs: LOOKUP_MIN_FETCH_MS,
               latency: 'lookup',
               veto: () => (cd.isOpen(p.host) ? 'cooling' : undefined),
             },

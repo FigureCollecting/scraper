@@ -31,7 +31,8 @@ const MFC = 'myfigurecollection.net';
 const MFC_URL = `https://${MFC}`;
 
 describe('createScrapingService on the host clock', () => {
-  let model: ReturnType<typeof requestModelPage>;
+  /** Every page the service opened (a fresh one per fetch, as the browser lane does), the latest last. */
+  let models: Array<ReturnType<typeof requestModelPage>>;
   let events: string[];
   let holds: (url?: string) => boolean;
   let pacer: PageRequestPacer;
@@ -53,13 +54,17 @@ describe('createScrapingService on the host clock', () => {
       holds: (url?: string) => holds(url),
       observe: (url, caller) => { events.push(`observe ${caller} ${url}`); },
     };
-    model = requestModelPage();
+    models = [];
+    const newPage = async () => {
+      models.push(requestModelPage());
+      return models[models.length - 1].page;
+    };
     const mockContext = {
-      newPage: jest.fn<(...args: any[]) => any>().mockResolvedValue(model.page),
+      newPage: jest.fn<(...args: any[]) => any>().mockImplementation(newPage),
       close: jest.fn<(...args: any[]) => any>().mockResolvedValue(undefined),
     };
     const mockBrowser = {
-      newPage: jest.fn<(...args: any[]) => any>().mockResolvedValue(model.page),
+      newPage: jest.fn<(...args: any[]) => any>().mockImplementation(newPage),
       close: jest.fn<(...args: any[]) => any>().mockResolvedValue(undefined),
       connected: true,
       createBrowserContext: jest.fn<(...args: any[]) => any>().mockResolvedValue(mockContext),
@@ -73,7 +78,11 @@ describe('createScrapingService on the host clock', () => {
     jest.useRealTimers();
   });
 
-  const gotos = () => model.wire.map(w => w.url);
+  /** The latest page, and what every page sent / how each set interception. */
+  const model = () => models[models.length - 1];
+  const wire = () => models.flatMap(m => m.wire);
+  const gotos = () => wire().map(w => w.url);
+  const interception = () => models.flatMap(m => m.interception);
 
   /** The MFC sync routes' shape (rulesets cookies.ts, lists.ts, csv.ts): goto, reload, a submitted form, a main-frame goto. */
   const syncWorkflow = async (page: Page) => {
@@ -92,7 +101,7 @@ describe('createScrapingService on the host clock', () => {
       await service.browserFetch(URL_A);
       expect(events).toEqual([`send pluginRoute ${URL_A}`, `send pluginRoute ${URL_B}`, `send pluginRoute ${URL_A}`]);
       expect(gotos()).toEqual([URL_A, URL_B, URL_A]);
-      expect(model.interception).toEqual([true, true, true]);
+      expect(interception()).toEqual([true, true, true]);
     });
 
     it("a withPage callback: goto, reload, goBack, goForward, a submitted form and a main-frame goto each pass the clock; the page is the page itself", async () => {
@@ -104,7 +113,7 @@ describe('createScrapingService on the host clock', () => {
         return page.title();
       });
       expect(title).toBe('Mock Page Title');
-      expect(model.wire.map(w => w.what)).toEqual([
+      expect(wire().map(w => w.what)).toEqual([
         `goto ${MFC_URL}`,
         `reload ${MFC_URL}`,
         `submit ${MFC_URL}/?submit=%23export`,
@@ -112,19 +121,19 @@ describe('createScrapingService on the host clock', () => {
         `goBack ${MFC_URL}/?mode=manager`,
         `goForward ${MFC_URL}/?mode=manager`,
       ]);
-      expect(events).toEqual(model.wire.map(w => `send pluginRoute ${w.url}`));
-      expect(model.page.goto).toHaveBeenCalledWith(MFC_URL, { waitUntil: 'domcontentloaded' });
+      expect(events).toEqual(wire().map(w => `send pluginRoute ${w.url}`));
+      expect(model().page.goto).toHaveBeenCalledWith(MFC_URL, { waitUntil: 'domcontentloaded' });
     });
 
     it('a subresource, a subframe navigation and a redirect hop continue at once, without the clock', async () => {
       const service = createScrapingService(undefined, { clockCaller: 'pluginRoute', pacer });
       await service.withPage(async () => {
-        await model.issue(`${MFC_URL}/api/list.json`, { navigation: false });
-        await model.issue(`${MFC_URL}/frame.html`, { frame: 'sub' });
-        await model.issue(`${MFC_URL}/detached`, { frame: null });
-        await model.issue(`${MFC_URL}/moved-here`, { redirectHops: 1 });
+        await model().issue(`${MFC_URL}/api/list.json`, { navigation: false });
+        await model().issue(`${MFC_URL}/frame.html`, { frame: 'sub' });
+        await model().issue(`${MFC_URL}/detached`, { frame: null });
+        await model().issue(`${MFC_URL}/moved-here`, { redirectHops: 1 });
       });
-      expect(model.wire.map(w => w.url)).toEqual([`${MFC_URL}/api/list.json`, `${MFC_URL}/frame.html`, `${MFC_URL}/detached`, `${MFC_URL}/moved-here`]);
+      expect(wire().map(w => w.url)).toEqual([`${MFC_URL}/api/list.json`, `${MFC_URL}/frame.html`, `${MFC_URL}/detached`, `${MFC_URL}/moved-here`]);
       expect(events).toEqual([]);
     });
 
@@ -134,27 +143,28 @@ describe('createScrapingService on the host clock', () => {
       };
       const service = createScrapingService(undefined, { clockCaller: 'pluginRoute', pacer });
       await expect(service.withPage(page => page.goto(MFC_URL))).rejects.toThrow('net::ERR_BLOCKEDBYCLIENT');
-      expect(model.aborted).toEqual([{ url: MFC_URL, errorCode: 'blockedbyclient' }]);
-      expect(model.wire).toEqual([]);
+      expect(model().aborted).toEqual([{ url: MFC_URL, errorCode: 'blockedbyclient' }]);
+      expect(wire()).toEqual([]);
     });
 
     it('a request that can no longer be resolved (its page closed) is dropped quietly, page-level or not', async () => {
       const service = createScrapingService(undefined, { clockCaller: 'pluginRoute', pacer });
       await service.withPage(async () => {
-        void model.issue(`${MFC_URL}/x.css`, { navigation: false, gone: true });
-        void model.issue(`${MFC_URL}/next`, { gone: true });
+        void model().issue(`${MFC_URL}/x.css`, { navigation: false, gone: true });
+        void model().issue(`${MFC_URL}/next`, { gone: true });
         await new Promise(resolve => setImmediate(resolve));
       });
       pacer.send = async () => {
         throw new Error('[HOST-CLOCK] refused');
       };
       await createScrapingService(undefined, { clockCaller: 'pluginRoute', pacer }).withPage(async () => {
-        void model.issue(`${MFC_URL}/refused-and-gone`, { gone: true });
+        void model().issue(`${MFC_URL}/refused-and-gone`, { gone: true });
         await new Promise(resolve => setImmediate(resolve));
       });
+      // The refusing pacer records nothing; its abort of the gone request threw and was swallowed.
       expect(events).toEqual([`send pluginRoute ${MFC_URL}/next`]);
-      expect(model.wire).toEqual([]);
-      expect(model.aborted).toEqual([]);
+      expect(wire()).toEqual([]);
+      expect(models.flatMap(m => m.aborted)).toEqual([]);
     });
 
     it('a declared prime: the prime navigation passes as sessionPrime, then the target as pluginRoute', async () => {
@@ -182,7 +192,7 @@ describe('createScrapingService on the host clock', () => {
       holds = () => false;
       const service = createScrapingService(undefined, { clockCaller: 'pluginRoute', pacer });
       await service.scrapePage(URL_A);
-      expect(model.interception).toEqual([]);
+      expect(interception()).toEqual([]);
       expect(gotos()).toEqual([URL_A]);
       expect(events).toEqual([`observe pluginRoute ${URL_A}`]);
     });
@@ -192,11 +202,11 @@ describe('createScrapingService on the host clock', () => {
       const service = createScrapingService(undefined, { clockCaller: 'pluginRoute', pacer });
       await service.withPage(async (page: Page) => {
         await syncWorkflow(page);
-        await model.issue(`${MFC_URL}/api/list.json`, { navigation: false });
-        await model.issue(`${MFC_URL}/frame.html`, { frame: 'sub' });
-        await model.issue(`${MFC_URL}/moved-here`, { redirectHops: 2 });
+        await model().issue(`${MFC_URL}/api/list.json`, { navigation: false });
+        await model().issue(`${MFC_URL}/frame.html`, { frame: 'sub' });
+        await model().issue(`${MFC_URL}/moved-here`, { redirectHops: 2 });
       });
-      expect(model.interception).toEqual([]);
+      expect(interception()).toEqual([]);
       expect(events).toEqual([
         `observe pluginRoute ${MFC_URL}`,
         `observe pluginRoute ${MFC_URL}`,
@@ -213,8 +223,8 @@ describe('createScrapingService on the host clock', () => {
       await service.withPage(async (page: Page) => { await page.goto(URL_B); });
       expect(events).toEqual([]);
       expect(gotos()).toEqual([URL_A, URL_B]);
-      expect(model.interception).toEqual([]);
-      expect(model.listenerCount()).toBe(0);
+      expect(interception()).toEqual([]);
+      expect(model().listenerCount()).toBe(0);
     });
 
     it('a declared prime: the prime is the first request (stamped there), the target follows through the clock as sessionPrime', async () => {
@@ -229,7 +239,7 @@ describe('createScrapingService on the host clock', () => {
     const service = createScrapingService(undefined, { clockCaller: 'pluginRoute' });
     await service.scrapePage(URL_A, { primeUrl: PRIME });
     expect(gotos()).toEqual([PRIME, URL_A]);
-    expect(model.interception).toEqual([]);
+    expect(interception()).toEqual([]);
   });
 
   describe('on the process clock: the MFC sync workflow shape (challenger regression, closeout round 1)', () => {
@@ -242,11 +252,16 @@ describe('createScrapingService on the host clock', () => {
       return clock;
     }
 
+    /** Advance fake time until `work` settles; work that settles at once moves no time. */
     async function run<T>(work: Promise<T>, budgetMs: number): Promise<T> {
       let done = false;
       const settled = work.finally(() => { done = true; });
       settled.catch(() => undefined);
-      for (let elapsed = 0; !done && elapsed <= budgetMs; elapsed += 250) await jest.advanceTimersByTimeAsync(250);
+      for (let elapsed = 0; ; elapsed += 250) {
+        for (let i = 0; i < 200 && !done; i++) await Promise.resolve();
+        if (done || elapsed >= budgetMs) break;
+        await jest.advanceTimersByTimeAsync(250);
+      }
       return settled;
     }
 
@@ -258,15 +273,15 @@ describe('createScrapingService on the host clock', () => {
       await run(service.withPage(async (page: Page) => {
         await syncWorkflow(page);
         // A subresource of the main host is not a page-level request: it goes at once.
-        await model.issue(`${MFC_URL}/static/app.js`, { navigation: false });
+        await model().issue(`${MFC_URL}/static/app.js`, { navigation: false });
       }), 60_000);
-      const pages = model.wire.filter(w => !w.url.endsWith('app.js')).map(w => w.at - START);
+      const pages = wire().filter(w => !w.url.endsWith('app.js')).map(w => w.at - START);
       expect(pages).toEqual([0, 7000, 14_000, 21_000]);
-      expect(model.wire[model.wire.length - 1].at - START).toBe(21_000);
+      expect(wire()[wire().length - 1].at - START).toBe(21_000);
       const [mfc] = clock.view(Date.now()).hosts;
       expect(mfc.sends60m.pluginRoute).toBe(4);
       expect(mfc.underFloor60m).toBe(0);
-      expect(model.interception).toEqual([true]);
+      expect(interception()).toEqual([true]);
     });
 
     it('clock ON: a second page-level request stacked past the cap is refused (counted under pluginRoute) and its navigation fails', async () => {
@@ -277,7 +292,7 @@ describe('createScrapingService on the host clock', () => {
       clock.reserve(MFC, START, 7000);
       const service = createScrapingService(undefined, { clockCaller: 'pluginRoute', pacer: processHostClockPacer() });
       await expect(run(service.withPage(page => page.goto(MFC_URL)), 30_000)).rejects.toThrow('net::ERR_BLOCKEDBYCLIENT');
-      expect(model.wire).toEqual([]);
+      expect(wire()).toEqual([]);
       expect(clock.view(Date.now()).hosts[0].clockRefusals60m.pluginRoute).toBe(1);
     });
 
@@ -287,10 +302,10 @@ describe('createScrapingService on the host clock', () => {
       processClock('hpoi.net');
       const service = createScrapingService(undefined, { clockCaller: 'pluginRoute', pacer: processHostClockPacer() });
       await run(service.scrapePage(`${MFC_URL}/item/1`), 1000);
-      expect(model.interception).toEqual([]);
+      expect(interception()).toEqual([]);
       await run(service.withPage(page => page.goto(`${MFC_URL}/item/2`)), 1000);
-      expect(model.interception).toEqual([true]);
-      expect(model.wire.map(w => w.at - START)).toEqual([0, 0]);
+      expect(interception()).toEqual([true]);
+      expect(wire().map(w => w.at - START)).toEqual([0, 0]);
     });
 
     it('clock OFF (the negative control): nothing intercepted, the same four requests leave at once, all four observed under the floor', async () => {
@@ -299,8 +314,8 @@ describe('createScrapingService on the host clock', () => {
       const clock = processClock('off');
       const service = createScrapingService(undefined, { clockCaller: 'pluginRoute', pacer: processHostClockPacer() });
       await run(service.withPage(syncWorkflow), 1000);
-      expect(model.interception).toEqual([]);
-      expect(model.wire.map(w => w.at - START)).toEqual([0, 0, 0, 0]);
+      expect(interception()).toEqual([]);
+      expect(wire().map(w => w.at - START)).toEqual([0, 0, 0, 0]);
       const [mfc] = clock.view(Date.now()).hosts;
       expect(mfc.clocked).toBe(false);
       expect(mfc.sends60m.pluginRoute).toBe(4);

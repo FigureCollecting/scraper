@@ -8,7 +8,8 @@
  *                                    membership is answered per call, never from a boot-time list
  *   host[,host...]                   only those hosts
  *
- * Tokens are comma-separated, trimmed and case-folded; blank tokens are skipped; each host is
+ * Tokens are comma-separated, trimmed and case-folded; blank tokens are skipped ('all' must stand
+ * alone, so 'all,' is a list holding the keyword, as in QB-U30a); each host is
  * normalised like the host clock and hostRateLimiter (a trailing dot and a leading `www.` stripped),
  * so `example.com` never pulls in `static.example.com`.
  *
@@ -63,7 +64,8 @@ const NOTHING: Omit<HostSelect, 'mode' | 'warnings' | 'malformed'> = { hosts: []
 /** Parse a scope knob's raw value with the grammar above. */
 export function parseHostSelect(raw: string | undefined, grammar: HostSelectGrammar): HostSelect {
   const value = (raw ?? '').trim();
-  const tokens = value.split(',').map(token => token.trim()).filter(token => token !== '');
+  const parts = value.split(',').map(token => token.trim());
+  const tokens = parts.filter(token => token !== '');
   const malformed = (why: string): HostSelect => ({
     mode: 'off',
     ...NOTHING,
@@ -75,7 +77,9 @@ export function parseHostSelect(raw: string | undefined, grammar: HostSelectGram
   }
   const [first, ...rest] = tokens;
   if (first.toLowerCase() === 'all') {
-    if (rest.length === 0) return { mode: 'all', ...NOTHING, warnings: [], malformed: false };
+    // 'all' ALONE is every host. With only blank tokens beside it ('all,', ', all') it is read as a
+    // list holding the keyword, as QB-U30a did (and QB-U19's parser does): a typo fails safe.
+    if (parts.length === 1) return { mode: 'all', ...NOTHING, warnings: [], malformed: false };
     const exclusions = rest.filter(token => token.startsWith('-'));
     if (exclusions.length > 0) {
       if (exclusions.length !== rest.length) return malformed('"all" mixes -host exclusions with listed hosts');
@@ -88,7 +92,7 @@ export function parseHostSelect(raw: string | undefined, grammar: HostSelectGram
       }
       return { mode: 'all-except', hosts: [], excluded, warnings: [], malformed: false };
     }
-    if (grammar.listEntries === 'strict') return malformed('"all" mixed with a listed host');
+    if (grammar.listEntries === 'strict' && rest.length > 0) return malformed('"all" mixed with a listed host');
   }
   const hosts: string[] = [];
   const warnings: string[] = [];

@@ -318,6 +318,11 @@ export class HostClock {
     this.scope = readScope(rawScope);
   }
 
+  /** Whether the configured scope names any host (SCRAPE_HOST_CLOCK is not off). */
+  isOn(): boolean {
+    return this.scope.mode !== 'off';
+  }
+
   /** Whether the host is on the shared clock. */
   inScope(host: string): boolean {
     return this.inScopeFn(normalizeClockHost(host));
@@ -424,8 +429,11 @@ export class HostClock {
     const floor = floorMs ?? this.bookings.get(key)?.floorMs ?? 0;
     const last = this.sends.get(key);
     if (last !== undefined && (last.at > sentAt || (last.at === sentAt && last.floorMs >= floor))) return;
-    // QB-U30b: a new send draws its jitter, which spaces the next request with the floor.
-    this.sends.set(key, { at: sentAt, floorMs: floor + this.drawJitter(key) });
+    // QB-U30b: a new send draws its jitter, which spaces the next request with the floor. A send that
+    // did not pass the gate (record) can land within the last send's jitter: the next allowed time
+    // then stays the last send's, never earlier (RECORD RULE).
+    const spacing = floor + this.drawJitter(key);
+    this.sends.set(key, { at: sentAt, floorMs: last === undefined ? spacing : Math.max(spacing, last.at + last.floorMs - sentAt) });
   }
 
   /**
@@ -478,17 +486,23 @@ export class HostClock {
     return floor === undefined ? undefined : floor + this.jitterMsFor(host) + (this.options.waitSlackMs ?? DEFAULT_WAIT_SLACK_MS);
   }
 
-  /** The largest floor + J a blocking caller waits for: budget - slack - min fetch (27000 at 60 s). */
-  ceilingMs(): number {
-    const budget = this.options.blockingBudgetMs ?? DEFAULT_BLOCKING_BUDGET_MS;
-    return budget - (this.options.waitSlackMs ?? DEFAULT_WAIT_SLACK_MS) - (this.options.minFetchMs ?? DEFAULT_MIN_FETCH_MS);
+  /**
+   * The largest floor + J a blocking caller waits for: budget - slack - min fetch (27000 at the
+   * deployed 60 s). A caller with a budget of its own (/lookup: LOOKUP_STORE_TIMEOUT_MS) passes it and
+   * the fetch time it must keep; the defaults are CATALOG_STORE_TIMEOUT_MS and SCRAPE_CATALOG_MIN_FETCH_MS.
+   */
+  ceilingMs(
+    budgetMs: number = this.options.blockingBudgetMs ?? DEFAULT_BLOCKING_BUDGET_MS,
+    minFetchMs: number = this.options.minFetchMs ?? DEFAULT_MIN_FETCH_MS,
+  ): number {
+    return budgetMs - (this.options.waitSlackMs ?? DEFAULT_WAIT_SLACK_MS) - minFetchMs;
   }
 
-  /** How a blocking caller treats the host (see {@link BlockingRole}), answered per call. */
-  blockingRole(host: string): BlockingRole {
+  /** How a blocking caller with this budget treats the host (see {@link BlockingRole}), answered per call. */
+  blockingRole(host: string, budgetMs?: number, minFetchMs?: number): BlockingRole {
     const floor = this.floorFor(host);
     if (floor === undefined) return 'off';
-    return floor + this.jitterMsFor(host) > this.ceilingMs() ? 'recorded' : 'clocked';
+    return floor + this.jitterMsFor(host) > this.ceilingMs(budgetMs, minFetchMs) ? 'recorded' : 'clocked';
   }
 
   /** A blocking reservation was refused past the cap: counted per host and caller (clockRefusals60m). */
@@ -599,21 +613,30 @@ export class HostClock {
   /**
    * QB-U30b's boot lines for the given store hosts: the jitter per host with the process seed its
    * streams derive from, and every store host on the clock that blocking callers record instead of
-   * waiting for (floor + J above the ceiling).
+   * waiting for (floor + J above the ceiling); given /lookup's budget, the same for /lookup's ceiling.
    */
-  bootLines(storeHosts: string[]): string[] {
+  bootLines(storeHosts: string[], lookup?: { budgetMs: number; minFetchMs: number }): string[] {
     const hosts = [...new Set(storeHosts.map(normalizeClockHost))].sort();
     const jittered = hosts.filter(host => this.jitterMsFor(host) > 0);
     const jitterLine =
       jittered.length === 0
         ? `[HOST-CLOCK] jitter ${JITTER_ENV} off: every gap is the floor`
         : `[HOST-CLOCK] jitter ${JITTER_ENV}: ${jittered.map(host => `${host} 0-${this.jitterMsFor(host) - 1} ms`).join(', ')}; process seed ${this.seed()}, one stream per (host, 'jitter')`;
-    const recorded = hosts.filter(host => this.blockingRole(host) === 'recorded').map(host => `${host} (floor ${this.floorFor(host)} ms)`);
+    const recorded = (budgetMs?: number, minFetchMs?: number) => {
+      const named = hosts.filter(host => this.blockingRole(host, budgetMs, minFetchMs) === 'recorded').map(host => `${host} (floor ${this.floorFor(host)} ms)`);
+      return named.length === 0 ? 'none' : named.join(', ');
+    };
     const slack = this.options.waitSlackMs ?? DEFAULT_WAIT_SLACK_MS;
-    return [
+    const lines = [
       jitterLine,
-      `[HOST-CLOCK] blocking callers wait at most floor + jitter + ${slack} ms; hosts above the ${this.ceilingMs()} ms ceiling are recorded only: ${recorded.length === 0 ? 'none' : recorded.join(', ')}`,
+      `[HOST-CLOCK] blocking callers wait at most floor + jitter + ${slack} ms; hosts above the ${this.ceilingMs()} ms ceiling are recorded only: ${recorded()}`,
     ];
+    if (lookup) {
+      lines.push(
+        `[HOST-CLOCK] /lookup (budget ${lookup.budgetMs} ms, min fetch ${lookup.minFetchMs} ms) waits only where floor + jitter <= ${this.ceilingMs(lookup.budgetMs, lookup.minFetchMs)} ms; recorded only: ${recorded(lookup.budgetMs, lookup.minFetchMs)}`,
+      );
+    }
+    return lines;
   }
 
   /** One boot log line: what the clock covers and, per listed host, the floor its images get. */

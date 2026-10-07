@@ -27,7 +27,7 @@ describe('plugin service on the gated lane', () => {
       respond: url => ({
         status: () => 200,
         url: () => url,
-        headers: () => (stuck ? { 'content-type': 'text/html', 'cf-mitigated': 'challenge' } : { 'content-type': 'text/html' }),
+        headers: (): Record<string, string> => (stuck ? { 'content-type': 'text/html', 'cf-mitigated': 'challenge' } : { 'content-type': 'text/html' }),
       }),
       extra: {
         title: jest.fn<(...a: any[]) => any>().mockResolvedValue(stuck ? 'Just a moment...' : 'Lucy'),

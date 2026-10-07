@@ -6,6 +6,8 @@
  * For a BLOCKING caller (the /catalog listing, seed and rotating fetches, POST /resolve, the legacy
  * /scrape route, /lookup, fetchBody follow-ups, a transport's extra request, the plugin routes):
  *
+ *   0. ROLE, from the caller's own budget and minimum fetch: a host whose floor + J is above
+ *      budget - slack - minimum fetch is not waited for (below).
  *   1. RESERVE the host's next slot at once (the queue sees it while this caller waits), refused when it
  *      is more than the WAIT CAP away (floor + J + SCRAPE_CATALOG_CLOCK_WAIT_SLACK_MS): the caller then
  *      gives its existing non-page outcome (the crawler's "stop this store for the pass") and nothing is
@@ -13,16 +15,16 @@
  *   2. THE WAIT RULE: sleep (a timer, every iteration that does not send) until the gate opens; a slot
  *      still valid whose gate another caller's late send pushed out is slept out, NOT re-booked; only a
  *      LOST slot (another booking already due) is booked again. For a caller with a budget, a total
- *      wait past the cap (possible only after a re-book) is refused at the gate, so wait + fetch stays
- *      within the budget.
+ *      wait past the cap (possible only after a re-book), or one that leaves the fetch no time, is
+ *      refused at the gate, so wait + fetch stays within the budget.
  *   3. In ONE synchronous block, no await inside: the gate; the caller's veto (a challenge cooldown that
  *      opened while it waited); settle; INVOKE the transport without awaiting it; markSent + record the
  *      send at the instant AFTER the invocation (review 7: stamping before the call left the next send
  *      short by the synchronous work in between); then await. The fetch gets the budget minus the wait.
  *
- * A host whose floor + J is above the ceiling is not waited for: the send goes at once and is RECORDED
- * on the clock (the queue's next record then waits a full floor after it). A host off the clock (out of
- * scope, or no store floor) is sent at once and reported to the observer only, exactly as before.
+ * A host whose floor + J is above the caller's ceiling is not waited for: the send goes at once and is
+ * RECORDED on the clock (the queue's next record then waits a full floor after it). A host off the clock
+ * (out of scope, or no store floor) is sent at once and reported to the observer only, exactly as before.
  *
  * Honest limit (design.host_clock.honest_limit): the recorded instant is the transport's invocation;
  * awaits inside the transport (an Impit session, a browser page from the pool) come after it.
@@ -35,17 +37,26 @@
  *   catalogRotating assembleCatalog.rotatingSeed (GET /catalog?list=)
  *   resolve         assembleResolve, each id's detail fetch (POST /resolve)
  *   scrape          routes/scraper.ts POST /scrape -> scrapeGeneric
- *   lookup          assembleLookup, each bySearch store fetch (POST /lookup); detail plans fetch nothing
+ *   lookup          assembleLookup, each bySearch store fetch (POST /lookup); detail plans fetch nothing.
+ *                   Its role comes from ITS budget (LOOKUP_STORE_TIMEOUT_MS) and minimum fetch (15 s).
  *   fetchBody       buildExtractContext: ctx.scraping.fetchBody and the scrapePage / scrapePageStealth
  *                   passthroughs (the queue's and /resolve's extraction; the crawl driver's
  *                   wrapFetchBodyWithLimiter wraps such a context and is not composed in index.ts)
  *   sessionPrime    every request after the first of one transport call: impit's prime / re-prime and
  *                   the target after it, the browser lane's target after a prime navigation, and a
  *                   relaunched gated browser's proof navigation
- *   pluginRoute     every page.goto of the scraping service handed to plugins (buildEngineServices):
- *                   the rulesets' /scrape/mfc, /sync/validate-cookies, /sync/export-csv and /sync list
- *                   workflows (withPage), and rulesets that hold it (amiami's API client). withBrowser
- *                   hands a plugin a whole browser and is NOT clocked (no ruleset calls it).
+ *   pluginRoute     every PAGE-LEVEL request (a main-frame navigation) of a page the scraping service
+ *                   handed to plugins (buildEngineServices) makes: the rulesets' /scrape/mfc,
+ *                   /sync/validate-cookies, /sync/export-csv and /sync list workflows (withPage) and the
+ *                   rulesets that hold it (amiami's API client, orzgk). Clocked at the REQUEST, whatever
+ *                   started it: page.goto, reload, goBack/goForward, a main-frame goto, a click that
+ *                   submits a form or follows a link (csv.ts's export submit, lists.ts's reload). While the
+ *                   clock may hold it the page's requests are intercepted and a page-level one is held
+ *                   for its send block (refused: aborted); otherwise nothing is intercepted and the
+ *                   observer is fed from the page's request events. NOT clocked: a redirect hop (it
+ *                   follows the navigation that passed), subresources and subframes (the honest limit:
+ *                   page-level requests only), a popup or a page a plugin opens itself, and withBrowser,
+ *                   which hands a plugin a whole browser (no ruleset calls it).
  * GET /catalog?range= synthesises its window and fetches nothing.
  */
 import { getHostClock, type HostClock, type HostClockCaller, type HostClockLatencyKind } from './hostClock.js';
@@ -57,6 +68,12 @@ export interface ClockedSendRequest {
   caller: HostClockCaller;
   /** The caller's whole budget (wait + fetch, ms); the transport is invoked with what the wait left. */
   budgetMs?: number;
+  /**
+   * The fetch time the caller must keep after its longest wait (default SCRAPE_CATALOG_MIN_FETCH_MS).
+   * With `budgetMs` it decides the caller's ceiling: a host whose wait cap would leave less is recorded,
+   * not waited for (/lookup's 35 s budget is not the catalog's 60 s).
+   */
+  minFetchMs?: number;
   /** Feed the host's listing p99 or /lookup p95 with this call's wait + fetch time. */
   latency?: HostClockLatencyKind;
   /** Checked in the send block, after any wait: a reason not to send now (e.g. a cooldown opened). */
@@ -118,7 +135,7 @@ export async function sendOnHostClock<T>(
     }
   };
 
-  const role = clock.blockingRole(host);
+  const role = clock.blockingRole(host, budgetMs, request.minFetchMs);
   if (role !== 'clocked') {
     const sending = invoke(budgetMs);
     const sentAt = now();
@@ -149,7 +166,8 @@ export async function sendOnHostClock<T>(
     }
     // THE SEND BLOCK: nothing below awaits before the transport has been invoked and the send recorded.
     const waitedMs = at - start;
-    if (budgetMs !== undefined && waitedMs > cap) return refuse(at, waitedMs);
+    // Never hand the transport a timeout of 0 or less: refused at the gate instead.
+    if (budgetMs !== undefined && (waitedMs > cap || budgetMs - waitedMs <= 0)) return refuse(at, waitedMs);
     const reason = request.veto?.();
     if (reason !== undefined) return { sent: false, refused: false, reason };
     clock.settle(host, at, floor);
@@ -188,10 +206,32 @@ export interface HostClockPacer {
   send<T>(url: string, caller: HostClockCaller, invoke: () => Promise<T>): Promise<T>;
 }
 
+/**
+ * The pacer the engine's scraping service needs for the PLUGIN routes, whose pages are clocked at the
+ * request (QB-U30b, caller 'pluginRoute'):
+ *   - `holds(url?)`: whether the clock may hold a page-level request: to this url's host (it is on the
+ *     clock), or, with no url (a plugin's own page, which may go anywhere), to any host (the clock is on);
+ *   - `observe(url, caller)`: a page-level request the clock could not hold left now: the observer only.
+ */
+export interface PageRequestPacer extends HostClockPacer {
+  holds(url?: string): boolean;
+  observe(url: string, caller: HostClockCaller): void;
+}
+
 /** The pacer on the process clock (resolved at each call, so a test or a reload sees the current one). */
-export function processHostClockPacer(deps: Omit<ClockedSendDeps, 'clock'> = {}): HostClockPacer {
+export function processHostClockPacer(deps: Omit<ClockedSendDeps, 'clock'> = {}): PageRequestPacer {
   const now = deps.now ?? Date.now;
   return {
+    holds(url) {
+      const clock = getHostClock();
+      if (url === undefined) return clock.isOn();
+      const host = hostOfUrl(url);
+      return host !== undefined && clock.inScope(host);
+    },
+    observe(url, caller) {
+      const host = hostOfUrl(url);
+      if (host !== undefined) getHostClock().recordSend(host, caller, now());
+    },
     first(url) {
       const host = hostOfUrl(url);
       if (host !== undefined) getHostClock().markSent(host, now());

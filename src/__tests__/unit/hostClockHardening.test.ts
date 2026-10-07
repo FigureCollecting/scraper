@@ -114,6 +114,47 @@ describe('/lookup on a clocked host: the fetch gets the store timeout minus the 
       warn.mockRestore();
     }
   });
+  it("a host the /lookup budget cannot wait for (floor 20000: 35000 - 3000 - 15000 < 20000) is fetched at once with the WHOLE budget (closeout round 1)", async () => {
+    const anitoys: StoreCapabilities = {
+      siteId: 'anitoys',
+      name: 'anitoys',
+      domains: ['anitoys.example'],
+      rateLimit: { domain: 'anitoys.example', baseDelayMs: 20_000, minDelayMs: 20_000, maxDelayMs: 1, backoffMultiplier: 1, recoveryDivisor: 1, successThreshold: 1 },
+      requiresBrowser: false,
+      allowedCookies: [],
+      retrieval: { bySearch: { urlTemplate: 'https://anitoys.example/search?q={q}' } },
+    } as StoreCapabilities;
+    const profiles = new ProfileRegistry();
+    profiles.register(anitoys);
+    // The catalog's 60 s default ceiling (27000) would clock it: /lookup's own budget must not.
+    const clock = new HostClock(parseHostClockScope('all'), 'all');
+    clock.setFloorSource(host => (host === 'anitoys.example' ? 20_000 : undefined));
+    clock.tryAcquire('anitoys.example', Date.now(), 20_000);
+    clock.settle('anitoys.example', Date.now(), 20_000);
+    jest.setSystemTime(Date.now() + 500);
+    const ruleset = { siteId: 'anitoys', version: '1', extract: jest.fn(), validate: jest.fn(), extractCandidates: () => [] } as unknown as ExtractionRuleset;
+    const sentAt: number[] = [];
+    const fetchSearch = jest.fn(() => {
+      sentAt.push(Date.now());
+      return new Promise<string>(() => undefined);
+    });
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      let settled = false;
+      const pending = assembleLookup({ profiles, getRulesetForUrl: () => ruleset, fetchSearch, hostClock: clock }).lookup('figure');
+      void pending.then(() => { settled = true; });
+      await jest.advanceTimersByTimeAsync(0);
+      expect(sentAt).toEqual([1_000_500]);
+      await jest.advanceTimersByTimeAsync(35_000 - 1);
+      expect(settled).toBe(false);
+      await jest.advanceTimersByTimeAsync(1);
+      expect((await pending).failed).toEqual(['anitoys']);
+      expect(warn.mock.calls.map(c => String(c[0])).some(line => line.includes('timed out after 35000ms'))).toBe(true);
+      expect(clock.view(Date.now()).hosts[0].sends60m.lookup).toBe(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
 });
 
 describe("a ruleset's in-extraction page fetches (ctx.scraping.scrapePage / scrapePageStealth) pass the clock as fetchBody", () => {

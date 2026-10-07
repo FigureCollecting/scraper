@@ -14,7 +14,7 @@
  * container's TZ) — the challenge's cross-origin frame reads the process zone, so `emulateTimezone`
  * cannot stand in for it (browserTimezone).
  */
-import type { Browser, Page, HTTPResponse } from 'puppeteer';
+import type { Browser, Page, HTTPRequest, HTTPResponse } from 'puppeteer';
 import { BrowserPool, isCleanHeadfulMode } from '../genericScraper.js';
 import { clampNavTimeoutMs, resolveNavTimeoutMs } from '../browserNavTimeout.js';
 import { ScrapingService, ScrapePageOptions, ScrapePageResult, PageOptions, BrowserFetchOptions, WaitForReadiness } from '@figurecollecting/scraper-plugin-contract';
@@ -22,7 +22,7 @@ import { CaptureSink, NoopCaptureSink, buildRawCapture } from '../captureSink.js
 import { sanitizeForLog } from '../../utils/security.js';
 import { getCfCookieStore, type CfCookieSource } from '../cookieJar.js';
 import { applyEgressTimezone } from '../browserTimezone.js';
-import { processHostClockPacer, type HostClockPacer } from '../hostClockSend.js';
+import { processHostClockPacer, type PageRequestPacer } from '../hostClockSend.js';
 import type { HostClockCaller } from '../hostClock.js';
 import {
   ChallengeLaneUnavailableError,
@@ -338,16 +338,9 @@ function isNavigationFailure(err: unknown): boolean {
  */
 const challengeOutcomes = new WeakMap<object, ChallengeOutcome>();
 
-/**
- * A clock-paced page (QB-U30b, the plugin service's `pacedPage`) is a Proxy of the real page; the
- * gated runner reads the outcome off the real page, so both are keyed by the real one.
- */
-const pacedPageTargets = new WeakMap<object, object>();
-const outcomeKey = (page: object): object => pacedPageTargets.get(page) ?? page;
-
 /** Record how this page's challenge wait ended. */
 function recordChallengeOutcome(page: object, outcome: ChallengeOutcome): void {
-  challengeOutcomes.set(outcomeKey(page), outcome);
+  challengeOutcomes.set(page, outcome);
 }
 
 /**
@@ -356,8 +349,8 @@ function recordChallengeOutcome(page: object, outcome: ChallengeOutcome): void {
  * is the honest answer for a fetch that never reached a challenge wait.
  */
 function takeChallengeOutcome(page: object): ChallengeOutcome {
-  const outcome = challengeOutcomes.get(outcomeKey(page)) ?? 'none';
-  challengeOutcomes.delete(outcomeKey(page));
+  const outcome = challengeOutcomes.get(page) ?? 'none';
+  challengeOutcomes.delete(page);
   return outcome;
 }
 
@@ -537,20 +530,30 @@ async function navigateAndCapture(
   };
 }
 
+/**
+ * A PAGE-LEVEL request of `page` (QB-U30b, the plugin routes on the host clock): a navigation of its
+ * main frame, whatever started it. Not a redirect hop (it follows a navigation that already passed the
+ * clock), a subresource, or a subframe's navigation.
+ */
+function isPageLevelRequest(page: Page, request: HTTPRequest): boolean {
+  return request.isNavigationRequest() && request.frame() === page.mainFrame() && request.redirectChain().length === 0;
+}
+
 /** Optional wiring for {@link createScrapingService}. */
 export interface ScrapingServiceOptions {
   /** Stored-cookie source (defaults to the CfCookieStore singleton, resolved per navigation). */
   cookieStore?: CfCookieSource;
   /**
    * THE HOST CLOCK (QB-U30b). Set for a service whose CALLERS do not clock their own calls — the one
-   * handed to plugins (buildEngineServices, caller 'pluginRoute'): then every `page.goto` this service
-   * makes, and every one a `withPage` callback makes, passes the shared per-host clock at the
-   * navigation itself (a declared prime navigation as 'sessionPrime'). Unset (the queue, /lookup,
-   * /catalog, /resolve, whose callers clock the call): only the requests a session prime ADDS pass it.
+   * handed to plugins (buildEngineServices, caller 'pluginRoute'): then every PAGE-LEVEL request of
+   * the pages this service hands out (a main-frame navigation, whatever started it: goto, reload,
+   * back/forward, a submitted form, a followed link) passes the shared per-host clock at the request
+   * itself (a declared prime navigation as 'sessionPrime'). Unset (the queue, /lookup, /catalog,
+   * /resolve, whose callers clock the call): only the requests a session prime ADDS pass it.
    */
   clockCaller?: HostClockCaller;
-  /** The pacer those navigations pass (defaults to the process clock's). */
-  pacer?: HostClockPacer;
+  /** The pacer those requests pass (defaults to the process clock's). */
+  pacer?: PageRequestPacer;
 }
 
 export function createScrapingService(
@@ -563,22 +566,31 @@ export function createScrapingService(
   const clockCaller = options.clockCaller;
 
   /**
-   * A page whose `goto` passes the host clock as `caller`; everything else is the page itself (methods
-   * bound to the real page, so puppeteer's private fields keep working).
+   * THE PLUGIN ROUTES ON THE CLOCK (QB-U30b): every page-level request `page` makes from now on passes
+   * the clock as `caller` at the request itself, so a navigation a plugin starts without page.goto (a
+   * reload, a submitted form, a followed link) is spaced like any other. While the clock may hold one
+   * (the fetch's target, or for a plugin's own page any host, is on the clock) the page's requests are
+   * INTERCEPTED: a page-level request is held for its send block and released there (refused: aborted,
+   * so its navigation fails), every other request is continued at once. Otherwise nothing is
+   * intercepted (byte-identical) and each page-level request is only reported to the observer.
+   * A request that can no longer be resolved (its page closed meanwhile) is dropped quietly.
    */
-  const pacedPage = (page: Page, caller: HostClockCaller): Page => {
-    const paced = new Proxy(page, {
-      get(target, prop) {
-        if (prop === 'goto') {
-          return (url: string, gotoOptions?: Parameters<Page['goto']>[1]) => pacer.send(url, caller, () => target.goto(url, gotoOptions));
-        }
-        const value = Reflect.get(target, prop, target) as unknown;
-        return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(target) : value;
-      },
+  async function clockPageRequests(page: Page, caller: HostClockCaller, targetUrl: string | undefined): Promise<void> {
+    if (!pacer.holds(targetUrl)) {
+      page.on('request', request => {
+        if (isPageLevelRequest(page, request)) pacer.observe(request.url(), caller);
+      });
+      return;
+    }
+    await page.setRequestInterception(true);
+    page.on('request', request => {
+      if (!isPageLevelRequest(page, request)) {
+        request.continue().catch(() => undefined);
+        return;
+      }
+      pacer.send(request.url(), caller, () => request.continue()).catch(() => request.abort('blockedbyclient').catch(() => undefined));
     });
-    pacedPageTargets.set(paced, page);
-    return paced;
-  };
+  }
 
   /**
    * A declared SESSION PRIME makes two requests to the host in one call (QB-U30b). In the plugin service
@@ -593,12 +605,15 @@ export function createScrapingService(
   }
 
   /**
-   * The fetch itself: in the plugin service its navigations pass the clock as the service's caller
-   * (a paced page); otherwise, after a prime this call made, the fetch is the call's second request
-   * and passes the clock as 'sessionPrime'; with no prime it runs exactly as before.
+   * The fetch itself: in the plugin service its page-level requests pass the clock as the service's
+   * caller ({@link clockPageRequests}); otherwise, after a prime this call made, the fetch is the call's
+   * second request and passes the clock as 'sessionPrime'; with no prime it runs exactly as before.
    */
-  function fetchAfter<T>(page: Page, fn: (page: Page) => Promise<T>, primed: boolean, targetUrl: string | undefined): Promise<T> {
-    if (clockCaller) return fn(pacedPage(page, clockCaller));
+  async function fetchAfter<T>(page: Page, fn: (page: Page) => Promise<T>, primed: boolean, targetUrl: string | undefined): Promise<T> {
+    if (clockCaller) {
+      await clockPageRequests(page, clockCaller, targetUrl);
+      return fn(page);
+    }
     if (primed && targetUrl) return pacer.send(targetUrl, 'sessionPrime', () => fn(page));
     return fn(page);
   }

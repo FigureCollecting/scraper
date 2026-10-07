@@ -413,26 +413,16 @@ describe('QB-U30b: every caller on one per-host clock, spacing measured at the t
     expect(mfc.listingFetchP99Ms60m).toBeGreaterThan(0);
   });
 
-  it("/lookup's budget is its own (closeout round 1): an anitoys-like bySearch host (floor 20000) that LOOKUP_STORE_TIMEOUT_MS 35000 cannot wait for and keep the 15 s minimum fetch is RECORDED, fetched at once with the whole 35 s", async () => {
+  it("/lookup's budget is its own (closeout round 1): an anitoys-like bySearch host (floor 20000) that LOOKUP_STORE_TIMEOUT_MS 35000 cannot wait for and keep the 15 s minimum fetch is RECORDED: fetched at once, the queue then waits a full floor", async () => {
     const anitoys = store('anitoys', 'anitoys.example', 20_000, { bySearch: { urlTemplate: 'https://anitoys.example/search?q={q}' } });
     const r = rig({ scope: 'all', stores: [anitoys] });
     r.q.enqueue('a1', { priority: 'WARM', url: 'https://anitoys.example/item/1' });
     await advance(500);
-    const timeouts: number[] = [];
-    const withTimeout = lookupModule.withTimeout;
-    const spy = jest.spyOn(lookupModule, 'withTimeout').mockImplementation((work, ms, what) => {
-      timeouts.push(ms);
-      return withTimeout(work, ms, what);
-    });
-    try {
-      const out = await drive(r.lookup.lookup('figure'), 1000);
-      expect(out.results).toHaveLength(1);
-      expect(out.failed).toEqual([]);
-      expect(out.cooldown).toEqual([]);
-    } finally {
-      spy.mockRestore();
-    }
-    expect(timeouts).toEqual([35_000]);
+    // The fetch timeout it gets (the whole 35 s) is pinned in hostClockHardening.test.ts.
+    const out = await drive(r.lookup.lookup('figure'), 1000);
+    expect(out.results).toHaveLength(1);
+    expect(out.failed).toEqual([]);
+    expect(out.cooldown).toEqual([]);
     r.q.enqueue('a2', { priority: 'WARM', url: 'https://anitoys.example/item/2' });
     await advance(30_000);
     const times = r.wire.filter(w => new URL(w.url).hostname === 'anitoys.example');
