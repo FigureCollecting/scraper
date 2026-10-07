@@ -67,8 +67,12 @@ interface Scenario {
   ids: Map<string, number>;
 }
 
-/** Bursts of contiguous ids (gaps up to maxGapMs), 0-3 planned failures, ~12 % raised from COLD, `restarts` restarts. */
-function scenario(seed: number, bursts: number, restarts: number, maxGapMs = 40_000): Scenario {
+/**
+ * Bursts of contiguous ids (gaps up to maxGapMs), 0-3 planned failures, ~12 % raised from COLD, `restarts`
+ * restarts. Dedup keys are 'x000123' by default; `numericKeys` makes them the id itself, all digits, as
+ * MFC's are (an all-digit key takes POOL-SELECT's padded sort key, R1's skip mark included).
+ */
+function scenario(seed: number, bursts: number, restarts: number, maxGapMs = 40_000, numericKeys = false): Scenario {
   const gen = refMulberry32(seed);
   const events: Event[] = [];
   const fails = new Map<string, number>();
@@ -81,7 +85,8 @@ function scenario(seed: number, bursts: number, restarts: number, maxGapMs = 40_
     id += 50 + Math.floor(gen() * 3_000);
     const size = 5 + Math.floor(gen() * 26);
     for (let j = 0; j < size; j++) {
-      const key = `x${String(seq++).padStart(6, '0')}`;
+      const key = numericKeys ? String(id + j) : `x${String(seq).padStart(6, '0')}`;
+      seq++;
       ids.set(key, id + j);
       const u = gen();
       fails.set(key, u < 0.6 ? 0 : u < 0.85 ? 1 : u < 0.95 ? 2 : 3);
@@ -122,11 +127,11 @@ afterEach(() => {
 
 jest.setTimeout(180_000);
 
-async function runThroughQueue(opts: { seed: number; adversarial: boolean; bursts: number; restarts: number; maxGapMs?: number }): Promise<ClassModelResult & { leftover: number; storeLeft: number; items: number; seconds: number }> {
+async function runThroughQueue(opts: { seed: number; adversarial: boolean; bursts: number; restarts: number; maxGapMs?: number; numericKeys?: boolean }): Promise<ClassModelResult & { leftover: number; storeLeft: number; items: number; seconds: number }> {
   process.env.SCRAPE_QUEUE_MAX_RESIDENT_PER_HOST = '8';
   jest.useFakeTimers();
   jest.setSystemTime(T0);
-  const sc = scenario(opts.seed, opts.bursts, opts.restarts, opts.maxGapMs);
+  const sc = scenario(opts.seed, opts.bursts, opts.restarts, opts.maxGapMs, opts.numericKeys);
   const model = new ClassModel(`${HOST}|WARM`, H_MS);
   const dir = poolTmpDir('pool-theorem-');
   dirs.push(dir);
@@ -229,6 +234,12 @@ describe('starvation theorem through the real queue: A(a) + B(a) + 2 + r for eve
     expect(r.raisedR1Picks).toBeGreaterThan(0);
     expect(r.restartsInWindows).toBeGreaterThan(0);
     expect(r.stages.R2 ?? 0).toBe(0);
+  });
+
+  it.each([101, 202])('adversarial rng with all-digit dedup keys, as MFC\'s are (scenario seed %i)', async (seed) => {
+    const r = await runThroughQueue({ seed, adversarial: true, bursts: 24, restarts: 3, numericKeys: true });
+    expectTheorem(r);
+    expect(r.raisedR1Picks).toBeGreaterThan(0);
   });
 
   it.each([303, 404])('seeded rng, R2 live (age cap H/2), denser bursts so items still reach a + H (scenario seed %i)', async (seed) => {

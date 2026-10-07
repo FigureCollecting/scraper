@@ -25,6 +25,7 @@ import { ScrapeQueue, resetScrapeQueue, type QueuePriority } from '../../service
 import { QUEUE_DB_FILE, type ScrapeQueueStore } from '../../services/queueStore';
 import { PoolDispatch, POOL_SELECT_ENV, setPoolDispatch, type PoolPickEvent } from '../../services/poolDispatch';
 import { HostClock, parseHostClockScope, setHostClock } from '../../services/hostClock';
+import type { Rng } from '../../services/poolSelect';
 import { openPoolStore, poolTmpDir, wirePoolQueue, type SiteSpec, type TransportCall } from '../helpers/poolQueueHarness';
 
 const T0 = 1_800_000_000_000;
@@ -537,5 +538,254 @@ describe('the pool block (getPoolView -> /health/detailed)', () => {
     for (let i = 1; i <= 3; i++) r.queue.enqueue(`k${i}`, { url: url(i * 100), priority: 'WARM' as QueuePriority });
     await advance(4_000);
     expect(r.queue.getPoolView(Date.now()).hosts.find((h) => h.host === HOST)?.picks60m).toBe(3);
+  });
+});
+
+/** Every R3 attempt draws (0.999, 0, 0): no uniform pick, bucket 0, rank 0 = the newest row. */
+function newestFirst(): Rng {
+  let i = 0;
+  return () => (i++ % 3 === 0 ? 0.999 : 0);
+}
+
+/** A rig whose pool always picks the newest row (R1/R2 do not apply to young rows). */
+function newestRig(opts: { select?: string; dir?: string } = {}): Rig {
+  const r = rig({ select: opts.select ?? 'all', dir: opts.dir });
+  r.pool = new PoolDispatch({ select: opts.select ?? 'all', seed: 1, rngFor: () => newestFirst(), onPick: (e) => r.picks.push(e) });
+  r.queue.setPoolDispatch(r.pool);
+  return r;
+}
+
+/** Resident and parked depth of one host, over its lanes. */
+const depth = (q: ScrapeQueue, host: string) =>
+  Object.values(q.getLaneCounts(host)).reduce((a, c) => ({ resident: a.resident + c.resident, parked: a.parked + c.parked }), { resident: 0, parked: 0 });
+
+const tierKeys = (q: ScrapeQueue, tier: 'warmQueue' | 'coldQueue' = 'warmQueue') =>
+  (q as unknown as Record<string, Array<{ mfcId: string }>>)[tier].map((i) => i.mfcId);
+
+const parkedRow = (key: string, id: number, age: number, priority: QueuePriority = 'WARM', host = HOST) =>
+  ({ id: `${key}-1`, mfcId: key, url: url(id, host), priority, attempts: 0, maxRetries: 3, enqueuedAt: T0 - age, state: 'parked' as const });
+
+function seededDir(rows: Array<ReturnType<typeof parkedRow> | (Omit<ReturnType<typeof parkedRow>, 'state'> & { state: 'pending' })>): string {
+  const dir = poolTmpDir('pool-ws-');
+  dirs.push(dir);
+  const seed = openPoolStore(dir);
+  for (const row of rows) seed.put(row);
+  seed.close();
+  return dir;
+}
+
+describe('pooled hosts in the working set and the dispatch scan (the excluded host keeps its places)', () => {
+  it("the shared page-in leaves a pooled host's parked rows on disk: ONE anchor row, its top page-in row; a FIFO host pages in as before", () => {
+    const dir = seededDir([
+      parkedRow('pc', 50, 5000, 'COLD'),
+      parkedRow('p1', 100, 3000),
+      parkedRow('p2', 200, 2000),
+      parkedRow('o1', 7, 4000, 'WARM', 'other.test'),
+      parkedRow('o2', 9, 1000, 'WARM', 'other.test'),
+    ]);
+    const r = rig({ select: 'all,-other.test', dir });
+    expect(r.queue.restoreFromStore(T0)).toMatchObject({ pending: 0, parked: 5 });
+    expect(r.queue.refillWorkingSet(T0)).toBe(3);
+    expect(depth(r.queue, HOST)).toEqual({ resident: 1, parked: 2 });
+    expect(depth(r.queue, 'other.test')).toEqual({ resident: 2, parked: 0 });
+    // The anchor is the host's first row in page-in order: WARM before COLD, then the oldest.
+    expect(tierKeys(r.queue).filter((k) => k.startsWith('p'))).toEqual(['p1']);
+    expect(r.queue.getStats().parked).toBe(2);
+    // Reachable now: a second refill takes nothing more of it.
+    expect(r.queue.refillWorkingSet(T0 + 1)).toBe(0);
+    expect(depth(r.queue, HOST)).toEqual({ resident: 1, parked: 2 });
+  });
+
+  it('a pooled host with no resident row gets its anchor even while FIFO rows fill the working set', () => {
+    process.env.SCRAPE_QUEUE_MAX_RESIDENT = '2';
+    const r = rig({ select: 'all,-other.test' });
+    r.queue.enqueue('o0', { url: url(1, 'other.test'), priority: 'WARM' }); // on the wire
+    r.queue.enqueue('o1', { url: url(2, 'other.test'), priority: 'WARM' });
+    r.queue.enqueue('o2', { url: url(3, 'other.test'), priority: 'WARM' });
+    r.queue.enqueue('p1', { url: url(100), priority: 'WARM' });
+    r.queue.enqueue('p2', { url: url(200), priority: 'WARM' });
+    expect(depth(r.queue, HOST)).toEqual({ resident: 0, parked: 2 });
+    r.queue.refillWorkingSet(Date.now());
+    expect(depth(r.queue, HOST)).toEqual({ resident: 1, parked: 1 });
+    expect(depth(r.queue, 'other.test')).toEqual({ resident: 2, parked: 0 });
+  });
+
+  it('a pooled host whose only resident row is held by its paused session gets its anchor (past the per-host cap)', () => {
+    process.env.SCRAPE_QUEUE_MAX_RESIDENT_PER_HOST = '1';
+    const r = rig({ select: 'all' });
+    const internals = r.queue as unknown as { sessionManager: { isSessionPaused(id: string): boolean } };
+    jest.spyOn(internals.sessionManager, 'isSessionPaused').mockImplementation((id: string) => id === 'paused');
+    r.queue.enqueue('k0', { url: url(1), priority: 'WARM' }); // on the wire
+    r.queue.enqueue('held', { url: url(500), priority: 'COLD', cookies: { a: 'b' }, sessionId: 'paused' });
+    r.queue.enqueue('p1', { url: url(100), priority: 'WARM' });
+    r.queue.enqueue('p2', { url: url(200), priority: 'WARM' });
+    expect(depth(r.queue, HOST)).toEqual({ resident: 1, parked: 2 });
+    r.queue.refillWorkingSet(Date.now());
+    expect(depth(r.queue, HOST)).toEqual({ resident: 2, parked: 1 });
+    expect(tierKeys(r.queue)).toEqual(['p1']);
+  });
+
+  it.each([
+    ['all,-other.test', { resident: 1, parked: 0 }],
+    ['off', { resident: 0, parked: 1 }],
+  ])("a full working set parks a FIFO host's enqueue only when FIFO rows fill it; a pooled host's always (%s)", (knob, fifo) => {
+    process.env.SCRAPE_QUEUE_MAX_RESIDENT = '2';
+    const r = rig({ select: knob });
+    r.queue.enqueue('p0', { url: url(1), priority: 'WARM' }); // on the wire
+    r.queue.enqueue('p1', { url: url(100), priority: 'WARM' });
+    r.queue.enqueue('p2', { url: url(200), priority: 'WARM' });
+    r.queue.enqueue('o1', { url: url(5, 'other.test'), priority: 'WARM' });
+    expect(depth(r.queue, 'other.test')).toEqual(fifo);
+    r.queue.enqueue('p3', { url: url(300), priority: 'WARM' });
+    expect(depth(r.queue, HOST)).toEqual({ resident: 2, parked: 1 });
+  });
+
+  it('a row whose URL has no host is a FIFO row for the cap (the knob never asks about it)', () => {
+    process.env.SCRAPE_QUEUE_MAX_RESIDENT = '2';
+    const r = rig({ select: 'all' });
+    r.queue.enqueue('p0', { url: url(1), priority: 'WARM' }); // on the wire
+    r.queue.enqueue('p1', { url: url(100), priority: 'WARM' });
+    r.queue.enqueue('p2', { url: url(200), priority: 'WARM' });
+    expect(() => r.queue.enqueue('bad', { url: 'not a url', priority: 'WARM' })).not.toThrow();
+    expect(r.queue.getStats()).toMatchObject({ warm: 3, parked: 0 });
+  });
+
+  it('the refill reads disk only for a pooled host that has rows parked', () => {
+    const r = rig({ select: 'all' });
+    r.queue.enqueue('p0', { url: url(1), priority: 'WARM' }); // pool.test: on the wire, nothing parked
+    r.store.put(parkedRow('o1', 7, 1000, 'WARM', 'other.test'));
+    r.queue.setQueueStore(r.store); // re-read the parked counts
+    const pageIn = jest.spyOn(r.store, 'pageIn');
+    r.queue.refillWorkingSet(Date.now());
+    expect(pageIn.mock.calls.map(([, opts]) => opts?.host).filter((h) => h !== undefined)).toEqual(['other.test']);
+    expect(depth(r.queue, 'other.test')).toEqual({ resident: 1, parked: 0 });
+  });
+
+  /** pool.test sent at T0 and other.test at T0 + 500: at T0 + 1000 only pool.test is ready. */
+  async function twoHostsPaced(r: Rig): Promise<void> {
+    r.queue.enqueue('a0', { url: url(1), priority: 'WARM' });
+    await jest.advanceTimersByTimeAsync(500);
+    r.queue.enqueue('x0', { url: url(1, 'other.test'), priority: 'WARM' });
+    await jest.advanceTimersByTimeAsync(10);
+    expect(keysOf(r.calls, HOST).length + keysOf(r.calls, 'other.test').length).toBe(2);
+  }
+
+  it("a pooled RESIDENT pick takes the head's place in the tier, and the head the pick's (FIFO's places)", async () => {
+    const r = newestRig();
+    await twoHostsPaced(r);
+    r.queue.enqueue('a', { url: url(100), priority: 'WARM' });
+    r.queue.enqueue('x', { url: url(7, 'other.test'), priority: 'WARM' });
+    jest.setSystemTime(Date.now() + 1);
+    r.queue.enqueue('b', { url: url(300), priority: 'WARM' });
+    jest.setSystemTime(Date.now() + 1);
+    r.queue.enqueue('c', { url: url(900), priority: 'WARM' });
+    expect(tierKeys(r.queue)).toEqual(['a', 'x', 'b', 'c']);
+    await jest.advanceTimersByTimeAsync(600); // T0 + ~1110: pool.test sent once more, other.test still paced
+    expect(r.picks.filter((p) => p.host === HOST).map((p) => p.key)).toEqual(['a0', 'c']);
+    expect(tierKeys(r.queue)).toEqual(['x', 'b', 'a']);
+  });
+
+  it.each(['WARM', 'HOT'] as const)('after a pooled pick of a PARKED %s row the head moves to the back of its tier', async (priority) => {
+    process.env.SCRAPE_QUEUE_MAX_RESIDENT_PER_HOST = '2';
+    const r = newestRig();
+    await twoHostsPaced(r);
+    r.queue.enqueue('a', { url: url(100), priority: 'WARM' });
+    r.queue.enqueue('x', { url: url(7, 'other.test'), priority: 'WARM' });
+    jest.setSystemTime(Date.now() + 1);
+    r.queue.enqueue('b', { url: url(300), priority: 'WARM' });
+    jest.setSystemTime(Date.now() + 1);
+    r.queue.enqueue('d', { url: url(900), priority });
+    expect(r.store.listParked(HOST, priority).map((p) => p.mfcId)).toEqual(['d']);
+    await jest.advanceTimersByTimeAsync(600);
+    expect(keysOf(r.calls, HOST)).toEqual([1, 900]);
+    expect(tierKeys(r.queue)).toEqual(['x', 'b', 'a']);
+    expect(depth(r.queue, HOST)).toEqual({ resident: 2, parked: 0 });
+  });
+});
+
+describe('pooled claims and candidates: lines a mutant could change unseen', () => {
+  it('a parked row claimed by a pick is in flight: a second enqueue of it dedups (one fetch)', async () => {
+    process.env.SCRAPE_QUEUE_MAX_RESIDENT_PER_HOST = '1';
+    const dir = seededDir([{ ...parkedRow('r1', 100, 2000), state: 'pending' as const }, parkedRow('p1', 900, 500)]);
+    const r = newestRig({ dir });
+    let release: () => void = () => {};
+    const page = jest.fn().mockImplementation(
+      (u: string) =>
+        new Promise((resolve) => {
+          r.calls.push({ t: Date.now(), url: u, status: 200 });
+          release = () => resolve({ html: '<html>ok</html>', url: u, title: 'Item', statusCode: 200 });
+        }),
+    );
+    r.queue.setScrapingService({ scrapePage: page, scrapePageStealth: page } as never);
+    r.queue.restoreFromStore(T0);
+    await jest.advanceTimersByTimeAsync(10);
+    expect(r.picks[0]?.key).toBe('p1');
+    expect(r.queue.enqueue('p1', { url: url(900), priority: 'WARM' }).deduplicated).toBe(true);
+    for (let i = 0; i < 6; i++) {
+      release();
+      await jest.advanceTimersByTimeAsync(1000);
+    }
+    expect(r.calls.filter((c) => c.url === url(900))).toHaveLength(1);
+  });
+
+  it("after a pooled claim with the GLOBAL cap binding, getStats().parked is the store's", async () => {
+    process.env.SCRAPE_QUEUE_MAX_RESIDENT = '1';
+    const dir = seededDir([{ ...parkedRow('r1', 100, 3000), state: 'pending' as const }, parkedRow('p1', 500, 2000), parkedRow('p2', 900, 500)]);
+    const r = newestRig({ dir });
+    r.queue.restoreFromStore(T0);
+    await jest.advanceTimersByTimeAsync(10);
+    expect(r.picks[0]?.key).toBe('p2');
+    expect(r.store.counts().parked).toBe(1);
+    expect(r.queue.getStats().parked).toBe(1);
+    expect(depth(r.queue, HOST).parked).toBe(1);
+  });
+
+  it("a pooled claim takes the row's waiting callers with it (no parked resolvers left behind)", async () => {
+    process.env.SCRAPE_QUEUE_MAX_RESIDENT_PER_HOST = '1';
+    const r = newestRig();
+    r.queue.enqueue('a', { url: url(100), priority: 'WARM' });
+    await jest.advanceTimersByTimeAsync(10);
+    r.queue.enqueue('b', { url: url(400), priority: 'WARM' });
+    jest.setSystemTime(Date.now() + 1);
+    const waiting = r.queue.enqueue('c', { url: url(900), priority: 'WARM' });
+    expect(r.store.listParked(HOST, 'WARM').map((p) => p.mfcId)).toEqual(['c']);
+    await advance(3_000);
+    expect(keysOf(r.calls)).toEqual([100, 900, 400]);
+    await expect(waiting.promise).resolves.toBeDefined();
+    expect((r.queue as unknown as { parkedResolvers: Map<string, unknown> }).parkedResolvers.size).toBe(0);
+  });
+
+  it('a row whose session is COOLING is not a candidate', async () => {
+    const r = newestRig();
+    const internals = r.queue as unknown as { sessionManager: { isInCooldown(id: string): { inCooldown: boolean } } };
+    jest.spyOn(internals.sessionManager, 'isInCooldown').mockImplementation((id: string) => ({ inCooldown: id === 'cool' }) as never);
+    r.queue.enqueue('k0', { url: url(1), priority: 'COLD' });
+    r.queue.enqueue('held', { url: url(500), priority: 'COLD', cookies: { a: 'b' }, sessionId: 'cool' });
+    r.queue.enqueue('k2', { url: url(300), priority: 'COLD' });
+    await advance(12_000);
+    expect(r.picks.map((p) => p.key)).toEqual(['k0', 'k2']);
+    expect(keysOf(r.calls)).toEqual([1, 300]);
+  });
+
+  it('two HOT rows PARKED: the older goes first (HOT stays FIFO)', async () => {
+    process.env.SCRAPE_QUEUE_MAX_RESIDENT_PER_HOST = '1';
+    const dir = seededDir([
+      { ...parkedRow('w1', 100, 9000), state: 'pending' as const },
+      parkedRow('w2', 300, 8000),
+      parkedRow('h1', 700, 5000, 'HOT'),
+      parkedRow('h2', 800, 1000, 'HOT'),
+    ]);
+    const r = newestRig({ dir });
+    r.queue.restoreFromStore(T0);
+    await advance(4_000);
+    expect(keysOf(r.calls).slice(0, 2)).toEqual([700, 800]);
+  });
+
+  it("a row whose URL has no host does not stop the queue under 'all,-host'", async () => {
+    const r = newestRig({ select: 'all,-other.test' });
+    r.queue.enqueue('bad', { url: 'not a url', priority: 'WARM' });
+    r.queue.enqueue('good', { url: url(5), priority: 'WARM' });
+    await advance(3_000);
+    expect(keysOf(r.calls)).toEqual([5]);
   });
 });

@@ -697,6 +697,22 @@ describe('queueStore — paging policy and transaction edges', () => {
     expect(store.pageIn(10, { skipHosts: ['busy.test'] }).map((i) => i.id)).toEqual(['bad']);
   });
 
+  it('pages in only one host\'s rows when `host` is given, highest priority then oldest (a pooled host\'s anchor)', () => {
+    const dir = tmpDir();
+    const store = open(dir);
+    store.put(ITEM({ id: 'o1', mfcId: 'o1', url: 'https://other.test/item/1', enqueuedAt: 500, state: 'parked' }));
+    store.put(ITEM({ id: 'c1', mfcId: 'c1', url: 'https://www.pool.test/item/1', priority: 'COLD', enqueuedAt: 1_000, state: 'parked' }));
+    store.put(ITEM({ id: 'w2', mfcId: 'w2', url: 'https://pool.test/item/2', priority: 'WARM', enqueuedAt: 3_000, state: 'parked' }));
+    store.put(ITEM({ id: 'w1', mfcId: 'w1', url: 'https://pool.test/item/3', priority: 'WARM', enqueuedAt: 2_000, state: 'parked' }));
+    store.put(ITEM({ id: 'bad', mfcId: 'bad', url: 'not a url at all', enqueuedAt: 100, state: 'parked' }));
+
+    expect(store.pageIn(1, { host: 'pool.test' }).map((i) => [i.id, i.state])).toEqual([['w1', 'pending']]);
+    expect(store.pageIn(5, { host: 'pool.test' }).map((i) => i.id)).toEqual(['w2', 'c1']);
+    expect(store.pageIn(5, { host: 'pool.test' })).toEqual([]);
+    // Nothing of another host, nor a row with no host, moved.
+    expect(store.counts()).toMatchObject({ parked: 2, pending: 3 });
+  });
+
   it('rolls the transaction back when the batch body throws', () => {
     const dir = tmpDir();
     const store = open(dir);

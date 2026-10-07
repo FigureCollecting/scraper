@@ -198,12 +198,16 @@ describe('SCRAPE_POOL_SELECT off: FIFO dispatch byte-identical to develop (golde
 });
 
 /**
- * The excluded host's order is its own as long as only the PER-HOST working-set cap binds. When the
- * GLOBAL cap (SCRAPE_QUEUE_MAX_RESIDENT, default 1000) binds, hosts share one page-in budget, so the
- * instant one of the excluded host's parked rows pages in depends on the other hosts' residency, and a
- * pooled host's parked picks move it: the excluded host then dispatches the same items, the same number
- * of times, but a parked HOT row can page in earlier or later than under 'off' (as it already moves
- * under FIFO whenever another host's traffic changes).
+ * The excluded host's order and times are its own as long as only the PER-HOST working-set cap binds:
+ * byte-identical to the golden. When the GLOBAL cap (SCRAPE_QUEUE_MAX_RESIDENT, default 1000) binds,
+ * 'off' itself ties MFC to the other hosts' rows: their rows hold places in the one shared working set,
+ * so a parked MFC row (the HOT raise here) pages in only when they leave. Excluded, MFC's places are
+ * counted against MFC and the other FIFO hosts only, so MFC dispatches at the same instants, the same
+ * items the same number of times, in the golden order, except that a HOT row may go EARLIER. No order
+ * can match 'off' item for item in general under the global cap: a pooled host sends other items, so a
+ * re-post or a retry of one of them changes how many rows it holds, and under 'off' that moves MFC.
+ * scrapeQueuePoolExcluded.test.ts pins the same "never later" under the global cap with five or six
+ * pooled hosts and a saturated dispatch slot.
  */
 describe("SCRAPE_POOL_SELECT='all,-myfigurecollection.net'", () => {
   it.each(['all,-myfigurecollection.net', ' ALL , -WWW.MyFigureCollection.NET. '])(
@@ -223,10 +227,22 @@ describe("SCRAPE_POOL_SELECT='all,-myfigurecollection.net'", () => {
     },
   );
 
-  it('with the GLOBAL cap binding, MFC dispatches the same items the same number of times as under off', async () => {
+  it('with the GLOBAL cap binding, MFC dispatches at the golden instants, the same items as often, in the golden order except a HOT row going earlier', async () => {
     const run = await runScenario('all,-myfigurecollection.net');
-    const mfcDispatches = (lines: string[]) => lines.filter((l) => l.startsWith('dispatch ') && / m\d+ \(/.test(l)).map((l) => l.split(' ').slice(2).join(' ')).sort();
-    expect(mfcDispatches(run.lines)).toEqual(mfcDispatches(golden().trimEnd().split('\n')));
+    // 'dispatch <ms> <key> (<PRIORITY> <attempt>)' -> [ms, key, priority, attempt]
+    const mfcDispatches = (lines: string[]) =>
+      lines.filter((l) => l.startsWith('dispatch ') && / m\d+ \(/.test(l)).map((l) => l.replace(/[()]/g, '').split(' ').slice(1));
+    const ex = mfcDispatches(run.lines);
+    const gold = mfcDispatches(golden().trimEnd().split('\n'));
+    const item = (d: string[]) => `${d[1]} ${d[2]} ${d[3]}`;
+    expect(gold.length).toBeGreaterThan(20);
+    expect(ex.map((d) => d[0])).toEqual(gold.map((d) => d[0]));
+    expect(ex.map(item).sort()).toEqual(gold.map(item).sort());
+    const notHot = (ds: string[][]) => ds.filter((d) => d[2] !== 'HOT').map(item);
+    expect(notHot(ex)).toEqual(notHot(gold));
+    const hot = ex.filter((d) => d[2] === 'HOT');
+    expect(hot.length).toBeGreaterThan(0);
+    for (const d of hot) expect(Number(d[0])).toBeLessThanOrEqual(Number(gold.find((g) => item(g) === item(d))?.[0]));
   });
 
   it('the pooled hosts dispatch in a different order from FIFO for this seed (the pool is live)', async () => {
