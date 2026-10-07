@@ -235,6 +235,8 @@ describe('pooled picks', () => {
     expect(r.store.listParked(HOST, 'WARM').map((p) => p.mfcId)).toEqual(['w1']);
     await advance(1_000);
     expect(keysOf(r.calls).slice(0, 2)).toEqual([100, 9]);
+    // The pick was made in the WARM class (its anti-sequence history and skip marks), not the head's COLD one.
+    expect(r.picks.find((p) => p.key === 'w1')?.classKey).toBe(`${HOST}|WARM`);
   });
 
   it('page-in follows the rule: a hard-aged PARKED row is paged in and dispatched by R1 ahead of younger residents', async () => {
@@ -464,6 +466,22 @@ describe('the pool block (getPoolView -> /health/detailed)', () => {
     expect(agedPool.agedCount).toBe(9);
     expect(agedPool.picks60m).toBe(0); // the pick left the trailing hour
     for (const h of aged.hosts) expect(Buffer.byteLength(JSON.stringify(h))).toBeLessThan(4096);
+  });
+
+  it('counts the picks of a trailing-dot spelling under the host itself', async () => {
+    const r = rig({ select: 'all', seed: 1 });
+    r.queue.enqueue('k1', { url: `https://${HOST}./item/100`, priority: 'WARM' });
+    await jest.advanceTimersByTimeAsync(10);
+    expect(r.picks.map((p) => p.host)).toEqual([`${HOST}.`]);
+    expect(r.queue.getPoolView(Date.now()).hosts.map((h) => [h.host, h.picks60m])).toEqual([[HOST, 1]]);
+  });
+
+  it('agedCount counts PARKED COLD rows past the age cap too', () => {
+    const r = rig({ select: 'all', seed: 1, ageCaps: `${HOST}=1` });
+    r.store.put(parkedRow('cold', 5, 2 * H, 'COLD'));
+    r.store.put(parkedRow('warm', 6, 2 * H, 'WARM'));
+    r.store.put(parkedRow('young', 7, 1000, 'COLD'));
+    expect(r.queue.getPoolView(T0).hosts.find((h) => h.host === HOST)?.agedCount).toBe(2);
   });
 
   it('lists a host named in the knob even with nothing queued, and the queue\'s hosts with zeros when off', () => {
@@ -728,12 +746,16 @@ describe('pooled claims and candidates: lines a mutant could change unseen', () 
     expect(r.calls.filter((c) => c.url === url(900))).toHaveLength(1);
   });
 
-  it("after a pooled claim with the GLOBAL cap binding, getStats().parked is the store's", async () => {
+  it("after a pooled claim with the GLOBAL cap binding, getStats().parked is the store's while the row is on the wire", async () => {
     process.env.SCRAPE_QUEUE_MAX_RESIDENT = '1';
     const dir = seededDir([{ ...parkedRow('r1', 100, 3000), state: 'pending' as const }, parkedRow('p1', 500, 2000), parkedRow('p2', 900, 500)]);
     const r = newestRig({ dir });
+    // The fetch never answers: no later scan re-reads the count.
+    const page = jest.fn().mockImplementation(() => new Promise(() => {}));
+    r.queue.setScrapingService({ scrapePage: page, scrapePageStealth: page } as never);
     r.queue.restoreFromStore(T0);
     await jest.advanceTimersByTimeAsync(10);
+    expect(page).toHaveBeenCalledTimes(1);
     expect(r.picks[0]?.key).toBe('p2');
     expect(r.store.counts().parked).toBe(1);
     expect(r.queue.getStats().parked).toBe(1);
@@ -779,6 +801,17 @@ describe('pooled claims and candidates: lines a mutant could change unseen', () 
     r.queue.restoreFromStore(T0);
     await advance(4_000);
     expect(keysOf(r.calls).slice(0, 2)).toEqual([700, 800]);
+  });
+
+  it('the anti-sequence id is an all-digit LAST path segment only ("x101" has none)', async () => {
+    const r = newestRig();
+    r.queue.enqueue('k100', { url: url(100), priority: 'WARM' }); // sent at once: the class's last id is 100
+    r.queue.enqueue('far', { url: `https://${HOST}/item/900`, priority: 'WARM' });
+    jest.setSystemTime(Date.now() + 1);
+    r.queue.enqueue('near', { url: `https://${HOST}/item/x101`, priority: 'WARM' });
+    await advance(1_500);
+    // 'near' is the newest and has no id, so nothing holds it back; read as 101 it would sit within 3 of 100.
+    expect(r.picks.map((p) => p.key)).toEqual(['k100', 'near']);
   });
 
   it("a row whose URL has no host does not stop the queue under 'all,-host'", async () => {
