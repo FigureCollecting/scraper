@@ -241,13 +241,13 @@ describe('pooled picks', () => {
     expect(r.picks.find((p) => p.key === 'w1')?.classKey).toBe(`${HOST}|WARM`);
   });
 
-  it('page-in follows the rule: a hard-aged PARKED row is paged in and dispatched by R1 ahead of younger residents', async () => {
+  it.each(['WARM', 'COLD'] as const)('page-in follows the rule (%s): a hard-aged PARKED row is paged in and dispatched by R1 ahead of younger residents', async (tier) => {
     const dir = poolTmpDir('pool-pagein-');
     dirs.push(dir);
     const seed = openPoolStore(dir);
-    seed.put({ id: 'old-1', mfcId: 'old', url: url(500), priority: 'WARM', attempts: 0, maxRetries: 3, enqueuedAt: T0 - 30 * H, state: 'parked' });
+    seed.put({ id: 'old-1', mfcId: 'old', url: url(500), priority: tier, attempts: 0, maxRetries: 3, enqueuedAt: T0 - 30 * H, state: 'parked' });
     for (let i = 1; i <= 5; i++) {
-      seed.put({ id: `r-${i}`, mfcId: `r${i}`, url: url(i * 100), priority: 'WARM', attempts: 0, maxRetries: 3, enqueuedAt: T0 - i * 1000, state: 'pending' });
+      seed.put({ id: `r-${i}`, mfcId: `r${i}`, url: url(i * 100), priority: tier, attempts: 0, maxRetries: 3, enqueuedAt: T0 - i * 1000, state: 'pending' });
     }
     seed.close();
     process.env.SCRAPE_QUEUE_MAX_RESIDENT_PER_HOST = '5';
@@ -258,6 +258,23 @@ describe('pooled picks', () => {
     expect(keysOf(r.calls)).toEqual([500]);
     expect(r.store.counts()).toEqual({ pending: 5, leased: 0, parked: 0 });
   });
+
+  it.each(['WARM', 'COLD'] as const)(
+    '%s: the old rows parked over the per-host cap are all dispatched while new arrivals keep the host resident',
+    async (tier) => {
+      process.env.SCRAPE_QUEUE_MAX_RESIDENT_PER_HOST = '2';
+      const r = rig({ select: 'all', seed: 7, ageCaps: `${HOST}=0.01` });
+      for (let i = 0; i < 10; i++) r.queue.enqueue(`old${i}`, { url: url(100 + i), priority: tier });
+      expect(r.store.listParked(HOST, tier)).toHaveLength(7); // old0 went at once; old1, old2 fill the cap
+      let k = 0;
+      for (let ms = 0; ms < 4 * 60_000; ms += 500) {
+        if (ms % 1000 === 0) r.queue.enqueue(`new${++k}`, { url: url(10_000 + k), priority: tier });
+        await jest.advanceTimersByTimeAsync(500);
+      }
+      // The class picks over its own tier's parked rows too: they age into R1 and go, they do not starve.
+      expect(keysOf(r.calls).filter((id) => id >= 100 && id < 110).sort((a, b) => a - b)).toEqual(Array.from({ length: 10 }, (_, i) => 100 + i));
+    },
+  );
 
   it('a PARKED row ages from its class entry, not its first enqueue', async () => {
     const dir = poolTmpDir('pool-parked-cea-');
