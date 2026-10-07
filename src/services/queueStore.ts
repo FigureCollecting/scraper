@@ -119,6 +119,8 @@ export interface PersistedQueueItem {
   maxRetries: number;
   /** `QueueItem.queuedAt` (epoch ms). */
   enqueuedAt: number;
+  /** STUB (QB-U19 red commit). */
+  classEnteredAt?: number;
   state: QueueItemState;
   /** Epoch ms at which a lease expires. Only meaningful while state === 'leased'. */
   leaseUntil?: number;
@@ -223,7 +225,9 @@ export interface ScrapeQueueStore {
    */
   claimKey(mfcId: string): PersistedQueueItem | null;
   /** Record a priority upgrade, so a restored item comes back at the priority it was raised to. */
-  setPriority(id: string, priority: QueuePriority): void;
+  setPriority(id: string, priority: QueuePriority, classEnteredAt?: number): void;
+  /** STUB (QB-U19 red commit). */
+  listParked(host: string, priority: QueuePriority): PersistedQueueItem[];
   /**
    * Label an UNLABELLED row (the queue's coalesce rule), so a restored item keeps the lane it adopted.
    * A row that already carries a lane, one this build knows or not, is left as it is.
@@ -768,6 +772,10 @@ function openSqliteStore(opts: OpenQueueStoreOptions, onUnknownLane: (value: str
       write(() => stmt.setLane.run(lane, id));
     },
 
+    listParked(): PersistedQueueItem[] {
+      return [];
+    },
+
     countByHostLane(state: QueueItemState): HostLaneRow[] {
       const rows = read(
         () => stmt.countByHostLane.all(state) as unknown as Array<{ host: string | null; lane: unknown; n: number }>,
@@ -917,6 +925,7 @@ export function createMemoryQueueStore(
     claimKey: () => null,
     setPriority: () => {},
     setLane: () => {},
+    listParked: () => [],
     countByHostLane: () => [],
     releaseLeases: () => 0,
     reapExpiredLeases: () => [],

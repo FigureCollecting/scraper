@@ -75,6 +75,7 @@ import type { QueueStoreView } from '../services/scrapeQueue.js';
 import type { HandsOffView } from '../services/extractionRegistry.js';
 import type { PluginsView } from '../services/pluginBootstrap.js';
 import type { HostClockView } from '../services/hostClock.js';
+import type { PoolView } from '../services/poolDispatch.js';
 
 export interface HealthDeps {
   /** The service version (package.json). */
@@ -171,6 +172,8 @@ export interface HealthDeps {
    * Counters only, under 1 KB per host; never throws.
    */
   getHostClock: () => HostClockView;
+  /** STUB (QB-U19 red commit). */
+  getPool: () => PoolView;
 }
 
 export function createHealthRoutes(deps: HealthDeps): Router {

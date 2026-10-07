@@ -30,6 +30,7 @@ import { evaluateRecordFetch, RecordFetchStatusError } from './recordFetchGate.j
 import { observeMfcItemFetch } from './sessionCanary.js';
 import { getChallengeCooldown, ChallengeCooldownError, normalizeHost, type ChallengeCooldown } from './challengeCooldown.js';
 import { getHostClock, type HostClock } from './hostClock.js';
+import type { PoolDispatch, PoolView } from './poolDispatch.js';
 import {
   createMemoryQueueStore,
   type PersistedQueueItem,
@@ -142,6 +143,8 @@ export interface QueueItem {
   maxRetries: number;
   /** When this item was queued */
   queuedAt: number;
+  /** When the item entered its dispatch class (QB-U19). STUB. */
+  classEnteredAt?: number;
   /** Last error encountered */
   lastError?: string;
   /** Error type for classification */
@@ -1040,6 +1043,14 @@ export class ScrapeQueue {
    */
   storeHostFloorMs(host: string): number | undefined {
     return this.profiles?.forHost(host) ? this.hostBaseDelayMs(host) : undefined;
+  }
+
+  /** STUB (QB-U19 red commit). */
+  setPoolDispatch(_pool: PoolDispatch | null): void {}
+
+  /** STUB (QB-U19 red commit). */
+  getPoolView(_now: number = Date.now()): PoolView {
+    return { scope: 'off', malformed: false, hosts: [] };
   }
 
   /** The active challenge-cooldown register — the injected instance, else the shared singleton. */

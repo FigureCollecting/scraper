@@ -74,6 +74,7 @@ app.use('/', createHealthRoutes({
   listPlugins: () => pluginsView(pluginBootstrap),
   // The shared host clock's send-time observer (QB-U30a): reads the same with the clock off.
   getHostClock: () => getHostClock().view(Date.now()),
+  getPool: () => getScrapeQueue().getPoolView(Date.now()),
 }));
 
 // Scraper routes (no /api prefix for consistency)
