@@ -5,8 +5,8 @@
  * every pass. The scenario walks a fresh cursor, a cap cutting a page short, listing drift between passes,
  * a cooldown, an exhaustion candidate and its confirmation, a re-check that is not due and one that is.
  *
- * The fixture was written by this same file on develop 049ac7ce (before QB-U24); PAGE_POOL_GOLDEN_OUT=<file>
- * writes the trace a tree produces, to regenerate it there. The file never names a pool field, so it runs
+ * The fixture was written by this same file on develop 049ac7ce (before QB-U24; sha256 1e1e8a769a594b6b...);
+ * PAGE_POOL_GOLDEN_OUT=<file> writes the trace a tree produces, to regenerate it there. The file never names a pool field, so it runs
  * unchanged on both trees. Fake engine and fake clock: no network.
  */
 import * as fs from 'fs';
@@ -75,7 +75,13 @@ const trace = async (env: Record<string, string>) => {
       ledgers: digest([...ledgers.files.entries()].sort(([a], [b]) => a.localeCompare(b))),
     });
   }
-  return { passes, finalLedgers: Object.fromEntries([...ledgers.files.entries()].sort(([a], [b]) => a.localeCompare(b))) };
+  // The final ledgers' cursor state in full; their enqueued maps (about 470 entries) as a count and a digest.
+  const finalLedgers = Object.fromEntries(
+    [...ledgers.files.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([siteId, l]) => [siteId, { backfill: l.backfill, recent: l.recent, enqueued: Object.keys(l.enqueued).length, enqueuedDigest: digest(l.enqueued) }]),
+  );
+  return { passes, finalLedgers };
 };
 
 describe('CRAWLER_PAGE_POOL off: the crawl is byte-identical to develop', () => {
