@@ -9,6 +9,7 @@
 import type { FetchBodyDetail, FetchRequest } from './engineServices/capturingFetch.js';
 import { CookieJar } from 'tough-cookie';
 import { isCloudflareChallenge } from './engineServices/challengeDetect.js';
+import { processHostClockPacer, type HostClockPacer } from './hostClockSend.js';
 import { getCfCookieStore, type CfCookieSource } from './cookieJar.js';
 import { normalizeHost } from './challengeCooldown.js';
 
@@ -192,23 +193,27 @@ function ensurePrimed(
   headers: Record<string, string>,
   nowMs: number,
   ttlMs: number,
-): Promise<void> {
+  // THE HOST CLOCK (QB-U30b): how the prime GET leaves. The call's FIRST request is the one its caller
+  // already put on the clock when it invoked this transport, so it is only stamped where it really
+  // leaves (pacer.first); a RE-prime is a later request of the call and runs its own send block.
+  sendPrime: (get: () => Promise<ImpitResponseLike>) => Promise<ImpitResponseLike>,
+): Promise<'cached' | 'primed'> {
   const host = hostOf(primeUrl);
-  if (host === undefined) return Promise.resolve();
+  if (host === undefined) return Promise.resolve('cached');
   const primedAt = session.primed.get(host);
-  if (primedAt !== undefined && nowMs - primedAt < ttlMs) return Promise.resolve();
+  if (primedAt !== undefined && nowMs - primedAt < ttlMs) return Promise.resolve('cached');
   const inFlight = session.priming.get(host);
-  if (inFlight) return inFlight;
+  if (inFlight) return inFlight.then(() => 'primed' as const);
   const p = (async () => {
     try {
-      await session.impit.fetch(primeUrl, { method: 'GET', headers });
+      await sendPrime(() => session.impit.fetch(primeUrl, { method: 'GET', headers }));
       session.primed.set(host, nowMs);
     } finally {
       session.priming.delete(host);
     }
   })();
   session.priming.set(host, p);
-  return p;
+  return p.then(() => 'primed' as const);
 }
 
 /**
@@ -252,6 +257,11 @@ export interface CreateImpitFetchOptions {
   primeTtlMs?: number;
   /** Stored-cookie source (defaults to the CfCookieStore singleton, resolved per call). */
   store?: CfCookieSource;
+  /**
+   * The host clock for the requests a primed call adds (QB-U30b caller 'sessionPrime'); defaults to
+   * the process clock's pacer (SCRAPE_HOST_CLOCK; off by default, so nothing waits).
+   */
+  pacer?: HostClockPacer;
 }
 
 /**
@@ -280,6 +290,7 @@ async function readDetail(res: ImpitResponseLike): Promise<FetchBodyDetail> {
 export function createImpitFetchDetailed(makeImpit: MakeImpit = defaultMakeImpit, options: CreateImpitFetchOptions = {}) {
   const now = options.now ?? Date.now;
   const primeTtlMs = options.primeTtlMs ?? PRIME_TTL_MS;
+  const pacer = options.pacer ?? processHostClockPacer();
   // Cache the SESSION promise (not the resolved session) so the get-then-set is synchronous and two
   // concurrent first-calls for a profile can never build two Impits. A failed build evicts itself.
   const sessions = new Map<string, Promise<ImpitSession>>();
@@ -338,8 +349,16 @@ export function createImpitFetchDetailed(makeImpit: MakeImpit = defaultMakeImpit
       return readDetail(await target());
     }
     const primeUrl = opts.prime.url;
-    await ensurePrimed(session, primeUrl, headers, now(), primeTtlMs);
-    let detail = await readDetail(await target());
+    // A primed call sends MORE than one request to the host (QB-U30b): the prime GET this call makes
+    // is its first request (stamped on the clock where it leaves); every request after it, the target
+    // included, passes the clock as 'sessionPrime'. An already primed host: the target is the first.
+    const firstGet = (get: () => Promise<ImpitResponseLike>) => {
+      pacer.first(primeUrl);
+      return get();
+    };
+    const paced = (requestUrl: string, get: () => Promise<ImpitResponseLike>) => pacer.send(requestUrl, 'sessionPrime', get);
+    const primed = await ensurePrimed(session, primeUrl, headers, now(), primeTtlMs, firstGet);
+    let detail = await readDetail(await (primed === 'cached' ? target() : paced(url, target)));
     // Only a parseable prime host can be re-primed; an unparseable one has nothing to retry against,
     // so it returns the body as-is rather than re-fetching the target for no gain.
     if (hostOf(primeUrl) !== undefined && looksLikeChallenge(detail.body)) {
@@ -354,8 +373,8 @@ export function createImpitFetchDetailed(makeImpit: MakeImpit = defaultMakeImpit
       // challenged ⇒ return it; the ruleset yields empty and the caller's own retry/backoff owns the
       // next attempt.
       invalidatePrime(session, primeUrl);
-      await ensurePrimed(session, primeUrl, headers, now(), primeTtlMs);
-      detail = await readDetail(await target());
+      await ensurePrimed(session, primeUrl, headers, now(), primeTtlMs, get => paced(primeUrl, get));
+      detail = await readDetail(await paced(url, target));
     }
     return detail;
   };

@@ -9,6 +9,7 @@
  * default off.
  */
 import { HostClock, getHostClock, parseHostClockScope, setHostClock, startHostClockSummary } from '../../services/hostClock';
+import { U30B_FIELDS, U30B_SENDS } from '../helpers/hostClockU30bFields';
 
 const MFC = 'myfigurecollection.net';
 
@@ -327,7 +328,7 @@ describe('HostClock', () => {
       clock.setFloorSource(host => (host === MFC ? 7000 : host === 'hpoi.net' ? 3000 : undefined));
       return clock;
     }
-    const idle = { sends60m: { queue: 0, image: 0 }, minGapMs60m: 0, underFloor60m: 0, lastSendAt: null };
+    const idle = { sends60m: { queue: 0, image: 0, ...U30B_SENDS }, minGapMs60m: 0, underFloor60m: 0, ...U30B_FIELDS, lastSendAt: null };
 
     it('shows a listed store host with zeros while idle', () => {
       expect(observed().view(0)).toEqual({ mode: 'hosts', hosts: [{ host: MFC, floorMs: 7000, clocked: true, ...idle }] });
@@ -346,7 +347,7 @@ describe('HostClock', () => {
       clock.recordSend(MFC, 'queue', 19_000);
       expect(clock.view(20_000).hosts).toEqual([{
         host: MFC, floorMs: 7000, clocked: true,
-        sends60m: { queue: 2, image: 2 }, minGapMs60m: 5000, underFloor60m: 1, lastSendAt: new Date(19_000).toISOString(),
+        sends60m: { queue: 2, image: 2, ...U30B_SENDS }, minGapMs60m: 5000, underFloor60m: 1, ...U30B_FIELDS, lastSendAt: new Date(19_000).toISOString(),
       }]);
     });
 
@@ -365,7 +366,7 @@ describe('HostClock', () => {
       clock.recordSend(MFC, 'image', 0);
       expect(clock.view(0)).toEqual({ mode: 'off', hosts: [{
         host: MFC, floorMs: 7000, clocked: false,
-        sends60m: { queue: 1, image: 1 }, minGapMs60m: 0, underFloor60m: 1, lastSendAt: new Date(0).toISOString(),
+        sends60m: { queue: 1, image: 1, ...U30B_SENDS }, minGapMs60m: 0, underFloor60m: 1, ...U30B_FIELDS, lastSendAt: new Date(0).toISOString(),
       }] });
     });
 
@@ -428,7 +429,7 @@ describe('HostClock', () => {
       clock.recordSend(MFC, 'image', 10);
       clock.setFloorSource(null);
       expect(clock.view(10).hosts).toEqual([{
-        host: MFC, floorMs: 0, clocked: true, sends60m: { queue: 1, image: 1 }, minGapMs60m: 10, underFloor60m: 0,
+        host: MFC, floorMs: 0, clocked: true, sends60m: { queue: 1, image: 1, ...U30B_SENDS }, minGapMs60m: 10, underFloor60m: 0, ...U30B_FIELDS,
         lastSendAt: new Date(10).toISOString(),
       }]);
     });

@@ -15,6 +15,7 @@ import { ChallengeCooldown } from '../../services/challengeCooldown';
 import { HostClock, parseHostClockScope, setHostClock } from '../../services/hostClock';
 import { paceImageBytesByHost } from '../../services/images/imageBytesPacing';
 import type { ImageBytesResult } from '../../services/images/imageBytes';
+import { U30B_FIELDS, U30B_SENDS } from '../helpers/hostClockU30bFields';
 
 const MFC = 'myfigurecollection.net';
 const FLOOR = 7000;
@@ -268,7 +269,7 @@ describe('paceImageBytesByHost on the shared host clock (QB-U8)', () => {
       expect(settle.mock.calls).toEqual([[MFC, 7600, FLOOR]]);
       expect(recordSend.mock.calls).toEqual([[MFC, 'image', 7600]]);
       expect(clock.view(7600).hosts).toEqual([{
-        host: MFC, floorMs: FLOOR, clocked: true, sends60m: { queue: 0, image: 1 }, minGapMs60m: 0, underFloor60m: 0,
+        host: MFC, floorMs: FLOOR, clocked: true, sends60m: { queue: 0, image: 1, ...U30B_SENDS }, minGapMs60m: 0, underFloor60m: 0, ...U30B_FIELDS,
         lastSendAt: new Date(7600).toISOString(),
       }]);
     });
@@ -300,7 +301,7 @@ describe('paceImageBytesByHost on the shared host clock (QB-U8)', () => {
       expect(fetcher).not.toHaveBeenCalled();
       expect(settle).not.toHaveBeenCalled();
       expect(recordSend).not.toHaveBeenCalled();
-      expect(clock.view(7000).hosts[0].sends60m).toEqual({ queue: 0, image: 0 });
+      expect(clock.view(7000).hosts[0].sends60m).toEqual({ queue: 0, image: 0, ...U30B_SENDS });
       // The limiter never saw a dispatch either: the host is still "never dispatched" there.
       expect(limiter.msUntilReady(MFC, 7000)).toBe(0);
     });
@@ -392,7 +393,7 @@ describe('paceImageBytesByHost on the shared host clock (QB-U8)', () => {
       // Today's limiter pacing, untouched: the first gap is its 2067 ms default.
       expect(times[1] - times[0]).toBe(2067);
       expect(off.view(times[3])).toEqual({ mode: 'off', hosts: [{
-        host: MFC, floorMs: FLOOR, clocked: false, sends60m: { queue: 0, image: 4 }, minGapMs60m: minGap(times), underFloor60m: 3,
+        host: MFC, floorMs: FLOOR, clocked: false, sends60m: { queue: 0, image: 4, ...U30B_SENDS }, minGapMs60m: minGap(times), underFloor60m: 3, ...U30B_FIELDS,
         lastSendAt: new Date(times[3]).toISOString(),
       }] });
     });

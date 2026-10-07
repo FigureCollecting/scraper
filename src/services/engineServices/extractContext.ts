@@ -50,6 +50,8 @@ import {
   resolveBrowserLaneOptions,
   withoutDeclaredEgress,
 } from '../residentialEgress.js';
+import type { HostClock } from '../hostClock.js';
+import { sendOnHostClockOrThrow } from '../hostClockSend.js';
 
 /**
  * Default courtesy gap (ms) when a store profile declares no `rateLimit.baseDelayMs` — should be
@@ -106,6 +108,11 @@ export interface BuildExtractContextOptions {
   sleep?: (ms: number) => Promise<void>;
   /** The engine's residential proxy (default: the process's RESIDENTIAL_PROXY_URL, resolved at boot). */
   residentialProxyUrl?: () => string | undefined;
+  /**
+   * The shared per-host clock (QB-U30b) fetchBody follow-ups book on (caller 'fetchBody'). Optional —
+   * defaults to the process clock (SCRAPE_HOST_CLOCK; off by default); tests inject one.
+   */
+  hostClock?: HostClock;
 }
 
 /** Lowercased, `www.`-stripped hostname; `undefined` on an unparseable URL (never throws). */
@@ -249,6 +256,22 @@ export function buildExtractContext(options: BuildExtractContextOptions): Extrac
   // primary page fetch — otherwise only the FIRST follow-up ever waits, and every call after it
   // is gapped against a primaryFetchedAt that has long since elapsed. Seeded with the primary
   // fetch's own host/time so the first same-host follow-up's behaviour is unchanged.
+  /**
+   * A ruleset's in-extraction request to a store host (fetchBody, and the scrapePage /
+   * scrapePageStealth passthroughs) on the shared per-host clock as caller 'fetchBody' (QB-U30b): on a
+   * clocked host it waits for the host's next slot and runs the send block; a slot past the wait cap
+   * rejects with a HostClockRefusedError; any other host is sent at once, as before.
+   */
+  const onClock = <T>(url: string, send: () => Promise<T>): Promise<T> => {
+    const host = safeHostname(url);
+    if (host === undefined) return send();
+    return sendOnHostClockOrThrow({ host, caller: 'fetchBody' }, send, {
+      ...(options.hostClock ? { clock: options.hostClock } : {}),
+      now,
+      sleep,
+    });
+  };
+
   const lastFetchedAt = options.lastFetchedAt ?? new Map<string, number>();
   if (primaryHost !== undefined) {
     // Monotonic seed: never regress a SHARED map's entry (a sibling context may have touched the
@@ -265,8 +288,16 @@ export function buildExtractContext(options: BuildExtractContextOptions): Extrac
     scraping: {
       // `async` so an egress REFUSAL rejects the returned promise rather than throwing
       // synchronously out of a Promise-returning API (a ruleset's `.catch()` must be able to see it).
-      scrapePage: async (url, pageOptions) => options.scraping.scrapePage(url, withLaneOptions(url, pageOptions)),
-      scrapePageStealth: async (url, pageOptions) => options.scraping.scrapePageStealth(url, withLaneOptions(url, pageOptions)),
+      // The lane options are resolved (and a refusal thrown) BEFORE the host clock is asked, so a
+      // refused request never costs the host a slot.
+      scrapePage: async (url, pageOptions) => {
+        const lane = withLaneOptions(url, pageOptions);
+        return onClock(url, () => options.scraping.scrapePage(url, lane));
+      },
+      scrapePageStealth: async (url, pageOptions) => {
+        const lane = withLaneOptions(url, pageOptions);
+        return onClock(url, () => options.scraping.scrapePageStealth(url, lane));
+      },
       browserFetch: notSupported('browserFetch'),
       withBrowser: notSupported('withBrowser'),
       withPage: notSupported('withPage'),
@@ -287,10 +318,16 @@ export function buildExtractContext(options: BuildExtractContextOptions): Extrac
         // Same host scope as the page passthroughs: an off-store follow-up keeps the store's
         // transport/headers but never its residential exit.
         const searchFetch = onDeclaringStore(url) ? options.searchFetch : withoutDeclaredEgress(options.searchFetch);
-        const result = await options.capturingFetch(url, searchFetch, {
-          ...(cookies ? { cookies } : {}),
-          ...(request ? { request } : {}),
-        });
+        // THE HOST CLOCK (QB-U30b): after the courtesy gap, a follow-up to a clocked store host books
+        // the host's next slot on the shared clock and runs the send block, so it is spaced from the
+        // primary fetch and from every other caller of that host. A slot past the wait cap rejects with
+        // a HostClockRefusedError (nothing sent), which the ruleset's own error handling sees.
+        const result = await onClock(url, () =>
+          options.capturingFetch(url, searchFetch, {
+            ...(cookies ? { cookies } : {}),
+            ...(request ? { request } : {}),
+          }),
+        );
         if (targetHost !== undefined) {
           lastFetchedAt.set(targetHost, now());
         }
