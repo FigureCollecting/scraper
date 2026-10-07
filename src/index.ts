@@ -14,6 +14,7 @@ import { getChallengeCooldown } from './services/challengeCooldown.js';
 import { getCfCookieStore } from './services/cookieJar.js';
 import { getHostClock, startHostClockSummary } from './services/hostClock.js';
 import { getMaxPagesGuard } from './services/maxPagesGuard.js';
+import { announcePoolDispatch, getPoolDispatch } from './services/poolDispatch.js';
 import { LOOKUP_MIN_FETCH_MS, resolveLookupStoreTimeoutMs } from './driver/assembleLookup.js';
 import { residentialEgressView } from './services/residentialEgress.js';
 import { rawStoreView, flushRawCaptureSink } from './services/s3ObjectStore.js';
@@ -78,6 +79,8 @@ app.use('/', createHealthRoutes({
   getHostClock: () => getHostClock().view(Date.now()),
   // The engine's maxPages guard (QB-U24): the /catalog pages it answered without a store fetch.
   getMaxPagesGuard: () => getMaxPagesGuard().view(Date.now()),
+  // The queue's POOL-SELECT dispatch per host (QB-U19): zeros while SCRAPE_POOL_SELECT is off.
+  getPool: () => getScrapeQueue().getPoolView(Date.now()),
 }));
 
 // Scraper routes (no /api prefix for consistency)
@@ -104,6 +107,11 @@ async function startServer(): Promise<void> {
   // fallback: the engine then runs exactly as it did before, minus the durability.
   const queue = getScrapeQueue();
   queue.setQueueStore(createQueueStore());
+  // POOL-SELECT DISPATCH (SCRAPE_POOL_SELECT, default off; QB-U19): a pooled host's next item is picked
+  // from its whole class (resident and parked rows) instead of FIFO. Each refused knob value is a WARN,
+  // and the boot line names the scope, the caps and this process's seed (picks replay from it). Logged
+  // before anything can be dispatched, whatever the plugin bootstrap does next.
+  announcePoolDispatch(getPoolDispatch());
 
   // STORED COOKIES (CF_COOKIE_FILE): load the hand-minted per-host cookie jar BEFORE any fetch can
   // run, and start its mtime poller so a re-minted file (a refreshed Secret) goes live without a

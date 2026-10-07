@@ -63,7 +63,11 @@
  *     scrape, lookup, fetchBody, sessionPrime, pluginRoute), and
  *     `maxPagesGuard: {mode, stores: [{siteId, maxPagesGuarded60m, lastGuardedAt}]}` (the engine's
  *     SCRAPE_CATALOG_MAX_PAGES_GUARD: per store, the /catalog pages above the profile's maxPages it answered
- *     exhausted WITHOUT a store fetch in the trailing hour).
+ *     exhausted WITHOUT a store fetch in the trailing hour), and
+ *     `pool: {scope, malformed, hosts: [{host, mode, picks60m, topBucketShare60m, uniformPicks60m,
+ *     agedPicks60m, agedShare60m, forcedPicks60m, agedCount, p99WaitH60m, maxWaitH60m, redraws60m,
+ *     scanFallbacks60m, retryPicks60m}]}` (the queue's POOL-SELECT dispatch per host, QB-U19: which
+ *     hosts SCRAPE_POOL_SELECT pools, and the trailing hour of their picks; zeros when off).
  *     A browser-pool-health failure still degrades to 500, now carrying { status:'degraded',
  *     challengeCooldowns, cfCookies, error } — both lists survive (neither lister can throw).
  */
@@ -82,6 +86,7 @@ import type { HandsOffView } from '../services/extractionRegistry.js';
 import type { PluginsView } from '../services/pluginBootstrap.js';
 import type { HostClockView } from '../services/hostClock.js';
 import type { MaxPagesGuardView } from '../services/maxPagesGuard.js';
+import type { PoolView } from '../services/poolDispatch.js';
 
 export interface HealthDeps {
   /** The service version (package.json). */
@@ -185,6 +190,14 @@ export interface HealthDeps {
    * answered exhausted without a store fetch in the trailing hour. Counters only; never throws.
    */
   getMaxPagesGuard: () => MaxPagesGuardView;
+  /**
+   * The queue's POOL-SELECT dispatch (getScrapeQueue().getPoolView(now), QB-U19): SCRAPE_POOL_SELECT as
+   * parsed (`scope`, `malformed`) and, per host, `{host, mode: pool | fifo-excluded | fifo-off,
+   * picks60m, topBucketShare60m, uniformPicks60m, agedPicks60m, agedShare60m, forcedPicks60m, agedCount,
+   * p99WaitH60m, maxWaitH60m, redraws60m, scanFallbacks60m, retryPicks60m}` over the trailing hour.
+   * Zeros for a FIFO host (and every host when the knob is off). Counters only, never throws.
+   */
+  getPool: () => PoolView;
 }
 
 export function createHealthRoutes(deps: HealthDeps): Router {
@@ -228,6 +241,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         plugins: deps.listPlugins(),
         hostClock: deps.getHostClock(),
         maxPagesGuard: deps.getMaxPagesGuard(),
+        pool: deps.getPool(),
         timestamp: new Date().toISOString(),
       });
     } catch (error) {
@@ -257,6 +271,8 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         // Whether MFC is being sent to under its floor matters most when the pod is sick, too.
         hostClock: deps.getHostClock(),
         maxPagesGuard: deps.getMaxPagesGuard(),
+        // So do waits past the age cap and forced picks (the starvation alarm's inputs).
+        pool: deps.getPool(),
         error: error instanceof Error ? error.message : 'Unknown error',
       });
     }

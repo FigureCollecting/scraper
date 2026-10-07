@@ -117,8 +117,9 @@ function inspect<T>(dir: string, fn: (db: DatabaseSync) => T): T {
 const columnsOf = (db: DatabaseSync, table: string): string[] =>
   (db.prepare(`PRAGMA table_info(${table})`).all() as unknown as Array<{ name: string }>).map((c) => c.name);
 
+/** The lane step's record (QB-U19 added a second step, queue_items.class_entered_at, pinned in its own suite). */
 const metaRows = (db: DatabaseSync) =>
-  db.prepare('SELECT key, value, applied_at FROM schema_meta ORDER BY key').all() as unknown as Array<{
+  db.prepare("SELECT key, value, applied_at FROM schema_meta WHERE key = 'queue_items.lane' ORDER BY key").all() as unknown as Array<{
     key: string;
     value: string;
     applied_at: number;
