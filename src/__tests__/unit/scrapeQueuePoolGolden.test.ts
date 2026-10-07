@@ -177,7 +177,7 @@ describe('SCRAPE_POOL_SELECT off: FIFO dispatch byte-identical to develop (golde
     expect(text((await runScenario(knob)).lines)).toBe(golden());
   });
 
-  it.each(['-myfigurecollection.net', 'all,myfigurecollection.net', '+myfigurecollection.net', 'all,-', 'off,late.test', 'late.test,all'])(
+  it.each(['-myfigurecollection.net', 'all,myfigurecollection.net', '+myfigurecollection.net', 'all,-', 'off,late.test', 'late.test,all', 'all,', ',all'])(
     "malformed '%s': behaves exactly as off (golden)",
     async (knob) => {
       expect(text((await runScenario(knob)).lines)).toBe(golden());

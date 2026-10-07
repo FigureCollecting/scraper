@@ -67,6 +67,45 @@ describe('PoolDispatch: per-host mode from SCRAPE_POOL_SELECT', () => {
   });
 });
 
+describe("PoolDispatch: SCRAPE_POOL_SELECT is read with the shared host-select grammar (hostSelect.ts, strict lists)", () => {
+  it.each(['all,', ',all'])("'%s' (a blank token beside 'all') is malformed: off, with the shared grammar's one warning", (raw) => {
+    const pd = new PoolDispatch({ select: raw, seed: 1 });
+    expect(pd.modeFor('hpoi.net')).toBe('fifo-off');
+    expect(pd.scopeView()).toEqual({ scope: 'off', malformed: true, hosts: [] });
+    expect(pd.warnings()).toEqual([
+      `[POOL] WARN ${POOL_SELECT_ENV}="${raw}" is malformed (entry "all" is a keyword, not a host, inside a host list); treated as off`,
+    ]);
+  });
+
+  it.each(['-myfigurecollection.net', 'all,myfigurecollection.net', '+myfigurecollection.net', 'all,-'])(
+    "the acceptance's malformed value '%s' is off, with one warning naming it",
+    (raw) => {
+      const pd = new PoolDispatch({ select: raw, seed: 1 });
+      expect(pd.modeFor('myfigurecollection.net')).toBe('fifo-off');
+      expect(pd.modeFor('hpoi.net')).toBe('fifo-off');
+      expect(pd.scopeView()).toEqual({ scope: 'off', malformed: true, hosts: [] });
+      expect(pd.warnings()).toHaveLength(1);
+      expect(pd.warnings()[0]).toMatch(new RegExp(`^\\[POOL\\] WARN ${POOL_SELECT_ENV}="${raw.replace(/[+.]/g, '\\$&')}" is malformed \\(.+\\); treated as off$`));
+    },
+  );
+
+  it("'all,-a,-b' excludes both; the scope lists the excluded hosts once, normalised", () => {
+    const pd = new PoolDispatch({ select: 'all,-a.test,-WWW.B.test.,-a.test', seed: 1 });
+    expect(pd.scopeView()).toEqual({ scope: 'all-except', malformed: false, hosts: ['a.test', 'b.test'] });
+    expect(pd.modeFor('a.test')).toBe('fifo-excluded');
+    expect(pd.modeFor('www.b.test')).toBe('fifo-excluded');
+    expect(pd.modeFor('c.test')).toBe('pool');
+    expect(pd.warnings()).toEqual([]);
+  });
+
+  it('a value with a line break is named on ONE log line', () => {
+    const pd = new PoolDispatch({ select: 'all,-a.test\n[POOL] forged', seed: 1 });
+    expect(pd.scopeView().malformed).toBe(true);
+    expect(pd.warnings()).toHaveLength(1);
+    expect(pd.warnings()[0]).not.toMatch(/[\r\n]/);
+  });
+});
+
 describe('PoolDispatch: age and hard caps', () => {
   it(`defaults: age cap ${DEFAULT_POOL_AGE_CAP_H} h, hard cap 2 x age cap`, () => {
     const pd = new PoolDispatch({ select: 'all', seed: 1 });

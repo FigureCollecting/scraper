@@ -221,8 +221,10 @@ describe('pooled picks', () => {
     const r = rig({ select: 'all', seed: 5 });
     for (let i = 1; i <= 6; i++) r.queue.enqueue(`w${i}`, { url: url(i * 100), priority: 'WARM' });
     await jest.advanceTimersByTimeAsync(10);
+    const pageIn = jest.spyOn(r.store, 'pageIn');
     r.queue.enqueue('h1', { url: url(7), priority: 'HOT' });
-    expect(r.store.listParked(HOST, 'HOT').map((p) => p.mfcId)).toEqual(['h1']);
+    // It parked, and the enqueue's refill paged it in as the host's HOT anchor.
+    expect(pageIn.mock.results.flatMap((res) => res.value as Array<{ mfcId: string }>).map((row) => row.mfcId)).toEqual(['h1']);
     await advance(1_500);
     expect(keysOf(r.calls)[1]).toBe(7);
   });
@@ -643,6 +645,22 @@ describe('pooled hosts in the working set and the dispatch scan (the excluded ho
     expect(tierKeys(r.queue)).toEqual(['p1']);
   });
 
+  it('a resident row ABOVE the parked rows\' tier held by its paused session does not count: the host gets its anchor', () => {
+    process.env.SCRAPE_QUEUE_MAX_RESIDENT_PER_HOST = '1';
+    const r = rig({ select: 'all' });
+    const internals = r.queue as unknown as { sessionManager: { isSessionPaused(id: string): boolean } };
+    jest.spyOn(internals.sessionManager, 'isSessionPaused').mockImplementation((id: string) => id === 'paused');
+    r.queue.enqueue('k0', { url: url(1), priority: 'WARM' }); // on the wire
+    r.queue.enqueue('held', { url: url(500), priority: 'WARM', cookies: { a: 'b' }, sessionId: 'paused' });
+    r.queue.enqueue('p1', { url: url(100), priority: 'WARM' });
+    r.queue.enqueue('p2', { url: url(200), priority: 'WARM' });
+    r.queue.refillWorkingSet(Date.now());
+    expect(depth(r.queue, HOST)).toEqual({ resident: 2, parked: 1 });
+    // A row with cookies queues HOT: the scan cannot dispatch it, so it reaches the host at no tier.
+    expect((r.queue as unknown as Record<string, Array<{ mfcId: string }>>).hotQueue.map((i) => i.mfcId)).toEqual(['held']);
+    expect(tierKeys(r.queue)).toEqual(['p1']);
+  });
+
   it.each([
     ['all,-other.test', { resident: 1, parked: 0 }],
     ['off', { resident: 0, parked: 1 }],
@@ -703,7 +721,7 @@ describe('pooled hosts in the working set and the dispatch scan (the excluded ho
     expect(tierKeys(r.queue)).toEqual(['x', 'b', 'a']);
   });
 
-  it.each(['WARM', 'HOT'] as const)('after a pooled pick of a PARKED %s row the head moves to the back of its tier', async (priority) => {
+  it('after a pooled pick of a PARKED WARM row the head moves to the back of its tier', async () => {
     process.env.SCRAPE_QUEUE_MAX_RESIDENT_PER_HOST = '2';
     const r = newestRig();
     await twoHostsPaced(r);
@@ -712,12 +730,92 @@ describe('pooled hosts in the working set and the dispatch scan (the excluded ho
     jest.setSystemTime(Date.now() + 1);
     r.queue.enqueue('b', { url: url(300), priority: 'WARM' });
     jest.setSystemTime(Date.now() + 1);
-    r.queue.enqueue('d', { url: url(900), priority });
-    expect(r.store.listParked(HOST, priority).map((p) => p.mfcId)).toEqual(['d']);
+    r.queue.enqueue('d', { url: url(900), priority: 'WARM' });
+    expect(r.store.listParked(HOST, 'WARM').map((p) => p.mfcId)).toEqual(['d']);
     await jest.advanceTimersByTimeAsync(600);
     expect(keysOf(r.calls, HOST)).toEqual([1, 900]);
     expect(tierKeys(r.queue)).toEqual(['x', 'b', 'a']);
     expect(depth(r.queue, HOST)).toEqual({ resident: 2, parked: 0 });
+  });
+
+  it('a PARKED HOT row of a pooled host is paged in and goes as HOT (FIFO, no pick): the WARM rows keep their places', async () => {
+    process.env.SCRAPE_QUEUE_MAX_RESIDENT_PER_HOST = '2';
+    const r = newestRig();
+    await twoHostsPaced(r);
+    r.queue.enqueue('a', { url: url(100), priority: 'WARM' });
+    r.queue.enqueue('x', { url: url(7, 'other.test'), priority: 'WARM' });
+    jest.setSystemTime(Date.now() + 1);
+    r.queue.enqueue('b', { url: url(300), priority: 'WARM' });
+    jest.setSystemTime(Date.now() + 1);
+    const pageIn = jest.spyOn(r.store, 'pageIn');
+    r.queue.enqueue('d', { url: url(900), priority: 'HOT' });
+    // It parked (over the per-host cap), and the enqueue's refill paged it in as the host's HOT anchor.
+    expect(pageIn.mock.calls.filter(([, opts]) => opts?.host === HOST).map(([, opts]) => opts?.priorities)).toEqual([['HOT']]);
+    expect(r.store.listParked(HOST, 'HOT')).toEqual([]);
+    await jest.advanceTimersByTimeAsync(600);
+    expect(keysOf(r.calls, HOST)).toEqual([1, 900]);
+    expect(r.picks.map((p) => p.key)).not.toContain('d');
+    expect(tierKeys(r.queue)).toEqual(['a', 'x', 'b']);
+    expect(depth(r.queue, HOST)).toEqual({ resident: 2, parked: 0 });
+  });
+
+  // HOT always first, tiers in order (closeout i2 BLOCKER): a pooled host's parked rows of a tier ABOVE
+  // every dispatchable resident row it has are reached only through an anchor of that tier. Without one,
+  // a HOT row waited for the host's COLD head, behind every other host's WARM rows.
+  /** pool.test: one row on the wire, one resident `resident` row, then `parked` rows over both caps (1 / 1). */
+  function residentThenParked(resident: QueuePriority, parked: Array<[string, QueuePriority]>): Rig {
+    process.env.SCRAPE_QUEUE_MAX_RESIDENT = '1';
+    process.env.SCRAPE_QUEUE_MAX_RESIDENT_PER_HOST = '1';
+    const r = rig({ select: 'all' });
+    r.queue.enqueue('wire', { url: url(1), priority: 'WARM' }); // on the wire
+    r.queue.enqueue('res', { url: url(50), priority: resident });
+    parked.forEach(([key, priority], k) => r.queue.enqueue(key, { url: url(100 + k), priority }));
+    return r;
+  }
+
+  it.each([
+    ['COLD', 'HOT', 'hotQueue'],
+    ['WARM', 'HOT', 'hotQueue'],
+    ['COLD', 'WARM', 'warmQueue'],
+  ] as const)('resident %s, parked %s: the refill anchors the parked row in its own tier, whatever the caps', (resident, parked, tier) => {
+    const r = residentThenParked(resident, [['lowc', 'COLD'], ['up1', parked], ['up22', parked]]);
+    r.queue.refillWorkingSet(Date.now());
+    expect(depth(r.queue, HOST)).toEqual({ resident: 2, parked: 2 });
+    expect((r.queue as unknown as Record<string, Array<{ mfcId: string }>>)[tier].map((i) => i.mfcId)).toContain('up1');
+    // Reachable in that tier now: a second refill takes nothing more.
+    r.queue.refillWorkingSet(Date.now() + 1);
+    expect(depth(r.queue, HOST)).toEqual({ resident: 2, parked: 2 });
+  });
+
+  it.each([
+    ['HOT', 'WARM'],
+    ['HOT', 'HOT'],
+    ['WARM', 'WARM'],
+    ['WARM', 'COLD'],
+  ] as const)('resident %s, parked %s: no anchor (the scan reaches the host at that tier or above)', (resident, parked) => {
+    const r = residentThenParked(resident, [['p1', parked]]);
+    r.queue.refillWorkingSet(Date.now());
+    expect(depth(r.queue, HOST)).toEqual({ resident: 1, parked: 1 });
+  });
+
+  it('a pooled host reachable at HOT costs the refill no disk read for an anchor', () => {
+    const r = residentThenParked('HOT', [['p1', 'COLD']]);
+    const pageIn = jest.spyOn(r.store, 'pageIn');
+    r.queue.refillWorkingSet(Date.now());
+    expect(pageIn.mock.calls.filter(([, opts]) => opts?.host !== undefined)).toEqual([]);
+    expect(depth(r.queue, HOST)).toEqual({ resident: 1, parked: 1 });
+  });
+
+  // The working-set bound (closeout i2 SHOULD): the FIFO hosts' cap counts their RESIDENT rows only,
+  // never a pooled host's parked ones.
+  it("a FIFO host fills its places up to the cap, and no further, while a pooled host has rows parked", () => {
+    process.env.SCRAPE_QUEUE_MAX_RESIDENT = '4';
+    const r = rig({ select: 'all,-other.test' });
+    for (let i = 0; i < 12; i++) r.queue.enqueue(`p${i}`, { url: url(100 + i), priority: 'WARM' });
+    for (let i = 0; i < 12; i++) r.queue.enqueue(`o${i}`, { url: url(100 + i, 'other.test'), priority: 'WARM' });
+    r.queue.refillWorkingSet(Date.now());
+    expect(depth(r.queue, HOST).parked).toBeGreaterThan(0);
+    expect(depth(r.queue, 'other.test')).toEqual({ resident: 4, parked: 8 });
   });
 });
 
