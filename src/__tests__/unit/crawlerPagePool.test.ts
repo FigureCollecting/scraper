@@ -599,6 +599,12 @@ describe('ledger.recent.pagePool', () => {
     const p = await runPass(mkCfg({ ...POOLED, pagePoolLookahead: 3 }), engine, createMemoryLedgerStore({ orzgk: ledgerAt(engine.items('orzgk'), 10) }), T0, 6);
     expect(sorted(p.backfillGets())).toEqual([10, 11, 12]);
   });
+
+  it('a lookahead above the pages per run handed straight to the crawler is still held to the pages per run', async () => {
+    const engine = makePagedEngine({ orzgk: catalog(30) });
+    const p = await runPass(mkCfg({ ...POOLED, pagePoolLookahead: 8 }), engine, createMemoryLedgerStore({ orzgk: ledgerAt(engine.items('orzgk'), 10) }), T0, 6);
+    expect(sorted(p.backfillGets())).toEqual([10, 11, 12, 13, 14]);
+  });
 });
 
 describe('listing drift (k ids prepended per pass)', () => {
@@ -690,12 +696,25 @@ describe('listing drift (k ids prepended per pass)', () => {
     });
 
     it('the page size is the recent read\'s PAGE 1, not a shorter page it read later', async () => {
-      // k = 11 on 10-id pages: page 3 of the recent read answers three known ids. ceil(11 / 3) would re-read four pages.
-      const short = (_s: string, page: number): EngineReply | undefined =>
-        page === 3
-          ? { status: 200, body: { siteId: 'orzgk', page, url: 'x', items: ['o9990', 'o9989', 'o9988'].map((id) => ({ itemId: id, collectUrl: itemUrl('orzgk', id) })), collectUrls: [], hasMore: true, nextPage: 4, count: 3 } }
-          : undefined;
+      // k = 11 on 10-id pages (new ids n900000..n899990). Pages 2 and 3 of the recent read answer three ids
+      // each: page 2 the last new id and two known ones, page 3 three known ids. ceil(11 / 3) would re-read four.
+      const page = (n: number, ids: string[]): EngineReply => ({
+        status: 200,
+        body: { siteId: 'orzgk', page: n, url: 'x', items: ids.map((id) => ({ itemId: id, collectUrl: itemUrl('orzgk', id) })), collectUrls: [], hasMore: true, nextPage: n + 1, count: ids.length },
+      });
+      const short = (_s: string, n: number): EngineReply | undefined =>
+        n === 2 ? page(2, ['n899990', 'o10000', 'o9999']) : n === 3 ? page(3, ['o9998', 'o9997', 'o9996']) : undefined;
       expect(await setFor({ prepend: 11, run: [22, 26], reply: short })).toEqual([20, 21, 22, 23, 27]);
+    });
+
+    it('re-observed known ids are not drift: a recent read that only re-observes keeps the marks', async () => {
+      // Every known id is older than reobserveAfterMs, so the recent read re-POSTs its three pages of known ids.
+      const engine = makePagedEngine({ orzgk: catalog(60) });
+      const l = ledgerAt(engine.items('orzgk'), 20);
+      l.recent.pagePool = { visited: [[22, 23, iso(T0 - HOUR_MS)]] };
+      const p = await runPass(mkCfg({ ...POOLED, reobserveAfterMs: HOUR_MS }), engine, createMemoryLedgerStore({ orzgk: l }), T0, 11);
+      expect(p.store().recentNew).toBe(30);
+      expect(sorted(p.backfillGets())).toEqual([20, 21, 24, 25, 26]);
     });
   });
 });
