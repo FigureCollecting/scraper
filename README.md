@@ -191,6 +191,7 @@ Detailed health check with browser pool status plus two operator views (additive
   | `open_failed` | false | SQLite refused the file and the retry failed too |
   | `open_failed_recovered` | **true** | The file was unusable, was moved aside to `quarantinedPath` (never deleted), and a fresh store opened; readable rows were salvaged into it |
   | `write_failed` | false | A write failed at runtime (full disk, revoked mount). The store degraded to in-memory for the rest of the process life and kept serving |
+  | `held` | false | The engine came up without every plugin (one failed to import, failed the plugin shape check or was refused while it registered — see `plugins.refused` — or no store registered at all, or the plugin bootstrap threw), so the file at `path` was closed at startup **without being restored**: a row whose store cannot be extracted would fail `EXTRACTION_UNAVAILABLE`, which is terminal, and be deleted. This process queues in memory; the rows wait for a start whose plugins all load. The file's open host cooldowns stay in it as well and are not applied by this process. `pending`, `leased` and `parked` read 0 here (they count the in-memory store); the log line `[SCRAPE QUEUE] durable queue HELD, not restored (<why>): …` names how many rows were left in the file |
 
   Startup emits exactly one greppable line whenever the store is not durable:
 
@@ -199,6 +200,8 @@ Detailed health check with browser pool status plus two operator views (additive
   ```
 
   **A pod that cannot attach its volume never reaches this code at all.** If a local-path claim cannot bind on the node the pod is scheduled to, the pod stays `Pending` and the container never starts — a scheduling signal visible in `kubectl describe pod`, not a `durable: false` reading.
+- `handsOff`: `[{siteId, hosts, tier, handsOff, denied, policyVersion}]` — the hands-off policies the rulesets plugin registered (plugin contract 0.17.0, `registerHandsOffPolicy`): the hosts Claude and its tools never contact (`handsOff: true`), permanently denied hosts (`denied: true`; `siteId: null` for a host-only entry), each with its robots.txt AI-bar `tier` and the policy version. A policy covers each listed host and its subdomains; the engine refuses a policy on a subdomain that is less strict than its parent's, so a listed decision is never lifted below it. Reading it sends no request anywhere. `[]` when no plugin registered a policy (a plugin older than 0.17.0, a plugin that failed to load, or before the plugins load); `plugins` below tells those apart. It survives the degraded (500) response. A plugin is loaded whole or not at all: if the registry refuses any call it makes while it loads, none of its stores, policies or routes are kept, so the list is never partial. Once a plugin has loaded its registration is closed: a call made after its `register()` resolved throws and takes no effect, so no policy is ever applied after the stores it guards went live. The robots summary, pins and route samples stay in the registry, never on this endpoint.
+- `plugins`: `{loaded: [{name, version}], refused: [{name, version}]}` — which plugins loaded at startup and which were refused (none of a refused plugin's registrations were kept). `refused` lists first the packages advertising the `scraper-ruleset` keyword that failed to import or are not a ScraperPlugin (named from their `package.json`), then the plugins the registry refused while they loaded. Names and versions only; why is in the pod log (`[PLUGIN LOADER] Failed to import candidate plugin …` / `[PLUGIN LOADER] Skipping …`, or `[PLUGIN BOOTSTRAP] Failed to register plugin …`). A refused plugin also holds the durable queue (`queueStore.reason: held`). Survives the degraded (500) response.
 - `residentialEgress`: `{configured, proxy?}` — whether a residential egress proxy (`RESIDENTIAL_PROXY_URL`) is wired. `proxy` (its `scheme://host:port`) appears only under `RESIDENTIAL_EGRESS_HEALTH_DETAIL=true`, since this endpoint is unauthenticated; credentials are stripped at the source either way, so a `user:password@` proxy never appears here. `{configured: false}` ⇒ every store declaring `egress: 'residential'` is refused (see *Residential egress* under Environment Variables).
 
 ### GET /version
@@ -670,6 +673,7 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
 | `CRAWLER_EXHAUSTED_RECHECK_MS` | `604800000` (7d) | Re-check an exhausted store's last cursor after this long |
 | `CRAWLER_RANGE_STORES` | *(none)* | csv of siteIds that walk their sequential id space; empty = no id-range walking at all |
 | `CRAWLER_RANGE_IDS_PER_RUN` | `50` | Max ids walked per store per run (the window asked of `/catalog?range=1`); clamped to the engine's `200`-id ceiling with a WARN |
+| `CRAWLER_RANGE_DESCENT_CAPS` | *(none)* | csv of `siteId:n` (`mfc:0`) lowering one store's DESCENT window below `CRAWLER_RANGE_IDS_PER_RUN`; a cap never raises it, and a store absent keeps it. `0` = no descent for that store: no window GET, no POST, its `range.cursor`, `range.frontier` and `range.seed` untouched (`rangeSkipped: "descent-cap"`), while the re-anchor, both gap sweeps and the lists step run as before. A malformed entry is ignored with a WARN naming it; an entry naming a store that is not id-range walked is ignored with a WARN |
 | `CRAWLER_RANGE_FRONTIER_<SITEID>` | *(none)* | Seed frontier for a store whose ledger has no numeric itemId yet; CHANGING it later re-seeds the walk from the new top. `<SITEID>` = the siteId uppercased with every non-alphanumeric character replaced by `_` |
 | `CRAWLER_RANGE_REANCHOR_H` | `24` | How often the frontier is moved up to the newest id the ledger has seen (never one the gap sweep wrote), recording the band it skipped as a KNOWN GAP. `0` = every run |
 | `CRAWLER_RANGE_REANCHOR_MAX_DELTA` | `50000` | The widest move one re-anchor may make. A wider one is refused with a WARN naming this knob and reported as `rangeReanchorRefused`, and it is tried again every run until the ledger or the knob changes. Raise it for a frontier frozen a long time. `0` refuses every move |
@@ -680,6 +684,7 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
 | `CRAWLER_LISTS_WINDOW_UTC` | *(none = no list fetched)* | Company lists: `HH:MM-HH:MM` UTC window (may wrap midnight) in which ONE group may be fetched per pass. Malformed or zero-width = off, with a WARN. The backlog drains outside it |
 | `CRAWLER_LISTS_INTERVAL_H` | `160` | Company lists: a group is fetched at most once per this many hours. In-window passes per day × interval days should cover the group count (7 × 6.67 ≈ 46 < 54 for mfc); below that the least-recently-polled rotation stretches the cycle to groups ÷ passes per day days |
 | `CRAWLER_LISTS_SPACING_MS` | `10000` | Company lists: wait between two lists of one group; never below `10000` (raised with a WARN) |
+| `CRAWLER_LISTS_ALTERNATE` | *(none)* | Company lists: csv of siteIds whose passes that START inside `CRAWLER_LISTS_WINDOW_UTC` fetch EITHER the Latest Additions tap OR one company group, never both; each window opens with a lists pass (7 in-window passes = L T L T L T L, 4 groups a night). Only a store with a lists step (`CRAWLER_LISTS_DRAIN_CAPS`) and a mode running recent and backfill; any other name is ignored with a WARN. Empty = today's pass |
 | `CRAWLER_REOBSERVE_MIN_AGE_H` | `12` | Re-observation lane: an id is eligible once its last observation is this many hours old. The SAME value is the backoff window for an id whose last re-observation was refused, so `0` means both "age is no bar" and "no backoff at all" — a refused id is retried on the very next run |
 | `CRAWLER_MAX_REOBSERVE_PER_STORE` | `0` | Re-observation lane: global per-store ceiling on re-observations per run. `0` = the lane is OFF unless a store opts in below |
 | `CRAWLER_STORE_REOBSERVE_CAPS` | *(none)* | csv of `siteId:cap` (`goodsmileus:50,bbts:20`) — the lane's per-store budget, SEPARATE from `CRAWLER_STORE_ENQUEUE_CAPS`, so neither lane starves the other. A malformed entry is ignored with a WARN; the rest still apply |
@@ -693,7 +698,8 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
   "version": 1,
   "siteId": "orzgk",
   "enqueued": { "<itemId>": { "at": "2026-09-06T12:00:00.000Z", "collectUrl": "https://...",
-                              "reobserveFailedAt": "...", "reobserveFailures": 1 } },
+                              "reobserveFailedAt": "...", "reobserveFailures": 1,
+                              "via": "tap", "lastVia": "reobserve" } },
   "backfill": {
     "cursor": 12,
     "exhaustCandidateCursor": 12, "exhaustCandidateAt": "...",
@@ -710,6 +716,16 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
 simply has no `range` and is neither corrupt nor migrated (the file stays `version: 1`). A `range`
 that IS present must be well formed — a malformed cursor or frontier is **corrupt**, never a silent
 reset that would re-walk the whole id space nor a non-number reported as one.
+
+`via` names the source whose accepted POST CREATED the entry: `tap` (the recent listing of a store
+in `CRAWLER_RANGE_STORES`; for mfc that listing IS the Latest Additions tap), `recent` (any other
+store's recent listing), `backfill`, `descent` (the id-range walk), `gap`, `lists` or `seed`;
+`reobserve` only ever appears as a `lastVia`, and `target` is reserved. FIRST WRITER WINS: a later
+write to the same id (a recent re-observation, the re-observation lane) keeps `via`, or keeps it
+absent on an entry written before the field existed, and records itself as `lastVia`. Both are
+optional and the file stays `version: 1`. Entries are not validated on load, so any build loads and
+saves back a value it does not know untouched (an older build's recent re-observation still rebuilds
+the entry whole and drops both).
 
 A missing file is a fresh ledger. Unparseable JSON, a wrong `version`, a wrong `siteId`, or a
 malformed section is **corrupt**: the store is refused for the run (counted as an error) and the
@@ -778,7 +794,7 @@ because the newest ids always outrank the deep id space for the run's budget.
   already gone, does not walk at all. Size them for it: `CRAWLER_MAX_REQUESTS` must cover the listing
   phases plus, per range store, one window GET and up to `CRAWLER_RANGE_IDS_PER_RUN` POSTs, and the
   store's cap must have that much headroom left. When it does not, `rangeSkipped` on the store
-  summary says which — `cap`, `budget`, `no-frontier`, `floor`, `cooldown`, `unsupported`, `failed`,
+  summary says which — `descent-cap`, `cap`, `budget`, `no-frontier`, `floor`, `cooldown`, `unsupported`, `failed`,
   `window-malformed`, `window-rejected`, `store-stopped`, `not-run`, `not-configured` — and it is `null` on a run that
   actually asked for a window. The window GET itself is synthesized (no upstream fetch) but is still
   charged one slot of the global budget and one spacing interval.
@@ -893,8 +909,24 @@ a stop in one lane (cooldown, challenge, sick scraper) stops every lane below it
   `interrupted`), `listsFetched`, `listsFailed`, `listsIdsSeen`, `listsIdsNew`, `listsEnqueued` (kept
   out of `enqueued`), `listsPending`, `listsDrainApplied`, `listsSkipped` (`not-configured`, `not-run`,
   `store-stopped`, `state-corrupt`, `state-failed`, `window-off`, `outside-window`, `paused`,
-  `none-due`, `unsupported`, `cooldown`, `budget`, `failed`; `null` when a group was fetched) and
+  `none-due`, `alternation-tap`, `unsupported`, `cooldown`, `budget`, `failed`; `null` when a group was fetched) and
   `listsDrainStopped`. Run level: `totalListsEnqueued`.
+- **Alternation** (`CRAWLER_LISTS_ALTERNATE`; Ross MS 2026-10-04) — for a named store, the kind of a pass
+  that starts inside the window is decided once, before the tap, from the lists state's `alternation`
+  marker `{lastInWindowKind, windowStart, at}`: no marker, or one from another window, = a LISTS pass (so
+  every window opens with lists, every night); otherwise the opposite of the last kind. A LISTS pass skips
+  the store's recent and backfill phases (both read the Latest Additions listing) and rotates as above; if
+  it issued no list GET (`none-due`, `paused`, `unsupported`, past the window) and the store is not stopped,
+  it taps after the id-range phase instead (`fallback-tap`); a list GET that was issued, answered or not,
+  costs the pass's tap. A TAP pass runs recent and backfill and asks for no group (`listsSkipped:
+  "alternation-tap"`). Both drain the backlog. The marker records the INTENDED kind (`lists` after a
+  fallback tap) and only the lists step's own save writes it, so a pass whose lists step did not run
+  (store stopped first) repeats its kind next pass: a tap pass stopped on its tap costs that night a
+  group. A pass that starts outside the window taps as today and never asks for a group, even if it
+  reaches the lists step inside the window; the marker is untouched. A lists state that cannot be read at
+  pass start turns alternation off for that pass (one WARN; today's pass). The marker is not validated on
+  load: a build without this knob keeps it, and a malformed one counts as absent. Store summary:
+  `alternation` = `off`, `outside-window`, `lists`, `tap` or `fallback-tap`.
 - **Stop switch** — remove the store from `CRAWLER_LISTS_DRAIN_CAPS` (no fetch, no drain); unset
   `CRAWLER_LISTS_WINDOW_UTC` to stop fetching while the backlog drains. A crawler on this version
   against an older engine loses only the priority (the old `/ingest/scrape` reads `url` alone), so every
@@ -1391,6 +1423,8 @@ See `.env.example` for complete configuration template.
   - A file SQLite cannot open is **moved aside** with a timestamp suffix, never deleted, and a fresh store is opened; readable rows are salvaged out of the quarantined copy. The engine stays durable through this
   - A write that fails at runtime degrades the store to in-memory for the rest of the process and reports `write_failed`. Rows already on disk are not lost — the next start reconciles them. Only a **storage** fault does this (full disk, I/O error, the mount gone read-only); a constraint or statement fault is an engine bug, is reported once, and does **not** cost the process its durability
   - The queue holds **one row per dedup key**, enforced by a unique index. A row left `leased` by a process that died is CLAIMED by the next enqueue of that key rather than duplicated, so a hard kill cannot cause a second fetch inside the live lease or reset the item's attempt budget
+  - Each row carries an optional work-class `lane` (`new`, `company` or `gap`; no lane counts as `other`) for the lane scheduler, kept through restore, lease, page-in and salvage. When one URL is enqueued twice, an unlabelled row adopts the incoming label, a labelled row keeps its own, and a HOT row is never relabelled. A lane this build does not know (written by a newer build) counts as `other` and is never overwritten (a salvage copy keeps it as text). The REST `POST /ingest/scrape` never sets a lane
+  - Schema changes are recorded in a `schema_meta` table and each one is gated by a presence check, never by a number: an OLDER build opens an upgraded file as it is (the rows it writes have no lane), and the new build re-opening it changes nothing. A record is only ever raised, so after a rollback it still says what the file has had. `PRAGMA user_version` is only the writability probe, rewritten on every open
   - Default: `/var/lib/scraper`
 - `SCRAPE_QUEUE_MAX_MB`: Hard ceiling on the queue file, in MiB (`PRAGMA max_page_count`)
   - The queue must never be the thing that fills the volume it lives on: a full volume takes the write-ahead log down with it, which is far worse than a refused write
@@ -1411,6 +1445,22 @@ See `.env.example` for complete configuration template.
   - Without it, one store's burst (the crawler enqueues 50 per store) could fill the working set and leave every other store's items on disk behind a host that is itself paced to one request every few seconds
   - Unset/invalid → default
   - Default: `250`
+- `SCRAPE_LANE_MODE`: Whether a host's dispatch slot is shared between work classes (`src/services/laneScheduler.ts`)
+  - **Not wired yet**: the queue does not read this until the lane wiring lands, so setting it today changes nothing
+  - `off` dispatches exactly as today; `shadow` computes and counts the lane pick but dispatches as today; `on` lets the pick choose which class's item takes the host's slot
+  - The scheduler only chooses WHICH class goes next, never WHEN: the host's pacing floor stays the only clock, so no lane setting can make a host faster
+  - Unset/blank → `off`; any other value → one WARN and `off`
+  - Default: `off`
+- `SCRAPE_LANE_WEIGHTS`: Per-host class weights, hosts separated by `;`, e.g. `myfigurecollection.net=new:40,company:40,gap:20,other:10`
+  - **Not wired yet** (see `SCRAPE_LANE_MODE`)
+  - Classes: `new`, `company`, `gap` (Ross's split) and `other` (anything unlabeled, such as the spine retry job's re-drives, or labeled with a name this build does not know, so no work is ever invisible). Weights are whole numbers 0–100 and relative; a class left out gets 0. The host is matched like the queue keys hosts (lowercased, a leading `www.` stripped)
+  - Weighted fair queueing (stride scheduling). Only classes with work compete, so a dry class's share goes to the others in proportion. A class coming back from empty gets no saved-up burst: it re-enters level with the classes that kept their work. If every other class had work on the pick before the return and all keep it, while every pick is charged to the class it picked, then counted from the return, in the first n picks it gets at most its weight's share of n plus one, for every n, whatever the others did earlier. If some other class had no work on that pick and comes back with it, that class can carry stride debt from earlier, and the returning class can read more; no ceiling is proven for that case (short histories pinned in the tests reach share + 1.36 at 40/40/20/10 and share + 2.91 at 100/1/1/1). The bound covers only windows that start at the return. Weight `0` is a filler, served only when every positive-weight class is empty; several weight-0 classes with work share the slot evenly
+  - A class counts as having work while it has any queued item, resident or parked. One reported empty while it still has work (for example because the dispatcher's scan skipped its items for one pick) loses its place each time it comes back. Some repeated patterns of such omissions, not only every other pick, can leave it with little or no service (at 40/40/20/10: `company` and `gap` left out 2 picks in 3 get none; `other` left out 2 in 5 gets under 2 % of its share); others cost less (at 40/40/20/10 a class left out 1 pick in 3, 4, 5 or 10 still gets at least 3/4 of its fair share)
+  - A host is laned by one whole, well-formed entry or not at all, except through the gap named below. An entry with a malformed class list (an unknown or repeated class, a class without a weight, a weight outside 0–100 or not a whole number, no positive weight) is dropped with a WARN, and its host then dispatches exactly as today: every other entry for that host, before or after it, is ignored too
+  - An entry with no `=` that starts with a class name (such as the `gap:20,other:10` that a `;` typed for `,` cuts off `myfigurecollection.net=new:40,company:40;gap:20,other:10`) refuses the **whole** setting with a WARN: which host it belongs to cannot be told, so no host is laned. So a `;` typed for any `,` in a well-formed class list never lanes a host by part of that list
+  - Any other entry with no `=` (a host name alone, a host with `:` typed for `=`, text that does not start with a class name), or whose text before `=` is not a plain host name (a url, a port, a path, a trailing dot, a bad label, a non-ASCII letter), is dropped with a WARN that it is not read as any host's entry: the other entries are read as if it were not there, so it lanes no host and cannot unlane the one it meant. The gap: the refusal covers only a piece with no `=` that starts with a class name. A cut-off piece that does not (a `;` inserted inside a pair, as in `new:4;0,company:40`, or a piece that starts with a misspelt class) is only dropped, and its host is then laned by the part of its list before the `;`. A host named twice in well-formed entries keeps its last entry, with a WARN as each one replaces the one before, even an identical one
+  - **Reading the split.** While `other` has work, weights 40/40/20/10 give 36.4/36.4/18.2/9.1 of the slot, so the four-class shares (basis `all`) do not read 40/40/20 as they stand; the three classes' counts over all picks, normalised over the three, do while all four are backlogged. The scheduler also tallies the picks made while `other` had no work (basis `ross-three`, `new`/`company`/`gap` only). That basis reads nothing while `other` always has work, and a weight-0 `other` with work blanks it too although it takes no share. `targetLaneShares` gives the expected share for a set of classes with work, on either basis. It is a benchmark only while that set stays the same over many picks: when it changes pick by pick the realised shares can drift far from it, and no bound is claimed (in a repeating 4-pick pattern at 40/40/20/10 where each class has work on half the picks, `new` reads 17.5 points above it and `other` 13.3 below)
+  - Unset/blank → no host is laned
 - `CHALLENGE_COOLDOWN_MS`: Per-host cooldown window (ms) after a store serves a Cloudflare challenge/block
   - While a host is cooling, the scrape queue and lookup fan-out skip it without fetching, so repeat challenges don't degrade the egress IP's CF reputation
   - Open cooldowns are persisted with the queue (`SCRAPE_QUEUE_DIR`) and rehydrated at boot: a restart inside an open window is exactly when the engine is most likely to walk straight back into the challenge it just backed off from

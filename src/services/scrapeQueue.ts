@@ -28,13 +28,15 @@ import { createScrapingService } from './engineServices/scrapingService.js';
 import { createCapturingFetch, laneOf, ChallengePageError, FetchHeadersUnsupportedError, FetchMethodUnsupportedError, type CapturingFetch, type CapturingFetchTransports } from './engineServices/capturingFetch.js';
 import { evaluateRecordFetch, RecordFetchStatusError } from './recordFetchGate.js';
 import { observeMfcItemFetch } from './sessionCanary.js';
-import { getChallengeCooldown, ChallengeCooldownError, type ChallengeCooldown } from './challengeCooldown.js';
+import { getChallengeCooldown, ChallengeCooldownError, normalizeHost, type ChallengeCooldown } from './challengeCooldown.js';
+import { getHostClock, type HostClock } from './hostClock.js';
 import {
   createMemoryQueueStore,
   type PersistedQueueItem,
   type QueueStoreReason,
   type ScrapeQueueStore,
 } from './queueStore.js';
+import { isQueueLane, LaneCounters, type HostLaneCounts, type QueueLane } from './queueLane.js';
 import { classifyFetchFailure } from './failureClassifier.js';
 import { createFailureReporterFromEnv, type FetchFailureReport } from './failureReporter.js';
 import { ResidentialEgressUnavailableError } from './residentialEgress.js';
@@ -146,6 +148,10 @@ export interface QueueItem {
   errorType?: ErrorType;
   /** Users waiting for this result (for deduplication) */
   waitingUserIds: string[];
+  /** Work class (new | company | gap). Absent = no lane, counted as 'other'. Persisted. */
+  lane?: QueueLane;
+  /** A lane on disk this build does not know (a newer build wrote it): counted as 'other', never relabeled. */
+  unknownLane?: string;
   /** Promise resolvers for waiting callers */
   resolvers: Array<{
     resolve: (data: ScrapedData) => void;
@@ -200,6 +206,11 @@ export interface EnqueueOptions {
    * URL itself as both key and option — no faked MFC fields.
    */
   url?: string;
+  /**
+   * Work class for the lane scheduler (QB-U1). Optional: absent = no lane ('other'). A value outside
+   * new | company | gap is ignored with a warning, never stored. The REST route never sets it.
+   */
+  lane?: QueueLane;
 }
 
 export interface EnqueueResult {
@@ -211,6 +222,8 @@ export interface EnqueueResult {
   position: number;
   /** Promise that resolves when scraping completes */
   promise: Promise<ScrapedData>;
+  /** The row's lane after the coalesce rule. Absent when the row has no lane. */
+  lane?: QueueLane;
 }
 
 /**
@@ -676,6 +689,9 @@ export class ScrapeQueue {
   // `currentDelay` (the GLOBAL lane): an item is only dispatched once BOTH the global lane AND
   // this per-host floor are satisfied.
   private hostLastDispatch: Map<string, number> = new Map();
+  // A host in SCRAPE_HOST_CLOCK's scope is paced on the SHARED per-host clock instead, the one the
+  // image lane books for that host's own images (QB-U8). Null = the process clock (off by default).
+  private hostClock: HostClock | null = null;
 
   // Ingest seams (engine plumbing, injected — see setters below).
   // When an emitter is configured (INGEST_BASE_URL) AND the registry resolves
@@ -732,6 +748,13 @@ export class ScrapeQueue {
   private parkedResolvers: Map<string, QueueItem['resolvers']> = new Map();
   /** Last expired-lease sweep (epoch ms) — the reaper is throttled to LEASE_REAP_INTERVAL_MS. */
   private lastLeaseReapAt = 0;
+  /**
+   * Per-(host, lane) depth and coalesce counters (QB-U1), read by the lane scheduler and the depth
+   * RPC without a query. RESIDENT moves exactly where an item enters or leaves a tier (addToQueue,
+   * removeFromQueue, the dispatch splice). PARKED is counted up as an enqueue parks and re-read from
+   * the store when the store is wired (boot), after a claim, and after a page-in that moved rows.
+   */
+  private laneCounters = new LaneCounters();
 
   constructor(testMode?: boolean) {
     // Auto-detect test environment if not explicitly set
@@ -765,6 +788,7 @@ export class ScrapeQueue {
   setQueueStore(store: ScrapeQueueStore | null): void {
     this.store = store ?? createMemoryQueueStore();
     this.parkedCount = this.store.counts().parked;
+    this.resyncParkedLanes();
     // WRITE-THROUGH for per-host cooldowns. Without this the register would be read back at boot and
     // never written, so "a restart honours an open cooldown" would hold only in tests — and the very
     // restart that re-drives the crawler's batch would walk straight back into the challenge the
@@ -820,6 +844,33 @@ export class ScrapeQueue {
   }
 
   /**
+   * STARTUP HOLD — what src/index.ts does INSTEAD of restoreFromStore() when the engine came up without
+   * every plugin (pluginBootstrap's settleDurableQueue: a plugin was refused or failed to load, no store
+   * registered, or the bootstrap threw). Every row restored into that registry whose store it cannot
+   * extract would fail EXTRACTION_UNAVAILABLE, which is terminal, and be deleted; and merely skipping
+   * the restore is not enough, because the dispatch scan's lease reaper and parked-row page-in, and a
+   * re-enqueue's claim of a row, reach the file the moment any new item sets the queue running. So the
+   * durable file is closed without being restored and this process queues in memory (reason `held`,
+   * `path` still naming the file); the next start with a whole registry restores the rows left in it.
+   * The file's open host cooldowns stay in it too, unapplied in this process, and a cooldown opened
+   * while held lives in memory only. index.ts holds once the plugins have loaded, so anything enqueued
+   * before that (a plugin enqueuing from inside register()) has already run against the file. A no-op
+   * on a store that is not durable: there is nothing to hold, and its own reason says more.
+   */
+  holdQueueStore(why: string): void {
+    if (!this.store.durable) return;
+    const { path } = this.store;
+    const counts = this.store.counts();
+    this.closeQueueStore();
+    this.setQueueStore(createMemoryQueueStore('held', path));
+    console.error(
+      `[SCRAPE QUEUE] durable queue HELD, not restored (${sanitizeForLog(why)}): ` +
+        `${counts.pending} pending, ${counts.leased} leased, ${counts.parked} parked left in ` +
+        `${sanitizeForLog(String(path))} for the next start; its open host cooldowns are not applied in this process`
+    ); // lgtm[js/log-injection]
+  }
+
+  /**
    * SIGTERM: hand every leased row back as pending. A PLANNED rollout then loses nothing — the next
    * process finds the in-flight items ready and re-drives them immediately, instead of waiting out a
    * lease nobody holds. Returns how many were released. Safe on the fallback (0).
@@ -846,6 +897,14 @@ export class ScrapeQueue {
       leased: counts.leased,
       parked: counts.parked,
     };
+  }
+
+  /**
+   * One host's depth per class (resident, parked) plus the since-boot coalesce counters. All four
+   * classes are always present; a host with nothing queued reads zeros. `www.` and case are ignored.
+   */
+  getLaneCounts(host: string): HostLaneCounts {
+    return this.laneCounters.forHost(normalizeHost(host));
   }
 
   /**
@@ -964,6 +1023,23 @@ export class ScrapeQueue {
    */
   setChallengeCooldown(cooldown: ChallengeCooldown | null): void {
     this.challengeCooldownStore = cooldown;
+  }
+
+  /**
+   * Override the shared per-host clock (tests / DI). Defaults to the process clock, which the image
+   * lane books too; it covers no host unless SCRAPE_HOST_CLOCK names it.
+   */
+  setHostClock(clock: HostClock | null): void {
+    this.hostClock = clock;
+  }
+
+  /**
+   * The floor (ms) this queue paces a STORE's host by, or undefined for a host no store declares (a
+   * CDN, an image subdomain). The composition root binds this as the shared clock's floor source,
+   * so a covered store's own images are paced by the very rule its records are.
+   */
+  storeHostFloorMs(host: string): number | undefined {
+    return this.profiles?.forHost(host) ? this.hostBaseDelayMs(host) : undefined;
   }
 
   /** The active challenge-cooldown register — the injected instance, else the shared singleton. */
@@ -1117,6 +1193,7 @@ export class ScrapeQueue {
 
     // Caller-supplied URL wins; otherwise build the MFC item URL from the key
     const url = options.url ?? `https://myfigurecollection.net/item/${mfcId}`;
+    const lane = this.enqueueLane(options.lane, mfcId);
 
     // A row on disk that `pendingItems` does not know about belongs to THIS queue and must be
     // CLAIMED, not duplicated. Two ways that happens: the item is parked (over the working-set cap),
@@ -1134,6 +1211,7 @@ export class ScrapeQueue {
       if (orphan !== null) {
         this.adoptPersisted(orphan, false);
         this.parkedCount = this.store.counts().parked;
+        this.resyncParkedLanes();
         // A claimed orphan lands in `pendingItems`, so the caller below takes the DEDUP path — which
         // deliberately never starts the loop, because an ordinary dedup joins an item something else
         // already set running. Nothing set this one running: it came off disk. Kick the loop, or the
@@ -1149,6 +1227,9 @@ export class ScrapeQueue {
       if (!existingItem.waitingUserIds.includes(userId)) {
         existingItem.waitingUserIds.push(userId);
       }
+
+      // Settle the lane BEFORE this request's priority/cookie upgrades, on the row as it stood.
+      this.coalesceLane(existingItem, lane);
 
       // Upgrade priority if new request is higher
       if (this.comparePriority(priority, existingItem.priority) > 0) {
@@ -1180,6 +1261,7 @@ export class ScrapeQueue {
         deduplicated: true,
         position: this.getPosition(existingItem),
         promise,
+        ...(existingItem.lane !== undefined ? { lane: existingItem.lane } : {}),
       };
     }
 
@@ -1206,6 +1288,7 @@ export class ScrapeQueue {
       queuedAt: Date.now(),
       waitingUserIds: [userId],
       resolvers: [],
+      ...(lane !== undefined ? { lane } : {}),
     };
 
     // Create promise for first caller
@@ -1223,6 +1306,7 @@ export class ScrapeQueue {
       this.store.put(this.toPersisted(item, 'parked'));
       this.parkedResolvers.set(mfcId, item.resolvers);
       this.parkedCount++;
+      this.laneCounters.adjust(this.hostOf(url), lane, 'parked', 1);
     } else {
       // Add to appropriate queue
       this.addToQueue(item);
@@ -1235,7 +1319,8 @@ export class ScrapeQueue {
     this.statusQueued[itemStatus]++;
 
     // mfcId can be a caller-supplied URL (trigger route) — sanitize for log
-    console.log(`[SCRAPE QUEUE] Enqueued ${sanitizeForLog(mfcId)} at priority ${effectivePriority} (queue size: ${this.getStats().total})`); // lgtm[js/log-injection]
+    const laneNote = lane !== undefined ? ` lane=${lane}` : '';
+    console.log(`[SCRAPE QUEUE] Enqueued ${sanitizeForLog(mfcId)} at priority ${effectivePriority}${laneNote} (queue size: ${this.getStats().total})`); // lgtm[js/log-injection]
 
     // Start processing if not already running (skip in test mode)
     if (!this.testMode) {
@@ -1247,7 +1332,62 @@ export class ScrapeQueue {
       deduplicated: false,
       position: this.getPosition(item),
       promise,
+      ...(lane !== undefined ? { lane } : {}),
     };
+  }
+
+  /**
+   * The lane an enqueue asked for, or undefined. The fixed vocabulary is enforced HERE, at the one
+   * door every caller passes, so the column only ever holds new | company | gap: anything else
+   * (including 'other', which is the absence of a lane, not a lane) is queued unlabelled with a warning.
+   */
+  private enqueueLane(raw: unknown, mfcId: string): QueueLane | undefined {
+    if (raw === undefined) return undefined;
+    if (isQueueLane(raw)) return raw;
+    // Printing the value must not be what throws the enqueue away (a null-prototype object has no
+    // toString), so a value that will not print is named by its type.
+    let printed: string;
+    try {
+      printed = String(raw);
+    } catch {
+      printed = `<${typeof raw}>`;
+    }
+    console.warn(
+      `[SCRAPE QUEUE] Ignored lane '${sanitizeForLog(printed)}' for ${sanitizeForLog(mfcId)}: ` +
+        'not one of new, company, gap; queued with no lane'
+    ); // lgtm[js/log-injection]
+    return undefined;
+  }
+
+  /**
+   * THE COALESCE RULE for two enqueues of one URL (plan v2, design.scheduler.coalesce):
+   *   - existing row unlabelled + incoming lane L -> the row ADOPTS L (relabeledLegacy). This is how
+   *     rows queued before labels went live, and work first queued unlabelled, find their class.
+   *   - existing row labelled + a different incoming lane -> the FIRST label is kept
+   *     (coalescedCrossLane, counted against the kept lane). A lane this build does not know is a
+   *     label too (a newer build wrote it): it is kept for the build that knows it, counted as 'other'.
+   *   - a HOT row is never relabeled (and not counted): HOT is dispatched ahead of every lane.
+   */
+  private coalesceLane(item: QueueItem, incoming: QueueLane | undefined): void {
+    if (incoming === undefined || item.priority === 'HOT' || item.lane === incoming) return;
+    const host = this.hostOf(item.url);
+    if (item.lane !== undefined || item.unknownLane !== undefined) {
+      this.laneCounters.note(host, item.lane, 'coalescedCrossLane');
+      return;
+    }
+    // Move resident depth only if the item IS resident: an in-flight item is in no tier, and is
+    // counted under its new lane if a failure puts it back. An item sits in its tier at most once
+    // (upgradePriority never queues an item that is on the wire), so one is the whole move.
+    if (this.getQueueForPriority(item.priority).includes(item)) {
+      this.laneCounters.adjust(host, undefined, 'resident', -1);
+      this.laneCounters.adjust(host, incoming, 'resident', 1);
+    }
+    item.lane = incoming;
+    this.store.setLane(item.id, incoming);
+    this.laneCounters.note(host, incoming, 'relabeledLegacy');
+    console.log(
+      `[SCRAPE QUEUE] Relabeled ${sanitizeForLog(item.mfcId)}: lane other -> ${incoming} (an unlabelled row adopts the first label)`
+    ); // lgtm[js/log-injection]
   }
 
   /**
@@ -1361,6 +1501,7 @@ export class ScrapeQueue {
     this.parkedResolvers.clear();
     this.store.clearAll();
     this.parkedCount = 0;
+    this.laneCounters.reset();
 
     // Reset per-status counters
     this.statusQueued = { owned: 0, ordered: 0, wished: 0 };
@@ -1425,6 +1566,7 @@ export class ScrapeQueue {
       enqueuedAt: item.queuedAt,
       state,
       ...(item.errorType !== undefined ? { lastErrorClass: item.errorType } : {}),
+      ...(item.lane !== undefined ? { lane: item.lane } : {}),
     };
   }
 
@@ -1496,6 +1638,8 @@ export class ScrapeQueue {
       ...(row.lastErrorClass !== undefined ? { errorType: normalizeErrorType(row.lastErrorClass) } : {}),
       waitingUserIds: [],
       resolvers: this.parkedResolvers.get(row.mfcId) ?? [],
+      ...(row.lane !== undefined ? { lane: row.lane } : {}),
+      ...(row.unknownLane !== undefined ? { unknownLane: row.unknownLane } : {}),
     };
     this.parkedResolvers.delete(row.mfcId);
     this.addToQueue(item);
@@ -1528,11 +1672,14 @@ export class ScrapeQueue {
       const budget = resolveMaxResident() - this.residentCount();
       if (budget > 0) {
         const skipHosts = this.hostsAtCap(resolveMaxResidentPerHost());
-        for (const row of this.store.pageIn(budget, { skipHosts })) {
+        const paged = this.store.pageIn(budget, { skipHosts });
+        for (const row of paged) {
           if (this.adoptPersisted(row, false)) loaded++;
         }
         // Re-read rather than decrement: a count that can never drift is worth one COUNT query.
         this.parkedCount = this.store.counts().parked;
+        // The per-lane reading costs a GROUP BY, so it is only re-read when rows actually moved.
+        if (paged.length > 0) this.resyncParkedLanes();
       }
     }
     return loaded;
@@ -1560,14 +1707,22 @@ export class ScrapeQueue {
     } else {
       queue.splice(insertIndex, 0, item);
     }
+    this.laneCounters.adjust(this.hostOf(item.url), item.lane, 'resident', 1);
   }
 
-  private removeFromQueue(item: QueueItem): void {
+  /** Take the item out of its tier. Returns whether it was there (false: not resident, e.g. on the wire). */
+  private removeFromQueue(item: QueueItem): boolean {
     const queue = this.getQueueForPriority(item.priority);
     const index = queue.indexOf(item);
-    if (index !== -1) {
-      queue.splice(index, 1);
-    }
+    if (index === -1) return false;
+    queue.splice(index, 1);
+    this.laneCounters.adjust(this.hostOf(item.url), item.lane, 'resident', -1);
+    return true;
+  }
+
+  /** Re-read the per-(host, lane) parked depth from the store (the parked side of the lane counters). */
+  private resyncParkedLanes(): void {
+    this.laneCounters.replaceParked(this.store.countByHostLane('parked'));
   }
 
   private getQueueForPriority(priority: QueuePriority): QueueItem[] {
@@ -1602,9 +1757,12 @@ export class ScrapeQueue {
       return; // Not an upgrade
     }
 
-    this.removeFromQueue(item);
+    const resident = this.removeFromQueue(item);
     item.priority = newPriority;
-    this.addToQueue(item);
+    // An item on the wire is in no tier: the raise is RECORDED (a retry re-queues it at the new
+    // priority) but nothing is queued. A copy queued here would be fetched again after the wire fetch
+    // completed, and a retry would add a second copy to the tier, throwing the lane counters off.
+    if (resident) this.addToQueue(item);
     // Record it, so an item restored after a restart comes back in the lane it was raised to.
     this.store.setPriority(item.id, newPriority);
 
@@ -1854,10 +2012,19 @@ export class ScrapeQueue {
     // retried, never the cookie-session-pause path). Expiry: once `until` passes, isOpen is false and
     // the fetch below proceeds normally.
     const cooldown = this.getChallengeCooldownStore();
-    if (host !== undefined && cooldown.isOpen(host)) {
-      const minsLeft = Math.max(1, Math.ceil(cooldown.remaining(host) / 60_000));
-      console.warn(`[COOLDOWN] skipped ${sanitizeForLog(item.url)} (${host} cooling, ${minsLeft} min left)`);
-      throw new ChallengeCooldownError(host, cooldown.remaining(host));
+    for (;;) {
+      if (host !== undefined && cooldown.isOpen(host)) {
+        const minsLeft = Math.max(1, Math.ceil(cooldown.remaining(host) / 60_000));
+        console.warn(`[COOLDOWN] skipped ${sanitizeForLog(item.url)} (${host} cooling, ${minsLeft} min left)`);
+        throw new ChallengeCooldownError(host, cooldown.remaining(host));
+      }
+      // THE TRANSPORT HAND-OFF (QB-U30a): the capturing fetch below hands the record's request to its
+      // transport synchronously, so the send-time gate and the send stamp here, the cooldown check
+      // above and that call are one synchronous step. Should the gate be shut (another caller sent
+      // on this clocked host since the dispatch decision), wait the rest and check everything again.
+      const wait = this.sendRecordOrWait(host);
+      if (wait === 0) break;
+      await new Promise<void>(resolve => setTimeout(resolve, wait));
     }
     const page = await this.getCapturingFetch()(item.url, searchFetch, { cookies: item.cookies });
     // A clean (non-challenge) body proves this host serves real pages again — clear a lingering,
@@ -2150,6 +2317,47 @@ export class ScrapeQueue {
     return Math.max(base, resolveHostHardFloorMs());
   }
 
+  /**
+   * The per-host floor check AND the dispatch record, in one synchronous step: 0 = dispatch now (the
+   * dispatch is recorded), else the ms still to wait (nothing recorded). A host on the shared clock
+   * books there, so its own images and its records keep the floor between them (and the send itself
+   * is stamped at the transport hand-off, sendRecordOrWait); any other host keeps the private map
+   * exactly as before.
+   */
+  private acquireHostSlot(host: string, now: number): number {
+    const clock = this.hostClock ?? getHostClock();
+    if (clock.inScope(host)) return clock.tryAcquire(host, now, this.hostBaseDelayMs(host));
+    const lastDispatch = this.hostLastDispatch.get(host);
+    if (lastDispatch !== undefined) {
+      const remaining = lastDispatch + this.hostBaseDelayMs(host) - now;
+      if (remaining > 0) return remaining;
+    }
+    this.hostLastDispatch.set(host, now);
+    return 0;
+  }
+
+  /**
+   * A record is about to be handed to its transport: 0 = go, and the send is stamped now on the
+   * shared clock (a host in scope, via its send-time gate) and on the clock's send-time observer
+   * (every store host, whatever the scope says); otherwise the ms before the gate opens, nothing
+   * stamped. The queue's own slot is its grant, already behind it, so only a send by another caller
+   * since then can shut the gate. A host off the clock never waits here: its private floor paced the
+   * dispatch, exactly as before.
+   */
+  private sendRecordOrWait(host: string | undefined): number {
+    if (host === undefined) return 0;
+    const clock = this.hostClock ?? getHostClock();
+    const sentAt = Date.now();
+    if (clock.inScope(host)) {
+      const floorMs = this.hostBaseDelayMs(host);
+      const wait = clock.msUntilSendable(host, sentAt, sentAt, floorMs);
+      if (wait > 0) return wait;
+      clock.settle(host, sentAt, floorMs);
+    }
+    clock.recordSend(host, 'queue', sentAt);
+    return 0;
+  }
+
   private getNextProcessableItem(now: number): QueueItem | null {
     // Top the working set up from disk BEFORE scanning: reap leases a dead process never released,
     // and page in parked rows if the tiers have drained below the caps. A no-op on today's traffic.
@@ -2191,20 +2399,17 @@ export class ScrapeQueue {
         // the queue.
         const host = this.hostOf(item.url);
         if (host !== undefined) {
-          const lastDispatch = this.hostLastDispatch.get(host);
-          if (lastDispatch !== undefined) {
-            const remaining = lastDispatch + this.hostBaseDelayMs(host) - now;
-            if (remaining > 0) {
-              hostPacedCount++;
-              if (remaining < minHostWaitMs) minHostWaitMs = remaining;
-              continue;
-            }
+          const remaining = this.acquireHostSlot(host, now);
+          if (remaining > 0) {
+            hostPacedCount++;
+            if (remaining < minHostWaitMs) minHostWaitMs = remaining;
+            continue;
           }
         }
 
-        // This item is processable - remove from queue, record its host dispatch, and return
+        // This item is processable (its host dispatch is already recorded) - remove it and return
         queue.splice(i, 1);
-        if (host !== undefined) this.hostLastDispatch.set(host, now);
+        this.laneCounters.adjust(host, item.lane, 'resident', -1);
         // LEASE it: the row stays on disk, marked as in-flight with an expiry. A crash here (the
         // `kill -9` / OOM case) leaves a lease that the next process's reaper re-drives, instead of
         // an item that simply vanished mid-navigation.

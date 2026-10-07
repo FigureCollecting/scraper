@@ -13,8 +13,18 @@
  * CHALLENGE COOLDOWN: a host that has just served a challenge is not fetched at all. (The cooldown
  * on the STORE's host is the caller's gate, exactly as it is for the page lanes; this one covers the
  * image host, which for many stores is the store host itself.)
+ *
+ * A store's MAIN host on the shared per-host clock (`SCRAPE_HOST_CLOCK`, see hostClock.ts) is paced
+ * on that clock too, at the store's floor (QB-U30a): the image books its slot, sleeps, and on waking
+ * passes the clock's SEND-TIME gate, re-checks the challenge cooldown and stamps the send, in one
+ * synchronous step with the transport call. The queue's record dispatch passes the same gate, so an
+ * image never leaves closer than the floor to a record or to another image of that host, measured at
+ * the instant each request is handed to its transport, however late a timer fires. The limiter still
+ * applies on top; every host the clock does not cover is paced exactly as before. Every main-host
+ * image of a store, clocked or not, is reported to the clock's send-time observer.
  */
 import { getChallengeCooldown } from '../challengeCooldown.js';
+import { getHostClock, type HostClock } from '../hostClock.js';
 import type { HostRateLimiter } from '../../driver/hostRateLimiter.js';
 import type { ImageBytesFailure, ImageBytesFetcher, ImageFetchOptions, ImageBytesResult } from './imageBytes.js';
 
@@ -53,6 +63,8 @@ export interface ImageBytesPacingDeps {
   sleep?: (ms: number) => Promise<void>;
   /** Default: the process-wide challenge cooldown register the queue and the lookup fan-out share. */
   cooldown?: ChallengeCooldownLike;
+  /** Default: the process-wide host clock the queue's record dispatch books (off unless scoped). */
+  hostClock?: Pick<HostClock, 'floorFor' | 'reserve' | 'msUntilSendable' | 'settle' | 'recordSend'>;
 }
 
 /**
@@ -85,19 +97,16 @@ export function paceImageBytesByHost(
   const now = deps.now ?? Date.now;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
   const cooldown = deps.cooldown ?? getChallengeCooldown();
+  const hostClock = deps.hostClock ?? getHostClock();
   // One PROLOGUE at a time per host. The wait and the dispatch record are separated by an await, so
   // without this every concurrent caller reads the same msUntilReady before any of them records and
   // they all wake together — a PDP's dozen images arriving at a shared CDN in one burst, which is
   // exactly what the budget exists to prevent. The driver's own scheduler has no such gap (it checks
   // and records in one synchronous tick); this chain restores that property here.
-  const prologues = new Map<string, Promise<void>>();
-  const awaitTurn = (host: string): Promise<void> => {
+  const prologues = new Map<string, Promise<unknown>>();
+  const awaitTurn = <T>(host: string, step: () => Promise<T>): Promise<T> => {
     const tail = prologues.get(host) ?? Promise.resolve();
-    const prologue = tail.then(async () => {
-      const wait = limiter.msUntilReady(host, now());
-      if (wait > 0) await sleep(wait);
-      limiter.recordDispatch(host, now());
-    });
+    const prologue = tail.then(step);
     // The stored tail never rejects, so one failed prologue cannot wedge the host's whole queue.
     const chained = prologue.catch(() => undefined);
     prologues.set(host, chained);
@@ -105,6 +114,41 @@ export function paceImageBytesByHost(
       // Drop the entry once this call is the last one on the chain, so an idle host costs nothing.
       if (prologues.get(host) === chained) prologues.delete(host);
     });
+  };
+  // A host the clock does not cover: wait out the limiter and record the dispatch; the caller fetches
+  // once its turn resolves, exactly as before the clock existed.
+  const limiterTurn = (host: string) => async (): Promise<void> => {
+    const wait = limiter.msUntilReady(host, now());
+    if (wait > 0) await sleep(wait);
+    limiter.recordDispatch(host, now());
+  };
+  // A host on the shared clock: book the slot NOW, at the later of the limiter's ready time and the
+  // clock's floor, so the queue sees it while this image sleeps. Awake, the image passes the
+  // SEND-TIME gate: an early timer sleeps the rest, and a slot the host was sent on meanwhile (this
+  // image slept through it) is booked again behind that send. Then, in one synchronous step with no
+  // await before the transport call: the cooldown is checked again (a challenge met while this image
+  // waited, which on a clocked host can be several floors, closes the host to it as well), and the
+  // send is stamped on the limiter, the clock and the observer with the same instant.
+  type Sent = { sent: Promise<ImageBytesResult> } | { refused: ImageBytesResult };
+  const clockTurn = (host: string, floor: number, url: string, options: ImageFetchOptions | undefined) => async (): Promise<Sent> => {
+    const start = now();
+    let slot = hostClock.reserve(host, start + limiter.msUntilReady(host, start), floor);
+    for (;;) {
+      const at = now();
+      const wait = hostClock.msUntilSendable(host, slot, at, floor);
+      if (wait === 0) {
+        const cooling = cooldown.remaining(host);
+        if (cooling > 0) {
+          return { refused: { ok: false, reason: 'refused', detail: `${host} began cooling from a Cloudflare challenge while this image waited; another ${Math.ceil(cooling / 1000)}s` } };
+        }
+        limiter.recordDispatch(host, at);
+        hostClock.settle(host, at, floor);
+        hostClock.recordSend(host, 'image', at);
+        return { sent: fetcher(url, options) };
+      }
+      if (at >= slot) slot = hostClock.reserve(host, at, floor);
+      await sleep(Math.max(wait, slot - at));
+    }
   };
 
   return async function pacedImageBytesFetch(url: string, options?: ImageFetchOptions): Promise<ImageBytesResult> {
@@ -117,8 +161,17 @@ export function paceImageBytesByHost(
     if (cooling > 0) {
       return { ok: false, reason: 'refused', detail: `${host} is cooling from a Cloudflare challenge for another ${Math.ceil(cooling / 1000)}s` };
     }
-    await awaitTurn(host);
-    const result = await fetcher(url, options);
+    const floor = hostClock.floorFor(host);
+    let result: ImageBytesResult;
+    if (floor === undefined) {
+      await awaitTurn(host, limiterTurn(host));
+      hostClock.recordSend(host, 'image', now());
+      result = await fetcher(url, options);
+    } else {
+      const turn = await awaitTurn(host, clockTurn(host, floor, url, options));
+      if ('refused' in turn) return turn.refused;
+      result = await turn.sent;
+    }
     // Cast rather than narrow on `ok`: this module is also compiled under the tests' non-strict
     // config, where a boolean discriminant does not narrow a union.
     const failure = result.ok ? undefined : (result as ImageBytesFailure);

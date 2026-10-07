@@ -42,7 +42,8 @@ import * as os from 'os';
 import * as path from 'path';
 import { ScrapeQueue, resetScrapeQueue, normalizeErrorType } from '../../services/scrapeQueue';
 import { createExtractionRegistry, ExtractionRegistryImpl } from '../../services/extractionRegistry';
-import { createQueueStore, openQueueStore, type ScrapeQueueStore } from '../../services/queueStore';
+import { createQueueStore, openQueueStore, QUEUE_DB_FILE, type ScrapeQueueStore } from '../../services/queueStore';
+import { settleDurableQueue } from '../../services/pluginBootstrap';
 import { ChallengeCooldown } from '../../services/challengeCooldown';
 import { okWriteStats } from '../helpers/ingestWriteStats';
 
@@ -278,6 +279,44 @@ describe('ScrapeQueue — dispatch, completion and retry', () => {
 
     expect(queue.getStats().failed).toBe(1);
     // The fetch_failure ledger already books a terminal failure; this store is not a history.
+    expect(store.counts()).toEqual({ pending: 0, leased: 0, parked: 0 });
+  });
+
+  // The crawler enqueues an id at COLD and, while that fetch is on the wire, the REST default enqueues
+  // it again at WARM. The raise used to put the in-flight item in the WARM tier as well, so the loop
+  // fetched it a SECOND time after the first fetch had already completed it.
+  it.each([
+    ['succeeds', () => Promise.resolve({ html: '<html></html>', url: urlFor('a1'), title: 'Item', statusCode: 200 }), 1],
+    ['fails and is retried', () => Promise.reject(new Error('NETWORK timeout reaching host')), 2],
+  ])('an item raised while its fetch is on the wire, whose fetch then %s, is fetched once per attempt, never from a second copy', async (_outcome, settle, fetches) => {
+    const store = openStore(tmpDir());
+    let release: () => void = () => {};
+    let calls = 0;
+    const scraping = scrapingStub(() => {
+      calls += 1;
+      // The FIRST fetch is held on the wire until the test releases it; any later one succeeds.
+      return calls === 1
+        ? new Promise((resolve, reject) => { release = () => settle().then(resolve, reject); })
+        : Promise.resolve({ html: '<html></html>', url: urlFor('a1'), title: 'Item', statusCode: 200 });
+    });
+    queue = new ScrapeQueue(false);
+    queue.setQueueStore(store);
+    queue.setPluginRegistry(makeRegistry());
+    queue.setIngestEmitter({ send: jest.fn().mockResolvedValue(okWriteStats()) });
+    queue.setScrapingService(scraping);
+
+    queue.enqueue('a1', { url: urlFor('a1'), priority: 'COLD' });
+    expect(store.counts().leased).toBe(1);
+    queue.enqueue('a1', { url: urlFor('a1'), priority: 'WARM' });
+    for (let i = 0; i < 20 && calls === 0; i++) await jest.advanceTimersByTimeAsync(10);
+    expect(calls).toBe(1);
+
+    release();
+    await flush(2_000, 6);
+
+    // One fetch per attempt: a success needs one; a retry needs exactly one more.
+    expect(scraping.scrapePage).toHaveBeenCalledTimes(fetches);
+    expect(queue.getStats()).toMatchObject({ total: 0, completed: 1 });
     expect(store.counts()).toEqual({ pending: 0, leased: 0, parked: 0 });
   });
 });
@@ -979,5 +1018,178 @@ describe('ScrapeQueue — a stale lease is claimed, never duplicated', () => {
     // row stays LEASED — claiming it back would re-queue work that is on the wire right now.
     expect(store.counts()).toEqual({ pending: 0, leased: 1, parked: 0 });
     expect(scraping.scrapePage).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * STARTUP HOLD (src/index.ts, durableQueueHold): when the engine came up without every plugin, the
+ * durable file is closed untouched instead of restored. Restoring into a registry that cannot extract
+ * a row's store fails the row EXTRACTION_UNAVAILABLE, which is terminal, and deletes it; so would the
+ * dispatch scan's lease reaper and parked-row page-in, and a re-enqueue's claim of the row, the moment
+ * any new item set the queue running. So the process queues in memory, and the rows wait for a start
+ * whose registry is whole.
+ */
+describe('ScrapeQueue — holding the durable store when the registry came up incomplete', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.useFakeTimers({ advanceTimers: true });
+    resetScrapeQueue();
+  });
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  function seedEveryState(dir: string) {
+    const first = openStore(dir);
+    first.put({
+      id: 'p1-1', mfcId: 'p1', url: urlFor('p1'), priority: 'WARM',
+      attempts: 2, maxRetries: 3, enqueuedAt: 1_000, state: 'pending', lastErrorClass: 'network',
+    });
+    first.put({ id: 'k1-1', mfcId: 'k1', url: urlFor('k1'), priority: 'COLD', attempts: 0, maxRetries: 3, enqueuedAt: 2_000, state: 'parked' });
+    first.put({ id: 'l1-1', mfcId: 'l1', url: urlFor('l1'), priority: 'WARM', attempts: 1, maxRetries: 3, enqueuedAt: 3_000, state: 'pending' });
+    first.lease('l1-1', 5_000); // long expired: the reaper would re-drive it
+    first.close();
+  }
+
+  it('leaves every row on disk as it was while the process keeps taking (and failing) new items', async () => {
+    const dir = tmpDir();
+    seedEveryState(dir);
+    const store = openStore(dir);
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    queue = new ScrapeQueue(false);
+    queue.setQueueStore(store);
+    queue.setPluginRegistry(createExtractionRegistry()); // the rulesets plugin was refused: no store at all
+    queue.setIngestEmitter({ send: jest.fn().mockResolvedValue(okWriteStats()) });
+    queue.setScrapingService(scrapingStub());
+
+    queue.holdQueueStore('plugin(s) refused at startup: rules');
+    queue.enqueue('p1', { url: urlFor('p1') }); // the key of the pending row
+    queue.enqueue('k1', { url: urlFor('k1') }); // the key of the parked row
+    queue.enqueue('n1', { url: urlFor('n1') });
+    // One host, paced per host: give each of the three items its turn.
+    for (let i = 0; i < 6; i++) {
+      jest.advanceTimersByTime(5_000);
+      await jest.advanceTimersByTimeAsync(50);
+    }
+    queue.refillWorkingSet(Date.now() + 3_600_000);
+
+    expect(queue.getStats().failed).toBe(3);
+    expect(queue.getQueueStoreView()).toMatchObject({
+      durable: false, reason: 'held', path: store.path, restoredAt: null, pending: 0, leased: 0, parked: 0,
+    });
+    // The held handle is CLOSED: it reads nothing although the rows are there, and can write nothing.
+    expect(store.counts()).toEqual({ pending: 0, leased: 0, parked: 0 });
+    const reopened = openStore(dir);
+    expect(reopened.counts()).toEqual({ pending: 1, leased: 1, parked: 1 });
+    const rows = reopened.restore(Date.now());
+    expect(rows.pending.map(r => [r.id, r.attempts, r.lastErrorClass])).toEqual([['p1-1', 2, 'network']]);
+    expect(rows.leasedExpired.map(r => [r.id, r.attempts])).toEqual([['l1-1', 1]]);
+    expect(errorSpy.mock.calls.map(c => String(c[0])).filter(l => l.includes('HELD'))).toEqual([
+      `[SCRAPE QUEUE] durable queue HELD, not restored (plugin(s) refused at startup: rules): ` +
+        `1 pending, 1 leased, 1 parked left in ${store.path} for the next start; ` +
+        `its open host cooldowns are not applied in this process`,
+    ]);
+    errorSpy.mockRestore();
+  });
+
+  it('leaves the open host cooldowns in the file, and does not apply them in this process', () => {
+    const dir = tmpDir();
+    const first = openStore(dir);
+    first.saveCooldown({ host: HOST, until: Date.now() + 3_600_000, reason: 'challenge page', openedAt: Date.now() });
+    first.close();
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const cooldown = new ChallengeCooldown();
+    queue = new ScrapeQueue(true);
+    queue.setChallengeCooldown(cooldown);
+    queue.setQueueStore(openStore(dir));
+
+    queue.holdQueueStore('no plugin registered a store');
+
+    expect(cooldown.isOpen(HOST)).toBe(false);
+    expect(openStore(dir).restore(Date.now()).cooldowns.map(c => c.host)).toEqual([HOST]);
+    expect(String(errorSpy.mock.calls[0]?.[0])).toContain('its open host cooldowns are not applied in this process');
+    errorSpy.mockRestore();
+  });
+
+  it('is a no-op on a store that is not durable: there is nothing to hold, and its own reason stays', () => {
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    queue = new ScrapeQueue(true);
+
+    queue.holdQueueStore('no plugin registered a store');
+
+    expect(queue.getQueueStoreView()).toMatchObject({ durable: false, reason: 'disabled', path: null });
+    expect(errorSpy).not.toHaveBeenCalled();
+    errorSpy.mockRestore();
+  });
+});
+
+/**
+ * A restore that THROWS (pluginBootstrap's settleDurableQueue): the store degrades rather than throws
+ * on a write, but a row it cannot read back throws out of the restore. node:sqlite refuses an INTEGER
+ * past 2^53 with ERR_OUT_OF_RANGE, and opening the file reads no row, so the file opens fine and the
+ * fault surfaces only at the restore. That row is still on disk at every start, so a throw here would
+ * crash-loop the engine. It holds the queue instead, and the restore's own transaction rolled back.
+ */
+describe('ScrapeQueue — a restore that throws holds the durable store instead of ending the process', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    resetScrapeQueue();
+  });
+
+  function rowsOnDisk(dir: string) {
+    const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
+    const raw = new DatabaseSync(path.join(dir, QUEUE_DB_FILE), { readOnly: true });
+    try {
+      return raw
+        .prepare('SELECT id, state, CAST(attempts AS TEXT) AS attempts FROM queue_items ORDER BY id')
+        .all()
+        .map(r => [r.id, r.state, r.attempts]);
+    } finally {
+      raw.close();
+    }
+  }
+
+  it('holds the queue, leaving every row as it was, when a row cannot be read back', () => {
+    const dir = tmpDir();
+    const first = openStore(dir);
+    first.put({ id: 'p1-1', mfcId: 'p1', url: urlFor('p1'), priority: 'WARM', attempts: 1, maxRetries: 3, enqueuedAt: 1_000, state: 'pending' });
+    first.put({ id: 'l1-1', mfcId: 'l1', url: urlFor('l1'), priority: 'WARM', attempts: 1, maxRetries: 3, enqueuedAt: 2_000, state: 'pending' });
+    first.lease('l1-1', 5_000); // long expired: the restore frees it before it reads the pending rows
+    first.put({ id: 'o1-1', mfcId: 'o1', url: urlFor('o1'), priority: 'WARM', attempts: 1, maxRetries: 3, enqueuedAt: 3_000, state: 'pending' });
+    first.close();
+    const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
+    const raw = new DatabaseSync(path.join(dir, QUEUE_DB_FILE));
+    raw.prepare("UPDATE queue_items SET attempts = ? WHERE id = 'o1-1'").run(2n ** 60n);
+    raw.close();
+    const before = rowsOnDisk(dir);
+    expect(before).toEqual([
+      ['l1-1', 'leased', '1'],
+      ['o1-1', 'pending', '1152921504606846976'],
+      ['p1-1', 'pending', '1'],
+    ]);
+
+    const store = openStore(dir);
+    expect(store.reason).toBe('ok');
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const registry = makeRegistry();
+    queue = new ScrapeQueue(true);
+    queue.setQueueStore(store);
+    queue.setPluginRegistry(registry);
+    const plugin = { name: 'rules', version: '1.0.0', register: async () => undefined };
+
+    let hold: string | undefined;
+    expect(() => {
+      hold = settleDurableQueue(queue!, { registry, plugins: [plugin], refused: [] });
+    }).not.toThrow();
+
+    expect(hold).toMatch(/^the durable queue could not be restored \(.*1152921504606846976\)$/);
+    expect(queue.getQueueStoreView()).toMatchObject({ durable: false, reason: 'held', path: store.path, restoredAt: null });
+    expect(queue.getStats().total).toBe(0);
+    expect(rowsOnDisk(dir)).toEqual(before);
+    expect(errorSpy.mock.calls.map(c => String(c[0])).filter(l => l.includes('HELD'))).toEqual([
+      `[SCRAPE QUEUE] durable queue HELD, not restored (${hold}): 2 pending, 1 leased, 0 parked left in ${store.path} ` +
+        'for the next start; its open host cooldowns are not applied in this process',
+    ]);
+    errorSpy.mockRestore();
   });
 });
