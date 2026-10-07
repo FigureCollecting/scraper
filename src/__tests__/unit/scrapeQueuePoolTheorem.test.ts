@@ -67,8 +67,8 @@ interface Scenario {
   ids: Map<string, number>;
 }
 
-/** Bursts of contiguous ids, 0-3 planned failures, ~12 % raised from COLD, `restarts` restarts. */
-function scenario(seed: number, bursts: number, restarts: number): Scenario {
+/** Bursts of contiguous ids (gaps up to maxGapMs), 0-3 planned failures, ~12 % raised from COLD, `restarts` restarts. */
+function scenario(seed: number, bursts: number, restarts: number, maxGapMs = 40_000): Scenario {
   const gen = refMulberry32(seed);
   const events: Event[] = [];
   const fails = new Map<string, number>();
@@ -77,7 +77,7 @@ function scenario(seed: number, bursts: number, restarts: number): Scenario {
   let seq = 0;
   let t = 0;
   for (let b = 0; b < bursts; b++) {
-    t += Math.floor(gen() * 40_000);
+    t += Math.floor(gen() * maxGapMs);
     id += 50 + Math.floor(gen() * 3_000);
     const size = 5 + Math.floor(gen() * 26);
     for (let j = 0; j < size; j++) {
@@ -122,11 +122,11 @@ afterEach(() => {
 
 jest.setTimeout(180_000);
 
-async function runThroughQueue(opts: { seed: number; adversarial: boolean; bursts: number; restarts: number }): Promise<ClassModelResult & { leftover: number; storeLeft: number; items: number; seconds: number }> {
+async function runThroughQueue(opts: { seed: number; adversarial: boolean; bursts: number; restarts: number; maxGapMs?: number }): Promise<ClassModelResult & { leftover: number; storeLeft: number; items: number; seconds: number }> {
   process.env.SCRAPE_QUEUE_MAX_RESIDENT_PER_HOST = '8';
   jest.useFakeTimers();
   jest.setSystemTime(T0);
-  const sc = scenario(opts.seed, opts.bursts, opts.restarts);
+  const sc = scenario(opts.seed, opts.bursts, opts.restarts, opts.maxGapMs);
   const model = new ClassModel(`${HOST}|WARM`, H_MS);
   const dir = poolTmpDir('pool-theorem-');
   dirs.push(dir);
@@ -152,7 +152,6 @@ async function runThroughQueue(opts: { seed: number; adversarial: boolean; burst
   };
   let proc = boot();
   let next = 0;
-  const started = process.hrtime.bigint();
   const hardStop = T0 + 3_600_000 * 3;
   while (Date.now() < hardStop) {
     const now = Date.now() - T0;
@@ -168,22 +167,22 @@ async function runThroughQueue(opts: { seed: number; adversarial: boolean; burst
         proc.queue.restoreFromStore(Date.now());
         continue;
       }
+      // The model learns of each class entry BEFORE the enqueue: an idle queue dispatches at once.
       const key = ev.key as string;
       if (ev.kind === 'arrive') {
         model.add(key, urlOf(key), sc.fails.get(key) as number);
-        proc.queue.enqueue(key, { url: urlOf(key), priority: ev.priority });
         if (ev.priority === 'WARM') model.enter(key, Date.now(), false);
+        proc.queue.enqueue(key, { url: urlOf(key), priority: ev.priority });
       } else {
         const it = model.items.get(key)!;
         if (it.done) {
           // Dispatched and finished while still COLD: the enqueue is a fresh row, not a raise.
           model.add(key, urlOf(key), 0);
-          proc.queue.enqueue(key, { url: urlOf(key), priority: 'WARM' });
           model.enter(key, Date.now(), false);
         } else {
-          proc.queue.enqueue(key, { url: urlOf(key), priority: 'WARM' });
           model.enter(key, Date.now(), true);
         }
+        proc.queue.enqueue(key, { url: urlOf(key), priority: 'WARM' });
       }
     }
     if (next >= sc.events.length && [...model.items.values()].every((i) => i.done)) break;
@@ -203,7 +202,7 @@ async function runThroughQueue(opts: { seed: number; adversarial: boolean; burst
     `theorem ${opts.adversarial ? 'adversarial' : 'seeded'} seed=${opts.seed}: items=${out.items} picks=${res.picks} fakeSeconds=${out.seconds} ` +
       `checked=${res.theoremChecked} violations=${res.theoremViolations.length} maxRatio=${res.maxRatio.toFixed(3)} maxRatioAllowance=${res.maxRatioCap.toFixed(3)} ` +
       `r1Violations=${res.r1Violations.length} poolSizeMismatches=${res.poolSizeMismatches.length} raisedR1=${res.raisedR1Picks} raisedSkip=${res.raisedSkipPicks} ` +
-      `skipPicks=${res.skipPicks} forced=${res.forcedPicks} restartsInWindows=${res.restartsInWindows} rules=${JSON.stringify(res.rules)} wall=${(Number(process.hrtime.bigint() - started) / 1e9).toFixed(1)}s`,
+      `skipPicks=${res.skipPicks} forced=${res.forcedPicks} restartsInWindows=${res.restartsInWindows} maxWaitS=${Math.max(...res.waitsMs) / 1000} rules=${JSON.stringify(res.rules)}`,
   );
   jest.useRealTimers();
   return out;
@@ -232,8 +231,8 @@ describe('starvation theorem through the real queue: A(a) + B(a) + 2 + r for eve
     expect(r.stages.R2 ?? 0).toBe(0);
   });
 
-  it.each([303, 404])('seeded rng, R2 live (age cap H/2), same pressures (scenario seed %i)', async (seed) => {
-    const r = await runThroughQueue({ seed, adversarial: false, bursts: 24, restarts: 3 });
+  it.each([303, 404])('seeded rng, R2 live (age cap H/2), denser bursts so items still reach a + H (scenario seed %i)', async (seed) => {
+    const r = await runThroughQueue({ seed, adversarial: false, bursts: 40, restarts: 3, maxGapMs: 12_000 });
     expectTheorem(r);
     expect(r.stages.R2 ?? 0).toBeGreaterThan(0);
   });

@@ -156,9 +156,9 @@ describe('class_entered_at on the queue', () => {
     const first = rig({ select: 'off', dir });
     first.queue.enqueue('k0', { url: url(100), priority: 'WARM' });
     first.queue.enqueue('k1', { url: url(1), priority: 'COLD' });
+    await jest.advanceTimersByTimeAsync(0); // k0 (dispatched at once) completes; k1 waits for the floor
     jest.setSystemTime(T0 + 2 * H);
     first.queue.enqueue('k1', { url: url(1), priority: 'WARM' });
-    await jest.advanceTimersByTimeAsync(0);
     first.queue.stop();
     first.queue.releaseLeasesForShutdown();
     first.store.close();
@@ -301,6 +301,83 @@ describe('pooled picks', () => {
     expect(pick).toHaveBeenCalled();
   });
 
+  it('a pick that throws falls back to FIFO for that dispatch, with a warning, and the queue keeps going', async () => {
+    const r = rig({ select: 'all', seed: 4 });
+    const pick = jest.spyOn(r.pool, 'pick').mockImplementation(() => {
+      throw new Error('boom\nforged');
+    });
+    const warn = console.warn as unknown as jest.Mock;
+    warn.mockClear();
+    for (let i = 1; i <= 4; i++) r.queue.enqueue(`k${i}`, { url: url(i), priority: 'WARM' });
+    await advance(5_000);
+    expect(keysOf(r.calls)).toEqual([1, 2, 3, 4]);
+    expect(pick).toHaveBeenCalled();
+    const lines = warn.mock.calls.map((c) => String(c[0])).filter((l) => l.includes('pool pick failed'));
+    expect(lines.length).toBeGreaterThan(0);
+    expect(lines[0]).toContain('pool pick failed for pool.test, dispatching FIFO: boom forged');
+  });
+
+  it('a pick that throws a non-Error is named too', async () => {
+    const r = rig({ select: 'all', seed: 4 });
+    jest.spyOn(r.pool, 'pick').mockImplementation(() => {
+      throw 'plain string';
+    });
+    const warn = console.warn as unknown as jest.Mock;
+    warn.mockClear();
+    r.queue.enqueue('k1', { url: url(1), priority: 'WARM' });
+    await jest.advanceTimersByTimeAsync(10);
+    expect(keysOf(r.calls)).toEqual([1]);
+    expect(warn.mock.calls.map((c) => String(c[0])).some((l) => l.endsWith('dispatching FIFO: plain string'))).toBe(true);
+  });
+
+  it('a pool that answers -1 (nothing picked) leaves the dispatch to the FIFO head', async () => {
+    const r = rig({ select: 'all', seed: 4 });
+    jest.spyOn(r.pool, 'pick').mockReturnValue(-1);
+    for (let i = 1; i <= 3; i++) r.queue.enqueue(`k${i}`, { url: url(i), priority: 'WARM' });
+    await advance(3_000);
+    expect(keysOf(r.calls)).toEqual([1, 2, 3]);
+  });
+
+  it('a row without a numeric id still pools (anti-sequence passes it)', async () => {
+    const r = rig({ select: 'all', seed: 4 });
+    r.queue.enqueue('a', { url: `https://${HOST}/item/alpha`, priority: 'WARM' });
+    r.queue.enqueue('b', { url: `https://${HOST}/item/beta`, priority: 'WARM' });
+    await advance(2_000);
+    expect(r.picks.map((p) => p.key)).toEqual(['a', 'b']);
+    expect(r.calls.map((c) => c.url)).toEqual([`https://${HOST}/item/alpha`, `https://${HOST}/item/beta`]);
+  });
+
+  it('a row held by its user session (paused) is not a candidate; the session row of an active session is', async () => {
+    const r = rig({ select: 'all', seed: 4 });
+    const internals = r.queue as unknown as { sessionManager: { isSessionPaused(id: string): boolean } };
+    jest.spyOn(internals.sessionManager, 'isSessionPaused').mockImplementation((id: string) => id === 'paused');
+    r.queue.enqueue('k0', { url: url(1), priority: 'COLD' });
+    r.queue.enqueue('held', { url: url(500), priority: 'COLD', cookies: { a: 'b' }, sessionId: 'paused' });
+    r.queue.enqueue('live', { url: url(900), priority: 'COLD', cookies: { a: 'b' }, sessionId: 'active' });
+    r.queue.enqueue('k2', { url: url(300), priority: 'COLD' });
+    await advance(12_000); // a paused row in the scan makes the blocked re-check the generic 5 s poll
+    expect(keysOf(r.calls).sort((x, y) => x - y)).toEqual([1, 300, 900]);
+    expect(r.picks.every((p) => p.key !== 'held')).toBe(true);
+    expect(r.picks.slice(1).map((p) => p.poolSize)).toEqual([2, 1]);
+  });
+
+  it('a parked pick whose row vanished before the claim falls back to the FIFO head', async () => {
+    const dir = poolTmpDir('pool-vanish-');
+    dirs.push(dir);
+    const seed = openPoolStore(dir);
+    seed.put({ id: 'old-1', mfcId: 'old', url: url(500), priority: 'WARM', attempts: 0, maxRetries: 3, enqueuedAt: T0 - 30 * H, state: 'parked' });
+    seed.put({ id: 'r-1', mfcId: 'r1', url: url(100), priority: 'WARM', attempts: 0, maxRetries: 3, enqueuedAt: T0 - 1000, state: 'pending' });
+    seed.close();
+    process.env.SCRAPE_QUEUE_MAX_RESIDENT_PER_HOST = '1'; // the host is at its cap: no page-in before the pick
+    const r = rig({ select: 'all', seed: 2, dir });
+    // The parked row is listed, then gone when the queue claims it (another handle took it).
+    jest.spyOn(r.store, 'claimKey').mockReturnValue(null);
+    r.queue.restoreFromStore(T0);
+    await jest.advanceTimersByTimeAsync(10);
+    expect(r.picks[0]).toMatchObject({ key: 'old', rule: 'R1' });
+    expect(keysOf(r.calls)).toEqual([100]);
+  });
+
   it('off never calls the pool', async () => {
     const r = rig({ select: 'off' });
     const pick = jest.spyOn(r.pool, 'pick');
@@ -341,28 +418,27 @@ describe('the pool block (getPoolView -> /health/detailed)', () => {
     const r = rig({ select: 'all,-other.test', seed: 6, ageCaps: `${HOST}=1` });
     for (let i = 1; i <= 10; i++) r.queue.enqueue(`k${i}`, { url: url(i * 100), priority: 'WARM' });
     r.queue.enqueue('o1', { url: url(1, 'other.test'), priority: 'WARM' });
-    await advance(2_500);
-    // 1 h 10 min later the 7 still waiting are aged (age cap 1 h): resident and parked alike.
-    r.queue.stop();
-    const later = Date.now() + 70 * 60_000;
-    const view = r.queue.getPoolView(later - 70 * 60_000);
+    await jest.advanceTimersByTimeAsync(10);
+    // k1 went at once; k2..k5 are resident (the per-host cap) and k6..k10 parked.
+    expect(r.store.counts().parked).toBe(5);
+    const view = r.queue.getPoolView(Date.now());
     const byHost = new Map(view.hosts.map((h) => [h.host, h]));
     expect(view.scope).toBe('all-except');
     expect(view.malformed).toBe(false);
     const pool = byHost.get(HOST)!;
     expect(pool.mode).toBe('pool');
-    expect(pool.picks60m).toBe(3);
+    expect(pool.picks60m).toBe(1);
     expect(pool.agedCount).toBe(0);
     expect(Object.keys(pool)).toEqual([
       'host', 'mode', 'picks60m', 'topBucketShare60m', 'uniformPicks60m', 'agedPicks60m', 'agedShare60m', 'forcedPicks60m',
       'agedCount', 'p99WaitH60m', 'maxWaitH60m', 'redraws60m', 'scanFallbacks60m', 'retryPicks60m',
     ]);
     expect(byHost.get('other.test')).toMatchObject({ mode: 'fifo-excluded', picks60m: 0, agedCount: 0 });
-    const aged = r.queue.getPoolView(later);
+    // 70 minutes on, the 9 still waiting are aged (age cap 1 h): resident and parked alike.
+    const aged = r.queue.getPoolView(Date.now() + 70 * 60_000);
     const agedPool = aged.hosts.find((h) => h.host === HOST)!;
-    expect(agedPool.agedCount).toBe(7);
-    expect(r.store.counts().parked).toBeGreaterThan(0);
-    expect(agedPool.picks60m).toBe(0); // the picks left the trailing hour
+    expect(agedPool.agedCount).toBe(9);
+    expect(agedPool.picks60m).toBe(0); // the pick left the trailing hour
     for (const h of aged.hosts) expect(Buffer.byteLength(JSON.stringify(h))).toBeLessThan(4096);
   });
 
@@ -382,6 +458,25 @@ describe('the pool block (getPoolView -> /health/detailed)', () => {
         forcedPicks60m: 0, agedCount: 0, p99WaitH60m: 0, maxWaitH60m: 0, redraws60m: 0, scanFallbacks60m: 0, retryPicks60m: 0,
       }],
     });
+  });
+
+  it('skips rows whose URL has no host (resident or parked); defaults to the current time', () => {
+    const r = rig({ select: 'all', seed: 1 });
+    r.queue.enqueue('k0', { url: url(100), priority: 'WARM' });
+    r.queue.enqueue('k1', { url: url(1), priority: 'WARM' });
+    r.queue.enqueue('bad', { url: 'not a url', priority: 'WARM' });
+    r.store.put({ id: 'p-1', mfcId: 'p', url: 'also not a url', priority: 'WARM', attempts: 0, maxRetries: 3, enqueuedAt: T0, state: 'parked' });
+    expect(r.queue.getPoolView().hosts.map((h) => h.host)).toEqual([HOST]);
+  });
+
+  it('agedCount leaves out a row held by its user session', () => {
+    const r = rig({ select: 'all', seed: 1, ageCaps: `${HOST}=1` });
+    const internals = r.queue as unknown as { sessionManager: { isSessionPaused(id: string): boolean } };
+    jest.spyOn(internals.sessionManager, 'isSessionPaused').mockReturnValue(true);
+    r.queue.enqueue('k0', { url: url(100), priority: 'WARM' });
+    r.queue.enqueue('k1', { url: url(1), priority: 'COLD' });
+    r.queue.enqueue('held', { url: url(2), priority: 'COLD', cookies: { a: 'b' }, sessionId: 's' });
+    expect(r.queue.getPoolView(T0 + 2 * H).hosts.map((h) => [h.host, h.agedCount])).toEqual([[HOST, 1]]);
   });
 
   it('a malformed knob reads malformed, scope off', () => {

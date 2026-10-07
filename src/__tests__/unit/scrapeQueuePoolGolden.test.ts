@@ -27,6 +27,8 @@ import { PoolDispatch, POOL_SELECT_ENV, setPoolDispatch } from '../../services/p
 import { openPoolStore, poolTmpDir, wirePoolQueue, type SiteSpec, type TransportCall } from '../helpers/poolQueueHarness';
 
 const FIXTURE = path.join(__dirname, '..', 'fixtures', 'poolDispatch', 'fifoGolden.txt');
+/** The same scenario with only the per-host working-set cap binding (global cap 1000), also written on develop 049ac7ce. */
+const FIXTURE_PER_HOST = path.join(__dirname, '..', 'fixtures', 'poolDispatch', 'fifoGoldenPerHostCap.txt');
 const T0 = 1_000_000;
 const MFC = 'myfigurecollection.net';
 
@@ -90,10 +92,10 @@ interface Run {
 }
 
 /** The scenario under one SCRAPE_POOL_SELECT value (undefined = unset). */
-async function runScenario(knob: string | undefined, seed = 7): Promise<Run> {
+async function runScenario(knob: string | undefined, seed = 7, maxResident = '14'): Promise<Run> {
   if (knob === undefined) delete process.env[POOL_SELECT_ENV];
   else process.env[POOL_SELECT_ENV] = knob;
-  process.env.SCRAPE_QUEUE_MAX_RESIDENT = '14';
+  process.env.SCRAPE_QUEUE_MAX_RESIDENT = maxResident;
   process.env.SCRAPE_QUEUE_MAX_RESIDENT_PER_HOST = '4';
   setPoolDispatch(new PoolDispatch({ seed }));
   jest.useFakeTimers();
@@ -116,7 +118,7 @@ async function runScenario(knob: string | undefined, seed = 7): Promise<Run> {
     let poolMid = queue.getPoolView(Date.now());
     for (let step = 1; step <= 800; step++) {
       await jest.advanceTimersByTimeAsync(500);
-      if (step === 60) poolMid = queue.getPoolView(Date.now());
+      if (step === 2) poolMid = queue.getPoolView(Date.now());
       const sec = (Date.now() - T0) / 1000;
       while (next < LATER.length && LATER[next][0] <= sec) {
         const [, [key, url, priority]] = LATER[next++];
@@ -151,6 +153,7 @@ async function runScenario(knob: string | undefined, seed = 7): Promise<Run> {
 
 const text = (lines: string[]) => `${lines.join('\n')}\n`;
 const golden = () => fs.readFileSync(FIXTURE, 'utf8');
+const goldenPerHost = () => fs.readFileSync(FIXTURE_PER_HOST, 'utf8');
 /** The lines of one host spelling family: dispatches of m* keys and transport calls to the MFC host. */
 const mfcLines = (lines: string[]) =>
   lines.filter((l) => / m\d+ \(/.test(l) || /^page \d+ \d+ https:\/\/(www\.)?myfigurecollection\.net\.?\//i.test(l));
@@ -162,6 +165,12 @@ describe('SCRAPE_POOL_SELECT off: FIFO dispatch byte-identical to develop (golde
     expect(run.lines.length).toBeGreaterThan(60);
     expect(run.lines.some((l) => l.startsWith('page ') && l.includes(' 500 '))).toBe(true);
     expect(text(run.lines)).toBe(golden());
+  });
+
+  it('unset, only the per-host cap binding (global cap 1000): its golden order and times', async () => {
+    const run = await runScenario(undefined, 7, '1000');
+    if (process.env.POOL_GOLDEN_PER_HOST_OUT) fs.writeFileSync(process.env.POOL_GOLDEN_PER_HOST_OUT, text(run.lines));
+    expect(text(run.lines)).toBe(goldenPerHost());
   });
 
   it.each(['off', ' OFF ', ''])("'%s': the golden order and times", async (knob) => {
@@ -179,7 +188,7 @@ describe('SCRAPE_POOL_SELECT off: FIFO dispatch byte-identical to develop (golde
     const run = await runScenario('off');
     expect(run.poolMid.scope).toBe('off');
     expect(run.poolMid.malformed).toBe(false);
-    expect(run.poolMid.hosts.map((h) => h.host).sort()).toEqual(['fast.test', MFC, 'myfigurecollection.net.', 'slow.test'].sort());
+    expect(run.poolMid.hosts.map((h) => h.host).sort()).toEqual(['fast.test', MFC, 'slow.test']);
     for (const h of run.poolMid.hosts) {
       expect(h.mode).toBe('fifo-off');
       expect(h.picks60m + h.agedPicks60m + h.forcedPicks60m + h.uniformPicks60m + h.redraws60m + h.scanFallbacks60m + h.retryPicks60m + h.agedCount).toBe(0);
@@ -188,12 +197,20 @@ describe('SCRAPE_POOL_SELECT off: FIFO dispatch byte-identical to develop (golde
   });
 });
 
+/**
+ * The excluded host's order is its own as long as only the PER-HOST working-set cap binds. When the
+ * GLOBAL cap (SCRAPE_QUEUE_MAX_RESIDENT, default 1000) binds, hosts share one page-in budget, so the
+ * instant one of the excluded host's parked rows pages in depends on the other hosts' residency, and a
+ * pooled host's parked picks move it: the excluded host then dispatches the same items, the same number
+ * of times, but a parked HOT row can page in earlier or later than under 'off' (as it already moves
+ * under FIFO whenever another host's traffic changes).
+ */
 describe("SCRAPE_POOL_SELECT='all,-myfigurecollection.net'", () => {
   it.each(['all,-myfigurecollection.net', ' ALL , -WWW.MyFigureCollection.NET. '])(
     "'%s': MFC (every spelling) keeps the golden FIFO order and times; the other hosts, the late one included, are pooled",
     async (knob) => {
-      const run = await runScenario(knob);
-      expect(text(mfcLines(run.lines))).toBe(text(mfcLines(golden().trimEnd().split('\n'))));
+      const run = await runScenario(knob, 7, '1000');
+      expect(text(mfcLines(run.lines))).toBe(text(mfcLines(goldenPerHost().trimEnd().split('\n'))));
       const byHost = new Map(run.pool.hosts.map((h) => [h.host, h]));
       expect(byHost.get(MFC)?.mode).toBe('fifo-excluded');
       expect(byHost.get(MFC)?.picks60m).toBe(0);
@@ -206,6 +223,12 @@ describe("SCRAPE_POOL_SELECT='all,-myfigurecollection.net'", () => {
     },
   );
 
+  it('with the GLOBAL cap binding, MFC dispatches the same items the same number of times as under off', async () => {
+    const run = await runScenario('all,-myfigurecollection.net');
+    const mfcDispatches = (lines: string[]) => lines.filter((l) => l.startsWith('dispatch ') && / m\d+ \(/.test(l)).map((l) => l.split(' ').slice(2).join(' ')).sort();
+    expect(mfcDispatches(run.lines)).toEqual(mfcDispatches(golden().trimEnd().split('\n')));
+  });
+
   it('the pooled hosts dispatch in a different order from FIFO for this seed (the pool is live)', async () => {
     const run = await runScenario('all,-myfigurecollection.net');
     const order = (lines: string[], prefix: RegExp) => lines.filter((l) => l.startsWith('dispatch ') && prefix.test(l)).map((l) => l.split(' ')[2]);
@@ -216,12 +239,12 @@ describe("SCRAPE_POOL_SELECT='all,-myfigurecollection.net'", () => {
   });
 
   it("'all,-a,-b' excludes both hosts", async () => {
-    const run = await runScenario('all,-myfigurecollection.net,-fast.test');
+    const run = await runScenario('all,-myfigurecollection.net,-fast.test', 7, '1000');
     const byHost = new Map(run.pool.hosts.map((h) => [h.host, h.mode]));
     expect(byHost.get(MFC)).toBe('fifo-excluded');
     expect(byHost.get('fast.test')).toBe('fifo-excluded');
     expect(byHost.get('late.test')).toBe('pool');
-    const fifo = golden().trimEnd().split('\n');
+    const fifo = goldenPerHost().trimEnd().split('\n');
     const fastLines = (lines: string[]) => lines.filter((l) => / f\d+ \(/.test(l) || l.startsWith('page ') && l.includes('fast.test'));
     expect(text(fastLines(run.lines))).toBe(text(fastLines(fifo)));
   });

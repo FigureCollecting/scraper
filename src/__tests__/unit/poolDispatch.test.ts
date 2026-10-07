@@ -105,6 +105,17 @@ describe('PoolDispatch: age and hard caps', () => {
     expect(pd.warnings()[0]).toContain(POOL_HARD_CAP_ENV);
   });
 
+  it('empty entries between commas are skipped; a hard cap for a host with no age override is checked against 12 h', () => {
+    const ok = new PoolDispatch({ select: 'all', ageCaps: 'hpoi.net=2,, fast.test=3,', hardCaps: 'other.test=30', seed: 1 });
+    expect(ok.capsFor('hpoi.net').ageCapMs).toBe(2 * H);
+    expect(ok.capsFor('fast.test').ageCapMs).toBe(3 * H);
+    expect(ok.capsFor('other.test')).toEqual({ ageCapMs: 12 * H, hardCapMs: 30 * H });
+    expect(ok.warnings()).toEqual([]);
+    const low = new PoolDispatch({ select: 'all', hardCaps: 'other.test=5', seed: 1 });
+    expect(low.capsFor('other.test')).toEqual({ ageCapMs: 12 * H, hardCapMs: 24 * H });
+    expect(low.warnings()).toHaveLength(1);
+  });
+
   it('a hard cap equal to the age cap is accepted', () => {
     const pd = new PoolDispatch({ select: 'all', ageCaps: 'hpoi.net=6', hardCaps: 'hpoi.net=6', seed: 1 });
     expect(pd.capsFor('hpoi.net')).toEqual({ ageCapMs: 6 * H, hardCapMs: 6 * H });
@@ -121,6 +132,15 @@ describe('PoolDispatch: seed and streams', () => {
       expect(s).toBeLessThan(2 ** 32);
     }
     expect(seeds.size).toBeGreaterThan(1);
+  });
+
+  it.each([-1, 2 ** 32, 1.5, Number.NaN])('refuses the seed %p', (seed) => {
+    expect(() => new PoolDispatch({ seed })).toThrow(RangeError);
+  });
+
+  it('accepts the seeds 0 and 2^32 - 1', () => {
+    expect(new PoolDispatch({ seed: 0 }).seed).toBe(0);
+    expect(new PoolDispatch({ seed: 2 ** 32 - 1 }).seed).toBe(2 ** 32 - 1);
   });
 
   it('picks replay from the logged seed: the stream is deriveStream(seed, host, "pick") into select()', () => {
@@ -301,6 +321,12 @@ describe('PoolDispatch: the trailing-hour statistics behind the pool block', () 
     expect(s.p99WaitH60m).toBeCloseTo(198 / 60, 3);
   });
 
+  it('topBucketShare60m is 0 when the hour holds no recency (R3) pick', () => {
+    const pd = new PoolDispatch({ select: 'all', ageCaps: 'hpoi.net=0.001', seed: 3 });
+    pd.pick('hpoi.net', 'hpoi.net|WARM', [{ key: 'a', recencyMs: NOW - 60_000, classEnteredAtMs: NOW - 60_000, numId: 10, retry: false }], NOW);
+    expect(pd.hostStats('hpoi.net', NOW)).toMatchObject({ picks60m: 1, topBucketShare60m: 0 });
+  });
+
   it('counts forced picks', () => {
     const events: PoolPickEvent[] = [];
     const pd = new PoolDispatch({ select: 'all', ageCaps: 'hpoi.net=0.001', seed: 3, onPick: (e) => events.push(e) });
@@ -339,6 +365,19 @@ describe('getPoolDispatch / setPoolDispatch / announcePoolDispatch', () => {
     expect(line).toContain('seed=123456789');
     expect(line).toContain('scope=off');
     expect(line).toContain('malformed');
+  });
+
+  it("boot line for a host list names the hosts; for 'all' it names no host", () => {
+    expect(new PoolDispatch({ select: 'hpoi.net,fast.test', seed: 2 }).describe()).toContain('scope=hosts hosts=hpoi.net,fast.test ');
+    const all = new PoolDispatch({ select: 'all', seed: 2 }).describe();
+    expect(all).toContain('scope=all ageCapH=12 hardCapH=24 seed=2');
+  });
+
+  it('logs to the console by default', () => {
+    const log = console.log as unknown as jest.Mock;
+    log.mockClear();
+    announcePoolDispatch(new PoolDispatch({ select: 'off', seed: 4 }));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('seed=4'));
   });
 
   it("boot line for 'all,-host' names the excluded hosts and the cap overrides", () => {

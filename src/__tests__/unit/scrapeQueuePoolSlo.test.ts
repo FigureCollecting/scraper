@@ -91,7 +91,6 @@ async function runSlo(name: string, inflowPerPick: number, failRate = 0, seed = 
   process.env.SCRAPE_QUEUE_MAX_RESIDENT_PER_HOST = '100';
   jest.useFakeTimers();
   jest.setSystemTime(T0);
-  const started = process.hrtime.bigint();
   const model = new ClassModel(`${HOST}|WARM`, 24 * HOUR);
   const gen = refMulberry32(seed ^ 0x5bd1e995);
   const dir = poolTmpDir('pool-slo-');
@@ -137,16 +136,17 @@ async function runSlo(name: string, inflowPerPick: number, failRate = 0, seed = 
     const u = `https://${HOST}/item/${id}`;
     keyOfUrl.set(u, key);
     model.add(key, u, fails);
-    queue.enqueue(key, { url: u, priority: 'WARM' });
+    // The model learns of the class entry BEFORE the enqueue: an idle queue dispatches at once.
     model.enter(key, Date.now(), false);
+    queue.enqueue(key, { url: u, priority: 'WARM' });
   };
-  // The initial backlog arrives over the hour before the first pick, oldest first.
-  jest.setSystemTime(T0 - BACKLOG * 1000);
+  // The initial backlog arrives one pick interval apart before the first pick, oldest first, as
+  // agingfix.py's does (ticks -(n0 - 1)..0): a backlog that built up at the service rate, not a burst.
+  jest.setSystemTime(T0 - (BACKLOG - 1) * FLOOR_MS);
   for (let i = 0; i < BACKLOG; i++) {
     add();
-    jest.setSystemTime(Date.now() + 1000);
+    if (i < BACKLOG - 1) jest.setSystemTime(Date.now() + FLOOR_MS);
   }
-  jest.setSystemTime(T0);
   let frac = 0;
   // Steady / draining window: one floor per step, arrivals through a fractional accumulator.
   while (Date.now() < windowEnd) {
@@ -192,7 +192,7 @@ async function runSlo(name: string, inflowPerPick: number, failRate = 0, seed = 
     `slo ${name}: enqueued=${out.enqueued} windowPicks=${out.windowPicks} wait p50=${out.p50H.toFixed(1)} h p99=${out.p99H.toFixed(1)} h max=${out.maxH.toFixed(1)} h ` +
       `agedShare=${out.agedShare.toFixed(3)} forced=${out.forcedPicks} maxPool=${out.maxPool} theorem checked=${out.theoremChecked} violations=${out.theoremViolations} ` +
       `maxRatio=${out.maxRatio.toFixed(3)} r1Violations=${out.r1Violations} poolSizeMismatches=${out.poolSizeMismatches} completedOrGivenUp=${out.completed} ` +
-      `left=${out.leftover}/${out.storeLeft} rules=${JSON.stringify(out.rules)} wall=${(Number(process.hrtime.bigint() - started) / 1e9).toFixed(1)}s`,
+      `left=${out.leftover}/${out.storeLeft} rules=${JSON.stringify(out.rules)}`,
   );
   jest.useRealTimers();
   return out;

@@ -2,6 +2,7 @@
 import { jest } from '@jest/globals';
 import { resetAllMocks } from './__mocks__/puppeteer';
 import { HOST_CLOCK_ENV, setHostClock } from '../services/hostClock';
+import { POOL_AGE_CAP_ENV, POOL_HARD_CAP_ENV, POOL_SELECT_ENV, setPoolDispatch } from '../services/poolDispatch';
 
 // Mock console methods to reduce test noise
 global.console = {
@@ -19,6 +20,11 @@ process.env.PORT = '0'; // Use random port for tests
 // The shared host clock is process-wide and reads SCRAPE_HOST_CLOCK once: a value in the shell
 // that runs the tests must not put every queue suite on one clock that outlives each test.
 delete process.env[HOST_CLOCK_ENV];
+// Likewise the pool dispatcher reads SCRAPE_POOL_SELECT (and its caps) once: a value in the shell must
+// not pool every queue suite's dispatch.
+delete process.env[POOL_SELECT_ENV];
+delete process.env[POOL_AGE_CAP_ENV];
+delete process.env[POOL_HARD_CAP_ENV];
 
 // Global test timeout
 jest.setTimeout(30000);
@@ -66,4 +72,9 @@ afterEach(() => {
   // test set must not reach the next one's process clock.
   delete process.env[HOST_CLOCK_ENV];
   setHostClock(null);
+  // A pool scope, skip marks and pick history a test set must not reach the next one's process pool.
+  delete process.env[POOL_SELECT_ENV];
+  delete process.env[POOL_AGE_CAP_ENV];
+  delete process.env[POOL_HARD_CAP_ENV];
+  setPoolDispatch(null);
 });
