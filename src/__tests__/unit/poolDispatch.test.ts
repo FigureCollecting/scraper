@@ -265,8 +265,9 @@ describe('PoolDispatch: the trailing-hour statistics behind the pool block', () 
     // 1: uniform (coin 0.05 < floor 0.10), rank floor(0.4 * 30) = 12 -> bucket 0.
     queue.push(0.05, 0.4);
     pd.pick('hpoi.net', K, freshPool, NOW);
-    // 2: R3 bucket draw (coin 0.5, bucket x 0.9 * 1.5 = 1.35 -> bucket 1 = ranks 25..29), rank 25 + floor(0.2 * 5) = 26.
-    queue.push(0.5, 0.9, 0.2);
+    // 2: R3 bucket draw (coin 0.5, bucket x 0.9 * 1.5 = 1.35 -> bucket 1 = ranks 25..29), rank 25 + floor(0 * 5) = 25:
+    //    the first rank OUTSIDE the top bucket (headSize 25).
+    queue.push(0.5, 0.9, 0.0);
     pd.pick('hpoi.net', K, freshPool, NOW + 1000);
     // 3: aged (1.5 h old, age cap 1 h, hard cap 2 h): R2 coin 0.05 < 0.9, then the draw.
     queue.push(0.05, 0.0);
@@ -291,7 +292,7 @@ describe('PoolDispatch: the trailing-hour statistics behind the pool block', () 
     expect(s.forcedPicks60m).toBe(0);
     expect(s.retryPicks60m).toBe(1);
     expect(s.scanFallbacks60m).toBe(1);
-    // R3-stage picks: uniform rank 12 (top bucket), R3 rank 26, the two fallbacks (ranks 0 and 1).
+    // R3-stage picks: uniform rank 12 (top bucket), R3 rank 25 (not), the two fallbacks (ranks 0 and 1).
     expect(s.topBucketShare60m).toBeCloseTo(3 / 4, 3);
     expect(s.redraws60m).toBe(events.reduce((a, e) => a + e.redraws, 0));
     expect(s.redraws60m).toBeGreaterThanOrEqual(2 * DEFAULT_ID_PARAMS.maxRedraws);
@@ -307,6 +308,36 @@ describe('PoolDispatch: the trailing-hour statistics behind the pool block', () 
       p99WaitH60m: 0, maxWaitH60m: 0, redraws60m: 0, scanFallbacks60m: 0, retryPicks60m: 0,
     });
     expect(pd.hostsSeen(later)).toEqual([]);
+  });
+
+  it('an aged-set pick that scans (stage R2, rule scan) counts as aged', () => {
+    const events: PoolPickEvent[] = [];
+    // Every draw is 0: the R2 coin passes and each of the 9 aged draws lands on rank 0 of the aged set.
+    const pd = new PoolDispatch({ select: 'all', ageCaps: 'hpoi.net=1', seed: 1, rngFor: () => () => 0, onPick: (e) => events.push(e) });
+    const K = 'hpoi.net|WARM';
+    pd.pick('hpoi.net', K, [{ key: 'p', recencyMs: NOW, classEnteredAtMs: NOW, numId: 1000, retry: false }], NOW);
+    // x is the most recent aged row and fails anti-sequence (1001 vs prev 1000); y is older and passes.
+    pd.pick('hpoi.net', K, [
+      { key: 'x', recencyMs: NOW - 1.2 * H, classEnteredAtMs: NOW - 1.2 * H, numId: 1001, retry: false },
+      { key: 'y', recencyMs: NOW - 1.5 * H, classEnteredAtMs: NOW - 1.5 * H, numId: 5000, retry: false },
+    ], NOW);
+    expect(events[1]).toMatchObject({ key: 'y', rule: 'scan', stage: 'R2' });
+    expect(pd.hostStats('hpoi.net', NOW)).toMatchObject({ picks60m: 2, agedPicks60m: 1 });
+  });
+
+  it('forgetAll drops every class\'s marks (a cleared queue): the next skip of that row is a mark again, not forced', () => {
+    const events: PoolPickEvent[] = [];
+    const pd = new PoolDispatch({ select: 'all', ageCaps: 'hpoi.net=0.001', seed: 3, onPick: (e) => events.push(e) });
+    const K = 'hpoi.net|WARM';
+    const old = NOW - 60_000;
+    const at = (key: string, numId: number, enteredAt: number): PoolCandidate => ({ key, recencyMs: enteredAt, classEnteredAtMs: enteredAt, numId, retry: false });
+    pd.pick('hpoi.net', K, [at('p', 11, NOW)], NOW);
+    pd.pick('hpoi.net', K, [at('a', 10, old), at('b', 500, old + 1)], NOW);
+    expect(events[1]).toMatchObject({ key: 'b', markSkip: 'a' });
+    pd.forgetAll();
+    pd.pick('hpoi.net', K, [at('q', 12, NOW)], NOW);
+    pd.pick('hpoi.net', K, [at('a', 10, old), at('c', 600, old + 2)], NOW);
+    expect(events[3]).toMatchObject({ key: 'c', rule: 'R1', markSkip: 'a' });
   });
 
   it('p99 is the sorted wait at floor(0.99 n), as the simulations take it', () => {

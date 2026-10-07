@@ -116,6 +116,19 @@ describe('parseHostScope: MALFORMED values are off, with one warning naming the 
     expect(scope.warning).toMatch(/treated as off/);
   });
 
+  it.each([
+    ['hpoi.net,,fast.test', 'an empty entry'],
+    ['all,', 'an empty entry'],
+    ['hpoi.net,all', "'all' is a keyword inside a host list"],
+    ['-hpoi.net,all', "'-hpoi.net' excludes a host without a leading 'all'"],
+    ['hpoi.net,-fast.test', "'-fast.test' excludes a host without a leading 'all'"],
+    ['all,hpoi.net', "'hpoi.net' after 'all' is not a '-host' exclusion"],
+    ['all,-', "'-' does not exclude a bare hostname"],
+    ['+hpoi.net', "'+hpoi.net' is not a bare hostname"],
+  ])('%p: the warning says why (%s)', (raw, why) => {
+    expect(parseHostScope(raw, ENV).warning).toBe(`WARN ${ENV}="${raw}" is malformed (${why}); treated as off`);
+  });
+
   it('a value with a line break is named without breaking the log line', () => {
     const scope = parseHostScope('all,-a.test\n[POOL] forged', ENV);
     expect(scope.malformed).toBe(true);

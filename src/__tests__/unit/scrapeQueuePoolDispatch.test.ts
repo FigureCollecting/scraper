@@ -254,6 +254,29 @@ describe('pooled picks', () => {
     expect(r.store.counts()).toEqual({ pending: 5, leased: 0, parked: 0 });
   });
 
+  it('a PARKED row ages from its class entry, not its first enqueue', async () => {
+    const dir = poolTmpDir('pool-parked-cea-');
+    dirs.push(dir);
+    const seed = openPoolStore(dir);
+    // 'raised' was first queued 40 h ago but entered this class 1 h ago; 'old' entered 30 h ago.
+    seed.put({ id: 'raised-1', mfcId: 'raised', url: url(500), priority: 'WARM', attempts: 0, maxRetries: 3, enqueuedAt: T0 - 40 * H, classEnteredAt: T0 - 1 * H, state: 'parked' });
+    seed.put({ id: 'old-1', mfcId: 'old', url: url(900), priority: 'WARM', attempts: 0, maxRetries: 3, enqueuedAt: T0 - 30 * H, state: 'parked' });
+    seed.put({ id: 'r-1', mfcId: 'r1', url: url(100), priority: 'WARM', attempts: 0, maxRetries: 3, enqueuedAt: T0 - 1000, state: 'pending' });
+    seed.close();
+    process.env.SCRAPE_QUEUE_MAX_RESIDENT_PER_HOST = '1';
+    const r = rig({ select: 'all', seed: 2, dir });
+    r.queue.restoreFromStore(T0);
+    await jest.advanceTimersByTimeAsync(10);
+    expect(r.picks[0]).toMatchObject({ key: 'old', rule: 'R1', waitMs: 30 * H, poolSize: 3 });
+  });
+
+  it('a retry is reported as one (an item that has spent one attempt)', async () => {
+    const r = rig({ select: 'all', seed: 4, failures: [[url(7), 1]] });
+    r.queue.enqueue('k7', { url: url(7), priority: 'WARM' });
+    await advance(2_000);
+    expect(r.picks.map((p) => [p.key, p.retry])).toEqual([['k7', false], ['k7', true]]);
+  });
+
   it('R2 draws over parked rows too: an aged parked row can be the aged pick', async () => {
     const dir = poolTmpDir('pool-r2-');
     dirs.push(dir);
@@ -467,6 +490,29 @@ describe('the pool block (getPoolView -> /health/detailed)', () => {
     r.queue.enqueue('bad', { url: 'not a url', priority: 'WARM' });
     r.store.put({ id: 'p-1', mfcId: 'p', url: 'also not a url', priority: 'WARM', attempts: 0, maxRetries: 3, enqueuedAt: T0, state: 'parked' });
     expect(r.queue.getPoolView().hosts.map((h) => h.host)).toEqual([HOST]);
+  });
+
+  it('agedCount counts a row exactly at the age cap (age >= cap), not one a millisecond younger', () => {
+    const r = rig({ select: 'all', seed: 1, ageCaps: `${HOST}=1` });
+    r.queue.enqueue('k0', { url: url(100), priority: 'WARM' });
+    r.queue.enqueue('k1', { url: url(1), priority: 'WARM' });
+    jest.setSystemTime(T0 + 1);
+    r.queue.enqueue('k2', { url: url(2), priority: 'WARM' });
+    expect(r.queue.getPoolView(T0 + H).hosts[0].agedCount).toBe(1);
+  });
+
+  it('a FIFO host reads agedCount 0 whatever its rows\' age', () => {
+    const r = rig({ select: 'all,-pool.test', seed: 1 });
+    r.queue.enqueue('k0', { url: url(100), priority: 'WARM' });
+    r.queue.enqueue('k1', { url: url(1), priority: 'WARM' });
+    const view = r.queue.getPoolView(T0 + 30 * H);
+    expect(view.hosts.map((h) => [h.host, h.mode, h.agedCount])).toEqual([[HOST, 'fifo-excluded', 0]]);
+  });
+
+  it('lists a host whose rows are all parked (none resident)', () => {
+    const r = rig({ select: 'all', seed: 1 });
+    r.store.put({ id: 'o-1', mfcId: 'o1', url: url(5, 'other.test'), priority: 'WARM', attempts: 0, maxRetries: 3, enqueuedAt: T0, state: 'parked' });
+    expect(r.queue.getPoolView(T0).hosts.map((h) => [h.host, h.mode])).toEqual([['other.test', 'pool']]);
   });
 
   it('agedCount leaves out a row held by its user session', () => {

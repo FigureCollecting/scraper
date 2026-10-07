@@ -195,7 +195,8 @@ function parseCaps(raw: string | undefined, envName: string, warnings: string[])
     const host = eq > 0 ? bareScopeHost(entry.slice(0, eq)) : null;
     const text = eq > 0 ? entry.slice(eq + 1).trim() : '';
     const hours = Number(text);
-    if (host === null || text === '' || !Number.isFinite(hours) || hours <= 0) {
+    // Number('') is 0, so an empty value is refused by hours <= 0 like a zero.
+    if (host === null || !Number.isFinite(hours) || hours <= 0) {
       warnings.push(`[POOL] WARN ${envName} entry "${sanitizeForLog(entry)}" is not host=hours with hours > 0; ignored`);
       continue;
     }
