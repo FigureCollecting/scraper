@@ -155,7 +155,8 @@ export interface LedgerRecent {
    * above `backfill.cursor` a cut-short pass fully attempted, and the drift the recent reads met that no
    * backfill save has applied to them yet. It lives under `recent` because that section is
    * loaded and stored WHOLE, unvalidated: an older build keeps it untouched and walks its cursor, and a bad
-   * value is ignored by the pool (src/crawler/pagePool.ts readVisited), never 'corrupt'.
+   * value (a page outside [1, MAX_LEDGER_PAGE], src/crawler/pagePool.ts isLedgerPage, or a drift count that is
+   * not a safe integer) makes the pool ignore it whole with a WARN, never 'corrupt'.
    */
   pagePool?: LedgerPagePool;
 }

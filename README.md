@@ -620,7 +620,10 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
   top (counted by the recent read, and carried in `recent.pagePool.drift` until a backfill saves, so a pass
   stopped before its backfill hands it on), the bottom ceil(k / page size) marks of a run sitting on an
   unvisited page are read again (one mark more when the pass had no recent read). Each pooled store's summary
-  carries `pagePicks`, the pages requested in order; the pass logs its seed.
+  carries `pagePicks`, the pages requested in order; the pass logs its seed. Every page number the pool
+  reads from the ledger (the marks, the cursor, the end candidate) must be an integer in [1, 100000]
+  (`MAX_LEDGER_PAGE`, 20 x the deepest declared listing); one that is not is dropped with ONE WARN per
+  store naming it (the cursor walks again from the top, the pool state is ignored, the candidate is cleared).
 - **id-range backfill** — for the stores named in `CRAWLER_RANGE_STORES` only: walk the store's
   SEQUENTIAL id space downward through `GET /catalog?store=&range=1&from=&count=`, up to
   `CRAWLER_RANGE_IDS_PER_RUN` ids per run. See *Id-range backfill* below.

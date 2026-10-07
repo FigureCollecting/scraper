@@ -55,9 +55,25 @@ export const MAX_MARK_SPAN = 1000;
  */
 const MAX_ORDER_SEARCH = 8;
 
-const isPositiveInt = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v > 0;
+/**
+ * The highest listing page the pool trusts from the ledger. The deepest listing a rulesets profile declares is
+ * amiami's 5000 pages (suruga-ya 2731, every other store far fewer), so this is 20 x headroom; and it keeps
+ * every page well inside the safe integers, where `page++` always moves (at 2^53 it stops, and a loop over
+ * such a page never ends). A pooled walk never asks for a page above it: a store that reached it would start
+ * again from the top, because a cursor above it is dropped as corrupt.
+ */
+export const MAX_LEDGER_PAGE = 100_000;
 
-const isCount = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v >= 0;
+/**
+ * THE validator for every page number the pool reads from the persisted ledger (the visited marks here; the
+ * backfill cursor and the end candidate in the crawler): an integer in [1, MAX_LEDGER_PAGE]. The ledger is a
+ * file a crash, an older build or a hand edit can leave holding any JSON value; a value that fails this is a
+ * corrupt entry, dropped by the caller with one WARN.
+ */
+export const isLedgerPage = (v: unknown): v is number => Number.isInteger(v) && (v as number) >= 1 && (v as number) <= MAX_LEDGER_PAGE;
+
+/** A drift count (ids, page size): a safe integer >= 0, so adding to it stays exact. */
+const isCount = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 0;
 
 const isDrift = (v: unknown): v is PendingDrift =>
   typeof v === 'object' && v !== null && isCount((v as PendingDrift).ids) && isCount((v as PendingDrift).pageSize);
@@ -65,8 +81,8 @@ const isDrift = (v: unknown): v is PendingDrift =>
 const isMark = (v: unknown): v is VisitedMark =>
   Array.isArray(v) &&
   v.length === 3 &&
-  isPositiveInt(v[0]) &&
-  isPositiveInt(v[1]) &&
+  isLedgerPage(v[0]) &&
+  isLedgerPage(v[1]) &&
   v[1] >= v[0] &&
   v[1] - v[0] < MAX_MARK_SPAN &&
   typeof v[2] === 'string';
@@ -77,6 +93,9 @@ const parsePool = (raw: unknown): LedgerPagePool | undefined => {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
   const { visited, drift } = raw as { visited?: unknown; drift?: unknown };
   if (!Array.isArray(visited) || !visited.every(isMark)) return undefined;
+  // A save writes disjoint marks, so a pool of ours covers at most MAX_LEDGER_PAGE pages in all. Checked
+  // before any page is read: it bounds readVisited's work (and its Map) at MAX_LEDGER_PAGE pages.
+  if (visited.reduce((n: number, [from, to]: VisitedMark) => n + to - from + 1, 0) > MAX_LEDGER_PAGE) return undefined;
   if (drift !== undefined && !isDrift(drift)) return undefined;
   return { visited, ...(drift ? { drift } : {}) };
 };
@@ -86,9 +105,11 @@ const NO_DRIFT: PendingDrift = { ids: 0, pageSize: 0 };
 /**
  * Read `ledger.recent.pagePool` into page -> visit time (epoch ms): the pages at or above `cursor` of every
  * mark younger than `ttlMs` at `nowMs`, and the drift not yet applied to them. Absent = nothing visited, no
- * drift. Anything structurally wrong is ignored WHOLE and flagged `malformed` (the caller warns): the pool is
- * only a hint, so a bad one must never refuse the store the way a corrupt ledger does. A mark whose time does
- * not parse counts as expired.
+ * drift. Anything structurally wrong (a page that fails isLedgerPage, a count that is not a safe integer, marks
+ * covering more than MAX_LEDGER_PAGE pages in all) is ignored WHOLE and flagged `malformed` (the caller warns):
+ * the pool is only a hint, so a bad one must not refuse the store the way a corrupt ledger does. So every page
+ * returned is a ledger page, and the read sets at most MAX_LEDGER_PAGE of them. A mark whose time does not
+ * parse counts as expired.
  */
 export function readVisited(
   raw: unknown,
@@ -125,7 +146,8 @@ export function addDrift(raw: LedgerPagePool | undefined, ids: number, pageSize:
  * caller passes that ceiling. A page further up the run only took ids from visited pages. A run shorter than
  * `depth` goes whole (what spills past its top lands on an unvisited page, or on a run that is itself
  * exposed). `depth` 0 forgets nothing. The drop stops at the run's top: `depth` comes from the ledger's
- * carried drift, which a corrupt ledger can make any integer (1e300), and every run is already in `exposed`.
+ * carried drift, which a corrupt ledger can make any safe integer, and every run is already in `exposed`. Each
+ * step deletes a page, so the loop ends within `visited.size` steps (at most MAX_LEDGER_PAGE from readVisited).
  * Mutates `visited`.
  */
 export function dropExposedMarks(visited: Map<number, number>, cursor: number, depth: number): void {
@@ -135,17 +157,23 @@ export function dropExposedMarks(visited: Map<number, number>, cursor: number, d
   }
 }
 
-/** The lowest page at or above `cursor` that is not visited: where the durable cursor belongs. */
+/**
+ * The lowest page at or above `cursor` that is not visited: where the durable cursor belongs. The walk stops
+ * past MAX_LEDGER_PAGE (a page above it is never trusted as visited), so it ends whatever the map holds.
+ */
 export function lowestUnvisited(cursor: number, visited: ReadonlyMap<number, number>): number {
   let page = cursor;
-  while (visited.has(page)) page++;
+  while (page <= MAX_LEDGER_PAGE && visited.has(page)) page++;
   return page;
 }
 
-/** The pass's page set: the `size` lowest unvisited pages at or above `cursor`, none above `endPage`. Ascending. */
+/**
+ * The pass's page set: the `size` lowest unvisited pages at or above `cursor`, none above `endPage` and none
+ * above MAX_LEDGER_PAGE. Ascending.
+ */
 export function passPageSet(cursor: number, size: number, visited: ReadonlyMap<number, number>, endPage?: number): number[] {
   const out: number[] = [];
-  for (let page = cursor; out.length < size && (endPage === undefined || page <= endPage); page++) {
+  for (let page = cursor; out.length < size && page <= MAX_LEDGER_PAGE && (endPage === undefined || page <= endPage); page++) {
     if (!visited.has(page)) out.push(page);
   }
   return out;

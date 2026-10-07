@@ -80,7 +80,7 @@
 import { randomInt } from 'crypto';
 import { createRequestGate, type GateResult, type RequestGate } from '../initiator/requestGate.js';
 import { deriveStream, type History } from '../services/poolSelect.js';
-import { addDrift, dropExposedMarks, lowestUnvisited, nextPage, passPageSet, readVisited, writeVisited } from './pagePool.js';
+import { addDrift, dropExposedMarks, isLedgerPage, lowestUnvisited, MAX_LEDGER_PAGE, nextPage, passPageSet, readVisited, writeVisited } from './pagePool.js';
 import { logger } from '../utils/logger.js';
 import { classifyFetchFailure } from '../services/failureClassifier.js';
 import type { FetchFailureReport, ReportFetchFailure } from '../services/failureReporter.js';
@@ -1359,9 +1359,23 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
   const pooledBackfill = async (st: StoreState): Promise<void> => {
     const ledger = st.ledger!;
     const b = ledger.backfill;
-    const start = b.cursor ?? Math.max(2, st.deepestRecentPage + 1);
+    // CORRUPT PAGES (review i4): every page number read from the ledger passes ONE validator (isLedgerPage, an
+    // integer in [1, MAX_LEDGER_PAGE]). One that does not is dropped, and ONE WARN per store names them all: a
+    // cursor walks again from the top, a bad pool is ignored whole, a bad end candidate is cleared.
+    const corrupt: string[] = [];
+    if (b.cursor !== null && b.cursor !== undefined && !isLedgerPage(b.cursor)) corrupt.push('cursor');
+    const start = isLedgerPage(b.cursor) ? b.cursor : Math.max(2, st.deepestRecentPage + 1);
     const read = readVisited(ledger.recent.pagePool, start, now(), poolTtlMs);
-    if (read.malformed) logger.warn('[CRAWLER] page pool state malformed — ignored and rewritten', { siteId: st.siteId });
+    if (read.malformed) corrupt.push('pagePool');
+    const candidate: unknown = b.exhaustCandidateCursor;
+    if (candidate !== undefined && !isLedgerPage(candidate)) corrupt.push('exhaustCandidateCursor');
+    if (corrupt.length > 0) {
+      logger.warn('[CRAWLER] page pool: corrupt ledger entries dropped (a page must be an integer in [1, MAX_LEDGER_PAGE])', {
+        siteId: st.siteId,
+        entries: corrupt,
+        maxPage: MAX_LEDGER_PAGE,
+      });
+    }
     const visited = read.visited;
     // DRIFT: k ids the recent reads met that the ledger did not hold (since the last backfill save, this pass
     // included) moved every listing id down k places, so re-read the bottom ceil(k / page size) pages of every
@@ -1371,10 +1385,11 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     const driftPages = (st.summary.recentPages === 0 ? 1 : 0) + Math.ceil(read.drift.ids / Math.max(1, read.drift.pageSize));
     dropExposedMarks(visited, start, driftPages);
     // What the ledger said about the end when the pass began. A candidate BELOW the cursor is stale (nothing
-    // writes one) and bounds nothing; it is cleared at the first save, as a real page clears it today.
+    // writes one) and bounds nothing; it is cleared at the first save, as a real page clears it today. So is a
+    // corrupt one.
     let priorExhausted = b.exhaustedAt !== undefined;
-    let priorCandidate = b.exhaustCandidateCursor !== undefined && b.exhaustCandidateCursor >= start ? b.exhaustCandidateCursor : undefined;
-    let clearEnd = b.exhaustCandidateCursor !== undefined && priorCandidate === undefined;
+    let priorCandidate = isLedgerPage(candidate) && candidate >= start ? candidate : undefined;
+    let clearEnd = candidate !== undefined && priorCandidate === undefined;
     let bound = priorExhausted ? start : priorCandidate;
     // The lowest page this pass saw an exhaustion signal on (every later pick is below it).
     let seenEnd: number | undefined;
