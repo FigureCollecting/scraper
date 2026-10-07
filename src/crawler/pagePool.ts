@@ -76,8 +76,9 @@ export function readVisited(raw: unknown, cursor: number, nowMs: number, ttlMs: 
  * visited). After new ids land on top, that page holds the slid-down tail of the unvisited page below it,
  * which nothing has read; the pages above it in the run only took ids from visited pages. Mutates `visited`.
  */
-export function dropExposedMarks(_visited: Map<number, number>, _cursor: number): void {
-  // STUB: the drift rule's failing tests come first.
+export function dropExposedMarks(visited: Map<number, number>, cursor: number): void {
+  const exposed = [...visited.keys()].filter((page) => page > cursor && !visited.has(page - 1));
+  for (const page of exposed) visited.delete(page);
 }
 
 /** The lowest page at or above `cursor` that is not visited: where the durable cursor belongs. */
