@@ -7,7 +7,7 @@
  * POOL-SELECT orders it: lower page = more recent, never two adjacent pages in a row, no monotone 3-run
  * while an order without one exists. Pure: no clock, no I/O.
  */
-import { addDrift, dropExposedMarks, lowestUnvisited, MAX_MARK_SPAN, nextPage, passPageSet, readVisited, writeVisited } from '../../crawler/pagePool';
+import { addDrift, dropExposedMarks, isLedgerPage, lowestUnvisited, MAX_LEDGER_PAGE, MAX_MARK_SPAN, nextPage, passPageSet, readVisited, writeVisited } from '../../crawler/pagePool';
 import { deriveStream, mulberry32, passesAntiSequence, DEFAULT_PAGE_PARAMS, type History } from '../../services/poolSelect';
 import { loadCrawlerConfig } from '../../crawler/config';
 import { logger } from '../../utils/logger';
@@ -367,5 +367,202 @@ describe('loadCrawlerConfig — the page pool knobs', () => {
     expect(load({}).pagePoolVisitedTtlMs).toBe(72 * HOUR_MS);
     expect(load({ CRAWLER_PAGE_POOL_VISITED_TTL_H: '24' }).pagePoolVisitedTtlMs).toBe(24 * HOUR_MS);
     expect(load({ CRAWLER_PAGE_POOL_VISITED_TTL_H: '0' }).pagePoolVisitedTtlMs).toBe(72 * HOUR_MS);
+  });
+});
+
+/*
+ * ONE validator for every page number the pool reads from the persisted ledger (QB-U24 review i4): the visited
+ * marks here, the cursor and the end candidate in the crawler. The ledger is a file a crash, a bad build or a
+ * hand edit can leave holding any JSON value, and `page++` stops moving at 2^53, so an unchecked page can hang
+ * a loop that blocks the pass for every store. `bounded` counts Map.set and Map.has and throws past a limit,
+ * so the old runaway loops fail fast here instead of hanging jest (a timeout cannot stop a synchronous loop).
+ */
+const POISON: unknown[] = [0, -1, 1.5, MAX_LEDGER_PAGE + 1, 2 ** 53 - 1, 2 ** 53, 1e300, NaN, Infinity, -Infinity, '12', null, undefined, true, {}, []];
+/** The test's own reading of "a ledger page": an integer in [1, MAX_LEDGER_PAGE]. */
+const okPage = (v: unknown): boolean => typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= 100_000;
+const okCount = (v: unknown): boolean => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0;
+
+const bounded = <T>(limit: number, fn: () => T): { out: T; ops: number } => {
+  const set = Map.prototype.set;
+  const has = Map.prototype.has;
+  let ops = 0;
+  const tick = (): void => {
+    if (++ops > limit) throw new Error(`ran past ${limit} Map operations`);
+  };
+  const s = jest.spyOn(Map.prototype, 'set').mockImplementation(function (this: Map<unknown, unknown>, k: unknown, v: unknown) {
+    tick();
+    return set.call(this, k, v);
+  });
+  const h = jest.spyOn(Map.prototype, 'has').mockImplementation(function (this: Map<unknown, unknown>, k: unknown) {
+    tick();
+    return has.call(this, k);
+  });
+  try {
+    return { out: fn(), ops };
+  } finally {
+    s.mockRestore();
+    h.mockRestore();
+  }
+};
+
+describe('isLedgerPage: the one validator for a page read from the ledger', () => {
+  it('MAX_LEDGER_PAGE is 100 000: 20 x the deepest listing a rulesets profile declares (amiami, 5000 pages of 50)', () => {
+    expect(MAX_LEDGER_PAGE).toBe(100_000);
+  });
+
+  it('accepts an integer in [1, MAX_LEDGER_PAGE]', () => {
+    expect([1, 2, 2731, 5000, MAX_LEDGER_PAGE - 1, MAX_LEDGER_PAGE].map((p) => isLedgerPage(p))).toEqual([true, true, true, true, true, true]);
+  });
+
+  it.each(POISON.map((v) => [String(v), v]))('rejects %s', (_label, v) => {
+    expect(isLedgerPage(v)).toBe(false);
+  });
+});
+
+describe('readVisited never trusts a page outside [1, MAX_LEDGER_PAGE]', () => {
+  const at = ago(1);
+  it.each(POISON.flatMap((v) => [
+    [`from ${String(v)}`, { visited: [[v, 12, at]] }],
+    [`to ${String(v)}`, { visited: [[12, v, at]] }],
+    [`from and to ${String(v)}`, { visited: [[v, v, at]] }],
+    [`a poisoned mark beside a good one (${String(v)})`, { visited: [[12, 13, at], [v, v, at]] }],
+  ]))('%s: malformed, read in a bounded number of steps', (_label, raw) => {
+    const { out } = bounded(1000, () => readVisited(raw, 1, NOW, TTL));
+    expect(out).toEqual({ visited: new Map(), drift: { ids: 0, pageSize: 0 }, malformed: true });
+  });
+
+  it.each([2 ** 53, 2 ** 53 + 2, 1e300, NaN, Infinity])('drift counts must be safe integers (%s)', (n) => {
+    expect(readVisited({ visited: [], drift: { ids: n, pageSize: 10 } }, 1, NOW, TTL).malformed).toBe(true);
+    expect(readVisited({ visited: [], drift: { ids: 3, pageSize: n } }, 1, NOW, TTL).malformed).toBe(true);
+  });
+
+  it('the largest safe drift count is well formed', () => {
+    expect(readVisited({ visited: [], drift: { ids: 2 ** 53 - 1, pageSize: 2 ** 53 - 1 } }, 1, NOW, TTL).malformed).toBe(false);
+  });
+
+  it('a mark ending at MAX_LEDGER_PAGE is accepted', () => {
+    const { visited, malformed } = readVisited({ visited: [[MAX_LEDGER_PAGE - 1, MAX_LEDGER_PAGE, at]] }, 1, NOW, TTL);
+    expect(malformed).toBe(false);
+    expect([...visited.keys()]).toEqual([MAX_LEDGER_PAGE - 1, MAX_LEDGER_PAGE]);
+  });
+
+  /*
+   * The marks a backfill save writes are disjoint, so a well-formed pool covers at most MAX_LEDGER_PAGE pages.
+   * More is not ours: review i4 built 16,800 disjoint 1000-page marks (each valid alone, about 760 KB of JSON)
+   * that filled a Map past V8's 2^24 limit and threw out of the pass for every store.
+   */
+  const marks = (n: number, width: number): unknown[] => Array.from({ length: n }, (_, i) => [i * width + 1, (i + 1) * width, at]);
+
+  it('marks covering exactly MAX_LEDGER_PAGE pages are accepted', () => {
+    const { visited, malformed } = readVisited({ visited: marks(MAX_LEDGER_PAGE / MAX_MARK_SPAN, MAX_MARK_SPAN) }, 1, NOW, TTL);
+    expect(malformed).toBe(false);
+    expect(visited.size).toBe(MAX_LEDGER_PAGE);
+  });
+
+  it('marks covering more than MAX_LEDGER_PAGE pages in all are malformed, before any page is read', () => {
+    const over = [...marks(MAX_LEDGER_PAGE / MAX_MARK_SPAN, MAX_MARK_SPAN), [1, 1, at]];
+    const { out, ops } = bounded(10, () => readVisited({ visited: over }, 1, NOW, TTL));
+    expect(out.malformed).toBe(true);
+    expect(ops).toBe(0);
+  });
+
+  it('the review\'s 16,800 x 1000-page pool is malformed, before any page is read (no RangeError)', () => {
+    const crafted = Array.from({ length: 16_800 }, (_, i) => [1 + i * 2000, i * 2000 + 1000, at]);
+    const { out, ops } = bounded(10, () => readVisited({ visited: crafted }, 1, NOW, TTL));
+    expect(out.malformed).toBe(true);
+    expect(ops).toBe(0);
+  });
+});
+
+describe('every page loop stops at MAX_LEDGER_PAGE', () => {
+  const v = (...pages: number[]) => new Map(pages.map((p) => [p, NOW]));
+
+  it('lowestUnvisited never walks past MAX_LEDGER_PAGE (and returns at once from an unsafe cursor)', () => {
+    expect(bounded(1000, () => lowestUnvisited(2 ** 53, v(2 ** 53))).out).toBe(2 ** 53);
+    expect(bounded(1000, () => lowestUnvisited(1e300, v(1e300))).out).toBe(1e300);
+    expect(lowestUnvisited(MAX_LEDGER_PAGE - 1, v(MAX_LEDGER_PAGE - 1, MAX_LEDGER_PAGE, MAX_LEDGER_PAGE + 1))).toBe(MAX_LEDGER_PAGE + 1);
+  });
+
+  it('passPageSet never offers a page above MAX_LEDGER_PAGE (none at all from an unsafe cursor)', () => {
+    expect(passPageSet(2 ** 53, 5, v())).toEqual([]);
+    expect(passPageSet(MAX_LEDGER_PAGE - 1, 5, v())).toEqual([MAX_LEDGER_PAGE - 1, MAX_LEDGER_PAGE]);
+    expect(passPageSet(MAX_LEDGER_PAGE + 1, 5, v())).toEqual([]);
+  });
+
+  it('dropExposedMarks forgets a whole 7-page run at depth 1e300, and all but its top page at depth 6', () => {
+    const huge = v(30, 31, 32, 33, 34, 35, 36);
+    dropExposedMarks(huge, 20, 1e300);
+    expect([...huge.keys()]).toEqual([]);
+    const six = v(30, 31, 32, 33, 34, 35, 36);
+    dropExposedMarks(six, 20, 6);
+    expect([...six.keys()]).toEqual([36]);
+  });
+});
+
+/*
+ * Seeded fuzz over the ledger's pool shape (500 seeds): marks and drift built from good values and the poison
+ * list. Property: the read finishes within MAX_LEDGER_PAGE + a few Map operations; it never accepts a poisoned
+ * page or count; every page it yields is a ledger page; and the backfill's own steps on what it yields
+ * (drop, cursor, page set, save) finish, offer only ledger pages, and write a pool that reads back well formed.
+ */
+describe('seeded fuzz over the ledger pool shape', () => {
+  const gen = (rng: () => number) => {
+    const pick = <T>(xs: readonly T[]): T => xs[Math.floor(rng() * xs.length)];
+    const small = (): number => 1 + Math.floor(rng() * 40);
+    const value = (): unknown => (rng() < 0.6 ? small() : pick([...POISON, MAX_LEDGER_PAGE, MAX_LEDGER_PAGE - 3]));
+    const mark = (): unknown => {
+      const r = rng();
+      if (r < 0.5) {
+        const from = small();
+        return [from, from + Math.floor(rng() * 4), rng() < 0.9 ? ago(rng() * 100) : value()];
+      }
+      if (r < 0.9) return [value(), value(), ago(rng() * 10)];
+      return pick([value(), [value()], [value(), value(), ago(1), 'x']]);
+    };
+    const r = rng();
+    if (r < 0.05) return value();
+    const raw: Record<string, unknown> = { visited: rng() < 0.97 ? Array.from({ length: Math.floor(rng() * 7) }, mark) : value() };
+    if (rng() < 0.6) raw.drift = rng() < 0.7 ? { ids: Math.floor(rng() * 40), pageSize: Math.floor(rng() * 12) } : { ids: value(), pageSize: value() };
+    return raw;
+  };
+
+  const poisoned = (raw: unknown): boolean => {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return false;
+    const { visited, drift } = raw as { visited?: unknown; drift?: { ids?: unknown; pageSize?: unknown } };
+    const badMark = Array.isArray(visited) && visited.some((m) => Array.isArray(m) && (!okPage(m[0]) || !okPage(m[1])));
+    const badDrift = typeof drift === 'object' && drift !== null && (!okCount(drift.ids) || !okCount(drift.pageSize));
+    return badMark || badDrift;
+  };
+
+  it('500 seeds: bounded, never trusts a poisoned value, and the backfill steps stay in range', () => {
+    let poisonedSeen = 0;
+    let wellFormedSeen = 0;
+    for (let seed = 0; seed < 500; seed++) {
+      const rng = mulberry32(seed);
+      const raw = gen(rng);
+      const cursor = 1 + Math.floor(rng() * 30);
+      const { out: read } = bounded(MAX_LEDGER_PAGE + 100, () => readVisited(raw, cursor, NOW, TTL));
+      if (poisoned(raw)) {
+        poisonedSeen++;
+        expect({ seed, malformed: read.malformed }).toEqual({ seed, malformed: true });
+      }
+      if (!read.malformed) wellFormedSeen++;
+      expect([...read.visited.keys()].every((p) => okPage(p) && p >= cursor)).toBe(true);
+      expect(okCount(read.drift.ids) && okCount(read.drift.pageSize)).toBe(true);
+      const { out } = bounded(MAX_LEDGER_PAGE + 100, () => {
+        const visited = new Map(read.visited);
+        dropExposedMarks(visited, cursor, Math.ceil(read.drift.ids / Math.max(1, read.drift.pageSize)));
+        const next = lowestUnvisited(cursor, visited);
+        const set = passPageSet(cursor, 5, visited);
+        return { next, set, saved: writeVisited(visited, next) };
+      });
+      expect(okPage(out.next) || out.next === MAX_LEDGER_PAGE + 1).toBe(true);
+      expect(out.set.every(okPage)).toBe(true);
+      const back = readVisited(out.saved, out.next, NOW, TTL);
+      expect({ seed, malformed: back.malformed }).toEqual({ seed, malformed: false });
+    }
+    // The fuzz reaches both sides.
+    expect(poisonedSeen).toBeGreaterThan(100);
+    expect(wellFormedSeen).toBeGreaterThan(100);
   });
 });

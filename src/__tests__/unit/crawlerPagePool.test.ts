@@ -12,7 +12,8 @@
 import { runCrawlerPass, type CrawlerConfig, type CrawlerStoreSummary } from '../../crawler/crawler';
 import { createEmptyLedger, createFileLedgerStore, createMemoryLedgerStore, type FsLike, type Ledger, type LedgerStore } from '../../crawler/ledger';
 import { createMemoryListsStateStore } from '../../crawler/listsState';
-import { DEFAULT_PAGE_PARAMS, passesAntiSequence } from '../../services/poolSelect';
+import { MAX_LEDGER_PAGE, readVisited } from '../../crawler/pagePool';
+import { DEFAULT_PAGE_PARAMS, mulberry32, passesAntiSequence } from '../../services/poolSelect';
 import { fakeClock, idRun, itemUrl, makePagedEngine, type EngineReply } from '../helpers/pagedCatalogEngine';
 import { logger } from '../../utils/logger';
 
@@ -579,7 +580,7 @@ describe('ledger.recent.pagePool', () => {
     const p = await runPass(mkCfg(POOLED), engine, ledgers, T0, 3);
     expect(p.store().ledgerCorrupt).toBe(false);
     expect(sorted(p.backfillGets())).toEqual([10, 11, 12, 13, 14]);
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('page pool state malformed'), expect.objectContaining({ siteId: 'orzgk' }));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('corrupt ledger entries dropped'), expect.objectContaining({ siteId: 'orzgk', entries: ['pagePool'] }));
     expect(ledgers.files.get('orzgk')!.recent.pagePool).toEqual({ visited: [] });
   });
 
@@ -876,5 +877,169 @@ describe('drift from a pass whose backfill never saved is carried to the next pa
     it.each([false, true])('pooled=%p (b) 10 ids in a pass stopped by a recent-read cooldown, then 5: every id of page 21 is POSTed', async (pool) => {
       expect(await walk(pool, true)).toEqual([]);
     });
+  });
+});
+
+/*
+ * Review i4: every page number the pooled pass reads from the ledger (the visited marks, the backfill cursor,
+ * the end candidate) goes through ONE validator, pagePool.isLedgerPage: an integer in [1, MAX_LEDGER_PAGE]. A
+ * value outside it is a corrupt entry: dropped, with ONE WARN per store naming every entry dropped, and the
+ * pass carries on. `runBounded` counts Map.set and throws past 2e6, so the old hang (a mark at 2^53 never ends
+ * readVisited's loop, and jest's timeout cannot stop a synchronous loop) fails fast instead.
+ */
+describe('corrupt page values in the ledger: one validator, one WARN, the pass finishes', () => {
+  const corruptWarns = (warn: jest.SpyInstance) => warn.mock.calls.filter((c) => String(c[0]).includes('corrupt ledger entries dropped'));
+  const oneWarn = (entries: string[]) => [[expect.any(String), { siteId: 'orzgk', entries, maxPage: MAX_LEDGER_PAGE }]];
+  const runBounded = async (...args: Parameters<typeof runPass>) => {
+    const set = Map.prototype.set;
+    let n = 0;
+    const spy = jest.spyOn(Map.prototype, 'set').mockImplementation(function (this: Map<unknown, unknown>, k: unknown, v: unknown) {
+      if (++n > 2_000_000) throw new Error('pool loop ran past 2e6 Map.set calls');
+      return set.call(this, k, v);
+    });
+    try {
+      return await runPass(...args);
+    } finally {
+      spy.mockRestore();
+    }
+  };
+  const at = iso(T0 - HOUR_MS);
+
+  it.each([2 ** 53, 2 ** 53 - 1, 1e300, MAX_LEDGER_PAGE + 1])('a visited mark at %s drops the whole pool: the pass reads the cursor pages', async (v) => {
+    const warn = jest.spyOn(logger, 'warn');
+    const engine = makePagedEngine({ orzgk: catalog(30) });
+    const l = ledgerAt(engine.items('orzgk'), 10);
+    l.recent.pagePool = { visited: [[12, 13, at], [v, v, at]] };
+    const ledgers = createMemoryLedgerStore({ orzgk: l });
+    const p = await runBounded(mkCfg(POOLED), engine, ledgers, T0, 3);
+    expect(p.store().ledgerCorrupt).toBe(false);
+    expect(sorted(p.backfillGets())).toEqual([10, 11, 12, 13, 14]);
+    expect(corruptWarns(warn)).toEqual(oneWarn(['pagePool']));
+    expect(ledgers.files.get('orzgk')!.recent.pagePool).toEqual({ visited: [] });
+  });
+
+  it.each([2 ** 53, 1e300, MAX_LEDGER_PAGE + 1])('a backfill cursor of %s is dropped: the walk restarts at the top, one WARN', async (v) => {
+    const warn = jest.spyOn(logger, 'warn');
+    const engine = makePagedEngine({ orzgk: catalog(30) });
+    const l = ledgerAt(engine.items('orzgk'), 10);
+    l.backfill.cursor = v;
+    const ledgers = createMemoryLedgerStore({ orzgk: l });
+    const p = await runBounded(mkCfg(POOLED), engine, ledgers, T0, 3);
+    expect(sorted(p.backfillGets())).toEqual([2, 3, 4, 5, 6]);
+    expect(ledgers.files.get('orzgk')!.backfill.cursor).toBe(7);
+    expect(corruptWarns(warn)).toEqual(oneWarn(['cursor']));
+  });
+
+  it('such a cursor reaches the pool through the real file store (the ledger load accepts any positive integer)', async () => {
+    const files = new Map<string, string>();
+    const fsLike: FsLike = {
+      readFile: async (p) => files.get(p) ?? Promise.reject(Object.assign(new Error('ENOENT'), { code: 'ENOENT' })),
+      writeFile: async (p, d) => void files.set(p, d),
+      rename: async (from, to) => {
+        files.set(to, files.get(from)!);
+        files.delete(from);
+      },
+      mkdir: async () => undefined,
+    };
+    const fileStore = createFileLedgerStore('/ledgers', fsLike, 1);
+    const engine = makePagedEngine({ orzgk: catalog(30) });
+    const l = ledgerAt(engine.items('orzgk'), 10);
+    l.backfill.cursor = 2 ** 53;
+    await fileStore.save(l);
+    expect(((await fileStore.load('orzgk')) as Ledger).backfill.cursor).toBe(2 ** 53);
+    const p = await runBounded(mkCfg(POOLED), engine, fileStore, T0, 3);
+    expect(sorted(p.backfillGets())).toEqual([2, 3, 4, 5, 6]);
+    expect(((await fileStore.load('orzgk')) as Ledger).backfill.cursor).toBe(7);
+  });
+
+  it.each([
+    ['a string', '12'],
+    ['a fraction', 12.5],
+    ['2^53', 2 ** 53],
+    ['1e300', 1e300],
+    ['above MAX_LEDGER_PAGE', MAX_LEDGER_PAGE + 1],
+    ['null (NaN after JSON)', null],
+  ])('an end candidate that is %s is dropped and cleared: the pass reads its five pages, one WARN', async (_label, v) => {
+    const warn = jest.spyOn(logger, 'warn');
+    const engine = makePagedEngine({ orzgk: catalog(30) });
+    const l = ledgerAt(engine.items('orzgk'), 10, { exhaustCandidateCursor: v as number, exhaustCandidateAt: iso(T0 - DAY_MS) });
+    const ledgers = createMemoryLedgerStore({ orzgk: l });
+    const p = await runBounded(mkCfg(POOLED), engine, ledgers, T0, 3);
+    expect(sorted(p.backfillGets())).toEqual([10, 11, 12, 13, 14]);
+    expect(ledgers.files.get('orzgk')!.backfill.exhaustCandidateCursor).toBeUndefined();
+    expect(ledgers.files.get('orzgk')!.backfill.exhaustCandidateAt).toBeUndefined();
+    expect(corruptWarns(warn)).toEqual(oneWarn(['exhaustCandidateCursor']));
+  });
+
+  it('a stale but valid candidate below the cursor is still cleared silently (not corrupt)', async () => {
+    const warn = jest.spyOn(logger, 'warn');
+    const engine = makePagedEngine({ orzgk: catalog(30) });
+    const l = ledgerAt(engine.items('orzgk'), 10, { exhaustCandidateCursor: 5, exhaustCandidateAt: iso(T0 - DAY_MS) });
+    const ledgers = createMemoryLedgerStore({ orzgk: l });
+    await runBounded(mkCfg(POOLED), engine, ledgers, T0, 3);
+    expect(ledgers.files.get('orzgk')!.backfill.exhaustCandidateCursor).toBeUndefined();
+    expect(corruptWarns(warn)).toEqual([]);
+  });
+
+  it('every corrupt entry in one ledger: ONE WARN naming them all', async () => {
+    const warn = jest.spyOn(logger, 'warn');
+    const engine = makePagedEngine({ orzgk: catalog(30) });
+    const l = ledgerAt(engine.items('orzgk'), 10, { exhaustCandidateCursor: 'x' as unknown as number });
+    l.backfill.cursor = 1e300;
+    l.recent.pagePool = { visited: [[2 ** 53, 2 ** 53, at]] };
+    const p = await runBounded(mkCfg(POOLED), engine, createMemoryLedgerStore({ orzgk: l }), T0, 3);
+    expect(sorted(p.backfillGets())).toEqual([2, 3, 4, 5, 6]);
+    expect(corruptWarns(warn)).toEqual(oneWarn(['cursor', 'pagePool', 'exhaustCandidateCursor']));
+  });
+
+  /*
+   * Seeded fuzz (80 seeds) over the three ledger values: the cursor (good, or a positive integer the ledger load
+   * lets through but the pool must not trust), the end candidate (absent, good, or any poison) and the pool's
+   * marks and drift (good and poisoned values mixed). Property: every pass finishes; it asks only for ledger
+   * pages; it saves a ledger-page cursor, no candidate or a ledger-page one, and a pool that reads back well
+   * formed; and it warns at most once, and never for a ledger with nothing corrupt.
+   */
+  it('seeded fuzz (80 seeds): every pass finishes, asks for and saves only ledger pages, and warns at most once', async () => {
+    const POISON: unknown[] = [0, -1, 1.5, MAX_LEDGER_PAGE + 1, 2 ** 53 - 1, 2 ** 53, 1e300, NaN, Infinity, '12', null, true];
+    const BIG_INTS = [MAX_LEDGER_PAGE + 1, 2 ** 53 - 1, 2 ** 53, 1e300];
+    let corruptSeeds = 0;
+    for (let seed = 0; seed < 80; seed++) {
+      const rng = mulberry32(seed);
+      const pick = <T>(xs: readonly T[]): T => xs[Math.floor(rng() * xs.length)];
+      const small = (): number => 5 + Math.floor(rng() * 30);
+      const value = (): unknown => (rng() < 0.6 ? small() : pick(POISON));
+      const engine = makePagedEngine({ orzgk: catalog(30) });
+      const l = ledgerAt(engine.items('orzgk'), 10);
+      const badCursor = rng() < 0.3;
+      if (badCursor) l.backfill.cursor = pick(BIG_INTS);
+      const c = rng();
+      const candidate = c < 0.4 ? undefined : c < 0.6 ? small() : pick(POISON);
+      if (candidate !== undefined) Object.assign(l.backfill, { exhaustCandidateCursor: candidate, exhaustCandidateAt: iso(T0 - DAY_MS) });
+      const marks = Array.from({ length: Math.floor(rng() * 4) }, () => {
+        const from = value();
+        return [from, typeof from === 'number' && rng() < 0.7 ? from + Math.floor(rng() * 3) : value(), at];
+      });
+      const drift = rng() < 0.5 ? undefined : { ids: rng() < 0.8 ? Math.floor(rng() * 30) : value(), pageSize: 10 };
+      (l.recent as Record<string, unknown>).pagePool = { visited: marks, ...(drift ? { drift } : {}) };
+      const warn = jest.spyOn(logger, 'warn');
+      warn.mockClear();
+      const ledgers = createMemoryLedgerStore({ orzgk: l });
+      const loaded = (await ledgers.load('orzgk')) as Ledger;
+      const okPage = (v: unknown) => typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= MAX_LEDGER_PAGE;
+      const anyCorrupt =
+        (loaded.backfill.cursor !== null && !okPage(loaded.backfill.cursor)) ||
+        (loaded.backfill.exhaustCandidateCursor !== undefined && !okPage(loaded.backfill.exhaustCandidateCursor)) ||
+        readVisited(loaded.recent.pagePool, 1, T0, 72 * HOUR_MS).malformed;
+      if (anyCorrupt) corruptSeeds++;
+      const p = await runBounded(mkCfg(POOLED), engine, ledgers, T0, seed);
+      const saved = ledgers.files.get('orzgk')!;
+      expect({ seed, gets: p.gets().every(okPage) }).toEqual({ seed, gets: true });
+      expect({ seed, cursor: okPage(saved.backfill.cursor) }).toEqual({ seed, cursor: true });
+      expect({ seed, cand: saved.backfill.exhaustCandidateCursor === undefined || okPage(saved.backfill.exhaustCandidateCursor) }).toEqual({ seed, cand: true });
+      expect({ seed, pool: readVisited(saved.recent.pagePool, saved.backfill.cursor!, T0, 72 * HOUR_MS).malformed }).toEqual({ seed, pool: false });
+      expect({ seed, warns: corruptWarns(warn).length }).toEqual({ seed, warns: anyCorrupt ? 1 : 0 });
+    }
+    expect(corruptSeeds).toBeGreaterThan(20);
+    expect(corruptSeeds).toBeLessThan(80);
   });
 });
