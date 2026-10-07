@@ -129,6 +129,9 @@ async function startServer(): Promise<void> {
     hostClock.setFloorSource(host => queue.storeHostFloorMs(host));
     for (const warning of hostClock.warnings()) console.warn(warning);
     console.log(hostClock.describe());
+    // QB-U30b: the jitter per host with the process seed, and the store hosts blocking callers record
+    // rather than wait for (floor + jitter above the ceiling).
+    for (const line of hostClock.bootLines(registry.allStores().flatMap(store => store.domains ?? []))) console.log(line);
     startHostClockSummary(hostClock);
     // Mount the cross-store buy-decision search (GET /lookup) now that the registry is populated.
     // Each store fetches via the transport its `searchFetch` declares (http / impersonate / browser);

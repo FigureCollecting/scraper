@@ -64,7 +64,7 @@ export interface ImageBytesPacingDeps {
   /** Default: the process-wide challenge cooldown register the queue and the lookup fan-out share. */
   cooldown?: ChallengeCooldownLike;
   /** Default: the process-wide host clock the queue's record dispatch books (off unless scoped). */
-  hostClock?: Pick<HostClock, 'floorFor' | 'reserve' | 'msUntilSendable' | 'settle' | 'recordSend'>;
+  hostClock?: Pick<HostClock, 'floorFor' | 'reserve' | 'msUntilSendable' | 'sendWait' | 'settle' | 'markSent' | 'recordSend'>;
 }
 
 /**
@@ -124,18 +124,24 @@ export function paceImageBytesByHost(
   };
   // A host on the shared clock: book the slot NOW, at the later of the limiter's ready time and the
   // clock's floor, so the queue sees it while this image sleeps. Awake, the image passes the
-  // SEND-TIME gate: an early timer sleeps the rest, and a slot the host was sent on meanwhile (this
-  // image slept through it) is booked again behind that send. Then, in one synchronous step with no
-  // await before the transport call: the cooldown is checked again (a challenge met while this image
-  // waited, which on a clocked host can be several floors, closes the host to it as well), and the
-  // send is stamped on the limiter, the clock and the observer with the same instant.
+  // SEND-TIME gate under the WAIT RULE (plan-v3 rev 7, QB-U30b): an early timer, or a valid slot whose
+  // gate another caller's late send pushed out, sleeps the rest WITHOUT re-booking (re-booking would
+  // burn a full floor); only a LOST slot (the host was taken by another booking that is already due)
+  // is booked again. Then, in one synchronous step: the cooldown is checked again (a challenge met
+  // while this image waited, which on a clocked host can be several floors, closes the host to it as
+  // well); the send is settled on the limiter and the clock; the transport is INVOKED; and the send is
+  // recorded on the clock and the observer at the instant after that invocation (rev 7 SEND BLOCK).
   type Sent = { sent: Promise<ImageBytesResult> } | { refused: ImageBytesResult };
   const clockTurn = (host: string, floor: number, url: string, options: ImageFetchOptions | undefined) => async (): Promise<Sent> => {
     const start = now();
     let slot = hostClock.reserve(host, start + limiter.msUntilReady(host, start), floor);
     for (;;) {
       const at = now();
-      const wait = hostClock.msUntilSendable(host, slot, at, floor);
+      const wait = hostClock.sendWait(host, slot, at, floor);
+      if (wait === null) {
+        slot = hostClock.reserve(host, at, floor);
+        continue;
+      }
       if (wait === 0) {
         const cooling = cooldown.remaining(host);
         if (cooling > 0) {
@@ -143,11 +149,13 @@ export function paceImageBytesByHost(
         }
         limiter.recordDispatch(host, at);
         hostClock.settle(host, at, floor);
-        hostClock.recordSend(host, 'image', at);
-        return { sent: fetcher(url, options) };
+        const sent = fetcher(url, options);
+        const sentAt = now();
+        hostClock.markSent(host, sentAt);
+        hostClock.recordSend(host, 'image', sentAt);
+        return { sent };
       }
-      if (at >= slot) slot = hostClock.reserve(host, at, floor);
-      await sleep(Math.max(wait, slot - at));
+      await sleep(wait);
     }
   };
 

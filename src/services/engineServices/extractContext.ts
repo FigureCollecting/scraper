@@ -50,6 +50,8 @@ import {
   resolveBrowserLaneOptions,
   withoutDeclaredEgress,
 } from '../residentialEgress.js';
+import type { HostClock } from '../hostClock.js';
+import { sendOnHostClockOrThrow } from '../hostClockSend.js';
 
 /**
  * Default courtesy gap (ms) when a store profile declares no `rateLimit.baseDelayMs` — should be
@@ -106,6 +108,11 @@ export interface BuildExtractContextOptions {
   sleep?: (ms: number) => Promise<void>;
   /** The engine's residential proxy (default: the process's RESIDENTIAL_PROXY_URL, resolved at boot). */
   residentialProxyUrl?: () => string | undefined;
+  /**
+   * The shared per-host clock (QB-U30b) fetchBody follow-ups book on (caller 'fetchBody'). Optional —
+   * defaults to the process clock (SCRAPE_HOST_CLOCK; off by default); tests inject one.
+   */
+  hostClock?: HostClock;
 }
 
 /** Lowercased, `www.`-stripped hostname; `undefined` on an unparseable URL (never throws). */
@@ -287,10 +294,23 @@ export function buildExtractContext(options: BuildExtractContextOptions): Extrac
         // Same host scope as the page passthroughs: an off-store follow-up keeps the store's
         // transport/headers but never its residential exit.
         const searchFetch = onDeclaringStore(url) ? options.searchFetch : withoutDeclaredEgress(options.searchFetch);
-        const result = await options.capturingFetch(url, searchFetch, {
-          ...(cookies ? { cookies } : {}),
-          ...(request ? { request } : {}),
-        });
+        const send = () =>
+          options.capturingFetch(url, searchFetch, {
+            ...(cookies ? { cookies } : {}),
+            ...(request ? { request } : {}),
+          });
+        // THE HOST CLOCK (QB-U30b): after the courtesy gap, a follow-up to a clocked store host books
+        // the host's next slot on the shared clock and runs the send block, so it is spaced from the
+        // primary fetch and from every other caller of that host. A slot past the wait cap rejects with
+        // a HostClockRefusedError (nothing sent), which the ruleset's own error handling sees.
+        const result =
+          targetHost === undefined
+            ? await send()
+            : await sendOnHostClockOrThrow({ host: targetHost, caller: 'fetchBody' }, send, {
+                ...(options.hostClock ? { clock: options.hostClock } : {}),
+                now,
+                sleep,
+              });
         if (targetHost !== undefined) {
           lastFetchedAt.set(targetHost, now());
         }

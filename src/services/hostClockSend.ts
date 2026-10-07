@@ -1,20 +1,183 @@
-/** STUB (red commit): the QB-U30b send block. Today's behaviour: every caller sends at once, unclocked. */
-import type { HostClock, HostClockCaller } from './hostClock.js';
+/**
+ * hostClockSend — the SEND BLOCK every QB-U30b caller runs on the shared per-host clock (plan-v3 rev 7,
+ * design.host_clock.split_interface), so that no two page-level requests reach a store's main host
+ * closer than its floor plus that send's jitter, whichever lane or route sends them.
+ *
+ * For a BLOCKING caller (the /catalog listing, seed and rotating fetches, POST /resolve, the legacy
+ * /scrape route, /lookup, fetchBody follow-ups, a transport's extra request, the plugin routes):
+ *
+ *   1. RESERVE the host's next slot at once (the queue sees it while this caller waits), refused when it
+ *      is more than the WAIT CAP away (floor + J + SCRAPE_CATALOG_CLOCK_WAIT_SLACK_MS): the caller then
+ *      gives its existing non-page outcome (the crawler's "stop this store for the pass") and nothing is
+ *      sent; the refusal is counted per host and caller (clockRefusals60m).
+ *   2. THE WAIT RULE: sleep (a timer, every iteration that does not send) until the gate opens; a slot
+ *      still valid whose gate another caller's late send pushed out is slept out, NOT re-booked; only a
+ *      LOST slot (another booking already due) is booked again. For a caller with a budget, a total
+ *      wait past the cap (possible only after a re-book) is refused at the gate, so wait + fetch stays
+ *      within the budget.
+ *   3. In ONE synchronous block, no await inside: the gate; the caller's veto (a challenge cooldown that
+ *      opened while it waited); settle; INVOKE the transport without awaiting it; markSent + record the
+ *      send at the instant AFTER the invocation (review 7: stamping before the call left the next send
+ *      short by the synchronous work in between); then await. The fetch gets the budget minus the wait.
+ *
+ * A host whose floor + J is above the ceiling is not waited for: the send goes at once and is RECORDED
+ * on the clock (the queue's next record then waits a full floor after it). A host off the clock (out of
+ * scope, or no store floor) is sent at once and reported to the observer only, exactly as before.
+ *
+ * Honest limit (design.host_clock.honest_limit): the recorded instant is the transport's invocation;
+ * awaits inside the transport (an Impit session, a browser page from the pool) come after it.
+ */
+import { getHostClock, type HostClock, type HostClockCaller, type HostClockLatencyKind } from './hostClock.js';
 
-export interface ClockedSendRequest { host: string; caller: HostClockCaller; budgetMs?: number; latency?: 'listing' | 'lookup'; veto?: () => string | undefined }
-export type ClockedSendResult<T> = { sent: true; value: T; waitedMs: number } | { sent: false; refused: true; waitMs: number } | { sent: false; refused: false; reason: string };
-export interface ClockedSendDeps { clock?: HostClock; now?: () => number; sleep?: (ms: number) => Promise<void> }
-export function hostOfUrl(_url: string): string | undefined {
-  return undefined;
+/** One blocking caller's send. */
+export interface ClockedSendRequest {
+  /** The host the request goes to (any spelling; the clock normalises it). */
+  host: string;
+  caller: HostClockCaller;
+  /** The caller's whole budget (wait + fetch, ms); the transport is invoked with what the wait left. */
+  budgetMs?: number;
+  /** Feed the host's listing p99 or /lookup p95 with this call's wait + fetch time. */
+  latency?: HostClockLatencyKind;
+  /** Checked in the send block, after any wait: a reason not to send now (e.g. a cooldown opened). */
+  veto?: () => string | undefined;
 }
-export class HostClockRefusedError extends Error {}
-export async function sendOnHostClock<T>(request: ClockedSendRequest, invoke: (timeoutMs: number | undefined) => Promise<T>, _deps: ClockedSendDeps = {}): Promise<ClockedSendResult<T>> {
-  return { sent: true, value: await invoke(request.budgetMs), waitedMs: 0 };
+
+export type ClockedSendResult<T> =
+  | { sent: true; value: T; waitedMs: number }
+  | { sent: false; refused: true; waitMs: number }
+  | { sent: false; refused: false; reason: string };
+
+/** Injectable clock, time and timer (tests); the defaults are the process clock, Date.now and setTimeout. */
+export interface ClockedSendDeps {
+  clock?: HostClock;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
 }
-export async function sendOnHostClockOrThrow<T>(request: ClockedSendRequest, invoke: (timeoutMs: number | undefined) => Promise<T>, _deps: ClockedSendDeps = {}): Promise<T> {
-  return invoke(request.budgetMs);
+
+const realSleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+
+/** The url's hostname, or undefined when it does not parse. */
+export function hostOfUrl(url: string): string | undefined {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return undefined;
+  }
 }
-export interface HostClockPacer { first(url: string): void; send<T>(url: string, caller: HostClockCaller, invoke: () => Promise<T>): Promise<T> }
-export function processHostClockPacer(_deps: Omit<ClockedSendDeps, 'clock'> = {}): HostClockPacer {
-  return { first: () => undefined, send: (_url, _caller, invoke) => invoke() };
+
+/** A send the clock refused: its slot is past the wait cap. Thrown by the throwing forms. */
+export class HostClockRefusedError extends Error {
+  constructor(
+    readonly host: string,
+    readonly caller: HostClockCaller,
+    readonly waitMs: number,
+    readonly capMs: number,
+  ) {
+    super(`[HOST-CLOCK] ${host} refused a ${caller} send: its slot is ${waitMs} ms away, past the ${capMs} ms cap`);
+    this.name = 'HostClockRefusedError';
+  }
+}
+
+/** Run one blocking caller's send on the clock (see the module doc). */
+export async function sendOnHostClock<T>(
+  request: ClockedSendRequest,
+  invoke: (timeoutMs: number | undefined) => Promise<T>,
+  deps: ClockedSendDeps = {},
+): Promise<ClockedSendResult<T>> {
+  const clock = deps.clock ?? getHostClock();
+  const now = deps.now ?? Date.now;
+  const sleep = deps.sleep ?? realSleep;
+  const { host, caller, budgetMs } = request;
+  const start = now();
+  const awaitSent = async (sending: Promise<T>, waitedMs: number): Promise<ClockedSendResult<T>> => {
+    try {
+      return { sent: true, value: await sending, waitedMs };
+    } finally {
+      if (request.latency) clock.noteLatency(host, request.latency, now() - start, now());
+    }
+  };
+
+  const role = clock.blockingRole(host);
+  if (role !== 'clocked') {
+    const sending = invoke(budgetMs);
+    const sentAt = now();
+    if (role === 'recorded') clock.record(host, sentAt, caller);
+    else clock.recordSend(host, caller, sentAt);
+    return awaitSent(sending, 0);
+  }
+
+  const floor = clock.floorFor(host) as number;
+  const cap = clock.capMsFor(host) as number;
+  const refuse = (at: number, waitMs: number): ClockedSendResult<T> => {
+    clock.noteRefusal(host, caller, at);
+    return { sent: false, refused: true, waitMs };
+  };
+  let slot = clock.reserve(host, start, floor, cap);
+  if (slot === null) return refuse(start, clock.nextSlot(host, start, floor) - start);
+  for (;;) {
+    const at = now();
+    const wait = clock.sendWait(host, slot, at, floor);
+    if (wait === null) {
+      slot = clock.reserve(host, at, floor);
+      continue;
+    }
+    if (wait > 0) {
+      await sleep(wait);
+      continue;
+    }
+    // THE SEND BLOCK: nothing below awaits before the transport has been invoked and the send recorded.
+    const waitedMs = at - start;
+    if (budgetMs !== undefined && waitedMs > cap) return refuse(at, waitedMs);
+    const reason = request.veto?.();
+    if (reason !== undefined) return { sent: false, refused: false, reason };
+    clock.settle(host, at, floor);
+    const sending = invoke(budgetMs === undefined ? undefined : budgetMs - waitedMs);
+    const sentAt = now();
+    clock.markSent(host, sentAt);
+    clock.recordSend(host, caller, sentAt);
+    return awaitSent(sending, waitedMs);
+  }
+}
+
+/** {@link sendOnHostClock} for a caller whose failure path is an exception: a refusal throws HostClockRefusedError, a veto an Error. */
+export async function sendOnHostClockOrThrow<T>(
+  request: ClockedSendRequest,
+  invoke: (timeoutMs: number | undefined) => Promise<T>,
+  deps: ClockedSendDeps = {},
+): Promise<T> {
+  const result = await sendOnHostClock(request, invoke, deps);
+  if (result.sent) return result.value;
+  if (result.refused) {
+    const clock = deps.clock ?? getHostClock();
+    throw new HostClockRefusedError(request.host, request.caller, result.waitMs, clock.capMsFor(request.host) ?? 0);
+  }
+  throw new Error(result.reason);
+}
+
+/**
+ * For a TRANSPORT that sends more than one request in one call (a session prime before the target, a
+ * re-prime and retry): its caller recorded the call's send when it invoked the transport, so
+ *   - `first(url)`: the call's first request leaves now (e.g. the prime GET after the transport's own
+ *     awaits): raise the host's last send to this instant, so what follows is spaced from it;
+ *   - `send(url, caller, invoke)`: every LATER request of the call runs its own send block.
+ */
+export interface HostClockPacer {
+  first(url: string): void;
+  send<T>(url: string, caller: HostClockCaller, invoke: () => Promise<T>): Promise<T>;
+}
+
+/** The pacer on the process clock (resolved at each call, so a test or a reload sees the current one). */
+export function processHostClockPacer(deps: Omit<ClockedSendDeps, 'clock'> = {}): HostClockPacer {
+  const now = deps.now ?? Date.now;
+  return {
+    first(url) {
+      const host = hostOfUrl(url);
+      if (host !== undefined) getHostClock().markSent(host, now());
+    },
+    send(url, caller, invoke) {
+      const host = hostOfUrl(url);
+      if (host === undefined) return invoke();
+      return sendOnHostClockOrThrow({ host, caller }, () => invoke(), { ...deps, clock: getHostClock() });
+    },
+  };
 }
