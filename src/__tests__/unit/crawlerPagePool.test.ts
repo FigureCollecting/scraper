@@ -781,6 +781,18 @@ describe('drift from a pass whose backfill never saved is carried to the next pa
     expect(sorted(c.backfillGets())).toEqual([22, 27]);
   });
 
+  it('carried drift can pass the recent read\'s 3 pages: 25 + 15 ids on 10-id pages re-read the bottom 4 pages of the run', async () => {
+    const s = setup();
+    s.ledgers.files.get('orzgk')!.recent.pagePool = { visited: [[22, 30, iso(T0 - HOUR_MS)]] };
+    s.engine.prepend('orzgk', idRun('n', 900_000, 25));
+    await runPass(mkCfg({ ...POOLED, phases: ['recent'] }), s.engine, s.ledgers, T0, 11);
+    s.engine.prepend('orzgk', idRun('n', 900_025, 15));
+    await runPass(mkCfg({ ...POOLED, phases: ['recent'] }), s.engine, s.ledgers, T0 + HOUR_MS, 12);
+    const c = await runPass(mkCfg({ ...POOLED, pagePoolLookahead: 2 }), s.engine, s.ledgers, T0 + 2 * HOUR_MS, 13);
+    expect(sorted(c.backfillGets())).toEqual([20, 21]);
+    expect(s.ledgers.files.get('orzgk')!.recent.pagePool).toEqual({ visited: [[26, 30, iso(T0 - HOUR_MS)]] });
+  });
+
   it('a recent read that meets no new ids leaves the pool state as it was (no zero drift written)', async () => {
     const s = setup();
     const before = structuredClone(s.ledgers.files.get('orzgk')!.recent.pagePool);
