@@ -32,6 +32,11 @@ import { observeGate, gateOutcomeOf, gateFailureReason } from '../services/gateS
 import type { ListingPage, RetrievalCapability, RotatingSeedList, SearchFetch, SeedList } from '@figurecollecting/scraper-plugin-contract';
 import type { FetchBodyOutcome } from '../services/engineServices/capturingFetch.js';
 import { declaredLastPage, getMaxPagesGuard, type MaxPagesGuard } from '../services/maxPagesGuard.js';
+import { sendOnHostClock, type ClockedSendResult } from '../services/hostClockSend.js';
+import type { HostClockCaller } from '../services/hostClock.js';
+import { resolveCatalogStoreTimeoutMs } from './catalogStoreTimeout.js';
+
+export { resolveCatalogStoreTimeoutMs } from './catalogStoreTimeout.js';
 
 /**
  * The lookup's injected services, including its optional STATUS-AWARE fetch on the same lanes
@@ -250,23 +255,6 @@ export interface Catalog {
   rotatingSeed(siteId: string, listId: string): Promise<RotatingSeedResult>;
 }
 
-/** Listing-fetch timeout (ms) used when CATALOG_STORE_TIMEOUT_MS is unset/invalid, and the clamp any override rides within. */
-const DEFAULT_CATALOG_TIMEOUT_MS = 30000;
-const MIN_CATALOG_TIMEOUT_MS = 1000;
-const MAX_CATALOG_TIMEOUT_MS = 120000;
-
-/**
- * Resolve the listing-fetch timeout (ms) from the environment. CATALOG_STORE_TIMEOUT_MS overrides the
- * 30s default (a catalog page is a 1.5–2MB body on orzgk — wider than a search hit); a missing,
- * empty, non-numeric, or non-positive value falls back to the default, and any usable value is
- * clamped to [1000, 120000]. Pure (env in → number out) — mirrors resolveLookupStoreTimeoutMs.
- */
-export function resolveCatalogStoreTimeoutMs(env: NodeJS.ProcessEnv): number {
-  const n = Number(env.CATALOG_STORE_TIMEOUT_MS);
-  if (!Number.isFinite(n) || n <= 0) return DEFAULT_CATALOG_TIMEOUT_MS;
-  return Math.min(MAX_CATALOG_TIMEOUT_MS, Math.max(MIN_CATALOG_TIMEOUT_MS, n));
-}
-
 /** An untrusted listing item is kept only as `{ itemId, url? }` with a non-empty string itemId. */
 const normalizeItem = (raw: unknown): ListingPage['items'][number] | undefined => {
   if (!raw || typeof raw !== 'object') return undefined;
@@ -281,6 +269,34 @@ export function assembleCatalog(services: CatalogServices): Catalog {
   const cd = services.challengeCooldown ?? getChallengeCooldown();
   const cfStore = services.cfCookieStore ?? getCfCookieStore();
   const pagesGuard = services.maxPagesGuard ?? getMaxPagesGuard();
+
+  /**
+   * THE HOST CLOCK (QB-U30b): every listing, seed and rotating fetch reserves the host's next slot on
+   * the shared per-host clock BEFORE its timeout starts, waits for it, and runs the send block there;
+   * the fetch then gets CATALOG_STORE_TIMEOUT_MS minus the wait, so wait + fetch stays within it and the
+   * crawler's 75 s request keeps its margin. A slot past the wait cap is refused, and so is a send a
+   * challenge cooldown closed while it waited: both answer `cooldown`, which the crawler reads as "stop
+   * this store for the pass" (no request is sent). Off the clock: fetched at once, as before.
+   */
+  const onClock = <T>(host: string, caller: HostClockCaller, fetch: (ms: number) => Promise<T>): Promise<ClockedSendResult<T>> =>
+    sendOnHostClock(
+      {
+        host,
+        caller,
+        budgetMs: timeoutMs,
+        ...(caller === 'catalogListing' ? { latency: 'listing' as const } : {}),
+        veto: () => (cd.isOpen(host) ? 'cooling' : undefined),
+      },
+      ms => fetch(ms ?? timeoutMs),
+      services.hostClock ? { clock: services.hostClock } : {},
+    );
+  /** A send the clock did not make: `cooldown` with the wait it refused, or the cooldown that vetoed it. */
+  const notSent = (host: string, out: Exclude<ClockedSendResult<unknown>, { sent: true }>) => {
+    const remainingMs = out.refused ? out.waitMs : cd.remaining(host);
+    // eslint-disable-next-line no-console
+    console.warn(`[HOST-CLOCK] ${sanitizeForLog(host)} ${out.refused ? `refused the fetch: its slot is ${remainingMs} ms away` : 'began cooling while the fetch waited for its slot'}; store left alone this pass`);
+    return { status: 'cooldown' as const, host, remainingMs };
+  };
 
   /**
    * Fetch and parse ONE declared page (a seed list or a rotating seed list) down the listing lane:
@@ -328,7 +344,9 @@ export function assembleCatalog(services: CatalogServices): Catalog {
     const transport = services.profiles.searchTransportFor(caps.domains[0] ?? host);
     let gate: ReturnType<typeof gateOutcomeOf>;
     try {
-      gate = gateOutcomeOf(await withTimeout(fetch(url, transport), timeoutMs, `${label} list fetch`));
+      const sent = await onClock(host, label === 'seed' ? 'catalogSeed' : 'catalogRotating', ms => withTimeout(fetch(url, transport), ms, `${label} list fetch`));
+      if (!sent.sent) return notSent(host, sent);
+      gate = gateOutcomeOf(sent.value);
     } catch (err) {
       // The request never produced a page (network, proxy, timeout): nothing says the next try fails.
       return fail(err instanceof Error ? err.message : String(err), { failure: 'transient' });
@@ -507,9 +525,11 @@ export function assembleCatalog(services: CatalogServices): Catalog {
         // primary domain exactly as /lookup does — the listing may live on a sibling host (api.)
         // the store's domains don't list. BOUNDED so a hung / CF-stalled store fails, not stalls.
         const transport = services.profiles.searchTransportFor(caps.domains[0] ?? host);
-        const gate = gateOutcomeOf(
-          await withTimeout(services.fetchSearchDetail ? services.fetchSearchDetail(url, transport) : services.fetchSearch(url, transport), timeoutMs, 'catalog fetch'),
+        const sent = await onClock(host, 'catalogListing', ms =>
+          withTimeout(services.fetchSearchDetail ? services.fetchSearchDetail(url, transport) : services.fetchSearch(url, transport), ms, 'catalog fetch'),
         );
+        if (!sent.sent) return { ...notSent(host, sent), siteId };
+        const gate = gateOutcomeOf(sent.value);
         const body = gate.body;
         // HONEST LISTING: a CF challenge/block body is NOT a catalog page — extractListing would
         // lift 0 items and pose the page as "end of catalog". Detect it BEFORE parsing, open the

@@ -14,6 +14,7 @@ import { getChallengeCooldown } from './services/challengeCooldown.js';
 import { getCfCookieStore } from './services/cookieJar.js';
 import { getHostClock, startHostClockSummary } from './services/hostClock.js';
 import { getMaxPagesGuard } from './services/maxPagesGuard.js';
+import { LOOKUP_MIN_FETCH_MS, resolveLookupStoreTimeoutMs } from './driver/assembleLookup.js';
 import { residentialEgressView } from './services/residentialEgress.js';
 import { rawStoreView, flushRawCaptureSink } from './services/s3ObjectStore.js';
 import { imageCaptureView } from './services/images/assembleImageCapture.js';
@@ -132,6 +133,10 @@ async function startServer(): Promise<void> {
     hostClock.setFloorSource(host => queue.storeHostFloorMs(host));
     for (const warning of hostClock.warnings()) console.warn(warning);
     console.log(hostClock.describe());
+    // QB-U30b: the jitter per host with the process seed, and the store hosts blocking callers (and
+    // /lookup, on its own budget) record rather than wait for (floor + jitter above the ceiling).
+    const lookupBudget = { budgetMs: resolveLookupStoreTimeoutMs(process.env), minFetchMs: LOOKUP_MIN_FETCH_MS };
+    for (const line of hostClock.bootLines(registry.allStores().flatMap(store => store.domains ?? []), lookupBudget)) console.log(line);
     startHostClockSummary(hostClock);
     // Mount the cross-store buy-decision search (GET /lookup) now that the registry is populated.
     // Each store fetches via the transport its `searchFetch` declares (http / impersonate / browser);

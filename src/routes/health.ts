@@ -54,10 +54,13 @@
  *     `plugins: {loaded: [{name, version}], refused: [{name, version}]}` (which plugins loaded at
  *     startup and which were refused — it tells a plugin with no policy from a refused plugin, and
  *     explains a queueStore `held`; why a plugin was refused stays in the pod log), and
- *     `hostClock: {mode, hosts: [{host, floorMs, clocked, sends60m: {queue, image}, minGapMs60m,
- *     underFloor60m, lastSendAt}]}` (the shared host clock's send-time observer: per store host, the
- *     trailing hour of requests measured at the instant each was handed to its transport — with the
- *     clock off too, so it is the live negative control for SCRAPE_HOST_CLOCK), and
+ *     `hostClock: {mode, hosts: [{host, floorMs, clocked, sends60m: {<caller>: n}, minGapMs60m,
+ *     underFloor60m, constrainedGaps60m, meanConstrainedGapMs60m, clockRefusals60m: {<caller>: n},
+ *     listingFetchP99Ms60m, lookupP95Ms60m, lastSendAt}]}` (the shared host clock's send-time
+ *     observer: per store host, the trailing hour of requests measured at the instant each was handed
+ *     to its transport — with the clock off too, so it is the live negative control for
+ *     SCRAPE_HOST_CLOCK; callers queue, image, catalogListing, catalogSeed, catalogRotating, resolve,
+ *     scrape, lookup, fetchBody, sessionPrime, pluginRoute), and
  *     `maxPagesGuard: {mode, stores: [{siteId, maxPagesGuarded60m, lastGuardedAt}]}` (the engine's
  *     SCRAPE_CATALOG_MAX_PAGES_GUARD: per store, the /catalog pages above the profile's maxPages it answered
  *     exhausted WITHOUT a store fetch in the trailing hour).
@@ -168,11 +171,12 @@ export interface HealthDeps {
    */
   listPlugins: () => PluginsView;
   /**
-   * The shared host clock's send-time observer (getHostClock().view(now), QB-U30a): `mode` (off | all
-   * | hosts) and, per store host, `{host, floorMs, clocked, sends60m: {queue, image}, minGapMs60m,
-   * underFloor60m, lastSendAt}` over the trailing hour, measured at the instant each request was
-   * handed to its transport. It reads the same with the clock off (the live negative control).
-   * Counters only, under 1 KB per host; never throws.
+   * The shared host clock's send-time observer (getHostClock().view(now), QB-U30a/U30b): `mode` (off |
+   * all | all-except | hosts) and, per store host, `{host, floorMs, clocked, sends60m: {<caller>: n},
+   * minGapMs60m, underFloor60m, constrainedGaps60m, meanConstrainedGapMs60m, clockRefusals60m:
+   * {<caller>: n}, listingFetchP99Ms60m, lookupP95Ms60m, lastSendAt}` over the trailing hour, measured
+   * at the instant each request was handed to its transport. It reads the same with the clock off (the
+   * live negative control). Counters only, under 1 KB per host; never throws.
    */
   getHostClock: () => HostClockView;
   /**

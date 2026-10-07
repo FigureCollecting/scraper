@@ -14,7 +14,7 @@
  * container's TZ) — the challenge's cross-origin frame reads the process zone, so `emulateTimezone`
  * cannot stand in for it (browserTimezone).
  */
-import type { Browser, Page, HTTPResponse } from 'puppeteer';
+import type { Browser, Page, HTTPRequest, HTTPResponse } from 'puppeteer';
 import { BrowserPool, isCleanHeadfulMode } from '../genericScraper.js';
 import { clampNavTimeoutMs, resolveNavTimeoutMs } from '../browserNavTimeout.js';
 import { ScrapingService, ScrapePageOptions, ScrapePageResult, PageOptions, BrowserFetchOptions, WaitForReadiness } from '@figurecollecting/scraper-plugin-contract';
@@ -22,6 +22,8 @@ import { CaptureSink, NoopCaptureSink, buildRawCapture } from '../captureSink.js
 import { sanitizeForLog } from '../../utils/security.js';
 import { getCfCookieStore, type CfCookieSource } from '../cookieJar.js';
 import { applyEgressTimezone } from '../browserTimezone.js';
+import { processHostClockPacer, type PageRequestPacer } from '../hostClockSend.js';
+import type { HostClockCaller } from '../hostClock.js';
 import {
   ChallengeLaneUnavailableError,
   awaitChallengeClearance,
@@ -528,10 +530,30 @@ async function navigateAndCapture(
   };
 }
 
+/**
+ * A PAGE-LEVEL request of `page` (QB-U30b, the plugin routes on the host clock): a navigation of its
+ * main frame, whatever started it. Not a redirect hop (it follows a navigation that already passed the
+ * clock), a subresource, or a subframe's navigation.
+ */
+function isPageLevelRequest(page: Page, request: HTTPRequest): boolean {
+  return request.isNavigationRequest() && request.frame() === page.mainFrame() && request.redirectChain().length === 0;
+}
+
 /** Optional wiring for {@link createScrapingService}. */
 export interface ScrapingServiceOptions {
   /** Stored-cookie source (defaults to the CfCookieStore singleton, resolved per navigation). */
   cookieStore?: CfCookieSource;
+  /**
+   * THE HOST CLOCK (QB-U30b). Set for a service whose CALLERS do not clock their own calls — the one
+   * handed to plugins (buildEngineServices, caller 'pluginRoute'): then every PAGE-LEVEL request of
+   * the pages this service hands out (a main-frame navigation, whatever started it: goto, reload,
+   * back/forward, a submitted form, a followed link) passes the shared per-host clock at the request
+   * itself (a declared prime navigation as 'sessionPrime'). Unset (the queue, /lookup, /catalog,
+   * /resolve, whose callers clock the call): only the requests a session prime ADDS pass it.
+   */
+  clockCaller?: HostClockCaller;
+  /** The pacer those requests pass (defaults to the process clock's). */
+  pacer?: PageRequestPacer;
 }
 
 export function createScrapingService(
@@ -540,6 +562,61 @@ export function createScrapingService(
 ): EngineScrapingService {
   // Resolved per navigation (not once here) so a hot-reloaded cookie file is always the one consulted.
   const store = (): CfCookieSource => options.cookieStore ?? getCfCookieStore();
+  const pacer = options.pacer ?? processHostClockPacer();
+  const clockCaller = options.clockCaller;
+
+  /**
+   * THE PLUGIN ROUTES ON THE CLOCK (QB-U30b): every page-level request `page` makes from now on passes
+   * the clock as `caller` at the request itself, so a navigation a plugin starts without page.goto (a
+   * reload, a submitted form, a followed link) is spaced like any other. While the clock may hold one
+   * (the fetch's target, or for a plugin's own page any host, is on the clock) the page's requests are
+   * INTERCEPTED: a page-level request is held for its send block and released there (refused: aborted,
+   * so its navigation fails), every other request is continued at once. Otherwise nothing is
+   * intercepted (byte-identical) and each page-level request is only reported to the observer.
+   * A request that can no longer be resolved (its page closed meanwhile) is dropped quietly.
+   */
+  async function clockPageRequests(page: Page, caller: HostClockCaller, targetUrl: string | undefined): Promise<void> {
+    if (!pacer.holds(targetUrl)) {
+      page.on('request', request => {
+        if (isPageLevelRequest(page, request)) pacer.observe(request.url(), caller);
+      });
+      return;
+    }
+    await page.setRequestInterception(true);
+    page.on('request', request => {
+      if (!isPageLevelRequest(page, request)) {
+        request.continue().catch(() => undefined);
+        return;
+      }
+      pacer.send(request.url(), caller, () => request.continue()).catch(() => request.abort('blockedbyclient').catch(() => undefined));
+    });
+  }
+
+  /**
+   * A declared SESSION PRIME makes two requests to the host in one call (QB-U30b). In the plugin service
+   * (clockCaller set) the prime navigation passes the clock as 'sessionPrime'. Otherwise the caller
+   * clocked the call when it invoked this service, so the prime is the call's FIRST request: it is
+   * stamped on the clock where it really leaves, and {@link fetchAfter} paces what follows it.
+   */
+  function primeNavigation(primeUrl: string, prime: () => Promise<HTTPResponse | null>): Promise<HTTPResponse | null> {
+    if (clockCaller) return pacer.send(primeUrl, 'sessionPrime', prime);
+    pacer.first(primeUrl);
+    return prime();
+  }
+
+  /**
+   * The fetch itself: in the plugin service its page-level requests pass the clock as the service's
+   * caller ({@link clockPageRequests}); otherwise, after a prime this call made, the fetch is the call's
+   * second request and passes the clock as 'sessionPrime'; with no prime it runs exactly as before.
+   */
+  async function fetchAfter<T>(page: Page, fn: (page: Page) => Promise<T>, primed: boolean, targetUrl: string | undefined): Promise<T> {
+    if (clockCaller) {
+      await clockPageRequests(page, clockCaller, targetUrl);
+      return fn(page);
+    }
+    if (primed && targetUrl) return pacer.send(targetUrl, 'sessionPrime', () => fn(page));
+    return fn(page);
+  }
   /** Page setup shared by both lifecycles: egress timezone first, then the caller's overrides. */
   async function preparePage(page: Page, options: EnginePageOptions): Promise<void> {
     // TIMEZONE, optional and cosmetic: what actually decides a challenge is the PROCESS zone (the
@@ -629,15 +706,20 @@ export function createScrapingService(
       await preparePage(page, options);
       // SESSION PRIME on a cold profile: anitoys' search results 404 without a same-session homepage
       // visit, so the origin root is navigated once per (browser instance, host), before the target.
-      if (options.primeUrl && !entry.primedHosts.has(host)) {
-        const primed = await page.goto(options.primeUrl, { waitUntil: 'domcontentloaded', timeout: resolveNavTimeout(options.navTimeoutMs) });
-        // The PRIME is the navigation that meets the challenge — `domcontentloaded` fires on the
-        // interstitial, and navigating to the target without waiting CANCELS the challenge script:
-        // the homepage never loads and the cookie the prime exists for is never set.
-        await awaitChallengeClearance(challengeAwarePage(page), primed, options.primeUrl);
+      const primeUrl = options.primeUrl && !entry.primedHosts.has(host) ? options.primeUrl : undefined;
+      if (primeUrl) {
+        const tab = page;
+        await primeNavigation(primeUrl, async () => {
+          const primed = await tab.goto(primeUrl, { waitUntil: 'domcontentloaded', timeout: resolveNavTimeout(options.navTimeoutMs) });
+          // The PRIME is the navigation that meets the challenge — `domcontentloaded` fires on the
+          // interstitial, and navigating to the target without waiting CANCELS the challenge script:
+          // the homepage never loads and the cookie the prime exists for is never set.
+          await awaitChallengeClearance(challengeAwarePage(tab), primed, primeUrl);
+          return primed;
+        });
         // Keyed by the URL that primed it, because a RELAUNCH must re-prove this host on the
         // replacement browser and has no other way to learn where to navigate.
-        entry.primedHosts.set(host, options.primeUrl);
+        entry.primedHosts.set(host, primeUrl);
       }
       // ONE line per gated fetch — the lane is invisible from outside the pod otherwise, and its
       // failure mode (a fetch quietly taking the per-request context instead) looks identical to a
@@ -649,7 +731,7 @@ export function createScrapingService(
         `[GATED] ${egress} tab for ${sanitizeForLog(host)} ` +
         `(primed=${entry.primedHosts.has(host)}, tabs=${entry.pagesOpen})`,
       );
-      const value = await fn(page);
+      const value = await fetchAfter(page, fn, primeUrl !== undefined, options.targetUrl);
       // A navigation that returned — even one holding an interstitial — proves the browser is not
       // wedged, which is the only thing the failure streak is watching for.
       BrowserPool.recordGatedNavigation(egress, true);
@@ -685,7 +767,9 @@ export function createScrapingService(
         // The same page preparation a real fetch gets: the challenge reads the profile, so a proof
         // run on a differently-shaped page proves nothing about the fetches that follow it.
         await preparePage(page, options);
-        const primed = await page.goto(primeUrl, { waitUntil: 'domcontentloaded', timeout: resolveNavTimeout(options.navTimeoutMs) });
+        // A relaunch's proof is a request no caller clocked: it passes the host clock on its own.
+        const tab = page;
+        const primed = await pacer.send(primeUrl, 'sessionPrime', () => tab.goto(primeUrl, { waitUntil: 'domcontentloaded', timeout: resolveNavTimeout(options.navTimeoutMs) }));
         return (await awaitChallengeClearanceOutcome(challengeAwarePage(page), primed, primeUrl)) !== 'unresolved';
       } catch {
         return false;
@@ -732,13 +816,18 @@ export function createScrapingService(
     try {
       page = await context.newPage();
       await preparePage(page, options);
-      if (options.primeUrl) {
+      const primeUrl = options.primeUrl;
+      if (primeUrl) {
         // Same rule as the gated prime above: wait the interstitial out, or the target navigation
         // cancels it and the priming visit never happened.
-        const primed = await page.goto(options.primeUrl, { waitUntil: 'domcontentloaded', timeout: resolveNavTimeout(options.navTimeoutMs) });
-        await awaitChallengeClearance(challengeAwarePage(page), primed, options.primeUrl);
+        const tab = page;
+        await primeNavigation(primeUrl, async () => {
+          const primed = await tab.goto(primeUrl, { waitUntil: 'domcontentloaded', timeout: resolveNavTimeout(options.navTimeoutMs) });
+          await awaitChallengeClearance(challengeAwarePage(tab), primed, primeUrl);
+          return primed;
+        });
       }
-      return await fn(page);
+      return await fetchAfter(page, fn, primeUrl !== undefined, options.targetUrl);
     } finally {
       // The browser is intentionally long-lived; the context is the per-request unit. If it will not
       // close cleanly it has leaked onto that browser, so retire the browser rather than reuse it
