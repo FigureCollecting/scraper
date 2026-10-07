@@ -57,7 +57,7 @@ const MAX_ORDER_SEARCH = 8;
 
 /**
  * The highest listing page the pool trusts from the ledger. The deepest listing a rulesets profile declares is
- * amiami's 5000 pages (suruga-ya 2731, every other store far fewer), so this is 20 x headroom; and it keeps
+ * amiami's 5000 pages (the next deepest 2731, every other store far fewer), so this is 20 x headroom; and it keeps
  * every page well inside the safe integers, where `page++` always moves (at 2^53 it stops, and a loop over
  * such a page never ends). A pooled walk never asks for a page above it: a store that reached it would start
  * again from the top, because a cursor above it is dropped as corrupt.
