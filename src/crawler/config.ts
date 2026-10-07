@@ -97,6 +97,16 @@ export interface CrawlerConfig {
    */
   rangeIdsPerRun: number;
   /**
+   * ID-RANGE DESCENT: per-store ceilings on the ids the DESCENT walks per run, from
+   * `CRAWLER_RANGE_DESCENT_CAPS` (`siteId:n`, the same csv shape as the other per-store caps). A cap only
+   * LOWERS `rangeIdsPerRun` for its store, and a store absent from it keeps `rangeIdsPerRun`. An explicit
+   * 0 turns that store's descent OFF and leaves its cursor, frontier and seed untouched, while its
+   * re-anchor, both gap sweeps and the lists step run as before and every other range store keeps
+   * walking (Ross QB-2, 2026-10-04: no blind id walking). loadCrawlerConfig always sets it; absent on a
+   * hand-built config = no caps.
+   */
+  rangeDescentCaps?: Record<string, number>;
+  /**
    * Seed frontiers per siteId, from `CRAWLER_RANGE_FRONTIER_<SITEID>`, used ONLY when the store's
    * ledger has no numeric itemId of its own to start from. `<SITEID>` is the siteId uppercased with
    * every non-alphanumeric character replaced by `_` (`good-smile` → `CRAWLER_RANGE_FRONTIER_GOOD_SMILE`).
@@ -165,6 +175,12 @@ export interface CrawlerConfig {
   listsDrainCaps?: Record<string, number>;
   /** LISTS: wait between two lists of one group (`CRAWLER_LISTS_SPACING_MS`), never below 10 s. */
   listsSpacingMs?: number;
+  /**
+   * LISTS ALTERNATION (`CRAWLER_LISTS_ALTERNATE`, csv of siteIds; Ross MS 2026-10-04): for these stores a
+   * pass that starts inside the lists window fetches EITHER the Latest Additions tap OR one company-list
+   * group, never both; each window opens with a lists pass. Empty (the default) or absent = today's pass.
+   */
+  listsAlternate?: string[];
 }
 
 /** A UTC time-of-day window in minutes after midnight; `endMin < startMin` means it wraps past midnight. */
@@ -251,7 +267,8 @@ const nonNegInt = (raw: string | undefined, fallback: number): number => {
 const SAFE_SITE_ID = /^[A-Za-z0-9_-]+$/;
 
 /**
- * Parse a per-store cap var — `CRAWLER_STORE_ENQUEUE_CAPS` or `CRAWLER_STORE_REOBSERVE_CAPS` — a csv
+ * Parse a per-store cap var — `CRAWLER_STORE_ENQUEUE_CAPS`, `CRAWLER_STORE_REOBSERVE_CAPS` or
+ * `CRAWLER_RANGE_DESCENT_CAPS` — a csv
  * of `siteId:cap` pairs. Every entry is validated on its own: a malformed one is DROPPED with a WARN
  * naming it AND the var it came from, and the well-formed entries still apply, so one typo can never
  * silently unthrottle a store nor void the whole declaration. A repeated siteId takes its LAST value.
@@ -268,6 +285,22 @@ const parseStoreCaps = (raw: string | undefined, envName: string): Record<string
       continue;
     }
     out[siteId] = cap;
+  }
+  return out;
+};
+
+/**
+ * Parse a csv of siteIds (`CRAWLER_LISTS_ALTERNATE`). Each entry must be a SAFE_SITE_ID, exactly like the
+ * per-store caps: a malformed one is DROPPED with a WARN naming it and the var, and a repeat is kept once.
+ */
+const parseSiteIds = (raw: string | undefined, envName: string): string[] => {
+  const out: string[] = [];
+  for (const entry of csv(raw ?? '')) {
+    if (!SAFE_SITE_ID.test(entry)) {
+      logger.warn(`[CRAWLER] ${envName} entry ignored (expected a siteId)`, { entry });
+      continue;
+    }
+    if (!out.includes(entry)) out.push(entry);
   }
   return out;
 };
@@ -453,6 +486,7 @@ export function loadCrawlerConfig(env: Env = process.env, argv: string[] = proce
     exhaustedRecheckMs: posInt(env.CRAWLER_EXHAUSTED_RECHECK_MS, DEFAULTS.exhaustedRecheckMs),
     rangeStores: csv(env.CRAWLER_RANGE_STORES ?? ''),
     rangeIdsPerRun: clampedPosInt(env.CRAWLER_RANGE_IDS_PER_RUN, DEFAULTS.rangeIdsPerRun, MAX_RANGE_IDS_PER_RUN, 'CRAWLER_RANGE_IDS_PER_RUN'),
+    rangeDescentCaps: parseStoreCaps(env.CRAWLER_RANGE_DESCENT_CAPS, 'CRAWLER_RANGE_DESCENT_CAPS'),
     rangeFrontiers: parseFrontiers(env, stores),
     // Hours, not ms: the operator reasons about this window in hours ("re-price nothing twice in a
     // shift"), and an explicit 0 is honoured — it means "age is no bar", not "revert to 12 h".
@@ -474,5 +508,6 @@ export function loadCrawlerConfig(env: Env = process.env, argv: string[] = proce
     listsIntervalMs: posInt(env.CRAWLER_LISTS_INTERVAL_H, DEFAULTS.listsIntervalH) * 60 * 60 * 1000,
     listsDrainCaps: parseStoreCaps(env.CRAWLER_LISTS_DRAIN_CAPS, 'CRAWLER_LISTS_DRAIN_CAPS'),
     listsSpacingMs: flooredNonNegInt(env.CRAWLER_LISTS_SPACING_MS, DEFAULTS.listsSpacingMs, MIN_LISTS_SPACING_MS, 'CRAWLER_LISTS_SPACING_MS'),
+    listsAlternate: parseSiteIds(env.CRAWLER_LISTS_ALTERNATE, 'CRAWLER_LISTS_ALTERNATE'),
   };
 }

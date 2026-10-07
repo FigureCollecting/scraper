@@ -220,7 +220,7 @@ describe('runCrawlerPass — recent mode', () => {
 
     const l = store.files.get('orzgk')!;
     expect(Object.keys(l.enqueued).sort()).toEqual(['1a', '1b', '2a', '2b', '3a', '3b']);
-    expect(l.enqueued['2a']).toEqual({ at: iso(T0), collectUrl: collectUrl('orzgk', '2a') });
+    expect(l.enqueued['2a']).toEqual({ at: iso(T0), collectUrl: collectUrl('orzgk', '2a'), via: 'recent' });
     expect(l.recent).toEqual({ lastRunAt: iso(T0), lastNewCount: 6 });
     expect(l.backfill).toEqual({ cursor: null }); // recent-only never touches backfill state
     expect(l.updatedAt).toBe(iso(T0));

@@ -673,6 +673,7 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
 | `CRAWLER_EXHAUSTED_RECHECK_MS` | `604800000` (7d) | Re-check an exhausted store's last cursor after this long |
 | `CRAWLER_RANGE_STORES` | *(none)* | csv of siteIds that walk their sequential id space; empty = no id-range walking at all |
 | `CRAWLER_RANGE_IDS_PER_RUN` | `50` | Max ids walked per store per run (the window asked of `/catalog?range=1`); clamped to the engine's `200`-id ceiling with a WARN |
+| `CRAWLER_RANGE_DESCENT_CAPS` | *(none)* | csv of `siteId:n` (`mfc:0`) lowering one store's DESCENT window below `CRAWLER_RANGE_IDS_PER_RUN`; a cap never raises it, and a store absent keeps it. `0` = no descent for that store: no window GET, no POST, its `range.cursor`, `range.frontier` and `range.seed` untouched (`rangeSkipped: "descent-cap"`), while the re-anchor, both gap sweeps and the lists step run as before. A malformed entry is ignored with a WARN naming it; an entry naming a store that is not id-range walked is ignored with a WARN |
 | `CRAWLER_RANGE_FRONTIER_<SITEID>` | *(none)* | Seed frontier for a store whose ledger has no numeric itemId yet; CHANGING it later re-seeds the walk from the new top. `<SITEID>` = the siteId uppercased with every non-alphanumeric character replaced by `_` |
 | `CRAWLER_RANGE_REANCHOR_H` | `24` | How often the frontier is moved up to the newest id the ledger has seen (never one the gap sweep wrote), recording the band it skipped as a KNOWN GAP. `0` = every run |
 | `CRAWLER_RANGE_REANCHOR_MAX_DELTA` | `50000` | The widest move one re-anchor may make. A wider one is refused with a WARN naming this knob and reported as `rangeReanchorRefused`, and it is tried again every run until the ledger or the knob changes. Raise it for a frontier frozen a long time. `0` refuses every move |
@@ -683,6 +684,7 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
 | `CRAWLER_LISTS_WINDOW_UTC` | *(none = no list fetched)* | Company lists: `HH:MM-HH:MM` UTC window (may wrap midnight) in which ONE group may be fetched per pass. Malformed or zero-width = off, with a WARN. The backlog drains outside it |
 | `CRAWLER_LISTS_INTERVAL_H` | `160` | Company lists: a group is fetched at most once per this many hours. In-window passes per day × interval days should cover the group count (7 × 6.67 ≈ 46 < 54 for mfc); below that the least-recently-polled rotation stretches the cycle to groups ÷ passes per day days |
 | `CRAWLER_LISTS_SPACING_MS` | `10000` | Company lists: wait between two lists of one group; never below `10000` (raised with a WARN) |
+| `CRAWLER_LISTS_ALTERNATE` | *(none)* | Company lists: csv of siteIds whose passes that START inside `CRAWLER_LISTS_WINDOW_UTC` fetch EITHER the Latest Additions tap OR one company group, never both; each window opens with a lists pass (7 in-window passes = L T L T L T L, 4 groups a night). Only a store with a lists step (`CRAWLER_LISTS_DRAIN_CAPS`) and a mode running recent and backfill; any other name is ignored with a WARN. Empty = today's pass |
 | `CRAWLER_REOBSERVE_MIN_AGE_H` | `12` | Re-observation lane: an id is eligible once its last observation is this many hours old. The SAME value is the backoff window for an id whose last re-observation was refused, so `0` means both "age is no bar" and "no backoff at all" — a refused id is retried on the very next run |
 | `CRAWLER_MAX_REOBSERVE_PER_STORE` | `0` | Re-observation lane: global per-store ceiling on re-observations per run. `0` = the lane is OFF unless a store opts in below |
 | `CRAWLER_STORE_REOBSERVE_CAPS` | *(none)* | csv of `siteId:cap` (`goodsmileus:50,bbts:20`) — the lane's per-store budget, SEPARATE from `CRAWLER_STORE_ENQUEUE_CAPS`, so neither lane starves the other. A malformed entry is ignored with a WARN; the rest still apply |
@@ -696,7 +698,8 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
   "version": 1,
   "siteId": "orzgk",
   "enqueued": { "<itemId>": { "at": "2026-09-06T12:00:00.000Z", "collectUrl": "https://...",
-                              "reobserveFailedAt": "...", "reobserveFailures": 1 } },
+                              "reobserveFailedAt": "...", "reobserveFailures": 1,
+                              "via": "tap", "lastVia": "reobserve" } },
   "backfill": {
     "cursor": 12,
     "exhaustCandidateCursor": 12, "exhaustCandidateAt": "...",
@@ -713,6 +716,16 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
 simply has no `range` and is neither corrupt nor migrated (the file stays `version: 1`). A `range`
 that IS present must be well formed — a malformed cursor or frontier is **corrupt**, never a silent
 reset that would re-walk the whole id space nor a non-number reported as one.
+
+`via` names the source whose accepted POST CREATED the entry: `tap` (the recent listing of a store
+in `CRAWLER_RANGE_STORES`; for mfc that listing IS the Latest Additions tap), `recent` (any other
+store's recent listing), `backfill`, `descent` (the id-range walk), `gap`, `lists` or `seed`;
+`reobserve` only ever appears as a `lastVia`, and `target` is reserved. FIRST WRITER WINS: a later
+write to the same id (a recent re-observation, the re-observation lane) keeps `via`, or keeps it
+absent on an entry written before the field existed, and records itself as `lastVia`. Both are
+optional and the file stays `version: 1`. Entries are not validated on load, so any build loads and
+saves back a value it does not know untouched (an older build's recent re-observation still rebuilds
+the entry whole and drops both).
 
 A missing file is a fresh ledger. Unparseable JSON, a wrong `version`, a wrong `siteId`, or a
 malformed section is **corrupt**: the store is refused for the run (counted as an error) and the
@@ -781,7 +794,7 @@ because the newest ids always outrank the deep id space for the run's budget.
   already gone, does not walk at all. Size them for it: `CRAWLER_MAX_REQUESTS` must cover the listing
   phases plus, per range store, one window GET and up to `CRAWLER_RANGE_IDS_PER_RUN` POSTs, and the
   store's cap must have that much headroom left. When it does not, `rangeSkipped` on the store
-  summary says which — `cap`, `budget`, `no-frontier`, `floor`, `cooldown`, `unsupported`, `failed`,
+  summary says which — `descent-cap`, `cap`, `budget`, `no-frontier`, `floor`, `cooldown`, `unsupported`, `failed`,
   `window-malformed`, `window-rejected`, `store-stopped`, `not-run`, `not-configured` — and it is `null` on a run that
   actually asked for a window. The window GET itself is synthesized (no upstream fetch) but is still
   charged one slot of the global budget and one spacing interval.
@@ -896,8 +909,24 @@ a stop in one lane (cooldown, challenge, sick scraper) stops every lane below it
   `interrupted`), `listsFetched`, `listsFailed`, `listsIdsSeen`, `listsIdsNew`, `listsEnqueued` (kept
   out of `enqueued`), `listsPending`, `listsDrainApplied`, `listsSkipped` (`not-configured`, `not-run`,
   `store-stopped`, `state-corrupt`, `state-failed`, `window-off`, `outside-window`, `paused`,
-  `none-due`, `unsupported`, `cooldown`, `budget`, `failed`; `null` when a group was fetched) and
+  `none-due`, `alternation-tap`, `unsupported`, `cooldown`, `budget`, `failed`; `null` when a group was fetched) and
   `listsDrainStopped`. Run level: `totalListsEnqueued`.
+- **Alternation** (`CRAWLER_LISTS_ALTERNATE`; Ross MS 2026-10-04) — for a named store, the kind of a pass
+  that starts inside the window is decided once, before the tap, from the lists state's `alternation`
+  marker `{lastInWindowKind, windowStart, at}`: no marker, or one from another window, = a LISTS pass (so
+  every window opens with lists, every night); otherwise the opposite of the last kind. A LISTS pass skips
+  the store's recent and backfill phases (both read the Latest Additions listing) and rotates as above; if
+  it issued no list GET (`none-due`, `paused`, `unsupported`, past the window) and the store is not stopped,
+  it taps after the id-range phase instead (`fallback-tap`); a list GET that was issued, answered or not,
+  costs the pass's tap. A TAP pass runs recent and backfill and asks for no group (`listsSkipped:
+  "alternation-tap"`). Both drain the backlog. The marker records the INTENDED kind (`lists` after a
+  fallback tap) and only the lists step's own save writes it, so a pass whose lists step did not run
+  (store stopped first) repeats its kind next pass: a tap pass stopped on its tap costs that night a
+  group. A pass that starts outside the window taps as today and never asks for a group, even if it
+  reaches the lists step inside the window; the marker is untouched. A lists state that cannot be read at
+  pass start turns alternation off for that pass (one WARN; today's pass). The marker is not validated on
+  load: a build without this knob keeps it, and a malformed one counts as absent. Store summary:
+  `alternation` = `off`, `outside-window`, `lists`, `tap` or `fallback-tap`.
 - **Stop switch** — remove the store from `CRAWLER_LISTS_DRAIN_CAPS` (no fetch, no drain); unset
   `CRAWLER_LISTS_WINDOW_UTC` to stop fetching while the backlog drains. A crawler on this version
   against an older engine loses only the priority (the old `/ingest/scrape` reads `url` alone), so every
