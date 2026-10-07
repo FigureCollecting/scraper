@@ -13,8 +13,9 @@
  *                 exhaustCandidateCursor?, exhaustCandidateAt?, // one empty sighting (unconfirmed)
  *                 exhaustedAt?, updatedAt? },                   // confirmed end-of-catalog
  *     recent:   { lastRunAt?, lastNewCount?,
- *                 pagePool?: { visited: [[from, to, at], ...] } },  // backfill page pool (QB-U24): pages
- *                                                                  // above backfill.cursor already visited
+ *                 pagePool?: { visited: [[from, to, at], ...],      // backfill page pool (QB-U24): pages
+ *                              drift?: { ids, pageSize } } },     // above backfill.cursor already visited,
+ *                                                                  // and drift not yet applied to them
  *     range?:   { cursor: number|null,      // next id to walk DOWNWARD; 0 = the id floor was reached
  *                 frontier?, seed?, updatedAt?,     // OPTIONAL: absent on a store that never range-walked
  *                 reanchoredAt?,                    // when the frontier was last moved up (D5)
@@ -151,7 +152,8 @@ export interface LedgerRecent {
   lastNewCount?: number;
   /**
    * The BACKFILL PAGE POOL's visited marks (QB-U24, written only for a store in CRAWLER_PAGE_POOL): the pages
-   * above `backfill.cursor` a cut-short pass fully attempted. It lives under `recent` because that section is
+   * above `backfill.cursor` a cut-short pass fully attempted, and the drift the recent reads met that no
+   * backfill save has applied to them yet. It lives under `recent` because that section is
    * loaded and stored WHOLE, unvalidated: an older build keeps it untouched and walks its cursor, and a bad
    * value is ignored by the pool (src/crawler/pagePool.ts readVisited), never 'corrupt'.
    */

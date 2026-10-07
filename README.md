@@ -617,8 +617,9 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
   pass, a cut-short page is re-read, an end is confirmed only on a later run, a confirmed end issues no
   GET until its re-check is due). A page a cut-short pass finished above the cursor is kept as a visited
   mark in `recent.pagePool` (expiring after `CRAWLER_PAGE_POOL_VISITED_TTL_H`); after k new ids arrive on
-  top (counted by the recent read), the bottom ceil(k / page size) marks of a run sitting on an unvisited
-  page are read again (one mark when the pass had no recent read). Each pooled store's summary
+  top (counted by the recent read, and carried in `recent.pagePool.drift` until a backfill saves, so a pass
+  stopped before its backfill hands it on), the bottom ceil(k / page size) marks of a run sitting on an
+  unvisited page are read again (one mark more when the pass had no recent read). Each pooled store's summary
   carries `pagePicks`, the pages requested in order; the pass logs its seed.
 - **id-range backfill** — for the stores named in `CRAWLER_RANGE_STORES` only: walk the store's
   SEQUENTIAL id space downward through `GET /catalog?store=&range=1&from=&count=`, up to

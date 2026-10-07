@@ -10,8 +10,11 @@
  * the one it could not finish. A mark expires after CRAWLER_PAGE_POOL_VISITED_TTL_H: listing pages drift
  * (new items push every item down), so an old visit no longer says what the page holds; and after a drift
  * the bottom pages of a visited run above an unvisited page are read again, as many as the drift spans
- * (dropExposedMarks). `recent` is stored whole by every build, so an older build keeps the field untouched
- * and walks its cursor.
+ * (dropExposedMarks). The drift a recent read meets is added to `drift` IN THE SAME SAVE as its page, and is
+ * spent by the next backfill save (which writes the marks with the drop applied and no `drift`): a pass whose
+ * backfill never saves (a stop or a cap after the recent read, no backfill phase, a first pick that fails)
+ * hands its drift on instead of losing it. `recent` is stored whole by every build, so an older build keeps
+ * the field untouched and walks its cursor.
  *
  * ORDER. A pass's page set is the L lowest unvisited pages at or above the cursor, none above a known or
  * candidate end. POOL-SELECT (src/services/poolSelect.ts, DEFAULT_PAGE_PARAMS) picks the next page from
@@ -26,8 +29,18 @@ import { DEFAULT_PAGE_PARAMS, passesAntiSequence, select, type Candidate, type H
 /** One visited mark: pages `from`..`to` (inclusive) fully attempted at `at` (ISO-8601). */
 export type VisitedMark = [from: number, to: number, at: string];
 
+/**
+ * Drift not yet applied to the marks: `ids` = the ids the recent reads met that the ledger did not hold, since
+ * the last backfill save; `pageSize` = the item count of the latest recent read's page 1.
+ */
+export interface PendingDrift {
+  ids: number;
+  pageSize: number;
+}
+
 export interface LedgerPagePool {
   visited: VisitedMark[];
+  drift?: PendingDrift;
 }
 
 /**
@@ -44,6 +57,11 @@ const MAX_ORDER_SEARCH = 8;
 
 const isPositiveInt = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v > 0;
 
+const isCount = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v >= 0;
+
+const isDrift = (v: unknown): v is PendingDrift =>
+  typeof v === 'object' && v !== null && isCount((v as PendingDrift).ids) && isCount((v as PendingDrift).pageSize);
+
 const isMark = (v: unknown): v is VisitedMark =>
   Array.isArray(v) &&
   v.length === 3 &&
@@ -53,23 +71,51 @@ const isMark = (v: unknown): v is VisitedMark =>
   v[1] - v[0] < MAX_MARK_SPAN &&
   typeof v[2] === 'string';
 
+/** The pool state if it is well formed (absent = empty), else undefined. */
+const parsePool = (raw: unknown): LedgerPagePool | undefined => {
+  if (raw === undefined) return { visited: [] };
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
+  const { visited, drift } = raw as { visited?: unknown; drift?: unknown };
+  if (!Array.isArray(visited) || !visited.every(isMark)) return undefined;
+  if (drift !== undefined && !isDrift(drift)) return undefined;
+  return { visited, ...(drift ? { drift } : {}) };
+};
+
+const NO_DRIFT: PendingDrift = { ids: 0, pageSize: 0 };
+
 /**
  * Read `ledger.recent.pagePool` into page -> visit time (epoch ms): the pages at or above `cursor` of every
- * mark younger than `ttlMs` at `nowMs`. Absent = nothing visited. Anything structurally wrong is ignored
- * WHOLE and flagged `malformed` (the caller warns): the pool is only a hint, so a bad one must never refuse
- * the store the way a corrupt ledger does. A mark whose time does not parse counts as expired.
+ * mark younger than `ttlMs` at `nowMs`, and the drift not yet applied to them. Absent = nothing visited, no
+ * drift. Anything structurally wrong is ignored WHOLE and flagged `malformed` (the caller warns): the pool is
+ * only a hint, so a bad one must never refuse the store the way a corrupt ledger does. A mark whose time does
+ * not parse counts as expired.
  */
-export function readVisited(raw: unknown, cursor: number, nowMs: number, ttlMs: number): { visited: Map<number, number>; malformed: boolean } {
+export function readVisited(
+  raw: unknown,
+  cursor: number,
+  nowMs: number,
+  ttlMs: number,
+): { visited: Map<number, number>; drift: PendingDrift; malformed: boolean } {
   const visited = new Map<number, number>();
-  if (raw === undefined) return { visited, malformed: false };
-  const marks = typeof raw === 'object' && raw !== null && !Array.isArray(raw) ? (raw as { visited?: unknown }).visited : undefined;
-  if (!Array.isArray(marks) || !marks.every(isMark)) return { visited: new Map(), malformed: true };
-  for (const [from, to, at] of marks) {
+  const pool = parsePool(raw);
+  if (!pool) return { visited, drift: NO_DRIFT, malformed: true };
+  for (const [from, to, at] of pool.visited) {
     const atMs = Date.parse(at);
     if (!(nowMs - atMs < ttlMs)) continue;
     for (let page = Math.max(from, cursor); page <= to; page++) visited.set(page, atMs);
   }
-  return { visited, malformed: false };
+  return { visited, drift: pool.drift ?? NO_DRIFT, malformed: false };
+}
+
+/**
+ * The pool state with `ids` more drift (met by a recent read page of a pass whose page 1 held `pageSize`
+ * items) to apply at the next backfill save. A malformed state is returned unchanged: the backfill ignores it
+ * whole, so it holds no marks to drop.
+ */
+export function addDrift(raw: LedgerPagePool | undefined, ids: number, pageSize: number): LedgerPagePool | undefined {
+  const pool = parsePool(raw);
+  if (!pool) return raw;
+  return { visited: pool.visited, drift: { ids: (pool.drift?.ids ?? 0) + ids, pageSize } };
 }
 
 /**

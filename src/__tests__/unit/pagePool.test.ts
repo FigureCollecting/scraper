@@ -7,7 +7,7 @@
  * POOL-SELECT orders it: lower page = more recent, never two adjacent pages in a row, no monotone 3-run
  * while an order without one exists. Pure: no clock, no I/O.
  */
-import { dropExposedMarks, lowestUnvisited, MAX_MARK_SPAN, nextPage, passPageSet, readVisited, writeVisited } from '../../crawler/pagePool';
+import { addDrift, dropExposedMarks, lowestUnvisited, MAX_MARK_SPAN, nextPage, passPageSet, readVisited, writeVisited } from '../../crawler/pagePool';
 import { deriveStream, mulberry32, passesAntiSequence, DEFAULT_PAGE_PARAMS, type History } from '../../services/poolSelect';
 import { loadCrawlerConfig } from '../../crawler/config';
 import { logger } from '../../utils/logger';
@@ -43,7 +43,7 @@ const violations = (order: number[]): number => {
 
 describe('readVisited', () => {
   it('no pool yet: nothing visited, not malformed', () => {
-    expect(readVisited(undefined, 10, NOW, TTL)).toEqual({ visited: new Map(), malformed: false });
+    expect(readVisited(undefined, 10, NOW, TTL)).toEqual({ visited: new Map(), drift: { ids: 0, pageSize: 0 }, malformed: false });
   });
 
   it('keeps the pages at or above the cursor of every live mark, with the mark time', () => {
@@ -67,7 +67,7 @@ describe('readVisited', () => {
   });
 
   it('an unreadable mark time counts as expired, not malformed', () => {
-    expect(readVisited({ visited: [[12, 12, 'yesterday']] }, 10, NOW, TTL)).toEqual({ visited: new Map(), malformed: false });
+    expect(readVisited({ visited: [[12, 12, 'yesterday']] }, 10, NOW, TTL)).toEqual({ visited: new Map(), drift: { ids: 0, pageSize: 0 }, malformed: false });
   });
 
   it.each([
@@ -83,8 +83,25 @@ describe('readVisited', () => {
     ['to below from', { visited: [[5, 4, ago(1)]] }],
     ['a mark time that is not a string', { visited: [[5, 5, 7]] }],
     ['a mark wider than the span cap', { visited: [[5, 5 + MAX_MARK_SPAN, ago(1)]] }],
+    ['drift not an object', { visited: [], drift: 3 }],
+    ['drift null', { visited: [], drift: null }],
+    ['drift ids missing', { visited: [], drift: { pageSize: 10 } }],
+    ['drift ids negative', { visited: [], drift: { ids: -1, pageSize: 10 } }],
+    ['drift ids fractional', { visited: [], drift: { ids: 1.5, pageSize: 10 } }],
+    ['drift ids a string', { visited: [], drift: { ids: '3', pageSize: 10 } }],
+    ['drift page size missing', { visited: [], drift: { ids: 3 } }],
+    ['drift page size negative', { visited: [], drift: { ids: 3, pageSize: -10 } }],
   ])('malformed (%s): ignored whole, flagged for a WARN', (_label, raw) => {
-    expect(readVisited(raw, 1, NOW, TTL)).toEqual({ visited: new Map(), malformed: true });
+    expect(readVisited(raw, 1, NOW, TTL)).toEqual({ visited: new Map(), drift: { ids: 0, pageSize: 0 }, malformed: true });
+  });
+
+  it('reads the pending drift beside the marks; zero counts are well formed', () => {
+    expect(readVisited({ visited: [[12, 12, ago(1)]], drift: { ids: 15, pageSize: 10 } }, 10, NOW, TTL)).toEqual({
+      visited: new Map([[12, NOW - HOUR_MS]]),
+      drift: { ids: 15, pageSize: 10 },
+      malformed: false,
+    });
+    expect(readVisited({ visited: [], drift: { ids: 0, pageSize: 0 } }, 10, NOW, TTL).malformed).toBe(false);
   });
 
   it('a mark exactly the span cap wide is accepted', () => {
@@ -197,6 +214,30 @@ describe('writeVisited', () => {
       [20, NOW - 5 * HOUR_MS],
     ]);
     expect(readVisited(writeVisited(visited, 10), 10, NOW, TTL).visited).toEqual(visited);
+  });
+});
+
+describe('addDrift', () => {
+  it('no pool yet: starts one with no marks and the drift', () => {
+    expect(addDrift(undefined, 10, 20)).toEqual({ visited: [], drift: { ids: 10, pageSize: 20 } });
+  });
+
+  it('adds to the pending ids, keeps the marks, and takes the latest page size', () => {
+    const marks: Array<[number, number, string]> = [[22, 26, ago(1)]];
+    expect(addDrift({ visited: marks, drift: { ids: 10, pageSize: 20 } }, 5, 10)).toEqual({ visited: marks, drift: { ids: 15, pageSize: 10 } });
+    expect(addDrift({ visited: marks }, 5, 10)).toEqual({ visited: marks, drift: { ids: 5, pageSize: 10 } });
+  });
+
+  it('a malformed pool is returned unchanged (the backfill ignores it whole)', () => {
+    const bad = { visited: 'nope' } as unknown as Parameters<typeof addDrift>[0];
+    expect(addDrift(bad, 5, 10)).toBe(bad);
+  });
+
+  it('writeVisited (the backfill save) writes no drift: the pending drift is spent', () => {
+    const pool = addDrift({ visited: [[22, 26, ago(1)]] }, 5, 10);
+    const { visited, drift } = readVisited(pool, 10, NOW, TTL);
+    expect(drift).toEqual({ ids: 5, pageSize: 10 });
+    expect(writeVisited(visited, 10)).toEqual({ visited: [[22, 26, ago(1)]] });
   });
 });
 
