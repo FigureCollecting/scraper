@@ -33,6 +33,8 @@ import type { FetchBodyOutcome } from '../services/engineServices/capturingFetch
 import { classifyFetchFailure } from '../services/failureClassifier.js';
 import type { FetchFailureReport, ReportFetchFailure } from '../services/failureReporter.js';
 import type { ProfileRegistry } from './profileRegistry.js';
+import type { HostClock } from '../services/hostClock.js';
+import { sendOnHostClock } from '../services/hostClockSend.js';
 import type {
   ExtractionRuleset,
   IdentityQuery,
@@ -101,8 +103,12 @@ export function resolveLookupStoreTimeoutMs(env: NodeJS.ProcessEnv): number {
   return Math.min(MAX_STORE_TIMEOUT_MS, Math.max(MIN_STORE_TIMEOUT_MS, n));
 }
 
-/** Per-store search-fetch timeout applied to every fan-out fetch. Resolved ONCE at module load. */
-const STORE_TIMEOUT_MS = resolveLookupStoreTimeoutMs(process.env);
+/**
+ * The fetch time a /lookup store fetch keeps after waiting for the host clock (QB-U30b): the default
+ * per-store search timeout, as the catalog keeps its own default (SCRAPE_CATALOG_MIN_FETCH_MS 30 s).
+ * A host the lookup budget cannot wait for and still keep this much is RECORDED, not waited for.
+ */
+export const LOOKUP_MIN_FETCH_MS = DEFAULT_STORE_TIMEOUT_MS;
 
 /**
  * Bound a per-store fetch: resolve with its value if it wins, else REJECT once `ms` elapses so a
@@ -160,6 +166,11 @@ export interface LookupServices {
    * environment-free `fc:search/<siteId>?q=…&mode=…` target.
    */
   reportFailure?: ReportFetchFailure;
+  /**
+   * The shared per-host clock (QB-U30b) the fetches book on. Optional — defaults to the process clock
+   * (SCRAPE_HOST_CLOCK; off by default, so every fetch goes at once as before); tests inject one.
+   */
+  hostClock?: HostClock;
 }
 
 export interface StoreLookupResult {
@@ -247,6 +258,9 @@ function parseOrClassified(err: unknown): FetchFailureReport['reasonClass'] {
 const identityLabel = (identity: IdentityQuery): string => identity.gtin14 ?? composeNameQuery(identity) ?? '';
 
 export function assembleLookup(services: LookupServices): Lookup {
+  // Per-store search-fetch timeout applied to every fan-out fetch. Resolved ONCE per assembly (index.ts
+  // assembles once at boot), like the catalog's: the host clock's role for /lookup reads it too.
+  const STORE_TIMEOUT_MS = resolveLookupStoreTimeoutMs(process.env);
   const runFanout = async (
     plan: ReturnType<typeof planRetrieval>,
     mode: LookupMode,
@@ -333,9 +347,32 @@ export function assembleLookup(services: LookupServices): Lookup {
           // store can't keep the whole Promise.all pending. A timeout REJECTS → the catch below treats
           // it exactly like any other fetch failure (siteId → `failed`, reason logged, returns null).
           const transport = services.profiles.searchTransportFor(p.host);
-          const outcome = gateOutcomeOf(
-            await withTimeout(services.fetchSearchDetail ? services.fetchSearchDetail(p.url, transport) : services.fetchSearch(p.url, transport), STORE_TIMEOUT_MS),
+          // THE HOST CLOCK (QB-U30b): on a clocked bySearch host the fetch reserves the host's next
+          // slot, waits for it and runs the send block, with STORE_TIMEOUT_MS minus the wait left for
+          // the fetch. A host whose wait cap would leave the fetch less than LOOKUP_MIN_FETCH_MS of
+          // STORE_TIMEOUT_MS is sent at once and RECORDED (the queue's next record waits a full floor
+          // after it). MFC declares no bySearch axis, so /lookup never reaches it.
+          // A refused slot (past the wait cap) or a cooldown that opened while waiting leaves the
+          // store in `cooldown`, unfetched, like a cooling host (no failure report: nothing failed).
+          const sent = await sendOnHostClock(
+            {
+              host: p.host,
+              caller: 'lookup',
+              budgetMs: STORE_TIMEOUT_MS,
+              minFetchMs: LOOKUP_MIN_FETCH_MS,
+              latency: 'lookup',
+              veto: () => (cd.isOpen(p.host) ? 'cooling' : undefined),
+            },
+            ms => withTimeout(services.fetchSearchDetail ? services.fetchSearchDetail(p.url, transport) : services.fetchSearch(p.url, transport), ms ?? STORE_TIMEOUT_MS),
+            services.hostClock ? { clock: services.hostClock } : {},
           );
+          if (!sent.sent) {
+            // eslint-disable-next-line no-console
+            console.warn(`[HOST-CLOCK] ${sanitizeForLog(p.siteId)} search left alone: ${sent.refused ? `its slot is ${sent.waitMs} ms away` : 'its host began cooling while it waited'}`);
+            cooldown.push(p.siteId);
+            return null;
+          }
+          const outcome = gateOutcomeOf(sent.value);
           const body = outcome.body;
           // HONEST SEARCH LANE: a CF challenge/block body is NOT parseable content — extractCandidates
           // would silently lift 0 candidates and pose the store as "carries nothing". Detect it BEFORE

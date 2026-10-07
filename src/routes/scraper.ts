@@ -1,6 +1,16 @@
 import express from 'express';
 import { scrapeGeneric, BrowserPool } from '../services/genericScraper.js';
 import { sanitizeForLog, sanitizeObjectForLog } from '../utils/security.js';
+import { sendOnHostClock, type ClockedSendDeps, type ClockedSendResult } from '../services/hostClockSend.js';
+
+/**
+ * The legacy /scrape route's in-process fetch on the shared per-host clock (QB-U30b caller 'scrape'):
+ * on a clocked store host it waits for the host's next slot and runs the send block; a slot past the
+ * wait cap is refused (nothing fetched). Any other host is fetched at once, as before.
+ */
+export function scrapeOnHostClock(url: string, config: unknown, deps: ClockedSendDeps = {}): Promise<ClockedSendResult<Awaited<ReturnType<typeof scrapeGeneric>>>> {
+  return sendOnHostClock({ host: new URL(url).hostname, caller: 'scrape' }, () => scrapeGeneric(url, config as Parameters<typeof scrapeGeneric>[1]), deps);
+}
 
 const router = express.Router();
 
@@ -38,7 +48,16 @@ router.post('/scrape', async (req, res) => {
     console.log(`[SCRAPER API] Processing generic URL: ${sanitizeForLog(url)}`); // lgtm[js/log-injection]
     console.log('[SCRAPER API] Using config:', sanitizeObjectForLog(config)); // lgtm[js/log-injection]
 
-    const scrapedData = await scrapeGeneric(url, config);
+    const sent = await scrapeOnHostClock(url, config);
+    if (!sent.sent) {
+      const waitMs = sent.refused ? sent.waitMs : 0;
+      res.set('Retry-After', String(Math.max(1, Math.ceil(waitMs / 1000))));
+      return res.status(503).json({
+        success: false,
+        message: `[HOST-CLOCK] ${sanitizeForLog(new URL(url).hostname)} refused a scrape send: its slot is ${waitMs} ms away, past the wait cap`,
+      });
+    }
+    const scrapedData = sent.value;
 
     console.log('[SCRAPER API] Generic scraping completed:', sanitizeObjectForLog(scrapedData)); // lgtm[js/log-injection]
     

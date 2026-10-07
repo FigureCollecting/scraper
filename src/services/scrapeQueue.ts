@@ -2198,7 +2198,13 @@ export class ScrapeQueue {
       if (wait === 0) break;
       await new Promise<void>(resolve => setTimeout(resolve, wait));
     }
-    const page = await this.getCapturingFetch()(item.url, searchFetch, { cookies: item.cookies });
+    // REV 7 SEND BLOCK (QB-U30b): INVOKE the transport, then record the send at the instant after the
+    // invocation (capturingFetch has no await before its transports.* call, so invoking it reaches
+    // the transport synchronously), then await. Stamping before the call left the next request short
+    // by whatever synchronous work ran between the stamp and the transport's entry.
+    const sending = this.getCapturingFetch()(item.url, searchFetch, { cookies: item.cookies });
+    this.recordRecordSend(host);
+    const page = await sending;
     // A clean (non-challenge) body proves this host serves real pages again — clear a lingering,
     // now-EXPIRED cooldown entry so /health/detailed stops listing it and the recovery is logged.
     // Guard on !isOpen: a still-LIVE window (one the search fan-out opened on this host WHILE this
@@ -2441,6 +2447,8 @@ export class ScrapeQueue {
       primaryUrl: item.url,
       primaryFetchedAt,
       baseDelayMs: caps?.rateLimit?.baseDelayMs,
+      // fetchBody follow-ups book on the queue's clock (QB-U30b): an injected one, else the process clock.
+      ...(this.hostClock ? { hostClock: this.hostClock } : {}),
     });
   }
 
@@ -2510,9 +2518,9 @@ export class ScrapeQueue {
 
   /**
    * A record is about to be handed to its transport: 0 = go, and the send is stamped now on the
-   * shared clock (a host in scope, via its send-time gate) and on the clock's send-time observer
-   * (every store host, whatever the scope says); otherwise the ms before the gate opens, nothing
-   * stamped. The queue's own slot is its grant, already behind it, so only a send by another caller
+   * shared clock (a host in scope, via its send-time gate; {@link recordRecordSend} then moves it to
+   * the instant after the transport's invocation and reports it to the send-time observer);
+   * otherwise the ms before the gate opens, nothing stamped. The queue's own slot is its grant, already behind it, so only a send by another caller
    * since then can shut the gate. A host off the clock never waits here: its private floor paced the
    * dispatch, exactly as before.
    */
@@ -2526,8 +2534,20 @@ export class ScrapeQueue {
       if (wait > 0) return wait;
       clock.settle(host, sentAt, floorMs);
     }
-    clock.recordSend(host, 'queue', sentAt);
     return 0;
+  }
+
+  /**
+   * The record's transport has just been invoked (rev 7, QB-U30b): move the host's last send on the
+   * clock to this instant (a host in scope) and report it to the send-time observer (every store host,
+   * whatever the scope says). The recorded instant is therefore at or after the transport's entry.
+   */
+  private recordRecordSend(host: string | undefined): void {
+    if (host === undefined) return;
+    const clock = this.hostClock ?? getHostClock();
+    const sentAt = Date.now();
+    clock.markSent(host, sentAt);
+    clock.recordSend(host, 'queue', sentAt);
   }
 
   private getNextProcessableItem(now: number): QueueItem | null {

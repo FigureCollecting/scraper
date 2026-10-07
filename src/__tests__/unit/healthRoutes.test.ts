@@ -11,6 +11,7 @@ import { CfCookieStore } from '../../services/cookieJar';
 import { createExtractionRegistry } from '../../services/extractionRegistry';
 import type { ImageCaptureStats } from '../../services/images/imageCaptureHook';
 import type { SinkStats } from '../../services/objectStoreCaptureSink';
+import { U30B_FIELDS, U30B_SENDS } from '../helpers/hostClockU30bFields';
 
 const NO_IMAGE_CAPTURE: ImageCaptureStats = {
   enabled: false,
@@ -833,7 +834,7 @@ describe('createHealthRoutes — hostClock', () => {
     mode: 'hosts' as const,
     hosts: [{
       host: 'myfigurecollection.net', floorMs: 7000, clocked: true,
-      sends60m: { queue: 3, image: 6 }, minGapMs60m: 7000, underFloor60m: 0, lastSendAt: '2026-10-06T05:00:00.000Z',
+      sends60m: { queue: 3, image: 6, ...U30B_SENDS }, minGapMs60m: 7000, underFloor60m: 0, ...U30B_FIELDS, lastSendAt: '2026-10-06T05:00:00.000Z',
     }],
   };
 
