@@ -226,7 +226,8 @@ describe('stop rules', () => {
       const marked = (l.recent.pagePool?.visited ?? []).flatMap(([from, to]) => Array.from({ length: to - from + 1 }, (_, i) => from + i));
       // Fully attempted = every page below the cursor (from 20) plus every visited mark above it.
       expect(cursor - 20 + marked.length).toBe(4);
-      expect(cursor).toBe(Math.min(cut, ...[20, 21, 22, 23, 24].filter((x) => !marked.includes(x))));
+      // The cut-short page is the one page of the five not fully attempted, so it is the lowest unvisited.
+      expect(cursor).toBe(cut);
       expect(marked).not.toContain(cut);
       expect(l.backfill.exhaustCandidateCursor).toBeUndefined();
       // Next pass: the cut-short page is fetched again and no fully attempted page is.
@@ -451,37 +452,68 @@ describe('ledger.recent.pagePool', () => {
   });
 });
 
-describe('listing drift (k ids prepended per pass): pooled coverage stays within 1 pp of sequential at the default L', () => {
+describe('listing drift (k ids prepended per pass)', () => {
   /**
-   * Review 2's drift model (drift.py): every pass walks its five pages in full (no cap binds), the
-   * catalogue is long enough that the walk never ends, and k new ids land on top between passes.
-   * `cap` adds a per-pass POST cap, so passes are cut short and visited marks above the cursor appear.
+   * Coverage = the share of every id that ever existed (the original catalogue plus each pass's k new ids)
+   * that some pass POSTed. `cap` = the per-pass POST cap; `passes` = how long the walk runs.
    */
-  const coverage = async (k: number, pool: boolean, seed: number, cap: number) => {
-    const PASSES = 12;
-    const engine = makePagedEngine({ orzgk: { pageSize: 20, items: idRun('o', 100_000, 2000) } });
+  const coverage = async (k: number, pool: boolean, seed: number, o: { cap: number; pageSize: number; items: number; passes: number }) => {
+    const engine = makePagedEngine({ orzgk: { pageSize: o.pageSize, items: idRun('o', 100_000, o.items) } });
     const ledgers = createMemoryLedgerStore();
     const all = new Set(engine.items('orzgk'));
     let fresh = 0;
-    for (let i = 0; i < PASSES; i++) {
+    for (let i = 0; i < o.passes; i++) {
       if (i > 0) {
         const ids = idRun('n', 500_000 + (fresh += k), k);
         engine.prepend('orzgk', ids);
         for (const id of ids) all.add(id);
       }
-      await runPass(mkCfg({ maxEnqueuePerStore: cap, ...(pool ? POOLED : {}) }), engine, ledgers, T0 + i * HOUR_MS, seed * 100 + i);
+      await runPass(mkCfg({ maxEnqueuePerStore: o.cap, ...(pool ? POOLED : {}) }), engine, ledgers, T0 + i * HOUR_MS, seed * 100 + i);
     }
     const got = new Set(engine.posted('orzgk').map((u) => u.slice(u.lastIndexOf('/') + 1)));
     return [...all].filter((id) => got.has(id)).length / all.size;
   };
 
-  it.each([2, 5, 15])('k = %i, no cap (the plan\'s model)', async (k) => {
-    const seq = await coverage(k, false, 0, 1000);
-    for (let seed = 0; seed < 10; seed++) expect(await coverage(k, true, seed, 1000)).toBeGreaterThanOrEqual(seq - 0.01);
+  /** Review 2's model (drift.py): every pass walks its five pages in full; twelve passes of a long catalogue. */
+  it.each([2, 5, 15])('k = %i, no cap binding (the plan\'s model): pooled coverage within 1 pp of sequential', async (k) => {
+    const o = { cap: 1000, pageSize: 20, items: 2000, passes: 12 };
+    const seq = await coverage(k, false, 0, o);
+    for (let seed = 0; seed < 10; seed++) expect(await coverage(k, true, seed, o)).toBeGreaterThanOrEqual(seq - 0.01);
   });
 
-  it.each([2, 5, 15])('k = %i, a cap that cuts every pass short', async (k) => {
-    const seq = await coverage(k, false, 0, 90);
-    for (let seed = 0; seed < 10; seed++) expect(await coverage(k, true, seed, 90)).toBeGreaterThanOrEqual(seq - 0.01);
+  /**
+   * A cap that cuts every pass short, run until both walks reach the catalogue end: visited marks above an
+   * unvisited page appear on every pass, and drift slides that page's unread tail onto them. Pooled
+   * coverage stays within 1 pp of sequential (the sequential walk misses nothing here).
+   */
+  it.each([2, 5, 15])('k = %i, a cap that cuts every pass short, walked to the end: pooled coverage within 1 pp of sequential', async (k) => {
+    const o = { cap: 90, pageSize: 20, items: 1000, passes: 40 };
+    const seq = await coverage(k, false, 0, o);
+    expect(seq).toBe(1);
+    for (let seed = 0; seed < 10; seed++) expect(await coverage(k, true, seed, o)).toBeGreaterThanOrEqual(seq - 0.01);
+  });
+
+  describe('the bottom visited page above an unvisited one is read again when the listing moved', () => {
+    /** cursor 20; pages 22-23 visited an hour ago; page 21 unvisited (the run sits on it). */
+    const setFor = async (o: { prepend: number; phases?: CrawlerConfig['phases'] }) => {
+      const engine = makePagedEngine({ orzgk: catalog(60) });
+      const l = ledgerAt(engine.items('orzgk'), 20);
+      l.recent.pagePool = { visited: [[22, 23, iso(T0 - HOUR_MS)]] };
+      if (o.prepend > 0) engine.prepend('orzgk', idRun('n', 900_000, o.prepend));
+      const p = await runPass(mkCfg({ ...POOLED, ...(o.phases ? { phases: o.phases } : {}) }), engine, createMemoryLedgerStore({ orzgk: l }), T0, 11);
+      return sorted(p.backfillGets());
+    };
+
+    it('no new ids on top: the marks hold', async () => {
+      expect(await setFor({ prepend: 0 })).toEqual([20, 21, 24, 25, 26]);
+    });
+
+    it('new ids on top: page 22 (bottom of the run) is read again, page 23 is not', async () => {
+      expect(await setFor({ prepend: 3 })).toEqual([20, 21, 22, 24, 25]);
+    });
+
+    it('no recent read this pass (backfill-only mode): the drift is unknown, so page 22 is read again', async () => {
+      expect(await setFor({ prepend: 0, phases: ['backfill'] })).toEqual([20, 21, 22, 24, 25]);
+    });
   });
 });

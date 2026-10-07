@@ -7,7 +7,7 @@
  * POOL-SELECT orders it: lower page = more recent, never two adjacent pages in a row, no monotone 3-run
  * while an order without one exists. Pure: no clock, no I/O.
  */
-import { lowestUnvisited, MAX_MARK_SPAN, nextPage, passPageSet, readVisited, writeVisited } from '../../crawler/pagePool';
+import { dropExposedMarks, lowestUnvisited, MAX_MARK_SPAN, nextPage, passPageSet, readVisited, writeVisited } from '../../crawler/pagePool';
 import { deriveStream, mulberry32, passesAntiSequence, DEFAULT_PAGE_PARAMS, type History } from '../../services/poolSelect';
 import { loadCrawlerConfig } from '../../crawler/config';
 import { logger } from '../../utils/logger';
@@ -117,6 +117,34 @@ describe('lowestUnvisited / passPageSet', () => {
 
   it('a set of 0 pages is empty', () => {
     expect(passPageSet(10, 0, v())).toEqual([]);
+  });
+});
+
+describe('dropExposedMarks (after listing drift)', () => {
+  const v = (...pages: number[]) => new Map(pages.map((p) => [p, NOW]));
+
+  it('forgets the bottom page of every visited run that sits on an unvisited page, and nothing else', () => {
+    const visited = v(12, 13, 14, 17);
+    dropExposedMarks(visited, 10);
+    expect([...visited.keys()]).toEqual([13, 14]);
+  });
+
+  it('a run right above the cursor is exposed (the cursor page is unvisited)', () => {
+    const visited = v(11, 12);
+    dropExposedMarks(visited, 10);
+    expect([...visited.keys()]).toEqual([12]);
+  });
+
+  it('a page at the cursor sits on visited ground (everything below the cursor is visited)', () => {
+    const visited = v(10, 11);
+    dropExposedMarks(visited, 10);
+    expect([...visited.keys()]).toEqual([10, 11]);
+  });
+
+  it('only the bottom of a run goes, even when the run is long (one pass of drift moves less than a page)', () => {
+    const visited = v(30, 31, 32, 33);
+    dropExposedMarks(visited, 20);
+    expect([...visited.keys()]).toEqual([31, 32, 33]);
   });
 });
 

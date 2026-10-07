@@ -44,6 +44,11 @@
  *             new item on it was attempted — a page cut short by the per-store cap, the
  *             global budget, or a sick scraper is re-fetched next run (known ids skip).
  *             `nextPage` is ignored: a contradictory {hasMore:false, nextPage:N} exists.
+ *             PAGE POOL (CRAWLER_PAGE_POOL, QB-U24): a store named there fetches the L lowest UNVISITED
+ *             pages at or above its cursor in a POOL-SELECT order instead (no two adjacent pages in a
+ *             row, no monotone run); the cursor stays the lowest unvisited page and the pages above it
+ *             a cut-short pass finished are kept as visited marks (ledger.recent.pagePool). The stop
+ *             rules below are the same; see pooledBackfill.
  *
  * END-OF-CATALOG IS CONFIRMED, NEVER INFERRED FROM ONE PAGE. The LISTING lane is still
  * status-blind: /catalog rides the string-returning http fetch, so a Shopify page-cap
@@ -72,7 +77,10 @@
  * window next run — duplicate POSTs the queue coalesces, never a lost or skipped id.
  * A corrupt ledger refuses the store and is NEVER overwritten. Imports nothing from src/driver/* — this is a thin HTTP client.
  */
+import { randomInt } from 'crypto';
 import { createRequestGate, type GateResult, type RequestGate } from '../initiator/requestGate.js';
+import { deriveStream, type History } from '../services/poolSelect.js';
+import { dropExposedMarks, lowestUnvisited, nextPage, passPageSet, readVisited, writeVisited } from './pagePool.js';
 import { logger } from '../utils/logger.js';
 import { classifyFetchFailure } from '../services/failureClassifier.js';
 import type { FetchFailureReport, ReportFetchFailure } from '../services/failureReporter.js';
@@ -122,6 +130,11 @@ export interface CrawlerDeps {
   reportFailure?: ReportFetchFailure;
   /** The rotating-lists step's own state files (default: `<siteId>.lists.json` beside the ledgers). */
   listsStore?: ListsStateStore;
+  /**
+   * BACKFILL PAGE POOL: the pass's 32-bit seed (each pooled store draws from its own (seed, siteId, 'page')
+   * stream). Default: a fresh crypto seed per pass, logged, so a pass's page order can be replayed.
+   */
+  pagePoolSeed?: number;
 }
 
 /** What one declared seed list yielded this run (mode `seed` only), in the order the lists were polled. */
@@ -285,6 +298,11 @@ export interface CrawlerStoreSummary {
   exhaustCandidate: boolean;
   /** End-of-catalog confirmed; re-checked after exhaustedRecheckMs. */
   exhausted: boolean;
+  /**
+   * BACKFILL PAGE POOL: the backfill pages this pass requested, in order. Present ONLY for a store in
+   * CRAWLER_PAGE_POOL, so every other store's summary line reads exactly as it always has.
+   */
+  pagePicks?: number[];
 }
 
 export interface CrawlerSummary {
@@ -512,6 +530,11 @@ interface StoreState {
   alternationMarker?: ListsAlternationMarker;
   /** A company-list GET was issued this pass, answered or not: a lists pass then never falls back to the tap. */
   listFetchIssued: boolean;
+  /**
+   * Ids the RECENT read met that the ledger did not hold (re-observations of known ids excluded): new items
+   * on top, so every listing page has slid down since the last pass. Read by the page pool (QB-U24) only.
+   */
+  recentUnseen: number;
 }
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -625,6 +648,28 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     } else if (!config.phases.includes('recent') || !config.phases.includes('backfill')) {
       logger.warn('[CRAWLER] CRAWLER_LISTS_ALTERNATE needs a pass that runs both recent and backfill — ignored', { siteId, mode: config.mode });
     } else alternated.add(siteId);
+  }
+
+  // BACKFILL PAGE POOL (QB-U24): which stores' backfill passes are pooled, and the pass's seed. A name that
+  // is not crawled did nothing, so it says so; with no pooled store the pass draws no seed and logs nothing.
+  const pagePoolNames = config.pagePool ?? [];
+  const isPooled = (siteId: string): boolean => pagePoolNames === 'all' || pagePoolNames.includes(siteId);
+  if (pagePoolNames !== 'all') {
+    for (const siteId of pagePoolNames) {
+      if (!stores.includes(siteId)) logger.warn('[CRAWLER] CRAWLER_PAGE_POOL names a store that is not being crawled — ignored', { siteId });
+    }
+  }
+  const poolLookahead = Math.min(config.pagePoolLookahead ?? config.backfillPagesPerRun, config.backfillPagesPerRun);
+  const poolTtlMs = config.pagePoolVisitedTtlMs ?? 72 * 60 * 60 * 1000;
+  let poolSeed = 0;
+  if (stores.some(isPooled)) {
+    poolSeed = deps.pagePoolSeed ?? randomInt(0, 2 ** 32);
+    logger.info('[CRAWLER] backfill page pool on', {
+      seed: poolSeed,
+      stores: pagePoolNames === 'all' ? 'all' : stores.filter(isPooled),
+      lookahead: poolLookahead,
+      visitedTtlH: poolTtlMs / 3_600_000,
+    });
   }
 
   /**
@@ -743,7 +788,10 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     deepestRecentPage: 0,
     passKind: null,
     listFetchIssued: false,
+    recentUnseen: 0,
   }));
+
+  for (const st of states) if (isPooled(st.siteId)) st.summary.pagePicks = [];
 
   let budgetExhausted = false;
 
@@ -1083,6 +1131,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
         continue;
       }
       const entry = ledger.enqueued[item.itemId];
+      if (!entry && phase === 'recent') st.recentUnseen++;
       let reobserve = false;
       if (entry) {
         if (phase === 'recent' && config.reobserveAfterMs > 0 && ageMs(entry.at) >= config.reobserveAfterMs) {
@@ -1204,6 +1253,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
         return;
       }
     }
+    if (isPooled(st.siteId)) return pooledBackfill(st);
 
     // Resume the saved cursor; otherwise start just past the recent phase's deepest page (page 2 at minimum).
     let cursor = b.cursor ?? Math.max(2, st.deepestRecentPage + 1);
@@ -1257,6 +1307,122 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       b.cursor = cursor;
       if (changed) b.updatedAt = iso();
       if (!(await persist(st))) return;
+      if (!allAttempted) return;
+    }
+  };
+
+  /**
+   * BACKFILL PAGE POOL (QB-U24, CRAWLER_PAGE_POOL). Called by backfillPhase for a pooled store AFTER its
+   * exhausted-and-not-due check, which therefore still issues ZERO GETs exactly as before.
+   *
+   * The pass's page set is the L lowest UNVISITED pages at or above the cursor (L = CRAWLER_PAGE_POOL_LOOKAHEAD,
+   * at most backfillPagesPerRun), never a page above the END: a confirmed end whose re-check is due is the
+   * cursor itself, and an unconfirmed candidate bounds the set at its page. POOL-SELECT orders the set
+   * (pagePool.nextPage); each page answered is processed exactly as the sequential walk processes it, and
+   * the ledger is saved after every page. The stop rules are the sequential walk's:
+   *   - a stop (cooldown, failure, budget, a failed save) or a cap ends the pass;
+   *   - a page CUT SHORT (not every new id attempted) stays unvisited and ends the pass, recording nothing
+   *     about the end;
+   *   - a page with an exhaustion signal (empty, or hasMore false) drops every page above it from the pass
+   *     and is the end candidate; it is never marked visited (it is re-read to confirm), and it is confirmed
+   *     only on a LATER run that sees it again once every page below it is visited (the two-run rule);
+   *   - a real page AT the end proves the end moved: the end is cleared and the pass refills with the lowest
+   *     unvisited pages, up to L pages in all, as the sequential walk would walk on.
+   * DRIFT. New ids on top push every id down, so the unread tail of an unvisited page slides onto the visited
+   * page above it, and a mark trusted there would skip those ids for good (the cursor later walks past the
+   * mark). Measured (QB-U24 report: 20-id pages, a 90-POST cap, 2-15 ids a pass): the plan's marks-until-TTL
+   * missed 1.1-4.7 % of the catalogue for good. So when the listing may have moved since the last pass (the
+   * recent read met ids the ledger did not hold, or did not run), the bottom page of every visited run that
+   * sits on an unvisited page is read again (pagePool.dropExposedMarks); the walk then misses nothing the
+   * sequential walk catches, at about one extra page per such run.
+   * So with L = backfillPagesPerRun a pass fetches a permutation of the sequential pass's pages, except that a
+   * cut-short pass has fully attempted the same NUMBER of pages but not necessarily the lowest ones (those
+   * stay as visited marks above the cursor), and that a pass meeting the end for the first time may also ask
+   * for at most L - 1 empty pages above it, once (the engine answers those without a store fetch where
+   * SCRAPE_CATALOG_MAX_PAGES_GUARD covers the store and the end is its maxPages).
+   */
+  const pooledBackfill = async (st: StoreState): Promise<void> => {
+    const ledger = st.ledger!;
+    const b = ledger.backfill;
+    const start = b.cursor ?? Math.max(2, st.deepestRecentPage + 1);
+    const read = readVisited(ledger.recent.pagePool, start, now(), poolTtlMs);
+    if (read.malformed) logger.warn('[CRAWLER] page pool state malformed — ignored and rewritten', { siteId: st.siteId });
+    const visited = read.visited;
+    // DRIFT: when the listing may have moved since the last pass (the recent read met ids the ledger did not
+    // hold, or there was no recent read), re-read the bottom page of every visited run above an unvisited page.
+    if (st.summary.recentPages === 0 || st.recentUnseen > 0) dropExposedMarks(visited, start);
+    // What the ledger said about the end when the pass began. A candidate BELOW the cursor is stale (nothing
+    // writes one) and bounds nothing; it is cleared at the first save, as a real page clears it today.
+    let priorExhausted = b.exhaustedAt !== undefined;
+    let priorCandidate = b.exhaustCandidateCursor !== undefined && b.exhaustCandidateCursor >= start ? b.exhaustCandidateCursor : undefined;
+    let clearEnd = b.exhaustCandidateCursor !== undefined && priorCandidate === undefined && !priorExhausted;
+    let bound = priorExhausted ? start : priorCandidate;
+    // The lowest page this pass saw an exhaustion signal on (every later pick is below it).
+    let seenEnd: number | undefined;
+    let remaining = passPageSet(start, poolLookahead, visited, bound);
+    let fetched = 0;
+    const rng = deriveStream(poolSeed, st.siteId, 'page');
+    let history: History = {};
+
+    const commit = async (): Promise<boolean> => {
+      const cursor = lowestUnvisited(start, visited);
+      b.cursor = cursor;
+      if (seenEnd !== undefined && cursor === seenEnd && (priorExhausted || priorCandidate === seenEnd)) {
+        clearExhaustion(ledger);
+        b.exhaustedAt = iso();
+        logger.info('[CRAWLER] backfill exhausted — confirmed at the same page', { siteId: st.siteId, page: seenEnd });
+      } else if (seenEnd !== undefined) {
+        if (b.exhaustCandidateCursor !== seenEnd || b.exhaustedAt !== undefined) {
+          clearExhaustion(ledger);
+          b.exhaustCandidateCursor = seenEnd;
+          b.exhaustCandidateAt = iso();
+          logger.info('[CRAWLER] backfill exhaustion candidate — will confirm on a later run', { siteId: st.siteId, page: seenEnd });
+        }
+      } else if (clearEnd) {
+        clearExhaustion(ledger);
+      }
+      ledger.recent.pagePool = writeVisited(visited, cursor);
+      b.updatedAt = iso();
+      return persist(st);
+    };
+
+    while (remaining.length > 0) {
+      const page = nextPage(remaining, history, rng, now());
+      history = { prev: page, prev2: history.prev };
+      remaining = remaining.filter((p) => p !== page);
+      fetched++;
+      st.summary.pagePicks!.push(page);
+      const out = await fetchPage(st, page, 'backfill');
+      if (out.kind !== 'page') return;
+      st.summary.pagesFetched++;
+      st.summary.backfillPages++;
+      const { allAttempted } = await processPage(st, out.items, 'backfill');
+      const exhaustionSignal = out.items.length === 0 || !out.hasMore;
+      if (exhaustionSignal && !allAttempted) {
+        // Cut short: its unattempted ids say nothing about the end. It stays unvisited for the next run.
+        logger.info('[CRAWLER] backfill page cut short — exhaustion not recorded', { siteId: st.siteId, page });
+        await commit();
+        return;
+      }
+      if (exhaustionSignal) {
+        seenEnd = page;
+        bound = page;
+        remaining = remaining.filter((p) => p < page);
+      } else {
+        if (page === bound) {
+          // A real page at the end: the catalog grew. Walk on as the sequential pass would.
+          bound = undefined;
+          priorExhausted = false;
+          priorCandidate = undefined;
+          clearEnd = true;
+          if (allAttempted) visited.set(page, now());
+          // Every page fetched so far was fully attempted (a cut-short page ends the pass), so it is visited.
+          remaining = passPageSet(start, poolLookahead - fetched, visited);
+        } else if (allAttempted) {
+          visited.set(page, now());
+        }
+      }
+      if (!(await commit())) return;
       if (!allAttempted) return;
     }
   };

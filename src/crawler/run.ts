@@ -52,6 +52,9 @@ async function main(): Promise<void> {
     listsDrainCaps: config.listsDrainCaps,
     listsSpacingMs: config.listsSpacingMs,
     listsAlternate: config.listsAlternate,
+    pagePool: config.pagePool,
+    pagePoolLookahead: config.pagePoolLookahead,
+    pagePoolVisitedTtlH: (config.pagePoolVisitedTtlMs ?? 0) / 3_600_000,
   });
   // The durable fetch-failure ledger (INGEST_BASE_URL + REPORT_FETCH_FAILURES). Null = off, and
   // every emit point in the pass is a no-op.

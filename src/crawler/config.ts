@@ -181,6 +181,20 @@ export interface CrawlerConfig {
    * group, never both; each window opens with a lists pass. Empty (the default) or absent = today's pass.
    */
   listsAlternate?: string[];
+  /**
+   * BACKFILL PAGE POOL (`CRAWLER_PAGE_POOL`, QB-U24): the stores whose backfill pass fetches its next pages in a
+   * POOL-SELECT order instead of cursor, cursor+1, ... — `'all'`, or a list of siteIds. Empty (the default) or
+   * absent = every store walks exactly as before. The recent read is never pooled.
+   */
+  pagePool?: 'all' | string[];
+  /**
+   * BACKFILL PAGE POOL: how many of the lowest unvisited pages one pass shuffles and fetches
+   * (`CRAWLER_PAGE_POOL_LOOKAHEAD`). Defaults to `backfillPagesPerRun` and is never larger: review 2 measured that
+   * wider shuffles lose coverage under listing drift (1.1-25.3 pp at 10-30). Absent = `backfillPagesPerRun`.
+   */
+  pagePoolLookahead?: number;
+  /** BACKFILL PAGE POOL: how long a visited mark above the cursor is trusted (`CRAWLER_PAGE_POOL_VISITED_TTL_H`, default 72 h). */
+  pagePoolVisitedTtlMs?: number;
 }
 
 /** A UTC time-of-day window in minutes after midnight; `endMin < startMin` means it wraps past midnight. */
@@ -233,6 +247,7 @@ const DEFAULTS = {
   rangeGapBudget: 0,
   listsIntervalH: 160,
   listsSpacingMs: MIN_LISTS_SPACING_MS,
+  pagePoolVisitedTtlH: 72,
 };
 
 type Env = Record<string, string | undefined>;
@@ -298,6 +313,26 @@ const parseSiteIds = (raw: string | undefined, envName: string): string[] => {
   for (const entry of csv(raw ?? '')) {
     if (!SAFE_SITE_ID.test(entry)) {
       logger.warn(`[CRAWLER] ${envName} entry ignored (expected a siteId)`, { entry });
+      continue;
+    }
+    if (!out.includes(entry)) out.push(entry);
+  }
+  return out;
+};
+
+/**
+ * Parse `CRAWLER_PAGE_POOL`: unset, empty or `off` = no store; `all` = every store; otherwise a csv of siteIds
+ * (each a SAFE_SITE_ID, kept once). A malformed entry, or the keyword `all` / `off` inside a list, is dropped
+ * with a WARN naming it, like every other per-store csv here: one typo never pools nor un-pools the fleet.
+ */
+const parsePagePool = (raw: string | undefined): 'all' | string[] => {
+  const keyword = (raw ?? '').trim().toLowerCase();
+  if (keyword === 'all') return 'all';
+  if (keyword === '' || keyword === 'off') return [];
+  const out: string[] = [];
+  for (const entry of csv(raw ?? '')) {
+    if (!SAFE_SITE_ID.test(entry) || ['all', 'off'].includes(entry.toLowerCase())) {
+      logger.warn('[CRAWLER] CRAWLER_PAGE_POOL entry ignored (expected `all`, `off`, or a csv of siteIds)', { entry });
       continue;
     }
     if (!out.includes(entry)) out.push(entry);
@@ -463,6 +498,7 @@ export function loadCrawlerConfig(env: Env = process.env, argv: string[] = proce
   }
 
   const scraperServiceUrl = (env.SCRAPER_SERVICE_URL || DEFAULTS.scraperServiceUrl).replace(/\/+$/, '');
+  const backfillPagesPerRun = posInt(env.CRAWLER_BACKFILL_PAGES_PER_RUN, DEFAULTS.backfillPagesPerRun);
   const ledgerDir = (env.CRAWLER_LEDGER_DIR ?? '').trim() || DEFAULTS.ledgerDir;
 
   return {
@@ -472,7 +508,7 @@ export function loadCrawlerConfig(env: Env = process.env, argv: string[] = proce
     stores,
     ledgerDir,
     recentMaxPages: posInt(env.CRAWLER_RECENT_MAX_PAGES, DEFAULTS.recentMaxPages),
-    backfillPagesPerRun: posInt(env.CRAWLER_BACKFILL_PAGES_PER_RUN, DEFAULTS.backfillPagesPerRun),
+    backfillPagesPerRun,
     maxRequests: nonNegInt(env.CRAWLER_MAX_REQUESTS, DEFAULTS.maxRequests),
     maxEnqueuePerStore: nonNegInt(env.CRAWLER_MAX_ENQUEUE_PER_STORE, DEFAULTS.maxEnqueuePerStore),
     storeEnqueueCaps: parseStoreCaps(env.CRAWLER_STORE_ENQUEUE_CAPS, 'CRAWLER_STORE_ENQUEUE_CAPS'),
@@ -509,5 +545,15 @@ export function loadCrawlerConfig(env: Env = process.env, argv: string[] = proce
     listsDrainCaps: parseStoreCaps(env.CRAWLER_LISTS_DRAIN_CAPS, 'CRAWLER_LISTS_DRAIN_CAPS'),
     listsSpacingMs: flooredNonNegInt(env.CRAWLER_LISTS_SPACING_MS, DEFAULTS.listsSpacingMs, MIN_LISTS_SPACING_MS, 'CRAWLER_LISTS_SPACING_MS'),
     listsAlternate: parseSiteIds(env.CRAWLER_LISTS_ALTERNATE, 'CRAWLER_LISTS_ALTERNATE'),
+    pagePool: parsePagePool(env.CRAWLER_PAGE_POOL),
+    // Never wider than one pass's pages: a wider shuffle is the variant review 2 measured losing coverage.
+    pagePoolLookahead: (() => {
+      const n = posInt(env.CRAWLER_PAGE_POOL_LOOKAHEAD, backfillPagesPerRun);
+      if (n <= backfillPagesPerRun) return n;
+      logger.warn('[CRAWLER] CRAWLER_PAGE_POOL_LOOKAHEAD lowered to CRAWLER_BACKFILL_PAGES_PER_RUN (a wider shuffle loses coverage)', { requested: n, applied: backfillPagesPerRun });
+      return backfillPagesPerRun;
+    })(),
+    // posInt: 0 would distrust every mark at once, so it keeps the default rather than re-walking every pass.
+    pagePoolVisitedTtlMs: posInt(env.CRAWLER_PAGE_POOL_VISITED_TTL_H, DEFAULTS.pagePoolVisitedTtlH) * 60 * 60 * 1000,
   };
 }

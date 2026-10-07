@@ -57,7 +57,10 @@
  *     `hostClock: {mode, hosts: [{host, floorMs, clocked, sends60m: {queue, image}, minGapMs60m,
  *     underFloor60m, lastSendAt}]}` (the shared host clock's send-time observer: per store host, the
  *     trailing hour of requests measured at the instant each was handed to its transport — with the
- *     clock off too, so it is the live negative control for SCRAPE_HOST_CLOCK).
+ *     clock off too, so it is the live negative control for SCRAPE_HOST_CLOCK), and
+ *     `maxPagesGuard: {mode, stores: [{siteId, maxPagesGuarded60m, lastGuardedAt}]}` (the engine's
+ *     SCRAPE_CATALOG_MAX_PAGES_GUARD: per store, the /catalog pages above the profile's maxPages it answered
+ *     exhausted WITHOUT a store fetch in the trailing hour).
  *     A browser-pool-health failure still degrades to 500, now carrying { status:'degraded',
  *     challengeCooldowns, cfCookies, error } — both lists survive (neither lister can throw).
  */
@@ -75,6 +78,7 @@ import type { QueueStoreView } from '../services/scrapeQueue.js';
 import type { HandsOffView } from '../services/extractionRegistry.js';
 import type { PluginsView } from '../services/pluginBootstrap.js';
 import type { HostClockView } from '../services/hostClock.js';
+import type { MaxPagesGuardView } from '../services/maxPagesGuard.js';
 
 export interface HealthDeps {
   /** The service version (package.json). */
@@ -171,6 +175,12 @@ export interface HealthDeps {
    * Counters only, under 1 KB per host; never throws.
    */
   getHostClock: () => HostClockView;
+  /**
+   * The engine's maxPages guard (getMaxPagesGuard().view(now), QB-U24): `mode` (off | all | stores) and, per
+   * store, `{siteId, maxPagesGuarded60m, lastGuardedAt}` — the listing pages above the profile's maxPages
+   * answered exhausted without a store fetch in the trailing hour. Counters only; never throws.
+   */
+  getMaxPagesGuard: () => MaxPagesGuardView;
 }
 
 export function createHealthRoutes(deps: HealthDeps): Router {
@@ -213,6 +223,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         handsOff: deps.listHandsOff(),
         plugins: deps.listPlugins(),
         hostClock: deps.getHostClock(),
+        maxPagesGuard: deps.getMaxPagesGuard(),
         timestamp: new Date().toISOString(),
       });
     } catch (error) {
@@ -241,6 +252,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         plugins: deps.listPlugins(),
         // Whether MFC is being sent to under its floor matters most when the pod is sick, too.
         hostClock: deps.getHostClock(),
+        maxPagesGuard: deps.getMaxPagesGuard(),
         error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
