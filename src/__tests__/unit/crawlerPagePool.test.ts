@@ -793,6 +793,35 @@ describe('drift from a pass whose backfill never saved is carried to the next pa
     expect(s.ledgers.files.get('orzgk')!.recent.pagePool).toEqual({ visited: [[26, 30, iso(T0 - HOUR_MS)]] });
   });
 
+  /*
+   * A carried drift is persisted data, so a corrupt or hand-edited ledger can hold any integer (QB-U24 review
+   * i3). A drift wider than the run only forgets the run, so the pass must finish at once with the picks a
+   * drift of exactly the run's five pages gives. A delete counter turns the old unbounded drop (about 4 ns a
+   * page, so years at 1e300) into a fast failure instead of a hung suite.
+   */
+  it('a huge carried drift (ids 1e300 on 1-id pages) forgets only the run: the pass finishes with the picks of a 5-page drift', async () => {
+    const picks = async (drift: { ids: number; pageSize: number }) => {
+      const s = setup();
+      s.ledgers.files.get('orzgk')!.recent.pagePool = { visited: [[22, 26, iso(T0 - HOUR_MS)]], drift };
+      const del = Map.prototype.delete;
+      let deletes = 0;
+      const spy = jest.spyOn(Map.prototype, 'delete').mockImplementation(function (this: Map<unknown, unknown>, key: unknown) {
+        if (++deletes > 100_000) throw new Error('dropExposedMarks ran past the visited run');
+        return del.call(this, key);
+      });
+      try {
+        const p = await runPass(mkCfg(POOLED), s.engine, s.ledgers, T0, 5);
+        return { gets: p.backfillGets(), pool: s.ledgers.files.get('orzgk')!.recent.pagePool };
+      } finally {
+        spy.mockRestore();
+      }
+    };
+    const huge = await picks({ ids: 1e300, pageSize: 1 });
+    const fivePages = await picks({ ids: 50, pageSize: 10 });
+    expect(sorted(huge.gets)).toEqual([20, 21, 22, 23, 24]);
+    expect(huge).toEqual(fivePages);
+  });
+
   it('a recent read that meets no new ids leaves the pool state as it was (no zero drift written)', async () => {
     const s = setup();
     const before = structuredClone(s.ledgers.files.get('orzgk')!.recent.pagePool);

@@ -180,6 +180,20 @@ describe('dropExposedMarks (after listing drift)', () => {
     dropExposedMarks(atCursor, 10, 3);
     expect([...atCursor.keys()]).toEqual([10, 11, 12]);
   });
+
+  it('a depth far past the run (a corrupt carried drift, e.g. 1e300) forgets the run and stops at its top', () => {
+    let deletes = 0;
+    class Counting<K, V> extends Map<K, V> {
+      delete(key: K): boolean {
+        if (++deletes > 100) throw new Error('deleted past the visited run');
+        return super.delete(key);
+      }
+    }
+    const visited = new Counting(v(12, 13, 17, 30, 31).entries());
+    dropExposedMarks(visited, 10, 1e300);
+    expect([...visited.keys()]).toEqual([]);
+    expect(deletes).toBe(5);
+  });
 });
 
 describe('writeVisited', () => {
