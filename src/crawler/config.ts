@@ -330,7 +330,7 @@ const parsePagePool = (raw: string | undefined): 'all' | string[] => {
   if (keyword === 'all') return 'all';
   if (keyword === '' || keyword === 'off') return [];
   const out: string[] = [];
-  for (const entry of csv(raw ?? '')) {
+  for (const entry of csv(raw as string)) {
     if (!SAFE_SITE_ID.test(entry) || ['all', 'off'].includes(entry.toLowerCase())) {
       logger.warn('[CRAWLER] CRAWLER_PAGE_POOL entry ignored (expected `all`, `off`, or a csv of siteIds)', { entry });
       continue;

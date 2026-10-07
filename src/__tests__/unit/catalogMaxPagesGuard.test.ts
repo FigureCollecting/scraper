@@ -129,11 +129,12 @@ const engineApp = () => {
 const EXHAUSTED = (siteId: string, page: number, url: string) => ({ siteId, page, url, items: [], collectUrls: [], hasMore: false, count: 0 });
 
 describe('SCRAPE_CATALOG_MAX_PAGES_GUARD scope', () => {
-  it.each([undefined, '', 'off', ' OFF '])('%p = off: guards nothing', (raw) => {
+  it.each([undefined, '', 'off', ' OFF '])('%p = off: guards nothing, warns nothing', (raw) => {
     const g = new MaxPagesGuard(raw);
     expect(g.covers('mfc')).toBe(false);
     expect(g.view(T0)).toEqual({ mode: 'off', stores: [] });
     expect(g.describe()).toContain('off');
+    expect(g.warnings()).toEqual([]);
   });
 
   it('all: every store', () => {
@@ -145,14 +146,14 @@ describe('SCRAPE_CATALOG_MAX_PAGES_GUARD scope', () => {
   });
 
   it('a csv: only those stores; a bad entry or a keyword inside the list is ignored with a WARN', () => {
-    const g = new MaxPagesGuard('mfc, three,mfc,bad/id,all');
+    const g = new MaxPagesGuard('mfc, three,,mfc,bad/id,all,');
     expect(g.covers('mfc')).toBe(true);
     expect(g.covers('three')).toBe(true);
     expect(g.covers('nomax')).toBe(false);
     expect(g.warnings()).toHaveLength(2);
     expect(g.warnings()[0]).toContain('bad/id');
     expect(g.warnings()[1]).toContain('"all"');
-    expect(g.describe()).toContain('mfc, three');
+    expect(g.describe()).toBe(`[CATALOG] ${MAX_PAGES_GUARD_ENV}=mfc, three: a page above the profile's maxPages is answered exhausted without a store fetch`);
     expect(new MaxPagesGuard('bad/id').view(T0).mode).toBe('off');
   });
 
@@ -236,7 +237,7 @@ describe('GET /catalog through the real route', () => {
 
   it('guard on: page 4 answers exhausted with ZERO store fetches; pages 1-3 are unchanged', async () => {
     const off = engineApp();
-    const offBodies = [];
+    const offBodies: unknown[] = [];
     for (const p of [1, 2, 3]) offBodies.push((await request(off.app).get(`/catalog?store=three&page=${p}`)).body);
 
     setMaxPagesGuard(new MaxPagesGuard('three'));

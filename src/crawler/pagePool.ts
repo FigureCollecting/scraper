@@ -36,10 +36,10 @@ export interface LedgerPagePool {
 export const MAX_MARK_SPAN = 1000;
 
 /**
- * The largest set whose whole order is searched for (2^n states per history pair). L defaults to the
- * pages per run (5); a larger set falls back to POOL-SELECT's step-by-step guarantee.
+ * The largest set whose whole order is searched for (at most 7! orders per candidate, a few ms). L is the
+ * pages per run (5 in production); a larger set falls back to POOL-SELECT's step-by-step guarantee.
  */
-const MAX_ORDER_SEARCH = 12;
+const MAX_ORDER_SEARCH = 8;
 
 const isPositiveInt = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v > 0;
 
@@ -125,21 +125,10 @@ export function writeVisited(visited: ReadonlyMap<number, number>, cursor: numbe
 
 /** Whether `pages` can still be fetched, in some order, without breaking anti-sequence after `history`. */
 function canOrder(pages: readonly number[], history: History): boolean {
-  const memo = new Map<string, boolean>();
-  const go = (left: number, prev: number | undefined, prev2: number | undefined): boolean => {
-    if (left === 0) return true;
-    const key = `${left}|${prev}|${prev2}`;
-    const known = memo.get(key);
-    if (known !== undefined) return known;
-    let ok = false;
-    for (let i = 0; i < pages.length && !ok; i++) {
-      const bit = 1 << i;
-      if ((left & bit) !== 0 && passesAntiSequence(pages[i], { prev, prev2 }, DEFAULT_PAGE_PARAMS)) ok = go(left & ~bit, pages[i], prev);
-    }
-    memo.set(key, ok);
-    return ok;
-  };
-  return go((1 << pages.length) - 1, history.prev, history.prev2);
+  if (pages.length === 0) return true;
+  return pages.some(
+    (p, i) => passesAntiSequence(p, history, DEFAULT_PAGE_PARAMS) && canOrder([...pages.slice(0, i), ...pages.slice(i + 1)], { prev: p, prev2: history.prev }),
+  );
 }
 
 const asCandidate = (page: number): Candidate => ({ key: String(page), tier: 0, recency: -page, numId: page });

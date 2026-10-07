@@ -1355,7 +1355,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     // writes one) and bounds nothing; it is cleared at the first save, as a real page clears it today.
     let priorExhausted = b.exhaustedAt !== undefined;
     let priorCandidate = b.exhaustCandidateCursor !== undefined && b.exhaustCandidateCursor >= start ? b.exhaustCandidateCursor : undefined;
-    let clearEnd = b.exhaustCandidateCursor !== undefined && priorCandidate === undefined && !priorExhausted;
+    let clearEnd = b.exhaustCandidateCursor !== undefined && priorCandidate === undefined;
     let bound = priorExhausted ? start : priorCandidate;
     // The lowest page this pass saw an exhaustion signal on (every later pick is below it).
     let seenEnd: number | undefined;
@@ -1372,7 +1372,9 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
         b.exhaustedAt = iso();
         logger.info('[CRAWLER] backfill exhausted — confirmed at the same page', { siteId: st.siteId, page: seenEnd });
       } else if (seenEnd !== undefined) {
-        if (b.exhaustCandidateCursor !== seenEnd || b.exhaustedAt !== undefined) {
+        // (A confirmed end is never pending here: its re-check reads the cursor page alone, and that page
+        // either confirms it again or is real, which clears it before any later signal.)
+        if (b.exhaustCandidateCursor !== seenEnd) {
           clearExhaustion(ledger);
           b.exhaustCandidateCursor = seenEnd;
           b.exhaustCandidateAt = iso();

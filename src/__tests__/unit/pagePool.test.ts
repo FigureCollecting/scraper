@@ -72,10 +72,12 @@ describe('readVisited', () => {
 
   it.each([
     ['not an object', 'x'],
+    ['null', null],
     ['an array', [[12, 12, ago(1)]]],
     ['no visited list', {}],
     ['visited not a list', { visited: 'x' }],
     ['a mark that is not a triple', { visited: [[12, 12]] }],
+    ['a mark with a fourth element', { visited: [[12, 12, ago(1), 'x']] }],
     ['a page that is not a positive integer', { visited: [[0, 3, ago(1)]] }],
     ['a fractional page', { visited: [[2.5, 3, ago(1)]] }],
     ['to below from', { visited: [[5, 4, ago(1)]] }],
@@ -165,6 +167,10 @@ describe('writeVisited', () => {
     });
   });
 
+  it('the cursor page itself is never written (the cursor is the lowest UNVISITED page)', () => {
+    expect(writeVisited(new Map([[10, NOW], [12, NOW]]), 10)).toEqual({ visited: [[12, 12, ago(0)]] });
+  });
+
   it('nothing above the cursor: an empty list', () => {
     expect(writeVisited(new Map([[3, NOW]]), 10)).toEqual({ visited: [] });
   });
@@ -190,6 +196,12 @@ describe('nextPage (POOL-SELECT page params)', () => {
         bad += violations(order);
       }
     }
+    expect(bad).toBe(0);
+  });
+
+  it('an eight-page set (the largest searched whole) is ordered without a violation, for every seed', () => {
+    let bad = 0;
+    for (let seed = 0; seed < 1000; seed++) bad += violations(orderOf([40, 41, 42, 43, 44, 45, 46, 47], seed));
     expect(bad).toBe(0);
   });
 
@@ -248,8 +260,10 @@ describe('loadCrawlerConfig — the page pool knobs', () => {
     ['empty', { CRAWLER_PAGE_POOL: '' }],
     ['off', { CRAWLER_PAGE_POOL: 'off' }],
     ['OFF padded', { CRAWLER_PAGE_POOL: '  OFF ' }],
-  ])('CRAWLER_PAGE_POOL %s = off (no store pooled)', (_l, env) => {
+  ])('CRAWLER_PAGE_POOL %s = off (no store pooled), with no WARN', (_l, env) => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
     expect(load(env).pagePool).toEqual([]);
+    expect(warn).not.toHaveBeenCalled();
   });
 
   it('CRAWLER_PAGE_POOL=all pools every listing store', () => {

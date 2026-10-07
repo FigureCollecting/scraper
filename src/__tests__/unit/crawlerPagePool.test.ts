@@ -168,8 +168,9 @@ describe('a pooled backfill pass is a permutation of the sequential one', () => 
     expect(firsts.get(10) ?? 0).toBeGreaterThan(firsts.get(14) ?? 0);
   });
 
-  it('the same seed replays the same picks; the seed is logged once per pass', async () => {
+  it('the same seed replays the same picks; the seed is logged once per pass; `all` warns nothing', async () => {
     const info = jest.spyOn(logger, 'info');
+    const warn = jest.spyOn(logger, 'warn');
     const picks = async (seed: number) => {
       const engine = makePagedEngine({ orzgk: catalog(30) });
       return (await runPass(mkCfg(POOLED), engine, createMemoryLedgerStore({ orzgk: ledgerAt(engine.items('orzgk'), 10) }), T0, seed)).backfillGets();
@@ -178,15 +179,22 @@ describe('a pooled backfill pass is a permutation of the sequential one', () => 
     const poolLines = info.mock.calls.filter((c) => String(c[0]).includes('page pool'));
     expect(poolLines).toHaveLength(2);
     expect(poolLines[0][1]).toEqual(expect.objectContaining({ seed: 99, stores: 'all', lookahead: 5 }));
+    expect(warn.mock.calls.filter((c) => String(c[0]).includes('CRAWLER_PAGE_POOL'))).toEqual([]);
   });
 
-  it('an unpooled store logs no pool line and its summary carries no pagePicks', async () => {
+  it('an unpooled store logs no pool line and its summary carries no pagePicks; a pooled name not crawled is WARNed', async () => {
     const info = jest.spyOn(logger, 'info');
+    const warn = jest.spyOn(logger, 'warn');
     const engine = makePagedEngine({ orzgk: catalog(30) });
     const p = await runPass(mkCfg({ pagePool: ['hlj'] }), engine, createMemoryLedgerStore({ orzgk: ledgerAt(engine.items('orzgk'), 10) }), T0);
     expect(p.backfillGets()).toEqual([10, 11, 12, 13, 14]);
     expect('pagePicks' in p.store()).toBe(false);
     expect(info.mock.calls.filter((c) => String(c[0]).includes('page pool'))).toHaveLength(0);
+    const poolWarns = warn.mock.calls.filter((c) => String(c[0]).includes('CRAWLER_PAGE_POOL'));
+    expect(poolWarns).toEqual([[expect.stringContaining('not being crawled'), { siteId: 'hlj' }]]);
+    warn.mockClear();
+    await runPass(mkCfg({ pagePool: ['orzgk'] }), makePagedEngine({ orzgk: catalog(30) }), createMemoryLedgerStore(), T0);
+    expect(warn.mock.calls.filter((c) => String(c[0]).includes('CRAWLER_PAGE_POOL'))).toEqual([]);
   });
 
   it('a named store is pooled and another is not, in the same pass', async () => {
@@ -371,6 +379,96 @@ describe('stop rules', () => {
       expect((await runPass(mkCfg(POOLED), engine, ledgers, T0 + 3 * HOUR_MS, seed + 3)).backfillGets()).toEqual([]);
     }
     expect(checked).toBeGreaterThan(10);
+  });
+});
+
+describe('edges of the stop rules', () => {
+  it('the last page cut short by the cap is NOT an end candidate: it stays unvisited and is read again', async () => {
+    // Page 12 is the catalogue's last (hasMore false) and holds ten new ids; the cap allows four.
+    const engine = makePagedEngine({ orzgk: catalog(12) });
+    const ledgers = createMemoryLedgerStore({ orzgk: ledgerAt(engine.items('orzgk'), 12) });
+    const p1 = await runPass(mkCfg({ ...POOLED, maxEnqueuePerStore: 4 }), engine, ledgers, T0, 1);
+    expect(p1.backfillGets()).toEqual([12]);
+    expect(p1.store().exhaustCandidate).toBe(false);
+    expect(p1.store().backfillCursor).toBe(12);
+    const p2 = await runPass(mkCfg({ ...POOLED, maxEnqueuePerStore: 100 }), engine, ledgers, T0 + HOUR_MS, 2);
+    expect(p2.backfillGets()).toContain(12);
+    expect(p2.store().exhaustCandidate).toBe(true);
+    expect(p2.store().backfillCursor).toBe(12);
+  });
+
+  it('a real page at the end that is cut short clears the end, stays unvisited and ends the pass', async () => {
+    // Five known ids arrived on top, so page 12 now holds five known ids and the first five of the old page
+    // 12; the first of those is refused transiently, which stops the store mid-page.
+    let firstNew = '';
+    const engine = makePagedEngine({ orzgk: catalog(12) }, { ingest: (url) => (url === itemUrl('orzgk', firstNew) ? { status: 503 } : undefined) });
+    firstNew = engine.items('orzgk')[110];
+    const l = ledgerAt(engine.items('orzgk'), 12, { exhaustCandidateCursor: 12, exhaustCandidateAt: iso(T0 - HOUR_MS) });
+    const extra = idRun('n', 90_000, 5);
+    engine.prepend('orzgk', extra);
+    for (const id of extra) l.enqueued[id] = { at: iso(T0 - DAY_MS), collectUrl: itemUrl('orzgk', id) };
+    const ledgers = createMemoryLedgerStore({ orzgk: l });
+    const p = await runPass(mkCfg(POOLED), engine, ledgers, T0, 1);
+    expect(p.backfillGets()).toEqual([12]);
+    expect(p.store().exhaustCandidate).toBe(false);
+    const saved = ledgers.files.get('orzgk')!;
+    expect(saved.backfill.cursor).toBe(12);
+    expect(saved.recent.pagePool).toEqual({ visited: [] });
+  });
+
+  it('a due re-check cut short by the cap keeps the confirmed end as it was (the sequential rule)', async () => {
+    // Page 12 is the last page (hasMore false) and its ten ids are new to the ledger; the cap allows four.
+    const exhaustedAt = iso(T0 - 8 * DAY_MS);
+    const engine = makePagedEngine({ orzgk: catalog(12) });
+    const ledgers = createMemoryLedgerStore({ orzgk: ledgerAt(engine.items('orzgk'), 12, { exhaustedAt }) });
+    const p = await runPass(mkCfg({ ...POOLED, maxEnqueuePerStore: 4 }), engine, ledgers, T0, 1);
+    expect(p.backfillGets()).toEqual([12]);
+    expect(p.store().exhausted).toBe(true);
+    expect(ledgers.files.get('orzgk')!.backfill.exhaustedAt).toBe(exhaustedAt);
+    expect(ledgers.files.get('orzgk')!.backfill.cursor).toBe(12);
+  });
+
+  it('a candidate BELOW the cursor is stale: it bounds nothing and is cleared at the first save', async () => {
+    const engine = makePagedEngine({ orzgk: catalog(30) });
+    const ledgers = createMemoryLedgerStore({ orzgk: ledgerAt(engine.items('orzgk'), 10, { exhaustCandidateCursor: 4, exhaustCandidateAt: iso(T0 - DAY_MS) }) });
+    const p = await runPass(mkCfg(POOLED), engine, ledgers, T0, 1);
+    expect(sorted(p.backfillGets())).toEqual([10, 11, 12, 13, 14]);
+    expect(p.store().exhaustCandidate).toBe(false);
+    expect(ledgers.files.get('orzgk')!.backfill.exhaustCandidateAt).toBeUndefined();
+  });
+
+  it('a candidate AT the cursor bounds the set to that page: it is read first, and found real the pass walks on', async () => {
+    const engine = makePagedEngine({ orzgk: catalog(30) });
+    const ledgers = createMemoryLedgerStore({ orzgk: ledgerAt(engine.items('orzgk'), 10, { exhaustCandidateCursor: 10, exhaustCandidateAt: iso(T0 - HOUR_MS) }) });
+    const p = await runPass(mkCfg(POOLED), engine, ledgers, T0, 1);
+    expect(p.backfillGets()[0]).toBe(10);
+    expect(sorted(p.backfillGets())).toEqual([10, 11, 12, 13, 14]);
+    expect(p.store().exhaustCandidate).toBe(false);
+  });
+
+  it('a failed ledger save stops the store after that page', async () => {
+    const engine = makePagedEngine({ orzgk: catalog(30) });
+    const inner = createMemoryLedgerStore({ orzgk: ledgerAt(engine.items('orzgk'), 10) });
+    let saves = 0;
+    const failing: LedgerStore = { load: (id) => inner.load(id), save: async (l) => { if (++saves > 1) throw new Error('disk full'); await inner.save(l); } };
+    const p = await runPass(mkCfg(POOLED), engine, failing, T0, 1);
+    // The recent read saved once; the first backfill page's save failed and stopped the store.
+    expect(p.backfillGets()).toHaveLength(1);
+    expect(p.store().errors).toBe(1);
+  });
+
+  it('with no injected seed each pass draws a fresh 32-bit crypto seed and logs it', async () => {
+    const info = jest.spyOn(logger, 'info');
+    const engine = makePagedEngine({ orzgk: catalog(30) });
+    const clock = fakeClock(T0);
+    for (let i = 0; i < 2; i++) {
+      await runCrawlerPass(mkCfg(POOLED), { fetch: engine.fetch, ledgerStore: createMemoryLedgerStore({ orzgk: ledgerAt(engine.items('orzgk'), 10) }), listsStore: createMemoryListsStateStore(), now: clock.now, sleep: clock.sleep });
+    }
+    const seeds = info.mock.calls.filter((c) => String(c[0]).includes('page pool')).map((c) => (c[1] as { seed: number }).seed);
+    expect(seeds).toHaveLength(2);
+    for (const seed of seeds) expect(Number.isInteger(seed) && seed >= 0 && seed < 2 ** 32).toBe(true);
+    // Two draws from 2^32 collide with probability 2^-32.
+    expect(seeds[0]).not.toBe(seeds[1]);
   });
 });
 
