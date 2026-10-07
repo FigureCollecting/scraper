@@ -718,3 +718,115 @@ describe('listing drift (k ids prepended per pass)', () => {
     });
   });
 });
+
+/*
+ * Drift seen by a pass whose backfill never saved (QB-U24 review i2). The drift a recent read sees must reach
+ * the marks even when that pass's backfill never runs or never saves: a stop or a cap after the recent step,
+ * a pass with no backfill phase, or a first backfill pick that fails. Otherwise the next pass counts only the
+ * ids that arrived since, and the unread ids of an unvisited page slide onto a page still marked visited.
+ */
+describe('drift from a pass whose backfill never saved is carried to the next pass', () => {
+  const cooldown: EngineReply = { status: 503, body: { error: 'cooldown', remainingMs: 60_000 } };
+
+  /** cursor 20; pages 22-26 visited an hour ago; page 21 unvisited (the run sits on it). 10-id pages. */
+  const setup = () => {
+    let fail: ((page: number) => EngineReply | undefined) | undefined;
+    const engine = makePagedEngine({ orzgk: catalog(60) }, { reply: (_s, page) => fail?.(page) });
+    const l = ledgerAt(engine.items('orzgk'), 20);
+    l.recent.pagePool = { visited: [[22, 26, iso(T0 - HOUR_MS)]] };
+    const ledgers = createMemoryLedgerStore({ orzgk: l });
+    return { engine, ledgers, failWith: (f?: (page: number) => EngineReply | undefined) => { fail = f; } };
+  };
+
+  /** Pass A: 10 new ids on top (one page), then the pass ends before its backfill saves anything. */
+  const passA: Array<[string, Partial<CrawlerConfig>, ((page: number) => EngineReply | undefined) | undefined]> = [
+    ['a cooldown on recent page 2', {}, (page) => (page === 2 ? cooldown : undefined)],
+    ['a 500 on recent page 2', {}, (page) => (page === 2 ? { status: 500, body: { error: 'boom' } } : undefined)],
+    // (the 5 ids the cap left are met again by pass B and counted twice: an over-count re-reads more, never less)
+    ['the per-store cap reached by the recent read', { maxEnqueuePerStore: 5 }, undefined],
+    ['a pass with no backfill phase', { phases: ['recent'] }, undefined],
+    ['a cooldown on the first backfill pick', {}, (page) => (page >= 20 ? cooldown : undefined)],
+  ];
+
+  it.each(passA)('%s: the next pass re-reads ceil((10 + 5) / 10) = 2 bottom pages of the run, not 1', async (_name, overA, fail) => {
+    const s = setup();
+    s.engine.prepend('orzgk', idRun('n', 900_000, 10));
+    s.failWith(fail);
+    const a = await runPass(mkCfg({ ...POOLED, ...overA }), s.engine, s.ledgers, T0, 11);
+    s.failWith(undefined);
+    expect(a.store().recentNew).toBe(10);
+    expect(a.store().backfillPages).toBe(0);
+    s.engine.prepend('orzgk', idRun('n', 900_010, 5));
+    const b = await runPass(mkCfg(POOLED), s.engine, s.ledgers, T0 + HOUR_MS, 12);
+    expect(sorted(b.backfillGets())).toEqual([20, 21, 22, 23, 27]);
+  });
+
+  it('with no recent read in the next pass, its unknown page is added to the carried drift: 1 + 1 pages re-read', async () => {
+    const s = setup();
+    s.engine.prepend('orzgk', idRun('n', 900_000, 10));
+    await runPass(mkCfg({ ...POOLED, phases: ['recent'] }), s.engine, s.ledgers, T0, 11);
+    const b = await runPass(mkCfg({ ...POOLED, phases: ['backfill'] }), s.engine, s.ledgers, T0 + HOUR_MS, 12);
+    expect(sorted(b.backfillGets())).toEqual([20, 21, 22, 23, 27]);
+  });
+
+  it('the carried drift is spent once: a backfill that saved drops nothing more on a pass with no new ids', async () => {
+    const s = setup();
+    s.engine.prepend('orzgk', idRun('n', 900_000, 10));
+    await runPass(mkCfg({ ...POOLED, phases: ['recent'] }), s.engine, s.ledgers, T0, 11);
+    // Pass B: no new ids; the carried page (22) is dropped and the two lowest unvisited pages read.
+    const b = await runPass(mkCfg({ ...POOLED, pagePoolLookahead: 2 }), s.engine, s.ledgers, T0 + HOUR_MS, 12);
+    expect(sorted(b.backfillGets())).toEqual([20, 21]);
+    // Pass C: no new ids, so nothing is dropped: 23-26 stay visited.
+    const c = await runPass(mkCfg({ ...POOLED, pagePoolLookahead: 2 }), s.engine, s.ledgers, T0 + 2 * HOUR_MS, 13);
+    expect(sorted(c.backfillGets())).toEqual([22, 27]);
+  });
+
+  it('an unpooled store writes no page pool state in a pass whose backfill never ran', async () => {
+    const s = setup();
+    delete s.ledgers.files.get('orzgk')!.recent.pagePool;
+    s.engine.prepend('orzgk', idRun('n', 900_000, 10));
+    await runPass(mkCfg({ phases: ['recent'] }), s.engine, s.ledgers, T0, 11);
+    expect(s.ledgers.files.get('orzgk')!.recent.pagePool).toBeUndefined();
+  });
+
+  /*
+   * The challenger's two-sided case (review i2), end to end: page 21 was never read, pages 22-26 were; 15 ids
+   * of drift in all. (a) all 15 in one pass; (b) 10 in a pass stopped by a cooldown on the recent read's page
+   * 2, then 5. Walked to the end, every id of page 21 must be POSTed, pooled or not.
+   */
+  describe('the challenger\'s two-sided case', () => {
+    const walk = async (pool: boolean, split: boolean) => {
+      const s = setup();
+      const page21 = s.engine.items('orzgk').slice(200, 210);
+      // pages 22-26 were fully attempted by an earlier cut-short pass (their ids are known)
+      for (const id of s.engine.items('orzgk').slice(210, 260)) s.ledgers.files.get('orzgk')!.enqueued[id] = { at: iso(T0 - 2 * HOUR_MS), collectUrl: itemUrl('orzgk', id) };
+      s.ledgers.files.get('orzgk')!.backfill.cursor = 21;
+      s.ledgers.files.get('orzgk')!.recent.pagePool = { visited: [[22, 26, iso(T0 - 2 * HOUR_MS)]] };
+      const cfg = mkCfg(pool ? POOLED : {});
+      let from = 0;
+      if (split) {
+        s.engine.prepend('orzgk', idRun('n', 900_000, 10));
+        s.failWith((page) => (page === 2 ? cooldown : undefined));
+        const a = await runPass(cfg, s.engine, s.ledgers, T0, 49);
+        s.failWith(undefined);
+        expect(a.store().recentNew).toBe(10);
+        expect(a.store().backfillPages).toBe(0);
+        s.engine.prepend('orzgk', idRun('n', 900_010, 5));
+        from = 1;
+      } else {
+        s.engine.prepend('orzgk', idRun('n', 900_000, 15));
+      }
+      for (let i = 0; i < 20; i++) await runPass(cfg, s.engine, s.ledgers, T0 + (from + i) * HOUR_MS, 50 + i);
+      const got = new Set(s.engine.posted('orzgk').map((u) => u.slice(u.lastIndexOf('/') + 1)));
+      return page21.filter((id) => !got.has(id));
+    };
+
+    it.each([false, true])('pooled=%p (a) 15 ids in ONE pass: every id of page 21 is POSTed', async (pool) => {
+      expect(await walk(pool, false)).toEqual([]);
+    });
+
+    it.each([false, true])('pooled=%p (b) 10 ids in a pass stopped by a recent-read cooldown, then 5: every id of page 21 is POSTed', async (pool) => {
+      expect(await walk(pool, true)).toEqual([]);
+    });
+  });
+});
