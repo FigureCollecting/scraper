@@ -26,6 +26,27 @@
  *
  * Honest limit (design.host_clock.honest_limit): the recorded instant is the transport's invocation;
  * awaits inside the transport (an Impit session, a browser page from the pool) come after it.
+ *
+ * EVERY OUTBOUND SITE that can reach a store's main host from this process, and its caller name:
+ *   queue           scrapeQueue.processViaIngest -> capturingFetch (impersonate | http | browser)  [QB-U30a]
+ *   image           paceImageBytesByHost (store main host; a CDN or static host keeps its limiter) [QB-U30a]
+ *   catalogListing  assembleCatalog.catalog (GET /catalog?store=&page=)
+ *   catalogSeed     assembleCatalog.seed (GET /catalog?seed=)
+ *   catalogRotating assembleCatalog.rotatingSeed (GET /catalog?list=)
+ *   resolve         assembleResolve, each id's detail fetch (POST /resolve)
+ *   scrape          routes/scraper.ts POST /scrape -> scrapeGeneric
+ *   lookup          assembleLookup, each bySearch store fetch (POST /lookup); detail plans fetch nothing
+ *   fetchBody       buildExtractContext: ctx.scraping.fetchBody and the scrapePage / scrapePageStealth
+ *                   passthroughs (the queue's and /resolve's extraction; the crawl driver's
+ *                   wrapFetchBodyWithLimiter wraps such a context and is not composed in index.ts)
+ *   sessionPrime    every request after the first of one transport call: impit's prime / re-prime and
+ *                   the target after it, the browser lane's target after a prime navigation, and a
+ *                   relaunched gated browser's proof navigation
+ *   pluginRoute     every page.goto of the scraping service handed to plugins (buildEngineServices):
+ *                   the rulesets' /scrape/mfc, /sync/validate-cookies, /sync/export-csv and /sync list
+ *                   workflows (withPage), and rulesets that hold it (amiami's API client). withBrowser
+ *                   hands a plugin a whole browser and is NOT clocked (no ruleset calls it).
+ * GET /catalog?range= synthesises its window and fetches nothing.
  */
 import { getHostClock, type HostClock, type HostClockCaller, type HostClockLatencyKind } from './hostClock.js';
 
@@ -119,6 +140,7 @@ export async function sendOnHostClock<T>(
     const wait = clock.sendWait(host, slot, at, floor);
     if (wait === null) {
       slot = clock.reserve(host, at, floor);
+      await sleep(Math.max(0, slot - at));
       continue;
     }
     if (wait > 0) {

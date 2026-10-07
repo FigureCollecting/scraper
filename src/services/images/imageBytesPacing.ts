@@ -140,6 +140,7 @@ export function paceImageBytesByHost(
       const wait = hostClock.sendWait(host, slot, at, floor);
       if (wait === null) {
         slot = hostClock.reserve(host, at, floor);
+        await sleep(Math.max(0, slot - at));
         continue;
       }
       if (wait === 0) {
