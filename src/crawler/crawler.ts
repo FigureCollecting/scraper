@@ -535,6 +535,8 @@ interface StoreState {
    * on top, so every listing page has slid down since the last pass. Read by the page pool (QB-U24) only.
    */
   recentUnseen: number;
+  /** How many items the recent read's page 1 held (0 = not read): the listing's page size, for the page pool. */
+  recentPageSize: number;
 }
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -789,6 +791,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     passKind: null,
     listFetchIssued: false,
     recentUnseen: 0,
+    recentPageSize: 0,
   }));
 
   for (const st of states) if (isPooled(st.siteId)) st.summary.pagePicks = [];
@@ -1221,6 +1224,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       st.summary.pagesFetched++;
       st.summary.recentPages++;
       st.deepestRecentPage = page;
+      if (page === 1) st.recentPageSize = out.items.length;
       const { newCount, allAttempted } = await processPage(st, out.items, 'recent');
       st.summary.recentNew += newCount;
       ledger.recent.lastRunAt = iso();
@@ -1328,13 +1332,15 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
    *     only on a LATER run that sees it again once every page below it is visited (the two-run rule);
    *   - a real page AT the end proves the end moved: the end is cleared and the pass refills with the lowest
    *     unvisited pages, up to L pages in all, as the sequential walk would walk on.
-   * DRIFT. New ids on top push every id down, so the unread tail of an unvisited page slides onto the visited
-   * page above it, and a mark trusted there would skip those ids for good (the cursor later walks past the
-   * mark). Measured (QB-U24 report: 20-id pages, a 90-POST cap, 2-15 ids a pass): the plan's marks-until-TTL
-   * missed 1.1-4.7 % of the catalogue for good. So when the listing may have moved since the last pass (the
-   * recent read met ids the ledger did not hold, or did not run), the bottom page of every visited run that
-   * sits on an unvisited page is read again (pagePool.dropExposedMarks); the walk then misses nothing the
-   * sequential walk catches, at about one extra page per such run.
+   * DRIFT. k new ids on top push every id down k places, so the unread ids of an unvisited page slide onto the
+   * visited pages above it, and a mark trusted there would skip those ids for good (the cursor later walks
+   * past the mark). Measured (QB-U24 report: 20-id pages, a 90-POST cap, 2-15 ids a pass): the plan's
+   * marks-until-TTL missed 1.1-4.7 % of the catalogue for good. So the bottom ceil(k / page size) pages of
+   * every visited run that sits on an unvisited page are read again (pagePool.dropExposedMarks), with k = the
+   * ids the recent read met that the ledger did not hold and the page size = its page 1; with no recent read,
+   * one page. Tested to the catalogue end (k = 2-45 a pass, 20-id pages, a 90-POST cap): pooled coverage
+   * within 1 pp of sequential. Not covered: drift the recent read cannot see (items LEAVING the listing; more
+   * new ids than the recent read's pages hold; drift in a pass with no recent read beyond one page).
    * So with L = backfillPagesPerRun a pass fetches a permutation of the sequential pass's pages, except that a
    * cut-short pass has fully attempted the same NUMBER of pages but not necessarily the lowest ones (those
    * stay as visited marks above the cursor), and that a pass meeting the end for the first time may also ask
@@ -1348,9 +1354,12 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     const read = readVisited(ledger.recent.pagePool, start, now(), poolTtlMs);
     if (read.malformed) logger.warn('[CRAWLER] page pool state malformed — ignored and rewritten', { siteId: st.siteId });
     const visited = read.visited;
-    // DRIFT: when the listing may have moved since the last pass (the recent read met ids the ledger did not
-    // hold, or there was no recent read), re-read the bottom page of every visited run above an unvisited page.
-    if (st.summary.recentPages === 0 || st.recentUnseen > 0) dropExposedMarks(visited, start, 1);
+    // DRIFT: k ids the recent read met that the ledger did not hold moved every listing id down k places
+    // since the last pass, so re-read the bottom ceil(k / page size) pages of every visited run above an
+    // unvisited page (k = 0 re-reads nothing). With no recent read the drift is unknown: one page, the plan's
+    // under-a-page-per-pass assumption. (An empty page 1 met no ids: k = 0, and max(1, 0) keeps it 0, not NaN.)
+    const driftPages = st.summary.recentPages === 0 ? 1 : Math.ceil(st.recentUnseen / Math.max(1, st.recentPageSize));
+    dropExposedMarks(visited, start, driftPages);
     // What the ledger said about the end when the pass began. A candidate BELOW the cursor is stale (nothing
     // writes one) and bounds nothing; it is cleared at the first save, as a real page clears it today.
     let priorExhausted = b.exhaustedAt !== undefined;

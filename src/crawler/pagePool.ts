@@ -9,8 +9,9 @@
  * arise only from a pass that was cut short (cap, budget, a stop) after it fully attempted a page above
  * the one it could not finish. A mark expires after CRAWLER_PAGE_POOL_VISITED_TTL_H: listing pages drift
  * (new items push every item down), so an old visit no longer says what the page holds; and after a drift
- * the bottom page of a visited run above an unvisited page is read again (dropExposedMarks). `recent` is
- * stored whole by every build, so an older build keeps the field untouched and walks its cursor.
+ * the bottom pages of a visited run above an unvisited page are read again, as many as the drift spans
+ * (dropExposedMarks). `recent` is stored whole by every build, so an older build keeps the field untouched
+ * and walks its cursor.
  *
  * ORDER. A pass's page set is the L lowest unvisited pages at or above the cursor, none above a known or
  * candidate end. POOL-SELECT (src/services/poolSelect.ts, DEFAULT_PAGE_PARAMS) picks the next page from
@@ -72,14 +73,18 @@ export function readVisited(raw: unknown, cursor: number, nowMs: number, ttlMs: 
 }
 
 /**
- * Forget the BOTTOM page of every visited run that sits on an unvisited page (pages below `cursor` count as
- * visited). After new ids land on top, that page holds the slid-down tail of the unvisited page below it,
- * which nothing has read; the pages above it in the run only took ids from visited pages. Mutates `visited`.
+ * Forget the bottom `depth` pages of every visited run that sits on an unvisited page (pages below `cursor`
+ * count as visited). k new ids on top move every id down k places, so the unread ids of the unvisited page
+ * below a run now sit up to ceil(k / page size) pages higher: on the run's bottom `depth` pages when the
+ * caller passes that ceiling. A page further up the run only took ids from visited pages. A run shorter than
+ * `depth` goes whole (what spills past its top lands on an unvisited page, or on a run that is itself
+ * exposed). `depth` 0 forgets nothing. Mutates `visited`.
  */
 export function dropExposedMarks(visited: Map<number, number>, cursor: number, depth: number): void {
-  void depth; // API stub (red commit): the depth rule lands with the fix.
   const exposed = [...visited.keys()].filter((page) => page > cursor && !visited.has(page - 1));
-  for (const page of exposed) visited.delete(page);
+  for (const bottom of exposed) {
+    for (let page = bottom; page < bottom + depth; page++) visited.delete(page);
+  }
 }
 
 /** The lowest page at or above `cursor` that is not visited: where the durable cursor belongs. */

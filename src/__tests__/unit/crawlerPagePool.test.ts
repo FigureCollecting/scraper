@@ -655,8 +655,8 @@ describe('listing drift (k ids prepended per pass)', () => {
 
   describe('the bottom visited page above an unvisited one is read again when the listing moved', () => {
     /** cursor 20; pages 22-23 visited an hour ago; page 21 unvisited (the run sits on it). */
-    const setFor = async (o: { prepend: number; phases?: CrawlerConfig['phases']; run?: [number, number] }) => {
-      const engine = makePagedEngine({ orzgk: catalog(60) });
+    const setFor = async (o: { prepend: number; phases?: CrawlerConfig['phases']; run?: [number, number]; reply?: (store: string, page: number) => EngineReply | undefined }) => {
+      const engine = makePagedEngine({ orzgk: catalog(60) }, o.reply ? { reply: o.reply } : {});
       const l = ledgerAt(engine.items('orzgk'), 20);
       const [from, to] = o.run ?? [22, 23];
       l.recent.pagePool = { visited: [[from, to, iso(T0 - HOUR_MS)]] };
@@ -687,6 +687,15 @@ describe('listing drift (k ids prepended per pass)', () => {
       [25, [20, 21, 22, 23, 24]],
     ])('k = %i new ids on top of 10-id pages: the bottom ceil(k / 10) pages of the run are read again', async (k, expected) => {
       expect(await setFor({ prepend: k as number, run: [22, 26] })).toEqual(expected);
+    });
+
+    it('the page size is the recent read\'s PAGE 1, not a shorter page it read later', async () => {
+      // k = 11 on 10-id pages: page 3 of the recent read answers three known ids. ceil(11 / 3) would re-read four pages.
+      const short = (_s: string, page: number): EngineReply | undefined =>
+        page === 3
+          ? { status: 200, body: { siteId: 'orzgk', page, url: 'x', items: ['o9990', 'o9989', 'o9988'].map((id) => ({ itemId: id, collectUrl: itemUrl('orzgk', id) })), collectUrls: [], hasMore: true, nextPage: 4, count: 3 } }
+          : undefined;
+      expect(await setFor({ prepend: 11, run: [22, 26], reply: short })).toEqual([20, 21, 22, 23, 27]);
     });
   });
 });
