@@ -5,7 +5,7 @@
  * Fake engine (no request reaches any store), fake clock, a stub hostClock block, a memory ring.
  */
 import { createEmptyLedger, createMemoryLedgerStore, type Ledger } from '../../crawler/ledger';
-import { createMemoryListsStateStore } from '../../crawler/listsState';
+import { createEmptyListsState, createMemoryListsStateStore } from '../../crawler/listsState';
 import { runCrawlerPass, type CrawlerConfig, type CrawlerStoreSummary } from '../../crawler/crawler';
 import { PASS_STRATEGY_VERSION, type PassRingStore, type PassStrategyRecord } from '../../crawler/passStrategy';
 import { logger } from '../../utils/logger';
@@ -23,10 +23,10 @@ const CHALLENGE_LIST: Reply = { status: 502, body: { error: 'catalog failed', si
 const COOLDOWN: Reply = { status: 503, body: { error: 'cooldown', siteId: 'mfc', host: 'mfc.test', remainingMs: 60_000 } };
 const CHALLENGE_PAGE: Reply = { status: 502, body: { error: 'catalog failed', siteId: 'mfc', reason: 'challenge page' } };
 
-/** Company 7620: d9 offers 1001-1003 (+ an id with no url), d1 offers 1003-1004: union 4, 1002 already known. */
+/** Company 7620: d9 offers 1001-1003 (+ an id with no url), d1 offers 1003-1004 (1004 twice): union 4, 1002 already known. */
 const LISTS: Record<string, Reply> = {
   'company-7620-d9': ok([...items([1001, 1002, 1003]), { itemId: '1009' }]),
-  'company-7620-d1': ok(items([1003, 1004])),
+  'company-7620-d1': ok(items([1003, 1004, 1004])),
   'company-7721-d9': CHALLENGE_LIST,
   'company-7721-d1': ok(items([1100])),
   'company-8800-d9': ok(items([1200])),
@@ -107,8 +107,10 @@ const runPasses = async (
   let reads = 0;
   const readHostClock = o.readHostClock ?? (async () => STUB_BLOCK);
   const lines: string[] = [];
-  jest.spyOn(logger, 'info').mockImplementation((message: string, data?: unknown) => {
-    lines.push(data === undefined ? message : `${message} ${JSON.stringify(data)}`);
+  jest.spyOn(logger, 'info').mockImplementation((...args: unknown[]) => {
+    const [message, data] = args as [string, unknown];
+    // A call with data prints it pretty (multi-line): mark it, so a record logged that way is caught.
+    lines.push(args.length > 1 ? `${message} <data> ${JSON.stringify(data)}` : message);
   });
   const summaries: CrawlerStoreSummary[][] = [];
   for (const h of hours) {
@@ -289,14 +291,93 @@ describe('pass-strategy record — other pass kinds', () => {
       passRing: { append: async (_s, r) => void records.push(r) },
     });
     expect(records[0]).toMatchObject({ strategy: 'fallback-tap', strategyParams: { ratio: '2:1', step: 1 }, listsCompanies: [], listsPerList: [] });
-    expect(records[0].idsDiscovered).toBe(8);
+    // The fallback tap reads page 1 only (a lists pass fetches no backfill page): 2040-2037 at 15:30, none known.
+    expect(records[0]).toMatchObject({ idsDiscovered: 4, idsNew: 4, idsDup: 0 });
   });
 
-  it('a challenge page on the tap counts a challenge; a 503 without the cooldown envelope counts nothing', async () => {
+  it('a challenge page on the tap counts a challenge', async () => {
     const run = await runPasses([3], mfcOnly(), {
-      reply: (c) => (c.store === 'mfc' && c.kind === 'listing' ? (c.page === 1 ? CHALLENGE_PAGE : { status: 503, body: {} }) : undefined),
+      reply: (c) => (c.store === 'mfc' && c.kind === 'listing' && c.page === 1 ? CHALLENGE_PAGE : undefined),
     });
     expect(run.records[0]).toMatchObject({ challenges: 1, cooldowns: 0, idsDiscovered: 0 });
+  });
+
+  it('a cooldown on the tap\'s first page counts a cooldown', async () => {
+    const run = await runPasses([3], mfcOnly(), {
+      reply: (c) => (c.store === 'mfc' && c.kind === 'listing' && c.page === 1 ? COOLDOWN : undefined),
+    });
+    expect(run.records[0]).toMatchObject({ challenges: 0, cooldowns: 1, idsDiscovered: 0 });
+  });
+
+  it('a 503 on the tap without the scraper\'s cooldown envelope (ingress, scaled to zero) counts nothing', async () => {
+    const run = await runPasses([3], mfcOnly(), {
+      reply: (c) => (c.store === 'mfc' && c.kind === 'listing' && c.page !== 1 ? { status: 503, body: { error: 'unavailable' } } : undefined),
+    });
+    expect(run.records[0]).toMatchObject({ challenges: 0, cooldowns: 0, idsDiscovered: 4 });
+  });
+
+  it('a cooldown or a challenge page on the ID-RANGE axis is not the strategy\'s: neither counts', async () => {
+    for (const reply of [COOLDOWN, CHALLENGE_PAGE]) {
+      const run = await runPasses([3], mfcOnly(), { reply: (c) => (c.store === 'mfc' && c.kind === 'range' ? reply : undefined) });
+      expect(run.calls.filter((c) => c.kind === 'range').length).toBeGreaterThan(0);
+      expect(run.records[0]).toMatchObject({ challenges: 0, cooldowns: 0, idsDiscovered: 8 });
+    }
+  });
+
+  it('a company list that fails for another reason (gone) counts no challenge', async () => {
+    const saved = LISTS['company-7620-d9'];
+    LISTS['company-7620-d9'] = { status: 502, body: { error: 'catalog failed', failure: 'deterministic', blocked: false, reason: 'not found', upstreamStatus: 404 } };
+    try {
+      const run = await runPasses([15], mfcOnly());
+      expect(run.records[0]).toMatchObject({ challenges: 0, cooldowns: 0 });
+      expect(run.records[0].listsPerList[0]).toEqual({ listId: 'company-7620-d9', domainId: 9, status: 'failed', ids: 0 });
+    } finally {
+      LISTS['company-7620-d9'] = saved;
+    }
+  });
+
+  it('an id a page lists twice counts once, even when the cap left it unposted', async () => {
+    const run = await runPasses([3], mfcOnly({ storeEnqueueCaps: { mfc: 1 } }), {
+      reply: (c) => (c.store === 'mfc' && c.kind === 'listing' && c.page === 1 ? ok(items([2016, 2015, 2015, 2014])) : undefined),
+    });
+    expect(run.records[0]).toMatchObject({ idsDiscovered: 3, idsNew: 3, idsDup: 0 });
+  });
+
+  it('an id the backfill page repeats from page 1 is discovered once', async () => {
+    const page1 = ok(items([2016, 2015, 2014, 2013]));
+    const run = await runPasses([3], mfcOnly(), {
+      reply: (c) => (c.store === 'mfc' && c.kind === 'listing' ? (c.page === 1 ? page1 : ok(items([2014, 2013, 2012]))) : undefined),
+    });
+    expect(run.records[0]).toMatchObject({ idsDiscovered: 5, idsNew: 5, idsDup: 0 });
+  });
+
+  it('an id this run already tried (a refused drain POST) is not new on the fallback tap', async () => {
+    const c = clock();
+    const engine = makeEngine(c.now, { decl: () => ({ status: 200, body: { siteId: 'mfc', rotatingSeedLists: [], count: 0 } }) });
+    const records: PassStrategyRecord[] = [];
+    jest.spyOn(logger, 'info').mockImplementation(() => undefined);
+    c.set(at(15));
+    const lists = createMemoryListsStateStore({ mfc: { ...createEmptyListsState('mfc'), pending: [{ itemId: '2040', collectUrl: itemUrl('mfc', 2040), group: '7620' }] } });
+    await runCrawlerPass(mfcOnly(), {
+      fetch: async (url, init) =>
+        init?.method === 'POST' && (init.body ?? '').includes('/item/2040')
+          ? { ok: false, status: 400, json: async () => ({ error: 'no ruleset' }), text: async () => '' }
+          : engine.fetch(url, init),
+      ledgerStore: createMemoryLedgerStore({ mfc: mfcLedger() }),
+      listsStore: lists,
+      now: c.now,
+      sleep: c.sleep,
+      passRing: { append: async (_s, r) => void records.push(r) },
+    });
+    // Page 1 at 15:30 holds 2040-2037; 2040 was refused by the drain earlier in this pass.
+    expect(records[0]).toMatchObject({ strategy: 'fallback-tap', idsDiscovered: 4, idsNew: 3, idsDup: 1 });
+  });
+
+  it('a challenge page on the tap\'s BACKFILL page counts too', async () => {
+    const run = await runPasses([3], mfcOnly(), {
+      reply: (c) => (c.store === 'mfc' && c.kind === 'listing' && c.page !== 1 ? CHALLENGE_PAGE : undefined),
+    });
+    expect(run.records[0]).toMatchObject({ challenges: 1, cooldowns: 0, idsDiscovered: 4 });
   });
 
   it('a 502 on the tap that is not a challenge (or has no JSON body) counts nothing', async () => {
@@ -304,6 +385,27 @@ describe('pass-strategy record — other pass kinds', () => {
       reply: (c) => (c.store === 'mfc' && c.kind === 'listing' ? { status: 502, body: { error: 'catalog failed', reason: 'timeout' } } : undefined),
     });
     expect(run.records[0]).toMatchObject({ challenges: 0, cooldowns: 0 });
+  });
+
+  it('a tap failure whose body is not JSON counts nothing and fails the axis as before', async () => {
+    const c = clock();
+    const engine = makeEngine(c.now);
+    const records: PassStrategyRecord[] = [];
+    jest.spyOn(logger, 'info').mockImplementation(() => undefined);
+    c.set(at(3));
+    const summary = await runCrawlerPass(mfcOnly(), {
+      fetch: async (url, init) =>
+        url.includes('page=')
+          ? { ok: false, status: 502, json: async () => Promise.reject(new SyntaxError('Unexpected token <')), text: async () => '<html>' }
+          : engine.fetch(url, init),
+      ledgerStore: createMemoryLedgerStore({ mfc: mfcLedger() }),
+      listsStore: createMemoryListsStateStore(),
+      now: c.now,
+      sleep: c.sleep,
+      passRing: { append: async (_s, r) => void records.push(r) },
+    });
+    expect(records[0]).toMatchObject({ challenges: 0, cooldowns: 0, idsDiscovered: 0 });
+    expect(mfcOf(summary.stores).errors).toBe(1);
   });
 
   it('a cooldown on a company list counts a cooldown and leaves the list skipped', async () => {
@@ -323,6 +425,30 @@ describe('pass-strategy record — other pass kinds', () => {
     } finally {
       LISTS['company-7620-d9'] = saved;
     }
+  });
+
+  it('two lists of one domain report that domain once', async () => {
+    const c = clock();
+    const decl = [
+      { id: 'a-d9', url: 'https://mfc.test/a', group: 'g', order: 1 },
+      { id: 'b-d9', url: 'https://mfc.test/b', group: 'g', order: 1 },
+    ];
+    const engine = makeEngine(c.now, {
+      decl: () => ({ status: 200, body: { siteId: 'mfc', rotatingSeedLists: decl, count: 2 } }),
+      list: (id) => ok(items(id === 'a-d9' ? [1500] : [1501])),
+    });
+    const records: PassStrategyRecord[] = [];
+    jest.spyOn(logger, 'info').mockImplementation(() => undefined);
+    c.set(at(15));
+    await runCrawlerPass(mfcOnly(), {
+      fetch: engine.fetch,
+      ledgerStore: createMemoryLedgerStore({ mfc: mfcLedger() }),
+      listsStore: createMemoryListsStateStore(),
+      now: c.now,
+      sleep: c.sleep,
+      passRing: { append: async (_s, r) => void records.push(r) },
+    });
+    expect(records[0]).toMatchObject({ listsCompanies: [{ entryId: 'g' }], listsDomains: [9], idsDiscovered: 2 });
   });
 
   it('a list id without a -d<n> suffix reports domainId null and adds no domain', async () => {
@@ -371,21 +497,25 @@ describe('pass-strategy record — the hostClock read', () => {
     ['a malformed entry for the host', { mode: 'on', hosts: [null, hostView('mfc.test', { minGapMs60m: 'soon' })] }],
     ['sends that are not a map', { mode: 'on', hosts: [hostView('mfc.test', { sends60m: [1, 2] })] }],
     ['a non-numeric send count', { mode: 'on', hosts: [hostView('mfc.test', { sends60m: sends({ queue: Number.NaN }) })] }],
+    ['no floor', { mode: 'on', hosts: [hostView('mfc.test', { floorMs: undefined })] }],
+    ['a clocked flag that is not a boolean', { mode: 'on', hosts: [hostView('mfc.test', { clocked: 'yes' })] }],
+    ['no underFloor count', { mode: 'on', hosts: [hostView('mfc.test', { underFloor60m: null })] }],
+    ['no listing p99', { mode: 'on', hosts: [hostView('mfc.test', { listingFetchP99Ms60m: '1800' })] }],
+    ['an entry without a host name', { mode: 'on', hosts: [hostView('mfc.test', { host: 7 })] }],
   ])('%s: hostClock null', async (_label, block) => {
     const run = await runPasses([15], mfcOnly(), { readHostClock: async () => block });
     expect(run.records[0].hostClock).toBeNull();
   });
 
+  it('a block whose sends carry no catalogListing count reads catalogListing 0', async () => {
+    const { catalogListing: _drop, ...rest } = sends({ queue: 4 });
+    const run = await runPasses([15], mfcOnly(), { readHostClock: async () => ({ mode: 'on', hosts: [hostView('mfc.test', { sends60m: rest })] }) });
+    expect(run.records[0].hostClock).toMatchObject({ catalogListing: 0, sends60m: rest });
+  });
+
   it('matches the store\'s host case- and www-insensitively', async () => {
     const run = await runPasses([15], mfcOnly(), { readHostClock: async () => ({ mode: 'on', hosts: [hostView('WWW.MFC.test')] }) });
     expect(run.records[0].hostClock).toEqual({ ...MFC_CLOCK, host: 'WWW.MFC.test' });
-  });
-
-  it('a store whose ledger holds no usable url has no host: hostClock null', async () => {
-    const l = mfcLedger();
-    l.enqueued = { x: { at: iso(DAY0), collectUrl: 'not a url' } };
-    const run = await runPasses([15], mfcOnly(), { ledgers: { mfc: l } });
-    expect(run.records[0].hostClock).toBeNull();
   });
 
   it('a store whose ledger was refused records strategy off and hostClock null', async () => {

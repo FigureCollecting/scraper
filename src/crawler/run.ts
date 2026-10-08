@@ -14,6 +14,7 @@ import { loadCrawlerConfig } from './config.js';
 import { runCrawlerPass, type FetchLike } from './crawler.js';
 import { createFileLedgerStore } from './ledger.js';
 import { createFileListsStateStore } from './listsState.js';
+import { createFilePassRingStore, createHealthHostClockReader } from './passStrategy.js';
 import { logger } from '../utils/logger.js';
 import { createFailureReporterFromEnv } from '../services/failureReporter.js';
 
@@ -63,6 +64,10 @@ async function main(): Promise<void> {
     fetch: httpFetch,
     ledgerStore: createFileLedgerStore(config.ledgerDir),
     listsStore: createFileListsStateStore(config.ledgerDir),
+    // QB-U36: used only when a store is in CRAWLER_LISTS_ALTERNATE — our own /health/detailed, once a pass,
+    // and `<siteId>.passes.ndjson` beside the ledgers.
+    readHostClock: createHealthHostClockReader(config.scraperServiceUrl, httpFetch, config.requestTimeoutMs),
+    passRing: createFilePassRingStore(config.ledgerDir),
     ...(reporter ? { reportFailure: (report) => reporter.report(report) } : {}),
   });
   // Every emit point is fire-and-forget and the process exits the instant this resolves, which

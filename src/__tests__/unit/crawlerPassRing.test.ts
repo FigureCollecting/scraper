@@ -6,12 +6,14 @@
 import { promises as fsp } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import type { FsLike } from '../../crawler/ledger';
+import { createEmptyLedger, type FsLike } from '../../crawler/ledger';
 import {
   PASS_RING_MAX_AGE_MS,
   PASS_RING_MAX_BYTES,
   createFilePassRingStore,
   createHealthHostClockReader,
+  domainIdOf,
+  storeHostOf,
   type PassStrategyRecord,
 } from '../../crawler/passStrategy';
 
@@ -93,6 +95,17 @@ describe('pass ring — append, order, restart', () => {
         ['2026-10-08T03:30:00.000Z', 'tap'],
       ]);
       expect((await fsp.readdir(dir)).sort()).toEqual(['mfc.passes.ndjson']);
+    } finally {
+      await fsp.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('defaults to the real fs and the wall clock', async () => {
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'qb-u36-ring-'));
+    try {
+      const before = Date.now();
+      expect(await createFilePassRingStore(dir).append('mfc', rec(before))).toEqual({ kept: 1, droppedAged: 0, droppedOversize: 0, droppedMalformed: 0 });
+      expect(lines(await fsp.readFile(path.join(dir, 'mfc.passes.ndjson'), 'utf8'))).toEqual([rec(before)]);
     } finally {
       await fsp.rm(dir, { recursive: true, force: true });
     }
@@ -258,5 +271,31 @@ describe('hostClock reader — our own /health/detailed', () => {
     } finally {
       jest.useRealTimers();
     }
+  });
+});
+
+describe('the store host and a list\'s domain', () => {
+  const ledger = (urls: string[]) => {
+    const l = createEmptyLedger('mfc');
+    urls.forEach((u, i) => (l.enqueued[String(i)] = { at: new Date(NOW).toISOString(), collectUrl: u }));
+    return l;
+  };
+
+  it('the host of the first entry with a parseable url, normalised (case, www.)', () => {
+    expect(storeHostOf(ledger(['not a url', 'https://WWW.MyFigureCollection.net/item/1', 'https://other.test/x']))).toBe('myfigurecollection.net');
+  });
+
+  it('no entry, or no parseable url: null', () => {
+    expect(storeHostOf(ledger([]))).toBeNull();
+    expect(storeHostOf(ledger(['not a url', '']))).toBeNull();
+  });
+
+  it('domainIdOf reads the -d<n> suffix and nothing else', () => {
+    expect(domainIdOf('company-7620-d9')).toBe(9);
+    expect(domainIdOf('company-7620-d1')).toBe(1);
+    expect(domainIdOf('company-7620-d12')).toBe(12);
+    expect(domainIdOf('gsc-top')).toBeNull();
+    expect(domainIdOf('company-7620-d9x')).toBeNull();
+    expect(domainIdOf('company-7620-d')).toBeNull();
   });
 });
