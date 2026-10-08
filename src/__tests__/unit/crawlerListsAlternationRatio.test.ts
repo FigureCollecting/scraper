@@ -150,6 +150,13 @@ describe('lists alternation ratio — the marker, pass by pass', () => {
     }
   });
 
+  it('a stepless tap marker is the FIRST tap step: at 1:2 the next pass is the second tap step, not a wrap to lists', async () => {
+    const w = '2026-10-06T15:30:00.000Z';
+    const lists = createMemoryListsStateStore({ mfc: { ...backlogState(6), alternation: { lastInWindowKind: 'tap', windowStart: w, at: w } } as unknown as ListsState });
+    const { passes } = await simulate(simConfig({ listsAlternate: ['mfc'], listsAlternateRatios: { mfc: { lists: 1, tap: 2 } } }), { passes: 3, from: at(0, 16), lists });
+    expect(passes.map((p) => `${storeOf(p, 'mfc').alternation}@${storeOf(p, 'mfc').alternationStep}`)).toEqual(['tap@3', 'lists@1', 'tap@2']);
+  });
+
   it('a malformed step is no step: the kind decides, and a malformed kind too opens the cycle', async () => {
     const w = '2026-10-06T15:30:00.000Z';
     for (const step of [0, -1, 2.5, '2', null, Number.NaN, 2 ** 53]) {
