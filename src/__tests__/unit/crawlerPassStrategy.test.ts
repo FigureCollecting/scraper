@@ -5,7 +5,7 @@
  * Fake engine (no request reaches any store), fake clock, a stub hostClock block, a memory ring.
  */
 import { createEmptyLedger, createMemoryLedgerStore, type Ledger } from '../../crawler/ledger';
-import { createEmptyListsState, createMemoryListsStateStore } from '../../crawler/listsState';
+import { createEmptyListsState, createMemoryListsStateStore, type ListsStateStore } from '../../crawler/listsState';
 import { runCrawlerPass, type CrawlerConfig, type CrawlerStoreSummary } from '../../crawler/crawler';
 import { PASS_STRATEGY_VERSION, type PassRingStore, type PassStrategyRecord } from '../../crawler/passStrategy';
 import { logger } from '../../utils/logger';
@@ -88,7 +88,18 @@ interface Run {
 const runPasses = async (
   hours: number[],
   cfg: CrawlerConfig,
-  o: { reply?: (c: Call) => Reply | undefined; readHostClock?: () => Promise<unknown>; ring?: PassRingStore; ledgers?: Record<string, Ledger> } = {},
+  o: {
+    reply?: (c: Call) => Reply | undefined;
+    readHostClock?: () => Promise<unknown>;
+    ring?: PassRingStore;
+    ledgers?: Record<string, Ledger>;
+    /** The hostClock read moves the fake clock this long (a slow scraper): after discovery, so never the store's own time. */
+    readerAdvanceMs?: number;
+    /** Ids already waiting in mfc's lists backlog when the run starts. */
+    mfcBacklog?: string[];
+    /** Replaces the lists-state store outright (a corrupt file, a failing read). */
+    listsStore?: ListsStateStore;
+  } = {},
 ): Promise<Run> => {
   const c = clock();
   const engine = makeEngine(c.now, {
@@ -101,7 +112,9 @@ const runPasses = async (
     reply: o.reply,
   });
   const ledgerStore = createMemoryLedgerStore(o.ledgers ?? { mfc: mfcLedger() });
-  const listsStore = createMemoryListsStateStore();
+  const backlog = createEmptyListsState('mfc');
+  backlog.pending = (o.mfcBacklog ?? []).map((id) => ({ itemId: id, collectUrl: itemUrl('mfc', id), group: '7620' }));
+  const listsStore = o.listsStore ?? createMemoryListsStateStore(o.mfcBacklog ? { mfc: backlog } : undefined);
   const records: PassStrategyRecord[] = [];
   const ring: PassRingStore = o.ring ?? { append: async (_siteId, rec) => void records.push(rec) };
   let reads = 0;
@@ -123,6 +136,7 @@ const runPasses = async (
       sleep: c.sleep,
       readHostClock: async () => {
         reads++;
+        c.advance(o.readerAdvanceMs ?? 0);
         return readHostClock();
       },
       passRing: ring,
@@ -606,6 +620,72 @@ describe('pass-strategy record — the ring', () => {
     c.set(at(3));
     await runCrawlerPass(mfcOnly(), { fetch: engine.fetch, ledgerStore: createMemoryLedgerStore({ mfc: mfcLedger() }), listsStore: createMemoryListsStateStore(), now: c.now, sleep: c.sleep });
     expect(strategyLines(lines)).toHaveLength(1);
+  });
+});
+
+describe('pass-strategy record — what the numbers mean (QB-U36 recheck)', () => {
+  it('storePassMs ends with the store\'s own last discovery phase: a slow hostClock read after it adds nothing (lists pass)', async () => {
+    const fast = await runPasses([15], mfcOnly());
+    const slow = await runPasses([15], mfcOnly(), { readerAdvanceMs: 9_000 });
+    expect(fast.records[0].strategy).toBe('lists');
+    expect(fast.records[0].storePassMs).toBeGreaterThan(0);
+    expect(slow.records[0].storePassMs).toBe(fast.records[0].storePassMs);
+  });
+
+  it('storePassMs ends with the store\'s own last discovery phase: a slow hostClock read after it adds nothing (tap pass)', async () => {
+    const fast = await runPasses([3], mfcOnly());
+    const slow = await runPasses([3], mfcOnly(), { readerAdvanceMs: 9_000 });
+    expect(fast.records[0].storePassMs).toBe(1000);
+    expect(slow.records[0].storePassMs).toBe(1000);
+  });
+
+  it('idsNew counts one thing for tap and lists: an id already in the lists backlog is not new on the tap', async () => {
+    // Outside the window at 03:30 the tap offers 2016..2009. Backlog holds 2016 (the newest, met on page 1).
+    const none = await runPasses([3], mfcOnly());
+    const held = await runPasses([3], mfcOnly(), { mfcBacklog: ['2016'] });
+    expect(none.records[0]).toMatchObject({ idsDiscovered: 8, idsNew: 8, idsDup: 0 });
+    expect(held.records[0]).toMatchObject({ idsDiscovered: 8, idsNew: 7, idsDup: 1 });
+  });
+
+  it('the same holds with no lists window, and on the tap step of an in-window cycle', async () => {
+    const ids = ['2037', '2038', '2039', '2040', '2041', '2042', '2043', '2044'];
+    const noWindow = await runPasses([3], mfcOnly({ listsWindow: undefined }), { mfcBacklog: ['2016'] });
+    expect(noWindow.records[0]).toMatchObject({ idsDiscovered: 8, idsNew: 7, idsDup: 1 });
+    // L, L, T at 15:30, 16:30, 17:30: a drain cap of 1 leaves most of the seeded backlog waiting for the tap.
+    const cycle = await runPasses([15, 16, 17], mfcOnly({ listsDrainCaps: { mfc: 1 } }), { mfcBacklog: ids });
+    expect(cycle.records.map((r) => r.strategy)).toEqual(['lists', 'lists', 'tap']);
+    expect(cycle.records[2]).toMatchObject({ idsDiscovered: 8, idsNew: 0, idsDup: 8 });
+  });
+
+  it('an unreadable or corrupt lists state leaves the backlog empty: the pass, its tap and its record go on', async () => {
+    const failing: ListsStateStore = { ...createMemoryListsStateStore(), load: async () => Promise.reject(new Error('disk gone')) };
+    const broken = await runPasses([3], mfcOnly(), { listsStore: failing });
+    const corrupt = await runPasses([3], mfcOnly(), { listsStore: createMemoryListsStateStore({ mfc: 'corrupt' }) });
+    for (const run of [broken, corrupt]) {
+      expect(run.records).toHaveLength(1);
+      expect(run.records[0]).toMatchObject({ strategy: 'outside-window', idsDiscovered: 8, idsNew: 8, idsDup: 0 });
+    }
+  });
+
+  it('the fallback tap of a lists pass also leaves a backlog id out of idsNew', async () => {
+    const c = clock();
+    const engine = makeEngine(c.now, { decl: () => ({ status: 200, body: { siteId: 'mfc', rotatingSeedLists: [], count: 0 } }) });
+    const records: PassStrategyRecord[] = [];
+    jest.spyOn(logger, 'info').mockImplementation(() => undefined);
+    const backlog = createEmptyListsState('mfc');
+    // The tap offers 2040-2037 at 15:30.
+    backlog.pending = [{ itemId: '2040', collectUrl: itemUrl('mfc', 2040), group: '7620' }];
+    c.set(at(15));
+    await runCrawlerPass(mfcOnly(), {
+      fetch: engine.fetch,
+      ledgerStore: createMemoryLedgerStore({ mfc: mfcLedger() }),
+      listsStore: createMemoryListsStateStore({ mfc: backlog }),
+      now: c.now,
+      sleep: c.sleep,
+      readHostClock: async () => STUB_BLOCK,
+      passRing: { append: async (_s, r) => void records.push(r) },
+    });
+    expect(records[0]).toMatchObject({ strategy: 'fallback-tap', idsDiscovered: 4, idsNew: 3, idsDup: 1 });
   });
 });
 
