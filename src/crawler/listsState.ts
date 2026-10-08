@@ -64,6 +64,12 @@ export interface ListsAlternationMarker {
   windowStart: string;
   /** ISO-8601 UTC start of that pass. */
   at: string;
+  /**
+   * The 1-based position of that pass in its window's lists:tap cycle (QB-U38). Written only for a ratio
+   * other than 1:1, where the kind alone cannot tell the first lists pass from the second; absent, the
+   * crawler reads `lists` as step 1 and `tap` as the first tap step.
+   */
+  step?: number;
 }
 
 export interface ListsState {

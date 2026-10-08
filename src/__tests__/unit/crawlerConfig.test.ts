@@ -450,6 +450,73 @@ describe('loadCrawlerConfig — the rotating company-lists step', () => {
     }
   });
 
+  it('CRAWLER_LISTS_ALTERNATE carries no ratio by default, nor for a bare siteId (1:1)', () => {
+    expect(loadCrawlerConfig({}).listsAlternateRatios).toEqual({});
+    expect(loadCrawlerConfig({ CRAWLER_LISTS_ALTERNATE: 'mfc' }).listsAlternateRatios).toEqual({});
+  });
+
+  it('parses a ratio siteId:lists:tap (Ross MS-1 (c): mfc:2:1), the store alternated as for a bare name', () => {
+    const warn = quiet();
+    try {
+      const c = loadCrawlerConfig({ CRAWLER_LISTS_ALTERNATE: ' mfc:2:1 , hpoi:1:1,orz:24:24' });
+      expect(c.listsAlternate).toEqual(['mfc', 'hpoi', 'orz']);
+      expect(c.listsAlternateRatios).toEqual({ mfc: { lists: 2, tap: 1 }, hpoi: { lists: 1, tap: 1 }, orz: { lists: 24, tap: 24 } });
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('an invalid ratio fails safe to 1:1: the store still alternates, with ONE WARN naming the var and the entry', () => {
+    const bad = ['mfc:0:1', 'mfc:2:0', 'mfc:2', 'mfc:', 'mfc::', 'mfc:a:b', 'mfc:2:1:1', 'mfc:25:1', 'mfc:1:25', 'mfc:-1:1', 'mfc:1.5:1', 'mfc:1e1:1', 'mfc: 2:1', 'mfc:02:1x'];
+    for (const entry of bad) {
+      const warn = quiet();
+      try {
+        const c = loadCrawlerConfig({ CRAWLER_LISTS_ALTERNATE: entry });
+        expect([entry, c.listsAlternate]).toEqual([entry, ['mfc']]);
+        expect([entry, c.listsAlternateRatios]).toEqual([entry, {}]);
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining('CRAWLER_LISTS_ALTERNATE'), { entry });
+        expect(String(warn.mock.calls[0][0])).toContain('1:1');
+      } finally {
+        warn.mockRestore();
+      }
+    }
+  });
+
+  it('a ratio on an unsafe siteId drops the entry as before', () => {
+    const warn = quiet();
+    try {
+      const c = loadCrawlerConfig({ CRAWLER_LISTS_ALTERNATE: '../etc:2:1,:2:1' });
+      expect(c.listsAlternate).toEqual([]);
+      expect(c.listsAlternateRatios).toEqual({});
+      expect(warn).toHaveBeenCalledTimes(2);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('a repeated siteId keeps its FIRST ratio; a repeat that asks for a different one is named in a WARN', () => {
+    const warn = quiet();
+    try {
+      expect(loadCrawlerConfig({ CRAWLER_LISTS_ALTERNATE: 'mfc:2:1,mfc:2:1' }).listsAlternateRatios).toEqual({ mfc: { lists: 2, tap: 1 } });
+      expect(warn).not.toHaveBeenCalled();
+      const c = loadCrawlerConfig({ CRAWLER_LISTS_ALTERNATE: 'mfc:2:1,mfc,mfc:3:1' });
+      expect(c.listsAlternate).toEqual(['mfc']);
+      expect(c.listsAlternateRatios).toEqual({ mfc: { lists: 2, tap: 1 } });
+      expect(warn).toHaveBeenCalledTimes(2);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('CRAWLER_LISTS_ALTERNATE'), { entry: 'mfc' });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('CRAWLER_LISTS_ALTERNATE'), { entry: 'mfc:3:1' });
+      warn.mockClear();
+      expect(loadCrawlerConfig({ CRAWLER_LISTS_ALTERNATE: 'mfc,mfc:1:1' }).listsAlternateRatios).toEqual({});
+      expect(warn).not.toHaveBeenCalled();
+      expect(loadCrawlerConfig({ CRAWLER_LISTS_ALTERNATE: 'mfc:1:2,mfc:2:2' }).listsAlternateRatios).toEqual({ mfc: { lists: 1, tap: 2 } });
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('CRAWLER_LISTS_SPACING_MS may widen the gap between one group lists but never below 10 s', () => {
     const warn = quiet();
     try {

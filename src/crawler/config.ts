@@ -182,6 +182,12 @@ export interface CrawlerConfig {
    */
   listsAlternate?: string[];
   /**
+   * LISTS ALTERNATION RATIO (QB-U38; Ross MS-1 (c) 2026-10-07): an entry `siteId:lists:tap` of
+   * `CRAWLER_LISTS_ALTERNATE` runs `lists` lists passes then `tap` tap passes, repeating from the window's
+   * first pass (`mfc:2:1` = L L T L L T L). A store in `listsAlternate` with no entry here alternates 1:1.
+   */
+  listsAlternateRatios?: Record<string, ListsAlternationRatio>;
+  /**
    * BACKFILL PAGE POOL (`CRAWLER_PAGE_POOL`, QB-U24): the stores whose backfill pass fetches its next pages in a
    * POOL-SELECT order instead of cursor, cursor+1, ... — `'all'`, or a list of siteIds. Empty (the default) or
    * absent = every store walks exactly as before. The recent read is never pooled.
@@ -304,20 +310,56 @@ const parseStoreCaps = (raw: string | undefined, envName: string): Record<string
   return out;
 };
 
+/** How many lists passes, then how many tap passes, one alternation cycle runs (QB-U38). */
+export interface ListsAlternationRatio {
+  lists: number;
+  tap: number;
+}
+
+/** A side of an alternation ratio: a pass is hourly, so a run longer than a day is a typo, never a plan. */
+const MAX_ALTERNATION_RUN = 24;
+
+const alternationRun = (raw: string): number | null => {
+  const n = Number(raw);
+  return /^\d+$/.test(raw) && n >= 1 && n <= MAX_ALTERNATION_RUN ? n : null;
+};
+
 /**
- * Parse a csv of siteIds (`CRAWLER_LISTS_ALTERNATE`). Each entry must be a SAFE_SITE_ID, exactly like the
- * per-store caps: a malformed one is DROPPED with a WARN naming it and the var, and a repeat is kept once.
+ * Parse `CRAWLER_LISTS_ALTERNATE`: a csv of `siteId` or `siteId:lists:tap`. The siteId must be a
+ * SAFE_SITE_ID, exactly like the per-store caps: a malformed one DROPS the entry with a WARN naming it and
+ * the var. A malformed ratio (not two integers 1-24) keeps the store at 1:1 with one WARN — a typo never
+ * turns the alternation off nor skews it. A repeated siteId keeps its first ratio, with a WARN when the
+ * repeat asks for a different one (a bare siteId counts as 1:1). Only a written ratio gets a ratio entry.
  */
-const parseSiteIds = (raw: string | undefined, envName: string): string[] => {
-  const out: string[] = [];
+const parseListsAlternate = (raw: string | undefined): { siteIds: string[]; ratios: Record<string, ListsAlternationRatio> } => {
+  const envName = 'CRAWLER_LISTS_ALTERNATE';
+  const siteIds: string[] = [];
+  const ratios: Record<string, ListsAlternationRatio> = {};
   for (const entry of csv(raw ?? '')) {
-    if (!SAFE_SITE_ID.test(entry)) {
-      logger.warn(`[CRAWLER] ${envName} entry ignored (expected a siteId)`, { entry });
+    const [siteId, ...parts] = entry.split(':');
+    if (!SAFE_SITE_ID.test(siteId)) {
+      logger.warn(`[CRAWLER] ${envName} entry ignored (expected a siteId, or siteId:lists:tap)`, { entry });
       continue;
     }
-    if (!out.includes(entry)) out.push(entry);
+    let ratio: ListsAlternationRatio | null = null;
+    if (parts.length > 0) {
+      const lists = alternationRun(parts[0]);
+      const tap = parts.length === 2 ? alternationRun(parts[1]) : null;
+      if (lists !== null && tap !== null) ratio = { lists, tap };
+      else logger.warn(`[CRAWLER] ${envName} ratio invalid (expected siteId:lists:tap, each 1-${MAX_ALTERNATION_RUN}) — the store alternates 1:1`, { entry });
+    }
+    if (siteIds.includes(siteId)) {
+      const kept = ratios[siteId] ?? { lists: 1, tap: 1 };
+      const asked = ratio ?? { lists: 1, tap: 1 };
+      if (kept.lists !== asked.lists || kept.tap !== asked.tap) {
+        logger.warn(`[CRAWLER] ${envName} repeats a siteId with a different ratio — the first is kept`, { entry });
+      }
+      continue;
+    }
+    siteIds.push(siteId);
+    if (ratio) ratios[siteId] = ratio;
   }
-  return out;
+  return { siteIds, ratios };
 };
 
 /**
@@ -500,6 +542,7 @@ export function loadCrawlerConfig(env: Env = process.env, argv: string[] = proce
   const scraperServiceUrl = (env.SCRAPER_SERVICE_URL || DEFAULTS.scraperServiceUrl).replace(/\/+$/, '');
   const backfillPagesPerRun = posInt(env.CRAWLER_BACKFILL_PAGES_PER_RUN, DEFAULTS.backfillPagesPerRun);
   const ledgerDir = (env.CRAWLER_LEDGER_DIR ?? '').trim() || DEFAULTS.ledgerDir;
+  const listsAlternate = parseListsAlternate(env.CRAWLER_LISTS_ALTERNATE);
 
   return {
     scraperServiceUrl,
@@ -544,7 +587,8 @@ export function loadCrawlerConfig(env: Env = process.env, argv: string[] = proce
     listsIntervalMs: posInt(env.CRAWLER_LISTS_INTERVAL_H, DEFAULTS.listsIntervalH) * 60 * 60 * 1000,
     listsDrainCaps: parseStoreCaps(env.CRAWLER_LISTS_DRAIN_CAPS, 'CRAWLER_LISTS_DRAIN_CAPS'),
     listsSpacingMs: flooredNonNegInt(env.CRAWLER_LISTS_SPACING_MS, DEFAULTS.listsSpacingMs, MIN_LISTS_SPACING_MS, 'CRAWLER_LISTS_SPACING_MS'),
-    listsAlternate: parseSiteIds(env.CRAWLER_LISTS_ALTERNATE, 'CRAWLER_LISTS_ALTERNATE'),
+    listsAlternate: listsAlternate.siteIds,
+    listsAlternateRatios: listsAlternate.ratios,
     pagePool: parsePagePool(env.CRAWLER_PAGE_POOL),
     // Never wider than one pass's pages: a wider shuffle is the variant review 2 measured losing coverage.
     pagePoolLookahead: (() => {

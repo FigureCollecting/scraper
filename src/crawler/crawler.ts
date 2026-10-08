@@ -282,6 +282,14 @@ export interface CrawlerStoreSummary {
    */
   alternation: ListsAlternation;
   /**
+   * LISTS ALTERNATION RATIO (QB-U38): the store's `lists:tap` ratio (`2:1`, or `1:1` for a bare name) and
+   * this pass's 1-based step in that cycle (`mfc:2:1` runs steps 1 2 3 = L L T). Present ONLY on a pass that
+   * started inside the lists window of an alternated store (`lists`, `tap`, `fallback-tap`), so every other
+   * summary line reads exactly as it always has.
+   */
+  alternationRatio?: string;
+  alternationStep?: number;
+  /**
    * Per-list stats for a `seed`-mode run, in the order the lists were polled. Empty in every other
    * mode, and empty for a store whose seed pass never got a list (no declaration, or a stop).
    */
@@ -2415,14 +2423,26 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       return;
     }
     const windowStart = windowStartMs(window, startedAtMs);
+    const ratio = config.listsAlternateRatios?.[st.siteId] ?? { lists: 1, tap: 1 };
+    const cycle = ratio.lists + ratio.tap;
     // Read defensively: the marker is not validated on load, and anything malformed counts as absent.
     const m: unknown = loaded.alternation;
     const sameWindow = isPlainObject(m) && typeof m.windowStart === 'string' && Date.parse(m.windowStart) === windowStart;
-    // A new window (or no marker) opens with lists, so every night is L T L T L T L — never 4 and 3 on alternate nights.
-    const kind = sameWindow && m.lastInWindowKind === 'lists' ? 'tap' : 'lists';
+    // The last in-window step: the marker's own, else its kind (a 1:1 build writes none), else none at all.
+    let last = 0;
+    if (sameWindow && Number.isSafeInteger(m.step) && (m.step as number) >= 1) last = m.step as number;
+    else if (sameWindow && m.lastInWindowKind === 'lists') last = 1;
+    else if (sameWindow && m.lastInWindowKind === 'tap') last = ratio.lists + 1;
+    // A new window (or no marker) opens the cycle with lists, so every night runs the same sequence
+    // (L T L T L T L at 1:1, L L T L L T L at 2:1). A step past a shortened cycle wraps.
+    const step = (last % cycle) + 1;
+    const kind = step <= ratio.lists ? 'lists' : 'tap';
     st.passKind = kind;
     st.summary.alternation = kind;
+    st.summary.alternationRatio = `${ratio.lists}:${ratio.tap}`;
+    st.summary.alternationStep = step;
     st.alternationMarker = { lastInWindowKind: kind, windowStart: new Date(windowStart).toISOString(), at: new Date(startedAtMs).toISOString() };
+    if (cycle > 2) st.alternationMarker.step = step;
   };
 
   /**
