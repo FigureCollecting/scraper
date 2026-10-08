@@ -701,7 +701,7 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
 | `CRAWLER_PAGE_POOL` | *(none)* | Backfill page pool (QB-U24): `all`, or a csv of siteIds, whose backfill pass fetches its pages in a POOL-SELECT order (see **backfill** above). Empty or `off` = every store walks its cursor exactly as before. A malformed entry, or `all` / `off` inside a list, is ignored with a WARN; a store not crawled is ignored with a WARN |
 | `CRAWLER_PAGE_POOL_LOOKAHEAD` | `CRAWLER_BACKFILL_PAGES_PER_RUN` | Backfill page pool: how many of the lowest unvisited pages one pass shuffles and fetches. Never larger than `CRAWLER_BACKFILL_PAGES_PER_RUN` (lowered with a WARN): wider shuffles lose coverage under listing drift |
 | `CRAWLER_PAGE_POOL_VISITED_TTL_H` | `72` | Backfill page pool: hours a visited mark above the cursor is trusted |
-| `CRAWLER_LISTS_ALTERNATE` | *(none)* | Company lists: csv of siteIds whose passes that START inside `CRAWLER_LISTS_WINDOW_UTC` fetch EITHER the Latest Additions tap OR one company group, never both; each window opens with a lists pass (7 in-window passes = L T L T L T L, 4 groups a night). Only a store with a lists step (`CRAWLER_LISTS_DRAIN_CAPS`) and a mode running recent and backfill; any other name is ignored with a WARN. Empty = today's pass |
+| `CRAWLER_LISTS_ALTERNATE` | *(none)* | Company lists: csv of siteIds whose passes that START inside `CRAWLER_LISTS_WINDOW_UTC` fetch EITHER the Latest Additions tap OR one company group, never both; each window opens with a lists pass (7 in-window passes = L T L T L T L, 4 groups a night). An entry `siteId:lists:tap` sets the ratio (`mfc:2:1` = L L T L L T L, 5 groups a night); a malformed ratio alternates 1:1 with a WARN. Only a store with a lists step (`CRAWLER_LISTS_DRAIN_CAPS`) and a mode running recent and backfill; any other name is ignored with a WARN. Empty = today's pass |
 | `CRAWLER_REOBSERVE_MIN_AGE_H` | `12` | Re-observation lane: an id is eligible once its last observation is this many hours old. The SAME value is the backoff window for an id whose last re-observation was refused, so `0` means both "age is no bar" and "no backoff at all" — a refused id is retried on the very next run |
 | `CRAWLER_MAX_REOBSERVE_PER_STORE` | `0` | Re-observation lane: global per-store ceiling on re-observations per run. `0` = the lane is OFF unless a store opts in below |
 | `CRAWLER_STORE_REOBSERVE_CAPS` | *(none)* | csv of `siteId:cap` (`goodsmileus:50,bbts:20`) — the lane's per-store budget, SEPARATE from `CRAWLER_STORE_ENQUEUE_CAPS`, so neither lane starves the other. A malformed entry is ignored with a WARN; the rest still apply |
@@ -944,6 +944,14 @@ a stop in one lane (cooldown, challenge, sick scraper) stops every lane below it
   pass start turns alternation off for that pass (one WARN; today's pass). The marker is not validated on
   load: a build without this knob keeps it, and a malformed one counts as absent. Store summary:
   `alternation` = `off`, `outside-window`, `lists`, `tap` or `fallback-tap`.
+- **Alternation ratio** (`CRAWLER_LISTS_ALTERNATE=mfc:2:1`; Ross MS-1 (c) 2026-10-07) — `lists` lists
+  passes then `tap` tap passes, the cycle restarting at each window's first pass (a lists pass). A bare
+  siteId is 1:1 and writes the marker exactly as above; any other ratio adds the marker's `step` (the
+  1-based position of the last in-window pass in its cycle; a marker without one reads `lists` as step 1
+  and `tap` as the first tap step, and a step past a shortened cycle wraps). Each side is an integer 1-24;
+  anything else keeps the store at 1:1 with one WARN, and a repeated siteId keeps its first ratio. An
+  in-window pass's summary adds `alternationRatio` (`2:1`) and `alternationStep` (1-based); no other
+  summary line changes. A fallback tap keeps its step, so the cycle does not slip.
 - **Stop switch** — remove the store from `CRAWLER_LISTS_DRAIN_CAPS` (no fetch, no drain); unset
   `CRAWLER_LISTS_WINDOW_UTC` to stop fetching while the backlog drains. A crawler on this version
   against an older engine loses only the priority (the old `/ingest/scrape` reads `url` alone), so every

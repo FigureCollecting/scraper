@@ -176,6 +176,11 @@ describe('lists alternation ratio — the marker, pass by pass', () => {
     const { passes } = await simulate(simConfig(twoToOne), { passes: 1, from: at(0, 15), lists });
     expect(steps(passes)).toEqual([1]);
     expect(kinds(passes)).toEqual(['lists']);
+    // At 1:2 an earlier night's tap (the first tap step, 2) read as this window's would make the opener a tap.
+    const staleTap = { lastInWindowKind: 'tap', windowStart: '2026-10-05T15:30:00.000Z', at: '2026-10-05T21:30:00.000Z' };
+    const oneToTwo = createMemoryListsStateStore({ mfc: { ...backlogState(4), alternation: staleTap } as unknown as ListsState });
+    const opener = await simulate(simConfig({ listsAlternate: ['mfc'], listsAlternateRatios: { mfc: { lists: 1, tap: 2 } } }), { passes: 1, from: at(0, 15), lists: oneToTwo });
+    expect(kinds(opener.passes)).toEqual(['lists']);
   });
 });
 
