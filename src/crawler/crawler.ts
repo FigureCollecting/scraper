@@ -576,8 +576,10 @@ interface StoreState {
 interface PassObs {
   /** Distinct ids (with a url) the tap's listing pages offered, recent and backfill. */
   tapIds: Set<string>;
-  /** Of those, the ones neither the ledger nor this run held when first met. */
+  /** Of those, the ones neither the ledger, this run nor the lists backlog held when first met. */
   tapNew: number;
+  /** The lists backlog's ids as the pass found them (a failed or corrupt read leaves it empty). */
+  backlog: Set<string>;
   challenges: number;
   cooldowns: number;
   listsStepMs: number;
@@ -846,7 +848,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
   for (const st of states) if (isPooled(st.siteId)) st.summary.pagePicks = [];
   for (const st of states) {
     if (alternated.has(st.siteId)) {
-      st.obs = { tapIds: new Set(), tapNew: 0, challenges: 0, cooldowns: 0, listsStepMs: 0, endMs: startedAtMs, group: null, perList: [] };
+      st.obs = { tapIds: new Set(), tapNew: 0, backlog: new Set(), challenges: 0, cooldowns: 0, listsStepMs: 0, endMs: startedAtMs, group: null, perList: [] };
     }
   }
 
@@ -1194,7 +1196,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       // PASS-STRATEGY: the tap's distinct ids, and whether each was new when first met.
       if (st.obs && (phase === 'recent' || phase === 'backfill') && !st.obs.tapIds.has(item.itemId)) {
         st.obs.tapIds.add(item.itemId);
-        if (!st.attempted.has(item.itemId) && !ledger.enqueued[item.itemId]) st.obs.tapNew++;
+        if (!st.attempted.has(item.itemId) && !ledger.enqueued[item.itemId] && !st.obs.backlog.has(item.itemId)) st.obs.tapNew++;
       }
       if (st.attempted.has(item.itemId)) {
         st.summary.known++;
@@ -2472,12 +2474,19 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     // A store the pass does not run (pulled out, ledger refused) has nothing to alternate.
     if (!alternated.has(st.siteId) || !st.ledger || st.stopped) return;
     const window = config.listsWindow ?? null;
+    // PASS-STRATEGY: a tap id already waiting in the lists backlog is not new. Only where this method reads no
+    // state itself is the backlog read here, once, silently: no lists step runs there to report a bad read.
+    const noteBacklog = async (): Promise<void> => {
+      if (!st.obs) return;
+      const read = await listsStore.load(st.siteId).catch(() => 'corrupt' as const);
+      if (read !== 'corrupt') st.obs.backlog = new Set(read.pending.map((p) => p.itemId));
+    };
     // No window = no list is ever fetched: there is nothing to alternate the tap with (listsSkipped says window-off).
-    if (!window) return;
+    if (!window) return noteBacklog();
     if (!inWindow(window, startedAtMs)) {
       st.passKind = 'outside-window';
       st.summary.alternation = 'outside-window';
-      return;
+      return noteBacklog();
     }
     let loaded: ListsState | 'corrupt';
     try {
@@ -2490,6 +2499,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       logger.warn('[CRAWLER] lists state corrupt at pass start — no alternation this pass', { siteId: st.siteId });
       return;
     }
+    if (st.obs) st.obs.backlog = new Set(loaded.pending.map((p) => p.itemId));
     const windowStart = windowStartMs(window, startedAtMs);
     const ratio = config.listsAlternateRatios?.[st.siteId] ?? { lists: 1, tap: 1 };
     const cycle = ratio.lists + ratio.tap;
