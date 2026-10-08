@@ -952,6 +952,8 @@ a stop in one lane (cooldown, challenge, sick scraper) stops every lane below it
   anything else keeps the store at 1:1 with one WARN, and a repeated siteId keeps its first ratio. An
   in-window pass's summary adds `alternationRatio` (`2:1`) and `alternationStep` (1-based); no other
   summary line changes. A fallback tap keeps its step, so the cycle does not slip.
+  A bare 1:1 store also reads a marker's `step`, so switching a store from a ratio back to a bare name
+  mid-window can run two lists passes in a row once; a pass still never fetches both the tap and a list.
 - **Stop switch** — remove the store from `CRAWLER_LISTS_DRAIN_CAPS` (no fetch, no drain); unset
   `CRAWLER_LISTS_WINDOW_UTC` to stop fetching while the backlog drains. A crawler on this version
   against an older engine loses only the priority (the old `/ingest/scrape` reads `url` alone), so every
