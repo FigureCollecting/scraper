@@ -954,6 +954,32 @@ a stop in one lane (cooldown, challenge, sick scraper) stops every lane below it
   summary line changes. A fallback tap keeps its step, so the cycle does not slip.
   A bare 1:1 store also reads a marker's `step`, so switching a store from a ratio back to a bare name
   mid-window can run two lists passes in a row once; a pass still never fetches both the tap and a list.
+- **Pass-strategy record** (QB-U36; Ross MS-1 2026-10-07, to assess the 2:1 trial) — for a store in
+  `CRAWLER_LISTS_ALTERNATE` (and only such a store: every other summary line is unchanged) each pass adds
+  these fields to the store summary, logs them as ONE line `[CRAWLER] pass-strategy {json}` and appends that
+  line to `<CRAWLER_LEDGER_DIR>/<siteId>.passes.ndjson`. The names are stable; a rename or a change of
+  meaning bumps `strategyVersion` (now `1`). The record adds no request to any store.
+
+  | Field | Meaning |
+  |---|---|
+  | `strategyVersion`, `siteId`, `at` | Record only: schema version, store, pass start (ISO-8601 UTC) |
+  | `strategy` | The pass's `alternation`: `lists`, `tap`, `fallback-tap`, `outside-window` or `off` |
+  | `strategyParams` | `{ratio, step}`: `alternationRatio` and `alternationStep`, both `null` outside the window or when off |
+  | `listsCompanies` | `[{entryId}]`: the company (lists group) read this pass; `[]` when none |
+  | `listsDomains` | The distinct domain ids of that group's lists (`[9, 1]` for an mfc company), from the list id's `-d<n>` |
+  | `listsPerList` | `[{listId, domainId, status, ids}]` per list of the group: `ok`, `failed`, or `skipped` (not fetched this pass: answered on an earlier pass, or not reached after a stop or a cooldown); `ids` = distinct ids with a url it offered |
+  | `idsDiscovered`, `idsNew`, `idsDup` | Distinct ids the tap's listing pages (recent and backfill) and the group's lists offered; of those, the ids neither the ledger, this run nor the lists backlog held; `idsDup = idsDiscovered - idsNew` |
+  | `challenges` | Challenge pages the tap or a company list answered (`reason: "challenge page"`) |
+  | `cooldowns` | The scraper's cooldown answers (503 with its `cooldown` envelope) to the tap or a company list |
+  | `listsStepMs` | Wall time of the lists step (rotate + drain); `0` when it did not run |
+  | `storePassMs` | Pass start to the end of the store's last discovery phase (the cross-store re-observe lane excluded) |
+  | `hostClock` | The store host's entry of OUR scraper's `/health/detailed` hostClock block, read ONCE per pass at pass end: `{host, floorMs, clocked, minGapMs60m, underFloor60m, sends60m, catalogListing, listingFetchP99Ms60m}` (`catalogListing` = `sends60m.catalogListing`). The host is the one the store's ledger urls name. `null` when the read fails (one WARN), the block is malformed, or no entry matches |
+
+  The ring keeps the last 30 days and at most 1 MiB (oldest lines dropped first, the newest always kept),
+  written through a tmp file and a rename on the ledger volume, so the history outlives the Job's pod. A
+  ring that cannot be read is left as found and the record lives in the log only (one WARN); lines that
+  are not records (a torn write) are dropped on the next append (one WARN). Query a store's history with
+  `jq -c '[.at, .strategy, .listsCompanies, .idsDiscovered, .idsNew, .idsDup, .challenges, .hostClock.underFloor60m]' mfc.passes.ndjson`.
 - **Stop switch** — remove the store from `CRAWLER_LISTS_DRAIN_CAPS` (no fetch, no drain); unset
   `CRAWLER_LISTS_WINDOW_UTC` to stop fetching while the backlog drains. A crawler on this version
   against an older engine loses only the priority (the old `/ingest/scrape` reads `url` alone), so every

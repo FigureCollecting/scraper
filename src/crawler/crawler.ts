@@ -96,6 +96,17 @@ import {
   type ListsState,
   type ListsStateStore,
 } from './listsState.js';
+import {
+  PASS_STRATEGY_VERSION,
+  domainIdOf,
+  pickHostClock,
+  storeHostOf,
+  type HostClockReader,
+  type PassListStat,
+  type PassRingStore,
+  type PassStrategyFields,
+  type PassStrategyRecord,
+} from './passStrategy.js';
 
 export type { CrawlerConfig, CrawlerMode } from './config.js';
 
@@ -135,6 +146,13 @@ export interface CrawlerDeps {
    * stream). Default: a fresh crypto seed per pass, logged, so a pass's page order can be replayed.
    */
   pagePoolSeed?: number;
+  /**
+   * PASS-STRATEGY (QB-U36): reads OUR scraper's hostClock block, once at the end of a pass with a store in
+   * CRAWLER_LISTS_ALTERNATE (run.ts: GET /health/detailed). Absent = the records carry `hostClock: null`.
+   */
+  readHostClock?: HostClockReader;
+  /** PASS-STRATEGY: the ring file each alternated store's record is appended to (run.ts: beside the ledgers). */
+  passRing?: PassRingStore;
 }
 
 /** What one declared seed list yielded this run (mode `seed` only), in the order the lists were polled. */
@@ -155,7 +173,11 @@ export interface SeedListStat {
   alsoDeclaredAs?: string[];
 }
 
-export interface CrawlerStoreSummary {
+/**
+ * PASS-STRATEGY (QB-U36): a store in CRAWLER_LISTS_ALTERNATE adds every field of PassStrategyFields (see
+ * passStrategy.ts) after the ones below; every other store's summary carries none of them.
+ */
+export interface CrawlerStoreSummary extends Partial<PassStrategyFields> {
   siteId: string;
   /** Listing pages fetched with 200 (recent + backfill). */
   pagesFetched: number;
@@ -546,6 +568,26 @@ interface StoreState {
   recentUnseen: number;
   /** How many items the recent read's page 1 held (0 = not read): the listing's page size, for the page pool. */
   recentPageSize: number;
+  /** PASS-STRATEGY counters, present only for a store in CRAWLER_LISTS_ALTERNATE: nothing else is counted. */
+  obs?: PassObs;
+}
+
+/** What the pass-strategy record counts while a pass runs (QB-U36). */
+interface PassObs {
+  /** Distinct ids (with a url) the tap's listing pages offered, recent and backfill. */
+  tapIds: Set<string>;
+  /** Of those, the ones neither the ledger, this run nor the lists backlog held when first met. */
+  tapNew: number;
+  /** The lists backlog's ids as the pass found them (a failed or corrupt read leaves it empty). */
+  backlog: Set<string>;
+  challenges: number;
+  cooldowns: number;
+  listsStepMs: number;
+  /** When the store's last discovery phase ended (pass start until one does). */
+  endMs: number;
+  /** The company group the lists step read, and its lists' outcomes. */
+  group: string | null;
+  perList: PassListStat[];
 }
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -804,6 +846,11 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
   }));
 
   for (const st of states) if (isPooled(st.siteId)) st.summary.pagePicks = [];
+  for (const st of states) {
+    if (alternated.has(st.siteId)) {
+      st.obs = { tapIds: new Set(), tapNew: 0, backlog: new Set(), challenges: 0, cooldowns: 0, listsStepMs: 0, endMs: startedAtMs, group: null, perList: [] };
+    }
+  }
 
   let budgetExhausted = false;
 
@@ -953,6 +1000,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       // would fabricate an observation in the one surface built for the operator to read. The crawl
       // behaviour is the same either way — the store is left alone this run.
       const isCooldown = isPlainObject(body) && body.error === 'cooldown';
+      if (isCooldown && st.obs && (axis === 'recent' || axis === 'backfill')) st.obs.cooldowns++;
       const remainingMs = isCooldown ? Number(body.remainingMs) : Number.NaN;
       emitFailure({
         site: st.siteId,
@@ -981,6 +1029,13 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       return stop('unsupported');
     }
     if (!res.ok) {
+      // PASS-STRATEGY: the engine names a challenge page in its 502 envelope; only an alternated store's tap reads it.
+      if (st.obs && (axis === 'recent' || axis === 'backfill')) {
+        const failure: unknown = await Promise.resolve()
+          .then(() => res.json())
+          .catch(() => undefined);
+        if (isPlainObject(failure) && failure.reason === 'challenge page') st.obs.challenges++;
+      }
       st.summary.errors++;
       logger.warn('[CRAWLER] catalog failed', { siteId: st.siteId, ...where, status: res.status });
       // E8 — the status here is the SCRAPER's, not the store's: 5xx = our own engine faulting,
@@ -1137,6 +1192,11 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       if (!item.collectUrl) {
         st.summary.uncollectable++;
         continue;
+      }
+      // PASS-STRATEGY: the tap's distinct ids, and whether each was new when first met.
+      if (st.obs && (phase === 'recent' || phase === 'backfill') && !st.obs.tapIds.has(item.itemId)) {
+        st.obs.tapIds.add(item.itemId);
+        if (!st.attempted.has(item.itemId) && !ledger.enqueued[item.itemId] && !st.obs.backlog.has(item.itemId)) st.obs.tapNew++;
       }
       if (st.attempted.has(item.itemId)) {
         st.summary.known++;
@@ -2061,6 +2121,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     const r = await listsGet(rotatingUrl(st.siteId, listId));
     const failed = (kind: 'deterministic' | 'transient', reason: string, blocked: boolean, reasonClass: FetchFailureReport['reasonClass'], httpStatus?: number): ListFetch => {
       st.summary.errors++;
+      if (st.obs && reasonClass === 'challenge') st.obs.challenges++;
       logger.warn('[CRAWLER] rotating list failed', { siteId: st.siteId, list: listId, failure: kind, reason });
       emitFailure({
         site: st.siteId,
@@ -2085,6 +2146,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     }
     if (r.status === 503 && body.error === 'cooldown') {
       st.summary.skipped++;
+      if (st.obs) st.obs.cooldowns++;
       logger.warn('[CRAWLER] rotating list host cooling — store left alone this run', { siteId: st.siteId, list: listId });
       return { kind: 'cooldown' };
     }
@@ -2207,6 +2269,8 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     let failed = 0;
     let reason: string | undefined;
     let stop: 'transient' | 'blocked' | 'cooldown' | 'budget' | undefined;
+    // PASS-STRATEGY: how each list ended THIS pass (a list not in here was not fetched).
+    const thisPass = new Map<string, { status: 'ok' | 'failed'; ids: number }>();
     for (const [i, listId] of lists.filter((id) => !Object.hasOwn(answered, id)).entries()) {
       if (i > 0) await sleep(config.listsSpacingMs ?? 10_000);
       st.listFetchIssued = true;
@@ -2219,10 +2283,12 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       if (out.kind === 'ok') {
         fetched++;
         answered[listId] = 'ok';
+        thisPass.set(listId, { status: 'ok', ids: new Set(out.items.filter((it) => it.collectUrl).map((it) => it.itemId)).size });
         for (const it of out.items) if (it.collectUrl && !union.has(it.itemId)) union.set(it.itemId, it);
         continue;
       }
       failed++;
+      thisPass.set(listId, { status: 'failed', ids: 0 });
       reason = out.reason;
       if (out.blocked || out.kind === 'transient') {
         st.stopped = true;
@@ -2234,6 +2300,10 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     st.summary.listsFetched = fetched;
     st.summary.listsFailed = failed;
     st.summary.listsIdsSeen = union.size;
+    if (st.obs) {
+      st.obs.group = group;
+      st.obs.perList = lists.map((listId) => ({ listId, domainId: domainIdOf(listId), status: thisPass.get(listId)?.status ?? 'skipped', ids: thisPass.get(listId)?.ids ?? 0 }));
+    }
 
     // Queue what neither the ledger, this run, nor the backlog (another group's copy) already holds.
     const queued = new Set(state.pending.map((p) => p.itemId));
@@ -2404,12 +2474,19 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     // A store the pass does not run (pulled out, ledger refused) has nothing to alternate.
     if (!alternated.has(st.siteId) || !st.ledger || st.stopped) return;
     const window = config.listsWindow ?? null;
+    // PASS-STRATEGY: a tap id already waiting in the lists backlog is not new. Only where this method reads no
+    // state itself is the backlog read here, once, silently: no lists step runs there to report a bad read.
+    const noteBacklog = async (): Promise<void> => {
+      if (!st.obs) return;
+      const read = await listsStore.load(st.siteId).catch(() => 'corrupt' as const);
+      if (read !== 'corrupt') st.obs.backlog = new Set(read.pending.map((p) => p.itemId));
+    };
     // No window = no list is ever fetched: there is nothing to alternate the tap with (listsSkipped says window-off).
-    if (!window) return;
+    if (!window) return noteBacklog();
     if (!inWindow(window, startedAtMs)) {
       st.passKind = 'outside-window';
       st.summary.alternation = 'outside-window';
-      return;
+      return noteBacklog();
     }
     let loaded: ListsState | 'corrupt';
     try {
@@ -2422,6 +2499,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
       logger.warn('[CRAWLER] lists state corrupt at pass start — no alternation this pass', { siteId: st.siteId });
       return;
     }
+    if (st.obs) st.obs.backlog = new Set(loaded.pending.map((p) => p.itemId));
     const windowStart = windowStartMs(window, startedAtMs);
     const ratio = config.listsAlternateRatios?.[st.siteId] ?? { lists: 1, tap: 1 };
     const cycle = ratio.lists + ratio.tap;
@@ -2498,7 +2576,9 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     if ((adopted || reanchored) && !(await commit())) return skipBoth('failed');
 
     await gapSweep(st, range, commit, 'reanchor');
+    const listsAt = now();
     await listsStep(st, commit);
+    if (st.obs) st.obs.listsStepMs += now() - listsAt;
     await gapSweep(st, range, commit, 'operator');
     await descentPhase(st, range, commit);
   };
@@ -2734,15 +2814,22 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
   // LISTS ALTERNATION: each alternated store's pass kind, decided before its tap. No knob, no extra step.
   if (alternated.size > 0) await Promise.all(states.map((st) => decideAlternation(st)));
 
+  // PASS-STRATEGY: when a store's discovery phases ended, for its storePassMs (the range phase, run last by
+  // every pass that alternates, sets the final value).
+  const settle = async (st: StoreState, work: Promise<void> | undefined): Promise<void> => {
+    await work;
+    if (st.obs) st.obs.endMs = now();
+  };
+
   // A LISTS pass skips the tap AND the backfill page: both read the Latest Additions listing.
   if (config.phases.includes('recent')) {
-    await Promise.all(states.map((st) => (st.passKind === 'lists' ? undefined : recentPhase(st))));
+    await Promise.all(states.map((st) => settle(st, st.passKind === 'lists' ? undefined : recentPhase(st))));
   }
   if (config.phases.includes('backfill')) {
-    await Promise.all(states.map((st) => (st.passKind === 'lists' ? undefined : backfillPhase(st))));
+    await Promise.all(states.map((st) => settle(st, st.passKind === 'lists' ? undefined : backfillPhase(st))));
     // The id-range walk goes LAST of the discovery phases: the newest ids (listing) always outrank the
     // deep id space for the run's budget, and a store may serve this axis while serving no listing at all.
-    await Promise.all(states.map((st) => (st.passKind === 'lists' ? rangeThenFallbackTap(st) : rangePhase(st))));
+    await Promise.all(states.map((st) => settle(st, st.passKind === 'lists' ? rangeThenFallbackTap(st) : rangePhase(st))));
   }
   // The RE-OBSERVATION lane runs after EVERY discovery phase, on its own per-store budget: discovery's
   // priority over the global request budget is therefore exactly what it was before this lane existed.
@@ -2750,10 +2837,70 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     await reobservePhase();
   }
 
+  const strategyRecords = alternated.size > 0 ? await passStrategyRecords() : [];
+
   const summary = summarize();
   logger.info('[CRAWLER] pass complete', summary as unknown as Record<string, unknown>);
   for (const s of summary.stores) {
     logger.info('[CRAWLER] store summary', s as unknown as Record<string, unknown>);
   }
+  await recordPassStrategies(strategyRecords);
   return summary;
+
+  /**
+   * PASS-STRATEGY (QB-U36): read the hostClock block ONCE, then give every alternated store its fields (on its
+   * summary) and its record. A failed read costs only the hostClock field.
+   */
+  async function passStrategyRecords(): Promise<PassStrategyRecord[]> {
+    let block: unknown;
+    if (deps.readHostClock) {
+      try {
+        block = await deps.readHostClock();
+      } catch (error) {
+        logger.warn('[CRAWLER] hostClock read failed — pass-strategy records carry hostClock null', { error: errMsg(error) });
+      }
+    }
+    const records: PassStrategyRecord[] = [];
+    for (const st of states) {
+      const o = st.obs;
+      if (!o) continue;
+      const s = st.summary;
+      const idsDiscovered = o.tapIds.size + s.listsIdsSeen;
+      const idsNew = o.tapNew + s.listsIdsNew;
+      const fields: PassStrategyFields = {
+        strategy: s.alternation,
+        strategyParams: { ratio: s.alternationRatio ?? null, step: s.alternationStep ?? null },
+        listsCompanies: o.group === null ? [] : [{ entryId: o.group }],
+        listsDomains: [...new Set(o.perList.flatMap((l) => (l.domainId === null ? [] : [l.domainId])))],
+        listsPerList: o.perList,
+        idsDiscovered,
+        idsNew,
+        idsDup: idsDiscovered - idsNew,
+        challenges: o.challenges,
+        cooldowns: o.cooldowns,
+        listsStepMs: o.listsStepMs,
+        storePassMs: o.endMs - startedAtMs,
+        hostClock: st.ledger ? pickHostClock(block, storeHostOf(st.ledger)) : null,
+      };
+      Object.assign(s, fields);
+      records.push({ strategyVersion: PASS_STRATEGY_VERSION, siteId: st.siteId, at: new Date(startedAtMs).toISOString(), ...fields });
+    }
+    return records;
+  }
+
+  /** One single-line `[CRAWLER] pass-strategy {json}` per record, then the ring; a ring failure is a WARN. */
+  async function recordPassStrategies(records: PassStrategyRecord[]): Promise<void> {
+    for (const rec of records) logger.info(`[CRAWLER] pass-strategy ${JSON.stringify(rec)}`);
+    if (!deps.passRing) return;
+    for (const rec of records) {
+      try {
+        const out = await deps.passRing.append(rec.siteId, rec);
+        if (out && out.droppedMalformed > 0) {
+          logger.warn('[CRAWLER] pass-strategy ring held malformed lines — dropped', { siteId: rec.siteId, droppedMalformed: out.droppedMalformed });
+        }
+      } catch (error) {
+        logger.warn('[CRAWLER] pass-strategy ring append failed — the record is in the log only', { siteId: rec.siteId, error: errMsg(error) });
+      }
+    }
+  }
 }
