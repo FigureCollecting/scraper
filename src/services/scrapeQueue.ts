@@ -27,6 +27,7 @@ import { enrichmentLogger } from '../utils/logger.js';
 import { createScrapingService } from './engineServices/scrapingService.js';
 import { createCapturingFetch, laneOf, ChallengePageError, FetchHeadersUnsupportedError, FetchMethodUnsupportedError, type CapturingFetch, type CapturingFetchTransports } from './engineServices/capturingFetch.js';
 import { evaluateRecordFetch, RecordFetchStatusError } from './recordFetchGate.js';
+import { tallyCapturingFetch, tallyPageFetcher, type FollowUpTally } from './challengeRecovery.js';
 import { observeMfcItemFetch } from './sessionCanary.js';
 import { getChallengeCooldown, ChallengeCooldownError, normalizeHost, type ChallengeCooldown } from './challengeCooldown.js';
 import { getHostClock, type HostClock } from './hostClock.js';
@@ -2270,7 +2271,10 @@ export class ScrapeQueue {
     // `ctx.scraping.fetchBody` follow-up (extractMany's second call) waits the store's declared
     // gap against THIS fetch, not against whenever the follow-up happens to be invoked.
     const primaryFetchedAt = Date.now();
-    const ctx = this.buildIngestExtractContext(item, ruleset, searchFetch, primaryFetchedAt);
+    // On a challenge-flagged page, count the ruleset's follow-ups that answer a real page: the only
+    // evidence that what it extracts came from somewhere other than the challenge body (see below).
+    const followUps: FollowUpTally = { clean: 0 };
+    const ctx = this.buildIngestExtractContext(item, ruleset, searchFetch, primaryFetchedAt, page.challenge ? followUps : undefined);
 
     let records: PluginExtractedData[];
     try {
@@ -2326,6 +2330,26 @@ export class ScrapeQueue {
         throw new ChallengePageError(item.url, page.transport ?? 'unknown', []);
       }
       throw error instanceof Error ? error : new Error(String(error));
+    }
+
+    // CHALLENGE PAGE, EXTRACTION SUCCEEDED, NOTHING RECOVERED — the THIRD door (NAME-ERRPAGE-1), and
+    // the one that let error pages into the spine: a ruleset extracts SOMETHING from any body, so a
+    // Cloudflare 522 page's <h1> became an MFC item's name, and the honesty gate below — which only runs
+    // AFTER the send — saw persisted>0 and booked the "amiami recovery". Recovery is a FOLLOW-UP that
+    // answered a real page (challengeRecovery.ts); without one, nothing extracted here is emitted and
+    // the page takes the same one-shot exit as the other two doors.
+    if (page.challenge && followUps.clean === 0) {
+      const lane = page.transport ?? 'unknown';
+      const reason = `challenge page via ${lane} transport (extracted, not recovered)`;
+      if (host !== undefined) {
+        cooldown.open(host, reason);
+        markStaleIfStored(this.getCfCookieStoreRef(), item.url, host, lane, reason);
+      }
+      console.error(
+        `[SCRAPE QUEUE] Refused ${records.length} record(s) extracted from a challenge page for ${sanitizeForLog(item.url)} ` +
+          `(ruleset ${ruleset.siteId}@${ruleset.version}): no follow-up fetch recovered it — nothing emitted, host cooldown opened`
+      );
+      throw new ChallengePageError(item.url, lane, []);
     }
 
     // IMAGE CAPTURE (capture-only): the extraction succeeded, so the store's own plates are now
@@ -2420,6 +2444,7 @@ export class ScrapeQueue {
     ruleset: ExtractionRuleset,
     searchFetch: SearchFetch | undefined,
     primaryFetchedAt: number,
+    followUps?: FollowUpTally,
   ): ExtractContext {
     let hostname: string | undefined;
     try {
@@ -2453,8 +2478,8 @@ export class ScrapeQueue {
     return buildExtractContext({
       config,
       logger: createPluginLogger(ruleset.siteId),
-      scraping: this.getRawPageFetcher(),
-      capturingFetch: this.getCapturingFetch(),
+      scraping: followUps ? tallyPageFetcher(this.getRawPageFetcher(), followUps) : this.getRawPageFetcher(),
+      capturingFetch: followUps ? tallyCapturingFetch(this.getCapturingFetch(), followUps) : this.getCapturingFetch(),
       searchFetch,
       cookies: item.cookies,
       primaryUrl: item.url,
