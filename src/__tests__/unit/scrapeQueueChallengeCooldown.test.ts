@@ -138,7 +138,7 @@ describe('ScrapeQueue × challenge cooldown', () => {
     return q;
   }
 
-  it('FAIL-FAST: a challenge that persists nothing is ONE fetch/send then FAILED, and opens the cooldown', async () => {
+  it('FAIL-FAST: a challenge nothing recovered is ONE fetch, no send, then FAILED, and opens the cooldown', async () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
     const http = jest.fn().mockResolvedValue(CHALLENGE_HTML);
     const send = jest.fn().mockResolvedValue(emptyStats());
@@ -150,7 +150,7 @@ describe('ScrapeQueue × challenge cooldown', () => {
     await advanceUntil(() => queue.getStats().failed === 1);
 
     expect(http).toHaveBeenCalledTimes(1);            // EXACTLY ONE fetch — no 3× retry storm
-    expect(send).toHaveBeenCalledTimes(1);            // EXACTLY ONE emit
+    expect(send).not.toHaveBeenCalled();              // refused before any emit: nothing recovered it (NAME-ERRPAGE-1)
     expect(queue.getStats().failed).toBe(1);
     expect(queue.getStats().completed).toBe(0);
     expect(queue.getStats().rateLimited).toBe(true);  // class stays rate_limited → global backoff preserved
