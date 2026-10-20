@@ -21,6 +21,8 @@ import {
   createRawCaptureSink,
   captureSiteFor,
   setCaptureSiteResolver,
+  captureAccountSessionFor,
+  setCaptureAccountSessionResolver,
   isImagePersistenceEnabled,
   toS3MetaData,
   S3ObjectStore,
@@ -257,6 +259,25 @@ describe('captureSiteFor — the late-bound page-site resolver', () => {
   it('is the resolver every sink built by createRawCaptureSink reports pages with', () => {
     const sink = createRawCaptureSink(FULL_ENV) as unknown as { siteFor?: unknown };
     expect(sink.siteFor).toBe(captureSiteFor);
+  });
+});
+
+describe('captureAccountSessionFor — the late-bound account-session resolver (RAW-MFC-1)', () => {
+  afterEach(() => setCaptureAccountSessionResolver(undefined));
+
+  it('treats no page as an account session before a resolver is registered', () => {
+    expect(captureAccountSessionFor('https://x.test/1')).toBe(false);
+  });
+
+  it('answers with the registered resolver, read at call time', () => {
+    setCaptureAccountSessionResolver((url) => url.startsWith('https://login.test/'));
+    expect(captureAccountSessionFor('https://login.test/item/1')).toBe(true);
+    expect(captureAccountSessionFor('https://x.test/1')).toBe(false);
+  });
+
+  it('is the resolver every sink built by createRawCaptureSink redacts with', () => {
+    const sink = createRawCaptureSink(FULL_ENV) as unknown as { accountSessionFor?: unknown };
+    expect(sink.accountSessionFor).toBe(captureAccountSessionFor);
   });
 });
 

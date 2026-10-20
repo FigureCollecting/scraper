@@ -272,7 +272,7 @@ export interface RawStoreConfig {
    */
   pathStyle?: boolean;
   /**
-   * RAW_CAPTURE_ACCOUNT_DATA: what a page rendered FOR the scrape account keeps of that account.
+   * RAW_CAPTURE_ACCOUNT_DATA: what a page fetched with an account session keeps of that account.
    * `redact` (the default, and what absent means) cuts it out before the page is hashed and stored
    * (captureRedaction); `keep` stores the page exactly as served.
    */
@@ -710,6 +710,11 @@ export class ObjectStoreCaptureSink implements CaptureSink {
      * unattributable page is left to the backfill and its site map.
      */
     private readonly siteFor?: PageSiteResolver,
+    /**
+     * Whether a page url was fetched with an ACCOUNT session (its host's stored jar holds a login,
+     * not just a clearance). Only those pages lose their account data; absent ⇒ none do.
+     */
+    private readonly accountSessionFor?: (url: string) => boolean,
   ) {
     if (config.keyScheme !== SUPPORTED_KEY_SCHEME) {
       throw new Error(
@@ -823,14 +828,24 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     return this.enqueue(() => this.storePage(page), byteLengthOf(page.bytes), 'page');
   }
 
+  /** Never throws: a resolver fault reads as an account session, the side that stores less. */
+  private fetchedWithAccount(c: RawCapture): boolean {
+    if (!this.accountSessionFor) return false;
+    try {
+      return this.accountSessionFor(c.finalUrl ?? c.url) || this.accountSessionFor(c.url);
+    } catch {
+      return true;
+    }
+  }
+
   /**
    * The page as it may be stored: unchanged, its account data cut out (re-addressed by the bytes
    * that remain, so the key, the dedup and the report all describe what is actually at rest), or
    * undefined when the cut could not be proven complete.
    */
   private withoutAccountData(c: RawCapture): RawCapture | undefined {
-    if (this.config.accountData === 'keep') return c;
-    const outcome = redactAccountData(c.finalUrl ?? c.url, asBuffer(c.bytes));
+    if (this.config.accountData === 'keep' || !this.fetchedWithAccount(c)) return c;
+    const outcome = redactAccountData(asBuffer(c.bytes));
     if (outcome.kind === 'untouched') return c;
     if (outcome.kind === 'redacted') {
       this.accountRedacted += 1;

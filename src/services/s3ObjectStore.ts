@@ -475,6 +475,20 @@ export function captureSiteFor(url: string): string | undefined {
 }
 
 /**
+ * Likewise late-bound: whether a page url was fetched with an ACCOUNT session, so its account data
+ * must come out before it is stored (captureRedaction). Unset ⇒ no page is treated as one.
+ */
+let captureAccountSessionResolver: ((url: string) => boolean) | undefined;
+
+export function setCaptureAccountSessionResolver(resolver: ((url: string) => boolean) | undefined): void {
+  captureAccountSessionResolver = resolver;
+}
+
+export function captureAccountSessionFor(url: string): boolean {
+  return captureAccountSessionResolver?.(url) ?? false;
+}
+
+/**
  * The composition-root factory: a real content-addressed sink when the raw-store
  * env is present and enabled, otherwise a NoopCaptureSink. Constructing the sink
  * asserts the key scheme (fail-fast on a misconfigured contract version).
@@ -485,7 +499,7 @@ export function createRawCaptureSink(env: NodeJS.ProcessEnv = process.env): Capt
   const store = new S3ObjectStore(loaded.config.bucket, loaded.config, loaded.creds);
   // Off unless REPORT_CAPTURES is armed. Null ⇒ the sink stores exactly as before, reporting nothing.
   const reporter = createCaptureReporterFromEnv(env);
-  return new ObjectStoreCaptureSink(store, loaded.config, reporter ? (r) => reporter.report(r) : undefined, captureSiteFor);
+  return new ObjectStoreCaptureSink(store, loaded.config, reporter ? (r) => reporter.report(r) : undefined, captureSiteFor, captureAccountSessionFor);
 }
 
 /**

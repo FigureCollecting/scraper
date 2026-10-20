@@ -1,16 +1,15 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { accountDataModeFromEnv, redactAccountData } from '../../services/captureRedaction';
+import { accountDataModeFromEnv, isAccountSession, redactAccountData } from '../../services/captureRedaction';
 
 // A SYNTHETIC logged-in item page, shaped like the stored ones (header user-menu, viewer-state
 // targets in #content and #side, the comment composer, inline ad-tech identity scripts). Every value
 // in it is invented; no captured page is used as a fixture.
 const LOGGED_IN = readFileSync(join(__dirname, '../fixtures/mfc/item-logged-in-synthetic.html'), 'utf8');
-const ITEM_URL = 'https://myfigurecollection.net/item/1';
 const VIEWER = 'scrapeuser';
 
-const redacted = (html: string, url = ITEM_URL): string => {
-  const out = redactAccountData(url, Buffer.from(html, 'utf8'));
+const redacted = (html: string): string => {
+  const out = redactAccountData(Buffer.from(html, 'utf8'));
   if (out.kind !== 'redacted') throw new Error(`expected redacted, got ${out.kind}`);
   return out.bytes.toString('utf8');
 };
@@ -39,26 +38,37 @@ describe('accountDataModeFromEnv — RAW_CAPTURE_ACCOUNT_DATA', () => {
   });
 });
 
-describe('redactAccountData — which pages it touches', () => {
-  it('leaves a page from any other store untouched', () => {
-    expect(redactAccountData('https://www.example-store.test/p/1', Buffer.from(LOGGED_IN)).kind).toBe('untouched');
+describe('isAccountSession — which stored jars are a LOGIN', () => {
+  it('is false with no stored cookies at all', () => {
+    expect(isAccountSession(undefined)).toBe(false);
+    expect(isAccountSession({})).toBe(false);
   });
 
-  it('does not treat a look-alike host as mfc', () => {
-    expect(redactAccountData('https://myfigurecollection.net.evil.test/item/1', Buffer.from(LOGGED_IN)).kind).toBe('untouched');
+  it('is false for a jar holding only Cloudflare clearance cookies', () => {
+    expect(isAccountSession({ cf_clearance: 'x', __cf_bm: 'y', _cfuvid: 'z' })).toBe(false);
   });
 
-  it('leaves a non-HTML mfc body (a JSON answer) untouched', () => {
-    expect(redactAccountData(ITEM_URL, Buffer.from('{"items":[1,2,3]}')).kind).toBe('untouched');
+  it('is true once the jar holds any session cookie beside them', () => {
+    expect(isAccountSession({ cf_clearance: 'x', PHPSESSID: 'y' })).toBe(true);
+  });
+});
+
+describe('redactAccountData — which bodies it touches', () => {
+  it('leaves a non-HTML body (a JSON answer) untouched', () => {
+    expect(redactAccountData(Buffer.from('{"items":[1,2,3]}')).kind).toBe('untouched');
   });
 
-  it('leaves an mfc page with nothing to remove untouched (no copy, no rehash)', () => {
-    const plain = '<!DOCTYPE html><html><head><title>t</title></head><body><section class="object">x</section></body></html>';
-    expect(redactAccountData(ITEM_URL, Buffer.from(plain)).kind).toBe('untouched');
+  it('leaves a page that shows no signed-in viewer untouched, inline scripts and all (no copy, no rehash)', () => {
+    // A session cookie alone proves nothing: one store's jar holds an anonymous visitor cookie.
+    const plain = '<!DOCTYPE html><html><head><title>t</title><script>var page = {"sku": 1};</script></head>' +
+      '<body><section class="object">x</section></body></html>';
+    expect(redactAccountData(Buffer.from(plain)).kind).toBe('untouched');
   });
 
-  it('applies on an mfc subdomain too', () => {
-    expect(redactAccountData('https://www.myfigurecollection.net/item/1', Buffer.from(LOGGED_IN)).kind).toBe('redacted');
+  it('REFUSES a page with a sign-out link but no account menu it can read', () => {
+    const moved = '<!DOCTYPE html><html><body><nav class="account-v2"><a href="/profile/someone">me</a>' +
+      '<a href="/session/signout/">Sign out</a></nav><section class="object">x</section></body></html>';
+    expect(redactAccountData(Buffer.from(moved)).kind).toBe('refused');
   });
 });
 
@@ -139,17 +149,18 @@ describe('redactAccountData — what a logged-in mfc page keeps', () => {
 describe('redactAccountData — fails closed', () => {
   it('REFUSES a logged-in page whose viewer still appears after the cut', () => {
     const leaky = LOGGED_IN.replace('<footer>', `<p>Added by <a href="/profile/${VIEWER}">${VIEWER}</a></p><footer>`);
-    const out = redactAccountData(ITEM_URL, Buffer.from(leaky));
+    const out = redactAccountData(Buffer.from(leaky));
     expect(out.kind).toBe('refused');
   });
 
   it('REFUSES a page whose sign-out link sits outside the user menu', () => {
     const leaky = LOGGED_IN.replace('<footer>', '<a href="/session/signout/">Sign out</a><footer>');
-    expect(redactAccountData(ITEM_URL, Buffer.from(leaky)).kind).toBe('refused');
+    expect(redactAccountData(Buffer.from(leaky)).kind).toBe('refused');
   });
 
   it('removes an unclosed viewer-state element whole rather than guessing where it ends', () => {
-    const unclosed = '<!DOCTYPE html><html><body><div class="tbx-target-NOTE"><section>secret';
+    const unclosed = '<!DOCTYPE html><html><body><div class="tbx-menu user-menu"><a class="handle" href="/profile/v1">v1</a></div>' +
+      '<div class="tbx-target-NOTE"><section>secret';
     const out = redacted(unclosed);
     expect(out).not.toContain('secret');
     expect(out).not.toContain('tbx-target-NOTE');

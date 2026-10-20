@@ -1,15 +1,23 @@
 /**
- * captureRedaction — take the SCRAPE ACCOUNT's own data out of a logged-in page before it is stored.
+ * captureRedaction — take the SCRAPE ACCOUNT's own data out of a page fetched with its login session
+ * before the page is stored.
  *
- * WHY: myfigurecollection.net is fetched with the stored login jar (the engine seeds it into the
- * impit session; it is what makes NSFW / age-gated items readable). So every mfc page we keep was
- * rendered FOR that account, and besides the item it carries the account itself: the header menu
- * (avatar, username, notification and message links, content toggles, sign-out), the viewer's state
- * for the item (collected or not, the private note, the lists it is on), the comment composer with
- * the viewer's avatar, and inline ad-tech scripts that push hashed identifiers. The raw store is
+ * WHY: one store is fetched with a stored LOGIN jar (the engine seeds the host's stored cookies into
+ * the impit session; that login is what makes its age-gated items readable). Every page we keep from
+ * it was rendered FOR that account, and besides the item it carries the account itself: the header
+ * menu (avatar, username, notification and message links, content toggles, sign-out), the viewer's
+ * state for the item (collected or not, the private note, the lists it is on), the comment composer
+ * with the viewer's avatar, and inline ad-tech scripts that push hashed identifiers. The raw store is
  * provenance kept for ever and indexed by url (RAW-MFC-1); none of that belongs in it.
  *
- * WHAT IS REMOVED on an mfc HTML page:
+ * WHEN: only for a page whose host's stored jar holds a cookie other than a Cloudflare clearance
+ * cookie — an account session (isAccountSession) — AND whose body shows a signed-in viewer (an account
+ * menu linking the viewer's /profile/). Which hosts carry a session is deployment data (the cookie
+ * file), so no store is named here. A session cookie alone proves nothing (one store's jar holds an
+ * anonymous visitor cookie), so a page that shows no viewer is stored exactly as served — unless it
+ * shows a sign-out link, which means a signed-in render this cannot read, and that is refused.
+ *
+ * WHAT IS REMOVED from such a page (the account chrome of the store fetched logged in today):
  *   - `.user-menu`, whole;
  *   - the CONTENTS of `.tbx-target-COLLECT`, `.tbx-target-COLLECTION`, `.tbx-target-NOTE` and
  *     `.tbx-target-LISTS` (the empty element stays, so the page keeps its shape);
@@ -24,8 +32,8 @@
  * /profile/ link) and for a sign-out link. A page that still shows either is REFUSED — not stored —
  * because a redaction that cannot be proven complete is not one.
  *
- * RAW_CAPTURE_ACCOUNT_DATA picks the mode: `keep` stores pages as served; anything else, unset and a
- * typo included, is `redact`.
+ * RAW_CAPTURE_ACCOUNT_DATA picks the mode: `keep` stores such pages as served; anything else, unset
+ * and a typo included, is `redact`.
  */
 import { load } from 'cheerio';
 
@@ -41,20 +49,24 @@ export function accountDataModeFromEnv(env: NodeJS.ProcessEnv = process.env): Ac
   return (env.RAW_CAPTURE_ACCOUNT_DATA ?? '').trim().toLowerCase() === 'keep' ? 'keep' : 'redact';
 }
 
-/** The hosts that ARE mfc. Subdomains count; a look-alike suffix does not. */
-const MFC_HOST = 'myfigurecollection.net';
-
 const VIEWER_STATE = '.tbx-target-COLLECT, .tbx-target-COLLECTION, .tbx-target-NOTE, .tbx-target-LISTS';
 const SIGN_OUT = /href\s*=\s*["']?[^"'\s>]*(?:\/session\/|logout)/i;
 
-function isMfc(url: string): boolean {
-  let host: string;
+/** Cloudflare's own cookies: a clearance proves a browser passed a challenge, not who is signed in. */
+const CLEARANCE_COOKIE = /^(?:cf_clearance|__cf_bm|__cflb|_cfuvid|cf_chl_.*)$/i;
+
+/** True when a host's stored jar carries a session for an ACCOUNT: any cookie that is not a clearance. */
+export function isAccountSession(cookies: Record<string, string> | undefined): boolean {
+  return cookies !== undefined && Object.keys(cookies).some(name => !CLEARANCE_COOKIE.test(name));
+}
+
+/** A percent-encoded path segment, decoded; the raw segment when it is not valid encoding. */
+function safeDecode(segment: string): string {
   try {
-    host = new URL(url).hostname.toLowerCase();
+    return decodeURIComponent(segment);
   } catch {
-    return false;
+    return segment;
   }
-  return host === MFC_HOST || host.endsWith(`.${MFC_HOST}`);
 }
 
 /** An HTML document, not a JSON or binary answer: the first non-blank bytes open a tag. */
@@ -104,17 +116,21 @@ function splice(text: string, ranges: Range[]): string {
 }
 
 /**
- * Redact one page body for `url`. Untouched unless the url is mfc, the body is HTML, and there is
- * something to remove.
+ * Redact one page body fetched with an account session. Untouched unless the body is HTML and there
+ * is something to remove.
  */
-export function redactAccountData(url: string, bytes: Buffer): RedactionOutcome {
-  if (!isMfc(url)) return { kind: 'untouched' };
+export function redactAccountData(bytes: Buffer): RedactionOutcome {
   const text = bytes.toString('utf8');
   if (!looksLikeHtml(text)) return { kind: 'untouched' };
 
   const $ = load(text, { sourceCodeLocationInfo: true });
   const viewerLink = /\/profile\/([^/?#"'\s]+)/.exec($('.user-menu a[href*="/profile/"]').first().attr('href') ?? '');
-  const viewer = viewerLink ? decodeURIComponent(viewerLink[1]).toLowerCase() : undefined;
+  const viewer = viewerLink ? safeDecode(viewerLink[1]).toLowerCase() : undefined;
+  if (viewer === undefined || viewer === '') {
+    // No viewer it can name. A sign-out link still says someone is signed in: refuse rather than
+    // store a render whose account chrome moved where these rules do not look.
+    return SIGN_OUT.test(text) ? { kind: 'refused', reason: 'a sign-out link with no account menu to cut' } : { kind: 'untouched' };
+  }
 
   const ranges: Range[] = [];
   const add = (r: Range | undefined): void => {
@@ -122,24 +138,20 @@ export function redactAccountData(url: string, bytes: Buffer): RedactionOutcome 
   };
   $('.user-menu').each((_, el) => add(whole(el as Located)));
   $(VIEWER_STATE).each((_, el) => add(inner(el as Located)));
-  if (viewer !== undefined) {
-    $('.user-expression-wrapper').each((_, el) => {
-      const ownedByViewer = $(el)
-        .find('a[href*="/profile/"]')
-        .toArray()
-        .some(a => ($(a).attr('href') ?? '').toLowerCase().includes(`/profile/${viewer}`));
-      if (ownedByViewer) add(whole(el as Located));
-    });
-  }
+  $('.user-expression-wrapper').each((_, el) => {
+    const ownedByViewer = $(el)
+      .find('a[href*="/profile/"]')
+      .toArray()
+      .some(a => ($(a).attr('href') ?? '').toLowerCase().includes(`/profile/${viewer}`));
+    if (ownedByViewer) add(whole(el as Located));
+  });
   $('script:not([src])').each((_, el) => {
     if (($(el).attr('type') ?? '').trim().toLowerCase() === 'application/ld+json') return;
     add(whole(el as Located));
   });
 
-  if (ranges.length === 0) return { kind: 'untouched' };
   const cut = splice(text, ranges);
-
-  if (viewer !== undefined && cut.toLowerCase().includes(viewer)) {
+  if (cut.toLowerCase().includes(viewer)) {
     return { kind: 'refused', reason: 'the viewer still appears after the cut' };
   }
   if (SIGN_OUT.test(cut)) return { kind: 'refused', reason: 'a sign-out link survives the cut' };

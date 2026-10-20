@@ -2410,11 +2410,13 @@ describe('ObjectStoreCaptureSink — account data on logged-in pages (RAW-MFC-1)
   const ITEM = 'https://myfigurecollection.net/item/7';
   const PAGE_CONFIG: RawStoreConfig = { ...CONFIG, jsonPrefix: 'raw-json/' };
   const mfcSite = (url: string): string | undefined => (url.startsWith('https://myfigurecollection.net/') ? 'mfc' : undefined);
+  // The deployment's cookie file holds a LOGIN for this one host only.
+  const loggedIn = (url: string): boolean => url.startsWith('https://myfigurecollection.net/');
 
   it('stores the REDACTED page by default, keyed and reported by the redacted bytes', async () => {
     const store = new FakeObjectStore();
     const reports: StoredCaptureReport[] = [];
-    const sink = new ObjectStoreCaptureSink(store, PAGE_CONFIG, async (r) => { reports.push(r); }, mfcSite);
+    const sink = new ObjectStoreCaptureSink(store, PAGE_CONFIG, async (r) => { reports.push(r); }, mfcSite, loggedIn);
     const c = cap({ url: ITEM, lane: 'api', bytes: LOGGED_IN });
 
     await send(sink, c);
@@ -2433,7 +2435,7 @@ describe('ObjectStoreCaptureSink — account data on logged-in pages (RAW-MFC-1)
 
   it('stores the page exactly as served when account data is kept', async () => {
     const store = new FakeObjectStore();
-    const sink = new ObjectStoreCaptureSink(store, { ...PAGE_CONFIG, accountData: 'keep' });
+    const sink = new ObjectStoreCaptureSink(store, { ...PAGE_CONFIG, accountData: 'keep' }, undefined, undefined, loggedIn);
     const c = cap({ url: ITEM, lane: 'api', bytes: LOGGED_IN });
 
     await send(sink, c);
@@ -2446,7 +2448,7 @@ describe('ObjectStoreCaptureSink — account data on logged-in pages (RAW-MFC-1)
   it('stores NOTHING when the redaction cannot be proven complete, and says so once', async () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
     const store = new FakeObjectStore();
-    const sink = new ObjectStoreCaptureSink(store, PAGE_CONFIG);
+    const sink = new ObjectStoreCaptureSink(store, PAGE_CONFIG, undefined, undefined, loggedIn);
     const leaky = Buffer.from(LOGGED_IN.toString('utf8').replace('</body>', '<p><a href="/profile/viewer1">viewer1</a></p></body>'), 'utf8');
 
     const admission = await sink.capture(cap({ url: ITEM, lane: 'api', bytes: leaky }));
@@ -2462,9 +2464,28 @@ describe('ObjectStoreCaptureSink — account data on logged-in pages (RAW-MFC-1)
     warn.mockRestore();
   });
 
+  it('stores a page fetched WITHOUT an account session exactly as served', async () => {
+    const store = new FakeObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, PAGE_CONFIG, undefined, undefined, () => false);
+
+    await send(sink, cap({ url: ITEM, lane: 'api', bytes: LOGGED_IN }));
+
+    expect(gunzipSync(store.puts[0].body).equals(LOGGED_IN)).toBe(true);
+    expect(sink.stats().accountRedacted).toBe(0);
+  });
+
+  it('reads a session resolver that throws as an account session — the side that stores less', async () => {
+    const store = new FakeObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, PAGE_CONFIG, undefined, undefined, () => { throw new Error('jar unreadable'); });
+
+    await send(sink, cap({ url: ITEM, lane: 'api', bytes: LOGGED_IN }));
+
+    expect(gunzipSync(store.puts[0].body).toString('utf8')).not.toContain('viewer1');
+  });
+
   it('leaves other stores\' pages and the asset lane alone', async () => {
     const store = new FakeObjectStore();
-    const sink = new ObjectStoreCaptureSink(store, PAGE_CONFIG);
+    const sink = new ObjectStoreCaptureSink(store, PAGE_CONFIG, undefined, undefined, loggedIn);
     const other = cap({ url: 'https://www.example-store.test/p/1', lane: 'api', bytes: LOGGED_IN });
 
     await send(sink, other);

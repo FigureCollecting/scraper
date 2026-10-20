@@ -17,7 +17,8 @@ import { getMaxPagesGuard } from './services/maxPagesGuard.js';
 import { announcePoolDispatch, getPoolDispatch } from './services/poolDispatch.js';
 import { LOOKUP_MIN_FETCH_MS, resolveLookupStoreTimeoutMs } from './driver/assembleLookup.js';
 import { residentialEgressView } from './services/residentialEgress.js';
-import { rawStoreView, flushRawCaptureSink, setCaptureSiteResolver } from './services/s3ObjectStore.js';
+import { rawStoreView, flushRawCaptureSink, setCaptureAccountSessionResolver, setCaptureSiteResolver } from './services/s3ObjectStore.js';
+import { isAccountSession } from './services/captureRedaction.js';
 import { imageCaptureView } from './services/images/assembleImageCapture.js';
 import { fetchFailureReportView } from './services/failureReporter.js';
 import { captureReportView } from './services/captureReporter.js';
@@ -134,6 +135,9 @@ async function startServer(): Promise<void> {
     // PAGE-CAPTURE ATTRIBUTION (RAW-MFC-1): a stored page is reported to the spine under the site key
     // of the store that claims its url — never under its hostname.
     setCaptureSiteResolver(url => registry.getSiteConfigForUrl(url)?.siteId);
+    // A page fetched with a stored ACCOUNT session (a login, not a clearance) loses that account's data
+    // before it is stored, unless RAW_CAPTURE_ACCOUNT_DATA=keep.
+    setCaptureAccountSessionResolver(url => isAccountSession(getCfCookieStore().cookiesFor(url)));
     queueBootstrap = bootstrap;
     // SHARED HOST CLOCK (SCRAPE_HOST_CLOCK, default off): a covered store host's own images are paced
     // on the clock its records book, at the floor the queue paces that host by (QB-U30a). Unbound, the
