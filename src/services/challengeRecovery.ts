@@ -54,3 +54,40 @@ export function tallyPageFetcher(fetcher: BrowserLaneFetcher, tally: FollowUpTal
     },
   };
 }
+
+/** The record field keys that carry a NAME (byte-identical family to the rulesets DATA-1 guard / fc-aggregation lifter). */
+const NAME_KEY = /^(?:name|title)$|^[a-z][A-Za-z]*(?:Name|Title)$|^(?:name|title)_[a-z]{2,3}$|^(?:name|title)[A-Z][a-z]{1,2}$/;
+
+const ENTITIES: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
+
+/** Visible text, tags as spaces, basic entities decoded, whitespace collapsed, lowercased. */
+function headline(text: string): string {
+  return text
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/&([a-z]+);/gi, (m, e: string) => ENTITIES[e.toLowerCase()] ?? m)
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+/**
+ * The name field a record LIFTED from the challenge body itself — one whose value is the challenge page's own
+ * <title> or first <h1> — or undefined. A follow-up that answered (the amiami item API) is no proof the record
+ * came from it: amiami falls back to the page's <h1> when the API answers "no item", and on a challenge page
+ * that <h1> is "Sorry, you have been blocked" or "Connection timed out Error code 522".
+ */
+export function nameLiftedFromChallenge(records: ReadonlyArray<{ fields?: Record<string, unknown> }>, html: string): string | undefined {
+  const heads = new Set<string>();
+  for (const tag of ['title', 'h1']) {
+    const m = new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)</${tag}>`, 'i').exec(html);
+    const h = m ? headline(m[1]) : '';
+    if (h) heads.add(h);
+  }
+  if (heads.size === 0) return undefined;
+  for (const record of records) {
+    for (const [key, value] of Object.entries(record.fields ?? {})) {
+      if (NAME_KEY.test(key) && typeof value === 'string' && heads.has(headline(value))) return key;
+    }
+  }
+  return undefined;
+}

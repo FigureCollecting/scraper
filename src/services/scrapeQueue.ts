@@ -27,7 +27,7 @@ import { enrichmentLogger } from '../utils/logger.js';
 import { createScrapingService } from './engineServices/scrapingService.js';
 import { createCapturingFetch, laneOf, ChallengePageError, FetchHeadersUnsupportedError, FetchMethodUnsupportedError, type CapturingFetch, type CapturingFetchTransports } from './engineServices/capturingFetch.js';
 import { evaluateRecordFetch, RecordFetchStatusError } from './recordFetchGate.js';
-import { tallyCapturingFetch, tallyPageFetcher, type FollowUpTally } from './challengeRecovery.js';
+import { nameLiftedFromChallenge, tallyCapturingFetch, tallyPageFetcher, type FollowUpTally } from './challengeRecovery.js';
 import { observeMfcItemFetch } from './sessionCanary.js';
 import { getChallengeCooldown, ChallengeCooldownError, normalizeHost, type ChallengeCooldown } from './challengeCooldown.js';
 import { getHostClock, type HostClock } from './hostClock.js';
@@ -2338,16 +2338,23 @@ export class ScrapeQueue {
     // AFTER the send — saw persisted>0 and booked the "amiami recovery". Recovery is a FOLLOW-UP that
     // answered a real page (challengeRecovery.ts); without one, nothing extracted here is emitted and
     // the page takes the same one-shot exit as the other two doors.
-    if (page.challenge && followUps.clean === 0) {
+    // A follow-up that answered is not proof the record came from it: a ruleset that falls back to the page
+    // (amiami, when its item API answers "no item") lifts the challenge page's own <title>/<h1> as the name.
+    // That record is refused too, but the host served the follow-up, so no cooldown is opened for it.
+    const lifted = page.challenge && followUps.clean > 0 ? nameLiftedFromChallenge(records, page.html) : undefined;
+    if (page.challenge && (followUps.clean === 0 || lifted !== undefined)) {
       const lane = page.transport ?? 'unknown';
       const reason = `challenge page via ${lane} transport (extracted, not recovered)`;
-      if (host !== undefined) {
+      if (host !== undefined && lifted === undefined) {
         cooldown.open(host, reason);
         markStaleIfStored(this.getCfCookieStoreRef(), item.url, host, lane, reason);
       }
       console.error(
         `[SCRAPE QUEUE] Refused ${records.length} record(s) extracted from a challenge page for ${sanitizeForLog(item.url)} ` +
-          `(ruleset ${ruleset.siteId}@${ruleset.version}): no follow-up fetch recovered it — nothing emitted, host cooldown opened`
+          `(ruleset ${ruleset.siteId}@${ruleset.version}): ` +
+          (lifted !== undefined
+            ? `'${lifted}' is the challenge page's own headline — nothing emitted`
+            : 'no follow-up fetch recovered it — nothing emitted, host cooldown opened')
       );
       throw new ChallengePageError(item.url, lane, []);
     }

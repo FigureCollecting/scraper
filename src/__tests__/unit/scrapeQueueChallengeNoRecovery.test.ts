@@ -18,6 +18,10 @@
  *   5. a follow-up through the scrapePage passthrough answering a real page → recovered.
  *   6. a follow-up fetchBody answering 5xx → not recovered.
  *   7. a NON-challenge page is untouched by any of this (no follow-up needed).
+ *   8. a scrapePage passthrough that answers a CF interstitial recovers nothing.
+ *   9. a scrapePageStealth passthrough answering a real page recovers.
+ *  10. a follow-up whose status the lane did not observe counts as recovered.
+ *  11. a follow-up answered, but the record is the challenge page's own h1 → nothing sent.
  */
 
 const mockNotifyItemFailed = jest.fn().mockResolvedValue(true);
@@ -258,5 +262,54 @@ describe('ScrapeQueue × challenge-flagged page: no emit without a recovered fol
     expect(send).toHaveBeenCalledTimes(1);
     expect(send.mock.calls[0][0].fields.name).toBe('Matoi Ryuuko Onsen Ver.');
     expect(cd.isOpen(HOST)).toBe(false);
+  });
+
+  it('(8) a scrapePage passthrough that answers a CF interstitial (status 200) recovers nothing', async () => {
+    const http = jest.fn().mockResolvedValue(CHALLENGE_HTML);
+    const scrapePage = jest.fn().mockResolvedValue({ html: CHALLENGE_HTML, url: 'x', title: 'Just a moment...', statusCode: 200 });
+    const send = jest.fn().mockResolvedValue(healthyStats());
+    queue = build(ruleset((ctx, url) => ctx!.scraping.scrapePage(url.replace('/item/', '/m/'))), 'http', { http, scrapePage }, send);
+    const url = `https://${HOST}/item/8`;
+    const captured = queue.enqueue(url, { url, sessionId: 's1' }).promise.catch((e: Error) => e);
+    await advanceUntil(() => queue.getStats().failed === 1);
+    expect(scrapePage).toHaveBeenCalledTimes(1);
+    expect(send).not.toHaveBeenCalled();
+    expect(((await captured) as Error).message).toContain('Cloudflare challenge page received');
+  });
+
+  it('(9) a scrapePageStealth passthrough answering a real page RECOVERS', async () => {
+    const http = jest.fn().mockResolvedValue(CHALLENGE_HTML);
+    const scrapePageStealth = jest.fn().mockResolvedValue({ html: CLEAN_HTML, url: 'x', title: 'Item', statusCode: 200 });
+    const send = jest.fn().mockResolvedValue(healthyStats());
+    queue = build(ruleset((ctx, url) => ctx!.scraping.scrapePageStealth(url.replace('/item/', '/m/'))), 'http', { http, scrapePageStealth }, send);
+    const url = `https://${HOST}/item/9`;
+    const result = queue.enqueue(url, { url, sessionId: 's1' });
+    await advanceUntil(() => queue.getStats().completed === 1 || queue.getStats().failed === 1);
+    await result.promise;
+    expect(scrapePageStealth).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('(10) a follow-up whose status the lane did not observe (bare body) counts as recovered', async () => {
+    const http = jest.fn((u: string) => Promise.resolve(u.includes('/api/') ? API_JSON : CHALLENGE_HTML));
+    const send = jest.fn().mockResolvedValue(healthyStats());
+    queue = build(ruleset((ctx, url) => ctx!.scraping.fetchBody!(url.replace('/item/', '/api/'))), 'http', { http }, send);
+    const url = `https://${HOST}/item/10`;
+    const result = queue.enqueue(url, { url, sessionId: 's1' });
+    await advanceUntil(() => queue.getStats().completed === 1 || queue.getStats().failed === 1);
+    await result.promise;
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('(11) a follow-up answered but the record is still the challenge page\'s own h1 (amiami "no item" fallback) → nothing sent', async () => {
+    const http = jest.fn((u: string) => Promise.resolve(u.includes('/api/') ? { body: '{"RSuccess":false,"item":null}', status: 200 } : { body: CF_522_HTML, status: 522 }));
+    const send = jest.fn().mockResolvedValue(healthyStats());
+    queue = build(ruleset((ctx, url) => ctx!.scraping.fetchBody!(url.replace('/item/', '/api/'))), 'http', { http }, send);
+    const url = `https://${HOST}/item/11`;
+    const captured = queue.enqueue(url, { url, sessionId: 's1' }).promise.catch((e: Error) => e);
+    await advanceUntil(() => queue.getStats().failed === 1 || queue.getStats().completed === 1);
+    expect(send).not.toHaveBeenCalled();
+    expect(((await captured) as Error).message).toContain('Cloudflare challenge page received');
+    expect(cd.isOpen(HOST)).toBe(false);               // the host served the follow-up: no cooldown for this one
   });
 });
