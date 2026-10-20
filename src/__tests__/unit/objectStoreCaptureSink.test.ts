@@ -1,4 +1,5 @@
 import { jest } from '@jest/globals';
+import { createHash } from 'node:crypto';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import { buildRawCapture, type RawCapture } from '../../services/captureSink';
 import type { StoredCaptureReport } from '../../services/captureReporter';
@@ -380,6 +381,8 @@ describe('ObjectStoreCaptureSink — the asset lane', () => {
     await send(sink, asset(JPEG));
     await send(sink, cap());
     expect(sink.stats()).toEqual({
+      accountRedacted: 0,
+      accountRefused: 0,
       stored: 1,
       deduped: 0,
       failed: 0,
@@ -2393,5 +2396,80 @@ describe('ObjectStoreCaptureSink — page-lane capture reporting (RAW-MFC-1)', (
 
     expect(reports).toHaveLength(0);
     warn.mockRestore();
+  });
+});
+
+// RAW-MFC-1: mfc pages are fetched with the login jar, so they are rendered FOR the scrape account.
+// The sink takes that account out before storing (captureRedaction), unless RAW_CAPTURE_ACCOUNT_DATA=keep.
+describe('ObjectStoreCaptureSink — account data on logged-in pages (RAW-MFC-1)', () => {
+  const LOGGED_IN = Buffer.from(
+    '<!DOCTYPE html><html><body><div class="tbx-menu user-menu"><a class="handle" href="/profile/viewer1">viewer1</a>' +
+      '<a href="/session/signout/">Sign out</a></div><section class="object">item record</section></body></html>',
+    'utf8',
+  );
+  const ITEM = 'https://myfigurecollection.net/item/7';
+  const PAGE_CONFIG: RawStoreConfig = { ...CONFIG, jsonPrefix: 'raw-json/' };
+  const mfcSite = (url: string): string | undefined => (url.startsWith('https://myfigurecollection.net/') ? 'mfc' : undefined);
+
+  it('stores the REDACTED page by default, keyed and reported by the redacted bytes', async () => {
+    const store = new FakeObjectStore();
+    const reports: StoredCaptureReport[] = [];
+    const sink = new ObjectStoreCaptureSink(store, PAGE_CONFIG, async (r) => { reports.push(r); }, mfcSite);
+    const c = cap({ url: ITEM, lane: 'api', bytes: LOGGED_IN });
+
+    await send(sink, c);
+
+    expect(store.puts).toHaveLength(1);
+    const stored = gunzipSync(store.puts[0].body).toString('utf8');
+    expect(stored).not.toContain('viewer1');
+    expect(stored).not.toContain('/session/');
+    expect(stored).toContain('<section class="object">item record</section>');
+    const sha = createHash('sha256').update(stored, 'utf8').digest('hex');
+    expect(store.puts[0].key).toBe(`raw-json/sha256/${sha.slice(0, 2)}/${sha}.json.gz`);
+    expect(reports[0].sha256).toBe(sha);
+    expect(reports[0].bytesLen).toBe(Buffer.byteLength(stored));
+    expect(sink.stats().accountRedacted).toBe(1);
+  });
+
+  it('stores the page exactly as served when account data is kept', async () => {
+    const store = new FakeObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, { ...PAGE_CONFIG, accountData: 'keep' });
+    const c = cap({ url: ITEM, lane: 'api', bytes: LOGGED_IN });
+
+    await send(sink, c);
+
+    expect(gunzipSync(store.puts[0].body).equals(LOGGED_IN)).toBe(true);
+    expect(store.puts[0].key).toContain(c.sha256);
+    expect(sink.stats().accountRedacted).toBe(0);
+  });
+
+  it('stores NOTHING when the redaction cannot be proven complete, and says so once', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new FakeObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, PAGE_CONFIG);
+    const leaky = Buffer.from(LOGGED_IN.toString('utf8').replace('</body>', '<p><a href="/profile/viewer1">viewer1</a></p></body>'), 'utf8');
+
+    const admission = await sink.capture(cap({ url: ITEM, lane: 'api', bytes: leaky }));
+    await sink.capture(cap({ url: ITEM, lane: 'api', bytes: Buffer.concat([leaky, Buffer.from(' ')]) }));
+    await sink.flush();
+
+    expect(admission).toEqual({ admitted: true }); // a decision, not a transient refusal
+    expect(store.puts).toHaveLength(0);
+    expect(sink.stats().accountRefused).toBe(2);
+    const lines = warn.mock.calls.map((a) => String(a[0])).filter((l) => l.includes('account data'));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).not.toContain('viewer1');
+    warn.mockRestore();
+  });
+
+  it('leaves other stores\' pages and the asset lane alone', async () => {
+    const store = new FakeObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, PAGE_CONFIG);
+    const other = cap({ url: 'https://www.example-store.test/p/1', lane: 'api', bytes: LOGGED_IN });
+
+    await send(sink, other);
+
+    expect(gunzipSync(store.puts[0].body).equals(LOGGED_IN)).toBe(true);
+    expect(sink.stats().accountRedacted).toBe(0);
   });
 });

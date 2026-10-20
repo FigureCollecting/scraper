@@ -30,6 +30,7 @@ import { Client as MinioClient } from 'minio';
 import type { CaptureSink } from './captureSink.js';
 import { NoopCaptureSink } from './captureSink.js';
 import { createCaptureReporterFromEnv } from './captureReporter.js';
+import { accountDataModeFromEnv } from './captureRedaction.js';
 import {
   ObjectStoreCaptureSink,
   MIN_RAW_STORE_ASSET_MAX_WAIT_MS,
@@ -453,6 +454,7 @@ export function loadRawStoreConfigFromEnv(
     assetMaxWaitMs: parseAssetMaxWaitMs(env.RAW_STORE_ASSET_MAX_WAIT_MS),
     maxImageBytes: parseImageMaxBytes(env.RAW_STORE_IMAGE_MAX_BYTES),
     pathStyle: env.RAW_STORE_S3_PATH_STYLE !== undefined ? env.RAW_STORE_S3_PATH_STYLE === 'true' : undefined,
+    accountData: accountDataModeFromEnv(env),
   };
   return { config, creds: { accessKeyId, secretAccessKey } };
 }

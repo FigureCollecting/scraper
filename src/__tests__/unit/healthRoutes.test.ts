@@ -387,6 +387,8 @@ describe('createHealthRoutes — rawStore counters', () => {
   // Typed, so the fixture cannot drift from the sink: a counter added to SinkStats must
   // reach this surface, and a counter this fixture invents must exist on the sink.
   const STATS: SinkStats = {
+    accountRedacted: 5,
+    accountRefused: 1,
     stored: 12,
     deduped: 3,
     failed: 0,

@@ -106,11 +106,13 @@
  * seventh asset with the queue EMPTY and two workers idle — the empty-queue admission
  * the reservation promises, broken by a knob that is not the concurrency knob.
  */
+import { createHash } from 'node:crypto';
 import { gzip } from 'node:zlib';
 import { promisify } from 'node:util';
 import type { CaptureAdmission, CaptureSink, RawCapture } from './captureSink.js';
 import { CAPTURE_ADMITTED } from './captureSink.js';
 import type { ReportStoredCapture, StoredCaptureReport } from './captureReporter.js';
+import { redactAccountData, type AccountDataMode } from './captureRedaction.js';
 import { sanitizeForLog } from '../utils/security.js';
 
 /** What a store round trip resolved to — the value a B5 in-flight loser reports rather than guesses. */
@@ -269,6 +271,12 @@ export interface RawStoreConfig {
    * the adapter defaults to `false` (path-style off). Unused by the sink logic.
    */
   pathStyle?: boolean;
+  /**
+   * RAW_CAPTURE_ACCOUNT_DATA: what a page rendered FOR the scrape account keeps of that account.
+   * `redact` (the default, and what absent means) cuts it out before the page is hashed and stored
+   * (captureRedaction); `keep` stores the page exactly as served.
+   */
+  accountData?: AccountDataMode;
 }
 
 /** Why an asset-lane capture was skipped without being stored. */
@@ -279,6 +287,10 @@ export type AssetSkipCounts = Record<AssetSkipReason, number>;
 
 /** Observable counters — the leak/failure surface for prod (mirrors BrowserPool). */
 export interface SinkStats {
+  /** Page captures stored with the scrape account's own data cut out (RAW_CAPTURE_ACCOUNT_DATA). */
+  accountRedacted: number;
+  /** Page captures NOT stored because their redaction could not be proven complete. */
+  accountRefused: number;
   stored: number;
   deduped: number;
   failed: number;
@@ -425,6 +437,8 @@ export const DEFAULT_RAW_STORE_ASSET_MAX_WAIT_MS = 30_000;
 export const MIN_RAW_STORE_ASSET_MAX_WAIT_MS = 1_000;
 /** Drops are loud, but once a minute — a wave must not turn into a log flood. */
 const DROP_LOG_INTERVAL_MS = 60_000;
+/** One line per hour for refused account redactions: the volume is in accountRefused. */
+const ACCOUNT_REFUSAL_LOG_INTERVAL_MS = 60 * 60_000;
 /** Rolling latency window. Percentiles over the recent past, at a fixed memory cost. */
 const LATENCY_SAMPLE_MAX = 512;
 
@@ -630,6 +644,9 @@ export class ObjectStoreCaptureSink implements CaptureSink {
   private droppedBytes = 0;
   private droppedSinceLog = 0;
   private lastDropLogAt = 0;
+  private accountRedacted = 0;
+  private accountRefused = 0;
+  private lastAccountRefusalLogAt = 0;
   private assetRefusedReserveDepth = 0;
   private assetRefusedReserveBytes = 0;
   private assetHeldSinceLog = 0;
@@ -734,6 +751,8 @@ export class ObjectStoreCaptureSink implements CaptureSink {
 
   stats(): SinkStats {
     return {
+      accountRedacted: this.accountRedacted,
+      accountRefused: this.accountRefused,
       stored: this.stored,
       deduped: this.deduped,
       failed: this.failed,
@@ -799,7 +818,35 @@ export class ObjectStoreCaptureSink implements CaptureSink {
       this.skippedDisabled += 1;
       return CAPTURE_ADMITTED; // a DECISION, not a refusal — re-offering changes nothing
     }
-    return this.enqueue(() => this.storePage(c), byteLengthOf(c.bytes), 'page');
+    const page = this.withoutAccountData(c);
+    if (!page) return CAPTURE_ADMITTED; // refused for its account data: a decision, like the kill switch
+    return this.enqueue(() => this.storePage(page), byteLengthOf(page.bytes), 'page');
+  }
+
+  /**
+   * The page as it may be stored: unchanged, its account data cut out (re-addressed by the bytes
+   * that remain, so the key, the dedup and the report all describe what is actually at rest), or
+   * undefined when the cut could not be proven complete.
+   */
+  private withoutAccountData(c: RawCapture): RawCapture | undefined {
+    if (this.config.accountData === 'keep') return c;
+    const outcome = redactAccountData(c.finalUrl ?? c.url, asBuffer(c.bytes));
+    if (outcome.kind === 'untouched') return c;
+    if (outcome.kind === 'redacted') {
+      this.accountRedacted += 1;
+      return { ...c, bytes: outcome.bytes, sha256: createHash('sha256').update(outcome.bytes).digest('hex') };
+    }
+    this.accountRefused += 1;
+    const now = Date.now();
+    if (now - this.lastAccountRefusalLogAt >= ACCOUNT_REFUSAL_LOG_INTERVAL_MS) {
+      this.lastAccountRefusalLogAt = now;
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[RAW-STORE] page NOT stored: its account data could not be fully redacted (${outcome.reason}); ` +
+          `${this.accountRefused} refused so far — one line per hour, the count is on /health/detailed`,
+      );
+    }
+    return undefined;
   }
 
   /** The page/api lanes' store round trip, on a worker. Swallows-but-counts. */

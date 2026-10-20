@@ -228,6 +228,17 @@ describe('createRawCaptureSink', () => {
   });
 });
 
+describe('loadRawStoreConfigFromEnv — RAW_CAPTURE_ACCOUNT_DATA (RAW-MFC-1)', () => {
+  it('redacts account data unless told otherwise', () => {
+    expect(loadRawStoreConfigFromEnv(FULL_ENV)?.config.accountData).toBe('redact');
+  });
+
+  it('keeps it only on an explicit keep', () => {
+    const env = { ...FULL_ENV, RAW_CAPTURE_ACCOUNT_DATA: 'keep' } as unknown as NodeJS.ProcessEnv;
+    expect(loadRawStoreConfigFromEnv(env)?.config.accountData).toBe('keep');
+  });
+});
+
 // RAW-MFC-1: the sink is built before the plugins load, so it reads the page-site resolver LATE —
 // whatever the composition root last registered is what a page report is attributed with.
 describe('captureSiteFor — the late-bound page-site resolver', () => {
