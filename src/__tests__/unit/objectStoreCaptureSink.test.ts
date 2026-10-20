@@ -2266,6 +2266,21 @@ describe('ObjectStoreCaptureSink — page-lane capture reporting (RAW-MFC-1)', (
     expect('engineVersion' in r).toBe(false);
   });
 
+  it('carries the negotiation witnesses when the page had them, and omits status and type when it had none', async () => {
+    const store = new FakeObjectStore();
+    const reports: StoredCaptureReport[] = [];
+    const sink = new ObjectStoreCaptureSink(store, PAGE_CONFIG, async (r) => { reports.push(r); }, siteFor);
+
+    await send(sink, cap({ contentEncoding: 'br', vary: 'Accept-Encoding' }));
+    await send(sink, buildRawCapture({ url: 'https://myfigurecollection.net/item/9', lane: 'api', bytes: Buffer.from('<html>9</html>') }));
+
+    expect(reports[0].contentEncoding).toBe('br');
+    expect(reports[0].vary).toBe('Accept-Encoding');
+    expect('httpStatus' in reports[1]).toBe(false);
+    expect('contentType' in reports[1]).toBe(false);
+    expect('contentEncoding' in reports[1]).toBe(false);
+  });
+
   it('reports wire and dom captures under raw-html/ with their own lanes', async () => {
     const store = new FakeObjectStore();
     const reports: StoredCaptureReport[] = [];
@@ -2462,6 +2477,17 @@ describe('ObjectStoreCaptureSink — account data on logged-in pages (RAW-MFC-1)
     expect(lines).toHaveLength(1);
     expect(lines[0]).not.toContain('viewer1');
     warn.mockRestore();
+  });
+
+  it('stores a session page that shows no viewer exactly as served', async () => {
+    const store = new FakeObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, PAGE_CONFIG, undefined, undefined, loggedIn);
+    const anonymous = Buffer.from('<!DOCTYPE html><html><body><script>var a = 1;</script><p>x</p></body></html>');
+
+    await send(sink, cap({ url: ITEM, lane: 'api', bytes: anonymous }));
+
+    expect(gunzipSync(store.puts[0].body).equals(anonymous)).toBe(true);
+    expect(sink.stats().accountRedacted).toBe(0);
   });
 
   it('stores a page fetched WITHOUT an account session exactly as served', async () => {

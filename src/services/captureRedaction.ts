@@ -79,25 +79,25 @@ interface Range {
   end: number;
 }
 
+/** Every element of a document parsed with sourceCodeLocationInfo carries its source offsets. */
 interface Located {
-  sourceCodeLocation?: {
+  sourceCodeLocation: {
     startOffset: number;
     endOffset: number;
     startTag?: { endOffset: number };
     endTag?: { startOffset: number };
-  } | null;
+  };
 }
 
 /** The element's whole source range, start tag through end tag. */
-function whole(el: Located): Range | undefined {
+function whole(el: Located): Range {
   const loc = el.sourceCodeLocation;
-  return loc ? { start: loc.startOffset, end: loc.endOffset } : undefined;
+  return { start: loc.startOffset, end: loc.endOffset };
 }
 
 /** What lies between the element's tags; the whole element when it was never closed. */
-function inner(el: Located): Range | undefined {
+function inner(el: Located): Range {
   const loc = el.sourceCodeLocation;
-  if (!loc) return undefined;
   if (!loc.startTag || !loc.endTag) return { start: loc.startOffset, end: loc.endOffset };
   return { start: loc.startTag.endOffset, end: loc.endTag.startOffset };
 }
@@ -133,8 +133,8 @@ export function redactAccountData(bytes: Buffer): RedactionOutcome {
   }
 
   const ranges: Range[] = [];
-  const add = (r: Range | undefined): void => {
-    if (r) ranges.push(r);
+  const add = (r: Range): void => {
+    ranges.push(r);
   };
   $('.user-menu').each((_, el) => add(whole(el as Located)));
   $(VIEWER_STATE).each((_, el) => add(inner(el as Located)));
@@ -142,7 +142,7 @@ export function redactAccountData(bytes: Buffer): RedactionOutcome {
     const ownedByViewer = $(el)
       .find('a[href*="/profile/"]')
       .toArray()
-      .some(a => ($(a).attr('href') ?? '').toLowerCase().includes(`/profile/${viewer}`));
+      .some(a => String($(a).attr('href')).toLowerCase().includes(`/profile/${viewer}`));
     if (ownedByViewer) add(whole(el as Located));
   });
   $('script:not([src])').each((_, el) => {

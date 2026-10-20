@@ -275,6 +275,12 @@ describe('captureAccountSessionFor — the late-bound account-session resolver (
     expect(captureAccountSessionFor('https://x.test/1')).toBe(false);
   });
 
+  it('hands the sink a reporter when capture reporting is armed', () => {
+    const env = { ...FULL_ENV, INGEST_BASE_URL: 'http://127.0.0.1:1', REPORT_CAPTURES: 'true' } as unknown as NodeJS.ProcessEnv;
+    const sink = createRawCaptureSink(env) as unknown as { reportCapture?: unknown };
+    expect(typeof sink.reportCapture).toBe('function');
+  });
+
   it('is the resolver every sink built by createRawCaptureSink redacts with', () => {
     const sink = createRawCaptureSink(FULL_ENV) as unknown as { accountSessionFor?: unknown };
     expect(sink.accountSessionFor).toBe(captureAccountSessionFor);

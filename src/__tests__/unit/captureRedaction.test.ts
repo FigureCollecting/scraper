@@ -146,6 +146,37 @@ describe('redactAccountData — what a logged-in mfc page keeps', () => {
   });
 });
 
+describe('redactAccountData — edges of the cut', () => {
+  const menu = '<div class="tbx-menu user-menu"><a class="handle" href="/profile/v1">v1</a><script>track("v1")</script></div>';
+
+  it('keeps another member\'s comment: only the viewer\'s own expression goes', () => {
+    const page = `<!DOCTYPE html><html><body>${menu}<div class="user-expression-wrapper"><a href="/profile/someoneelse">x</a>` +
+      'great figure</div></body></html>';
+    const out = redacted(page);
+    expect(out).toContain('<div class="user-expression-wrapper"><a href="/profile/someoneelse">x</a>great figure</div>');
+  });
+
+  it('cuts a script nested inside the menu once, with the menu', () => {
+    const page = `<!DOCTYPE html><html><body>${menu}<p>kept</p></body></html>`;
+    expect(redacted(page)).toBe('<!DOCTYPE html><html><body><p>kept</p></body></html>');
+  });
+
+  it('leaves an already-empty viewer-state element as it is', () => {
+    const page = `<!DOCTYPE html><html><body>${menu}<div class="tbx-target-NOTE"></div></body></html>`;
+    expect(redacted(page)).toBe('<!DOCTYPE html><html><body><div class="tbx-target-NOTE"></div></body></html>');
+  });
+
+  it('reads the process environment when none is passed', () => {
+    const before = process.env.RAW_CAPTURE_ACCOUNT_DATA;
+    delete process.env.RAW_CAPTURE_ACCOUNT_DATA;
+    try {
+      expect(accountDataModeFromEnv()).toBe('redact');
+    } finally {
+      if (before !== undefined) process.env.RAW_CAPTURE_ACCOUNT_DATA = before;
+    }
+  });
+});
+
 describe('redactAccountData — fails closed', () => {
   it('REFUSES a logged-in page whose viewer still appears after the cut', () => {
     const leaky = LOGGED_IN.replace('<footer>', `<p>Added by <a href="/profile/${VIEWER}">${VIEWER}</a></p><footer>`);
