@@ -79,3 +79,25 @@ The scraper must not read the spine database, so the work list is a file the ope
 media-manager's clean copy (`app/workers/mask_seed.py`, branch feat/mm-report-1) is the minimal one; the byte and pixel caps
 before decode (its I8 unit) have not landed and `mask_batch.py:806` decompresses without a size cap. Land them before the
 bulk run.
+
+## Job sketch (for fc-infra; not applied by this unit)
+
+```
+# one-shot Job, scraper image, no npm in the image: node dist/...
+args: ["node","dist/services/images/galleryCaptureCli.js","--probe","20"]      # first run
+args: ["node","dist/services/images/galleryCaptureCli.js","--max-files","20000","--max-minutes","330"]   # staged real runs
+env:
+  PERSIST_RAW_IMAGES: "true"            # the lane must be on; the driver refuses to fetch what would be dropped
+  REPORT_CAPTURES: "true"               # + INGEST_BASE_URL, RAW_STORE_S3_* exactly as the scraper Deployment has them
+  IMAGE_HOST_POLICY_JSON: '{"static.myfigurecollection.net":{"lane":"http","egress":"direct"}}'
+  IMAGE_HOST_RATE_JSON:   '{"static.myfigurecollection.net":{"intervalMs":1000}}'     # desk IMGRATE
+  GALLERY_WORKLIST_PATH: /state/wl.jsonl     # from `npm run gallery:worklist` (fc-aggregation)
+  GALLERY_LEDGER_PATH:   /state/ledger.jsonl
+  GALLERY_SOURCE_CLASS:  unknown             # until Ross rules on official vs member pictures
+volumes: a small PVC at /state (the work list ~170 MB for the whole catalogue, the ledger grows ~100 bytes a file)
+network: egress 443 to static.myfigurecollection.net and the raw store, plus the ingest listener, as the scraper has it
+```
+
+Operator flow: run `gallery:worklist`, copy the file to the PVC, run the probe Job and read `PROBE PASS|FAIL` (exit 5 on
+anything but PASS), then run staged real Jobs until the list is done. A block pauses the Job (exit 3) and writes the marker;
+`--resume` clears it deliberately.
