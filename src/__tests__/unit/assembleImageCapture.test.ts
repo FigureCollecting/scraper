@@ -5,6 +5,7 @@
  */
 import {
   createImageCaptureHookFromEnv,
+  createImageHostLimiter,
   createRecordImageCapture,
   getImageCaptureHook,
   imageCaptureView,
@@ -363,5 +364,19 @@ describe('createImageCaptureHookFromEnv — a lane needs a real store, not just 
     const view = imageCaptureView(createImageCaptureHookFromEnv(env(), { sink: { capture: async () => undefined } }));
     expect(view).toMatchObject({ enabled: false });
     expect(view.reason).toMatch(/raw store/i);
+  });
+});
+
+describe('createImageHostLimiter (IMAGE_HOST_RATE_JSON)', () => {
+  it('pins a configured image host to its interval and leaves every other host on the limiter default', () => {
+    const limiter = createImageHostLimiter(env({ IMAGE_HOST_RATE_JSON: JSON.stringify({ 'static.myfigurecollection.net': { intervalMs: 1000 } }) }));
+    expect(limiter.currentDelay('static.myfigurecollection.net')).toBe(1000);
+    for (let i = 0; i < 30; i++) limiter.recordSuccess('static.myfigurecollection.net');
+    expect(limiter.currentDelay('static.myfigurecollection.net')).toBe(1000);
+    expect(limiter.currentDelay('cdn.shopify.com')).toBe(2067);
+  });
+
+  it('is the old behaviour without the variable', () => {
+    expect(createImageHostLimiter(env()).currentDelay('static.myfigurecollection.net')).toBe(2067);
   });
 });

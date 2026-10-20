@@ -12,6 +12,7 @@
  * and a second hook would quietly double every one of them.
  */
 import type { ExtractedData, ExtractionRuleset, SearchFetch } from '@figurecollecting/scraper-plugin-contract';
+import { imageHostRateFor } from './imageHostRates.js';
 import { HostRateLimiter } from '../../driver/hostRateLimiter.js';
 import { getRawCaptureSink, isImagePersistenceEnabled, rawStoreView } from '../s3ObjectStore.js';
 import type { CaptureSink } from '../captureSink.js';
@@ -131,6 +132,15 @@ function lazyGatedLane(resolveLane: () => GatedTabLane): GatedTabBytesFetcher {
 }
 
 /**
+ * The image lane's limiter. A host named in IMAGE_HOST_RATE_JSON gets that pinned gap; every other image host
+ * gets the limiter's own default: a CDN is not in the store profile index, so there is nothing store-specific
+ * to look up, and there should not be.
+ */
+export function createImageHostLimiter(env: NodeJS.ProcessEnv = process.env): HostRateLimiter {
+  return new HostRateLimiter(imageHostRateFor(env));
+}
+
+/**
  * Build the process's image capture hook from the environment.
  *
  * The pacing wrapper goes OUTSIDE the lane router, not around each lane: the budget belongs to the
@@ -166,9 +176,7 @@ export function createImageCaptureHookFromEnv(
         impit: createImpitBytesFetch(),
         gated: lazyGatedLane(deps.browserLane ?? (() => createCapturingScrapingService())),
       }),
-      // An unmapped image host gets the limiter's own default gap: a CDN is not in the store profile
-      // index, so there is nothing store-specific to look up, and there should not be.
-      new HostRateLimiter(() => undefined),
+      createImageHostLimiter(env),
     );
   const reporter = createFailureReporterFromEnv(env);
   // The memo-hit reporter: a second item sharing an image never reaches the sink (which reports the
