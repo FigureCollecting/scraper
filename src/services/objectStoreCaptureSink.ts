@@ -115,6 +115,8 @@ import { sanitizeForLog } from '../utils/security.js';
 
 /** What a store round trip resolved to — the value a B5 in-flight loser reports rather than guesses. */
 type StoreOutcome = 'stored' | 'deduped';
+/** url -> the registered store's site key, or undefined when no store claims the url. */
+export type PageSiteResolver = (url: string) => string | undefined;
 /**
  * An op already running for a content address. The loser reports the WINNER's `fetchedAt` (so the two
  * dedup into ONE raw.capture rather than fork on the loser's own clock) and the winner's `done` outcome
@@ -685,6 +687,12 @@ export class ObjectStoreCaptureSink implements CaptureSink {
      * capture path; a report that fails is the reporter's own to swallow and count.
      */
     private readonly reportCapture?: ReportStoredCapture,
+    /**
+     * The store's site key for a PAGE url (the plugin registry's answer). Absent, or undefined for a
+     * url, ⇒ that page is stored but not reported: a hostname is never interned as a site, so an
+     * unattributable page is left to the backfill and its site map.
+     */
+    private readonly siteFor?: PageSiteResolver,
   ) {
     if (config.keyScheme !== SUPPORTED_KEY_SCHEME) {
       throw new Error(
@@ -801,9 +809,19 @@ export class ObjectStoreCaptureSink implements CaptureSink {
 
       // A sibling op already owns this address. Its bytes are ours by definition —
       // the key IS the content hash — so this capture is a dedup, not a second write.
-      // Page captures do not report, so the loser simply counts and returns.
-      if (this.inFlightKeys.has(key)) {
+      // It is still its OWN observation (its own url and clock), so when it will be
+      // reported it waits for the winner: a failed PUT leaves nothing to describe.
+      const existing = this.inFlightKeys.get(key);
+      if (existing) {
         this.deduped += 1;
+        if (!this.pageReportable(c)) return;
+        let outcome: StoreOutcome | undefined;
+        try {
+          outcome = await existing.done;
+        } catch {
+          outcome = undefined;
+        }
+        if (outcome !== undefined) this.reportPage(c, key, true);
         return;
       }
       // ONE budget across both round trips (see withTimeout): what the operator sets
@@ -835,6 +853,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
         const outcome = await op;
         if (outcome === 'deduped') this.deduped += 1;
         else this.stored += 1;
+        this.reportPage(c, key, outcome === 'deduped');
       } finally {
         this.inFlightKeys.delete(key);
       }
@@ -952,6 +971,54 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     } catch (err) {
       this.assetFailed += 1;
       this.warnAssetFailure(c, err);
+    }
+  }
+
+  /** A page is reported only when a reporter is wired and a registered store claims its url. */
+  private pageReportable(c: RawCapture): boolean {
+    return this.reportCapture !== undefined && this.pageSite(c) !== undefined;
+  }
+
+  /** The site key for a page: its resolved address first, then the address it was fetched as. */
+  private pageSite(c: RawCapture): string | undefined {
+    if (!this.siteFor) return undefined;
+    try {
+      return this.siteFor(c.finalUrl ?? c.url) ?? this.siteFor(c.url);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Emit one PAGE capture (wire / dom / api), best-effort. A page names no item (an empty item id is
+   * a PAGE capture to the contract) and carries no engine version: the I5 backfill rebuilds the same
+   * object from its metadata with none, so live and backfill land on ONE capture identity. The url is
+   * the RESOLVED one, which is what metadata() records and the backfill reads back.
+   */
+  private reportPage(c: RawCapture, storageKey: string, alreadyStored: boolean): void {
+    const report = this.reportCapture;
+    if (!report) return;
+    const site = this.pageSite(c);
+    if (site === undefined) return;
+    const page: StoredCaptureReport = {
+      site,
+      url: c.finalUrl ?? c.url,
+      lane: c.lane,
+      sha256: c.sha256,
+      bytesLen: byteLengthOf(c.bytes),
+      storageKey,
+      fetchedAt: c.fetchedAt,
+      alreadyStored,
+      ...(c.statusCode !== undefined ? { httpStatus: c.statusCode } : {}),
+      ...(c.contentType !== undefined ? { contentType: c.contentType } : {}),
+      ...(c.contentEncoding !== undefined ? { contentEncoding: c.contentEncoding } : {}),
+      ...(c.vary !== undefined ? { vary: c.vary } : {}),
+    };
+    // Fire-and-forget, and a synchronous throw from an injected reporter is caught here too.
+    try {
+      void Promise.resolve(report(page)).catch(() => undefined);
+    } catch {
+      /* the capture path never sees a reporter fault */
     }
   }
 

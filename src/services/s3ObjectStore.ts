@@ -37,6 +37,7 @@ import {
   DEFAULT_IMAGE_PUT_TIMEOUT_MS,
   resolveRawStoreConcurrency,
   type ObjectStore,
+  type PageSiteResolver,
   type PutOptions,
   type RawStoreConfig,
   type SinkStats,
@@ -457,6 +458,21 @@ export function loadRawStoreConfigFromEnv(
 }
 
 /**
+ * The page-site resolver the composition root registers once the plugins have loaded (url -> the
+ * registered store's site key). The sink is built before that, so it holds {@link captureSiteFor},
+ * which reads whatever is registered at call time. Unset ⇒ pages are stored but not reported.
+ */
+let captureSiteResolver: PageSiteResolver | undefined;
+
+export function setCaptureSiteResolver(resolver: PageSiteResolver | undefined): void {
+  captureSiteResolver = resolver;
+}
+
+export function captureSiteFor(url: string): string | undefined {
+  return captureSiteResolver?.(url);
+}
+
+/**
  * The composition-root factory: a real content-addressed sink when the raw-store
  * env is present and enabled, otherwise a NoopCaptureSink. Constructing the sink
  * asserts the key scheme (fail-fast on a misconfigured contract version).
@@ -467,7 +483,7 @@ export function createRawCaptureSink(env: NodeJS.ProcessEnv = process.env): Capt
   const store = new S3ObjectStore(loaded.config.bucket, loaded.config, loaded.creds);
   // Off unless REPORT_CAPTURES is armed. Null ⇒ the sink stores exactly as before, reporting nothing.
   const reporter = createCaptureReporterFromEnv(env);
-  return new ObjectStoreCaptureSink(store, loaded.config, reporter ? (r) => reporter.report(r) : undefined);
+  return new ObjectStoreCaptureSink(store, loaded.config, reporter ? (r) => reporter.report(r) : undefined, captureSiteFor);
 }
 
 /**

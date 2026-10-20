@@ -2228,3 +2228,170 @@ describe('ObjectStoreCaptureSink — capture reporting (I3)', () => {
     warn.mockRestore();
   });
 });
+
+// RAW-MFC-1: the page lanes (wire / dom / api) were stored but never reported, so after the one-shot
+// I5 backfill (09-17) no page capture reached raw.capture and none could be found by url.
+describe('ObjectStoreCaptureSink — page-lane capture reporting (RAW-MFC-1)', () => {
+  const PAGE_CONFIG: RawStoreConfig = { ...CONFIG, jsonPrefix: 'raw-json/' };
+  const SITES: Record<string, string> = { 'myfigurecollection.net': 'mfc', 'www.example-store.test': 'example' };
+  const siteFor = (url: string): string | undefined => SITES[new URL(url).hostname];
+  const pageKey = (c: RawCapture, prefix: string, ext: string) => `${prefix}sha256/${c.sha256.slice(0, 2)}/${c.sha256}${ext}`;
+
+  it('reports a freshly-stored api-lane page under its site key, as a PAGE capture', async () => {
+    const store = new FakeObjectStore();
+    const reports: StoredCaptureReport[] = [];
+    const sink = new ObjectStoreCaptureSink(store, PAGE_CONFIG, async (r) => { reports.push(r); }, siteFor);
+    const c = cap({ lane: 'api', fetchedAt: '2026-10-20T01:02:03.000Z' });
+
+    await send(sink, c);
+
+    expect(reports).toHaveLength(1);
+    const r = reports[0];
+    expect(r.site).toBe('mfc');
+    expect(r.lane).toBe('api');
+    expect(r.url).toBe('https://myfigurecollection.net/item/12345');
+    expect(r.sha256).toBe(c.sha256);
+    expect(r.storageKey).toBe(pageKey(c, 'raw-json/', '.json.gz'));
+    expect(r.bytesLen).toBe(HTML.length); // the UNCOMPRESSED length, never the gzip size
+    expect(r.alreadyStored).toBe(false);
+    expect(r.fetchedAt).toBe('2026-10-20T01:02:03.000Z');
+    expect(r.httpStatus).toBe(200);
+    expect(r.contentType).toBe('text/html');
+    // A page capture names no item, and carries no engine version: the I5 backfill of the same object
+    // sends none either, so the two land on ONE capture identity instead of two.
+    expect('itemId' in r).toBe(false);
+    expect('engineVersion' in r).toBe(false);
+  });
+
+  it('reports wire and dom captures under raw-html/ with their own lanes', async () => {
+    const store = new FakeObjectStore();
+    const reports: StoredCaptureReport[] = [];
+    const sink = new ObjectStoreCaptureSink(store, PAGE_CONFIG, async (r) => { reports.push(r); }, siteFor);
+    const wire = cap({ lane: 'wire' });
+    const dom = cap({ lane: 'dom', bytes: Buffer.from('<html><body>rendered</body></html>') });
+
+    await send(sink, wire);
+    await send(sink, dom);
+
+    expect(reports.map((r) => r.lane)).toEqual(['wire', 'dom']);
+    expect(reports[0].storageKey).toBe(pageKey(wire, 'raw-html/', '.html.gz'));
+    expect(reports[1].storageKey).toBe(pageKey(dom, 'raw-html/', '.html.gz'));
+  });
+
+  it('reports the RESOLVED url, the one the object metadata and the backfill both record', async () => {
+    const store = new FakeObjectStore();
+    const reports: StoredCaptureReport[] = [];
+    const sink = new ObjectStoreCaptureSink(store, PAGE_CONFIG, async (r) => { reports.push(r); }, siteFor);
+
+    await send(sink, cap({ url: 'https://www.example-store.test/p?id=1', finalUrl: 'https://www.example-store.test/products/1' }));
+
+    expect(reports[0].url).toBe('https://www.example-store.test/products/1');
+    expect(reports[0].site).toBe('example');
+  });
+
+  it('reports a HEAD-dedup hit as a new observation with already_stored=true and never re-PUTs', async () => {
+    const store = new FakeObjectStore();
+    const reports: StoredCaptureReport[] = [];
+    const sink = new ObjectStoreCaptureSink(store, PAGE_CONFIG, async (r) => { reports.push(r); }, siteFor);
+    const c = cap({ lane: 'api' });
+    store.existing.add(pageKey(c, 'raw-json/', '.json.gz'));
+
+    await send(sink, c);
+
+    expect(store.puts).toHaveLength(0);
+    expect(reports).toHaveLength(1);
+    expect(reports[0].alreadyStored).toBe(true);
+  });
+
+  it('stores but does NOT report a page whose url names no registered store (a host is never a site)', async () => {
+    const store = new FakeObjectStore();
+    const reports: StoredCaptureReport[] = [];
+    const sink = new ObjectStoreCaptureSink(store, PAGE_CONFIG, async (r) => { reports.push(r); }, siteFor);
+
+    await send(sink, cap({ url: 'https://unknown.test/x' }));
+
+    expect(store.puts).toHaveLength(1);
+    expect(reports).toHaveLength(0);
+  });
+
+  it('stores but does not report pages when no site resolver is wired', async () => {
+    const store = new FakeObjectStore();
+    const reports: StoredCaptureReport[] = [];
+    const sink = new ObjectStoreCaptureSink(store, PAGE_CONFIG, async (r) => { reports.push(r); });
+
+    await send(sink, cap());
+
+    expect(store.puts).toHaveLength(1);
+    expect(reports).toHaveLength(0);
+  });
+
+  it('does not report a page whose PUT failed — nothing is at rest to describe', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new FakeObjectStore();
+    store.failPut = true;
+    const reports: StoredCaptureReport[] = [];
+    const sink = new ObjectStoreCaptureSink(store, PAGE_CONFIG, async (r) => { reports.push(r); }, siteFor);
+
+    await send(sink, cap());
+
+    expect(reports).toHaveLength(0);
+    expect(sink.stats().failed).toBe(1);
+    warn.mockRestore();
+  });
+
+  it('never lets a throwing page report reject out of the capture path', async () => {
+    const store = new FakeObjectStore();
+    const sink = new ObjectStoreCaptureSink(store, PAGE_CONFIG, () => { throw new Error('reporter down'); }, siteFor);
+
+    await expect(send(sink, cap())).resolves.toBeUndefined();
+    expect(store.puts).toHaveLength(1);
+  });
+
+  it('an in-flight page loser awaits the winner and reports ITS OWN observation as already stored', async () => {
+    const store = new GatedObjectStore();
+    const reports: StoredCaptureReport[] = [];
+    const sink = new ObjectStoreCaptureSink(store, { ...PAGE_CONFIG, concurrency: 2 }, async (r) => { reports.push(r); }, siteFor);
+    const first = cap({ url: 'https://myfigurecollection.net/item/1', fetchedAt: '2026-10-20T00:00:00.000Z' });
+    const second = cap({ url: 'https://myfigurecollection.net/item/2', fetchedAt: '2026-10-20T00:00:05.000Z' });
+
+    await sink.capture(first);
+    await until(() => store.keys.length === 1);
+    await sink.capture(second);
+    await drain(store, sink);
+
+    expect(store.keys).toHaveLength(1);
+    expect(reports).toHaveLength(2);
+    const win = reports.find((r) => r.url.endsWith('/1'))!;
+    const lose = reports.find((r) => r.url.endsWith('/2'))!;
+    expect(win.alreadyStored).toBe(false);
+    expect(lose.alreadyStored).toBe(true);
+    // A second page fetch is its own observation: its own url and its own clock.
+    expect(lose.fetchedAt).toBe('2026-10-20T00:00:05.000Z');
+    expect(lose.storageKey).toBe(win.storageKey);
+  });
+
+  it('a page loser reports nothing when the winner it waited on failed', async () => {
+    class FailingGatedStore implements ObjectStore {
+      readonly keys: string[] = [];
+      private release!: () => void;
+      private readonly gate = new Promise<void>((r) => { this.release = r; });
+      async exists(): Promise<boolean> { return false; }
+      async put(k: string): Promise<void> { this.keys.push(k); await this.gate; throw new Error('simulated PUT failure'); }
+      fail(): void { this.release(); }
+    }
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new FailingGatedStore();
+    const reports: StoredCaptureReport[] = [];
+    const sink = new ObjectStoreCaptureSink(store, { ...PAGE_CONFIG, concurrency: 2 }, async (r) => { reports.push(r); }, siteFor);
+
+    await sink.capture(cap({ url: 'https://myfigurecollection.net/item/1' }));
+    await until(() => store.keys.length === 1);
+    await sink.capture(cap({ url: 'https://myfigurecollection.net/item/2' }));
+    await new Promise((r) => setImmediate(r));
+    store.fail();
+    await sink.flush();
+
+    expect(reports).toHaveLength(0);
+    warn.mockRestore();
+  });
+});

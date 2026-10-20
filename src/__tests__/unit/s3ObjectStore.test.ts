@@ -19,6 +19,8 @@ import {
   rawStoreView,
   loadRawStoreConfigFromEnv,
   createRawCaptureSink,
+  captureSiteFor,
+  setCaptureSiteResolver,
   isImagePersistenceEnabled,
   toS3MetaData,
   S3ObjectStore,
@@ -223,6 +225,27 @@ describe('createRawCaptureSink', () => {
   it('fails fast on an unknown key scheme rather than silently dropping captures', () => {
     const env = { ...FULL_ENV, RAW_STORE_KEY_SCHEME: 'sha256-v2' } as unknown as NodeJS.ProcessEnv;
     expect(() => createRawCaptureSink(env)).toThrow(/sha256-v1/);
+  });
+});
+
+// RAW-MFC-1: the sink is built before the plugins load, so it reads the page-site resolver LATE —
+// whatever the composition root last registered is what a page report is attributed with.
+describe('captureSiteFor — the late-bound page-site resolver', () => {
+  afterEach(() => setCaptureSiteResolver(undefined));
+
+  it('names no site before a resolver is registered', () => {
+    expect(captureSiteFor('https://myfigurecollection.net/item/1')).toBeUndefined();
+  });
+
+  it('answers with the registered resolver, read at call time', () => {
+    setCaptureSiteResolver((url) => (new URL(url).hostname === 'myfigurecollection.net' ? 'mfc' : undefined));
+    expect(captureSiteFor('https://myfigurecollection.net/item/1')).toBe('mfc');
+    expect(captureSiteFor('https://unknown.test/x')).toBeUndefined();
+  });
+
+  it('is the resolver every sink built by createRawCaptureSink reports pages with', () => {
+    const sink = createRawCaptureSink(FULL_ENV) as unknown as { siteFor?: unknown };
+    expect(sink.siteFor).toBe(captureSiteFor);
   });
 });
 
