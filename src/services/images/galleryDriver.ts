@@ -275,6 +275,10 @@ export function judgeProbe(input: { observations: FetchObservation[]; requests: 
   const reasonList = [...reasons].map(([text, n]) => (n > 1 ? `${text} (x${n})` : text));
   if (reasonList.length > 0) return { verdict: 'FAIL', reasons: reasonList, notes, evidence };
   if (observations.length === 0) return { verdict: 'INCONCLUSIVE', reasons: ['no request was made'], notes, evidence };
+  const unrecorded = observations.filter(o => o.ok && !byUrl.has(o.url)).length;
+  if (unrecorded > 0) {
+    return { verdict: 'INCONCLUSIVE', reasons: [`no request record for ${unrecorded} fetched file(s): what was sent cannot be shown, so "no cookies" is not proven`], notes, evidence };
+  }
   if (observations.length < input.wanted && input.exhausted !== true) {
     return { verdict: 'INCONCLUSIVE', reasons: [`only ${observations.length} of ${input.wanted} files were fetched`], notes, evidence };
   }

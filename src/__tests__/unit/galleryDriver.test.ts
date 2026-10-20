@@ -361,6 +361,12 @@ describe('judgeProbe', () => {
     expect(judgeProbe({ observations: [good(1)], requests: [req()], allowedHosts: [STATIC], wanted: 20, exhausted: true }).verdict).toBe('PASS');
   });
 
+  it('is inconclusive when it cannot show what was sent (a fetched file with no request record)', () => {
+    const v = judgeProbe({ observations: [good(1), good(2)], requests: [req()], allowedHosts: [STATIC], wanted: 2 });
+    expect(v.verdict).toBe('INCONCLUSIVE');
+    expect(v.reasons.join(' ')).toMatch(/no request record/);
+  });
+
   it('notes a Set-Cookie as information, not as a failure', () => {
     const v = judgeProbe({ observations: [good(1)], requests: [req({ setCookie: true })], allowedHosts: [STATIC], wanted: 1 });
     expect(v.verdict).toBe('PASS');
