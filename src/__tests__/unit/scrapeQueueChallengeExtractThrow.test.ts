@@ -17,7 +17,8 @@
  *   3. EmptyExtractionError from an OPTING ruleset (emptyResultIsValid) on a challenge page → still
  *      a FAILURE (the !page.challenge guard) and now one-shot + cooldown, not retried.
  *   4. NON-challenge page + extract throws → UNCHANGED: 'unknown', bounded retries, no cooldown.
- *   5. challenge page + extraction SUCCEEDS + persisted>0 → UNCHANGED success, no cooldown (amiami).
+ *   5. challenge page + extraction SUCCEEDS through a follow-up that answered + persisted>0 → success,
+ *      no cooldown (amiami; NAME-ERRPAGE-1 requires the follow-up).
  *   6. after (1), a second item for the same host is skipped by the pre-fetch cooldown gate WITHOUT
  *      any fetch (the shared seam).
  *
@@ -44,7 +45,7 @@ jest.mock('../../services/webhookClient', () => ({
   notifyItemSkipped: jest.fn().mockResolvedValue(true),
 }));
 
-import type { ExtractionRuleset, ExtractedData, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
+import type { ExtractContext, ExtractionRuleset, ExtractedData, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
 import { ScrapeQueue, resetScrapeQueue } from '../../services/scrapeQueue';
 import { ChallengeCooldown, resetChallengeCooldown } from '../../services/challengeCooldown';
 import { createExtractionRegistry, ExtractionRegistryImpl } from '../../services/extractionRegistry';
@@ -275,16 +276,24 @@ describe('ScrapeQueue × challenge page whose extraction THROWS (fail fast + ope
   });
 
   it('(5) challenge page + extraction SUCCEEDS + persisted>0 → UNCHANGED success, cooldown NOT opened (amiami recovery)', async () => {
-    const http = jest.fn().mockResolvedValue(CHALLENGE_HTML);
+    // the item page is a challenge; the ruleset's own follow-up (`<url>/api`) answers a real body
+    const http = jest.fn((u: string) => Promise.resolve(u.endsWith('/api') ? { body: '{"name":"Vegito"}', status: 200 } : CHALLENGE_HTML));
     const send = jest.fn().mockResolvedValue(healthyStats()); // the ruleset recovered the record via its own transport
-    queue = buildQueue(extractRuleset((_html, url) => recordFor(url)), http, send);
+    const recovering = {
+      ...extractRuleset((_html, url) => recordFor(url)),
+      async extractAsync(_html: string, url: string, ctx?: ExtractContext) {
+        await ctx!.scraping.fetchBody!(`${url}/api`);
+        return recordFor(url);
+      },
+    } as OptInRuleset;
+    queue = buildQueue(recovering, http, send);
 
     const url = `https://${HOST}/product/amiami-1`;
     const result = queue.enqueue(url, { url, sessionId: 's1' });
     await advanceUntil(() => queue.getStats().completed === 1 || queue.getStats().failed === 1);
     await result.promise;
 
-    expect(http).toHaveBeenCalledTimes(1);
+    expect(http).toHaveBeenCalledTimes(2);            // the page + the ruleset's one follow-up
     expect(send).toHaveBeenCalledTimes(1);
     expect(queue.getStats().completed).toBe(1);
     expect(queue.getStats().failed).toBe(0);
