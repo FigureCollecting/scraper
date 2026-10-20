@@ -414,11 +414,12 @@ describe('probe mode through the driver', () => {
 
 describe('the real hook underneath (the NORMAL process, not a shortcut)', () => {
   const NOW0 = 1_700_000_000_000;
-  function rig(opts: { respond?: (url: string, headers: Record<string, string>) => { status: number; type?: string; body?: Buffer; headers?: Record<string, string> }; maxPerItem?: number } = {}) {
+  type Reply = { status: number; type?: string; body?: Buffer; headers?: Record<string, string> };
+  function rig(opts: { respond?: (url: string, headers: Record<string, string>) => Reply; maxPerItem?: number } = {}) {
     const clock = { t: NOW0 };
     const sink = new CollectingCaptureSink();
     const sent: Array<{ url: string; headers: Record<string, string> }> = [];
-    const respond = opts.respond ?? ((url: string) => ({ status: 200, type: 'image/png', body: PNG(Number(/(\d+)\.jpeg/.exec(url)![1]) % 200) }));
+    const respond: (url: string, headers: Record<string, string>) => Reply = opts.respond ?? ((url: string) => ({ status: 200, type: 'image/png', body: PNG(Number(/(\d+)\.jpeg/.exec(url)![1]) % 200) }));
     const recording = createRecordingFetch(async (url, init) => {
       sent.push({ url, headers: init.headers });
       const r = respond(url, init.headers);
