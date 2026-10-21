@@ -4,7 +4,7 @@ Part 1 (fc-aggregation `gallery:backfill`) recorded, for every stored MFC item p
 `galleryImages` claim: `{entries:[{position, src, w, h}]}`. Nothing was downloaded. This is the part that downloads,
 through the process every other image already takes. Ross's rules (10-20): files take the NORMAL process, no shortcut;
 cookie-less plain GETs of the static host; its own per-host pacing; holdings first; auto-pause on 403/429/challenge;
-the deployed rate is config (desk IMGRATE; built for 1/s).
+the deployed rate is config (desk IMGRATE, Ross: 3 files/s, `intervalMs` 333).
 
 ## Why the image lane skipped them (so the lift is deliberate)
 
@@ -36,7 +36,7 @@ The scraper must not read the spine database, so the work list is a file the ope
 
 ## What changes in the scraper
 
-1. **Per-host rate seam** (`imageHostRates.ts`). `IMAGE_HOST_RATE_JSON='{"static.myfigurecollection.net":{"intervalMs":1000}}'`
+1. **Per-host rate seam** (`imageHostRates.ts`). `IMAGE_HOST_RATE_JSON='{"static.myfigurecollection.net":{"intervalMs":333}}'` (Ross, IMGRATE b: 3 files/s)
    feeds the image limiter (`assembleImageCapture.ts:171`, today `new HostRateLimiter(() => undefined)`: a 2,067 ms base
    that speeds up toward 274 ms). A row pins base = min = interval, so success never speeds it up; 429/503 still back it off.
    IMGRATE is this one number.
@@ -48,7 +48,7 @@ The scraper must not read the spine database, so the work list is a file the ope
    `ImageCaptureRequest` per item whose synthetic `describeImages` returns `{url, role:'gallery', position, sourceClass}`;
    awaits `hook.capture()` (sequential, one item at a time); observes every fetch; settles stored / gone urls.
    `IMAGE_MAX_PER_ITEM=100` for this process only. The item's `contentLevel` rides the ref (fail closed to `unknown`).
-   `sourceClass` is config (`GALLERY_SOURCE_CLASS`, default `unknown`) until Ross rules on the official-vs-member question.
+   `sourceClass` is config (`GALLERY_SOURCE_CLASS`). Ross ruled (desk GALSRC b): the MFC official gallery is `manufacturer_press`, set in the Job env below; the code default stays `unknown`, so a Job that forgets the setting claims nothing.
 4. **Auto-pause**: N consecutive blocked fetches (403, 429, 503, `cf-mitigated`, a 2xx that is not an image, a cooling
    host) stop the run and write a pause marker (default 3 and 6 h); the next run refuses until it lapses or `--resume`.
 5. **Probe** (`--probe [N=20]`): the first N files of the work list through the real hook and sink, with evidence per
@@ -71,8 +71,8 @@ The scraper must not read the spine database, so the work list is a file the ope
 
 1. Merge; roll the scraper image. 2. Mount the work list and a small PVC. 3. Probe Job (`--probe 20`) -> read the verdict.
    If challenged, the fallback is the residential lane at a lower rate (a policy row, not code). 4. Holdings only
-   (`--max-files` staged), then figures, then the rest. Desk IMGRATE sets `intervalMs`: 1000 = 1/s (holdings ~4 h,
-   all ~19 days).
+   (`--max-files` staged), then figures, then the rest. Desk IMGRATE sets `intervalMs`: Ross chose 333 = 3 files/s (holdings, 14,346 files, about 1.3 h;
+   the whole catalogue, about 1.7M files, about 6.6 days).
 
 ## Derive side (not this unit, but a precondition)
 
@@ -90,10 +90,10 @@ env:
   PERSIST_RAW_IMAGES: "true"            # the lane must be on; the driver refuses to fetch what would be dropped
   REPORT_CAPTURES: "true"               # + INGEST_BASE_URL, RAW_STORE_S3_* exactly as the scraper Deployment has them
   IMAGE_HOST_POLICY_JSON: '{"static.myfigurecollection.net":{"lane":"http","egress":"direct"}}'
-  IMAGE_HOST_RATE_JSON:   '{"static.myfigurecollection.net":{"intervalMs":1000}}'     # desk IMGRATE
+  IMAGE_HOST_RATE_JSON:   '{"static.myfigurecollection.net":{"intervalMs":333}}'      # desk IMGRATE b: 3 files/s, no speed-up
   GALLERY_WORKLIST_PATH: /state/wl.jsonl     # from `npm run gallery:worklist` (fc-aggregation)
   GALLERY_LEDGER_PATH:   /state/ledger.jsonl
-  GALLERY_SOURCE_CLASS:  unknown             # until Ross rules on official vs member pictures
+  GALLERY_SOURCE_CLASS:  manufacturer_press   # desk GALSRC b: the MFC official gallery
 volumes: a small PVC at /state (the work list ~170 MB for the whole catalogue, the ledger grows ~100 bytes a file)
 network: egress 443 to static.myfigurecollection.net and the raw store, plus the ingest listener, as the scraper has it
 ```
