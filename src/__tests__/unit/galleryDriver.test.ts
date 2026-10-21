@@ -182,6 +182,7 @@ describe('runGalleryCapture', () => {
     expect(fh.calls.map(c => [c.itemId, c.urls])).toEqual([['1', [U(10), U(11)]], ['2', [U(20)]]]);
     expect(fh.calls[0]!.positions).toEqual([0, 1]);
     expect(fh.calls[1]!.contentLevels).toEqual(['explicit']);
+    expect(fh.calls[0]!.contentLevels).toEqual(['unknown', 'unknown']); // an item with NO level is gated, never defaulted to general
     expect(fh.calls[0]!.sourceClasses).toEqual(['unknown', 'unknown']);
     expect(fh.calls[0]!.origin).toBe('ingest');
     expect(r).toMatchObject({ stopped: 'done', items: 2, fetched: 3, stored: 3, blocked: 0 });
@@ -452,6 +453,12 @@ describe('the real hook underneath (the NORMAL process, not a shortcut)', () => 
     expect(r.sink.captures.every(c => c.lane === 'asset' && c.sha256.length === 64)).toBe(true);
     expect(r.sink.captures.map(x => x.position)).toEqual(nums.map((_, i) => i));
     expect(r.sink.captures.every(x => x.role === 'gallery' && x.sourceItem?.site === 'mfc' && x.sourceItem?.itemId === '1005999' && x.sourceUrl === PAGE('1005999') && x.contentLevel === 'general' && x.sourceClass === 'unknown')).toBe(true);
+  });
+
+  it('an item whose work list line has no content level is stored as unknown (the most restrictive), never general', async () => {
+    const r = rig();
+    await go(r, [item('77', [1, 2])]);
+    expect(r.sink.captures.map(x => x.contentLevel)).toEqual(['unknown', 'unknown']);
   });
 
   it('sends no cookie and no authorization header, ever', async () => {

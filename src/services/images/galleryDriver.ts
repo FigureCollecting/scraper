@@ -414,7 +414,8 @@ export async function runGalleryCapture(deps: GalleryDeps, opts: GalleryRunOptio
       ruleset: {
         describeImages: () => todo.map(e => ({
           url: e.src, role: 'gallery' as const, position: e.position, sourceClass,
-          ...(item.contentLevel !== undefined ? { contentLevel: item.contentLevel } : {}),
+          // Never defaulted to general: an item whose level is not known is gated as the most restrictive.
+          contentLevel: item.contentLevel ?? ('unknown' as const),
         })),
       },
       origin: 'ingest',
