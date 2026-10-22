@@ -35,7 +35,7 @@
     "@figurecollecting/ingest-contract": "^0.6.0",
     "@figurecollecting/scraper-plugin-contract": "file:packages/plugin-contract",
     "@opentelemetry/api": "^1.9.1",
-    "@opentelemetry/auto-instrumentations-node": "^0.80.0",
+    "@opentelemetry/auto-instrumentations-node": "^0.81.2",
     "@opentelemetry/core": "^2.11.0",
     "@opentelemetry/exporter-trace-otlp-http": "^0.222.0",
     "@opentelemetry/resources": "^2.11.0",
