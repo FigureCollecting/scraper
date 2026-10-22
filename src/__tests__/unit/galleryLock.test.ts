@@ -109,6 +109,28 @@ describe('acquireRunLock', () => {
   });
 });
 
+describe('a filesystem that cannot hard-link', () => {
+  const withNoLinks = (code: string): jest.SpyInstance => {
+    const fsModule = require('node:fs') as typeof import('node:fs');
+    return jest.spyOn(fsModule, 'linkSync').mockImplementation((() => { throw Object.assign(new Error(code), { code }); }) as typeof linkSync);
+  };
+
+  it.each(['EPERM', 'ENOSYS', 'EOPNOTSUPP', 'ENOTSUP', 'EXDEV'])('%s: the lock is made with an exclusive create instead, and is just as exclusive', code => {
+    withNoLinks(code);
+    const first = acquireRunLock(file, at(NOW));
+    expect(first.held).toBe(true);
+    expect(readLock()).toEqual({ token: 'mine', hostname: 'me', startedAt: NOW, heartbeatAt: NOW });
+    expect(acquireRunLock(file, { ...at(NOW), token: 'second' })).toMatchObject({ held: false });
+    expect(require('node:fs').readdirSync(dir)).toEqual(['gallery-capture.lock']);
+  });
+
+  it('any other link error is not swallowed', () => {
+    withNoLinks('EIO');
+    expect(() => acquireRunLock(file, at(NOW))).toThrow(/EIO/);
+    expect(require('node:fs').readdirSync(dir)).toEqual([]);
+  });
+});
+
 describe('heartbeat', () => {
   it('refreshes heartbeatAt and keeps everything else', () => {
     let now = NOW;
