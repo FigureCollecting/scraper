@@ -66,6 +66,23 @@ export interface FetchObserver {
   tripped(): string | undefined;
   /** Stop issuing: every later call is refused without touching the network, and is not an observation. */
   stop(reason: string): void;
+  /** Why it was stopped, or undefined while it runs. */
+  stopped(): string | undefined;
+}
+
+/** The detail of a refusal caused by a stop: it is not a verdict on the host, so it is never recorded as an observation. */
+export const STOP_DETAIL = 'gallery driver stopped: ';
+
+/**
+ * Refuse at DISPATCH once the run is stopped. Put it directly over the transport (under the pacing wrapper): a request that was
+ * already waiting for its slot when the signal came is then refused when the wait ends, instead of going out after the stop.
+ */
+export function gateOnStop(inner: ImageBytesFetcher, stopped: () => string | undefined): ImageBytesFetcher {
+  return async (url, options) => {
+    const why = stopped();
+    if (why !== undefined) return { ok: false, reason: 'refused', detail: `${STOP_DETAIL}${why}` };
+    return inner(url, options);
+  };
 }
 
 export function createFetchObserver(opts: { pauseAfter: number; now: () => number }): FetchObserver {
@@ -81,9 +98,10 @@ export function createFetchObserver(opts: { pauseAfter: number; now: () => numbe
   };
   return {
     stop(reason) { stopped = reason; },
+    stopped: () => stopped,
     wrap(inner) {
       return async (url, options) => {
-        if (stopped !== undefined) return { ok: false, reason: 'refused', detail: `gallery driver stopped: ${stopped}` };
+        if (stopped !== undefined) return { ok: false, reason: 'refused', detail: `${STOP_DETAIL}${stopped}` };
         if (trip !== undefined) return { ok: false, reason: 'refused', detail: `gallery driver paused: ${trip}` };
         const t0 = opts.now();
         let res: ImageBytesResult;
@@ -96,6 +114,7 @@ export function createFetchObserver(opts: { pauseAfter: number; now: () => numbe
           throw err;
         }
         const ms = opts.now() - t0;
+        if (!res.ok && res.reason === 'refused' && res.detail?.startsWith(STOP_DETAIL)) return res; // stopped at dispatch: no verdict on the host
         const o: FetchObservation = res.ok
           ? { url, ok: true, status: res.status, contentType: res.contentType, bytes: res.bytes.length, finalUrl: res.finalUrl, ms }
           : {
@@ -130,6 +149,32 @@ const pathOf = (url: string): string => {
 };
 /** One spelling of a host: trimmed, lowercased, no trailing root dot. The allow-list and every url are compared in it. */
 export const normalizeHost = (host: string): string => host.trim().toLowerCase().replace(/\.+$/, '');
+/**
+ * One origin the run may fetch from: a host, and a port. A host named without a port means its DEFAULT ports (https 443, http 80);
+ * `host:port` means that port and no other. A host name alone would also let a redirect reach any other service on the same host.
+ */
+export interface AllowedOrigin { host: string; port?: number }
+export function parseAllowedOrigin(entry: string): AllowedOrigin | undefined {
+  const m = /^([A-Za-z0-9._-]+)(?::([0-9]{1,5}))?$/.exec(entry.trim());
+  if (m === null) return undefined;
+  const host = normalizeHost(m[1]!);
+  if (host === '') return undefined;
+  if (m[2] === undefined) return { host };
+  const port = Number(m[2]);
+  return port >= 1 && port <= 65535 ? { host, port } : undefined;
+}
+/** The compiled list; an entry that does not parse allows nothing (fail closed). */
+const compileAllowed = (entries: readonly string[]): AllowedOrigin[] => entries.flatMap(e => { const o = parseAllowedOrigin(e); return o === undefined ? [] : [o]; });
+/** The host names behind a list of origins: what the host policy, the rate rows and the probe preflight are keyed by. */
+export const allowedHostnames = (entries: readonly string[]): string[] => [...new Set(compileAllowed(entries).map(o => o.host))];
+export function originAllowed(url: string, allowed: readonly AllowedOrigin[]): boolean {
+  let u: URL;
+  try { u = new URL(url); } catch { return false; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+  const host = normalizeHost(u.hostname);
+  const explicit = u.port === '' ? undefined : Number(u.port); // WHATWG drops the scheme's own default port
+  return allowed.some(a => a.host === host && (a.port === undefined ? explicit === undefined : (explicit ?? (u.protocol === 'https:' ? 443 : 80)) === a.port));
+}
 const hostOf = (url: string): string | undefined => {
   try {
     return normalizeHost(new URL(url).hostname);
@@ -141,7 +186,8 @@ const hostOf = (url: string): string | undefined => {
 // ---------------------------------------------------------------------------
 // the ledger
 // ---------------------------------------------------------------------------
-export type Settled = 'stored' | 'gone' | 'oversize';
+/** `skipped:too_large`: the raw store skips a body over RAW_STORE_IMAGE_MAX_BYTES; the file is real but will never be at rest, and is not asked for again. */
+export type Settled = 'stored' | 'gone' | 'oversize' | 'skipped:too_large';
 /**
  * Settlement is per (item, url), not per url: an item that shares a picture with another still needs its OWN depiction reported
  * (the hook's memo hit does that without a second fetch), so a url settled for one item says nothing about the next. `item` is
@@ -182,7 +228,7 @@ export function createFileLedger(file: string): GalleryLedger {
       try {
         const r = JSON.parse(line) as Record<string, unknown>;
         if (r === null || typeof r !== 'object' || Array.isArray(r)) continue;
-        if (typeof r.i === 'string' && typeof r.u === 'string' && (r.s === 'stored' || r.s === 'gone' || r.s === 'oversize')) memory.settle(r.i, r.u, r.s);
+        if (typeof r.i === 'string' && typeof r.u === 'string' && (r.s === 'stored' || r.s === 'gone' || r.s === 'oversize' || r.s === 'skipped:too_large')) memory.settle(r.i, r.u, r.s);
         else if ('pause' in r) {
           if (typeof r.pause === 'number') memory.pause(r.pause, String(r.why ?? ''));
           else if (r.pause === null) memory.clearPause();
@@ -269,7 +315,7 @@ export function followAllowedRedirects(
   paced: ImageBytesFetcher,
   opts: { allowedHosts: readonly string[]; locationOf: (url: string) => string | undefined; maxHops?: number },
 ): ImageBytesFetcher {
-  const allowed = opts.allowedHosts.map(normalizeHost);
+  const allowed = compileAllowed(opts.allowedHosts);
   const maxHops = opts.maxHops ?? MAX_REDIRECT_HOPS;
   const refused = (detail: string): ImageBytesResult => ({ ok: false, reason: 'refused', detail });
   return async (url, options) => {
@@ -278,8 +324,8 @@ export function followAllowedRedirects(
     for (let hop = 0; ; hop++) {
       const res = await paced(current, useOptions);
       if (res.ok) {
-        const host = hostOf(res.finalUrl ?? current);
-        return host !== undefined && allowed.includes(host) ? res : refused(`the bytes came from ${host ?? 'an unparseable host'}, outside the allow-list`);
+        const where = res.finalUrl ?? current;
+        return originAllowed(where, allowed) ? res : refused(`the bytes came from ${describeOrigin(where)}, outside the allow-list`);
       }
       if (res.reason !== 'http-status' || res.status === undefined || !REDIRECT_STATUSES.has(res.status)) return res;
       const location = opts.locationOf(current);
@@ -287,10 +333,9 @@ export function followAllowedRedirects(
       if (hop >= maxHops) return refused(`more than ${maxHops} redirects`);
       let next: URL;
       try { next = new URL(location); } catch { return refused('an unparseable redirect Location'); }
-      const nextHost = normalizeHost(next.hostname);
-      if ((next.protocol !== 'http:' && next.protocol !== 'https:') || !allowed.includes(nextHost)) {
-        return refused(`redirected to ${next.protocol === 'http:' || next.protocol === 'https:' ? nextHost : next.protocol}, outside the allow-list`);
-      }
+      // never echoed, never fetched: a Location with credentials is how a password reaches a log
+      if (next.username !== '' || next.password !== '') return refused('a redirect Location with credentials');
+      if (!originAllowed(next.href, allowed)) return refused(`redirected to ${describeOrigin(next.href)}, outside the allow-list`);
       if (new URL(current).origin !== next.origin && useOptions?.referer !== undefined) {
         const { referer: _dropped, ...withoutReferer } = useOptions;
         useOptions = withoutReferer;
@@ -298,6 +343,16 @@ export function followAllowedRedirects(
       current = next.href;
     }
   };
+}
+
+/** scheme, host and port of a url, never its userinfo or path: safe to put in a message. */
+function describeOrigin(url: string): string {
+  try {
+    const u = new URL(url);
+    return u.protocol === 'http:' || u.protocol === 'https:' ? `${u.protocol}//${u.host}` : u.protocol;
+  } catch {
+    return 'an unparseable url';
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -324,7 +379,7 @@ export interface ProbeVerdict {
 
 export function judgeProbe(input: { observations: FetchObservation[]; requests: RequestRecord[]; allowedHosts: readonly string[]; wanted: number; exhausted?: boolean }): ProbeVerdict {
   const { observations, requests } = input;
-  const allowedHosts = input.allowedHosts.map(normalizeHost);
+  const allowed = compileAllowed(input.allowedHosts);
   const reasons = new Map<string, number>();
   const notes: string[] = [];
   const add = (text: string) => reasons.set(text, (reasons.get(text) ?? 0) + 1);
@@ -337,8 +392,8 @@ export function judgeProbe(input: { observations: FetchObservation[]; requests: 
       else add(`status ${o.status ?? o.reason ?? 'unknown'} (${o.reason ?? 'failed'})`);
     } else {
       if (o.status !== 200) add(`status ${o.status} where 200 was expected`);
-      const host = hostOf(o.finalUrl ?? o.url);
-      if (host === undefined || !allowedHosts.includes(host)) add(`bytes came from another host (${host ?? 'unparseable'})`);
+      const where = o.finalUrl ?? o.url;
+      if (!originAllowed(where, allowed)) add(`bytes came from another origin (${describeOrigin(where)})`);
     }
   }
   let setCookies = 0;
@@ -398,6 +453,12 @@ export interface GalleryRunOptions {
   dryRun?: boolean;
   /** Aborted by SIGTERM: stop issuing requests, confirm what is queued, settle only what the sink confirmed, and say so. */
   signal?: AbortSignal;
+  /**
+   * The raw store's own per-image ceiling (RAW_STORE_IMAGE_MAX_BYTES). The sink SKIPS a body over it and still reports it admitted, so
+   * a fetch of that size is not stored: it is settled `skipped:too_large`. Without it a store-side skip cannot be explained and is
+   * treated as a failure.
+   */
+  storeMaxBytes?: number;
 }
 
 /**
@@ -407,12 +468,18 @@ export interface GalleryRunOptions {
 export interface ConfirmingSink {
   /** Resolves once everything admitted has reached the store, or has failed trying. */
   flush(): Promise<void>;
-  stats(): { assetFailed: number; dropped: number; droppedBytes: number; assetRefusedReserve: number };
+  stats(): {
+    assetFailed: number; dropped: number; droppedBytes: number; assetRefusedReserve: number;
+    /** Bodies the sink admitted but never put: too large for the store, not an image, empty, or the lane off. */
+    assetSkipped?: { tooLarge: number; notImage: number; empty: number; disabled: number };
+  };
 }
-const lossOf = (s: ReturnType<ConfirmingSink['stats']>): number => s.assetFailed + s.dropped + s.droppedBytes + s.assetRefusedReserve;
+type SinkStats = ReturnType<ConfirmingSink['stats']>;
+const lossOf = (s: SinkStats): number => s.assetFailed + s.dropped + s.droppedBytes + s.assetRefusedReserve;
+const skippedOf = (s: SinkStats | undefined, kind: 'tooLarge' | 'notImage' | 'empty' | 'disabled'): number => s?.assetSkipped?.[kind] ?? 0;
 
 export interface GalleryDeps {
-  hook: Pick<ImageCaptureHook, 'capture' | 'stats'>;
+  hook: Pick<ImageCaptureHook, 'capture' | 'stats' | 'forget'>;
   /** The sink the hook writes to. Required for every run that fetches: a url is never settled on an unconfirmed put. */
   sink?: ConfirmingSink;
   observer: FetchObserver;
@@ -435,9 +502,12 @@ export interface GalleryReport {
   items: number;
   planned: number;
   fetched: number;
+  /** (item, picture) pairs now settled as stored: the store confirmed the put, or a sharing item's picture was confirmed earlier. Not "fetched". */
   stored: number;
   gone: number;
   oversize: number;
+  /** Pairs settled `skipped:too_large`: the raw store skips bodies over its own ceiling. */
+  skippedTooLarge: number;
   blocked: number;
   trouble: number;
   skippedLedger: number;
@@ -465,11 +535,12 @@ function preflight(policy: ImageHostPolicy, pageUrl: string, hosts: readonly str
 export async function runGalleryCapture(deps: GalleryDeps, opts: GalleryRunOptions): Promise<GalleryReport> {
   const mode: GalleryReport['mode'] = opts.probe !== undefined ? 'probe' : opts.dryRun === true ? 'dry-run' : 'run';
   const report: GalleryReport = {
-    mode, stopped: 'done', items: 0, planned: 0, fetched: 0, stored: 0, gone: 0, oversize: 0, blocked: 0, trouble: 0,
+    mode, stopped: 'done', items: 0, planned: 0, fetched: 0, stored: 0, gone: 0, oversize: 0, skippedTooLarge: 0, blocked: 0, trouble: 0,
     skippedLedger: 0, notAllowedHost: 0, badLines: 0, entriesCapped: 0, itemsWithFailures: 0,
   };
   const started = deps.now();
-  const allowed = opts.allowedHosts.map(normalizeHost);
+  const allowed = compileAllowed(opts.allowedHosts);
+  const outcome = new Map<string, 'stored' | 'too_large'>(); // what the store CONFIRMED for a url in this run
   const sourceClass: SourceClass = opts.sourceClass ?? 'unknown';
   const budget = opts.probe ?? opts.maxFiles;
 
@@ -506,7 +577,7 @@ export async function runGalleryCapture(deps: GalleryDeps, opts: GalleryRunOptio
       if (opts.maxMs !== undefined && deps.now() - started >= opts.maxMs) { report.stopped = 'time'; exhausted = false; break; }
       if (budget !== undefined && report.planned >= budget) { report.stopped = 'limit'; exhausted = false; break; }
       if (!preflighted) {
-        const problem = preflight(deps.policy, item.pageUrl, allowed);
+        const problem = preflight(deps.policy, item.pageUrl, allowedHostnames(opts.allowedHosts));
         if (problem !== undefined) return { ...report, stopped: 'refused', refusal: problem };
         preflighted = true;
       }
@@ -518,8 +589,7 @@ export async function runGalleryCapture(deps: GalleryDeps, opts: GalleryRunOptio
       // the url every comparison uses: the canonical spelling, whatever a feed handed over
       const wanted = item.entries.flatMap(e => {
         const url = canonicalImageUrl(e.src);
-        const host = url === undefined ? undefined : hostOf(url);
-        if (url === undefined || host === undefined || !allowed.includes(host)) { report.notAllowedHost++; return []; }
+        if (url === undefined || !originAllowed(url, allowed)) { report.notAllowedHost++; return []; }
         if (deps.ledger.has(itemKey, url)) { report.skippedLedger++; return []; }
         return [{ ...e, src: url }];
       });
@@ -550,12 +620,23 @@ export async function runGalleryCapture(deps: GalleryDeps, opts: GalleryRunOptio
       // is settled, so a put that fails (or a process that dies) leaves the file unsettled and fetched again, never lost.
       if (deps.sink !== undefined) await deps.sink.flush();
       const after = deps.hook.stats();
+      const sinkAfter = deps.sink?.stats();
       const obs = deps.observer.take();
 
       // `failed` also counts fetch faults the observations already account for; what is left is the sink losing bytes
       // we did fetch. Such an item is re-driven whole rather than settled, so a stored-but-lost file is never forgotten.
       const accounted = obs.filter(o => !o.ok && (o.reason === 'http-status' || o.reason === 'timeout' || o.reason === 'threw')).length;
-      const sinkLost = after.failed - before.failed - accounted > 0 || (deps.sink !== undefined && sinkBefore !== undefined && lossOf(deps.sink.stats()) > lossOf(sinkBefore));
+      // A body over the store's ceiling is SKIPPED by the sink (and reported admitted): the sizes we fetched explain exactly that.
+      // Any other skip (not an image, empty, lane off), or a size skip the fetches do not account for, is bytes that are not at rest.
+      const storeCap = opts.storeMaxBytes;
+      const overCap = (o: FetchObservation): boolean => o.ok && storeCap !== undefined && o.bytes !== undefined && o.bytes > storeCap;
+      const sizeSkips = obs.filter(overCap).length;
+      const tooLargeDelta = skippedOf(sinkAfter, 'tooLarge') - skippedOf(sinkBefore, 'tooLarge');
+      const otherSkipDelta = (['notImage', 'empty', 'disabled'] as const).reduce((n, k) => n + skippedOf(sinkAfter, k) - skippedOf(sinkBefore, k), 0);
+      const unexplainedSkip = otherSkipDelta > 0 || tooLargeDelta > sizeSkips;
+      const sinkLost = after.failed - before.failed - accounted > 0
+        || (sinkAfter !== undefined && sinkBefore !== undefined && lossOf(sinkAfter) > lossOf(sinkBefore))
+        || unexplainedSkip;
       if (sinkLost) report.itemsWithFailures++;
 
       const observed = new Set<string>();
@@ -564,15 +645,23 @@ export async function runGalleryCapture(deps: GalleryDeps, opts: GalleryRunOptio
         const url = canonicalImageUrl(o.url) ?? o.url;
         observed.add(url);
         const c = classifyObservation(o);
-        if (c === 'ok') report.stored++; else report[c]++;
+        if (c !== 'ok') report[c]++;
+        else if (!sinkLost) {
+          if (overCap(o)) { report.skippedTooLarge++; outcome.set(url, 'too_large'); } else { report.stored++; outcome.set(url, 'stored'); }
+        }
         if (mode === 'probe') { probeObservations.push(o); continue; }
-        if (c === 'ok' && !sinkLost) deps.ledger.settle(itemKey, url, 'stored');
+        if (c === 'ok' && !sinkLost) deps.ledger.settle(itemKey, url, overCap(o) ? 'skipped:too_large' : 'stored');
         else if (c === 'gone') deps.ledger.settle(itemKey, url, 'gone');
         else if (c === 'oversize') deps.ledger.settle(itemKey, url, 'oversize');
       }
+      // Bytes the store lost are not at rest, whatever the hook's memo was told when it admitted them: take the urls out of it, so a
+      // later item sharing one fetches it itself (and the store is asked again) rather than being told it is stored.
+      if (sinkLost) deps.hook.forget?.([...observed]);
+
       // A file this item lists that no fetch was made for, because the hook already held its bytes from another item (a MEMO hit:
       // no request, but this item's own depiction is reported). Only when the memo explains every unfetched file and nothing else
-      // was skipped is it settled; a file left out for any other reason stays unsettled and is planned again.
+      // was skipped is it settled, and then only for a file whose put THIS run saw the store confirm; a memo hit nothing confirmed is a
+      // failure (unsettled, fetched again next run). A file left out for any other reason stays unsettled and is planned again.
       if (mode !== 'probe' && !sinkLost) {
         const unfetched = todo.filter(e => !observed.has(e.src));
         const skips = (counts: object): Array<[string, number]> => Object.entries(counts).map(([k, v]) => [k, typeof v === 'number' ? v : 0]);
@@ -580,7 +669,16 @@ export async function runGalleryCapture(deps: GalleryDeps, opts: GalleryRunOptio
         const delta = (k: string, v: number): number => v - (was.get(k) ?? 0);
         const memoHits = skips(after.skipped).filter(([k]) => k === 'memo').reduce((n, [k, v]) => n + delta(k, v), 0);
         const otherSkips = skips(after.skipped).filter(([k]) => k !== 'memo').reduce((n, [k, v]) => n + delta(k, v), 0);
-        if (unfetched.length > 0 && memoHits === unfetched.length && otherSkips === 0) for (const e of unfetched) deps.ledger.settle(itemKey, e.src, 'stored');
+        if (unfetched.length > 0 && memoHits === unfetched.length && otherSkips === 0) {
+          let unconfirmed = 0;
+          for (const e of unfetched) {
+            const known = outcome.get(e.src);
+            if (known === 'stored') { deps.ledger.settle(itemKey, e.src, 'stored'); report.stored++; }
+            else if (known === 'too_large') { deps.ledger.settle(itemKey, e.src, 'skipped:too_large'); report.skippedTooLarge++; }
+            else unconfirmed++;
+          }
+          if (unconfirmed > 0) report.itemsWithFailures++;
+        }
       }
       deps.log(`[gallery] ${itemKey}: ${obs.length} fetched, ${report.stored} stored so far, ${report.blocked} blocked`);
 
@@ -603,7 +701,7 @@ export async function runGalleryCapture(deps: GalleryDeps, opts: GalleryRunOptio
   }
 
   if (mode === 'probe') {
-    report.probe = judgeProbe({ observations: probeObservations, requests: deps.requests(), allowedHosts: allowed, wanted: opts.probe ?? 0, exhausted });
+    report.probe = judgeProbe({ observations: probeObservations, requests: deps.requests(), allowedHosts: opts.allowedHosts, wanted: opts.probe ?? 0, exhausted });
   }
   return report;
 }

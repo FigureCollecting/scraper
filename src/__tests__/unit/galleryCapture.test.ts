@@ -2,7 +2,7 @@
  * The gallery job's entry (`gallery:capture`): arguments and env in, one hook and one pacing limiter composed from
  * the same pieces the ingest lane uses, a report out, and an exit code an operator and a Job can act on.
  */
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { galleryExitCode, main, parseGalleryArgs } from '../../services/images/galleryCapture';
@@ -67,7 +67,7 @@ describe('parseGalleryArgs: the environment', () => {
 });
 
 describe('galleryExitCode', () => {
-  const base: GalleryReport = { mode: 'run', stopped: 'done', items: 0, planned: 0, fetched: 0, stored: 0, gone: 0, oversize: 0, blocked: 0, trouble: 0, skippedLedger: 0, notAllowedHost: 0, badLines: 0, entriesCapped: 0, itemsWithFailures: 0 };
+  const base: GalleryReport = { mode: 'run', stopped: 'done', items: 0, planned: 0, fetched: 0, stored: 0, gone: 0, oversize: 0, skippedTooLarge: 0, blocked: 0, trouble: 0, skippedLedger: 0, notAllowedHost: 0, badLines: 0, entriesCapped: 0, itemsWithFailures: 0 };
   it.each([
     [{ ...base }, 0],
     [{ ...base, stopped: 'limit' as const }, 0],
@@ -112,7 +112,7 @@ describe('main', () => {
     return {
       fetched, flushed,
       deps: {
-        env: { IMAGE_HOST_RATE_JSON: JSON.stringify({ [STATIC]: { intervalMs: 100 } }), GALLERY_ALLOWED_HOSTS: STATIC } as NodeJS.ProcessEnv,
+        env: { IMAGE_HOST_RATE_JSON: JSON.stringify({ [STATIC]: { intervalMs: 100 } }), GALLERY_ALLOWED_HOSTS: STATIC, RAW_STORE_IMAGE_MAX_BYTES: '10485760' } as NodeJS.ProcessEnv,
         print: (s: string) => void out.push(s),
         policy: POLICY,
         baseFetch: async (url: string) => {
@@ -242,7 +242,7 @@ describe('main', () => {
     expect(await main(['--worklist', work, '--ledger', ledger], { ...d.deps, env: env as NodeJS.ProcessEnv })).toBe(2);
     expect(out.join('\n')).toMatch(new RegExp(`REFUSED: no explicit rate row for ${STATIC.replace(/\./g, '\\.')}`));
     expect(d.fetched).toEqual([]);
-    expect(existsSync(`${ledger}.lock`)).toBe(false);
+    expect(existsSync(lockFile())).toBe(false);
   });
 
   it('a dry run needs no rate row (it makes no request)', async () => {
@@ -252,35 +252,129 @@ describe('main', () => {
     expect(await main(['--worklist', work, '--dry-run'], { ...d.deps, env: env as NodeJS.ProcessEnv })).toBe(0);
   });
 
-  // S6: one run per ledger
-  it('a second run exits 3 with zero requests while a live run holds the ledger, and says whose lock it is', async () => {
-    writeFileSync(`${ledger}.lock`, `${process.pid}\n`);
+  // S6 (round 2: R2-S1, N3): one run at a time per HOST, on a lease
+  const lockFile = (): string => path.join(dir, 'gallery-capture.lock');
+  const lease = (over: Record<string, unknown> = {}): string => JSON.stringify({ token: 'other', hostname: 'pod-a', startedAt: Date.now() - 600_000, heartbeatAt: Date.now() - 5_000, ...over });
+
+  it('a second run exits 8 (LOCKED has its own code) with zero requests while a fresh lease is held, and says whose it is', async () => {
+    writeFileSync(lockFile(), lease());
     const d = deps();
-    expect(await main(['--worklist', work, '--ledger', ledger], d.deps)).toBe(3);
-    expect(out.join('\n')).toContain(`LOCKED: another run holds ${ledger}.lock (pid ${process.pid})`);
+    expect(await main(['--worklist', work, '--ledger', ledger], d.deps)).toBe(8);
+    expect(out.join('\n')).toMatch(/LOCKED: another run holds .*gallery-capture\.lock \(pod-a, heartbeat \d+s ago\); this one made no request/);
     expect(d.fetched).toEqual([]);
-    expect(readFileSync(`${ledger}.lock`, 'utf8')).toBe(`${process.pid}\n`);
+    expect(JSON.parse(readFileSync(lockFile(), 'utf8')).token).toBe('other');
   });
 
-  it('a lock that is held but names no pid is reported without one', async () => {
-    writeFileSync(`${ledger}.lock`, '');
+  it('a lock nobody can read is reported without an owner', async () => {
+    writeFileSync(lockFile(), '');
     const d = deps();
-    expect(await main(['--worklist', work, '--ledger', ledger], d.deps)).toBe(3);
+    expect(await main(['--worklist', work, '--ledger', ledger], d.deps)).toBe(8);
     expect(out.join('\n')).toMatch(/LOCKED: another run holds .*\.lock; this one made no request/);
+  });
+
+  it('a lease whose heartbeat is older than 60 s is taken over, whoever wrote it', async () => {
+    writeFileSync(lockFile(), lease({ heartbeatAt: Date.now() - 120_000 }));
+    const d = deps();
+    expect(await main(['--worklist', work, '--ledger', ledger], d.deps)).toBe(0);
+    expect(d.fetched.length).toBe(3);
+    expect(existsSync(lockFile())).toBe(false);
   });
 
   it('takes its own lock for the run and always lets it go: after a clean run and after a crash', async () => {
     const d = deps();
     expect(await main(['--worklist', work, '--ledger', ledger], d.deps)).toBe(0);
-    expect(existsSync(`${ledger}.lock`)).toBe(false);
+    expect(existsSync(lockFile())).toBe(false);
     const boom = { ...deps().deps, makeHook: () => { throw new Error('hook could not be built'); } };
     expect(await main(['--worklist', work, '--ledger', ledger], boom as never)).toBe(1);
-    expect(existsSync(`${ledger}.lock`)).toBe(false);
+    expect(existsSync(lockFile())).toBe(false);
+  });
+
+  it('the lock does not depend on --ledger: another ledger in the same directory is blocked (a probe cannot run beside a run)', async () => {
+    writeFileSync(lockFile(), lease());
+    const d = deps();
+    expect(await main(['--worklist', work, '--ledger', path.join(dir, 'probe-ledger.jsonl'), '--probe', '2'], d.deps)).toBe(8);
+    expect(d.fetched).toEqual([]);
+  });
+
+  it('GALLERY_LOCK_PATH names the lock, wherever the ledger is', async () => {
+    const elsewhere = path.join(dir, 'locks', 'x.lock');
+    mkdirSync(path.dirname(elsewhere));
+    writeFileSync(elsewhere, lease());
+    const d = deps();
+    const env = { ...d.deps.env, GALLERY_LOCK_PATH: elsewhere } as NodeJS.ProcessEnv;
+    expect(await main(['--worklist', work, '--ledger', ledger], { ...d.deps, env })).toBe(8);
+    rmSync(elsewhere);
+    expect(await main(['--worklist', work, '--ledger', ledger], { ...d.deps, env })).toBe(0);
+    expect(existsSync(elsewhere)).toBe(false);
+    expect(existsSync(lockFile())).toBe(false);
+  });
+
+  it('GALLERY_LEDGER_PATH decides the default lock directory over the --ledger flag', async () => {
+    const other = path.join(dir, 'state');
+    mkdirSync(other);
+    writeFileSync(path.join(other, 'gallery-capture.lock'), lease());
+    const d = deps();
+    const env = { ...d.deps.env, GALLERY_LEDGER_PATH: path.join(other, 'ledger.jsonl') } as NodeJS.ProcessEnv;
+    expect(await main(['--worklist', work, '--ledger', ledger], { ...d.deps, env })).toBe(8);
   });
 
   it('a dry run takes no lock', async () => {
-    writeFileSync(`${ledger}.lock`, `${process.pid}\n`);
+    writeFileSync(lockFile(), lease());
     expect(await main(['--worklist', work, '--ledger', ledger, '--dry-run'], deps().deps)).toBe(0);
+  });
+
+  it('a run that LOSES its lease (another run took the lock) stops at once and exits 7', async () => {
+    const d = deps();
+    const slowHook = {
+      async capture(req: { ruleset: { describeImages?: (f: Record<string, unknown>) => Array<{ url: string }> }; fields: Record<string, unknown> }) {
+        for (const r of req.ruleset.describeImages!(req.fields)) d.fetched.push(r.url);
+        writeFileSync(lockFile(), lease({ token: 'taker', heartbeatAt: Date.now() }));
+        await new Promise(r => setTimeout(r, 250));
+      },
+      async drain() { /* nothing */ },
+      stats: () => ({ enabled: true, attempted: 0, stored: 0, deduped: 0, failed: 0, residentialBytesToday: 0, skipped: {} }),
+    };
+    const code = await main(['--worklist', work, '--ledger', ledger], { ...d.deps, makeHook: () => slowHook as never, lockHeartbeatMs: 20 });
+    expect(code).toBe(7);
+    expect(d.fetched).toEqual([U(1), U(2)]);
+    expect(out.join('\n')).toMatch(/LOST the lock/);
+    expect(JSON.parse(readFileSync(lockFile(), 'utf8')).token).toBe('taker');
+  });
+
+  // B1b: the store's own size cap is part of the Job's env
+  it.each([['unset', undefined], ['zero', '0'], ['negative', '-5'], ['not a number', 'lots'], ['empty', '']])('exits 2 with zero requests when RAW_STORE_IMAGE_MAX_BYTES is %s', async (_why, value) => {
+    const d = deps();
+    const env = { ...d.deps.env } as Record<string, string | undefined>;
+    if (value === undefined) delete env.RAW_STORE_IMAGE_MAX_BYTES; else env.RAW_STORE_IMAGE_MAX_BYTES = value;
+    expect(await main(['--worklist', work, '--ledger', ledger], { ...d.deps, env: env as NodeJS.ProcessEnv })).toBe(2);
+    expect(out.join('\n')).toMatch(/RAW_STORE_IMAGE_MAX_BYTES/);
+    expect(d.fetched).toEqual([]);
+    expect(existsSync(lockFile())).toBe(false);
+  });
+
+  it('a dry run does not need RAW_STORE_IMAGE_MAX_BYTES', async () => {
+    const d = deps();
+    const env = { ...d.deps.env } as Record<string, string | undefined>;
+    delete env.RAW_STORE_IMAGE_MAX_BYTES;
+    expect(await main(['--worklist', work, '--dry-run'], { ...d.deps, env: env as NodeJS.ProcessEnv })).toBe(0);
+  });
+
+  // N1: GALLERY_ALLOWED_HOSTS entries are origins
+  it('GALLERY_ALLOWED_HOSTS takes host or host:port, and a malformed entry is a usage error', () => {
+    expect(parseGalleryArgs([], { GALLERY_ALLOWED_HOSTS: 'A.example, b.example:8443' } as NodeJS.ProcessEnv).allowedHosts).toEqual(['a.example', 'b.example:8443']);
+    for (const bad of ['a.example:0', 'a.example:70000', 'a b', 'a.example/x', 'https://a.example']) {
+      expect(() => parseGalleryArgs([], { GALLERY_ALLOWED_HOSTS: bad } as NodeJS.ProcessEnv)).toThrow(/GALLERY_ALLOWED_HOSTS/);
+    }
+  });
+
+  it('the rate row of an origin entry is the row of its HOST NAME: with the row the run goes ahead, without it the message names the host', async () => {
+    const d = deps();
+    const withPort = { ...d.deps.env, GALLERY_ALLOWED_HOSTS: `${STATIC}:443` } as NodeJS.ProcessEnv;
+    expect(await main(['--worklist', work, '--ledger', ledger], { ...d.deps, env: withPort })).toBe(0);
+    expect(d.fetched).toEqual([U(1), U(2), U(3)]);
+    const noRow = { ...withPort, IMAGE_HOST_RATE_JSON: '{}' } as NodeJS.ProcessEnv;
+    expect(await main(['--worklist', work, '--ledger', ledger + '2'], { ...d.deps, env: noRow })).toBe(2);
+    expect(out.join('\n')).toContain(`no explicit rate row for ${STATIC} in IMAGE_HOST_RATE_JSON`);
   });
 
   // S7: a signal reaches the run through deps.signal

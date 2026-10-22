@@ -6,19 +6,22 @@
  * the limiter's rate taken from IMAGE_HOST_RATE_JSON, and a plain-http-only bytes router — so any other lane is
  * `unsupported` by construction, not by configuration. Nothing here fetches an image itself.
  *
- * Exit codes: 0 done (or a limit reached), 3 paused (a block, or a live pause marker), 4 refused (lane off or the host
- * policy is not plain http + direct), 5 probe not a PASS, 2 bad arguments or input (nothing ran), 1 the run crashed.
+ * Exit codes (one meaning each): 0 done (or a limit reached), 1 the run crashed, 2 bad arguments, input or config (nothing ran),
+ * 3 paused (a block, a failure storm, or a live pause marker), 4 refused (lane off or the host policy is not plain http + direct),
+ * 5 probe not a PASS, 6 the raw store did not confirm some item's files (unsettled, run again), 7 stopped by SIGTERM/SIGINT or by
+ * losing the lock, 8 LOCKED (another run holds the lease; this one made no request).
  */
 import { existsSync } from 'node:fs';
+import path from 'node:path';
 import type { SourceClass } from '@figurecollecting/scraper-plugin-contract';
 import { HostRateLimiter } from '../../driver/hostRateLimiter.js';
-import { flushRawCaptureSink } from '../s3ObjectStore.js';
+import { flushRawCaptureSink, parseImageMaxBytes } from '../s3ObjectStore.js';
 import { getRawCaptureSink } from '../s3ObjectStore.js';
 import { createImageHostLimiter, createImageCaptureHookFromEnv } from './assembleImageCapture.js';
-import { acquireRunLock } from './galleryLock.js';
+import { acquireRunLock, LOCK_HEARTBEAT_MS } from './galleryLock.js';
 import { readWorklistFile } from './galleryWorklist.js';
 import {
-  createFetchObserver, createFileLedger, createMemoryLedger, createRecordingFetch, followAllowedRedirects, runGalleryCapture,
+  allowedHostnames, createFetchObserver, createFileLedger, createMemoryLedger, createRecordingFetch, followAllowedRedirects, gateOnStop, parseAllowedOrigin, runGalleryCapture,
   type ConfirmingSink, type GalleryLedger, type GalleryReport,
 } from './galleryDriver.js';
 import { createHttpBytesFetch, type BytesFetchImpl } from './httpBytesFetch.js';
@@ -33,7 +36,11 @@ const MAX_PROBE = 200;
 const SOURCE_CLASSES: readonly string[] = ['manufacturer_press', 'retailer_studio', 'user_photo', 'unknown'];
 const USAGE =
   'usage: gallery:capture --worklist <file.jsonl> --ledger <file.jsonl> [--probe [N]] [--max-files N] [--max-minutes N] ' +
-  '[--pause-after N] [--pause-minutes N] [--resume] [--dry-run] [--source-class <class>]  (env: GALLERY_WORKLIST_PATH, GALLERY_LEDGER_PATH, GALLERY_ALLOWED_HOSTS)';
+  '[--pause-after N] [--pause-minutes N] [--resume] [--dry-run] [--source-class <class>]  (env: GALLERY_WORKLIST_PATH, GALLERY_LEDGER_PATH, GALLERY_ALLOWED_HOSTS = host or host:port, GALLERY_LOCK_PATH)';
+
+/** The lease file, when nothing names it: beside the ledger, under one name, so every ledger of a host shares one lock. */
+const LOCK_FILE_NAME = 'gallery-capture.lock';
+export const EXIT_LOCKED = 8;
 
 export interface GalleryArgs {
   worklist?: string;
@@ -57,7 +64,11 @@ function whole(flag: string, v: string | undefined, max: number): number {
 
 /** argv + env -> options; throws a usage error (the CLI exits 2) on anything it does not understand. */
 export function parseGalleryArgs(argv: readonly string[], env: NodeJS.ProcessEnv = process.env): GalleryArgs {
-  const hosts = (env.GALLERY_ALLOWED_HOSTS ?? '').split(',').map(h => h.trim().toLowerCase()).filter(h => h !== '');
+  const hosts = (env.GALLERY_ALLOWED_HOSTS ?? '').split(',').map(h => h.trim()).filter(h => h !== '').map(entry => {
+    const origin = parseAllowedOrigin(entry);
+    if (origin === undefined) throw new Error(`${USAGE} (GALLERY_ALLOWED_HOSTS entry '${entry.slice(0, 80)}' is not a host or host:port)`);
+    return origin.port === undefined ? origin.host : `${origin.host}:${origin.port}`;
+  });
   const out: GalleryArgs = {
     ...(env.GALLERY_WORKLIST_PATH ? { worklist: env.GALLERY_WORKLIST_PATH } : {}),
     ...(env.GALLERY_LEDGER_PATH ? { ledger: env.GALLERY_LEDGER_PATH } : {}),
@@ -120,6 +131,8 @@ export interface GalleryMainDeps {
   makeHook?: (fetchBytes: ImageBytesFetcher, env: NodeJS.ProcessEnv) => ImageCaptureHook;
   /** Drain the raw store sink before exit (default: flushRawCaptureSink). */
   flush?: () => Promise<unknown>;
+  /** How often the lease is refreshed (default 10 s). */
+  lockHeartbeatMs?: number;
 }
 
 export async function main(argv: readonly string[] = process.argv.slice(2), deps: GalleryMainDeps = {}): Promise<number> {
@@ -137,23 +150,43 @@ export async function main(argv: readonly string[] = process.argv.slice(2), deps
   }
 
   // No explicit rate row, no run: the limiter's own default eases up toward ~3.65 files/s, faster than the rate decided for this host.
-  // A dry run makes no request and is left alone.
+  // A dry run makes no request and is left alone. The rate and the policy are keyed by HOST NAME, so an origin entry is looked up by its host.
   if (!args.dryRun) {
     const rateFor = imageHostRateFor(env, print);
-    const missing = args.allowedHosts.filter(h => rateFor(h) === undefined);
+    const missing = allowedHostnames(args.allowedHosts).filter(h => rateFor(h) === undefined);
     if (missing.length > 0) {
       print(`REFUSED: no explicit rate row for ${missing.join(', ')} in IMAGE_HOST_RATE_JSON (e.g. {"${missing[0]}":{"intervalMs":333}}); a host with no decided rate is never fetched at the limiter default`);
       return 2;
     }
   }
-  // One run at a time per ledger: a second makes no request.
+  // The store's own ceiling is part of the Job's env: the sink skips a body over it and still calls it admitted, so without the number
+  // a run cannot say which files are at rest. Copy the scraper Deployment's value; it is not defaulted here.
+  const storeMaxBytes = parseImageMaxBytes(env.RAW_STORE_IMAGE_MAX_BYTES);
+  if (!args.dryRun && storeMaxBytes === undefined) {
+    print('REFUSED: RAW_STORE_IMAGE_MAX_BYTES is not set to a positive number of bytes (copy the scraper Deployment\'s value, e.g. 10485760): the raw store skips bodies over it, so the run must know the ceiling to say which files are at rest');
+    return 2;
+  }
+  // One run at a time per HOST, on a lease that does not depend on --ledger (a probe with its own ledger must not run beside a live run).
   let lock: ReturnType<typeof acquireRunLock> | undefined;
-  if (args.ledger !== undefined && !args.dryRun) {
-    lock = acquireRunLock(`${args.ledger}.lock`);
+  const lockPath = env.GALLERY_LOCK_PATH || (args.ledger === undefined ? undefined : path.join(path.dirname(env.GALLERY_LEDGER_PATH || args.ledger), LOCK_FILE_NAME));
+  if (lockPath !== undefined && !args.dryRun) {
+    lock = acquireRunLock(lockPath);
     if (!lock.held) {
-      print(`LOCKED: another run holds ${args.ledger}.lock${lock.pid !== undefined ? ` (pid ${lock.pid})` : ''}; this one made no request`);
-      return 3;
+      const owner = lock.owner;
+      print(`LOCKED: another run holds ${lockPath}${owner !== undefined ? ` (${owner.hostname}, heartbeat ${Math.max(0, Math.round((Date.now() - owner.heartbeatAt) / 1000))}s ago)` : ''}; this one made no request`);
+      return EXIT_LOCKED;
     }
+  }
+  // A signal, or the loss of the lease, stops the run the same way.
+  const stop = new AbortController();
+  const relay = (): void => stop.abort();
+  if (deps.signal?.aborted === true) stop.abort();
+  else deps.signal?.addEventListener('abort', relay, { once: true });
+  if (lock?.held) {
+    lock.startHeartbeat(() => {
+      print(`LOST the lock ${lockPath ?? ''}: another run took it over (this run's heartbeat did not reach the file); stopping`);
+      stop.abort();
+    }, deps.lockHeartbeatMs ?? LOCK_HEARTBEAT_MS);
   }
 
   const flush = deps.flush ?? (() => flushRawCaptureSink({ env }));
@@ -163,7 +196,8 @@ export async function main(argv: readonly string[] = process.argv.slice(2), deps
     const recording = createRecordingFetch(deps.baseFetch);
     const limiter: HostRateLimiter = createImageHostLimiter(env);
     // observer( follow-by-hand( paced( http lane over the manual-redirect transport ) ) ): every hop is paced and checked
-    const paced = paceImageBytesByHost(createImageBytesRouter({ http: createHttpBytesFetch({ fetchImpl: recording.fetchImpl }) }), limiter);
+    // gateOnStop sits under the pacer: a request already waiting for its slot is refused when its wait ends, if the run has been stopped
+    const paced = paceImageBytesByHost(gateOnStop(createImageBytesRouter({ http: createHttpBytesFetch({ fetchImpl: recording.fetchImpl }) }), observer.stopped), limiter);
     const fetchBytes = observer.wrap(followAllowedRedirects(paced, { allowedHosts: args.allowedHosts, locationOf: recording.takeLocation }));
     const policy = deps.policy ?? loadImageHostPolicy(env);
     const hook = (deps.makeHook ?? ((f, e) => createImageCaptureHookFromEnv({ ...e, IMAGE_MAX_PER_ITEM: '100' }, { fetchBytes: f, policy })))(fetchBytes, env);
@@ -178,7 +212,8 @@ export async function main(argv: readonly string[] = process.argv.slice(2), deps
         ...(args.maxMinutes !== undefined ? { maxMs: args.maxMinutes * 60_000 } : {}),
         ...(args.probe !== undefined ? { probe: args.probe } : {}),
         resume: args.resume, dryRun: args.dryRun,
-        ...(deps.signal !== undefined ? { signal: deps.signal } : {}),
+        signal: stop.signal,
+        ...(storeMaxBytes !== undefined ? { storeMaxBytes } : {}),
       },
     );
     await hook.drain();
@@ -199,6 +234,7 @@ export async function main(argv: readonly string[] = process.argv.slice(2), deps
     try { await flush(); } catch { /* the sink's own drain reports its losses */ }
     return 1;
   } finally {
+    deps.signal?.removeEventListener('abort', relay);
     if (lock?.held) lock.release();
   }
 }

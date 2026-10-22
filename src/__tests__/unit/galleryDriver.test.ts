@@ -390,7 +390,8 @@ describe('runGalleryCapture', () => {
       const { report, ledger } = run([item('1', [1, 2])], () => ok200(), {}, { failedPerCapture: 1 });
       const r = await report;
       expect(ledger.has(K('1'), U(1))).toBe(false);
-      expect(r.stored).toBe(2);
+      expect(r.stored).toBe(0); // N4: stored counts files the store confirmed; this item's two were downloaded (fetched 2) and lost
+      expect(r.fetched).toBe(2);
       expect(r.itemsWithFailures).toBe(1);
     });
   });
@@ -413,7 +414,7 @@ describe('judgeProbe', () => {
     ['cloudflare mitigated', { requests: [req({ cfMitigated: 'challenge' })] }, /challenge|mitigat/i],
     ['a non-200 status', { observations: [{ url: U(1), ok: false, status: 403, reason: 'http-status', ms: 1 } as FetchObservation] }, /403|status/i],
     ['a 2xx that is not an image', { observations: [{ url: U(1), ok: false, status: 200, reason: 'not-image', contentType: 'text/html', ms: 1 } as FetchObservation] }, /not an image|html/i],
-    ['bytes from another host', { observations: [{ ...good(1), finalUrl: 'https://elsewhere.example/a.jpg' }] }, /host/i],
+    ['bytes from another origin', { observations: [{ ...good(1), finalUrl: 'https://elsewhere.example/a.jpg' }] }, /another origin.*elsewhere\.example/i],
   ])('fails when %s', (_label, over, why) => {
     const v = judgeProbe({ observations: [good(1)], requests: [req()], allowedHosts: [STATIC], wanted: 1, ...over } as never);
     expect(v.verdict).toBe('FAIL');
@@ -623,7 +624,8 @@ describe('B2 (unit): a file is settled only once the sink has confirmed its put'
     const ledger = createMemoryLedger();
     const r = await run([item('1', [1, 2]), item('2', [3])], () => ok200(), {}, { sink, ledger }).report;
     expect([ledger.has(K('1'), U(1)), ledger.has(K('1'), U(2)), ledger.has(K('2'), U(3))]).toEqual([false, false, true]);
-    expect(r).toMatchObject({ itemsWithFailures: 1, stored: 3 });
+    // N4: stored is what the store confirmed (item 2's one file); the other two were downloaded and lost
+    expect(r).toMatchObject({ itemsWithFailures: 1, stored: 1, fetched: 3 });
   });
 
   it('refuses to fetch at all when the sink cannot confirm a write (a dry run is left alone)', async () => {
@@ -672,7 +674,8 @@ describe('S1 (unit): an unfetched file the memo explains is settled for its own 
     const hook = memoHook(observer);
     const ledger = createMemoryLedger();
     const r = await runGalleryCapture({ hook, sink: okSink(), observer, policy: POLICY, ledger, items: feedAll([item('1', [1, 2]), item('2', [1]), item('3', [1, 3])]), now: () => 0, log: noop, requests: () => [] }, baseOpts());
-    expect(r).toMatchObject({ fetched: 3, stored: 3, items: 3, planned: 5 });
+    // fetched 3 files; stored counts the five (item, picture) pairs the store has now been told about and confirmed
+    expect(r).toMatchObject({ fetched: 3, stored: 5, items: 3, planned: 5 });
     expect([ledger.has(K('1'), U(1)), ledger.has(K('2'), U(1)), ledger.has(K('3'), U(1)), ledger.has(K('3'), U(3))]).toEqual([true, true, true, true]);
   });
 
