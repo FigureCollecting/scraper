@@ -79,7 +79,14 @@ describe('galleryExitCode', () => {
     [{ ...base, itemsWithFailures: 1 }, 6],
     [{ ...base, stopped: 'limit' as const, itemsWithFailures: 2 }, 6],
     [{ ...base, stopped: 'paused' as const, itemsWithFailures: 1 }, 3],
-    [{ ...base, mode: 'probe' as const, itemsWithFailures: 1, probe: { verdict: 'PASS' as const, reasons: [], notes: [], evidence: [] } }, 6],
+    // a probe answers one question and the code follows the printed verdict: PASS is 0, anything else 5 (6 is for a real run)
+    [{ ...base, mode: 'probe' as const, itemsWithFailures: 1, probe: { verdict: 'PASS' as const, reasons: [], notes: [], evidence: [] } }, 5],
+    [{ ...base, mode: 'probe' as const, itemsWithFailures: 1, probe: { verdict: 'FAIL' as const, reasons: ['x'], notes: [], evidence: [] } }, 5],
+    [{ ...base, mode: 'probe' as const, itemsWithFailures: 0, probe: { verdict: 'FAIL' as const, reasons: ['x'], notes: [], evidence: [] } }, 5],
+    // a probe that tripped the pause exits by its verdict, not by the pause (the marker and the PAUSED line are still there)
+    [{ ...base, mode: 'probe' as const, stopped: 'paused' as const, probe: { verdict: 'FAIL' as const, reasons: ['x'], notes: [], evidence: [] } }, 5],
+    [{ ...base, mode: 'probe' as const, stopped: 'paused-marker' as const }, 3],
+    [{ ...base, mode: 'probe' as const, stopped: 'interrupted' as const, probe: { verdict: 'INCONCLUSIVE' as const, reasons: ['x'], notes: [], evidence: [] } }, 7],
     // S7: stopped by a signal
     [{ ...base, stopped: 'interrupted' as const }, 7],
     [{ ...base, stopped: 'interrupted' as const, itemsWithFailures: 1 }, 7],

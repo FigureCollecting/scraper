@@ -19,6 +19,7 @@
  */
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 import type { SourceClass } from '@figurecollecting/scraper-plugin-contract';
+import { sniffImageType } from '../objectStoreCaptureSink.js';
 import type { BytesFetchImpl } from './httpBytesFetch.js';
 import type { ImageBytesFetcher, ImageBytesResult } from './imageBytes.js';
 import type { ImageCaptureHook } from './imageCaptureHook.js';
@@ -37,15 +38,17 @@ export interface FetchObservation {
   detail?: string;
   contentType?: string;
   bytes?: number;
+  /** An ok fetch whose body the store will not keep: empty, or not JPEG, PNG, GIF, WebP or AVIF by its magic bytes (the lane trusts a declared image/* type; the sink does not). */
+  notImage?: boolean;
   finalUrl?: string;
   signals?: Record<string, string>;
   ms: number;
 }
-export type ObservationClass = 'ok' | 'blocked' | 'gone' | 'oversize' | 'trouble';
+export type ObservationClass = 'ok' | 'blocked' | 'gone' | 'oversize' | 'trouble' | 'notimage';
 
-/** What one fetch says about the host. Blocked is the only class that counts toward a pause. */
+/** What one fetch says about the host. Blocked, trouble and notimage count toward a pause; only a good image resets it. */
 export function classifyObservation(o: FetchObservation): ObservationClass {
-  if (o.ok) return 'ok';
+  if (o.ok) return o.notImage === true ? 'notimage' : 'ok';
   if (o.signals?.['cf-mitigated'] !== undefined) return 'blocked';
   if (o.reason === 'refused') return 'blocked';
   if (o.reason === 'not-image' && o.status !== undefined && o.status >= 200 && o.status <= 299) return 'blocked';
@@ -94,7 +97,7 @@ export function createFetchObserver(opts: { pauseAfter: number; now: () => numbe
   // must not be asked for the rest of the list at the full pace. A success resets it; gone and oversize are verdicts on one url.
   const fail = (o: FetchObservation): void => {
     streak += 1;
-    if (streak >= opts.pauseAfter) trip = `${streak} consecutive blocked or failed fetches (last: ${o.status ?? o.reason} on ${pathOf(o.url)})`;
+    if (streak >= opts.pauseAfter) trip = `${streak} consecutive blocked or failed fetches (last: ${o.ok ? 'a body that is not an image' : (o.status ?? o.reason)} on ${pathOf(o.url)})`;
   };
   return {
     stop(reason) { stopped = reason; },
@@ -116,7 +119,11 @@ export function createFetchObserver(opts: { pauseAfter: number; now: () => numbe
         const ms = opts.now() - t0;
         if (!res.ok && res.reason === 'refused' && res.detail?.startsWith(STOP_DETAIL)) return res; // stopped at dispatch: no verdict on the host
         const o: FetchObservation = res.ok
-          ? { url, ok: true, status: res.status, contentType: res.contentType, bytes: res.bytes.length, finalUrl: res.finalUrl, ms }
+          ? {
+              url, ok: true, status: res.status, contentType: res.contentType, bytes: res.bytes.length, finalUrl: res.finalUrl, ms,
+              // the sink decides by magic bytes, with the very function used here, so the two cannot disagree about what it keeps
+              ...(res.bytes.length === 0 || sniffImageType(res.bytes) === undefined ? { notImage: true } : {}),
+            }
           : {
               url, ok: false, reason: res.reason, ms,
               ...(res.reason === 'refused' && res.detail !== undefined ? { detail: res.detail } : {}),
@@ -126,7 +133,7 @@ export function createFetchObserver(opts: { pauseAfter: number; now: () => numbe
             };
         seen.push(o);
         const c = classifyObservation(o);
-        if (c === 'blocked' || c === 'trouble') fail(o);
+        if (c === 'blocked' || c === 'trouble' || c === 'notimage') fail(o);
         else if (c === 'ok') streak = 0;
         return res;
       };
@@ -179,14 +186,20 @@ export function originAllowed(url: string, allowed: readonly AllowedOrigin[]): b
 // ---------------------------------------------------------------------------
 // the ledger
 // ---------------------------------------------------------------------------
-/** `skipped:too_large`: the raw store skips a body over RAW_STORE_IMAGE_MAX_BYTES; the file is real but will never be at rest, and is not asked for again. */
+/**
+ * `skipped:too_large`: the raw store skips a body over RAW_STORE_IMAGE_MAX_BYTES; `skipped:not_image`: it skips a body that is empty or
+ * whose magic bytes are not JPEG, PNG, GIF, WebP or AVIF (an HTML page served as image/jpeg, a BMP). Either way the file is real but will
+ * never be at rest: it is settled, counted, never reported to the spine and not asked for again.
+ */
 /**
  * What the store CONFIRMED for a url during this run: the one thing a later item's memo hit can be settled on. Bounded (a run is millions
  * of urls); it only has to outlast the hook's own bounded memo, which can serve a url only while it still holds it. A url this forgets is
  * a memo hit with no known outcome, which is a failure (unsettled, fetched again next run), never a guess.
  */
-export function createOutcomeMemory(max: number): { get(url: string): 'stored' | 'too_large' | undefined; set(url: string, v: 'stored' | 'too_large'): void } {
-  const m = new Map<string, 'stored' | 'too_large'>();
+/** What the raw store does with a fetched body. */
+export type StoreVerdict = 'stored' | 'too_large' | 'not_image';
+export function createOutcomeMemory(max: number): { get(url: string): StoreVerdict | undefined; set(url: string, v: StoreVerdict): void } {
+  const m = new Map<string, StoreVerdict>();
   return {
     get(url) {
       const v = m.get(url);
@@ -205,8 +218,9 @@ export function createOutcomeMemory(max: number): { get(url: string): 'stored' |
   };
 }
 export const DEFAULT_OUTCOME_MEMORY = 200_000;
+const SETTLED_AS: Record<StoreVerdict, Settled> = { stored: 'stored', too_large: 'skipped:too_large', not_image: 'skipped:not_image' };
 
-export type Settled = 'stored' | 'gone' | 'oversize' | 'skipped:too_large';
+export type Settled = 'stored' | 'gone' | 'oversize' | 'skipped:too_large' | 'skipped:not_image';
 /**
  * Settlement is per (item, url), not per url: an item that shares a picture with another still needs its OWN depiction reported
  * (the hook's memo hit does that without a second fetch), so a url settled for one item says nothing about the next. `item` is
@@ -247,7 +261,7 @@ export function createFileLedger(file: string): GalleryLedger {
       try {
         const r = JSON.parse(line) as Record<string, unknown>;
         if (r === null || typeof r !== 'object' || Array.isArray(r)) continue;
-        if (typeof r.i === 'string' && typeof r.u === 'string' && (r.s === 'stored' || r.s === 'gone' || r.s === 'oversize' || r.s === 'skipped:too_large')) memory.settle(r.i, r.u, r.s);
+        if (typeof r.i === 'string' && typeof r.u === 'string' && (r.s === 'stored' || r.s === 'gone' || r.s === 'oversize' || r.s === 'skipped:too_large' || r.s === 'skipped:not_image')) memory.settle(r.i, r.u, r.s);
         else if ('pause' in r) {
           if (typeof r.pause === 'number') memory.pause(r.pause, String(r.why ?? ''));
           else if (r.pause === null) memory.clearPause();
@@ -410,6 +424,7 @@ export function judgeProbe(input: { observations: FetchObservation[]; requests: 
       if (o.reason === 'not-image') add(`not an image: a ${o.status ?? '2xx'} answered with ${o.contentType ?? 'no content type'}`);
       else add(`status ${o.status ?? o.reason ?? 'unknown'} (${o.reason ?? 'failed'})`);
     } else {
+      if (o.notImage === true) add(`not an image: a ${o.status ?? 200} body labelled ${o.contentType ?? 'image'} that the store would not keep (it keeps JPEG, PNG, GIF, WebP and AVIF)`);
       if (o.status !== 200) add(`status ${o.status} where 200 was expected`);
       const where = o.finalUrl ?? o.url;
       if (!originAllowed(where, allowed)) add(`bytes came from another origin (${describeOrigin(where)})`);
@@ -529,6 +544,8 @@ export interface GalleryReport {
   oversize: number;
   /** Pairs settled `skipped:too_large`: the raw store skips bodies over its own ceiling. */
   skippedTooLarge: number;
+  /** Pairs settled `skipped:not_image`: the raw store skips a body that is empty or not JPEG, PNG, GIF, WebP or AVIF. */
+  skippedNotImage: number;
   blocked: number;
   trouble: number;
   skippedLedger: number;
@@ -556,12 +573,13 @@ function preflight(policy: ImageHostPolicy, pageUrl: string, hosts: readonly str
 export async function runGalleryCapture(deps: GalleryDeps, opts: GalleryRunOptions): Promise<GalleryReport> {
   const mode: GalleryReport['mode'] = opts.probe !== undefined ? 'probe' : opts.dryRun === true ? 'dry-run' : 'run';
   const report: GalleryReport = {
-    mode, stopped: 'done', items: 0, planned: 0, fetched: 0, stored: 0, gone: 0, oversize: 0, skippedTooLarge: 0, blocked: 0, trouble: 0,
+    mode, stopped: 'done', items: 0, planned: 0, fetched: 0, stored: 0, gone: 0, oversize: 0, skippedTooLarge: 0, skippedNotImage: 0, blocked: 0, trouble: 0,
     skippedLedger: 0, notAllowedHost: 0, badLines: 0, entriesCapped: 0, itemsWithFailures: 0,
   };
   const started = deps.now();
   const allowed = compileAllowed(opts.allowedHosts);
   const outcome = createOutcomeMemory(opts.outcomeMemory ?? DEFAULT_OUTCOME_MEMORY); // what the store CONFIRMED for a url in this run
+  const count = (v: StoreVerdict): void => { if (v === 'stored') report.stored++; else if (v === 'too_large') report.skippedTooLarge++; else report.skippedNotImage++; };
   const sourceClass: SourceClass = opts.sourceClass ?? 'unknown';
   const budget = opts.probe ?? opts.maxFiles;
 
@@ -647,14 +665,22 @@ export async function runGalleryCapture(deps: GalleryDeps, opts: GalleryRunOptio
       // `failed` also counts fetch faults the observations already account for; what is left is the sink losing bytes
       // we did fetch. Such an item is re-driven whole rather than settled, so a stored-but-lost file is never forgotten.
       const accounted = obs.filter(o => !o.ok && (o.reason === 'http-status' || o.reason === 'timeout' || o.reason === 'threw')).length;
-      // A body over the store's ceiling is SKIPPED by the sink (and reported admitted): the sizes we fetched explain exactly that.
-      // Any other skip (not an image, empty, lane off), or a size skip the fetches do not account for, is bytes that are not at rest.
+      // The store SKIPS some bodies and still calls them admitted. It checks, in this order: empty, over its ceiling, not JPEG/PNG/GIF/WebP/AVIF
+      // by magic bytes. The fetched sizes and the observer's sniff (the sink's own function) say which of this item's files it skipped and why,
+      // so each is settled by its own verdict. A skip the fetched bodies do not account for (the lane off, or more skips than bodies that
+      // qualify) is bytes that are not at rest and is treated as a lost put. The hook may send a body only once (same bytes under two urls),
+      // so the sink counting FEWER skips than there are qualifying bodies is fine.
       const storeCap = opts.storeMaxBytes;
-      const overCap = (o: FetchObservation): boolean => o.ok && storeCap !== undefined && o.bytes !== undefined && o.bytes > storeCap;
-      const sizeSkips = obs.filter(overCap).length;
-      const tooLargeDelta = skippedOf(sinkAfter, 'tooLarge') - skippedOf(sinkBefore, 'tooLarge');
-      const otherSkipDelta = (['notImage', 'empty', 'disabled'] as const).reduce((n, k) => n + skippedOf(sinkAfter, k) - skippedOf(sinkBefore, k), 0);
-      const unexplainedSkip = otherSkipDelta > 0 || tooLargeDelta > sizeSkips;
+      const verdictOf = (o: FetchObservation): StoreVerdict => {
+        if (o.bytes === 0) return 'not_image';
+        if (storeCap !== undefined && o.bytes !== undefined && o.bytes > storeCap) return 'too_large';
+        return o.notImage === true ? 'not_image' : 'stored';
+      };
+      const fetchedOk = obs.filter(o => o.ok);
+      const sizeSkips = fetchedOk.filter(o => verdictOf(o) === 'too_large').length;
+      const typeSkips = fetchedOk.filter(o => verdictOf(o) === 'not_image').length;
+      const delta = (k: 'tooLarge' | 'notImage' | 'empty' | 'disabled'): number => skippedOf(sinkAfter, k) - skippedOf(sinkBefore, k);
+      const unexplainedSkip = delta('disabled') > 0 || delta('tooLarge') > sizeSkips || delta('notImage') + delta('empty') > typeSkips;
       const sinkLost = after.failed - before.failed - accounted > 0
         || (sinkAfter !== undefined && sinkBefore !== undefined && lossOf(sinkAfter) > lossOf(sinkBefore))
         || unexplainedSkip;
@@ -666,12 +692,14 @@ export async function runGalleryCapture(deps: GalleryDeps, opts: GalleryRunOptio
         const url = canonicalImageUrl(o.url) ?? o.url;
         observed.add(url);
         const c = classifyObservation(o);
-        if (c !== 'ok') report[c]++;
-        else if (!sinkLost) {
-          if (overCap(o)) { report.skippedTooLarge++; outcome.set(url, 'too_large'); } else { report.stored++; outcome.set(url, 'stored'); }
+        if (c !== 'ok' && c !== 'notimage') report[c]++;
+        const verdict = o.ok && !sinkLost ? verdictOf(o) : undefined;
+        if (verdict !== undefined) {
+          outcome.set(url, verdict);
+          count(verdict);
         }
         if (mode === 'probe') { probeObservations.push(o); continue; }
-        if (c === 'ok' && !sinkLost) deps.ledger.settle(itemKey, url, overCap(o) ? 'skipped:too_large' : 'stored');
+        if (verdict !== undefined) deps.ledger.settle(itemKey, url, SETTLED_AS[verdict]);
         else if (c === 'gone') deps.ledger.settle(itemKey, url, 'gone');
         else if (c === 'oversize') deps.ledger.settle(itemKey, url, 'oversize');
       }
@@ -694,9 +722,9 @@ export async function runGalleryCapture(deps: GalleryDeps, opts: GalleryRunOptio
           let unconfirmed = 0;
           for (const e of unfetched) {
             const known = outcome.get(e.src);
-            if (known === 'stored') { deps.ledger.settle(itemKey, e.src, 'stored'); report.stored++; }
-            else if (known === 'too_large') { deps.ledger.settle(itemKey, e.src, 'skipped:too_large'); report.skippedTooLarge++; }
-            else unconfirmed++;
+            if (known === undefined) { unconfirmed++; continue; }
+            deps.ledger.settle(itemKey, e.src, SETTLED_AS[known]);
+            count(known);
           }
           if (unconfirmed > 0) report.itemsWithFailures++;
         }
@@ -722,7 +750,15 @@ export async function runGalleryCapture(deps: GalleryDeps, opts: GalleryRunOptio
   }
 
   if (mode === 'probe') {
-    report.probe = judgeProbe({ observations: probeObservations, requests: deps.requests(), allowedHosts: opts.allowedHosts, wanted: opts.probe ?? 0, exhausted });
+    const judged = judgeProbe({ observations: probeObservations, requests: deps.requests(), allowedHosts: opts.allowedHosts, wanted: opts.probe ?? 0, exhausted });
+    // A probe puts its files through the real sink. Whatever the store did not keep is evidence the host's answers cannot be stored as they are,
+    // so the verdict cannot be a PASS (and the exit code, which follows the verdict, cannot be 0).
+    const storeProblems = [
+      ...(report.itemsWithFailures > 0 ? [`the store did not confirm the files of ${report.itemsWithFailures} item(s)`] : []),
+      ...(report.skippedTooLarge > 0 ? [`the store skipped ${report.skippedTooLarge} file(s) as over its size ceiling`] : []),
+      ...(report.skippedNotImage > 0 ? [`the store skipped ${report.skippedNotImage} file(s) as not an image`] : []),
+    ];
+    report.probe = storeProblems.length === 0 ? judged : { ...judged, verdict: 'FAIL', reasons: [...judged.reasons, ...storeProblems] };
   }
   return report;
 }

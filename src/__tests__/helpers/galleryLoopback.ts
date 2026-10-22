@@ -129,6 +129,18 @@ export async function startLoopback(initialS3: S3Mode = 'ok'): Promise<Loopback>
         res.writeHead(200, { 'content-type': 'image/png', 'content-length': b.length });
         return void res.end(b);
       }
+      // an HTML page (a hotlink or soft-404 page) served with an image content type: the lane takes the declared type, the store sniffs
+      case 'htmlimg': {
+        const body = Buffer.from(`<html><body>hotlink protected: ${rest}</body></html>`);
+        res.writeHead(200, { 'content-type': 'image/jpeg', 'content-length': body.length });
+        return void res.end(body);
+      }
+      // a BMP original: a real image, but not one the store keeps (it keeps JPEG, PNG, GIF, WebP and AVIF)
+      case 'bmp': {
+        const body = Buffer.concat([Buffer.from('BM'), Buffer.from(rest.padEnd(60, '.'))]);
+        res.writeHead(200, { 'content-type': 'image/bmp', 'content-length': body.length });
+        return void res.end(body);
+      }
       case 'redir-same': res.writeHead(302, { location: `/img/${rest}` }); return void res.end();
       case 'redir-chain': {
         const k = Number(rest.split('/')[0]);

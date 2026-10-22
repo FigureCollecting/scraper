@@ -8,7 +8,7 @@
  *
  * Exit codes (one meaning each): 0 done (or a limit reached), 1 the run crashed, 2 bad arguments, input or config (nothing ran),
  * 3 paused (a block, a failure storm, or a live pause marker), 4 refused (lane off or the host policy is not plain http + direct),
- * 5 probe not a PASS, 6 the raw store did not confirm some item's files (unsettled, run again), 7 stopped by SIGTERM/SIGINT or by
+ * 5 probe not a PASS (a probe exits by its printed verdict: 0 or 5), 6 the raw store did not confirm some item's files (unsettled, run again), 7 stopped by SIGTERM/SIGINT or by
  * losing the lock, 8 LOCKED (another run holds the lease; this one made no request).
  */
 import { existsSync } from 'node:fs';
@@ -110,9 +110,12 @@ export function parseGalleryArgs(argv: readonly string[], env: NodeJS.ProcessEnv
 export function galleryExitCode(r: GalleryReport): number {
   if (r.stopped === 'interrupted') return 7;
   if (r.stopped === 'refused') return 4;
+  // A probe answers one question, and the code follows the PRINTED verdict: PASS exits 0, anything else exits 5, including a probe whose
+  // writes the store did not confirm (the driver already makes that a FAIL) and one that tripped the pause (the marker is still written
+  // and the PAUSED line still printed). 3 and 6 are for a real run.
+  if (r.probe !== undefined) return r.probe.verdict === 'PASS' && r.itemsWithFailures === 0 ? 0 : 5;
   if (r.stopped === 'paused' || r.stopped === 'paused-marker') return 3;
   if (r.itemsWithFailures > 0) return 6;
-  if (r.probe !== undefined && r.probe.verdict !== 'PASS') return 5;
   return 0;
 }
 
