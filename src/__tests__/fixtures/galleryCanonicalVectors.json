@@ -1,0 +1,312 @@
+[
+ [
+  "already canonical",
+  "https://static.example.net/upload/a.jpg",
+  "https://static.example.net/upload/a.jpg"
+ ],
+ [
+  "host in capitals",
+  "https://STATIC.Example.NET/upload/a.jpg",
+  "https://static.example.net/upload/a.jpg"
+ ],
+ [
+  "a trailing dot on the host",
+  "https://static.example.net./upload/a.jpg",
+  "https://static.example.net/upload/a.jpg"
+ ],
+ [
+  "a percent-encoded host",
+  "http://%6cocalhost:8080/a.jpg",
+  "http://localhost:8080/a.jpg"
+ ],
+ [
+  "the default port",
+  "https://static.example.net:443/a.jpg",
+  "https://static.example.net/a.jpg"
+ ],
+ [
+  "a non-default port is kept",
+  "https://static.example.net:8443/a.jpg",
+  "https://static.example.net:8443/a.jpg"
+ ],
+ [
+  "dot segments",
+  "https://static.example.net/a/b/../c/./d.jpg",
+  "https://static.example.net/a/c/d.jpg"
+ ],
+ [
+  "a fragment",
+  "https://static.example.net/a.jpg#frag",
+  "https://static.example.net/a.jpg"
+ ],
+ [
+  "an unreserved character that was escaped",
+  "https://static.example.net/a%7E%41%2d%2E%5Fb.jpg",
+  "https://static.example.net/a~A-._b.jpg"
+ ],
+ [
+  "an escape in lower case",
+  "https://static.example.net/a%c3%a4.jpg",
+  "https://static.example.net/a%C3%A4.jpg"
+ ],
+ [
+  "a non-ASCII character",
+  "https://static.example.net/ä.jpg",
+  "https://static.example.net/%C3%A4.jpg"
+ ],
+ [
+  "a reserved escape stays escaped, in capitals",
+  "https://static.example.net/a%2fb%3f.jpg",
+  "https://static.example.net/a%2Fb%3F.jpg"
+ ],
+ [
+  "a query",
+  "https://static.example.net/a.jpg?x=%7e&y=%c3%a4",
+  "https://static.example.net/a.jpg?x=~&y=%C3%A4"
+ ],
+ [
+  "an empty path",
+  "https://static.example.net",
+  "https://static.example.net/"
+ ],
+ [
+  "credentials have no canonical form",
+  "https://user:pw@static.example.net/a.jpg",
+  null
+ ],
+ [
+  "not http(s)",
+  "ftp://static.example.net/a.jpg",
+  null
+ ],
+ [
+  "not a url",
+  "static.example.net/a.jpg",
+  null
+ ],
+ [
+  "a space",
+  "https://static.example.net/a b.jpg",
+  null
+ ],
+ [
+  "plain",
+  "https://img.invalid/upload/pictures/a.jpeg",
+  "https://img.invalid/upload/pictures/a.jpeg"
+ ],
+ [
+  "stray % before an escaped digit (the round-2 collision)",
+  "https://img.invalid/upload/pictures/x%4%31.jpeg",
+  "https://img.invalid/upload/pictures/x%2541.jpeg"
+ ],
+ [
+  "the same file spelled plainly stays a different file",
+  "https://img.invalid/upload/pictures/xA.jpeg",
+  "https://img.invalid/upload/pictures/xA.jpeg"
+ ],
+ [
+  "two stray % then escapes",
+  "https://img.invalid/upload/pictures/x%%34%31.jpeg",
+  "https://img.invalid/upload/pictures/x%2541.jpeg"
+ ],
+ [
+  "an escaped percent",
+  "https://img.invalid/upload/pictures/100%25.jpeg",
+  "https://img.invalid/upload/pictures/100%25.jpeg"
+ ],
+ [
+  "a trailing stray %",
+  "https://img.invalid/upload/pictures/100%.jpeg",
+  "https://img.invalid/upload/pictures/100%25.jpeg"
+ ],
+ [
+  "an escaped slash",
+  "https://img.invalid/upload/pictures/a%2Fb.jpeg",
+  "https://img.invalid/upload/pictures/a%2Fb.jpeg"
+ ],
+ [
+  "a real slash is another path",
+  "https://img.invalid/upload/pictures/a/b.jpeg",
+  "https://img.invalid/upload/pictures/a/b.jpeg"
+ ],
+ [
+  "an escaped slash in lower case",
+  "https://img.invalid/upload/pictures/a%2fb.jpeg",
+  "https://img.invalid/upload/pictures/a%2Fb.jpeg"
+ ],
+ [
+  "an escaped tilde",
+  "https://img.invalid/upload/pictures/%7Euser.jpeg",
+  "https://img.invalid/upload/pictures/~user.jpeg"
+ ],
+ [
+  "a tilde",
+  "https://img.invalid/upload/pictures/~user.jpeg",
+  "https://img.invalid/upload/pictures/~user.jpeg"
+ ],
+ [
+  "an escaped letter in the query",
+  "https://img.invalid/upload/pictures/a.jpeg?v=%41",
+  "https://img.invalid/upload/pictures/a.jpeg?v=A"
+ ],
+ [
+  "a letter in the query",
+  "https://img.invalid/upload/pictures/a.jpeg?v=A",
+  "https://img.invalid/upload/pictures/a.jpeg?v=A"
+ ],
+ [
+  "an empty query",
+  "https://img.invalid/upload/pictures/a.jpeg?",
+  "https://img.invalid/upload/pictures/a.jpeg"
+ ],
+ [
+  "a query with two keys",
+  "https://img.invalid/upload/pictures/a.jpeg?a=1&b=2",
+  "https://img.invalid/upload/pictures/a.jpeg?a=1&b=2"
+ ],
+ [
+  "the keys are not sorted",
+  "https://img.invalid/upload/pictures/a.jpeg?b=2&a=1",
+  "https://img.invalid/upload/pictures/a.jpeg?b=2&a=1"
+ ],
+ [
+  "a plus in the query is kept",
+  "https://img.invalid/upload/pictures/a.jpeg?q=a+b",
+  "https://img.invalid/upload/pictures/a.jpeg?q=a+b"
+ ],
+ [
+  "an escaped space in the query",
+  "https://img.invalid/upload/pictures/a.jpeg?q=a%20b",
+  "https://img.invalid/upload/pictures/a.jpeg?q=a%20b"
+ ],
+ [
+  "an escaped plus in the query",
+  "https://img.invalid/upload/pictures/a.jpeg?q=a%2Bb",
+  "https://img.invalid/upload/pictures/a.jpeg?q=a%2Bb"
+ ],
+ [
+  "the case of the path is kept",
+  "https://img.invalid/upload/pictures/A.JPEG",
+  "https://img.invalid/upload/pictures/A.JPEG"
+ ],
+ [
+  "a non-ASCII letter",
+  "https://img.invalid/upload/pictures/é.jpeg",
+  "https://img.invalid/upload/pictures/%C3%A9.jpeg"
+ ],
+ [
+  "a combining accent",
+  "https://img.invalid/upload/pictures/e%CC%81.jpeg",
+  "https://img.invalid/upload/pictures/e%CC%81.jpeg"
+ ],
+ [
+  "an escaped non-ASCII letter",
+  "https://img.invalid/upload/pictures/%C3%A9.jpeg",
+  "https://img.invalid/upload/pictures/%C3%A9.jpeg"
+ ],
+ [
+  "an escaped non-ASCII letter in lower case",
+  "https://img.invalid/upload/pictures/%c3%a9.jpeg",
+  "https://img.invalid/upload/pictures/%C3%A9.jpeg"
+ ],
+ [
+  "user and password",
+  "https://user:pw@img.invalid/a.jpeg",
+  null
+ ],
+ [
+  "a user only",
+  "https://user@img.invalid/a.jpeg",
+  null
+ ],
+ [
+  "a password only",
+  "https://:pw@img.invalid/a.jpeg",
+  null
+ ],
+ [
+  "https on 443",
+  "https://img.invalid:443/a.jpeg",
+  "https://img.invalid/a.jpeg"
+ ],
+ [
+  "http on 443 keeps the port",
+  "http://img.invalid:443/a.jpeg",
+  "http://img.invalid:443/a.jpeg"
+ ],
+ [
+  "capitals and a root dot on the host",
+  "https://IMG.invalid./a.jpeg",
+  "https://img.invalid/a.jpeg"
+ ],
+ [
+  "two root dots",
+  "https://img.invalid../a.jpeg",
+  "https://img.invalid/a.jpeg"
+ ],
+ [
+  "an escaped parent segment",
+  "https://img.invalid/upload/pictures/%2E%2E/b.jpeg",
+  "https://img.invalid/upload/b.jpeg"
+ ],
+ [
+  "a mixed parent segment",
+  "https://img.invalid/upload/pictures/.%2E/b.jpeg",
+  "https://img.invalid/upload/b.jpeg"
+ ],
+ [
+  "an escaped NUL stays escaped",
+  "https://img.invalid/upload/pictures/a%00b.jpeg",
+  "https://img.invalid/upload/pictures/a%00b.jpeg"
+ ],
+ [
+  "a backslash is a slash",
+  "https://img.invalid/upload/pictures/a\\b.jpeg",
+  "https://img.invalid/upload/pictures/a/b.jpeg"
+ ],
+ [
+  "an escaped backslash stays escaped",
+  "https://img.invalid/upload/pictures/a%5Cb.jpeg",
+  "https://img.invalid/upload/pictures/a%5Cb.jpeg"
+ ],
+ [
+  "a semicolon",
+  "https://img.invalid/upload/pictures/a;b.jpeg",
+  "https://img.invalid/upload/pictures/a;b.jpeg"
+ ],
+ [
+  "an escaped semicolon",
+  "https://img.invalid/upload/pictures/a%3Bb.jpeg",
+  "https://img.invalid/upload/pictures/a%3Bb.jpeg"
+ ],
+ [
+  "only stray percent signs",
+  "https://img.invalid/upload/pictures/%%",
+  "https://img.invalid/upload/pictures/%25%25"
+ ],
+ [
+  "a lone stray percent",
+  "https://img.invalid/upload/pictures/%",
+  "https://img.invalid/upload/pictures/%25"
+ ],
+ [
+  "a percent before a non-hex pair",
+  "https://img.invalid/upload/pictures/%G1.jpeg",
+  "https://img.invalid/upload/pictures/%25G1.jpeg"
+ ],
+ [
+  "stray then an escaped percent then digits",
+  "https://img.invalid/upload/pictures/%%2541.jpeg",
+  "https://img.invalid/upload/pictures/%25%2541.jpeg"
+ ],
+ [
+  "an escaped percent then digits",
+  "https://img.invalid/upload/pictures/%2541.jpeg",
+  "https://img.invalid/upload/pictures/%2541.jpeg"
+ ],
+ [
+  "an escaped percent then escaped digits",
+  "https://img.invalid/upload/pictures/%25%34%31.jpeg",
+  "https://img.invalid/upload/pictures/%2541.jpeg"
+ ]
+]

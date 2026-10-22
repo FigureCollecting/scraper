@@ -3,7 +3,8 @@
  * spine's `galleryImages` claims), read here. The scraper never opens the spine; this file is the whole interface, so
  * the parser is strict about the shape and tolerant of a bad line (counted, never fatal, never half-applied).
  */
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { canonicalImageUrl, parseWorklist, parseWorklistLine, readWorklistFile } from '../../services/images/galleryWorklist';
@@ -153,30 +154,49 @@ describe('parseWorklist / readWorklistFile', () => {
   });
 });
 
-// The canonical spelling: fc-aggregation's `gallery:worklist` produces the same form from the same vectors.
-// (test/vectors is duplicated, not shared: a change to one must be made to the other)
-const CANONICAL_VECTORS: ReadonlyArray<[string, string, string | undefined]> = [
-  ['already canonical', 'https://static.example.net/upload/a.jpg', 'https://static.example.net/upload/a.jpg'],
-  ['host in capitals', 'https://STATIC.Example.NET/upload/a.jpg', 'https://static.example.net/upload/a.jpg'],
-  ['a trailing dot on the host', 'https://static.example.net./upload/a.jpg', 'https://static.example.net/upload/a.jpg'],
-  ['a percent-encoded host', 'http://%6cocalhost:8080/a.jpg', 'http://localhost:8080/a.jpg'],
-  ['the default port', 'https://static.example.net:443/a.jpg', 'https://static.example.net/a.jpg'],
-  ['a non-default port is kept', 'https://static.example.net:8443/a.jpg', 'https://static.example.net:8443/a.jpg'],
-  ['dot segments', 'https://static.example.net/a/b/../c/./d.jpg', 'https://static.example.net/a/c/d.jpg'],
-  ['a fragment', 'https://static.example.net/a.jpg#frag', 'https://static.example.net/a.jpg'],
-  ['an unreserved character that was escaped', 'https://static.example.net/a%7E%41%2d%2E%5Fb.jpg', 'https://static.example.net/a~A-._b.jpg'],
-  ['an escape in lower case', 'https://static.example.net/a%c3%a4.jpg', 'https://static.example.net/a%C3%A4.jpg'],
-  ['a non-ASCII character', 'https://static.example.net/\u00e4.jpg', 'https://static.example.net/%C3%A4.jpg'],
-  ['a reserved escape stays escaped, in capitals', 'https://static.example.net/a%2fb%3f.jpg', 'https://static.example.net/a%2Fb%3F.jpg'],
-  ['a query', 'https://static.example.net/a.jpg?x=%7e&y=%c3%a4', 'https://static.example.net/a.jpg?x=~&y=%C3%A4'],
-  ['an empty path', 'https://static.example.net', 'https://static.example.net/'],
-  ['credentials have no canonical form', 'https://user:pw@static.example.net/a.jpg', undefined],
-  ['not http(s)', 'ftp://static.example.net/a.jpg', undefined],
-  ['not a url', 'static.example.net/a.jpg', undefined],
-  ['a space', 'https://static.example.net/a b.jpg', undefined],
-];
+// The canonical spelling: fc-aggregation's `gallery:worklist` produces the same form from the SAME vector file
+// (src/__tests__/fixtures/galleryCanonicalVectors.json here, src/gallery/gallery-canonical-vectors.json there: identical
+// copies, one sha256 in each test, and the same fuzz digest below pins that the two functions agree).
+const CANONICAL_VECTORS = (JSON.parse(readFileSync(path.resolve(__dirname, '../fixtures/galleryCanonicalVectors.json'), 'utf8')) as Array<[string, string, string | null]>)
+  .map(([why, input, want]) => [why, input, want === null ? undefined : want] as [string, string, string | undefined]);
+
+/** mulberry32: a fixed-seed generator, so the fuzz set is the same on every machine and in both repos. */
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+/**
+ * 4,000 urls from a fixed seed: half built from single characters that have ever mattered (percent signs and hex digits above all),
+ * half from fragments (`%`, `%4`, `%31`, `%25`, ...) so that stray and valid escapes sit next to each other often. The scraper
+ * pins the digest of the outputs; fc-aggregation generates the same set and pins the same digest.
+ */
+function fuzzUrls(n: number): string[] {
+  const rnd = mulberry32(0x5eed2026);
+  const chars = ['a', 'B', 'z', '0', '9', '%', '%', '%', '%', '4', '1', 'F', 'f', 'E', 'e', '3', '2', '5', '7', '.', '.', '/', '~', '-', '_', '?', '#', '\\', ';', '+', '=', '&', ':', '@', 'é', '\u00c4', ' '];
+  const frags = ['%', '%%', '%4', '%3', '%2', '%0', '%G', '%31', '%34', '%41', '%25', '%2e', '%2E', '%7e', '%7E', '4', '1', 'A', 'F', 'x', '.', '..', '/', '?', '=', '#', '\\', 'é', ';', '+', '-', '~'];
+  const hosts = ['img.invalid', 'IMG.Invalid.', 'img.invalid:443', 'img.invalid:8443', 'img.invalid../'];
+  const pick = <T>(xs: readonly T[]): T => xs[Math.floor(rnd() * xs.length)]!;
+  return Array.from({ length: n }, (_v, i) => {
+    let tail = '';
+    if (i % 2 === 0) for (let k = 1 + Math.floor(rnd() * 16); k > 0; k--) tail += pick(chars);
+    else for (let k = 1 + Math.floor(rnd() * 8); k > 0; k--) tail += pick(frags);
+    return `${pick(['https', 'http', 'HTTPS'])}://${pick(hosts)}/p/${tail}`;
+  });
+}
 
 describe('canonicalImageUrl', () => {
+  it('the shared vector file is the one fc-aggregation carries (62 vectors)', () => {
+    const text = readFileSync(path.resolve(__dirname, '../fixtures/galleryCanonicalVectors.json'));
+    expect(CANONICAL_VECTORS).toHaveLength(62);
+    expect(createHash('sha256').update(text).digest('hex').slice(0, 16)).toBe('5da0901452452ec3');
+  });
+
   it.each(CANONICAL_VECTORS)('%s', (_why, input, want) => {
     expect(canonicalImageUrl(input)).toBe(want);
   });
@@ -186,5 +206,35 @@ describe('canonicalImageUrl', () => {
     expect(canonicalImageUrl(5)).toBeUndefined();
     expect(canonicalImageUrl('')).toBeUndefined();
     expect(canonicalImageUrl(`https://static.example.net/${'a'.repeat(2100)}`)).toBeUndefined();
+  });
+
+  it('c(c(x)) === c(x) for every vector input, however many passes the pipeline makes (R2-B2)', () => {
+    const bad = CANONICAL_VECTORS.flatMap(([, input]) => {
+      const once = canonicalImageUrl(input);
+      return once === undefined || canonicalImageUrl(once) === once ? [] : [`${input} -> ${once} -> ${String(canonicalImageUrl(once))}`];
+    });
+    expect(bad).toEqual([]);
+  });
+
+  it('c(c(x)) === c(x) over 4,000 generated urls (fixed seed), and two spellings that differ in a decoded character never meet', () => {
+    const urls = fuzzUrls(4000);
+    expect(new Set(urls).size).toBeGreaterThan(3500);
+    const bad: string[] = [];
+    const outputs: Array<string | null> = [];
+    for (const u of urls) {
+      const once = canonicalImageUrl(u);
+      outputs.push(once ?? null);
+      if (once === undefined) continue;
+      const twice = canonicalImageUrl(once);
+      if (twice !== once) bad.push(`${u} -> ${once} -> ${String(twice)}`);
+    }
+    expect(bad.slice(0, 5)).toEqual([]);
+    // the fc-aggregation copy computes the same digest over the same fuzz set: the two functions agree
+    expect(createHash('sha256').update(JSON.stringify(outputs)).digest('hex').slice(0, 16)).toBe('af640957bd14d471');
+  });
+
+  it('a stray percent sign is escaped, so the two files x%4%31 and xA are not the same file', () => {
+    expect(canonicalImageUrl('https://img.invalid/p/x%4%31.jpeg')).toBe('https://img.invalid/p/x%2541.jpeg');
+    expect(canonicalImageUrl('https://img.invalid/p/x%4%31.jpeg')).not.toBe(canonicalImageUrl('https://img.invalid/p/xA.jpeg'));
   });
 });

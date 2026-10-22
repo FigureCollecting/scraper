@@ -40,9 +40,15 @@ const isHttpUrl = (v: unknown): v is string =>
   typeof v === 'string' && v.length > 0 && v.length <= MAX_SRC_CHARS && /^https?:\/\//i.test(v) && !/[\s\u0000-\u001f]/.test(v) && URL.canParse(v);
 
 const UNRESERVED = /^[A-Za-z0-9\-._~]$/;
-/** %-escapes in one spelling: an unreserved character is written as itself, every other escape in upper-case hex. */
+/**
+ * %-escapes in one spelling, in ONE pass over the original text (what a pass writes is never read again, so nothing is decoded twice):
+ * a valid `%XX` that spells an unreserved character is written as that character, any other valid escape in upper-case hex, and a
+ * stray `%` (one not followed by two hex digits) is a literal percent sign and is written `%25`. Escaping the stray one is what makes
+ * the function idempotent: `x%4%31` is the file named `x%41`, and must not become `xA` on a second pass.
+ */
 const canonicalEscapes = (s: string): string =>
-  s.replace(/%([0-9a-fA-F]{2})/g, (_m, hex: string) => {
+  s.replace(/%([0-9a-fA-F]{2})|%/g, (_m, hex: string | undefined) => {
+    if (hex === undefined) return '%25';
     const ch = String.fromCharCode(parseInt(hex, 16));
     return UNRESERVED.test(ch) ? ch : `%${hex.toUpperCase()}`;
   });
