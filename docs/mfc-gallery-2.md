@@ -91,6 +91,7 @@ env:
   REPORT_CAPTURES: "true"               # + INGEST_BASE_URL, RAW_STORE_S3_* exactly as the scraper Deployment has them
   IMAGE_HOST_POLICY_JSON: '{"static.myfigurecollection.net":{"lane":"http","egress":"direct"}}'
   IMAGE_HOST_RATE_JSON:   '{"static.myfigurecollection.net":{"intervalMs":333}}'      # desk IMGRATE b: 3 files/s, no speed-up
+  GALLERY_ALLOWED_HOSTS: static.myfigurecollection.net   # REQUIRED: no host is built in (hands-off plan C1), the run exits 2 without one
   GALLERY_WORKLIST_PATH: /state/wl.jsonl     # from `npm run gallery:worklist` (fc-aggregation)
   GALLERY_LEDGER_PATH:   /state/ledger.jsonl
   GALLERY_SOURCE_CLASS:  manufacturer_press   # desk GALSRC b: the MFC official gallery

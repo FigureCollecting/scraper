@@ -2,7 +2,7 @@
  * galleryWorklist — the interface between fc-aggregation's `gallery:worklist` and the gallery driver.
  *
  * One JSON object per line:
- *   {"site":"mfc","itemId":"1005999","pageUrl":"https://myfigurecollection.net/item/1005999","rank":0,
+ *   {"site":"shop","itemId":"1005999","pageUrl":"https://shop.example/item/1005999","rank":0,
  *    "contentLevel":"general","entries":[{"position":0,"src":"https://static.../a.jpg","w":600,"h":600}, ...]}
  * `rank` orders the work (0 owned, 1 ordered, 2 wished, 5 figures and statues, 9 the rest); the file is already in
  * that order and the driver trusts it. The scraper never reads the spine database, so this file is the whole

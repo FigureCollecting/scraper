@@ -20,7 +20,7 @@ const POLICY = buildImageHostPolicy({ [STATIC]: { lane: 'http', egress: 'direct'
 describe('parseGalleryArgs', () => {
   it('has safe defaults and reads the env', () => {
     const a = parseGalleryArgs([], { GALLERY_WORKLIST_PATH: '/w.jsonl', GALLERY_LEDGER_PATH: '/l.jsonl' } as NodeJS.ProcessEnv);
-    expect(a).toMatchObject({ worklist: '/w.jsonl', ledger: '/l.jsonl', allowedHosts: [STATIC], pauseAfter: 3, pauseMinutes: 360, sourceClass: 'unknown', dryRun: false, resume: false });
+    expect(a).toMatchObject({ worklist: '/w.jsonl', ledger: '/l.jsonl', allowedHosts: [], pauseAfter: 3, pauseMinutes: 360, sourceClass: 'unknown', dryRun: false, resume: false });
     expect(a.probe).toBeUndefined();
     expect(a.maxFiles).toBeUndefined();
   });
@@ -104,7 +104,7 @@ describe('main', () => {
     return {
       fetched, flushed,
       deps: {
-        env: { IMAGE_HOST_RATE_JSON: JSON.stringify({ [STATIC]: { intervalMs: 100 } }) } as NodeJS.ProcessEnv,
+        env: { IMAGE_HOST_RATE_JSON: JSON.stringify({ [STATIC]: { intervalMs: 100 } }), GALLERY_ALLOWED_HOSTS: STATIC } as NodeJS.ProcessEnv,
         print: (s: string) => void out.push(s),
         policy: POLICY,
         baseFetch: async (url: string) => {
@@ -125,6 +125,15 @@ describe('main', () => {
     };
   };
   const reportOf = (): Record<string, unknown> => JSON.parse(out.find(l => l.startsWith('GALLERY-REPORT '))!.slice('GALLERY-REPORT '.length));
+
+  // hands-off plan C1: the engine names no site, so no host is built in; the run says which host it may fetch from
+  it('exits 2 and fetches nothing when no allowed host is named', async () => {
+    const d = deps();
+    const bare = { ...d.deps, env: { ...d.deps.env, GALLERY_ALLOWED_HOSTS: '' } as NodeJS.ProcessEnv };
+    expect(await main(['--worklist', work, '--ledger', ledger], bare)).toBe(2);
+    expect(out.join('\n')).toMatch(/GALLERY_ALLOWED_HOSTS must name the image host/);
+    expect(d.fetched).toEqual([]);
+  });
 
   it('a dry run reads the list and fetches nothing', async () => {
     const d = deps();

@@ -25,7 +25,6 @@ import { paceImageBytesByHost } from './imageBytesPacing.js';
 import { createImageBytesRouter, type ImageCaptureHook } from './imageCaptureHook.js';
 import { loadImageHostPolicy, type ImageHostPolicy } from './imageHostPolicy.js';
 
-export const DEFAULT_ALLOWED_HOSTS = ['static.myfigurecollection.net'];
 const DEFAULT_PROBE = 20;
 const MAX_PROBE = 200;
 const SOURCE_CLASSES: readonly string[] = ['manufacturer_press', 'retailer_studio', 'user_photo', 'unknown'];
@@ -59,7 +58,8 @@ export function parseGalleryArgs(argv: readonly string[], env: NodeJS.ProcessEnv
   const out: GalleryArgs = {
     ...(env.GALLERY_WORKLIST_PATH ? { worklist: env.GALLERY_WORKLIST_PATH } : {}),
     ...(env.GALLERY_LEDGER_PATH ? { ledger: env.GALLERY_LEDGER_PATH } : {}),
-    allowedHosts: hosts.length > 0 ? hosts : [...DEFAULT_ALLOWED_HOSTS],
+    // no host is built in (hands-off plan C1: the engine names no site); main() refuses a run that names none
+    allowedHosts: hosts,
     pauseAfter: env.GALLERY_PAUSE_AFTER ? whole('GALLERY_PAUSE_AFTER', env.GALLERY_PAUSE_AFTER, 1000) : 3,
     pauseMinutes: env.GALLERY_PAUSE_MINUTES ? whole('GALLERY_PAUSE_MINUTES', env.GALLERY_PAUSE_MINUTES, 100_000) : 360,
     sourceClass: 'unknown',
@@ -119,6 +119,7 @@ export async function main(argv: readonly string[] = process.argv.slice(2), deps
   const now = deps.now ?? Date.now;
   let args: GalleryArgs;
   try { args = parseGalleryArgs(argv, env); } catch (e) { print((e as Error).message); return 2; }
+  if (args.allowedHosts.length === 0) { print(`${USAGE} (GALLERY_ALLOWED_HOSTS must name the image host(s) this run may fetch from)`); return 2; }
   if (args.worklist === undefined) { print(`${USAGE} (a work list is required)`); return 2; }
   if (!existsSync(args.worklist)) { print(`ERROR cannot read the work list ${args.worklist}`); return 2; }
   if (args.ledger === undefined && !args.dryRun) {

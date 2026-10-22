@@ -5,7 +5,7 @@
  * default, a 2,067 ms gap that eases toward 274 ms after a few successes. That is right for a shared CDN
  * nobody has measured and wrong for a host somebody decided a rate for. `IMAGE_HOST_RATE_JSON` is that decision:
  *
- *   IMAGE_HOST_RATE_JSON='{"static.myfigurecollection.net":{"intervalMs":1000}}'
+ *   IMAGE_HOST_RATE_JSON='{"images.example.net":{"intervalMs":1000}}'
  *
  * A row pins the host's gap — its base AND its floor — so a run of successes never speeds the host up; a
  * 429/503 still backs it off (x1.4, up to `maxDelayMs`, default 3 minutes) and recovery returns only to the
