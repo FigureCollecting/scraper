@@ -128,6 +128,15 @@ describe('R2-B1b (unit): the raw store\'s own size cap', () => {
     expect(r).toMatchObject({ stored: 1, skippedTooLarge: 2, itemsWithFailures: 0 });
   });
 
+  it('the ceiling is inclusive, as the sink\'s is: exactly storeMaxBytes is stored, one byte more is skipped:too_large', async () => {
+    const observer = createFetchObserver({ pauseAfter: 9, now: () => 0 });
+    const mh = memoHook(observer, url => (url === U(1) ? ok200(1, 100) : ok200(2, 101)));
+    const sink = scriptedSink((n, c) => { if (n === 1) c.assetSkipped.tooLarge += 1; });
+    const { ledger, how } = recordingLedger();
+    await runGalleryCapture(gdeps(mh.hook, sink, observer, ledger, [item('1', [1, 2])]), baseOpts({ storeMaxBytes: 100 }));
+    expect([...how.entries()].sort()).toEqual([[`${K('1')} 1.jpeg`, 'stored'], [`${K('1')} 2.jpeg`, 'skipped:too_large']]);
+  });
+
   it('an unexplained store skip (notImage, empty, disabled, or a tooLarge the sizes do not explain) leaves the item unsettled and counted', async () => {
     for (const which of ['notImage', 'empty', 'disabled', 'tooLarge'] as const) {
       const observer = createFetchObserver({ pauseAfter: 9, now: () => 0 });
