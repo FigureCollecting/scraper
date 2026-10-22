@@ -3,7 +3,7 @@
  * (`galleryCaptureCli.ts`) as a child process: the real global fetch, the env-built capture hook, the real object-store sink
  * against a fake S3, the real flush. Nothing here leaves 127.0.0.1.
  */
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
@@ -63,7 +63,7 @@ describe('B1: the allow-list holds across redirects', () => {
 
   it('a hop to another allowed host is followed, and carries no Referer', async () => {
     writeWorklist(lb, wl, [{ id: 1, paths: ['redir/9.jpeg'] }]);
-    const r = await runCli(['--worklist', wl, '--ledger', ledger], cliEnv(lb, { GALLERY_ALLOWED_HOSTS: 'localhost,127.0.0.1' }));
+    const r = await runCli(['--worklist', wl, '--ledger', ledger], cliEnv(lb, { GALLERY_ALLOWED_HOSTS: `localhost:${lb.portA},127.0.0.1:${lb.portB}` }));
     expect(r.report).toMatchObject({ stored: 1, blocked: 0 });
     expect(lb.a[0]!.headers.referer).toBe('https://item-page.invalid/item/1');
     expect(lb.b.length).toBe(1);
@@ -109,8 +109,16 @@ describe('B2: settled means the sink confirmed the durable put', () => {
     await run.done;
     expect(settled()).toEqual([]);
 
+    // a killed run cannot release its lease: for up to 60 s an immediate resume is told LOCKED (exit 8, no request) ...
     lb.setS3('ok');
     const before = lb.a.length;
+    const tooSoon = await runCli(['--worklist', wl, '--ledger', ledger], cliEnv(lb));
+    expect(tooSoon.code).toBe(8);
+    expect(lb.a.length).toBe(before);
+    // ... and once its heartbeat is older than that, the lease is stale and the resume takes it over
+    const lockFile = path.join(dir, 'gallery-capture.lock');
+    const left = JSON.parse(readFileSync(lockFile, 'utf8')) as Record<string, unknown>;
+    writeFileSync(lockFile, JSON.stringify({ ...left, heartbeatAt: Date.now() - 61_000 }));
     const second = await runCli(['--worklist', wl, '--ledger', ledger], cliEnv(lb));
     expect(second.code).toBe(0);
     expect(lb.a.length - before).toBe(3);
@@ -202,32 +210,34 @@ describe('S5: a 5xx storm pauses the run like a block does', () => {
   });
 });
 
-describe('S6: one run at a time per ledger', () => {
-  it('a second run on a live ledger exits 3 with zero requests; the first is unharmed and releases the lock', async () => {
+describe('S6: one run at a time', () => {
+  const lockPath = (): string => path.join(dir, 'gallery-capture.lock');
+  it('a second run on a live lease exits 8 with zero requests; the first is unharmed and releases the lock', async () => {
     writeWorklist(lb, wl, [{ id: 1, paths: ['slow/1.jpeg', 'img/2.jpeg'] }]);
     const first = startCli(['--worklist', wl, '--ledger', ledger], cliEnv(lb));
     const t0 = Date.now();
     while (lb.a.length < 1 && Date.now() - t0 < 30_000) await new Promise(r => setTimeout(r, 25));
     const second = await runCli(['--worklist', wl, '--ledger', ledger], cliEnv(lb));
-    expect(second.code).toBe(3);
+    expect(second.code).toBe(8);
     expect(second.out).toMatch(/another run holds/);
     expect(lb.a.length).toBeLessThanOrEqual(1);
     const done = await first.done;
     expect(done.code).toBe(0);
-    expect(existsSync(`${ledger}.lock`)).toBe(false);
+    expect(existsSync(lockPath())).toBe(false);
   });
 
-  it('a lock whose pid is gone is stale and is taken over; a lock whose pid lives is not', async () => {
+  it('the lease, not a pid, decides: a lock whose heartbeat is old is taken over even if its pid lives; a fresh one holds even if its pid is gone', async () => {
     writeWorklist(lb, wl, [{ id: 1, paths: ['img/1.jpeg'] }]);
     const gone = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))']).stdout.toString();
-    writeFileSync(`${ledger}.lock`, `${gone}\n`);
+    const lease = (heartbeatAt: number, pid: string | number) => JSON.stringify({ token: 't', hostname: 'pod-a', startedAt: heartbeatAt, heartbeatAt, pid: Number(pid) });
+    writeFileSync(lockPath(), lease(Date.now() - 3_600_000, process.pid));
     const r = await runCli(['--worklist', wl, '--ledger', ledger], cliEnv(lb));
     expect(r.code).toBe(0);
-    expect(existsSync(`${ledger}.lock`)).toBe(false);
+    expect(existsSync(lockPath())).toBe(false);
 
-    writeFileSync(`${ledger}.lock`, `${process.pid}\n`);
+    writeFileSync(lockPath(), lease(Date.now() - 1_000, gone));
     const held = await runCli(['--worklist', wl, '--ledger', ledger], cliEnv(lb));
-    expect(held.code).toBe(3);
+    expect(held.code).toBe(8);
   });
 });
 
@@ -244,7 +254,7 @@ describe('S7: SIGTERM stops the run', () => {
     expect(lb.a.length).toBeLessThanOrEqual(2);
     const confirmed = new Set(lb.puts.filter(p => p.replied).map(p => p.meta['x-amz-meta-url']));
     for (const r of readLedger(ledger).filter(x => x.s === 'stored')) expect(confirmed.has(String(r.u))).toBe(true);
-    expect(existsSync(`${ledger}.lock`)).toBe(false);
+    expect(existsSync(path.join(dir, 'gallery-capture.lock'))).toBe(false);
   });
 });
 

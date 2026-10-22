@@ -46,6 +46,15 @@ function chunk(type: string, data: Buffer): Buffer {
   crc.writeUInt32BE(crc32(td));
   return Buffer.concat([len, td, crc]);
 }
+/** A valid 1x1 PNG of exactly `size` bytes (padding in a tEXt chunk), unique per tag. */
+export function pngOfSize(tag: string, size: number): Buffer {
+  const base = png(tag);
+  const pad = Math.max(0, size - base.length);
+  const ihdr = base.subarray(8, 8 + 25);
+  const text = chunk('tEXt', Buffer.concat([Buffer.from(`k\0${tag}`), Buffer.alloc(pad, 0x61)]));
+  const idat = base.subarray(8 + 25 + (12 + `k\0${tag}`.length), base.length - 12);
+  return Buffer.concat([base.subarray(0, 8), ihdr, text, idat, base.subarray(base.length - 12)]);
+}
 /** A valid 1x1 PNG made unique per tag by a tEXt chunk, so each file has its own sha256. */
 export function png(tag: string): Buffer {
   const ihdr = Buffer.alloc(13);
@@ -65,11 +74,14 @@ export type S3Mode = 'ok' | 'fail500' | { slowMs: number };
 
 export interface Loopback {
   portA: number;
+  /** A second port on the SAME host name as A (`localhost`): a different origin. */
+  portA2: number;
   portB: number;
   portS3: number;
   portIng: number;
   /** Requests A and B saw, in order. */
   a: Seen[];
+  a2: Seen[];
   b: Seen[];
   /** Every S3 request (HEAD and PUT) and the PUTs alone. */
   s3: Seen[];
@@ -87,7 +99,7 @@ function listen(server: http.Server): Promise<number> {
 }
 
 export async function startLoopback(initialS3: S3Mode = 'ok'): Promise<Loopback> {
-  const lb: Partial<Loopback> & { a: Seen[]; b: Seen[]; s3: Seen[]; puts: Put[]; ing: string[] } = { a: [], b: [], s3: [], puts: [], ing: [] };
+  const lb: Partial<Loopback> & { a: Seen[]; a2: Seen[]; b: Seen[]; s3: Seen[]; puts: Put[]; ing: string[] } = { a: [], a2: [], b: [], s3: [], puts: [], ing: [] };
   let s3mode: S3Mode = initialS3;
   const seen = (req: http.IncomingMessage): Seen => ({ method: req.method ?? '', path: req.url ?? '', host: req.headers.host ?? '', headers: req.headers, t: clock() });
 
@@ -106,6 +118,17 @@ export async function startLoopback(initialS3: S3Mode = 'ok'): Promise<Loopback>
       case 'img': return img();
       // a redirect to an OFF-HOST target (127.0.0.1 is not the allowed host `localhost`)
       case 'redir': res.writeHead(302, { location: `http://127.0.0.1:${(B.address() as { port: number }).port}/stolen/${rest}` }); return void res.end();
+      // a redirect to ANOTHER PORT on the allowed host name (a different origin)
+      case 'redir-port': res.writeHead(302, { location: `http://localhost:${(A2.address() as { port: number }).port}/stolen/${rest}` }); return void res.end();
+      // a redirect whose Location carries credentials
+      case 'redir-userinfo': res.writeHead(302, { location: `http://user:hunter2@localhost:${(A.address() as { port: number }).port}/img/${rest}` }); return void res.end();
+      // a picture of an exact size: bigimg/<bytes>/<tag>
+      case 'bigimg': {
+        const bytes = Number(rest.split('/')[0]);
+        const b = pngOfSize(`A:${rest}`, bytes);
+        res.writeHead(200, { 'content-type': 'image/png', 'content-length': b.length });
+        return void res.end(b);
+      }
       case 'redir-same': res.writeHead(302, { location: `/img/${rest}` }); return void res.end();
       case 'redir-chain': {
         const k = Number(rest.split('/')[0]);
@@ -125,6 +148,13 @@ export async function startLoopback(initialS3: S3Mode = 'ok'): Promise<Loopback>
       case 'slow': return void setTimeout(img, 1500);
       default: res.writeHead(404); return void res.end();
     }
+  });
+
+  const A2 = http.createServer((req, res) => {
+    lb.a2.push(seen(req));
+    const b = png(`A2:${req.url ?? ''}`);
+    res.writeHead(200, { 'content-type': 'image/png', 'content-length': b.length });
+    res.end(b);
   });
 
   const B = http.createServer((req, res) => {
@@ -176,14 +206,14 @@ export async function startLoopback(initialS3: S3Mode = 'ok'): Promise<Loopback>
     });
   });
 
-  const [portA, portB, portS3, portIng] = await Promise.all([listen(A), listen(B), listen(S3), listen(ING)]);
-  const servers = [A, B, S3, ING];
+  const [portA, portA2, portB, portS3, portIng] = await Promise.all([listen(A), listen(A2), listen(B), listen(S3), listen(ING)]);
+  const servers = [A, A2, B, S3, ING];
   const closeAll = async (): Promise<void> => {
     for (const s of servers) s.closeAllConnections();
     await Promise.all(servers.map(s => new Promise<void>(resolve => s.close(() => resolve()))));
   };
   return Object.assign(lb, {
-    portA, portB, portS3, portIng,
+    portA, portA2, portB, portS3, portIng,
     setS3: (m: S3Mode) => { s3mode = m; },
     urlA: (p: string) => `http://localhost:${portA}/${p}`,
     close: closeAll,
@@ -208,7 +238,7 @@ export function writeWorklist(lb: Loopback, file: string, specs: WorklistSpec[])
   writeFileSync(file, `${lines.join('\n')}\n`);
 }
 
-/** The env the real Job entry needs to run against the loopback: both hosts on the plain http lane, an explicit 100 ms rate row each. */
+/** The env the real Job entry needs to run against the loopback: both hosts on the plain http lane, an explicit 100 ms rate row each, A's origin allowed. */
 export function cliEnv(lb: Loopback, over: Record<string, string | undefined> = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     PATH: process.env.PATH,
@@ -221,7 +251,10 @@ export function cliEnv(lb: Loopback, over: Record<string, string | undefined> = 
     RAW_STORE_S3_PATH_STYLE: 'true',
     IMAGE_HOST_POLICY_JSON: JSON.stringify({ localhost: { lane: 'http', egress: 'direct' }, '127.0.0.1': { lane: 'http', egress: 'direct' } }),
     IMAGE_HOST_RATE_JSON: JSON.stringify({ localhost: { intervalMs: 100 }, '127.0.0.1': { intervalMs: 100 } }),
-    GALLERY_ALLOWED_HOSTS: 'localhost',
+    // an ORIGIN: the allowed host name and A's port (a bare host would allow only the default ports)
+    GALLERY_ALLOWED_HOSTS: `localhost:${lb.portA}`,
+    // the store's own size cap is part of the Job's env (the Deployment's value); the run refuses to start without it
+    RAW_STORE_IMAGE_MAX_BYTES: '10485760',
     GALLERY_SOURCE_CLASS: 'manufacturer_press',
     NODE_OPTIONS: '--dns-result-order=ipv4first',
   };
