@@ -32,12 +32,43 @@ export interface WorklistItem {
   entries: WorklistEntry[];
 }
 export type WorklistLine =
-  | { ok: true; item: WorklistItem; dropped: number }
+  | { ok: true; item: WorklistItem; dropped: number; /** Entries left out because the item listed more than the cap. */ capped: number }
   | { ok: false; error: string };
 
 const isToken = (v: unknown): v is string => typeof v === 'string' && v.length > 0 && v.length <= MAX_TOKEN_CHARS && !/[\s\u0000-\u001f]/.test(v);
 const isHttpUrl = (v: unknown): v is string =>
   typeof v === 'string' && v.length > 0 && v.length <= MAX_SRC_CHARS && /^https?:\/\//i.test(v) && !/[\s\u0000-\u001f]/.test(v) && URL.canParse(v);
+
+const UNRESERVED = /^[A-Za-z0-9\-._~]$/;
+/** %-escapes in one spelling: an unreserved character is written as itself, every other escape in upper-case hex. */
+const canonicalEscapes = (s: string): string =>
+  s.replace(/%([0-9a-fA-F]{2})/g, (_m, hex: string) => {
+    const ch = String.fromCharCode(parseInt(hex, 16));
+    return UNRESERVED.test(ch) ? ch : `%${hex.toUpperCase()}`;
+  });
+
+/**
+ * THE canonical spelling of an image url: the one form the work list carries, the ledger keys on and the fetch asks for
+ * (fc-aggregation's `gallery:worklist` produces the same form, from the same vectors). Host lower-cased with no trailing dot,
+ * default port gone, dot segments resolved, no fragment, non-ASCII percent-encoded, and every %-escape in one spelling
+ * (an unreserved character is never escaped, any other escape is upper-case). An http(s) url with credentials, or one that does
+ * not parse, has no canonical form: undefined.
+ */
+export function canonicalImageUrl(src: unknown): string | undefined {
+  if (typeof src !== 'string' || src.length === 0 || src.length > MAX_SRC_CHARS || /[\s\u0000-\u001f]/.test(src)) return undefined;
+  let u: URL;
+  try {
+    u = new URL(src);
+  } catch {
+    return undefined;
+  }
+  if ((u.protocol !== 'http:' && u.protocol !== 'https:') || u.username !== '' || u.password !== '') return undefined;
+  u.hash = '';
+  u.hostname = u.hostname.replace(/\.+$/, '');
+  u.pathname = canonicalEscapes(u.pathname);
+  u.search = canonicalEscapes(u.search);
+  return u.href;
+}
 const dimension = (v: unknown): number | null => (typeof v === 'number' && Number.isSafeInteger(v) && v > 0 && v <= MAX_DIMENSION ? v : null);
 
 /** One line -> a valid item, or the reason it is not one. Never throws. */
@@ -55,23 +86,31 @@ export function parseWorklistLine(text: string): WorklistLine {
   if (!isHttpUrl(o.pageUrl)) return { ok: false, error: 'pageUrl must be an http(s) url' };
   if (typeof o.rank !== 'number' || !Number.isInteger(o.rank) || o.rank < 0 || o.rank > 99) return { ok: false, error: 'rank must be a whole number from 0 to 99' };
   if (!Array.isArray(o.entries)) return { ok: false, error: 'entries must be an array' };
-  if (o.entries.length > MAX_WORKLIST_ENTRIES) return { ok: false, error: `more than ${MAX_WORKLIST_ENTRIES} entries` };
 
   const entries: WorklistEntry[] = [];
   const seen = new Set<string>();
   let dropped = 0;
   for (const e of o.entries as unknown[]) {
     const r = e !== null && typeof e === 'object' && !Array.isArray(e) ? e as Record<string, unknown> : undefined;
-    if (r === undefined || !isHttpUrl(r.src) || seen.has(r.src)) { dropped++; continue; }
-    seen.add(r.src);
+    const src = r === undefined ? undefined : canonicalImageUrl(r.src);
+    if (r === undefined || src === undefined || seen.has(src)) { dropped++; continue; }
+    seen.add(src);
     const position = typeof r.position === 'number' && Number.isSafeInteger(r.position) && r.position >= 0 ? r.position : entries.length;
-    entries.push({ position, src: r.src, w: dimension(r.w), h: dimension(r.h) });
+    entries.push({ position, src, w: dimension(r.w), h: dimension(r.h) });
   }
   if (entries.length === 0) return { ok: false, error: 'no usable entry' };
+  // A longer gallery is capped, never refused whole: the first MAX_WORKLIST_ENTRIES by position are kept (Array.sort is stable, so
+  // equal positions keep their listed order), and how many were left out is reported.
+  let capped = 0;
+  if (entries.length > MAX_WORKLIST_ENTRIES) {
+    entries.sort((a, b) => a.position - b.position);
+    capped = entries.length - MAX_WORKLIST_ENTRIES;
+    entries.length = MAX_WORKLIST_ENTRIES;
+  }
 
   const item: WorklistItem = { site: o.site, itemId: o.itemId, pageUrl: o.pageUrl, rank: o.rank, entries };
   if (o.contentLevel !== undefined) item.contentLevel = (typeof o.contentLevel === 'string' && CONTENT_LEVELS.has(o.contentLevel) ? o.contentLevel : 'unknown') as ContentLevel;
-  return { ok: true, item, dropped };
+  return { ok: true, item, dropped, capped };
 }
 
 export interface ParsedWorklist { items: WorklistItem[]; bad: Array<{ line: number; error: string }> }
@@ -89,7 +128,7 @@ export function parseWorklist(text: string): ParsedWorklist {
 }
 
 /** Stream a work list file line by line (a catalogue list is ~135k lines); a bad line is yielded as such, not thrown. */
-export async function* readWorklistFile(file: string): AsyncGenerator<{ ok: true; item: WorklistItem; dropped: number } | { ok: false; line: number; error: string }> {
+export async function* readWorklistFile(file: string): AsyncGenerator<{ ok: true; item: WorklistItem; dropped: number; capped: number } | { ok: false; line: number; error: string }> {
   const stream = createReadStream(file, { encoding: 'utf8' });
   const lines = createInterface({ input: stream, crlfDelay: Infinity });
   let n = 0;

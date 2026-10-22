@@ -6,7 +6,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { parseWorklist, parseWorklistLine, readWorklistFile } from '../../services/images/galleryWorklist';
+import { canonicalImageUrl, parseWorklist, parseWorklistLine, readWorklistFile } from '../../services/images/galleryWorklist';
 
 const STATIC = 'https://static.myfigurecollection.net';
 const line = (over: Record<string, unknown> = {}) =>
@@ -29,6 +29,7 @@ describe('parseWorklistLine', () => {
         ],
       },
       dropped: 0,
+      capped: 0,
     });
   });
 
@@ -55,13 +56,38 @@ describe('parseWorklistLine', () => {
     expect(r.ok && r.dropped).toBe(6);
   });
 
-  it('refuses an item whose entries are all unusable, or empty, or more than 100', () => {
+  it('refuses an item whose entries are all unusable, or empty', () => {
     expect(parseWorklistLine(line({ entries: [] })).ok).toBe(false);
     expect(parseWorklistLine(line({ entries: [{ src: 'ftp://x/y.jpg' }] })).ok).toBe(false);
-    const many = Array.from({ length: 101 }, (_, i) => ({ position: i, src: `${STATIC}/${i}.jpg` }));
+  });
+
+  // S2: a gallery over the cap is capped, never refused whole
+  it('caps a longer gallery at the first 100 by position, and counts the rest, instead of refusing the item', () => {
+    const many = Array.from({ length: 150 }, (_, i) => ({ position: 149 - i, src: `${STATIC}/${149 - i}.jpg` }));
     const r = parseWorklistLine(line({ entries: many }));
-    expect(r.ok).toBe(false);
-    expect(!r.ok && r.error).toMatch(/100/);
+    expect(r.ok && r.item.entries.length).toBe(100);
+    expect(r.ok && r.item.entries.map(e => e.position)).toEqual(Array.from({ length: 100 }, (_, i) => i));
+    expect(r.ok && r.capped).toBe(50);
+  });
+
+  it('exactly 100 is not capped, and equal positions keep their listed order when the cap bites', () => {
+    const exact = Array.from({ length: 100 }, (_, i) => ({ position: i, src: `${STATIC}/${i}.jpg` }));
+    expect(parseWorklistLine(line({ entries: exact }))).toMatchObject({ ok: true, capped: 0 });
+    const ties = Array.from({ length: 102 }, (_, i) => ({ position: 7, src: `${STATIC}/t${i}.jpg` }));
+    const r = parseWorklistLine(line({ entries: ties }));
+    expect(r.ok && r.item.entries[0]!.src).toBe(`${STATIC}/t0.jpg`);
+    expect(r.ok && r.item.entries[99]!.src).toBe(`${STATIC}/t99.jpg`);
+    expect(r.ok && r.capped).toBe(2);
+  });
+
+  // S3: every entry is carried in the canonical spelling
+  it('carries every src in its canonical spelling, and a duplicate spelling is a duplicate', () => {
+    const r = parseWorklistLine(line({ entries: [
+      { position: 0, src: 'HTTPS://Static.MyFigureCollection.NET./upload/a%7e.jpg#x' },
+      { position: 1, src: 'https://static.myfigurecollection.net:443/upload/a~.jpg' },
+    ] }));
+    expect(r.ok && r.item.entries.map(e => e.src)).toEqual([`${STATIC}/upload/a~.jpg`]);
+    expect(r.ok && r.dropped).toBe(1);
   });
 
   it.each([
@@ -124,5 +150,41 @@ describe('parseWorklist / readWorklistFile', () => {
   it('rejects a missing file with a clear error', async () => {
     const it = readWorklistFile('/nonexistent/wl.jsonl')[Symbol.asyncIterator]();
     await expect(it.next()).rejects.toThrow(/wl\.jsonl/);
+  });
+});
+
+// The canonical spelling: fc-aggregation's `gallery:worklist` produces the same form from the same vectors.
+// (test/vectors is duplicated, not shared: a change to one must be made to the other)
+const CANONICAL_VECTORS: ReadonlyArray<[string, string, string | undefined]> = [
+  ['already canonical', 'https://static.example.net/upload/a.jpg', 'https://static.example.net/upload/a.jpg'],
+  ['host in capitals', 'https://STATIC.Example.NET/upload/a.jpg', 'https://static.example.net/upload/a.jpg'],
+  ['a trailing dot on the host', 'https://static.example.net./upload/a.jpg', 'https://static.example.net/upload/a.jpg'],
+  ['a percent-encoded host', 'http://%6cocalhost:8080/a.jpg', 'http://localhost:8080/a.jpg'],
+  ['the default port', 'https://static.example.net:443/a.jpg', 'https://static.example.net/a.jpg'],
+  ['a non-default port is kept', 'https://static.example.net:8443/a.jpg', 'https://static.example.net:8443/a.jpg'],
+  ['dot segments', 'https://static.example.net/a/b/../c/./d.jpg', 'https://static.example.net/a/c/d.jpg'],
+  ['a fragment', 'https://static.example.net/a.jpg#frag', 'https://static.example.net/a.jpg'],
+  ['an unreserved character that was escaped', 'https://static.example.net/a%7E%41%2d%2E%5Fb.jpg', 'https://static.example.net/a~A-._b.jpg'],
+  ['an escape in lower case', 'https://static.example.net/a%c3%a4.jpg', 'https://static.example.net/a%C3%A4.jpg'],
+  ['a non-ASCII character', 'https://static.example.net/\u00e4.jpg', 'https://static.example.net/%C3%A4.jpg'],
+  ['a reserved escape stays escaped, in capitals', 'https://static.example.net/a%2fb%3f.jpg', 'https://static.example.net/a%2Fb%3F.jpg'],
+  ['a query', 'https://static.example.net/a.jpg?x=%7e&y=%c3%a4', 'https://static.example.net/a.jpg?x=~&y=%C3%A4'],
+  ['an empty path', 'https://static.example.net', 'https://static.example.net/'],
+  ['credentials have no canonical form', 'https://user:pw@static.example.net/a.jpg', undefined],
+  ['not http(s)', 'ftp://static.example.net/a.jpg', undefined],
+  ['not a url', 'static.example.net/a.jpg', undefined],
+  ['a space', 'https://static.example.net/a b.jpg', undefined],
+];
+
+describe('canonicalImageUrl', () => {
+  it.each(CANONICAL_VECTORS)('%s', (_why, input, want) => {
+    expect(canonicalImageUrl(input)).toBe(want);
+  });
+
+  it('is idempotent on every vector, and refuses a non-string or an over-long url', () => {
+    for (const [, , want] of CANONICAL_VECTORS) if (want !== undefined) expect(canonicalImageUrl(want)).toBe(want);
+    expect(canonicalImageUrl(5)).toBeUndefined();
+    expect(canonicalImageUrl('')).toBeUndefined();
+    expect(canonicalImageUrl(`https://static.example.net/${'a'.repeat(2100)}`)).toBeUndefined();
   });
 });
