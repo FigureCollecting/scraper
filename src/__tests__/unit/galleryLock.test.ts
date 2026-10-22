@@ -1,5 +1,5 @@
 /** One gallery run at a time per ledger (red team S6): an O_EXCL lock file beside the ledger, taken over only when its pid is gone. */
-import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { acquireRunLock } from '../../services/images/galleryLock';
@@ -67,6 +67,15 @@ describe('acquireRunLock', () => {
     const l = acquireRunLock(file, 10);
     rmSync(file);
     expect(() => l.held && l.release()).not.toThrow();
+  });
+
+  it('an error that is not "already exists" is not swallowed (a missing directory throws)', () => {
+    expect(() => acquireRunLock(path.join(dir, 'no-such-dir', 'ledger.lock'), 1)).toThrow(/ENOENT/);
+  });
+
+  it('a lock path that cannot be read as a pid file (a directory) is reported held, not taken', () => {
+    mkdirSync(file);
+    expect(acquireRunLock(file, 1)).toEqual({ held: false });
   });
 
   it('two takeovers of one stale lock: exactly one wins, the other sees the winner alive', () => {

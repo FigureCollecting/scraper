@@ -2,7 +2,7 @@
  * The gallery job's entry (`gallery:capture`): arguments and env in, one hook and one pacing limiter composed from
  * the same pieces the ingest lane uses, a report out, and an exit code an operator and a Job can act on.
  */
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { galleryExitCode, main, parseGalleryArgs } from '../../services/images/galleryCapture';
@@ -227,5 +227,80 @@ describe('main', () => {
     const boom = { ...d.deps, makeHook: () => { throw new Error('hook could not be built'); } };
     expect(await main(['--worklist', work, '--ledger', ledger], boom as never)).toBe(1);
     expect(out.join('\n')).toMatch(/hook could not be built/);
+  });
+
+  // S4: a host with no decided rate would run at the limiter's own default, faster than the rate chosen for it
+  it.each([
+    ['no IMAGE_HOST_RATE_JSON at all', undefined],
+    ['a row for another host only', JSON.stringify({ 'other.example': { intervalMs: 333 } })],
+    ['a row that is not readable', '{not json'],
+    ['a row with an interval outside the allowed range', JSON.stringify({ [STATIC]: { intervalMs: 5 } })],
+  ])('exits 2 with zero requests when the allowed host has no explicit rate row: %s', async (_why, rateJson) => {
+    const d = deps();
+    const env = { ...d.deps.env } as Record<string, string | undefined>;
+    if (rateJson === undefined) delete env.IMAGE_HOST_RATE_JSON; else env.IMAGE_HOST_RATE_JSON = rateJson;
+    expect(await main(['--worklist', work, '--ledger', ledger], { ...d.deps, env: env as NodeJS.ProcessEnv })).toBe(2);
+    expect(out.join('\n')).toMatch(new RegExp(`REFUSED: no explicit rate row for ${STATIC.replace(/\./g, '\\.')}`));
+    expect(d.fetched).toEqual([]);
+    expect(existsSync(`${ledger}.lock`)).toBe(false);
+  });
+
+  it('a dry run needs no rate row (it makes no request)', async () => {
+    const d = deps();
+    const env = { ...d.deps.env } as Record<string, string | undefined>;
+    delete env.IMAGE_HOST_RATE_JSON;
+    expect(await main(['--worklist', work, '--dry-run'], { ...d.deps, env: env as NodeJS.ProcessEnv })).toBe(0);
+  });
+
+  // S6: one run per ledger
+  it('a second run exits 3 with zero requests while a live run holds the ledger, and says whose lock it is', async () => {
+    writeFileSync(`${ledger}.lock`, `${process.pid}\n`);
+    const d = deps();
+    expect(await main(['--worklist', work, '--ledger', ledger], d.deps)).toBe(3);
+    expect(out.join('\n')).toContain(`LOCKED: another run holds ${ledger}.lock (pid ${process.pid})`);
+    expect(d.fetched).toEqual([]);
+    expect(readFileSync(`${ledger}.lock`, 'utf8')).toBe(`${process.pid}\n`);
+  });
+
+  it('a lock that is held but names no pid is reported without one', async () => {
+    writeFileSync(`${ledger}.lock`, '');
+    const d = deps();
+    expect(await main(['--worklist', work, '--ledger', ledger], d.deps)).toBe(3);
+    expect(out.join('\n')).toMatch(/LOCKED: another run holds .*\.lock; this one made no request/);
+  });
+
+  it('takes its own lock for the run and always lets it go: after a clean run and after a crash', async () => {
+    const d = deps();
+    expect(await main(['--worklist', work, '--ledger', ledger], d.deps)).toBe(0);
+    expect(existsSync(`${ledger}.lock`)).toBe(false);
+    const boom = { ...deps().deps, makeHook: () => { throw new Error('hook could not be built'); } };
+    expect(await main(['--worklist', work, '--ledger', ledger], boom as never)).toBe(1);
+    expect(existsSync(`${ledger}.lock`)).toBe(false);
+  });
+
+  it('a dry run takes no lock', async () => {
+    writeFileSync(`${ledger}.lock`, `${process.pid}\n`);
+    expect(await main(['--worklist', work, '--ledger', ledger, '--dry-run'], deps().deps)).toBe(0);
+  });
+
+  // S7: a signal reaches the run through deps.signal
+  it('a run already told to stop makes no request, settles nothing and exits 7', async () => {
+    const d = deps();
+    const ac = new AbortController();
+    ac.abort();
+    expect(await main(['--worklist', work, '--ledger', ledger], { ...d.deps, signal: ac.signal })).toBe(7);
+    expect(d.fetched).toEqual([]);
+    expect(reportOf()).toMatchObject({ stopped: 'interrupted', fetched: 0 });
+    expect(existsSync(ledger) ? readFileSync(ledger, 'utf8') : '').toBe('');
+  });
+
+  // B2: the raw store did not confirm the bytes
+  it('exits 6 and settles nothing when the raw store reports a lost put', async () => {
+    const d = deps();
+    let lost = 0;
+    const sink = { flush: async () => { lost += 1; }, stats: () => ({ assetFailed: lost, dropped: 0, droppedBytes: 0, assetRefusedReserve: 0 }) };
+    expect(await main(['--worklist', work, '--ledger', ledger], { ...d.deps, sink })).toBe(6);
+    expect(reportOf()).toMatchObject({ itemsWithFailures: 2 });
+    expect(existsSync(ledger) ? readFileSync(ledger, 'utf8') : '').toBe('');
   });
 });
