@@ -278,7 +278,8 @@ describe('assembleCatalog — seed (fetch one declared list)', () => {
     await assembleCatalog(challenged).seed('examplestore', 'new-arrivals');
     expect(store.markStale).toHaveBeenCalled();
 
-    const clean = services({ cfCookieStore: store });
+    // The status-aware lane (what wireServices wires): only a 2xx the lane SAW proves the host FRESH.
+    const clean = { ...services({ cfCookieStore: store }), fetchSearchDetail: jest.fn(async () => ({ status: 200, body: '<html>seed</html>' })) };
     await assembleCatalog(clean).seed('examplestore', 'new-arrivals');
     expect(store.markFresh).toHaveBeenCalled();
   });

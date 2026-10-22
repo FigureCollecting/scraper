@@ -21,6 +21,11 @@ const MIN_WINDOW_MS = 60_000;
 const MAX_WINDOW_MS = 24 * 60 * 60_000;
 /** Default window when nothing (arg or env) says otherwise — 30 minutes. */
 const DEFAULT_WINDOW_MS = 30 * 60_000;
+/**
+ * Default run of CONSECUTIVE gate failures (an empty body or a 5xx from a gated host — see
+ * gateSignal) that opens a host's cooldown. Conservative: one busy 5xx is not a refused gate.
+ */
+const DEFAULT_GATE_FAILURE_THRESHOLD = 5;
 
 /**
  * Coerce a requested window (ms) into the allowed band. A finite value is clamped to
@@ -40,6 +45,18 @@ function resolveWindowFromEnv(): number {
   const raw = process.env.CHALLENGE_COOLDOWN_MS;
   if (raw === undefined || raw.trim() === '') return DEFAULT_WINDOW_MS;
   return clampWindow(Number(raw));
+}
+
+/** A positive whole number, else the default — a garbage threshold degrades to sane, never to 0 or 1. */
+function validThreshold(n: number): number {
+  return Number.isInteger(n) && n >= 1 ? n : DEFAULT_GATE_FAILURE_THRESHOLD;
+}
+
+/** The gate-failure threshold from GATE_FAILURE_COOLDOWN_THRESHOLD. Unset / empty / invalid → 5. */
+function resolveGateThresholdFromEnv(): number {
+  const raw = process.env.GATE_FAILURE_COOLDOWN_THRESHOLD;
+  if (raw === undefined || raw.trim() === '') return DEFAULT_GATE_FAILURE_THRESHOLD;
+  return validThreshold(Number(raw));
 }
 
 /** Host key normalization — lowercase, trimmed, `www.` stripped (matches ProfileRegistry). */
@@ -83,6 +100,8 @@ export interface ChallengeCooldownOptions {
   windowMs?: number;
   /** Optional durable sink. Absent ⇒ the register is memory-only, exactly as before. */
   persistence?: CooldownPersistence;
+  /** Consecutive gate failures that open a host's cooldown. Beats the env; invalid → 5. */
+  gateFailureThreshold?: number;
 }
 
 /**
@@ -114,11 +133,16 @@ export class ChallengeCooldown {
   private readonly now: () => number;
   private readonly windowMs: number;
   private persistence: CooldownPersistence | null;
+  /** Per-host run of consecutive gate failures (memory-only: a restart starts every run at 0). */
+  private readonly gateFailures = new Map<string, number>();
+  private readonly gateFailureThreshold: number;
 
   constructor(opts: ChallengeCooldownOptions = {}) {
     this.now = opts.now ?? Date.now;
     this.windowMs = clampWindow(opts.windowMs ?? resolveWindowFromEnv());
     this.persistence = opts.persistence ?? null;
+    this.gateFailureThreshold =
+      opts.gateFailureThreshold !== undefined ? validThreshold(opts.gateFailureThreshold) : resolveGateThresholdFromEnv();
   }
 
   /**
@@ -194,6 +218,33 @@ export class ChallengeCooldown {
     // eslint-disable-next-line no-console
     console.warn(`[COOLDOWN] cleared ${key}`);
     return true;
+  }
+
+  /**
+   * One more CONSECUTIVE gate failure for `host` (gateSignal: an empty body or a 5xx from a gated
+   * host). When the run reaches the threshold, the host's cooldown opens exactly as a challenge opens
+   * it — same window, same persistence, same fast-fail for every queued item. The run is NOT reset by
+   * opening: only a clean fetch ends it, so the first probe after the window lapses re-opens at once
+   * if the gate is still refusing. A failure while the window is live (a fetch already in flight)
+   * does not re-open it, so stragglers cannot stretch the window. Returns the run length, and the
+   * entry when this call opened the cooldown.
+   */
+  recordGateFailure(host: string, reason: string): { count: number; opened?: CooldownEntry } {
+    const key = normalizeHost(host);
+    const count = (this.gateFailures.get(key) ?? 0) + 1;
+    this.gateFailures.set(key, count);
+    if (count < this.gateFailureThreshold || this.isOpen(key)) return { count };
+    return { count, opened: this.open(key, `${count} consecutive gate failures (${reason})`) };
+  }
+
+  /** A clean fetch ends `host`'s run of gate failures. True if there was a run to end. */
+  resetGateFailures(host: string): boolean {
+    return this.gateFailures.delete(normalizeHost(host));
+  }
+
+  /** The current run of consecutive gate failures for `host` (0 when none). */
+  gateFailureCount(host: string): number {
+    return this.gateFailures.get(normalizeHost(host)) ?? 0;
   }
 
   /** The currently-open cooldowns as observability views (expired-but-unremoved entries excluded). */

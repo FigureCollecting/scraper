@@ -234,7 +234,8 @@ describe('assembleCatalog × stored cookies — stale / fresh signals', () => {
 
   it('a clean listing → markFresh("orzgk.com"); markStale never', async () => {
     const cfCookieStore = fakeStore(['orzgk.com']);
-    const { catalog } = build({ fetchSearch: jest.fn(async () => '[]'), cfCookieStore });
+    // The status-aware lane (what wireServices wires): only a 2xx the lane SAW proves the host FRESH.
+    const { catalog } = build({ fetchSearch: jest.fn(async () => '[]'), fetchSearchDetail: jest.fn(async () => ({ status: 200, body: '[]' })), cfCookieStore });
 
     expect(await catalog.catalog('orzgk')).toMatchObject({ status: 'ok', siteId: 'orzgk' });
     expect(cfCookieStore.markFresh).toHaveBeenCalledTimes(1);

@@ -1,0 +1,710 @@
+/**
+ * TDD (red first) — QB-U1: the scrape queue carries a lane per item.
+ *
+ * WHY: Ross (2026-09-29) splits MFC's one host slot between work classes (new, company, gap, and
+ * 'other' for unlabelled work). The queue therefore has to (1) take an optional lane at enqueue,
+ * (2) keep it on the row through every path an item travels, (3) settle two enqueues of the same URL
+ * with different labels by a fixed rule, and (4) keep per-(host, class) depth that QB-U3's scheduler
+ * and QB-U12's GetLaneDepth can read without a query. Dispatch itself does not change here.
+ *
+ * The coalesce rule (plan v2, design.scheduler.coalesce):
+ *   existing lane null + incoming L  -> the row ADOPTS L            (relabeledLegacy)
+ *   existing lane L + incoming M != L -> the first label is kept     (coalescedCrossLane)
+ *   HOT rows are never relabeled.
+ */
+const mockNotifyItemFailed = jest.fn().mockResolvedValue(true);
+
+jest.mock('../../services/genericScraper', () => ({
+  BrowserPool: {
+    getStealthBrowser: jest.fn(),
+    getBrowser: jest.fn(),
+    returnBrowser: jest.fn(),
+    getPoolSize: jest.fn().mockReturnValue(2),
+    getPoolCapacity: jest.fn().mockReturnValue(3),
+    reset: jest.fn(),
+  },
+}));
+
+jest.mock('../../services/webhookClient', () => ({
+  notifyItemSuccess: jest.fn().mockResolvedValue(true),
+  notifyItemFailed: (...args: any[]) => mockNotifyItemFailed(...args),
+  notifyItemSkipped: jest.fn().mockResolvedValue(true),
+}));
+
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { DatabaseSync } from 'node:sqlite';
+import { ScrapeQueue, resetScrapeQueue, type QueueItem } from '../../services/scrapeQueue';
+import { openQueueStore, QUEUE_DB_FILE, type ScrapeQueueStore } from '../../services/queueStore';
+import { QUEUE_LANE_CLASSES, type QueueLane, type QueueLaneClass } from '../../services/queueLane';
+
+const HOST = 'myfigurecollection.net';
+const urlFor = (id: string, host = HOST) => `https://${host}/item/${id}`;
+
+let dirs: string[] = [];
+let stores: ScrapeQueueStore[] = [];
+let queue: ScrapeQueue | undefined;
+
+function tmpDir(): string {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'scrape-queue-lane-'));
+  dirs.push(d);
+  return d;
+}
+
+function openStore(dir: string): ScrapeQueueStore {
+  const s = openQueueStore({ dir });
+  stores.push(s);
+  return s;
+}
+
+function wired(store?: ScrapeQueueStore): ScrapeQueue {
+  queue = new ScrapeQueue(true);
+  if (store) queue.setQueueStore(store);
+  return queue;
+}
+
+/** The lane on disk for a dedup key, read through a separate read-only handle. */
+function diskLane(dir: string, key: string): unknown {
+  const db = new DatabaseSync(path.join(dir, QUEUE_DB_FILE), { readOnly: true });
+  try {
+    return (db.prepare('SELECT lane FROM queue_items WHERE mfc_id = ?').get(key) as unknown as { lane: unknown } | undefined)?.lane;
+  } finally {
+    db.close();
+  }
+}
+
+type Internals = {
+  hotQueue: QueueItem[];
+  warmQueue: QueueItem[];
+  coldQueue: QueueItem[];
+  pendingItems: Map<string, QueueItem>;
+  getNextProcessableItem(now: number): QueueItem | null;
+  handleSuccess(item: QueueItem, result: unknown): void;
+  handleFailure(item: QueueItem, error: Error): void;
+};
+const internals = (q: ScrapeQueue) => q as unknown as Internals;
+
+/** Resident depth recounted from the tiers themselves — the truth the counters must match. */
+function recountResident(q: ScrapeQueue, host: string): Record<QueueLaneClass, number> {
+  const out = { new: 0, company: 0, gap: 0, other: 0 } as Record<QueueLaneClass, number>;
+  const i = internals(q);
+  for (const item of [...i.hotQueue, ...i.warmQueue, ...i.coldQueue]) {
+    let h: string | undefined;
+    try {
+      h = new URL(item.url).hostname.toLowerCase().replace(/^www\./, '');
+    } catch {
+      h = undefined;
+    }
+    if (h === host) out[item.lane ?? 'other']++;
+  }
+  return out;
+}
+
+/** How many slots of the tiers hold THIS item object (an item must never sit in the tiers twice). */
+function tierCopies(q: ScrapeQueue, item: QueueItem): number {
+  const i = internals(q);
+  return [...i.hotQueue, ...i.warmQueue, ...i.coldQueue].filter((x) => x === item).length;
+}
+
+/** The priority on disk for a dedup key, read through a separate read-only handle. */
+function diskPriority(dir: string, key: string): unknown {
+  const db = new DatabaseSync(path.join(dir, QUEUE_DB_FILE), { readOnly: true });
+  try {
+    return (db.prepare('SELECT priority FROM queue_items WHERE mfc_id = ?').get(key) as unknown as { priority: unknown } | undefined)?.priority;
+  } finally {
+    db.close();
+  }
+}
+
+/** Parked depth recounted from the store — the truth the parked counters must match. */
+function recountParked(store: ScrapeQueueStore, host: string): Record<QueueLaneClass, number> {
+  const out = { new: 0, company: 0, gap: 0, other: 0 } as Record<QueueLaneClass, number>;
+  for (const row of store.countByHostLane('parked')) if (row.host === host) out[row.lane ?? 'other'] += row.n;
+  return out;
+}
+
+function depth(q: ScrapeQueue, host = HOST, field: 'resident' | 'parked' = 'resident'): Record<QueueLaneClass, number> {
+  const counts = q.getLaneCounts(host);
+  return Object.fromEntries(QUEUE_LANE_CLASSES.map((c) => [c, counts[c][field]])) as Record<QueueLaneClass, number>;
+}
+
+const Z = { new: 0, company: 0, gap: 0, other: 0 };
+
+afterEach(() => {
+  if (queue) {
+    queue.stop();
+    queue.clear();
+    queue = undefined;
+  }
+  resetScrapeQueue();
+  for (const s of stores) {
+    try {
+      s.close();
+    } catch {
+      /* already closed */
+    }
+  }
+  stores = [];
+  for (const d of dirs) fs.rmSync(d, { recursive: true, force: true });
+  dirs = [];
+  delete process.env.SCRAPE_QUEUE_MAX_RESIDENT;
+  delete process.env.SCRAPE_QUEUE_MAX_RESIDENT_PER_HOST;
+  jest.restoreAllMocks();
+});
+
+// ---------------------------------------------------------------------------------------------
+describe('ScrapeQueue lane — enqueue takes an optional lane', () => {
+  it('writes the lane through and reports it as the effective lane', () => {
+    const dir = tmpDir();
+    const q = wired(openStore(dir));
+
+    const r = q.enqueue('a1', { url: urlFor('a1'), lane: 'new' });
+
+    expect(r.lane).toBe('new');
+    expect(diskLane(dir, 'a1')).toBe('new');
+  });
+
+  it('an unlabelled enqueue writes lane NULL, warns about nothing, and its result carries no lane at all', () => {
+    const dir = tmpDir();
+    const q = wired(openStore(dir));
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const r = q.enqueue('a1', { url: urlFor('a1') });
+
+    expect('lane' in r).toBe(false);
+    expect(diskLane(dir, 'a1')).toBeNull();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it.each([['other'], ['bogus'], ['']])('queues a label outside the vocabulary (%p) as unlabelled, with a warning', (bad) => {
+    const dir = tmpDir();
+    const q = wired(openStore(dir));
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const r = q.enqueue('a1', { url: urlFor('a1'), lane: bad as QueueLane });
+
+    expect('lane' in r).toBe(false);
+    expect(diskLane(dir, 'a1')).toBeNull();
+    expect(depth(q)).toEqual({ ...Z, other: 1 });
+    expect(warn.mock.calls.filter((c) => /lane/.test(String(c[0])))).toHaveLength(1);
+  });
+
+  // Neither REST nor the planned gRPC enum can send such a value; an in-process caller can. The door
+  // promises "queued unlabelled with a warning" for ANY value outside the vocabulary, so printing the
+  // value for that warning must never be what throws the enqueue away.
+  // The warning names the value by its type, so a function reads '<function>', not '<object>'.
+  it.each([
+    ['a null-prototype object', () => Object.create(null) as unknown, '<object>'],
+    ['an object whose toString throws', () => ({ toString: () => { throw new Error('no text'); } }) as unknown, '<object>'],
+    ['a function whose toString throws', () => Object.assign(() => 0, { toString: () => { throw new Error('no text'); } }) as unknown, '<function>'],
+  ])('queues a lane that cannot even be printed (%s) as unlabelled, with a warning, never a throw', (_what, make, printed) => {
+    const dir = tmpDir();
+    const q = wired(openStore(dir));
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const r = q.enqueue('a1', { url: urlFor('a1'), lane: make() as QueueLane });
+
+    expect(r.deduplicated).toBe(false);
+    expect('lane' in r).toBe(false);
+    expect(diskLane(dir, 'a1')).toBeNull();
+    expect(depth(q)).toEqual({ ...Z, other: 1 });
+    const lines = warn.mock.calls.map((c) => String(c[0])).filter((l) => /Ignored lane/.test(l));
+    expect(lines).toEqual([`[SCRAPE QUEUE] Ignored lane '${printed}' for a1: not one of new, company, gap; queued with no lane`]);
+  });
+
+  it('carries a lane per item through a bulk enqueue', () => {
+    const dir = tmpDir();
+    const q = wired(openStore(dir));
+
+    q.enqueueBulk([
+      { mfcId: 'b1', url: urlFor('b1'), lane: 'company' },
+      { mfcId: 'b2', url: urlFor('b2'), lane: 'gap' },
+      { mfcId: 'b3', url: urlFor('b3') },
+    ]);
+
+    expect([diskLane(dir, 'b1'), diskLane(dir, 'b2'), diskLane(dir, 'b3')]).toEqual(['company', 'gap', null]);
+  });
+
+  it('names the lane on the Enqueued log line only when there is one', () => {
+    const log = jest.spyOn(console, 'log').mockImplementation(() => {});
+    const q = wired();
+
+    q.enqueue('a1', { url: urlFor('a1'), lane: 'gap' });
+    q.enqueue('a2', { url: urlFor('a2') });
+
+    const lines = log.mock.calls.map((c) => String(c[0])).filter((l) => l.startsWith('[SCRAPE QUEUE] Enqueued'));
+    expect(lines[0]).toMatch(/Enqueued a1 at priority WARM lane=gap \(queue size: 1\)$/);
+    expect(lines[1]).toBe('[SCRAPE QUEUE] Enqueued a2 at priority WARM (queue size: 2)');
+  });
+
+  it('keeps the lane on the in-memory item when there is no durable store', () => {
+    const q = wired();
+    q.enqueue('a1', { url: urlFor('a1'), lane: 'company' });
+
+    expect(internals(q).pendingItems.get('a1')?.lane).toBe('company');
+    expect(depth(q)).toEqual({ ...Z, company: 1 });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+describe('ScrapeQueue lane — (f) the coalesce rule', () => {
+  it('null + L: the unlabelled row ADOPTS the incoming lane (relabeledLegacy)', () => {
+    const dir = tmpDir();
+    const q = wired(openStore(dir));
+    q.enqueue('k', { url: urlFor('k') });
+
+    const r = q.enqueue('k', { url: urlFor('k'), lane: 'company' });
+
+    expect(r.deduplicated).toBe(true);
+    expect(r.lane).toBe('company');
+    expect(diskLane(dir, 'k')).toBe('company');
+    expect(depth(q)).toEqual({ ...Z, company: 1 });
+    const counts = q.getLaneCounts(HOST);
+    expect(counts.company.relabeledLegacy).toBe(1);
+    expect(counts.company.coalescedCrossLane).toBe(0);
+  });
+
+  it('L + L: nothing changes and nothing is counted', () => {
+    const dir = tmpDir();
+    const q = wired(openStore(dir));
+    q.enqueue('k', { url: urlFor('k'), lane: 'gap' });
+
+    const r = q.enqueue('k', { url: urlFor('k'), lane: 'gap' });
+
+    expect(r.lane).toBe('gap');
+    expect(diskLane(dir, 'k')).toBe('gap');
+    expect(q.getLaneCounts(HOST).gap).toEqual({ resident: 1, parked: 0, relabeledLegacy: 0, coalescedCrossLane: 0 });
+  });
+
+  it('L + M: the first label is KEPT (coalescedCrossLane, counted against the kept lane)', () => {
+    const dir = tmpDir();
+    const q = wired(openStore(dir));
+    q.enqueue('k', { url: urlFor('k'), lane: 'new' });
+
+    const r = q.enqueue('k', { url: urlFor('k'), lane: 'gap' });
+
+    expect(r.lane).toBe('new');
+    expect(diskLane(dir, 'k')).toBe('new');
+    expect(depth(q)).toEqual({ ...Z, new: 1 });
+    const counts = q.getLaneCounts(HOST);
+    expect(counts.new.coalescedCrossLane).toBe(1);
+    expect(counts.gap.coalescedCrossLane).toBe(0);
+    expect(counts.new.relabeledLegacy).toBe(0);
+  });
+
+  it('L + no label: the lane is kept and nothing is counted', () => {
+    const dir = tmpDir();
+    const q = wired(openStore(dir));
+    q.enqueue('k', { url: urlFor('k'), lane: 'company' });
+
+    const r = q.enqueue('k', { url: urlFor('k') });
+
+    expect(r.lane).toBe('company');
+    expect(diskLane(dir, 'k')).toBe('company');
+    expect(q.getLaneCounts(HOST).company).toEqual({ resident: 1, parked: 0, relabeledLegacy: 0, coalescedCrossLane: 0 });
+  });
+
+  it('HOT + L: a HOT row is never relabeled, and nothing is counted', () => {
+    const dir = tmpDir();
+    const q = wired(openStore(dir));
+    q.enqueue('k', { url: urlFor('k'), priority: 'HOT' });
+
+    const r = q.enqueue('k', { url: urlFor('k'), lane: 'new' });
+
+    expect('lane' in r).toBe(false);
+    expect(diskLane(dir, 'k')).toBeNull();
+    expect(depth(q)).toEqual({ ...Z, other: 1 });
+    const counts = q.getLaneCounts(HOST);
+    expect(counts.new.relabeledLegacy).toBe(0);
+    expect(counts.other.coalescedCrossLane).toBe(0);
+  });
+
+  it('HOT L + M: a labelled HOT row keeps its lane and counts no cross-lane coalesce', () => {
+    const q = wired(openStore(tmpDir()));
+    q.enqueue('k', { url: urlFor('k'), priority: 'HOT', lane: 'company' });
+
+    const r = q.enqueue('k', { url: urlFor('k'), lane: 'gap' });
+
+    expect(r.lane).toBe('company');
+    expect(q.getLaneCounts(HOST).company.coalescedCrossLane).toBe(0);
+  });
+
+  it('a PARKED unlabelled row is claimed and adopts the label, on disk and in the counters', () => {
+    process.env.SCRAPE_QUEUE_MAX_RESIDENT = '1';
+    const dir = tmpDir();
+    const store = openStore(dir);
+    const q = wired(store);
+    q.enqueue('a0', { url: urlFor('a0') });
+    q.enqueue('a1', { url: urlFor('a1') });
+    expect(depth(q, HOST, 'parked')).toEqual({ ...Z, other: 1 });
+
+    const r = q.enqueue('a1', { url: urlFor('a1'), lane: 'gap' });
+
+    expect(r).toMatchObject({ deduplicated: true, lane: 'gap' });
+    expect(diskLane(dir, 'a1')).toBe('gap');
+    expect(depth(q, HOST, 'parked')).toEqual(Z);
+    expect(depth(q)).toEqual({ ...Z, other: 1, gap: 1 });
+    expect(q.getLaneCounts(HOST).gap.relabeledLegacy).toBe(1);
+  });
+
+  it('a row left by an OLDER build (lane null on disk) adopts the first label after a restart', () => {
+    const dir = tmpDir();
+    const first = openStore(dir);
+    first.put({ id: 'k-1', mfcId: 'k', url: urlFor('k'), priority: 'COLD', attempts: 1, maxRetries: 3, enqueuedAt: 1_000, state: 'pending' });
+    first.close();
+    const q = wired(openStore(dir));
+    q.restoreFromStore(5_000);
+    expect(depth(q)).toEqual({ ...Z, other: 1 });
+
+    const r = q.enqueue('k', { url: urlFor('k'), priority: 'COLD', lane: 'company' });
+
+    expect(r.lane).toBe('company');
+    expect(diskLane(dir, 'k')).toBe('company');
+    expect(depth(q)).toEqual({ ...Z, company: 1 });
+  });
+
+  it('an IN-FLIGHT unlabelled item adopts the label without moving resident depth it is not part of', () => {
+    const dir = tmpDir();
+    const q = wired(openStore(dir));
+    q.enqueue('k', { url: urlFor('k') });
+    const inFlight = internals(q).getNextProcessableItem(Date.now());
+    expect(inFlight?.mfcId).toBe('k');
+    expect(depth(q)).toEqual(Z);
+
+    const r = q.enqueue('k', { url: urlFor('k'), lane: 'new' });
+
+    expect(r.lane).toBe('new');
+    expect(diskLane(dir, 'k')).toBe('new');
+    expect(depth(q)).toEqual(Z);
+    expect(q.getLaneCounts(HOST).new.relabeledLegacy).toBe(1);
+
+    // If it fails and is re-queued, it comes back under the lane it adopted.
+    internals(q).handleFailure(inFlight as QueueItem, new Error('NETWORK timeout reaching host'));
+    expect(depth(q)).toEqual({ ...Z, new: 1 });
+  });
+
+  it.each([['pending'], ['parked']] as const)(
+    'a lane this build does not know (a %s row) is still a lane: kept on disk and in memory, counted as other',
+    (state) => {
+      const dir = tmpDir();
+      const first = openStore(dir);
+      first.put({ id: 'k-1', mfcId: 'k', url: urlFor('k'), priority: 'WARM', attempts: 0, maxRetries: 3, enqueuedAt: 1_000, state });
+      first.close();
+      const raw = new DatabaseSync(path.join(dir, QUEUE_DB_FILE));
+      raw.exec(`UPDATE queue_items SET lane = 'premium' WHERE id = 'k-1'`);
+      raw.close();
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      const q = wired(openStore(dir));
+      q.restoreFromStore(5_000);
+
+      const r = q.enqueue('k', { url: urlFor('k'), lane: 'new' });
+
+      expect(r.deduplicated).toBe(true);
+      expect('lane' in r).toBe(false);
+      expect(diskLane(dir, 'k')).toBe('premium');
+      expect(internals(q).pendingItems.get('k')?.lane).toBeUndefined();
+      expect(depth(q)).toEqual({ ...Z, other: 1 });
+      expect(depth(q, HOST, 'parked')).toEqual(Z);
+      const counts = q.getLaneCounts(HOST);
+      expect(QUEUE_LANE_CLASSES.map((c) => counts[c].relabeledLegacy)).toEqual([0, 0, 0, 0]);
+      expect(counts.other.coalescedCrossLane).toBe(1);
+    }
+  );
+
+  it('HOT + L onto an unlabelled WARM row: the lane settles on the row as it stood, THEN it is raised to HOT', () => {
+    const dir = tmpDir();
+    const q = wired(openStore(dir));
+    q.enqueue('k', { url: urlFor('k') });
+
+    const r = q.enqueue('k', { url: urlFor('k'), priority: 'HOT', lane: 'new' });
+
+    expect(internals(q).pendingItems.get('k')).toMatchObject({ priority: 'HOT', lane: 'new' });
+    expect(r.lane).toBe('new');
+    expect(diskLane(dir, 'k')).toBe('new');
+    expect(depth(q)).toEqual({ ...Z, new: 1 });
+    expect(q.getLaneCounts(HOST).new.relabeledLegacy).toBe(1);
+  });
+
+  it('logs a relabel once, naming the lane the row adopted', () => {
+    const log = jest.spyOn(console, 'log').mockImplementation(() => {});
+    const q = wired();
+    q.enqueue('k', { url: urlFor('k') });
+    q.enqueue('k', { url: urlFor('k'), lane: 'gap' });
+    q.enqueue('k', { url: urlFor('k'), lane: 'gap' });
+
+    const relabels = log.mock.calls.map((c) => String(c[0])).filter((l) => /Relabeled/.test(l));
+    expect(relabels).toEqual(['[SCRAPE QUEUE] Relabeled k: lane other -> gap (an unlabelled row adopts the first label)']);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+describe('ScrapeQueue lane — per-(host, lane) depth', () => {
+  it('counts resident depth per host and class, and reads a www. host as the same host', () => {
+    const q = wired(openStore(tmpDir()));
+    q.enqueue('a', { url: urlFor('a'), lane: 'new' });
+    q.enqueue('b', { url: urlFor('b', 'www.myfigurecollection.net'), lane: 'new' });
+    q.enqueue('c', { url: urlFor('c'), lane: 'company', priority: 'COLD' });
+    q.enqueue('d', { url: urlFor('d') });
+    q.enqueue('e', { url: urlFor('e', 'other.example'), lane: 'gap' });
+    q.enqueue('f', { url: 'not a url', lane: 'gap' });
+
+    expect(depth(q)).toEqual({ new: 2, company: 1, gap: 0, other: 1 });
+    expect(depth(q, 'www.MyFigureCollection.net')).toEqual({ new: 2, company: 1, gap: 0, other: 1 });
+    expect(depth(q, 'other.example')).toEqual({ ...Z, gap: 1 });
+  });
+
+  it('counts overflow as parked depth and moves it to resident as it pages in', () => {
+    process.env.SCRAPE_QUEUE_MAX_RESIDENT = '2';
+    const store = openStore(tmpDir());
+    const q = wired(store);
+    q.enqueue('a0', { url: urlFor('a0'), lane: 'new' });
+    q.enqueue('a1', { url: urlFor('a1'), lane: 'new' });
+    q.enqueue('a2', { url: urlFor('a2'), lane: 'company' });
+    q.enqueue('a3', { url: urlFor('a3') });
+    expect(depth(q)).toEqual({ ...Z, new: 2 });
+    expect(depth(q, HOST, 'parked')).toEqual({ ...Z, company: 1, other: 1 });
+
+    q.cancel('a0');
+    q.cancel('a1');
+    expect(q.refillWorkingSet(Date.now())).toBe(2);
+
+    expect(depth(q)).toEqual({ ...Z, company: 1, other: 1 });
+    expect(depth(q, HOST, 'parked')).toEqual(Z);
+    expect(internals(q).pendingItems.get('a2')?.lane).toBe('company');
+  });
+
+  it('re-reads parked depth from the store only when a page-in actually moved rows', () => {
+    process.env.SCRAPE_QUEUE_MAX_RESIDENT = '10';
+    process.env.SCRAPE_QUEUE_MAX_RESIDENT_PER_HOST = '1';
+    const store = openStore(tmpDir());
+    const q = wired(store);
+    q.enqueue('a0', { url: urlFor('a0'), lane: 'new' });
+    q.enqueue('a1', { url: urlFor('a1'), lane: 'new' });
+    const reads = jest.spyOn(store, 'countByHostLane');
+
+    // The only parked row is on a host at its cap: nothing pages in, so nothing is re-read.
+    expect(q.refillWorkingSet(Date.now())).toBe(0);
+    expect(reads).not.toHaveBeenCalled();
+
+    q.cancel('a0');
+    expect(q.refillWorkingSet(Date.now())).toBe(1);
+    expect(reads).toHaveBeenCalledWith('parked');
+    expect(depth(q, HOST, 'parked')).toEqual(Z);
+  });
+
+  it('a priority upgrade does not count an item twice', () => {
+    const q = wired(openStore(tmpDir()));
+    q.enqueue('k', { url: urlFor('k'), lane: 'gap', priority: 'COLD' });
+    q.enqueue('k', { url: urlFor('k'), priority: 'WARM' });
+
+    expect(depth(q)).toEqual({ ...Z, gap: 1 });
+  });
+
+  it('an IN-FLIGHT item raised by a later enqueue: resident depth still equals what the tiers hold', () => {
+    const q = wired(openStore(tmpDir()));
+    q.enqueue('k', { url: urlFor('k'), lane: 'new' });
+    const inFlight = internals(q).getNextProcessableItem(Date.now());
+    expect(inFlight?.mfcId).toBe('k');
+    expect(depth(q)).toEqual(Z);
+
+    q.enqueue('k', { url: urlFor('k'), priority: 'HOT' });
+
+    // The raise looks for the item in its old tier and does not find it (it is on the wire). Whatever
+    // the raise then does with the item, the counters must follow the tiers, never go below them.
+    expect(depth(q)).toEqual(recountResident(q, HOST));
+  });
+
+  // A raise used to ADD the in-flight item to its new tier; the retry then added it a second time, so
+  // one item sat in one tier twice, was dispatched twice, and a relabel (which moves resident depth by
+  // one) left a phantom 'other' and, once drained, a negative 'new' that nothing ever reconciled.
+  it.each([
+    ['a higher priority', { priority: 'HOT' as const }],
+    ['cookies', { priority: 'WARM' as const, cookies: { sid: 'x' }, sessionId: 's1' }],
+  ])('a raise (by %s) that finds the item on the wire records it and queues nothing; the retry comes back raised', (_by, raise) => {
+    const dir = tmpDir();
+    const q = wired(openStore(dir));
+    q.enqueue('k', { url: urlFor('k'), priority: 'COLD', lane: 'gap' });
+    const inFlight = internals(q).getNextProcessableItem(Date.now()) as QueueItem;
+    expect(inFlight.mfcId).toBe('k');
+
+    const r = q.enqueue('k', { url: urlFor('k'), ...raise });
+
+    expect(r.deduplicated).toBe(true);
+    expect(inFlight.priority).toBe('HOT');
+    expect(diskPriority(dir, 'k')).toBe('HOT');
+    expect(tierCopies(q, inFlight)).toBe(0);
+    expect(depth(q)).toEqual(Z);
+
+    internals(q).handleFailure(inFlight, new Error('NETWORK timeout reaching host'));
+
+    expect(internals(q).hotQueue).toEqual([inFlight]);
+    expect(tierCopies(q, inFlight)).toBe(1);
+    expect(depth(q)).toEqual({ ...Z, gap: 1 });
+  });
+
+  it('an unlabelled item raised on the wire, retried, then relabeled sits in its tier ONCE, and its depth moves with it', () => {
+    const q = wired(openStore(tmpDir()));
+    q.enqueue('k', { url: urlFor('k'), priority: 'COLD' });
+    const inFlight = internals(q).getNextProcessableItem(Date.now()) as QueueItem;
+    q.enqueue('k', { url: urlFor('k'), priority: 'WARM' });
+    internals(q).handleFailure(inFlight, new Error('NETWORK timeout reaching host'));
+
+    q.enqueue('k', { url: urlFor('k'), lane: 'new' });
+
+    expect(tierCopies(q, inFlight)).toBe(1);
+    expect(depth(q)).toEqual({ ...Z, new: 1 });
+    expect(depth(q)).toEqual(recountResident(q, HOST));
+  });
+
+  it('...and drained, it is fetched ONCE and every resident counter is back to zero', () => {
+    const q = wired(openStore(tmpDir()));
+    q.enqueue('k', { url: urlFor('k'), priority: 'COLD' });
+    let now = Date.now();
+    const inFlight = internals(q).getNextProcessableItem(now) as QueueItem;
+    q.enqueue('k', { url: urlFor('k'), priority: 'WARM' });
+    internals(q).handleFailure(inFlight, new Error('NETWORK timeout reaching host'));
+    q.enqueue('k', { url: urlFor('k'), lane: 'new' });
+
+    const dispatched: string[] = [];
+    for (let n = 0; n < 3; n++) {
+      const next = internals(q).getNextProcessableItem((now += 600_000));
+      if (next === null) break;
+      dispatched.push(next.mfcId);
+      internals(q).handleSuccess(next, {});
+    }
+
+    expect(dispatched).toEqual(['k']);
+    expect(depth(q)).toEqual(Z);
+    expect(recountResident(q, HOST)).toEqual(Z);
+  });
+
+  it('dispatch takes an item out of resident depth; a retry puts it back; success does not', () => {
+    const q = wired(openStore(tmpDir()));
+    q.enqueue('k1', { url: urlFor('k1'), lane: 'company' });
+    q.enqueue('k2', { url: urlFor('k2', 'b.example'), lane: 'company' });
+
+    const first = internals(q).getNextProcessableItem(Date.now()) as QueueItem;
+    expect(depth(q).company + depth(q, 'b.example').company).toBe(1);
+    internals(q).handleFailure(first, new Error('NETWORK timeout reaching host'));
+    expect(depth(q).company + depth(q, 'b.example').company).toBe(2);
+
+    const next = internals(q).getNextProcessableItem(Date.now() + 120_000) as QueueItem;
+    internals(q).handleSuccess(next, {});
+    expect(depth(q).company + depth(q, 'b.example').company).toBe(1);
+  });
+
+  it('cancel and clear take items out; clear forgets the coalesce counters too', () => {
+    const q = wired(openStore(tmpDir()));
+    q.enqueue('a', { url: urlFor('a'), lane: 'new' });
+    q.enqueue('b', { url: urlFor('b') });
+    q.enqueue('b', { url: urlFor('b'), lane: 'gap' });
+    q.cancel('a');
+    expect(depth(q)).toEqual({ ...Z, gap: 1 });
+
+    q.clear();
+    expect(q.getLaneCounts(HOST).gap).toEqual({ resident: 0, parked: 0, relabeledLegacy: 0, coalescedCrossLane: 0 });
+  });
+
+  it('is reconciled at BOOT: resident from the restored rows, parked from the disk', () => {
+    const dir = tmpDir();
+    const first = openStore(dir);
+    const row = (id: string, state: 'pending' | 'parked', lane?: QueueLane) => ({
+      id: `${id}-1`, mfcId: id, url: urlFor(id), priority: 'WARM' as const,
+      attempts: 0, maxRetries: 3, enqueuedAt: 1_000, state, ...(lane ? { lane } : {}),
+    });
+    first.put(row('p1', 'pending', 'new'));
+    first.put(row('p2', 'pending'));
+    first.put(row('k1', 'parked', 'company'));
+    first.put(row('k2', 'parked', 'company'));
+    first.put(row('k3', 'parked', 'gap'));
+    first.put({ ...row('l1', 'pending', 'gap') });
+    first.lease('l1-1', 2_000);
+    first.close();
+
+    const q = wired(openStore(dir));
+    // setQueueStore alone already knows what is parked on disk.
+    expect(depth(q, HOST, 'parked')).toEqual({ ...Z, company: 2, gap: 1 });
+
+    q.restoreFromStore(5_000);
+    expect(depth(q)).toEqual({ ...Z, new: 1, other: 1, gap: 1 });
+    expect(depth(q, HOST, 'parked')).toEqual({ ...Z, company: 2, gap: 1 });
+  });
+
+  it('never drifts from the tiers and the disk across a long mixed run, with items held in flight, raised there, and restarts', () => {
+    process.env.SCRAPE_QUEUE_MAX_RESIDENT = '8';
+    process.env.SCRAPE_QUEUE_MAX_RESIDENT_PER_HOST = '5';
+    const dir = tmpDir();
+    let store = openStore(dir);
+    let q = wired(store);
+    const hosts = [HOST, 'www.myfigurecollection.net', 'b.example', 'c.example'];
+    const lanes: Array<QueueLane | undefined> = ['new', 'company', 'gap', undefined];
+    let seed = 0x5eed;
+    const rnd = (n: number) => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed % n;
+    };
+    let now = Date.now();
+    const log = jest.spyOn(console, 'log').mockImplementation(() => {});
+
+    // Dispatched items are HELD on the wire across later operations (a raise, a cancel, a refill, a
+    // restart), not settled on the spot: that is where an item is in pendingItems but in no tier.
+    let inFlight: QueueItem[] = [];
+    const settle = (item: QueueItem): void => {
+      if (rnd(2) === 0) internals(q).handleSuccess(item, {});
+      else internals(q).handleFailure(item, new Error('NETWORK timeout reaching host'));
+    };
+
+    for (let step = 0; step < 600; step++) {
+      const op = rnd(15);
+      const key = `k${rnd(30)}`;
+      if (op < 5) {
+        const host = hosts[rnd(hosts.length)];
+        const priority = (['WARM', 'COLD', 'HOT'] as const)[rnd(3)];
+        const lane = lanes[rnd(lanes.length)];
+        q.enqueue(key, { url: urlFor(key, host), priority, ...(lane ? { lane } : {}) });
+      } else if (op < 6) {
+        q.cancel(key);
+      } else if (op < 8) {
+        now += 60_000;
+        const item = internals(q).getNextProcessableItem(now);
+        if (item) inFlight.push(item);
+      } else if (op < 10) {
+        const item = inFlight.shift();
+        if (item) settle(item);
+      } else if (op < 12) {
+        q.refillWorkingSet(now);
+      } else if (op < 14) {
+        // Enqueue the key of an item that is ON THE WIRE: the raise and relabel paths then
+        // meet an item that is in pendingItems but in no tier.
+        const held = inFlight[rnd(Math.max(inFlight.length, 1))];
+        if (held) {
+          const priority = (['WARM', 'COLD', 'HOT'] as const)[rnd(3)];
+          const lane = lanes[rnd(lanes.length)];
+          q.enqueue(held.mfcId, { url: held.url, priority, ...(lane ? { lane } : {}) });
+        }
+      } else {
+        q.stop();
+        store.close();
+        store = openStore(dir);
+        q = wired(store);
+        q.restoreFromStore(now);
+        inFlight = [];
+      }
+      // An item sits in the tiers at most once, and never while it is on the wire.
+      const tiers = [...internals(q).hotQueue, ...internals(q).warmQueue, ...internals(q).coldQueue];
+      expect({ step, twice: tiers.filter((x, i) => tiers.indexOf(x) !== i).map((x) => x.mfcId) }).toEqual({ step, twice: [] });
+      expect({ step, queuedOnTheWire: inFlight.filter((x) => tiers.includes(x)).map((x) => x.mfcId) }).toEqual({ step, queuedOnTheWire: [] });
+      for (const host of [HOST, 'b.example', 'c.example']) {
+        expect({ step, host, resident: depth(q, host) }).toEqual({ step, host, resident: recountResident(q, host) });
+        expect({ step, host, parked: depth(q, host, 'parked') }).toEqual({ step, host, parked: recountParked(store, host) });
+      }
+      // Memory and disk agree on every row's lane.
+      for (const [key2, item] of internals(q).pendingItems) {
+        const onDisk = diskLane(dir, key2);
+        if (onDisk !== undefined) expect({ step, key: key2, lane: onDisk }).toEqual({ step, key: key2, lane: item.lane ?? null });
+      }
+    }
+    log.mockRestore();
+  });
+});

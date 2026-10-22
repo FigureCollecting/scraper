@@ -10,13 +10,13 @@
  * `browser` transport is wired at the mount from the ScrapingService; unset here → it degrades to http.
  */
 import { buildProfileRegistry } from '../driver/profileRegistry.js';
-import { assembleLookup, type Lookup, type LookupServices } from '../driver/assembleLookup.js';
-import { assembleCatalog, type Catalog } from '../driver/assembleCatalog.js';
+import { assembleLookup, type Lookup } from '../driver/assembleLookup.js';
+import { assembleCatalog, type Catalog, type CatalogServices } from '../driver/assembleCatalog.js';
 import { makeFetchSearch, type FetchSearchTransports } from './fetchSearch.js';
-import { impitFetchBody } from './impitFetch.js';
+import { impitFetchBody, impitFetchBodyDetailed } from './impitFetch.js';
 import { getCfCookieStore, type CfCookieSource } from './cookieJar.js';
 import { createFailureReporterFromEnv } from './failureReporter.js';
-import type { FetchBodyDetail } from './engineServices/capturingFetch.js';
+import type { FetchBodyDetail, FetchBodyOutcome, FetchRequest } from './engineServices/capturingFetch.js';
 import type { ExtractionRuleset, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
 
 /** The slice of the engine ExtractionRegistry the lookup needs. */
@@ -71,15 +71,23 @@ export function createHttpFetchDetailed(options: { store?: CfCookieSource } = {}
    * 404 or a bounce to the front page from a ruleset that failed to lift a record. A response object
    * that carries neither (a test double shaped like `{ text() }`) yields neither field.
    */
-  return async function httpFetchDetail(url: string): Promise<FetchBodyDetail> {
+  return async function httpFetchDetail(url: string, request?: FetchRequest): Promise<FetchBodyDetail> {
     const store = options.store ?? getCfCookieStore();
     const cookies = store.cookiesFor(url);
+    const post = request?.method === 'POST' ? request : undefined;
     const headers: Record<string, string> = {
       'user-agent': store.userAgentFor(url) ?? DESKTOP_UA,
       accept: 'application/json, text/html',
+      // The ruleset's headers, lowercase and allowlisted by the ExtractContext (never user-agent,
+      // cookie or content-type): its `accept` replaces the default above in place.
+      ...(request?.headers ?? {}),
       ...(cookies ? { cookie: serializeCookieHeader(cookies) } : {}),
+      ...(post ? { 'content-type': post.contentType } : {}),
     };
     const res = await fetch(url, {
+      // A POST's redirect is returned, not followed: a 302/303 would come back as a GET's bytes booked
+      // as the POST's, and a 307/308 would resend the body to a host no guard has seen.
+      ...(post ? { method: post.method, body: post.body, redirect: 'manual' as const } : {}),
       headers,
       // One signal bounds headers AND body: text() streams under the same abort.
       signal: AbortSignal.timeout(HTTP_FETCH_TIMEOUT_MS),
@@ -101,8 +109,8 @@ export function createHttpFetchDetailed(options: { store?: CfCookieSource } = {}
  */
 export function createHttpFetch(options: { store?: CfCookieSource } = {}) {
   const detailed = createHttpFetchDetailed(options);
-  return async function httpFetchBody(url: string): Promise<string> {
-    return (await detailed(url)).body;
+  return async function httpFetchBody(url: string, request?: FetchRequest): Promise<string> {
+    return (await (request ? detailed(url, request) : detailed(url))).body;
   };
 }
 
@@ -115,7 +123,8 @@ export const httpFetchBodyDetailed = createHttpFetchDetailed();
  * call), so a second instance would be harmless here rather than costly as it is on the impit lane;
  * projecting the one instance anyway keeps "one fetcher per lane" true without exception.
  */
-export const httpFetchBody = async (url: string): Promise<string> => (await httpFetchBodyDetailed(url)).body;
+export const httpFetchBody = async (url: string, request?: FetchRequest): Promise<string> =>
+  (await (request ? httpFetchBodyDetailed(url, request) : httpFetchBodyDetailed(url))).body;
 
 /**
  * Build the cross-store Lookup from the engine's registered stores + the three search transports.
@@ -143,7 +152,7 @@ export function createEngineCatalog(
 }
 
 /** The engine wiring both runtimes share: registry → ProfileRegistry, ruleset lookup, 3-way search fetch. */
-function wireServices(registry: LookupRegistry, transports: Partial<FetchSearchTransports>): LookupServices {
+function wireServices(registry: LookupRegistry, transports: Partial<FetchSearchTransports>): CatalogServices {
   const profiles = buildProfileRegistry(registry.allStores());
   const fetchSearch = makeFetchSearch({
     http: transports.http ?? httpFetchBody,
@@ -157,6 +166,13 @@ function wireServices(registry: LookupRegistry, transports: Partial<FetchSearchT
     profiles,
     getRulesetForUrl: (url) => registry.getRulesetForUrl(url),
     fetchSearch,
+    // The same lanes and sessions, answering the store's status too. /lookup and every /catalog axis
+    // read it: the gate (gateSignal) needs the status the lane saw to prove a host clean.
+    fetchSearchDetail: makeFetchSearch<FetchBodyOutcome>({
+      http: transports.http ?? httpFetchBodyDetailed,
+      impersonate: transports.impersonate ?? impitFetchBodyDetailed,
+      browser: transports.browser,
+    }),
     ...(reporter ? { reportFailure: (report) => reporter.report(report) } : {}),
   };
 }

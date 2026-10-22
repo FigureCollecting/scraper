@@ -18,7 +18,9 @@ export { createWebhookService } from './webhookService.js';
 
 export function buildEngineServices(): EngineServices {
   return {
-    scraping: createScrapingService(getRawCaptureSink()),
+    // The plugin-mounted routes (rulesets /scrape/mfc, /sync/*) reach stores through this service, and
+    // nothing upstream clocks their calls: every navigation it makes passes the host clock (QB-U30b).
+    scraping: createScrapingService(getRawCaptureSink(), { clockCaller: 'pluginRoute' }),
     queue: createQueueService(),
     sessions: createSessionService(),
     webhooks: createWebhookService(),

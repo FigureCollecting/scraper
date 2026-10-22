@@ -1,0 +1,96 @@
+dispatch 0 m101 (WARM 1/4)
+page 0 200 https://myfigurecollection.net/item/101
+dispatch 0 m122 (WARM 1/4)
+dispatch 1 f1 (WARM 1/4)
+page 1 200 https://fast.test/p/1
+dispatch 2 s1 (WARM 1/4)
+page 2 200 https://www.slow.test/p/1
+dispatch 1001 f2 (WARM 1/4)
+page 1001 200 https://fast.test/p/2
+dispatch 2001 f3 (WARM 1/4)
+page 2001 200 https://fast.test/p/3
+dispatch 3001 f4 (WARM 1/4)
+page 3001 500 https://fast.test/p/4
+dispatch 4001 f4 (WARM 2/4)
+page 4001 500 https://fast.test/p/4
+dispatch 5001 f4 (WARM 3/4)
+page 5001 200 https://fast.test/p/4
+dispatch 6001 f5 (WARM 1/4)
+page 6001 200 https://fast.test/p/5
+dispatch 7000 m102 (WARM 1/4)
+page 7000 200 https://myfigurecollection.net/item/102
+dispatch 7001 f6 (WARM 1/4)
+page 7001 200 https://fast.test/p/6
+dispatch 8001 f7 (WARM 1/4)
+page 8001 200 https://fast.test/p/7
+dispatch 9001 f8 (WARM 1/4)
+page 9001 200 https://fast.test/p/8
+dispatch 10001 f9 (COLD 1/4)
+page 10001 200 https://fast.test/p/9
+dispatch 11001 f10 (COLD 1/4)
+page 11001 200 https://fast.test/p/10
+dispatch 14000 m301 (HOT 1/4)
+page 14000 200 https://myfigurecollection.net/item/301
+dispatch 20002 s2 (WARM 1/4)
+page 20002 200 https://www.slow.test/p/2
+dispatch 21000 m103 (WARM 1/4)
+page 21000 200 https://myfigurecollection.net/item/103
+dispatch 28000 m104 (WARM 1/4)
+page 28000 200 https://myfigurecollection.net/item/104
+dispatch 35000 m105 (WARM 1/4)
+page 35000 200 https://myfigurecollection.net/item/105
+dispatch 40002 s3 (WARM 1/4)
+page 40002 200 https://www.slow.test/p/3
+dispatch 42000 m203 (WARM 1/4)
+page 42000 200 https://myfigurecollection.net/item/203
+dispatch 49000 m106 (WARM 1/4)
+page 49000 200 https://myfigurecollection.net/item/106
+dispatch 56000 m107 (WARM 1/4)
+page 56000 500 https://myfigurecollection.net/item/107
+dispatch 60000 l1 (WARM 1/4)
+page 60000 200 https://late.test/x/1
+dispatch 63000 l2 (WARM 1/4)
+page 63000 200 https://late.test/x/2
+dispatch 63001 m108 (WARM 1/4)
+page 63001 200 https://myfigurecollection.net/item/108
+dispatch 65000 l3 (WARM 1/4)
+page 65000 500 https://late.test/x/3
+dispatch 67000 l4 (WARM 1/4)
+page 67000 200 https://late.test/x/4
+dispatch 69000 l3 (WARM 2/4)
+page 69000 200 https://late.test/x/3
+dispatch 70001 m109 (WARM 1/4)
+page 70001 200 https://myfigurecollection.net/item/109
+dispatch 71000 l5 (WARM 1/4)
+page 71000 200 https://late.test/x/5
+dispatch 73000 l6 (WARM 1/4)
+page 73000 200 https://late.test/x/6
+dispatch 77001 m110 (WARM 1/4)
+page 77001 500 https://myfigurecollection.net/item/110
+dispatch 84001 m111 (WARM 1/4)
+page 84001 200 https://myfigurecollection.net/item/111
+dispatch 90000 f11 (WARM 1/4)
+page 90000 200 https://fast.test/p/11
+dispatch 91001 f12 (WARM 1/4)
+page 91001 200 https://fast.test/p/12
+dispatch 91002 m112 (WARM 1/4)
+page 91002 200 https://myfigurecollection.net/item/112
+dispatch 98002 m120 (WARM 1/4)
+page 98002 200 https://www.myfigurecollection.net/item/120
+dispatch 105002 m107 (WARM 2/4)
+page 105002 200 https://myfigurecollection.net/item/107
+dispatch 112002 m110 (WARM 2/4)
+page 112002 500 https://myfigurecollection.net/item/110
+dispatch 119002 m110 (WARM 3/4)
+page 119002 200 https://myfigurecollection.net/item/110
+dispatch 126002 m201 (COLD 1/4)
+page 126002 200 https://myfigurecollection.net/item/201
+dispatch 133002 m303 (HOT 1/4)
+page 133002 200 https://myfigurecollection.net/item/303
+dispatch 140002 m202 (COLD 1/4)
+page 140002 200 https://myfigurecollection.net/item/202
+dispatch 147002 m204 (COLD 1/4)
+page 147002 200 https://myfigurecollection.net/item/204
+dispatch 154002 m121 (COLD 1/4)
+page 154002 200 https://MyFigureCollection.net/item/121
+final completed=41 failed=1 total=0 parked=0 store={"pending":0,"leased":0,"parked":0}

@@ -7,9 +7,13 @@
  *
  * `fetchBody` is implemented over the SAME transport-dispatching `capturingFetch` the primary
  * ingest fetch already uses (`engineServices/capturingFetch.ts`), given the store's OWN declared
- * `searchFetch` transport — so the follow-up's raw bytes still land in the capture sink under the
- * 'api' lane, same as the primary fetch. Cookies pass through (opts.cookies overrides the
- * context's own).
+ * `searchFetch` transport — so the follow-up's raw bytes land in the capture sink on the SAME lane
+ * as the primary fetch: 'api' for a store that declares an impersonate/http transport, but a
+ * full browser navigation captured as wire/dom for a store that declares none (measured on hpoi,
+ * 2026-09-22). The context's own cookies (the queue item's, engine-supplied) pass through to the
+ * lane as before; a ruleset cannot add any (`opts.cookies` is refused, contract 0.15.0). A POST
+ * (0.14.0) and request headers (0.15.0, `FETCH_BODY_ALLOWED_HEADERS` only) are validated here, before
+ * the courtesy wait, and ride only the http/impersonate lanes.
  *
  * COURTESY GAP (D8): before dispatching, `fetchBody` waits until `primaryFetchedAt +
  * baseDelayMs` has elapsed — but ONLY when the follow-up targets the SAME host as the primary
@@ -28,14 +32,17 @@
  * them through `ExtractContext.scraping` — a loud failure, not a silent no-op, if a future ruleset
  * assumes more surface than this context provides.
  */
-import type {
-  ExtractContext,
-  ScrapePageResult,
-  SearchFetch,
-  SiteConfig,
-  PluginLogger,
+import {
+  FETCH_BODY_ALLOWED_HEADERS,
+  type ExtractContext,
+  type FetchBodyOptions,
+  type ScrapePageResult,
+  type SearchFetch,
+  type SiteConfig,
+  type PluginLogger,
 } from '@figurecollecting/scraper-plugin-contract';
-import type { CapturingFetch } from './capturingFetch.js';
+import { DEFAULT_POST_CONTENT_TYPE, type CapturingFetch, type FetchRequest } from './capturingFetch.js';
+import { sanitizeForLog } from '../../utils/security.js';
 import type { EngineScrapePageOptions } from './scrapingService.js';
 import {
   getResidentialProxyUrl,
@@ -43,6 +50,8 @@ import {
   resolveBrowserLaneOptions,
   withoutDeclaredEgress,
 } from '../residentialEgress.js';
+import type { HostClock } from '../hostClock.js';
+import { sendOnHostClockOrThrow } from '../hostClockSend.js';
 
 /**
  * Default courtesy gap (ms) when a store profile declares no `rateLimit.baseDelayMs` — should be
@@ -73,7 +82,10 @@ export interface BuildExtractContextOptions {
   capturingFetch: CapturingFetch;
   /** The store's OWN declared search-fetch transport (undeclared → capturingFetch's browser default). */
   searchFetch: SearchFetch | undefined;
-  /** Cookies to pass through to `fetchBody`, unless a call overrides them via `opts.cookies`. */
+  /**
+   * The queue item's own cookies (engine-supplied), passed to the lane; a ruleset cannot add or
+   * override any (`opts.cookies` is refused, contract 0.15.0).
+   */
   cookies?: Record<string, string>;
   /** The URL the PRIMARY fetch (that produced `html`) was fetched from — for the same-host gate. */
   primaryUrl: string;
@@ -96,6 +108,11 @@ export interface BuildExtractContextOptions {
   sleep?: (ms: number) => Promise<void>;
   /** The engine's residential proxy (default: the process's RESIDENTIAL_PROXY_URL, resolved at boot). */
   residentialProxyUrl?: () => string | undefined;
+  /**
+   * The shared per-host clock (QB-U30b) fetchBody follow-ups book on (caller 'fetchBody'). Optional —
+   * defaults to the process clock (SCRAPE_HOST_CLOCK; off by default); tests inject one.
+   */
+  hostClock?: HostClock;
 }
 
 /** Lowercased, `www.`-stripped hostname; `undefined` on an unparseable URL (never throws). */
@@ -117,6 +134,87 @@ function notSupported(member: string): () => never {
       `[EXTRACT CONTEXT] ScrapingService.${member} is not available via ExtractContext — this context provides only ` +
         `scrapePage/scrapePageStealth (passthrough) and fetchBody (the extractMany same-store follow-up seam)`
     );
+  };
+}
+
+/** A ruleset's fetchBody options break the contract (a GET with a body, an unknown method, …). */
+export class FetchBodyRequestError extends Error {
+  constructor(url: string, reason: string) {
+    super(`[EXTRACT CONTEXT] fetchBody(${sanitizeForLog(url)}) refused: ${reason}`);
+    this.name = 'FetchBodyRequestError';
+  }
+}
+
+const ALLOWED_HEADERS: ReadonlySet<string> = new Set(FETCH_BODY_ALLOWED_HEADERS);
+
+/**
+ * A ruleset's `headers`, checked against the contract's allowlist and returned with lowercase names
+ * and RFC 9110 surrounding whitespace dropped; `undefined` when there are none. Every refusal lands
+ * before any request: the engine owns identity (UA, cookies, TLS profile) and framing headers.
+ */
+function toRequestHeaders(url: string, raw: unknown): Record<string, string> | undefined {
+  if (raw === undefined) return undefined;
+  // A plain object only: a Map or a WHATWG Headers has no own entries, so it would be dropped silently.
+  const proto: unknown = raw !== null && typeof raw === 'object' ? Object.getPrototypeOf(raw) : undefined;
+  if (proto !== Object.prototype && proto !== null) {
+    throw new FetchBodyRequestError(url, 'headers must be a plain object of header name to string value');
+  }
+  const headers: Record<string, string> = {};
+  for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (/[\r\n]/.test(name)) throw new FetchBodyRequestError(url, 'a header name contains CR or LF');
+    const lower = name.toLowerCase();
+    if (!ALLOWED_HEADERS.has(lower)) {
+      throw new FetchBodyRequestError(
+        url,
+        `header '${sanitizeForLog(name)}' is not one a ruleset may set (allowed: ${FETCH_BODY_ALLOWED_HEADERS.join(', ')}; ` +
+          'the engine owns identity and framing headers)',
+      );
+    }
+    if (typeof value !== 'string') throw new FetchBodyRequestError(url, `header '${lower}' value must be a string`);
+    if (/[\r\n]/.test(value)) throw new FetchBodyRequestError(url, `header '${lower}' value contains CR or LF`);
+    if (!/^[\t\x20-\x7e]*$/.test(value)) {
+      throw new FetchBodyRequestError(url, `header '${lower}' value must be printable ASCII`);
+    }
+    if (lower in headers) throw new FetchBodyRequestError(url, `header '${lower}' is given twice`);
+    // Empty after the OWS trim is refused: undici sends `name: ` while impit drops it, so the lanes would disagree.
+    const trimmed = value.replace(/^[\t ]+|[\t ]+$/g, '');
+    if (trimmed === '') throw new FetchBodyRequestError(url, `header '${lower}' value is empty`);
+    headers[lower] = trimmed;
+  }
+  return Object.keys(headers).length > 0 ? headers : undefined;
+}
+
+/**
+ * The contract's options as the lanes' request: `undefined` for a bare GET (the pre-0.14.0 call), a
+ * GET carrying the ruleset's headers, or the POST. Checked at runtime too, since a JS ruleset is not
+ * held to the contract's types.
+ */
+function toFetchRequest(url: string, opts: FetchBodyOptions | undefined): FetchRequest | undefined {
+  if (opts?.cookies !== undefined) {
+    throw new FetchBodyRequestError(url, 'cookies are not a fetchBody option: the engine owns the cookie jar (contract 0.15.0)');
+  }
+  const method: unknown = opts?.method;
+  const body: unknown = opts?.body;
+  const contentType: unknown = opts?.contentType;
+  const headers = toRequestHeaders(url, opts?.headers);
+  if (method === undefined || method === 'GET') {
+    if (body !== undefined || contentType !== undefined) {
+      throw new FetchBodyRequestError(url, 'a GET carries no body or contentType (send method POST)');
+    }
+    return headers ? { method: 'GET', headers } : undefined;
+  }
+  if (method !== 'POST') {
+    throw new FetchBodyRequestError(url, `method '${sanitizeForLog(String(method))}' is not supported (GET or POST)`);
+  }
+  if (body !== undefined && typeof body !== 'string') throw new FetchBodyRequestError(url, 'body must be a string');
+  if (contentType !== undefined && typeof contentType !== 'string') {
+    throw new FetchBodyRequestError(url, 'contentType must be a string');
+  }
+  return {
+    method: 'POST',
+    body: body ?? '',
+    contentType: contentType ?? DEFAULT_POST_CONTENT_TYPE,
+    ...(headers ? { headers } : {}),
   };
 }
 
@@ -158,6 +256,22 @@ export function buildExtractContext(options: BuildExtractContextOptions): Extrac
   // primary page fetch — otherwise only the FIRST follow-up ever waits, and every call after it
   // is gapped against a primaryFetchedAt that has long since elapsed. Seeded with the primary
   // fetch's own host/time so the first same-host follow-up's behaviour is unchanged.
+  /**
+   * A ruleset's in-extraction request to a store host (fetchBody, and the scrapePage /
+   * scrapePageStealth passthroughs) on the shared per-host clock as caller 'fetchBody' (QB-U30b): on a
+   * clocked host it waits for the host's next slot and runs the send block; a slot past the wait cap
+   * rejects with a HostClockRefusedError; any other host is sent at once, as before.
+   */
+  const onClock = <T>(url: string, send: () => Promise<T>): Promise<T> => {
+    const host = safeHostname(url);
+    if (host === undefined) return send();
+    return sendOnHostClockOrThrow({ host, caller: 'fetchBody' }, send, {
+      ...(options.hostClock ? { clock: options.hostClock } : {}),
+      now,
+      sleep,
+    });
+  };
+
   const lastFetchedAt = options.lastFetchedAt ?? new Map<string, number>();
   if (primaryHost !== undefined) {
     // Monotonic seed: never regress a SHARED map's entry (a sibling context may have touched the
@@ -174,13 +288,23 @@ export function buildExtractContext(options: BuildExtractContextOptions): Extrac
     scraping: {
       // `async` so an egress REFUSAL rejects the returned promise rather than throwing
       // synchronously out of a Promise-returning API (a ruleset's `.catch()` must be able to see it).
-      scrapePage: async (url, pageOptions) => options.scraping.scrapePage(url, withLaneOptions(url, pageOptions)),
-      scrapePageStealth: async (url, pageOptions) => options.scraping.scrapePageStealth(url, withLaneOptions(url, pageOptions)),
+      // The lane options are resolved (and a refusal thrown) BEFORE the host clock is asked, so a
+      // refused request never costs the host a slot.
+      scrapePage: async (url, pageOptions) => {
+        const lane = withLaneOptions(url, pageOptions);
+        return onClock(url, () => options.scraping.scrapePage(url, lane));
+      },
+      scrapePageStealth: async (url, pageOptions) => {
+        const lane = withLaneOptions(url, pageOptions);
+        return onClock(url, () => options.scraping.scrapePageStealth(url, lane));
+      },
       browserFetch: notSupported('browserFetch'),
       withBrowser: notSupported('withBrowser'),
       withPage: notSupported('withPage'),
 
       async fetchBody(url, fetchOpts) {
+        // Refused before the courtesy wait: a malformed request never costs the host a slot.
+        const request = toFetchRequest(url, fetchOpts);
         const targetHost = safeHostname(url);
         const last = targetHost !== undefined ? lastFetchedAt.get(targetHost) : undefined;
         if (last !== undefined) {
@@ -190,15 +314,27 @@ export function buildExtractContext(options: BuildExtractContextOptions): Extrac
             await sleep(remaining);
           }
         }
-        const cookies = fetchOpts?.cookies ?? options.cookies;
+        const cookies = options.cookies;
         // Same host scope as the page passthroughs: an off-store follow-up keeps the store's
         // transport/headers but never its residential exit.
         const searchFetch = onDeclaringStore(url) ? options.searchFetch : withoutDeclaredEgress(options.searchFetch);
-        const result = await options.capturingFetch(url, searchFetch, cookies ? { cookies } : {});
+        // THE HOST CLOCK (QB-U30b): after the courtesy gap, a follow-up to a clocked store host books
+        // the host's next slot on the shared clock and runs the send block, so it is spaced from the
+        // primary fetch and from every other caller of that host. A slot past the wait cap rejects with
+        // a HostClockRefusedError (nothing sent), which the ruleset's own error handling sees.
+        const result = await onClock(url, () =>
+          options.capturingFetch(url, searchFetch, {
+            ...(cookies ? { cookies } : {}),
+            ...(request ? { request } : {}),
+          }),
+        );
         if (targetHost !== undefined) {
           lastFetchedAt.set(targetHost, now());
         }
-        return result;
+        // The plugin contract names the HTTP status `statusCode`; the capturing fetch names it
+        // `status`. Rulesets written to the contract (hpoi's non-2xx gate, amiami's status notes)
+        // read `statusCode` and silently saw undefined. Carry both names.
+        return result.status === undefined ? result : { ...result, statusCode: result.status };
       },
     },
   };

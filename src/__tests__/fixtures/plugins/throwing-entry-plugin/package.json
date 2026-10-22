@@ -1,0 +1,6 @@
+{
+  "name": "throwing-entry-plugin",
+  "version": "4.0.0",
+  "main": "index.js",
+  "keywords": ["scraper-ruleset"]
+}

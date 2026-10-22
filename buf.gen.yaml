@@ -1,0 +1,14 @@
+# TypeScript via protoc-gen-es (node_modules/.bin, through `npm run proto:generate`).
+# The output in src/gen is COMMITTED: the image build compiles it with the rest of
+# src and needs no buf, a PR shows wire changes in its diff, and CI proves the
+# committed output matches the protos. `clean: true` wipes src/gen first, so a
+# file orphaned by a deleted proto shows up as a deletion.
+version: v2
+clean: true
+plugins:
+  - local: protoc-gen-es
+    out: src/gen
+    opt:
+      - target=ts
+      # src is ESM (NodeNext): relative imports need the .js extension.
+      - import_extension=js

@@ -332,4 +332,67 @@ describe('the optional id-range section', () => {
       expect(await createFileLedgerStore(DIR, f.fs).load('orzgk')).toBe('corrupt');
     }
   });
+  it('round-trips the KNOWN-GAP bands and the re-anchor stamp beside the cursor', async () => {
+    const f = makeFakeFs();
+    const doc = withRange({
+      cursor: 3724150,
+      frontier: 3801000,
+      reanchoredAt: '2026-09-18T04:00:00.000Z',
+      gaps: [
+        { from: 3765216, to: 3801000, next: 3765316, origin: 'reanchor', createdAt: '2026-09-18T04:00:00.000Z', updatedAt: '2026-09-18T05:00:00.000Z' },
+        { from: 100, to: 100, next: 101, origin: 'operator', createdAt: '2026-09-18T04:00:00.000Z', closedAt: '2026-09-18T05:00:00.000Z' },
+      ],
+    });
+    f.files.set(path.join(DIR, 'orzgk.json'), JSON.stringify(doc));
+    expect(await createFileLedgerStore(DIR, f.fs).load('orzgk')).toEqual(doc);
+  });
+
+  it("returns 'corrupt' on a malformed gap band — a bad band would be swept as real ids or silently dropped", async () => {
+    const ok = { from: 10, to: 20, next: 10, origin: 'reanchor', createdAt: '2026-09-18T04:00:00.000Z' };
+    for (const gaps of [
+      'x',
+      {},
+      [null],
+      [{ ...ok, from: 0 }],
+      [{ ...ok, from: '10' }],
+      [{ ...ok, to: 9 }],
+      [{ ...ok, next: 9 }],
+      [{ ...ok, next: 1.5 }],
+      [{ ...ok, origin: 'guess' }],
+      [{ ...ok, createdAt: 7 }],
+      [{ ...ok, updatedAt: 7 }],
+      [{ ...ok, closedAt: 7 }],
+      [{ ...ok, next: 22 }],
+      [{ from: 10, to: 20, next: 10, origin: 'reanchor' }],
+    ]) {
+      const f = makeFakeFs();
+      f.files.set(path.join(DIR, 'orzgk.json'), JSON.stringify(withRange({ cursor: 500, gaps })));
+      expect(await createFileLedgerStore(DIR, f.fs).load('orzgk')).toBe('corrupt');
+    }
+  });
+
+  it("returns 'corrupt' on a malformed re-anchor stamp — the cadence would otherwise fire every run", async () => {
+    for (const reanchoredAt of [7, true, {}]) {
+      const f = makeFakeFs();
+      f.files.set(path.join(DIR, 'orzgk.json'), JSON.stringify(withRange({ cursor: 500, reanchoredAt })));
+      expect(await createFileLedgerStore(DIR, f.fs).load('orzgk')).toBe('corrupt');
+    }
+  });
+
+  it('round-trips the sweptFrom marker on an entry: it is what keeps a swept id off the frontier next run', async () => {
+    const f = makeFakeFs();
+    const doc = {
+      ...sample(),
+      enqueued: { '9000000': { at: '2026-09-18T04:00:00.000Z', collectUrl: 'https://mfc.test/item/9000000', sweptFrom: 'operator' } },
+    };
+    f.files.set(path.join(DIR, 'orzgk.json'), JSON.stringify(doc));
+    expect(await createFileLedgerStore(DIR, f.fs).load('orzgk')).toEqual(doc);
+  });
+
+  it('accepts a band whose next is one past its top (swept, awaiting the close stamp)', async () => {
+    const f = makeFakeFs();
+    const doc = withRange({ cursor: 500, gaps: [{ from: 10, to: 20, next: 21, origin: 'operator', createdAt: '2026-09-18T04:00:00.000Z' }] });
+    f.files.set(path.join(DIR, 'orzgk.json'), JSON.stringify(doc));
+    expect(await createFileLedgerStore(DIR, f.fs).load('orzgk')).toEqual(doc);
+  });
 });

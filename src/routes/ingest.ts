@@ -1,7 +1,7 @@
 /**
  * Ingest trigger route — the HTTP surface for the queue's ingest path.
  *
- * POST /ingest/scrape {url} validates the URL, confirms the ingest path is
+ * POST /ingest/scrape {url, priority?} validates the URL, confirms the ingest path is
  * usable (emitter configured + a plugin ruleset matches), and enqueues the
  * URL into the scrape queue. Everything downstream — raw page fetch, plugin
  * extraction, spine emit, retry/failure semantics — is the queue's existing,
@@ -9,6 +9,10 @@
  *
  * The URL itself is the queue's dedup key: repeat triggers for the same URL
  * coalesce onto the pending item (deduplicated: true, same itemId).
+ *
+ * `priority` is optional: absent = the queue's default (WARM). `COLD` is for bulk
+ * backlogs that must never delay fresher work; `HOT` is refused (it means a
+ * cookie-bearing user import, which this route cannot carry).
  */
 
 import express, { type Router } from 'express';
@@ -24,7 +28,7 @@ export function createIngestRouter(getQueue: () => ScrapeQueue = getScrapeQueue)
   const router = express.Router();
 
   router.post('/ingest/scrape', (req, res) => {
-    const { url } = req.body ?? {};
+    const { url, priority } = req.body ?? {};
 
     if (!url || typeof url !== 'string') {
       return res.status(400).json({
@@ -39,6 +43,13 @@ export function createIngestRouter(getQueue: () => ScrapeQueue = getScrapeQueue)
       return res.status(400).json({
         success: false,
         message: 'Invalid URL format',
+      });
+    }
+
+    if (priority !== undefined && priority !== 'WARM' && priority !== 'COLD') {
+      return res.status(400).json({
+        success: false,
+        message: "priority must be 'WARM' or 'COLD' when present",
       });
     }
 
@@ -58,7 +69,7 @@ export function createIngestRouter(getQueue: () => ScrapeQueue = getScrapeQueue)
       });
     }
 
-    const result = queue.enqueue(url, { url });
+    const result = queue.enqueue(url, priority === undefined ? { url } : { url, priority });
 
     // result.id embeds the URL (it is the dedup key), so it is user-tainted
     // and must be sanitized wherever it is logged; position is a number.

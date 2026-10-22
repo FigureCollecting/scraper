@@ -17,18 +17,35 @@
 import { logger } from '../utils/logger.js';
 
 /**
- * Which phases one pass runs. `recent` / `backfill` / `both` are the listing-and-id-space feeder.
- * `seed` is a DIFFERENT, exclusive pass: ONLY the declared seed lists, and none of the other phases.
- * It is not a fourth phase bolted onto `both` because its whole justification is the bounded cost of
- * a small declared set — folding it into a walk would hide that cost inside an unbounded one.
+ * One phase a pass may run.
+ *
+ * `recent` / `backfill` are the listing-and-id-space DISCOVERY feeder (the id-range walk rides
+ * `backfill`). `reobserve` is the RE-OBSERVATION lane (D4, Ross 2026-09-18): it walks the ledger
+ * instead of the store's pages and re-drives ids we already know, so an exhausted store keeps a live
+ * price/availability series instead of freezing on the day it was walked. `seed` is a DIFFERENT,
+ * EXCLUSIVE pass: ONLY the declared seed lists, and none of the other phases — its whole
+ * justification is the bounded cost of a small declared set, and folding it into a walk would hide
+ * that cost inside an unbounded one.
  */
-export type CrawlerMode = 'recent' | 'backfill' | 'both' | 'seed';
+export type CrawlerPhaseName = 'recent' | 'backfill' | 'reobserve' | 'seed';
+
+/**
+ * What `CRAWLER_MODE` named: one of the legacy single tokens (`recent`, `backfill`, `both`, `seed`),
+ * the new `reobserve`, or a csv naming any subset of them (`both,reobserve`). `both` keeps meaning
+ * recent+backfill exactly as before.
+ */
+export type CrawlerMode = CrawlerPhaseName | 'both' | `${string},${string}`;
+
+/** The order phases run in, whatever order the operator named them. Discovery keeps its priority. */
+export const PHASE_ORDER: readonly CrawlerPhaseName[] = ['recent', 'backfill', 'reobserve'] as const;
 
 export interface CrawlerConfig {
   /** Base URL of the scraper's HTTP surface — the ONLY thing the crawler talks to. */
   scraperServiceUrl: string;
-  /** Which phases run: `recent`, `backfill`, `both` (recent THEN backfill, one process), or `seed` (the declared seed lists ONLY). */
+  /** What the operator named, normalised for the summary and the logs (`both` stays `both`). */
   mode: CrawlerMode;
+  /** The phases this pass ACTUALLY runs, deduplicated and in PHASE_ORDER; `['seed']` for the exclusive seed pass. */
+  phases: CrawlerPhaseName[];
   /** siteIds to crawl this pass. */
   stores: string[];
   /** Directory holding one `<siteId>.json` ledger per store (a PVC in the cluster). */
@@ -80,11 +97,122 @@ export interface CrawlerConfig {
    */
   rangeIdsPerRun: number;
   /**
+   * ID-RANGE DESCENT: per-store ceilings on the ids the DESCENT walks per run, from
+   * `CRAWLER_RANGE_DESCENT_CAPS` (`siteId:n`, the same csv shape as the other per-store caps). A cap only
+   * LOWERS `rangeIdsPerRun` for its store, and a store absent from it keeps `rangeIdsPerRun`. An explicit
+   * 0 turns that store's descent OFF and leaves its cursor, frontier and seed untouched, while its
+   * re-anchor, both gap sweeps and the lists step run as before and every other range store keeps
+   * walking (Ross QB-2, 2026-10-04: no blind id walking). loadCrawlerConfig always sets it; absent on a
+   * hand-built config = no caps.
+   */
+  rangeDescentCaps?: Record<string, number>;
+  /**
    * Seed frontiers per siteId, from `CRAWLER_RANGE_FRONTIER_<SITEID>`, used ONLY when the store's
    * ledger has no numeric itemId of its own to start from. `<SITEID>` is the siteId uppercased with
    * every non-alphanumeric character replaced by `_` (`good-smile` → `CRAWLER_RANGE_FRONTIER_GOOD_SMILE`).
    */
   rangeFrontiers: Record<string, number>;
+  /**
+   * RE-OBSERVE: an id is eligible only once its last observation is at least this old
+   * (`CRAWLER_REOBSERVE_MIN_AGE_H`, hours). It is also the BACKOFF window for an id whose last
+   * re-observation POST was refused: without it a permanently-refused id would sit at the head of
+   * the oldest-first queue every run and starve the store's whole lane.
+   */
+  reobserveMinAgeMs: number;
+  /**
+   * RE-OBSERVE: the global per-store ceiling on re-observation POSTs per run. DEFAULT 0 = the lane is
+   * OFF everywhere, so the fleet OPTS IN per store through `storeReobserveCaps`. Deliberately not the
+   * discovery default: re-observation spends real requests at a gated store, where browser time is
+   * the fleet's scarcest resource.
+   */
+  maxReobservePerStore: number;
+  /**
+   * RE-OBSERVE: per-store overrides of `maxReobservePerStore`, keyed by siteId — the same
+   * `siteId:cap` shape as `storeEnqueueCaps`, and a SEPARATE budget from it, so discovery can never
+   * be starved by re-observation nor re-observation by discovery.
+   */
+  storeReobserveCaps: Record<string, number>;
+  /** RE-OBSERVE: print the selection and enqueue NOTHING (no POST, no ledger stamp). */
+  reobserveDryRun: boolean;
+  /**
+   * ID-RANGE RE-ANCHOR (D5): how often the frontier is moved up to the newest id the ledger has seen,
+   * from `CRAWLER_RANGE_REANCHOR_H` (hours). 0 = re-anchor on EVERY run. The descent walks DOWN from a
+   * frontier frozen the day it began, so without this the ids the store adds above that frontier are
+   * seen only by whatever the Latest Additions tap happens to catch between two runs.
+   */
+  rangeReanchorMs: number;
+  /**
+   * RE-ANCHOR sanity bound, from `CRAWLER_RANGE_REANCHOR_MAX_DELTA`: a re-anchor that would move the
+   * frontier up by MORE than this many ids is refused with a WARN naming this knob. A jump that size is
+   * more likely a bad id in the ledger than new items; raise it for a frontier frozen a long time.
+   * 0 refuses every move.
+   */
+  rangeReanchorMaxDelta: number;
+  /**
+   * GAP SWEEP: the sweep's OWN per-run, per-store budget — at most this many ids touched AND at most
+   * this many ingest POSTs. DEFAULT 0 = the sweep is OFF, so a store fills gaps only once the fleet
+   * config asks it to. Deliberately SEPARATE from `maxEnqueuePerStore`: the descent must not be able
+   * to starve the sweep, nor the sweep the descent.
+   */
+  rangeGapBudget: number;
+  /**
+   * GAP SWEEP: operator-declared bands per siteId, from `CRAWLER_RANGE_GAPS` — a csv of
+   * `siteId:lo-hi` and `siteId:id` entries (a single id is a band of width 1). They are ADOPTED into
+   * the store's ledger once, beside the bands the re-anchor records for itself.
+   */
+  rangeGaps: Record<string, GapBandDecl[]>;
+  /** GAP SWEEP: print the open bands and their widths, and sweep NOTHING (no window GET, no POST). */
+  rangeGapDryRun: boolean;
+  /**
+   * LISTS: the UTC time-of-day window in which a rotating list group may be fetched, from
+   * `CRAWLER_LISTS_WINDOW_UTC` (`HH:MM-HH:MM`, may wrap midnight). null = no list is ever fetched.
+   * loadCrawlerConfig always sets the four `lists*` knobs; absent on a hand-built config = off / default.
+   */
+  listsWindow?: UtcWindow | null;
+  /** LISTS: one group is fetched at most once per this interval (`CRAWLER_LISTS_INTERVAL_H`, default 160 h). */
+  listsIntervalMs?: number;
+  /** LISTS: per-store drain budget (`CRAWLER_LISTS_DRAIN_CAPS`, `siteId:cap`). A store absent or at 0 runs no lists step. */
+  listsDrainCaps?: Record<string, number>;
+  /** LISTS: wait between two lists of one group (`CRAWLER_LISTS_SPACING_MS`), never below 10 s. */
+  listsSpacingMs?: number;
+  /**
+   * LISTS ALTERNATION (`CRAWLER_LISTS_ALTERNATE`, csv of siteIds; Ross MS 2026-10-04): for these stores a
+   * pass that starts inside the lists window fetches EITHER the Latest Additions tap OR one company-list
+   * group, never both; each window opens with a lists pass. Empty (the default) or absent = today's pass.
+   */
+  listsAlternate?: string[];
+  /**
+   * LISTS ALTERNATION RATIO (QB-U38; Ross MS-1 (c) 2026-10-07): an entry `siteId:lists:tap` of
+   * `CRAWLER_LISTS_ALTERNATE` runs `lists` lists passes then `tap` tap passes, repeating from the window's
+   * first pass (`mfc:2:1` = L L T L L T L). A store in `listsAlternate` with no entry here alternates 1:1.
+   */
+  listsAlternateRatios?: Record<string, ListsAlternationRatio>;
+  /**
+   * BACKFILL PAGE POOL (`CRAWLER_PAGE_POOL`, QB-U24): the stores whose backfill pass fetches its next pages in a
+   * POOL-SELECT order instead of cursor, cursor+1, ... — `'all'`, or a list of siteIds. Empty (the default) or
+   * absent = every store walks exactly as before. The recent read is never pooled.
+   */
+  pagePool?: 'all' | string[];
+  /**
+   * BACKFILL PAGE POOL: how many of the lowest unvisited pages one pass shuffles and fetches
+   * (`CRAWLER_PAGE_POOL_LOOKAHEAD`). Defaults to `backfillPagesPerRun` and is never larger: review 2 measured that
+   * wider shuffles lose coverage under listing drift (1.1-25.3 pp at 10-30). Absent = `backfillPagesPerRun`.
+   */
+  pagePoolLookahead?: number;
+  /** BACKFILL PAGE POOL: how long a visited mark above the cursor is trusted (`CRAWLER_PAGE_POOL_VISITED_TTL_H`, default 72 h). */
+  pagePoolVisitedTtlMs?: number;
+}
+
+/** A UTC time-of-day window in minutes after midnight; `endMin < startMin` means it wraps past midnight. */
+export interface UtcWindow {
+  startMin: number;
+  endMin: number;
+}
+
+/** One operator-declared gap band, before it is adopted into a store's ledger. */
+export interface GapBandDecl {
+  from: number;
+  to: number;
 }
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
@@ -96,6 +224,10 @@ const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
  * clamped HERE, once, with a WARN, rather than being truncated invisibly on the wire.
  */
 export const MAX_RANGE_IDS_PER_RUN = 200;
+
+
+/** Ross's guardrail for the rotating lists: two lists of one group are never fetched less than 10 s apart. */
+export const MIN_LISTS_SPACING_MS = 10_000;
 
 /** The first store armed for continuous collection (orzgk: Woo Store API, 100/page, newest-first). */
 export const DEFAULT_CRAWLER_STORES = ['orzgk'];
@@ -114,6 +246,14 @@ const DEFAULTS = {
   reobserveAfterMs: WEEK_MS,
   exhaustedRecheckMs: WEEK_MS,
   rangeIdsPerRun: 50,
+  reobserveMinAgeH: 12,
+  maxReobservePerStore: 0,
+  rangeReanchorH: 24,
+  rangeReanchorMaxDelta: 50000,
+  rangeGapBudget: 0,
+  listsIntervalH: 160,
+  listsSpacingMs: MIN_LISTS_SPACING_MS,
+  pagePoolVisitedTtlH: 72,
 };
 
 type Env = Record<string, string | undefined>;
@@ -148,12 +288,13 @@ const nonNegInt = (raw: string | undefined, fallback: number): number => {
 const SAFE_SITE_ID = /^[A-Za-z0-9_-]+$/;
 
 /**
- * Parse `CRAWLER_STORE_ENQUEUE_CAPS` — a csv of `siteId:cap` pairs. Every entry is validated on its
- * own: a malformed one is DROPPED with a WARN naming it, and the well-formed entries still apply, so
- * one typo can never silently unthrottle a store nor void the whole declaration. A repeated siteId
- * takes its LAST value.
+ * Parse a per-store cap var — `CRAWLER_STORE_ENQUEUE_CAPS`, `CRAWLER_STORE_REOBSERVE_CAPS` or
+ * `CRAWLER_RANGE_DESCENT_CAPS` — a csv
+ * of `siteId:cap` pairs. Every entry is validated on its own: a malformed one is DROPPED with a WARN
+ * naming it AND the var it came from, and the well-formed entries still apply, so one typo can never
+ * silently unthrottle a store nor void the whole declaration. A repeated siteId takes its LAST value.
  */
-const parseStoreCaps = (raw: string | undefined): Record<string, number> => {
+const parseStoreCaps = (raw: string | undefined, envName: string): Record<string, number> => {
   const out: Record<string, number> = {};
   for (const entry of csv(raw ?? '')) {
     const at = entry.indexOf(':');
@@ -161,10 +302,82 @@ const parseStoreCaps = (raw: string | undefined): Record<string, number> => {
     const capRaw = at === -1 ? '' : entry.slice(at + 1).trim();
     const cap = Number(capRaw);
     if (!SAFE_SITE_ID.test(siteId) || !/^\d+$/.test(capRaw) || !Number.isSafeInteger(cap)) {
-      logger.warn('[CRAWLER] CRAWLER_STORE_ENQUEUE_CAPS entry ignored (expected siteId:nonNegativeInteger)', { entry });
+      logger.warn(`[CRAWLER] ${envName} entry ignored (expected siteId:nonNegativeInteger)`, { entry });
       continue;
     }
     out[siteId] = cap;
+  }
+  return out;
+};
+
+/** How many lists passes, then how many tap passes, one alternation cycle runs (QB-U38). */
+export interface ListsAlternationRatio {
+  lists: number;
+  tap: number;
+}
+
+/** A side of an alternation ratio: a pass is hourly, so a run longer than a day is a typo, never a plan. */
+const MAX_ALTERNATION_RUN = 24;
+
+const alternationRun = (raw: string): number | null => {
+  const n = Number(raw);
+  return /^\d+$/.test(raw) && n >= 1 && n <= MAX_ALTERNATION_RUN ? n : null;
+};
+
+/**
+ * Parse `CRAWLER_LISTS_ALTERNATE`: a csv of `siteId` or `siteId:lists:tap`. The siteId must be a
+ * SAFE_SITE_ID, exactly like the per-store caps: a malformed one DROPS the entry with a WARN naming it and
+ * the var. A malformed ratio (not two integers 1-24) keeps the store at 1:1 with one WARN — a typo never
+ * turns the alternation off nor skews it. A repeated siteId keeps its first ratio, with a WARN when the
+ * repeat asks for a different one (a bare siteId counts as 1:1). Only a written ratio gets a ratio entry.
+ */
+const parseListsAlternate = (raw: string | undefined): { siteIds: string[]; ratios: Record<string, ListsAlternationRatio> } => {
+  const envName = 'CRAWLER_LISTS_ALTERNATE';
+  const siteIds: string[] = [];
+  const ratios: Record<string, ListsAlternationRatio> = {};
+  for (const entry of csv(raw ?? '')) {
+    const [siteId, ...parts] = entry.split(':');
+    if (!SAFE_SITE_ID.test(siteId)) {
+      logger.warn(`[CRAWLER] ${envName} entry ignored (expected a siteId, or siteId:lists:tap)`, { entry });
+      continue;
+    }
+    let ratio: ListsAlternationRatio | null = null;
+    if (parts.length > 0) {
+      const lists = alternationRun(parts[0]);
+      const tap = parts.length === 2 ? alternationRun(parts[1]) : null;
+      if (lists !== null && tap !== null) ratio = { lists, tap };
+      else logger.warn(`[CRAWLER] ${envName} ratio invalid (expected siteId:lists:tap, each 1-${MAX_ALTERNATION_RUN}) — the store alternates 1:1`, { entry });
+    }
+    if (siteIds.includes(siteId)) {
+      const kept = ratios[siteId] ?? { lists: 1, tap: 1 };
+      const asked = ratio ?? { lists: 1, tap: 1 };
+      if (kept.lists !== asked.lists || kept.tap !== asked.tap) {
+        logger.warn(`[CRAWLER] ${envName} repeats a siteId with a different ratio — the first is kept`, { entry });
+      }
+      continue;
+    }
+    siteIds.push(siteId);
+    if (ratio) ratios[siteId] = ratio;
+  }
+  return { siteIds, ratios };
+};
+
+/**
+ * Parse `CRAWLER_PAGE_POOL`: unset, empty or `off` = no store; `all` = every store; otherwise a csv of siteIds
+ * (each a SAFE_SITE_ID, kept once). A malformed entry, or the keyword `all` / `off` inside a list, is dropped
+ * with a WARN naming it, like every other per-store csv here: one typo never pools nor un-pools the fleet.
+ */
+const parsePagePool = (raw: string | undefined): 'all' | string[] => {
+  const keyword = (raw ?? '').trim().toLowerCase();
+  if (keyword === 'all') return 'all';
+  if (keyword === '' || keyword === 'off') return [];
+  const out: string[] = [];
+  for (const entry of csv(raw as string)) {
+    if (!SAFE_SITE_ID.test(entry) || ['all', 'off'].includes(entry.toLowerCase())) {
+      logger.warn('[CRAWLER] CRAWLER_PAGE_POOL entry ignored (expected `all`, `off`, or a csv of siteIds)', { entry });
+      continue;
+    }
+    if (!out.includes(entry)) out.push(entry);
   }
   return out;
 };
@@ -185,6 +398,32 @@ const parseFrontiers = (env: Env, stores: string[]): Record<string, number> => {
   return out;
 };
 
+/**
+ * Parse `CRAWLER_RANGE_GAPS` — a csv of `siteId:lo-hi` (a cluster range) or `siteId:id` (one id, a band
+ * of width 1). Ross's ask was "several ids or cluster ranges to track", and one shape serves both.
+ *
+ * Every entry is validated on its own and a malformed one is DROPPED with a WARN naming it, exactly
+ * like the per-store caps: a typo in one band must not void the operator's other declarations, and a
+ * band silently coerced from a typo would be swept as though those were real ids.
+ */
+const parseRangeGaps = (raw: string | undefined): Record<string, GapBandDecl[]> => {
+  const out: Record<string, GapBandDecl[]> = {};
+  for (const entry of csv(raw ?? '')) {
+    const at = entry.indexOf(':');
+    const siteId = at === -1 ? '' : entry.slice(0, at).trim();
+    const bandRaw = at === -1 ? '' : entry.slice(at + 1).trim();
+    const m = /^(\d+)(?:-(\d+))?$/.exec(bandRaw);
+    const from = m ? Number(m[1]) : Number.NaN;
+    const to = m ? (m[2] === undefined ? from : Number(m[2])) : Number.NaN;
+    if (!SAFE_SITE_ID.test(siteId) || !m || !Number.isSafeInteger(from) || !Number.isSafeInteger(to) || from < 1 || to < from) {
+      logger.warn('[CRAWLER] CRAWLER_RANGE_GAPS entry ignored (expected siteId:lowId-highId or siteId:id)', { entry });
+      continue;
+    }
+    (out[siteId] ??= []).push({ from, to });
+  }
+  return out;
+};
+
 /** Positive int, clamped to `max` with a WARN naming the env var when the operator asked for more. */
 const clampedPosInt = (raw: string | undefined, fallback: number, max: number, envName: string): number => {
   const n = posInt(raw, fallback);
@@ -193,27 +432,129 @@ const clampedPosInt = (raw: string | undefined, fallback: number, max: number, e
   return max;
 };
 
-const parseMode = (raw: string | undefined): CrawlerMode =>
-  raw === 'recent' || raw === 'backfill' || raw === 'seed' ? raw : 'both';
+/**
+ * `CRAWLER_LISTS_WINDOW_UTC` = `HH:MM-HH:MM` UTC, start inclusive, end exclusive, may wrap midnight.
+ * Unreadable or zero-width = null (no list fetched) with a WARN: it gates a barred space, so it fails closed.
+ */
+const parseUtcWindow = (raw: string | undefined): UtcWindow | null => {
+  const value = (raw ?? '').trim();
+  if (value === '') return null;
+  const m = /^(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})$/.exec(value);
+  const toMin = (h: string, mm: string): number => (Number(h) <= 23 && Number(mm) <= 59 ? Number(h) * 60 + Number(mm) : Number.NaN);
+  const startMin = m ? toMin(m[1], m[2]) : Number.NaN;
+  const endMin = m ? toMin(m[3], m[4]) : Number.NaN;
+  if (!Number.isFinite(startMin) || !Number.isFinite(endMin) || startMin === endMin) {
+    logger.warn('[CRAWLER] CRAWLER_LISTS_WINDOW_UTC ignored (expected HH:MM-HH:MM UTC of non-zero width) — no list will be fetched', { value: raw });
+    return null;
+  }
+  return { startMin, endMin };
+};
 
-export function loadCrawlerConfig(env: Env = process.env): CrawlerConfig {
+/** A spacing knob with a floor: below it (0 included) is raised to the floor with a WARN naming the var. */
+const flooredNonNegInt = (raw: string | undefined, fallback: number, floor: number, envName: string): number => {
+  const n = nonNegInt(raw, fallback);
+  if (n >= floor) return n;
+  logger.warn(`[CRAWLER] ${envName} raised to its floor`, { requested: n, applied: floor });
+  return floor;
+};
+
+const PHASE_TOKENS = new Set<string>(['recent', 'backfill', 'reobserve', 'seed']);
+
+/** What `CRAWLER_MODE` accepts, for the error message an operator will read at 01:30Z. */
+const ACCEPTED_MODE = 'recent, backfill, both, seed, reobserve (csv for a subset, e.g. "both,reobserve")';
+
+/**
+ * Parse `CRAWLER_MODE` into the phases that will run.
+ *
+ * The var grew from ONE token into a csv naming any SUBSET, so the re-observation lane can be armed
+ * beside discovery (`both,reobserve`) or run alone (`reobserve`). Every legacy value keeps its exact
+ * meaning: `both`, and the unset or empty var, is recent+backfill.
+ *
+ * FAIL-CLOSED on a typo. An unrecognised token THROWS, naming the token and the accepted grammar,
+ * because the alternative is what this var used to do: `both,reobserv` warned once into an hourly log
+ * and then ran discovery-only, so the lane an operator believed they had armed simply did not exist
+ * and the only other tell was a summary field nobody was reading. A CronJob that dies at config time
+ * is loud, hourly, and harmless (`backoffLimit: 0`, no restart storm).
+ *
+ * What is NOT a typo, and must never be fatal: an ABSENT or EMPTY value (a blank or templated-away
+ * env var must still run the default pass rather than fail every hour), and duplicates or whitespace,
+ * which are normalised.
+ *
+ * `seed` stays EXCLUSIVE. Named alone it is the seed pass, unchanged; named ALONGSIDE another phase
+ * it is DROPPED with a WARN rather than silently voiding the walk the operator also asked for — a
+ * bounded declared poll whose whole point is a knowable cost must not be folded into an unbounded one.
+ * It is a WARN and not a throw because every token there is one we recognise: the operator asked for
+ * two things that cannot both happen, not for something we cannot read.
+ */
+export const phasesForMode = (raw: string | undefined): CrawlerPhaseName[] => {
+  const tokens = csv(raw ?? '');
+  const named = new Set<CrawlerPhaseName>();
+  for (const token of tokens) {
+    if (token === 'both') {
+      named.add('recent');
+      named.add('backfill');
+      continue;
+    }
+    if (!PHASE_TOKENS.has(token)) {
+      throw new Error(`CRAWLER_MODE names an unknown phase ${JSON.stringify(token)} — accepted: ${ACCEPTED_MODE}`);
+    }
+    named.add(token as CrawlerPhaseName);
+  }
+  if (named.has('seed')) {
+    if (named.size === 1) return ['seed'];
+    named.delete('seed');
+    logger.warn('[CRAWLER] CRAWLER_MODE names `seed` alongside other phases — seed is an EXCLUSIVE pass and was dropped', { mode: raw });
+  }
+  const phases = PHASE_ORDER.filter((p) => named.has(p));
+  // No tokens at all (unset, empty, whitespace, or only separators) is the DEFAULT, never a failure.
+  return phases.length > 0 ? phases : ['recent', 'backfill'];
+};
+
+/** The phase set as ONE label for the summary and the logs: recent+backfill keeps reading `both`. */
+const labelPhases = (phases: CrawlerPhaseName[]): CrawlerMode =>
+  phases.length === 2 && phases[0] === 'recent' && phases[1] === 'backfill' ? 'both' : (phases.join(',') as CrawlerMode);
+
+/** A boolean knob: `1` / `true` / `yes` / `on` (case-insensitive) is ON; anything else is OFF. */
+const boolFlag = (raw: string | undefined): boolean => ['1', 'true', 'yes', 'on'].includes((raw ?? '').trim().toLowerCase());
+
+/**
+ * `argv` is read for ONE flag: `--dry-run`, the same switch as CRAWLER_REOBSERVE_DRY_RUN. A CronJob
+ * operator reaches for a command-line flag when trying a store out by hand (`kubectl create job
+ * --from=cronjob/ingest-crawler … -- node dist/crawler/run.js --dry-run`) and for an env var when
+ * arming it in the manifest; both must reach the same knob.
+ */
+export function loadCrawlerConfig(env: Env = process.env, argv: string[] = process.argv): CrawlerConfig {
   // A csv var is defaulted ONLY when unset. An explicitly-set-but-empty value is
   // honored as an empty list — the operator's kill switch (zero stores → no work).
   const stores = env.CRAWLER_STORES === undefined ? [...DEFAULT_CRAWLER_STORES] : csv(env.CRAWLER_STORES);
+  const phases = phasesForMode(env.CRAWLER_MODE);
+  // CRAWLER_DRY_RUN (and `--dry-run`) is accepted as an ALIAS for the OPT-IN lanes' dry runs — the
+  // re-observation lane and the id-range gap sweep — and warns about its scope. The DISCOVERY phases
+  // have their own dry run (an enqueue cap of 0 — pages are fetched, nothing is POSTed), and a name
+  // that promised a whole-pass dry run while discovery still POSTed would be the worst kind of safety
+  // knob. Gating only ONE of the two opt-in lanes would be the second worst: an operator arming the
+  // sweep with `--dry-run` would watch the re-observation selection print while the sweep enqueued.
+  const aliasDryRun = boolFlag(env.CRAWLER_DRY_RUN);
+  if (aliasDryRun) {
+    logger.warn('[CRAWLER] CRAWLER_DRY_RUN gates the RE-OBSERVATION lane and the id-range GAP SWEEP — discovery still enqueues (use CRAWLER_MAX_ENQUEUE_PER_STORE=0 for that)');
+  }
 
   const scraperServiceUrl = (env.SCRAPER_SERVICE_URL || DEFAULTS.scraperServiceUrl).replace(/\/+$/, '');
+  const backfillPagesPerRun = posInt(env.CRAWLER_BACKFILL_PAGES_PER_RUN, DEFAULTS.backfillPagesPerRun);
   const ledgerDir = (env.CRAWLER_LEDGER_DIR ?? '').trim() || DEFAULTS.ledgerDir;
+  const listsAlternate = parseListsAlternate(env.CRAWLER_LISTS_ALTERNATE);
 
   return {
     scraperServiceUrl,
-    mode: parseMode(env.CRAWLER_MODE),
+    mode: labelPhases(phases),
+    phases,
     stores,
     ledgerDir,
     recentMaxPages: posInt(env.CRAWLER_RECENT_MAX_PAGES, DEFAULTS.recentMaxPages),
-    backfillPagesPerRun: posInt(env.CRAWLER_BACKFILL_PAGES_PER_RUN, DEFAULTS.backfillPagesPerRun),
+    backfillPagesPerRun,
     maxRequests: nonNegInt(env.CRAWLER_MAX_REQUESTS, DEFAULTS.maxRequests),
     maxEnqueuePerStore: nonNegInt(env.CRAWLER_MAX_ENQUEUE_PER_STORE, DEFAULTS.maxEnqueuePerStore),
-    storeEnqueueCaps: parseStoreCaps(env.CRAWLER_STORE_ENQUEUE_CAPS),
+    storeEnqueueCaps: parseStoreCaps(env.CRAWLER_STORE_ENQUEUE_CAPS, 'CRAWLER_STORE_ENQUEUE_CAPS'),
     maxConcurrency: posInt(env.CRAWLER_MAX_CONCURRENCY, DEFAULTS.maxConcurrency),
     requestSpacingMs: posInt(env.CRAWLER_REQUEST_SPACING_MS, DEFAULTS.requestSpacingMs),
     requestTimeoutMs: posInt(env.CRAWLER_REQUEST_TIMEOUT_MS, DEFAULTS.requestTimeoutMs),
@@ -224,6 +565,39 @@ export function loadCrawlerConfig(env: Env = process.env): CrawlerConfig {
     exhaustedRecheckMs: posInt(env.CRAWLER_EXHAUSTED_RECHECK_MS, DEFAULTS.exhaustedRecheckMs),
     rangeStores: csv(env.CRAWLER_RANGE_STORES ?? ''),
     rangeIdsPerRun: clampedPosInt(env.CRAWLER_RANGE_IDS_PER_RUN, DEFAULTS.rangeIdsPerRun, MAX_RANGE_IDS_PER_RUN, 'CRAWLER_RANGE_IDS_PER_RUN'),
+    rangeDescentCaps: parseStoreCaps(env.CRAWLER_RANGE_DESCENT_CAPS, 'CRAWLER_RANGE_DESCENT_CAPS'),
     rangeFrontiers: parseFrontiers(env, stores),
+    // Hours, not ms: the operator reasons about this window in hours ("re-price nothing twice in a
+    // shift"), and an explicit 0 is honoured — it means "age is no bar", not "revert to 12 h".
+    reobserveMinAgeMs: nonNegInt(env.CRAWLER_REOBSERVE_MIN_AGE_H, DEFAULTS.reobserveMinAgeH) * 60 * 60 * 1000,
+    maxReobservePerStore: nonNegInt(env.CRAWLER_MAX_REOBSERVE_PER_STORE, DEFAULTS.maxReobservePerStore),
+    storeReobserveCaps: parseStoreCaps(env.CRAWLER_STORE_REOBSERVE_CAPS, 'CRAWLER_STORE_REOBSERVE_CAPS'),
+    reobserveDryRun: boolFlag(env.CRAWLER_REOBSERVE_DRY_RUN) || aliasDryRun || argv.includes('--dry-run'),
+    // Hours, like the re-observe window and for the same reason: the operator reasons about this
+    // cadence in hours ("once a day"), and an explicit 0 is honoured as "every run" rather than
+    // reverting to a day — a cadence knob must not fail SLOW at its most eager setting.
+    rangeReanchorMs: nonNegInt(env.CRAWLER_RANGE_REANCHOR_H, DEFAULTS.rangeReanchorH) * 60 * 60 * 1000,
+    // nonNegInt: an explicit 0 is the bound at its tightest (refuse every move), never the default.
+    rangeReanchorMaxDelta: nonNegInt(env.CRAWLER_RANGE_REANCHOR_MAX_DELTA, DEFAULTS.rangeReanchorMaxDelta),
+    rangeGapBudget: nonNegInt(env.CRAWLER_RANGE_GAP_BUDGET, DEFAULTS.rangeGapBudget),
+    rangeGaps: parseRangeGaps(env.CRAWLER_RANGE_GAPS),
+    rangeGapDryRun: boolFlag(env.CRAWLER_RANGE_GAP_DRY_RUN) || aliasDryRun || argv.includes('--dry-run'),
+    listsWindow: parseUtcWindow(env.CRAWLER_LISTS_WINDOW_UTC),
+    // posInt: 0 would re-poll the first group every pass, so it keeps the default rather than failing open.
+    listsIntervalMs: posInt(env.CRAWLER_LISTS_INTERVAL_H, DEFAULTS.listsIntervalH) * 60 * 60 * 1000,
+    listsDrainCaps: parseStoreCaps(env.CRAWLER_LISTS_DRAIN_CAPS, 'CRAWLER_LISTS_DRAIN_CAPS'),
+    listsSpacingMs: flooredNonNegInt(env.CRAWLER_LISTS_SPACING_MS, DEFAULTS.listsSpacingMs, MIN_LISTS_SPACING_MS, 'CRAWLER_LISTS_SPACING_MS'),
+    listsAlternate: listsAlternate.siteIds,
+    listsAlternateRatios: listsAlternate.ratios,
+    pagePool: parsePagePool(env.CRAWLER_PAGE_POOL),
+    // Never wider than one pass's pages: a wider shuffle is the variant review 2 measured losing coverage.
+    pagePoolLookahead: (() => {
+      const n = posInt(env.CRAWLER_PAGE_POOL_LOOKAHEAD, backfillPagesPerRun);
+      if (n <= backfillPagesPerRun) return n;
+      logger.warn('[CRAWLER] CRAWLER_PAGE_POOL_LOOKAHEAD lowered to CRAWLER_BACKFILL_PAGES_PER_RUN (a wider shuffle loses coverage)', { requested: n, applied: backfillPagesPerRun });
+      return backfillPagesPerRun;
+    })(),
+    // posInt: 0 would distrust every mark at once, so it keeps the default rather than re-walking every pass.
+    pagePoolVisitedTtlMs: posInt(env.CRAWLER_PAGE_POOL_VISITED_TTL_H, DEFAULTS.pagePoolVisitedTtlH) * 60 * 60 * 1000,
   };
 }

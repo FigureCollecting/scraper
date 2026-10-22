@@ -14,6 +14,7 @@
  * fault, and it is classified by the queue exactly as it is for the string lanes.
  */
 
+import { createHash } from 'node:crypto';
 import { DEFAULT_PROFILE } from '../impitFetch.js';
 
 /** Why an image fetch did not yield bytes. */
@@ -29,7 +30,9 @@ export type ImageBytesFailureReason =
   /** The body is larger than the image size cap — refused before, or abandoned after, the read. */
   | 'too-large'
   /** Refused before the network: a denied host, or residential egress on a lane that cannot proxy. */
-  | 'refused';
+  | 'refused'
+  /** A valid image whose sha256 the host's policy lists as a placeholder served in place of the plate. */
+  | 'display-gated';
 
 /** Response headers kept alongside the bytes — provenance only, never a cookie or an auth header. */
 export const CAPTURED_IMAGE_HEADERS = [
@@ -66,6 +69,8 @@ export interface ImageBytesOk {
   finalUrl: string;
   /** {@link CAPTURED_IMAGE_HEADERS} that were present, lowercased. */
   headers: Record<string, string>;
+  /** The response re-issued the policy's session cookie with a new value (see {@link sessionCookieReissued}). */
+  sessionReissued?: true;
 }
 
 export interface ImageBytesFailure {
@@ -93,6 +98,8 @@ export interface ImageBytesFailure {
    * refused before the network. Nothing was spent, so nothing is claimed.
    */
   bytesRead?: number;
+  /** The response re-issued the policy's session cookie with a new value (see {@link sessionCookieReissued}). */
+  sessionReissued?: true;
 }
 
 export type ImageBytesResult = ImageBytesOk | ImageBytesFailure;
@@ -130,6 +137,10 @@ export interface ImageFetchOptions {
    * by the lanes themselves and needs no guard.
    */
   allowFinalUrl?: (finalUrl: string) => boolean;
+  /** The image host's listed placeholder bodies, `{sha256 hex: label}`; a match is refused as `display-gated`. */
+  placeholders?: Readonly<Record<string, string>>;
+  /** The host's login-session cookie; a response setting it to a new value is flagged `sessionReissued`. */
+  sessionCookie?: string;
 }
 
 /**
@@ -343,4 +354,64 @@ export function isTimeoutError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
   if (err.name === 'TimeoutError' || err.name === 'AbortError') return true;
   return /\btimed out\b|\btimeout\b/i.test(err.message);
+}
+
+/** Lowercase hex sha256 of a body — the key form of a policy's `placeholders`. */
+export function sha256Hex(bytes: Buffer): string {
+  return createHash('sha256').update(bytes).digest('hex');
+}
+
+/**
+ * The refusal for a body the host lists as a placeholder, else undefined. Runs after classification:
+ * a placeholder is a valid image, so only its exact bytes can tell it from a plate.
+ */
+export function placeholderRefusal(
+  bytes: Buffer,
+  placeholders: Readonly<Record<string, string>> | undefined,
+  status?: number,
+): ImageBytesFailure | undefined {
+  if (!placeholders) return undefined;
+  const digest = sha256Hex(bytes);
+  const label = placeholders[digest];
+  if (label === undefined) return undefined;
+  return {
+    ok: false,
+    reason: 'display-gated',
+    ...(status !== undefined ? { status } : {}),
+    bytesRead: bytes.byteLength,
+    detail: `${label}: body sha256 ${digest} is a listed placeholder`,
+  };
+}
+
+/**
+ * Whether any Set-Cookie line sets `name` to a value other than `storedValue`. A logged-in response
+ * leaves the session alone; a server that did not recognise it issues a new one. Values are compared
+ * here and never returned, so no cookie value leaves the lane.
+ */
+export function sessionCookieReissued(setCookies: readonly string[], name: string | undefined, storedValue: string | undefined): boolean {
+  if (!name) return false;
+  for (const line of setCookies) {
+    const pair = line.split(';', 1)[0];
+    const eq = pair.indexOf('=');
+    if (eq < 0) continue;
+    if (pair.slice(0, eq).trim() !== name) continue;
+    if (pair.slice(eq + 1).trim() !== storedValue) return true;
+  }
+  return false;
+}
+
+/**
+ * Split a Set-Cookie header joined into one string: Chrome joins with newlines, fetch's `get()` with
+ * commas — a comma is taken as a separator only where a new `name=` follows, since `Expires` has one.
+ */
+export function splitSetCookieHeader(joined: string): string[] {
+  return joined
+    .split(/\n|,(?=\s*[!#$%&'*+\-.^_`|~0-9A-Za-z]+=)/)
+    .map(part => part.trim())
+    .filter(part => part !== '');
+}
+
+/** The result with the session flag set when the response re-issued the session cookie. */
+export function withSessionFlag<T extends ImageBytesResult>(result: T, reissued: boolean): T {
+  return reissued ? { ...result, sessionReissued: true } : result;
 }

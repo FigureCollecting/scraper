@@ -176,6 +176,11 @@ export interface ImageCaptureSkipCounts {
    * is broken". The url is deliberately NOT memoized, so the next pass tries again.
    */
   sinkQueueFull: number;
+  /**
+   * A valid image the host's policy lists as a PLACEHOLDER served in place of the plate (mfc's
+   * anonymous "NSFW" tile). Never stored; also counted in `failed` and filed in the ledger.
+   */
+  displayGated: number;
 }
 
 export interface ImageCaptureStats {
@@ -248,6 +253,11 @@ export interface ImageCaptureHookDeps {
    * the stored object's own metadata names only the first item, so nothing else can add its depiction.
    */
   reportCapture?: ReportStoredCapture;
+  /**
+   * A `loginGated` image host answered as if logged out: a listed placeholder, or a re-issued
+   * session cookie. Absent ⇒ not signalled. Must not throw; a throw is swallowed.
+   */
+  onSessionLost?: (imageUrl: string, lane: ImageLane, reason: string, sessionCookie?: string) => void;
   /** Whether the lane runs. Default true — the composition root owns both halves of that answer. */
   enabled?: boolean;
   /** Why it does not, published on the health view. Ignored when `enabled` is not false. */
@@ -281,6 +291,13 @@ function storeHostOf(pageUrl: string): string {
 }
 
 /**
+ * The ledger class a `display-gated` failure is filed under. The spine's `fetch_failure_reason`
+ * (migration 0020) has no `display_gated` label and rejects unknown wire values, so it rides the
+ * closest existing gated class, with `display_gated: …` as the message.
+ */
+export const DISPLAY_GATED_LEDGER_CLASS: FetchReasonClass = 'http_403';
+
+/**
  * The ledger's reason class for a failed image fetch. Named by what the STORE said, so an image row
  * reads the same way a record row does: a 404 is a gone item, not a parse problem of ours.
  *
@@ -291,6 +308,8 @@ function reasonClassFor(failure: ImageBytesFailure): FetchReasonClass {
   switch (failure.reason) {
     case 'timeout':
       return 'timeout';
+    case 'display-gated':
+      return DISPLAY_GATED_LEDGER_CLASS;
     case 'http-status':
       if (failure.status === 404) return 'gone_404';
       if (failure.status === 410) return 'gone_410';
@@ -333,6 +352,7 @@ export function createImageCaptureHook(deps: ImageCaptureHookDeps): ImageCapture
     unsupported: 0,
     inFlight: 0,
     sinkQueueFull: 0,
+    displayGated: 0,
   };
   const lastLoggedByHost = new Map<string, number>();
   const inFlight = new Set<Promise<void>>();
@@ -451,6 +471,8 @@ export function createImageCaptureHook(deps: ImageCaptureHookDeps): ImageCapture
       ...(decision.accept !== undefined ? { accept: decision.accept } : {}),
       ...(userAgent !== undefined ? { userAgent } : {}),
       ...(proxyUrl !== undefined ? { proxyUrl } : {}),
+      ...(decision.placeholders !== undefined ? { placeholders: decision.placeholders } : {}),
+      ...(decision.sessionCookie !== undefined ? { sessionCookie: decision.sessionCookie } : {}),
       // Re-assert on what the bytes ACTUALLY came from: the lane decision only ever saw the
       // requested url, and a redirect can land on a banned host, or carry a residential fetch off
       // the store that declared the exit.
@@ -485,6 +507,24 @@ export function createImageCaptureHook(deps: ImageCaptureHookDeps): ImageCapture
       gate.release();
     }
 
+    // SESSION LOST, on a login-gated host only: the placeholder is what a logged-out session gets,
+    // and a re-issued session cookie is the server starting a new one.
+    if (decision.loginGated) {
+      const gated = !result.ok && (result as ImageBytesFailure).reason === 'display-gated';
+      if (gated || result.sessionReissued) {
+        try {
+          deps.onSessionLost?.(
+            url,
+            decision.lane,
+            gated ? 'placeholder body on a login-gated host' : 'session cookie re-issued on an image response',
+            decision.sessionCookie,
+          );
+        } catch {
+          /* a signal is bookkeeping; it must not cost the capture */
+        }
+      }
+    }
+
     if (!result.ok) {
       const failure = result as ImageBytesFailure;
       // BOOK FIRST, whatever the verdict. The home line carried these bytes; that the lane then
@@ -505,6 +545,8 @@ export function createImageCaptureHook(deps: ImageCaptureHookDeps): ImageCapture
         skipped.tooLarge += 1;
         return;
       }
+      // A placeholder is filed (the host withheld the plate) but counted under its own name too.
+      if (failure.reason === 'display-gated') skipped.displayGated += 1;
       // OURS, not theirs. 'refused' is this engine declining the bytes (a cooling host, a redirect
       // off the declaring store, a residential fetch with no proxy) and 'unsupported' is this
       // BUILD's lane being unable to carry them. Neither is anything the store did, so neither is

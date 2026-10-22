@@ -39,7 +39,7 @@ jest.mock('../../services/webhookClient', () => ({
   notifyItemSkipped: jest.fn().mockResolvedValue(true),
 }));
 
-import type { ExtractionRuleset, ExtractedData, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
+import type { ExtractContext, ExtractionRuleset, ExtractedData, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
 import { ScrapeQueue, resetScrapeQueue } from '../../services/scrapeQueue';
 import { ChallengeCooldown, resetChallengeCooldown } from '../../services/challengeCooldown';
 import { createExtractionRegistry, ExtractionRegistryImpl } from '../../services/extractionRegistry';
@@ -76,6 +76,21 @@ function recordFor(url: string): ExtractedData {
 function ruleset(extract: (html: string, url: string) => ExtractedData = (_h, url) => recordFor(url)): ExtractionRuleset {
   return { siteId: SITE, version: '1.0.0', extract, validate: () => ({ valid: true, errors: [], warnings: [] }) };
 }
+
+/** recordFor, reached the amiami way: one follow-up through ctx.scraping.fetchBody (`<url>/api`) first (NAME-ERRPAGE-1). */
+function recoveringRuleset(): ExtractionRuleset {
+  return {
+    ...ruleset(),
+    async extractAsync(_html: string, url: string, ctx?: ExtractContext) {
+      await ctx!.scraping.fetchBody!(`${url}/api`);
+      return recordFor(url);
+    },
+  } as ExtractionRuleset;
+}
+
+/** The http lane: a challenge for the item page, a real JSON body for its `/api` follow-up. */
+const challengeThenApi = () =>
+  jest.fn((u: string) => Promise.resolve(u.endsWith('/api') ? { body: '{"item":{"name":"Lucy"}}', status: 200 } : CHALLENGE_HTML));
 
 function makeRegistry(rs: ExtractionRuleset, searchFetch?: StoreCapabilities['searchFetch'], domain = HOST): ExtractionRegistryImpl {
   const registry = createExtractionRegistry();
@@ -172,10 +187,11 @@ describe('ScrapeQueue × stored-cookie stale / fresh signals', () => {
   }
 
   it('(1) honesty gate: a challenge that persisted nothing on a host WITH stored cookies → markStale ONCE (lane http), still one fetch + ChallengePageError + cooldown', async () => {
-    const http = jest.fn().mockResolvedValue(CHALLENGE_HTML);
+    // the ruleset's follow-up answered, so the record is emitted and the honesty gate (not the pre-emit door) decides
+    const http = challengeThenApi();
     const send = jest.fn().mockResolvedValue(emptyStats());
     const store = fakeStore([HOST]);
-    queue = buildQueue({ http, send, store });
+    queue = buildQueue({ ruleset: recoveringRuleset(), http, send, store });
 
     const url = `https://${HOST}/product/1`;
     const result = queue.enqueue(url, { url });
@@ -186,8 +202,8 @@ describe('ScrapeQueue × stored-cookie stale / fresh signals', () => {
     expect(store.markStale).toHaveBeenCalledTimes(1);
     expect(store.markStale).toHaveBeenCalledWith(HOST, 'http', 'challenge page via http transport');
     expect(store.markFresh).not.toHaveBeenCalled();
-    // storm protection UNCHANGED: one fetch, one-shot typed failure, cooldown open
-    expect(http).toHaveBeenCalledTimes(1);
+    // storm protection UNCHANGED: one fetch (the page + its one follow-up), one-shot typed failure, cooldown open
+    expect(http).toHaveBeenCalledTimes(2);
     expect(send).toHaveBeenCalledTimes(1);
     expect(queue.getStats().failed).toBe(1);
     expect(((await captured) as Error).message).toContain('Cloudflare challenge page received');
@@ -256,10 +272,10 @@ describe('ScrapeQueue × stored-cookie stale / fresh signals', () => {
   });
 
   it('(5) amiami recovery (challenge page but persisted>0) → neither stale nor fresh: not a dead cookie, not a clean primary', async () => {
-    const http = jest.fn().mockResolvedValue(CHALLENGE_HTML);
+    const http = challengeThenApi();
     const send = jest.fn().mockResolvedValue(healthyStats());
     const store = fakeStore([HOST]);
-    queue = buildQueue({ http, send, store });
+    queue = buildQueue({ ruleset: recoveringRuleset(), http, send, store });
 
     const url = `https://${HOST}/product/6`;
     const result = queue.enqueue(url, { url });
@@ -290,7 +306,8 @@ describe('ScrapeQueue × stored-cookie stale / fresh signals', () => {
     expect(scraping.scrapePageStealth).toHaveBeenCalledTimes(1); // stored cookies ⇒ stealth
     expect(scraping.scrapePage).not.toHaveBeenCalled();
     expect(store.markStale).toHaveBeenCalledTimes(1);
-    expect(store.markStale).toHaveBeenCalledWith(HOST, 'browser', 'challenge page via browser transport');
+    expect(store.markStale).toHaveBeenCalledWith(HOST, 'browser', 'challenge page via browser transport (extracted, not recovered)');
+    expect(send).not.toHaveBeenCalled(); // refused before the emit: no follow-up recovered it
     expect(((await captured) as Error).message).toContain('via browser transport');
     expect(cd.isOpen(HOST)).toBe(true);
     expect(cd.list()[0].reason).toContain('browser');
@@ -313,7 +330,7 @@ describe('ScrapeQueue × stored-cookie stale / fresh signals', () => {
       expect(http).toHaveBeenCalledTimes(1);
       expect(cd.isOpen(FIXTURE_HOST)).toBe(true);
       const rows = getCfCookieStore().view();
-      expect(rows.find((r) => r.host === FIXTURE_HOST)).toMatchObject({ stale: true, staleReason: 'challenge page via http transport' });
+      expect(rows.find((r) => r.host === FIXTURE_HOST)).toMatchObject({ stale: true, staleReason: 'challenge page via http transport (extracted, not recovered)' });
       expect(rows.find((r) => r.host === 'myfigurecollection.net')).toMatchObject({ stale: false });
       // the view never carries a value
       expect(JSON.stringify(rows)).not.toContain('FAKE_cf_fixture');

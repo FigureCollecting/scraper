@@ -4,6 +4,106 @@ All notable changes to `@figurecollecting/scraper-plugin-contract` will be docum
 file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this
 package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] - 2026-10-02
+
+Additive: every addition is optional, and a plugin that calls them on an older engine (with `?.`)
+is a no-op. A plugin that calls none of the new methods and makes all its registry calls before
+`register()` resolves loads exactly as before.
+
+### Changed
+- A registry call made after the plugin has loaded — any method, `registerSite` and
+  `registerRuleset` included, from a timer or an un-awaited load — now throws
+  (`plugin registration is closed`) and takes no effect; an older engine applied it late. Uncaught,
+  that throw ends the engine process, so a plugin that registers lazily must move those calls into
+  `register()` before it resolves.
+
+### Added
+- `ExtractionRegistry.registerHandsOffPolicy?(policy: HandsOffPolicy)` and the `HandsOffPolicy`,
+  `AiBarTier`, `AiBarSummary` and `RobotsPin` exports, plus `AI_BAR_TIERS` (the tiers as a runtime
+  list; `AiBarTier` is derived from it). A plugin registers which hosts Claude and its tools must
+  never contact (`handsOff`), permanently denied hosts (`denied`, `siteId` absent for a host-only
+  entry), the robots.txt classification behind the decision and its pins. The engine covers each
+  host and its subdomains and lists `{siteId, hosts, tier, handsOff, denied, policyVersion}` on
+  `/health/detailed` as `handsOff`. It throws, naming the policy and the value, on a host or siteId
+  another policy already holds, a host that is not a DNS hostname, a malformed field (`handsOff` or
+  `denied` not a boolean, a `tier` outside `AI_BAR_TIERS`, a missing `policyVersion`, a `summary`
+  that is not an `AiBarSummary`, `pins` or `routeSamples` that are not arrays of the declared shape),
+  or a policy on a subdomain that is less strict than the policy on its parent (it would lift the
+  parent's `handsOff` or `denied` there). The policy must be plain data: the engine copies its own
+  enumerable fields once and checks the copy, so a field on a prototype, behind a class getter or
+  non-enumerable counts as missing.
+- `ExtractionRegistry.registerRobotsClassifier?(classifier: RobotsClassifier)` and the
+  `RobotsClassifier` export (`{ tokenListDate, classify(body, routeUrls) }`). One per engine; a
+  second registration throws.
+- A refused call refuses the whole plugin. The engine stages the calls a plugin makes while it loads
+  (in `register()` and `registerRoutes()`) and applies them only once both have succeeded, so none of
+  the plugin's sites, rulesets, policies, classifier or routes take effect after a refusal, even one
+  the plugin caught. Make every call before `register()` resolves: once the plugin has loaded the
+  engine closes its registration, and a later call throws and takes no effect. So a policy goes live
+  together with the plugin's stores or not at all; one left until after `register()` resolves is
+  refused, never applied late.
+- `SiteConfig.requiredCookies?: string[]` — the cookie names a healthy session jar must hold.
+  `allowedCookies` stays the allow-list. `registerSite` copies it once and checks the copy, throwing,
+  naming the site, when it is present and not an array of strings (a hole counts as a non-string),
+  which refuses the whole plugin. A later change to the plugin's own array has no effect.
+
+## [0.16.0] - 2026-09-26
+
+Additive, backward-compatible: a ruleset that declares nothing behaves exactly as before.
+
+### Added
+- `RetrievalCapability.rotatingSeedLists?: RotatingSeedList[]` (and the `RotatingSeedList` export) —
+  `{ id, url, group, order }`. Declared pages the engine polls one GROUP per pass on its own
+  rotation (every list of the group in that pass; groups by ascending `order`), parsed by
+  `extractSeedList(body, listId)`. A separate field from `seedLists`, so an engine that predates it
+  never polls these pages and the exclusive seed pass never lists them. Ids share one namespace with
+  `seedLists`. An `id` or `group` outside `[A-Za-z0-9._-]`, or equal to `__proto__`, is dropped.
+
+## [0.15.0] - 2026-09-26
+
+The type surface is additive (every 0.14.0 call still compiles). One runtime change: `cookies` is
+now refused (see Changed); no published ruleset passes it.
+
+### Added
+- `fetchBody(url, { headers? })` and the `FETCH_BODY_ALLOWED_HEADERS` / `FetchBodyHeaderName` /
+  `FetchBodyHeaders` exports. A ruleset may set `origin`, `referer`, `accept`, `accept-language` and
+  `x-requested-with` (names case-insensitive), on a GET or a POST; a ruleset `accept` replaces the
+  transport's default. Any other name (`cookie`, `authorization`, `host`, `user-agent`,
+  `content-length`, `content-type`, `proxy-*`, `sec-*`, …), a name or value with CR or LF, a value
+  that is not printable ASCII, a value that is empty once surrounding spaces and tabs are trimmed,
+  one name given twice in different cases, and `headers` that is not a plain object are refused
+  before any request is sent: the engine owns the request's identity (User-Agent, cookies, TLS
+  profile) and framing. The http and impersonate transports send the headers; the browser transport
+  refuses a call that carries any.
+
+### Changed
+- `fetchBody`'s `cookies` option is refused (deprecated in the type). The http and impersonate
+  transports never sent it (only the engine's cookie jar is sent), so the option promised something
+  two of three transports silently dropped; a ruleset cookie map would also have been ruleset-set
+  identity, which the header allowlist refuses.
+
+## [0.14.0] - 2026-09-25
+
+Additive, backward-compatible: a `fetchBody` call without the new options is the same GET as before.
+
+### Added
+- `fetchBody(url, { cookies?, method?, body?, contentType? })` (and the `FetchBodyOptions` /
+  `FetchBodyMethod` exports). `method` is `'GET'` (default) or `'POST'`; a POST sends `body` with
+  `contentType` (default `application/x-www-form-urlencoded; charset=UTF-8`). A GET with a body is
+  refused. The http and impersonate transports send it; the browser transport refuses a POST. A POST
+  that is answered with a redirect returns the 3xx itself (`statusCode`), and the redirect is not
+  followed. A POST must be a read-only query, because a retried extraction sends it again.
+
+## [0.13.0] - 2026-09-22
+
+Additive, backward-compatible: a ruleset that declares nothing behaves exactly as before.
+
+### Added
+- `ExtractionRuleset.gonePage?: GonePage` (and the `GonePage` export) — `{ statuses, titleIncludes?,
+  bodyIncludes? }`. A response whose status is listed and whose page carries every declared marker is
+  failed as gone-or-denied on first sight instead of being booked by its status (a store that serves
+  a removed item as HTTP 500 was retried as a transient fault).
+
 ## [0.11.0] - 2026-09-09
 
 Additive, backward-compatible: a store that declares nothing behaves exactly as before, and every

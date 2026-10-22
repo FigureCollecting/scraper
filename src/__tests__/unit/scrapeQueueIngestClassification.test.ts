@@ -29,7 +29,7 @@ jest.mock('../../services/webhookClient', () => ({
   notifyItemSkipped: jest.fn().mockResolvedValue(true),
 }));
 
-import type { ExtractionRuleset, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
+import type { ExtractContext, ExtractionRuleset, StoreCapabilities } from '@figurecollecting/scraper-plugin-contract';
 import { ScrapeQueue, resetScrapeQueue } from '../../services/scrapeQueue';
 import { createExtractionRegistry, ExtractionRegistryImpl } from '../../services/extractionRegistry';
 import { getSessionManager, resetSessionManager } from '../../services/sessionManager';
@@ -77,6 +77,26 @@ function makeRuleset(itemId: string): ExtractionRuleset & { extract: jest.Mock }
   }));
   return { siteId: 'mock-mfc', version: '1.0.0', extract, validate: () => ({ valid: true, errors: [], warnings: [] }) };
 }
+
+/**
+ * makeRuleset's record, reached the amiami way: ONE follow-up through ctx.scraping.fetchBody (the item
+ * API at `<url>/api`) before extracting. A challenge-flagged page needs that follow-up to have answered
+ * a real body before anything is emitted (NAME-ERRPAGE-1).
+ */
+function makeRecoveringRuleset(itemId: string): ExtractionRuleset {
+  const base = makeRuleset(itemId);
+  return {
+    ...base,
+    async extractAsync(html: string, url: string, ctx?: ExtractContext) {
+      await ctx!.scraping.fetchBody!(`${url}/api`);
+      return base.extract(html, url);
+    },
+  } as ExtractionRuleset;
+}
+
+/** The http lane: a challenge for the item page, a real JSON body for its `/api` follow-up. */
+const challengeThenApi = () =>
+  jest.fn((u: string) => Promise.resolve(u.endsWith('/api') ? { body: '{"item":{"name":"Kitagawa Marin"}}', status: 200 } : CHALLENGE_HTML));
 
 function makeScrapingStub() {
   const page = { html: FIXTURE_HTML, url: 'https://x.test/item/1', title: 'Item', statusCode: 200 };
@@ -149,9 +169,9 @@ describe('ScrapeQueue - ingest failure classification (by class, not message tex
 
   it('a flagged challenge page whose URL contains "404" and persists nothing classifies as rate_limited (not not_found), with backoff', async () => {
     // URL ".../figure-4045" embeds "404". The http lane FLAGS the challenge (it no longer throws at
-    // fetch); the ruleset lifts a record the spine persists nothing for, so the honesty gate raises a
-    // ChallengePageError — class-based classifyError routes it rate_limited BEFORE the "404" substring
-    // in the URL could book it not_found.
+    // fetch); the ruleset lifts a record from the challenge body with no follow-up, so the queue
+    // refuses it before the emit (NAME-ERRPAGE-1) with a ChallengePageError — class-based
+    // classifyError routes it rate_limited BEFORE the "404" substring in the URL could book it not_found.
     const send = jest.fn().mockResolvedValue(emptyStats()); // spine persists nothing from the challenge body
     const http = jest.fn().mockResolvedValue(CHALLENGE_HTML); // http lane → flagged challenge (challenge:true)
     queue = new ScrapeQueue(false);
@@ -166,7 +186,7 @@ describe('ScrapeQueue - ingest failure classification (by class, not message tex
     await advanceUntil(() => queue.getStats().failed === 1);
 
     expect(http).toHaveBeenCalledTimes(1);           // fail-fast: ONE attempt (no retry storm), class still rate_limited
-    expect(send).toHaveBeenCalledTimes(1);           // reached the emitter once (flag, not fetch-throw)
+    expect(send).not.toHaveBeenCalled();             // refused before the emit: nothing recovered it
     expect(queue.getStats().rateLimited).toBe(true); // CF block escalated backoff, not booked as 404
     const reason = mockNotifyItemFailed.mock.calls[0][2] as string;
     expect(reason).toContain('rate_limited');
@@ -354,9 +374,9 @@ describe('ScrapeQueue - challenge page: flag → honesty gate (recover vs fail) 
     // inserted>0 — the ruleset recovered the real record through its OWN follow-up transport. The
     // honesty gate's persist-or-fail passes: an honest success, never a ChallengePageError.
     const send = jest.fn().mockResolvedValue(healthyStats());
-    const http = jest.fn().mockResolvedValue(CHALLENGE_HTML);
+    const http = challengeThenApi();
     queue = new ScrapeQueue(false);
-    queue.setPluginRegistry(makeRegistry(makeRuleset('107714'), 'amiami.example.test', { transport: 'http' }));
+    queue.setPluginRegistry(makeRegistry(makeRecoveringRuleset('107714'), 'amiami.example.test', { transport: 'http' }));
     queue.setIngestEmitter({ send });
     queue.setScrapingService(makeScrapingStub());
     queue.setIngestTransports({ http });
@@ -381,10 +401,11 @@ describe('ScrapeQueue - challenge page: flag → honesty gate (recover vs fail) 
   it('a challenge-flagged page that persisted NOTHING → FAILS as ChallengePageError (rate_limited, server warnings in message), never EmptyIngestRecordError', async () => {
     // Empty stats WITH a server warning: the ChallengePageError must name the lane AND carry the
     // server warnings (CHANGE 2), so an operator sees why the spine stored nothing behind the block.
+    // The ruleset's follow-up answered (so the record is emitted), but the spine persisted nothing.
     const send = jest.fn().mockResolvedValue(emptyStats(['anchor identifier unstorable; claims unbound']));
-    const http = jest.fn().mockResolvedValue(CHALLENGE_HTML);
+    const http = challengeThenApi();
     queue = new ScrapeQueue(false);
-    queue.setPluginRegistry(makeRegistry(makeRuleset('12345'), 'fnc.example.test', { transport: 'http' }));
+    queue.setPluginRegistry(makeRegistry(makeRecoveringRuleset('12345'), 'fnc.example.test', { transport: 'http' }));
     queue.setIngestEmitter({ send });
     queue.setScrapingService(makeScrapingStub());
     queue.setIngestTransports({ http });
@@ -394,7 +415,7 @@ describe('ScrapeQueue - challenge page: flag → honesty gate (recover vs fail) 
     const captured = result.promise.catch((e: Error) => e);
     await advanceUntil(() => queue.getStats().failed === 1);
 
-    expect(http).toHaveBeenCalledTimes(1);            // fail-fast: ONE attempt (no retry storm)
+    expect(http).toHaveBeenCalledTimes(2);            // fail-fast: ONE attempt (the page + its one follow-up), no retry storm
     expect(queue.getStats().rateLimited).toBe(true);  // CF block escalated backoff (not empty_record)
     const reason = mockNotifyItemFailed.mock.calls[0][2] as string;
     expect(reason).toContain('rate_limited');

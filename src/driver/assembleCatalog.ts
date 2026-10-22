@@ -24,13 +24,32 @@
 import { resolveByIdUrl, resolveListingUrl } from './retrievalPlanner.js';
 import { withCollectUrl, withTimeout, type LookupServices } from './assembleLookup.js';
 import { sanitizeForLog } from '../utils/security.js';
+import { isSafeRotatingName } from '../utils/rotatingName.js';
 import { isCloudflareChallenge } from '../services/engineServices/challengeDetect.js';
 import { getChallengeCooldown, normalizeHost } from '../services/challengeCooldown.js';
 import { getCfCookieStore, markStaleIfStored, markFreshIfStored } from '../services/cookieJar.js';
-import type { ListingPage, RetrievalCapability, SeedList } from '@figurecollecting/scraper-plugin-contract';
+import { observeGate, gateOutcomeOf, gateFailureReason } from '../services/gateSignal.js';
+import type { ListingPage, RetrievalCapability, RotatingSeedList, SearchFetch, SeedList } from '@figurecollecting/scraper-plugin-contract';
+import type { FetchBodyOutcome } from '../services/engineServices/capturingFetch.js';
+import { declaredLastPage, getMaxPagesGuard, type MaxPagesGuard } from '../services/maxPagesGuard.js';
+import { sendOnHostClock, type ClockedSendResult } from '../services/hostClockSend.js';
+import type { HostClockCaller } from '../services/hostClock.js';
+import { resolveCatalogStoreTimeoutMs } from './catalogStoreTimeout.js';
 
-/** The catalog runtime takes exactly the lookup's injected services (registry, ruleset lookup, fetch, cooldown). */
-export type CatalogServices = LookupServices;
+export { resolveCatalogStoreTimeoutMs } from './catalogStoreTimeout.js';
+
+/**
+ * The lookup's injected services, including its optional STATUS-AWARE fetch on the same lanes
+ * (`fetchSearchDetail`). Every catalog axis reads it when present: the gate needs the status, and
+ * the declared-page axes tell a store's 4xx (spend the slot) from its 5xx (retry) with it.
+ */
+export type CatalogServices = LookupServices & {
+  /**
+   * The maxPages guard (SCRAPE_CATALOG_MAX_PAGES_GUARD, QB-U24). Optional — defaults to the process-wide
+   * guard, read from the env once; tests inject one.
+   */
+  maxPagesGuard?: MaxPagesGuard;
+};
 
 /** A listed item as /catalog returns it: the contract's listing item plus the engine-derived `collectUrl`. */
 export type CatalogItem = ListingPage['items'][number] & { collectUrl?: string };
@@ -106,6 +125,37 @@ export type SeedResult =
   | { status: 'cooldown'; siteId: string; host: string; remainingMs: number }
   | { status: 'failed'; siteId: string; reason: string };
 
+/** One declared rotating seed list as discovery reports it. */
+export type RotatingSeedListSummary = RotatingSeedList;
+
+export type RotatingSeedListsResult =
+  | { status: 'ok'; siteId: string; rotatingSeedLists: RotatingSeedListSummary[]; count: number }
+  | { status: 'unsupported'; siteId: string; reason: string };
+
+/**
+ * A failed rotating fetch: `deterministic` would fail the same way again (parser throw, store 4xx,
+ * challenge), `transient` may not (5xx, network, timeout); `blocked` = the store refuses us (challenge,
+ * 401/403/429); `upstreamStatus` = the store's own status, when the lane observed one.
+ */
+export type RotatingFailure = { failure: 'deterministic' | 'transient'; blocked?: true; upstreamStatus?: number };
+
+/** One fetched rotating seed list: a seed result that also names the list's group. */
+export type RotatingSeedResult =
+  | {
+      status: 'ok';
+      siteId: string;
+      listId: string;
+      group: string;
+      url: string;
+      items: CatalogItem[];
+      collectUrls: string[];
+      hasMore: false;
+      count: number;
+    }
+  | { status: 'unsupported'; siteId: string; reason: string }
+  | { status: 'cooldown'; siteId: string; host: string; remainingMs: number }
+  | ({ status: 'failed'; siteId: string; reason: string } & RotatingFailure);
+
 /**
  * The store's WELL-FORMED declared seed lists, in declared order. A store profile is plugin-supplied
  * and therefore untrusted at runtime: an entry that is not an object, carries a blank id or url, or
@@ -128,6 +178,29 @@ function declaredSeedLists(retrieval: RetrievalCapability | undefined): SeedList
     if (seen.has(id)) continue;
     seen.add(id);
     out.push({ id, url, cadence, ...(typeof note === 'string' && note.length > 0 ? { note } : {}) });
+  }
+  return out;
+}
+
+/**
+ * The store's WELL-FORMED rotating seed lists, in declared order. Untrusted like `seedLists`: an
+ * entry without a safe id or group, a url or a finite numeric order is dropped, a repeated id keeps
+ * its first entry, and an id a seed list already uses is dropped (the two fields share one namespace).
+ */
+function declaredRotatingSeedLists(retrieval: RetrievalCapability | undefined): RotatingSeedList[] {
+  const raw: unknown = retrieval?.rotatingSeedLists;
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set<string>(declaredSeedLists(retrieval).map((l) => l.id));
+  const out: RotatingSeedList[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') continue;
+    const { id, url, group, order } = entry as Partial<RotatingSeedList>;
+    if (!isSafeRotatingName(id) || !isSafeRotatingName(group)) continue;
+    if (typeof url !== 'string' || url.length === 0) continue;
+    if (typeof order !== 'number' || !Number.isFinite(order)) continue;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push({ id, url, group, order });
   }
   return out;
 }
@@ -170,23 +243,16 @@ export interface Catalog {
    * smaller, declared set of pages reached down the identical path.
    */
   seed(siteId: string, listId: string): Promise<SeedResult>;
-}
-
-/** Listing-fetch timeout (ms) used when CATALOG_STORE_TIMEOUT_MS is unset/invalid, and the clamp any override rides within. */
-const DEFAULT_CATALOG_TIMEOUT_MS = 30000;
-const MIN_CATALOG_TIMEOUT_MS = 1000;
-const MAX_CATALOG_TIMEOUT_MS = 120000;
-
-/**
- * Resolve the listing-fetch timeout (ms) from the environment. CATALOG_STORE_TIMEOUT_MS overrides the
- * 30s default (a catalog page is a 1.5–2MB body on orzgk — wider than a search hit); a missing,
- * empty, non-numeric, or non-positive value falls back to the default, and any usable value is
- * clamped to [1000, 120000]. Pure (env in → number out) — mirrors resolveLookupStoreTimeoutMs.
- */
-export function resolveCatalogStoreTimeoutMs(env: NodeJS.ProcessEnv): number {
-  const n = Number(env.CATALOG_STORE_TIMEOUT_MS);
-  if (!Number.isFinite(n) || n <= 0) return DEFAULT_CATALOG_TIMEOUT_MS;
-  return Math.min(MAX_CATALOG_TIMEOUT_MS, Math.max(MIN_CATALOG_TIMEOUT_MS, n));
+  /**
+   * The ROTATING seed lists `siteId` declares, in declared order. Pure, like `seedLists`, and
+   * deliberately a separate call: the seed axis never lists these pages.
+   */
+  rotatingSeedLists(siteId: string): RotatingSeedListsResult;
+  /**
+   * ONE declared rotating seed list, fetched down the seed axis's lane and parsed by `extractSeedList`.
+   * A failure says whether it is deterministic or transient, and whether the store is blocking us.
+   */
+  rotatingSeed(siteId: string, listId: string): Promise<RotatingSeedResult>;
 }
 
 /** An untrusted listing item is kept only as `{ itemId, url? }` with a non-empty string itemId. */
@@ -202,6 +268,130 @@ export function assembleCatalog(services: CatalogServices): Catalog {
   const timeoutMs = resolveCatalogStoreTimeoutMs(process.env);
   const cd = services.challengeCooldown ?? getChallengeCooldown();
   const cfStore = services.cfCookieStore ?? getCfCookieStore();
+  const pagesGuard = services.maxPagesGuard ?? getMaxPagesGuard();
+
+  /**
+   * THE HOST CLOCK (QB-U30b): every listing, seed and rotating fetch reserves the host's next slot on
+   * the shared per-host clock BEFORE its timeout starts, waits for it, and runs the send block there;
+   * the fetch then gets CATALOG_STORE_TIMEOUT_MS minus the wait, so wait + fetch stays within it and the
+   * crawler's 75 s request keeps its margin. A slot past the wait cap is refused, and so is a send a
+   * challenge cooldown closed while it waited: both answer `cooldown`, which the crawler reads as "stop
+   * this store for the pass" (no request is sent). Off the clock: fetched at once, as before.
+   */
+  const onClock = <T>(host: string, caller: HostClockCaller, fetch: (ms: number) => Promise<T>): Promise<ClockedSendResult<T>> =>
+    sendOnHostClock(
+      {
+        host,
+        caller,
+        budgetMs: timeoutMs,
+        ...(caller === 'catalogListing' ? { latency: 'listing' as const } : {}),
+        veto: () => (cd.isOpen(host) ? 'cooling' : undefined),
+      },
+      ms => fetch(ms ?? timeoutMs),
+      services.hostClock ? { clock: services.hostClock } : {},
+    );
+  /** A send the clock did not make: `cooldown` with the wait it refused, or the cooldown that vetoed it. */
+  const notSent = (host: string, out: Exclude<ClockedSendResult<unknown>, { sent: true }>) => {
+    const remainingMs = out.refused ? out.waitMs : cd.remaining(host);
+    // eslint-disable-next-line no-console
+    console.warn(`[HOST-CLOCK] ${sanitizeForLog(host)} ${out.refused ? `refused the fetch: its slot is ${remainingMs} ms away` : 'began cooling while the fetch waited for its slot'}; store left alone this pass`);
+    return { status: 'cooldown' as const, host, remainingMs };
+  };
+
+  /**
+   * Fetch and parse ONE declared page (a seed list or a rotating seed list) down the listing lane:
+   * the store's declared transport, its host cooldown, challenge detection and cookie signals.
+   * `fetch` may answer with the store's status; when it does, a 4xx/5xx is reported rather than parsed.
+   */
+  const fetchDeclaredPage = async (
+    siteId: string,
+    listId: string,
+    url: string,
+    label: 'seed' | 'rotating seed',
+    fetch: (url: string, searchFetch: SearchFetch) => Promise<FetchBodyOutcome>,
+  ): Promise<
+    | { status: 'ok'; items: CatalogItem[]; collectUrls: string[]; hasMore: false; count: number }
+    | { status: 'unsupported'; reason: string }
+    | { status: 'cooldown'; host: string; remainingMs: number }
+    | ({ status: 'failed'; reason: string } & RotatingFailure)
+  > => {
+    const caps = services.profiles.forSite(siteId)!;
+    let host: string;
+    try {
+      host = normalizeHost(new URL(url).hostname);
+    } catch {
+      return { status: 'unsupported', reason: `malformed ${label} list url` };
+    }
+    const ruleset = services.getRulesetForUrl(url);
+    if (!ruleset?.extractSeedList) return { status: 'unsupported', reason: 'ruleset has no extractSeedList parser' };
+
+    // The listing axis's cooldown gate, unchanged: a cooling host is skipped WITHOUT fetching,
+    // because a challenge fetch degrades the egress IP's reputation for every other store on it.
+    if (cd.isOpen(host)) {
+      const remainingMs = cd.remaining(host);
+      const minsLeft = Math.max(1, Math.ceil(remainingMs / 60_000));
+      // eslint-disable-next-line no-console
+      console.warn(`[COOLDOWN] skipped ${sanitizeForLog(url)} (${host} cooling, ${minsLeft} min left)`);
+      return { status: 'cooldown', host, remainingMs };
+    }
+
+    const fail = (why: string, f: RotatingFailure) => {
+      const reason = sanitizeForLog(why);
+      // eslint-disable-next-line no-console
+      console.warn(`[catalog] ${sanitizeForLog(siteId)} ${label} ${sanitizeForLog(listId)} failed: ${reason}`);
+      return { status: 'failed' as const, reason, ...f };
+    };
+    const transport = services.profiles.searchTransportFor(caps.domains[0] ?? host);
+    let gate: ReturnType<typeof gateOutcomeOf>;
+    try {
+      const sent = await onClock(host, label === 'seed' ? 'catalogSeed' : 'catalogRotating', ms => withTimeout(fetch(url, transport), ms, `${label} list fetch`));
+      if (!sent.sent) return notSent(host, sent);
+      gate = gateOutcomeOf(sent.value);
+    } catch (err) {
+      // The request never produced a page (network, proxy, timeout): nothing says the next try fails.
+      return fail(err instanceof Error ? err.message : String(err), { failure: 'transient' });
+    }
+    const body = gate.body;
+    const upstream = gate.status;
+    // A challenge body is NOT an empty shelf: parsing it would report the list as yielding
+    // nothing, which on a SLOW-cadence axis is a silence nobody would question for a week.
+    if (isCloudflareChallenge(body)) {
+      cd.open(host, `${label} list challenge page`);
+      markStaleIfStored(cfStore, url, host, transport.transport ?? 'http', `${label} list challenge page`);
+      return fail('challenge page', { failure: 'deterministic', blocked: true });
+    }
+    // CLEAN means a 2xx the lane SAW with a real body (gateSignal): an empty body or a 5xx from a
+    // gated host is a refused gate — stale mark + a strike toward the host's cooldown — and a
+    // status-blind body proves nothing either way. Neither marks the host FRESH.
+    const lane = transport.transport ?? 'http';
+    const verdict = observeGate({ cooldown: cd, store: cfStore }, { url, host, lane, searchFetch: transport, ...gate });
+    if (upstream !== undefined && upstream >= 400) {
+      const blocked = upstream === 401 || upstream === 403 || upstream === 429;
+      const failure = upstream >= 500 || upstream === 429 ? 'transient' : 'deterministic';
+      return fail(`store answered ${upstream}`, { failure, ...(blocked ? { blocked: true as const } : {}), upstreamStatus: upstream });
+    }
+    // A refused gate that still answered 2xx (an empty body) is not an empty shelf either. It is
+    // `transient` and not `blocked`: the crawler stops the store for this pass on a transient, so the
+    // next list of the same refusing host is not fetched in the same pass.
+    if (verdict === 'gate_failure') return fail(gateFailureReason(gate, lane), { failure: 'transient' });
+    // A clean page inside an OPEN window (opened while this fetch was in flight) is not FRESH either.
+    if (verdict === 'clean' && !cd.isOpen(host)) markFreshIfStored(cfStore, url, host);
+    try {
+      // UNTRUSTED plugin output, guarded exactly as the listing axis guards it. `hasMore` and
+      // `nextPage` are NOT read at all: a declared list is one page, so a parser claiming a
+      // further page is claiming something this axis has no way to fetch.
+      const parsed: unknown = await ruleset.extractSeedList(body, listId);
+      const raw = parsed && typeof parsed === 'object' ? (parsed as Partial<ListingPage>) : {};
+      const items = Array.isArray(raw.items)
+        ? raw.items.map(normalizeItem).filter((it): it is ListingPage['items'][number] => it !== undefined)
+        : [];
+      const decorated: CatalogItem[] = items.map((it) => withCollectUrl(it, caps.retrieval, url));
+      const collectUrls = decorated.map((it) => it.collectUrl).filter((u): u is string => typeof u === 'string' && u.length > 0);
+      return { status: 'ok', items: decorated, collectUrls, hasMore: false, count: decorated.length };
+    } catch (err) {
+      return fail(err instanceof Error ? err.message : String(err), { failure: 'deterministic' });
+    }
+  };
 
   return {
     seedLists(siteId) {
@@ -222,56 +412,29 @@ export function assembleCatalog(services: CatalogServices): Catalog {
       // An UNDECLARED id is a coverage gap, never a fetch: the whole point of the axis is that the
       // set of pages it may reach was written down in advance.
       if (!list) return { status: 'unsupported', siteId, reason: `store declares no seed list ${JSON.stringify(listId)}` };
-      const url = list.url;
-      let host: string;
-      try {
-        host = normalizeHost(new URL(url).hostname);
-      } catch {
-        return { status: 'unsupported', siteId, reason: 'malformed seed list url' };
-      }
-      const ruleset = services.getRulesetForUrl(url);
-      if (!ruleset?.extractSeedList) return { status: 'unsupported', siteId, reason: 'ruleset has no extractSeedList parser' };
+      const out = await fetchDeclaredPage(siteId, listId, list.url, 'seed', services.fetchSearchDetail ?? services.fetchSearch);
+      if (out.status !== 'failed') return out.status === 'ok' ? { ...out, siteId, listId, url: list.url } : { ...out, siteId };
+      return { status: 'failed', siteId, reason: out.reason };
+    },
 
-      // The listing axis's cooldown gate, unchanged: a cooling host is skipped WITHOUT fetching,
-      // because a challenge fetch degrades the egress IP's reputation for every other store on it.
-      if (cd.isOpen(host)) {
-        const remainingMs = cd.remaining(host);
-        const minsLeft = Math.max(1, Math.ceil(remainingMs / 60_000));
-        // eslint-disable-next-line no-console
-        console.warn(`[COOLDOWN] skipped ${sanitizeForLog(url)} (${host} cooling, ${minsLeft} min left)`);
-        return { status: 'cooldown', siteId, host, remainingMs };
-      }
+    rotatingSeedLists(siteId) {
+      const caps = services.profiles.forSite(siteId);
+      if (!caps) return { status: 'unsupported', siteId, reason: 'unknown store' };
+      const lists = declaredRotatingSeedLists(caps.retrieval);
+      if (lists.length === 0) return { status: 'unsupported', siteId, reason: 'store declares no rotating seed lists' };
+      return { status: 'ok', siteId, rotatingSeedLists: lists, count: lists.length };
+    },
 
-      try {
-        const transport = services.profiles.searchTransportFor(caps.domains[0] ?? host);
-        const body = await withTimeout(services.fetchSearch(url, transport), timeoutMs, 'seed list fetch');
-        // A challenge body is NOT an empty shelf: parsing it would report the list as yielding
-        // nothing, which on a SLOW-cadence axis is a silence nobody would question for a week.
-        if (isCloudflareChallenge(body)) {
-          // eslint-disable-next-line no-console
-          console.warn(`[catalog] ${sanitizeForLog(siteId)} seed ${sanitizeForLog(listId)} failed: challenge page`);
-          cd.open(host, 'seed list challenge page');
-          markStaleIfStored(cfStore, url, host, transport.transport ?? 'http', 'seed list challenge page');
-          return { status: 'failed', siteId, reason: 'challenge page' };
-        }
-        markFreshIfStored(cfStore, url, host);
-        // UNTRUSTED plugin output, guarded exactly as the listing axis guards it. `hasMore` and
-        // `nextPage` are NOT read at all: a seed list is one declared page, so a parser claiming a
-        // further page is claiming something this axis has no way to fetch.
-        const parsed: unknown = await ruleset.extractSeedList(body, listId);
-        const raw = parsed && typeof parsed === 'object' ? (parsed as Partial<ListingPage>) : {};
-        const items = Array.isArray(raw.items)
-          ? raw.items.map(normalizeItem).filter((it): it is ListingPage['items'][number] => it !== undefined)
-          : [];
-        const decorated: CatalogItem[] = items.map((it) => withCollectUrl(it, caps.retrieval, url));
-        const collectUrls = decorated.map((it) => it.collectUrl).filter((u): u is string => typeof u === 'string' && u.length > 0);
-        return { status: 'ok', siteId, listId, url, items: decorated, collectUrls, hasMore: false, count: decorated.length };
-      } catch (err) {
-        const reason = sanitizeForLog(err instanceof Error ? err.message : String(err));
-        // eslint-disable-next-line no-console
-        console.warn(`[catalog] ${sanitizeForLog(siteId)} seed ${sanitizeForLog(listId)} failed: ${reason}`);
-        return { status: 'failed', siteId, reason };
-      }
+    async rotatingSeed(siteId, listId) {
+      const caps = services.profiles.forSite(siteId);
+      if (!caps) return { status: 'unsupported', siteId, reason: 'unknown store' };
+      const lists = declaredRotatingSeedLists(caps.retrieval);
+      if (lists.length === 0) return { status: 'unsupported', siteId, reason: 'store declares no rotating seed lists' };
+      const list = lists.find((l) => l.id === listId);
+      if (!list) return { status: 'unsupported', siteId, reason: `store declares no rotating seed list ${JSON.stringify(listId)}` };
+      const out = await fetchDeclaredPage(siteId, listId, list.url, 'rotating seed', services.fetchSearchDetail ?? services.fetchSearch);
+      if (out.status === 'ok') return { ...out, siteId, listId, group: list.group, url: list.url };
+      return { ...out, siteId };
     },
 
     idRange(siteId, from, count) {
@@ -337,6 +500,15 @@ export function assembleCatalog(services: CatalogServices): Catalog {
       const ruleset = services.getRulesetForUrl(url);
       if (!ruleset?.extractListing) return { status: 'unsupported', siteId, reason: 'ruleset has no extractListing parser' };
 
+      // MAXPAGES GUARD (SCRAPE_CATALOG_MAX_PAGES_GUARD, QB-U24): a page above the last page the profile
+      // declares is answered with the existing exhausted page and NO store fetch, for a guarded store. It is
+      // a fact about the declaration, not about the host, so it is answered ahead of the cooldown gate.
+      const lastPage = declaredLastPage(byListing);
+      if (lastPage !== undefined && pageNo > lastPage && pagesGuard.covers(siteId)) {
+        pagesGuard.record(siteId, Date.now());
+        return { status: 'ok', siteId, page: pageNo, url, items: [], collectUrls: [], hasMore: false, count: 0 };
+      }
+
       // CHALLENGE COOLDOWN gate, keyed by the host actually fetched (a sibling api. host cools on its
       // own): a cooling host is skipped WITHOUT fetching — a challenge fetch degrades the egress IP's
       // CF reputation — and reported as `cooldown` (the store is fine; we are leaving it alone).
@@ -353,7 +525,12 @@ export function assembleCatalog(services: CatalogServices): Catalog {
         // primary domain exactly as /lookup does — the listing may live on a sibling host (api.)
         // the store's domains don't list. BOUNDED so a hung / CF-stalled store fails, not stalls.
         const transport = services.profiles.searchTransportFor(caps.domains[0] ?? host);
-        const body = await withTimeout(services.fetchSearch(url, transport), timeoutMs, 'catalog fetch');
+        const sent = await onClock(host, 'catalogListing', ms =>
+          withTimeout(services.fetchSearchDetail ? services.fetchSearchDetail(url, transport) : services.fetchSearch(url, transport), ms, 'catalog fetch'),
+        );
+        if (!sent.sent) return { ...notSent(host, sent), siteId };
+        const gate = gateOutcomeOf(sent.value);
+        const body = gate.body;
         // HONEST LISTING: a CF challenge/block body is NOT a catalog page — extractListing would
         // lift 0 items and pose the page as "end of catalog". Detect it BEFORE parsing, open the
         // host's cooldown so the queue and the next crawl leave it alone, and report failed.
@@ -367,7 +544,21 @@ export function assembleCatalog(services: CatalogServices): Catalog {
           return { status: 'failed', siteId, reason: 'challenge page' };
         }
         // A clean listing for a host WITH stored cookies is the FRESH signal (clears a stale mark).
-        markFreshIfStored(cfStore, url, host);
+        // CLEAN means a 2xx the lane SAW with a real body (gateSignal): an empty body or a 5xx from a
+        // gated host is a refused gate — stale mark + a strike toward the host's cooldown — and a
+        // status-blind body proves nothing either way. Neither marks the host FRESH.
+        const lane = transport.transport ?? 'http';
+        const verdict = observeGate({ cooldown: cd, store: cfStore }, { url, host, lane, searchFetch: transport, ...gate });
+        // HONEST LISTING, as for a challenge: a refused gate is not a catalog page — parsing it would
+        // pose the store as "end of catalog". Report it failed; the strike above already counted.
+        if (verdict === 'gate_failure') {
+          const reason = gateFailureReason(gate, lane);
+          // eslint-disable-next-line no-console
+          console.warn(`[catalog] ${sanitizeForLog(siteId)} page ${pageNo} failed: ${reason}`);
+          return { status: 'failed', siteId, reason };
+        }
+        // A clean page inside an OPEN window (opened while this fetch was in flight) is not FRESH either.
+        if (verdict === 'clean' && !cd.isOpen(host)) markFreshIfStored(cfStore, url, host);
         // UNTRUSTED plugin output: a non-object page → no items; a non-array `items` → none; each
         // item must be an object with a non-empty string itemId (else dropped); paging signals are
         // used only when well-typed, else derived (non-empty page ⇒ more; next = page + 1).

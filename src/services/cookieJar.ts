@@ -20,6 +20,7 @@
  * Everything is injectable (path / fs / clock / interval) so the behavior is deterministic in tests.
  */
 import * as nodeFs from 'fs';
+import { createHash } from 'crypto';
 import { normalizeHost } from './challengeCooldown.js';
 
 /** Default poll interval for the file's mtime. */
@@ -39,6 +40,16 @@ interface StaleMark {
   reason: string;
 }
 
+/** A session-lost mark: sticky until a reload changes the fingerprinted value(s). */
+interface SessionLostMark {
+  since: number;
+  reason: string;
+  /** The session cookie named when marked; undefined ⇒ every value of the entry is fingerprinted. */
+  cookie?: string;
+  /** sha256 of the value(s) the mark was taken against — never the value itself. */
+  fingerprint: string;
+}
+
 /** The observability view of one host (what /health/detailed lists). NEVER carries a value. */
 export interface CfCookieHostView {
   host: string;
@@ -50,6 +61,10 @@ export interface CfCookieHostView {
   stale: boolean;
   staleSince?: string;
   staleReason?: string;
+  /** The login session is gone (sticky: only a reload with new values clears it) → re-mint. */
+  sessionLost: boolean;
+  sessionLostSince?: string;
+  sessionLostReason?: string;
 }
 
 /** The read surface the three fetch lanes consume (a structural subset of CfCookieStore). */
@@ -66,6 +81,15 @@ export interface CfCookieStaleSignals {
   markStale(host: string, lane: string, reason: string): boolean;
   /** A clean body came back for a host: clear its stale mark. True on the transition. */
   markFresh(host: string): boolean;
+}
+
+/** The session-lost surface the image lane consumes. */
+export interface CfCookieSessionSignals {
+  /**
+   * A login-gated host answered as logged out: flip `sessionLost` (once). Sticky — `markFresh` and a
+   * reload with the same values leave it set. True on the transition.
+   */
+  markSessionLost(host: string, lane: string, reason: string, sessionCookie?: string): boolean;
 }
 
 /**
@@ -88,6 +112,23 @@ export function markStaleIfStored(store: CfCookieStoreLike, url: string, host: s
 /** The FRESH counterpart at a clean-fetch site: a real body came back for a host WITH stored cookies. */
 export function markFreshIfStored(store: CfCookieStoreLike, url: string, host: string): boolean {
   return store.cookiesFor(url) !== undefined && store.markFresh(host);
+}
+
+/** The session-lost counterpart: marked only for a url whose host has stored cookies. */
+export function markSessionLostIfStored(
+  store: CfCookieSource & CfCookieSessionSignals,
+  url: string,
+  lane: string,
+  reason: string,
+  sessionCookie?: string,
+): boolean {
+  let host: string;
+  try {
+    host = new URL(url).hostname;
+  } catch {
+    return false;
+  }
+  return store.cookiesFor(url) !== undefined && store.markSessionLost(host, lane, reason, sessionCookie);
 }
 
 /**
@@ -178,7 +219,16 @@ function parseCookieFile(raw: string): ParsedFile {
   return { ok: true, entries, skipped };
 }
 
-export class CfCookieStore implements CfCookieSource, CfCookieStaleSignals {
+/** sha256 over the named cookie's value, else over every name=value of the entry (sorted). */
+function fingerprintOf(entry: HostEntry, cookie: string | undefined): string {
+  const named = cookie !== undefined ? entry.cookies.get(cookie) : undefined;
+  const material = named !== undefined
+    ? named
+    : [...entry.cookies.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([n, v]) => `${n}=${v}`).join('\n');
+  return createHash('sha256').update(material).digest('hex');
+}
+
+export class CfCookieStore implements CfCookieSource, CfCookieStaleSignals, CfCookieSessionSignals {
   private readonly path: string | undefined;
   private readonly fs: CfCookieFs;
   private readonly now: () => number;
@@ -186,6 +236,8 @@ export class CfCookieStore implements CfCookieSource, CfCookieStaleSignals {
 
   private entries = new Map<string, HostEntry>();
   private stale = new Map<string, StaleMark>();
+  /** Kept across reloads and a vanished file; dropped only when the host's fingerprint changes. */
+  private sessionLost = new Map<string, SessionLostMark>();
   private loadedAt: number | undefined;
   /** mtime of the file at the last load attempt (undefined = missing / never loaded). */
   private lastMtimeMs: number | undefined;
@@ -289,6 +341,10 @@ export class CfCookieStore implements CfCookieSource, CfCookieStaleSignals {
     }
     this.entries = parsed.entries;
     this.stale = new Map();
+    for (const [host, mark] of this.sessionLost) {
+      const entry = this.entries.get(host);
+      if (entry && fingerprintOf(entry, mark.cookie) !== mark.fingerprint) this.sessionLost.delete(host);
+    }
     this.loadedAt = this.now();
     const summary = [...this.entries.entries()]
       .map(([host, e]) => `${host}(${[...e.cookies.keys()].join(',')}${e.userAgent ? ' ua=pinned' : ''})`)
@@ -356,12 +412,24 @@ export class CfCookieStore implements CfCookieSource, CfCookieStaleSignals {
     return true;
   }
 
+  markSessionLost(host: string, lane: string, reason: string, sessionCookie?: string): boolean {
+    const key = this.resolveKey(host);
+    if (key === undefined || this.sessionLost.has(key)) return false;
+    const entry = this.entries.get(key)!;
+    const cookie = sessionCookie !== undefined && entry.cookies.has(sessionCookie) ? sessionCookie : undefined;
+    this.sessionLost.set(key, { since: this.now(), reason, ...(cookie ? { cookie } : {}), fingerprint: fingerprintOf(entry, cookie) });
+    // eslint-disable-next-line no-console
+    console.warn(`[CF-COOKIE] SESSION LOST ${key} via ${lane}: ${reason} — re-mint the login via runbook (clears only on new cookie values)`);
+    return true;
+  }
+
   /** Snapshot for /health/detailed — names, pins, timestamps, stale flags. NEVER a value. */
   view(): CfCookieHostView[] {
     const loadedAt = new Date(this.loadedAt ?? this.now()).toISOString();
     const out: CfCookieHostView[] = [];
     for (const [host, e] of this.entries) {
       const mark = this.stale.get(host);
+      const lost = this.sessionLost.get(host);
       out.push({
         host,
         cookieNames: [...e.cookies.keys()],
@@ -371,6 +439,8 @@ export class CfCookieStore implements CfCookieSource, CfCookieStaleSignals {
         ...(e.expiresAt !== undefined ? { expiresAt: e.expiresAt } : {}),
         stale: mark !== undefined,
         ...(mark ? { staleSince: new Date(mark.since).toISOString(), staleReason: mark.reason } : {}),
+        sessionLost: lost !== undefined,
+        ...(lost ? { sessionLostSince: new Date(lost.since).toISOString(), sessionLostReason: lost.reason } : {}),
       });
     }
     return out;

@@ -554,7 +554,9 @@ describe('assembleLookup × stored cookies — stale / fresh signals', () => {
     const cd = new ChallengeCooldown({ now: () => 1000, windowMs: 60_000 });
     const cfCookieStore = fakeStore(['goodsmileus.com', 'solarisjapan.com']);
     const fetchSearch = jest.fn(async (url: string) => (url.includes('goodsmileus') ? CHALLENGE : '{}'));
-    const { lookup } = build({ challengeCooldown: cd, fetchSearch, cfCookieStore });
+    // The status-aware lane (what wireServices wires): only a 2xx the lane SAW proves the host FRESH.
+    const fetchSearchDetail = jest.fn(async (url: string) => ({ status: 200, body: await fetchSearch(url) }));
+    const { lookup } = build({ challengeCooldown: cd, fetchSearch, fetchSearchDetail, cfCookieStore });
 
     const out = await lookup.lookup('tomie');
 

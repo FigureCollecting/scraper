@@ -8,8 +8,10 @@ import express from 'express';
 import request from 'supertest';
 import { createHealthRoutes, type HealthDeps } from '../../routes/health';
 import { CfCookieStore } from '../../services/cookieJar';
+import { createExtractionRegistry } from '../../services/extractionRegistry';
 import type { ImageCaptureStats } from '../../services/images/imageCaptureHook';
 import type { SinkStats } from '../../services/objectStoreCaptureSink';
+import { U30B_FIELDS, U30B_SENDS } from '../helpers/hostClockU30bFields';
 
 const NO_IMAGE_CAPTURE: ImageCaptureStats = {
   enabled: false,
@@ -17,7 +19,7 @@ const NO_IMAGE_CAPTURE: ImageCaptureStats = {
   attempted: 0,
   stored: 0,
   deduped: 0,
-  skipped: { policyDeny: 0, memo: 0, thumbnailRole: 0, userRole: 0, cap: 0, residentialBudget: 0, notImage: 0, tooLarge: 0, refused: 0, unsupported: 0, inFlight: 0, sinkQueueFull: 0 },
+  skipped: { policyDeny: 0, memo: 0, thumbnailRole: 0, userRole: 0, cap: 0, residentialBudget: 0, notImage: 0, tooLarge: 0, refused: 0, unsupported: 0, inFlight: 0, sinkQueueFull: 0, displayGated: 0 },
   failed: 0,
   residentialBytesToday: 0,
 };
@@ -41,6 +43,11 @@ const build = (over: Partial<HealthDeps> = {}) => {
       durable: false, reason: 'disabled' as const, path: null, quarantinedPath: null,
       lostAtStartup: 0, restoredAt: null, pending: 0, leased: 0, parked: 0,
     }),
+    listHandsOff: () => [],
+    listPlugins: () => ({ loaded: [], refused: [] }),
+    getHostClock: () => ({ mode: 'off', hosts: [] }),
+    getMaxPagesGuard: () => ({ mode: 'off', stores: [] }),
+    getPool: () => ({ scope: 'off', malformed: false, hosts: [] }),
     ...over,
   }));
   return app;
@@ -156,6 +163,7 @@ describe('createHealthRoutes', () => {
         stale: true,
         staleSince: '2023-11-14T22:13:20.000Z',
         staleReason: 'challenge page via browser transport',
+        sessionLost: false,
       }]);
       const json = JSON.stringify(res.body);
       for (const v of VALUES) expect(json).not.toContain(v);
@@ -181,6 +189,31 @@ describe('createHealthRoutes', () => {
       expect(res.body.status).toBe('degraded');
       expect(res.body.cfCookies).toEqual([expect.objectContaining({ host: 'myfigurecollection.net', cookieNames: ['cf_clearance', 'PHPSESSID'], stale: false })]);
       for (const v of VALUES) expect(JSON.stringify(res.body)).not.toContain(v);
+    });
+
+    it('GET /health/detailed lists the hosts whose login session is LOST, flat, on both branches', async () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      const store = realStore();
+      const quiet = await request(build({ listCfCookies: () => store.view() })).get('/health/detailed');
+      expect(quiet.body.cookieSessionLost).toEqual([]);
+
+      store.markSessionLost('myfigurecollection.net', 'impit', 'placeholder body on a login-gated host', 'PHPSESSID');
+      const healthy = await request(build({ listCfCookies: () => store.view() })).get('/health/detailed');
+      expect(healthy.body.cookieSessionLost).toEqual(['myfigurecollection.net']);
+      expect(healthy.body.cfCookies[0]).toMatchObject({
+        sessionLost: true,
+        sessionLostReason: 'placeholder body on a login-gated host',
+      });
+      const degraded = await request(build({
+        getBrowserPoolHealth: async () => { throw new Error('pool down'); },
+        listCfCookies: () => store.view(),
+      })).get('/health/detailed');
+      expect(degraded.status).toBe(500);
+      expect(degraded.body.cookieSessionLost).toEqual(['myfigurecollection.net']);
+      // The liveness contract is untouched.
+      const live = await request(build({ listCfCookies: () => store.view() })).get('/health');
+      expect(live.body).toEqual({ service: 'scraper', version: '9.9.9', status: 'healthy' });
+      warn.mockRestore();
     });
   });
 });
@@ -537,7 +570,7 @@ describe('createHealthRoutes — imageCapture', () => {
     attempted: 40,
     stored: 31,
     deduped: 4,
-    skipped: { policyDeny: 2, memo: 9, thumbnailRole: 12, userRole: 3, cap: 1, residentialBudget: 5, notImage: 2, tooLarge: 1, refused: 4, unsupported: 1, inFlight: 7, sinkQueueFull: 6 },
+    skipped: { policyDeny: 2, memo: 9, thumbnailRole: 12, userRole: 3, cap: 1, residentialBudget: 5, notImage: 2, tooLarge: 1, refused: 4, unsupported: 1, inFlight: 7, sinkQueueFull: 6, displayGated: 0 },
     failed: 3,
     residentialBytesToday: 12_345,
   };
@@ -695,5 +728,206 @@ describe('createHealthRoutes — queueStore', () => {
     const res = await request(app).get('/health/detailed');
     expect(res.status).toBe(500);
     expect(res.body.queueStore).toEqual(DURABLE);
+  });
+});
+
+/**
+ * The hands-off list (plugin contract 0.17.0): which hosts the rulesets plugin registered as off
+ * limits to Claude and its tools, read from our own system with zero upstream requests. Driven by a
+ * REAL registry so the block is exactly what the registry reports; the robots summary, pins and route
+ * samples stay out of it.
+ */
+describe('createHealthRoutes — handsOff', () => {
+  const registryWithPolicies = () => {
+    const registry = createExtractionRegistry();
+    registry.registerHandsOffPolicy({
+      siteId: 'alpha',
+      hosts: ['alpha.example.test'],
+      handsOff: true,
+      tier: 'FULL_BAR',
+      summary: { tier: 'FULL_BAR', namedTokens: ['examplebot'], fullBarTokens: ['examplebot'], routeBarTokens: [], crawlDelayTokens: [], contentSignals: ['ai-train=no'] },
+      pins: [{ url: 'https://alpha.example.test/robots.txt', sha256: 'c'.repeat(64), fetchedAt: '2026-09-29T00:00:00.000Z' }],
+      routeSamples: ['https://alpha.example.test/item/1'],
+      policyVersion: 'policy-2026-09-29',
+    });
+    registry.registerHandsOffPolicy({
+      hosts: ['denied.example.test'],
+      handsOff: true,
+      denied: true,
+      tier: 'NOT_NAMED',
+      summary: { tier: 'NOT_NAMED', namedTokens: [], fullBarTokens: [], routeBarTokens: [], crawlDelayTokens: [], contentSignals: [] },
+      pins: [],
+      routeSamples: [],
+      policyVersion: 'policy-2026-09-29',
+    });
+    return registry;
+  };
+  const EXPECTED = [
+    { siteId: 'alpha', hosts: ['alpha.example.test'], tier: 'FULL_BAR', handsOff: true, denied: false, policyVersion: 'policy-2026-09-29' },
+    { siteId: null, hosts: ['denied.example.test'], tier: 'NOT_NAMED', handsOff: true, denied: true, policyVersion: 'policy-2026-09-29' },
+  ];
+
+  it('GET /health/detailed carries handsOff [{siteId, hosts, tier, handsOff, denied, policyVersion}] and no robots detail', async () => {
+    const registry = registryWithPolicies();
+    const res = await request(build({ listHandsOff: () => registry.handsOffView() })).get('/health/detailed');
+
+    expect(res.status).toBe(200);
+    expect(res.body.handsOff).toEqual(EXPECTED);
+    expect(JSON.stringify(res.body)).not.toContain('c'.repeat(64));
+    expect(JSON.stringify(res.body)).not.toContain('ai-train=no');
+  });
+
+  it('reports handsOff: [] when no plugin registered a policy (an older plugin, or none loaded yet)', async () => {
+    const res = await request(build({ listHandsOff: () => createExtractionRegistry().handsOffView() })).get('/health/detailed');
+
+    expect(res.status).toBe(200);
+    expect(res.body.handsOff).toEqual([]);
+  });
+
+  it('keeps handsOff on the degraded (500) response (the list matters most when the pod is sick)', async () => {
+    const registry = registryWithPolicies();
+    const app = build({
+      getBrowserPoolHealth: async () => { throw new Error('pool down'); },
+      listHandsOff: () => registry.handsOffView(),
+    });
+    const res = await request(app).get('/health/detailed');
+
+    expect(res.status).toBe(500);
+    expect(res.body.status).toBe('degraded');
+    expect(res.body.handsOff).toEqual(EXPECTED);
+  });
+});
+
+/**
+ * Which plugins loaded and which were refused at startup. It tells the two readings of handsOff: []
+ * apart (a plugin that registered no policy vs. a plugin that was refused), and explains a queueStore
+ * reading `held`. Names and versions only: the refusal itself is in the pod log, never on this
+ * unauthenticated endpoint.
+ */
+describe('createHealthRoutes — plugins', () => {
+  const VIEW = { loaded: [{ name: 'rules-plugin', version: '0.9.32' }], refused: [{ name: 'broken-plugin', version: '1.0.0' }] };
+
+  it('GET /health/detailed lists the loaded and the refused plugins', async () => {
+    const res = await request(build({ listPlugins: () => VIEW })).get('/health/detailed');
+
+    expect(res.status).toBe(200);
+    expect(res.body.plugins).toEqual(VIEW);
+  });
+
+  it('keeps plugins on the degraded (500) response', async () => {
+    const res = await request(build({
+      getBrowserPoolHealth: async () => { throw new Error('pool down'); },
+      listPlugins: () => VIEW,
+    })).get('/health/detailed');
+
+    expect(res.status).toBe(500);
+    expect(res.body.plugins).toEqual(VIEW);
+  });
+});
+
+/**
+ * The shared host clock's SEND-TIME observer (QB-U30a): per store host, the sends of the trailing hour
+ * by caller, the smallest gap between two sends and how many gaps were under the floor. It reads the
+ * same whether the clock is on or off (off = the live negative control).
+ */
+describe('createHealthRoutes — hostClock', () => {
+  const VIEW = {
+    mode: 'hosts' as const,
+    hosts: [{
+      host: 'myfigurecollection.net', floorMs: 7000, clocked: true,
+      sends60m: { queue: 3, image: 6, ...U30B_SENDS }, minGapMs60m: 7000, underFloor60m: 0, ...U30B_FIELDS, lastSendAt: '2026-10-06T05:00:00.000Z',
+    }],
+  };
+
+  it('GET /health/detailed carries the hostClock block', async () => {
+    const res = await request(build({ getHostClock: () => VIEW })).get('/health/detailed');
+
+    expect(res.status).toBe(200);
+    expect(res.body.hostClock).toEqual(VIEW);
+  });
+
+  it('keeps hostClock on the degraded (500) response', async () => {
+    const res = await request(build({
+      getBrowserPoolHealth: async () => { throw new Error('pool down'); },
+      getHostClock: () => VIEW,
+    })).get('/health/detailed');
+
+    expect(res.status).toBe(500);
+    expect(res.body.hostClock).toEqual(VIEW);
+  });
+});
+
+/**
+ * The engine's maxPages guard (QB-U24, SCRAPE_CATALOG_MAX_PAGES_GUARD): per guarded store, how many
+ * /catalog pages above the profile's maxPages it answered exhausted WITHOUT a store fetch in the trailing
+ * hour. QB-U26's acceptance reads `maxPagesGuarded60m` here.
+ */
+describe('createHealthRoutes — maxPagesGuard', () => {
+  const VIEW = {
+    mode: 'stores' as const,
+    stores: [{ siteId: 'mfc', maxPagesGuarded60m: 1, lastGuardedAt: '2026-10-07T03:30:00.000Z' }],
+  };
+
+  it('GET /health/detailed carries the maxPagesGuard block', async () => {
+    const res = await request(build({ getMaxPagesGuard: () => VIEW })).get('/health/detailed');
+
+    expect(res.status).toBe(200);
+    expect(res.body.maxPagesGuard).toEqual(VIEW);
+  });
+
+  it('keeps maxPagesGuard on the degraded (500) response', async () => {
+    const res = await request(build({
+      getBrowserPoolHealth: async () => { throw new Error('pool down'); },
+      getMaxPagesGuard: () => VIEW,
+    })).get('/health/detailed');
+
+    expect(res.status).toBe(500);
+    expect(res.body.maxPagesGuard).toEqual(VIEW);
+  });
+});
+
+/**
+ * The queue's POOL-SELECT dispatch (QB-U19): per host its mode (pool | fifo-excluded | fifo-off) and the
+ * trailing hour's pick counters, plus agedCount. Present with zeros when SCRAPE_POOL_SELECT is off.
+ */
+describe('createHealthRoutes — pool', () => {
+  const VIEW = {
+    scope: 'all-except' as const,
+    malformed: false,
+    hosts: [
+      {
+        host: 'hpoi.net', mode: 'pool' as const, picks60m: 300, topBucketShare60m: 0.5, uniformPicks60m: 9, agedPicks60m: 200,
+        agedShare60m: 0.667, forcedPicks60m: 0, agedCount: 4, p99WaitH60m: 12.2, maxWaitH60m: 14.1, redraws60m: 30,
+        scanFallbacks60m: 2, retryPicks60m: 7,
+      },
+      {
+        host: 'myfigurecollection.net', mode: 'fifo-excluded' as const, picks60m: 0, topBucketShare60m: 0, uniformPicks60m: 0,
+        agedPicks60m: 0, agedShare60m: 0, forcedPicks60m: 0, agedCount: 0, p99WaitH60m: 0, maxWaitH60m: 0, redraws60m: 0,
+        scanFallbacks60m: 0, retryPicks60m: 0,
+      },
+    ],
+  };
+
+  it('GET /health/detailed carries the pool block', async () => {
+    const res = await request(build({ getPool: () => VIEW })).get('/health/detailed');
+
+    expect(res.status).toBe(200);
+    expect(res.body.pool).toEqual(VIEW);
+  });
+
+  it('keeps the pool block on the degraded (500) response', async () => {
+    const res = await request(build({
+      getBrowserPoolHealth: async () => { throw new Error('pool down'); },
+      getPool: () => VIEW,
+    })).get('/health/detailed');
+
+    expect(res.status).toBe(500);
+    expect(res.body.pool).toEqual(VIEW);
+  });
+
+  it('off: the block is present with an off scope', async () => {
+    const res = await request(build()).get('/health/detailed');
+
+    expect(res.body.pool).toEqual({ scope: 'off', malformed: false, hosts: [] });
   });
 });

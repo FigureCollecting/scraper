@@ -19,6 +19,7 @@ import type { CaptureSink } from '../captureSink.js';
 import { createFailureReporterFromEnv, type FetchOriginName } from '../failureReporter.js';
 import { createCaptureReporterFromEnv } from '../captureReporter.js';
 import { getResidentialProxyUrl } from '../residentialEgress.js';
+import { getCfCookieStore, markSessionLostIfStored, type CfCookieSessionSignals, type CfCookieSource } from '../cookieJar.js';
 import { createCapturingScrapingService } from '../engineServices/capturingScrapingService.js';
 import { createHttpBytesFetch } from './httpBytesFetch.js';
 import { createImpitBytesFetch } from './impitBytesFetch.js';
@@ -106,6 +107,8 @@ export interface AssembleImageCaptureDeps {
   /** The pooled browser surface for the gated lane (default: the shared capturing service, lazily). */
   browserLane?: () => GatedTabLane;
   policy?: ImageHostPolicy;
+  /** Where a lost login is marked (default: the process cookie store). */
+  sessionSignals?: CfCookieSource & CfCookieSessionSignals;
 }
 
 /**
@@ -134,7 +137,8 @@ function lazyGatedLane(resolveLane: () => GatedTabLane): GatedTabBytesFetcher {
 /**
  * The image lane's limiter. A host named in IMAGE_HOST_RATE_JSON gets that pinned gap; every other image host
  * gets the limiter's own default: a CDN is not in the store profile index, so there is nothing store-specific
- * to look up, and there should not be.
+ * to look up, and there should not be. A store's MAIN host on the shared clock (SCRAPE_HOST_CLOCK) is also held
+ * to its store floor there (QB-U8).
  */
 export function createImageHostLimiter(env: NodeJS.ProcessEnv = process.env): HostRateLimiter {
   return new HostRateLimiter(imageHostRateFor(env));
@@ -187,6 +191,8 @@ export function createImageCaptureHookFromEnv(
     policy: deps.policy ?? loadImageHostPolicy(env),
     fetchBytes,
     proxyUrlFor: egress => (egress === 'residential' ? getResidentialProxyUrl() : undefined),
+    onSessionLost: (url, lane, reason, sessionCookie) =>
+      void markSessionLostIfStored(deps.sessionSignals ?? getCfCookieStore(), url, lane, reason, sessionCookie),
     ...(reporter ? { reportFailure: report => reporter.report(report) } : {}),
     ...(captureReporter ? { reportCapture: report => captureReporter.report(report) } : {}),
     enabled,
@@ -228,7 +234,7 @@ export function imageCaptureView(hook: ImageCaptureHook = getImageCaptureHook())
       attempted: 0,
       stored: 0,
       deduped: 0,
-      skipped: { policyDeny: 0, memo: 0, thumbnailRole: 0, userRole: 0, cap: 0, residentialBudget: 0, notImage: 0, tooLarge: 0, refused: 0, unsupported: 0, inFlight: 0, sinkQueueFull: 0 },
+      skipped: { policyDeny: 0, memo: 0, thumbnailRole: 0, userRole: 0, cap: 0, residentialBudget: 0, notImage: 0, tooLarge: 0, refused: 0, unsupported: 0, inFlight: 0, sinkQueueFull: 0, displayGated: 0 },
       failed: 0,
       residentialBytesToday: 0,
     };

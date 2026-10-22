@@ -73,6 +73,15 @@ export interface ImageHostRule {
   accept?: string;
   /** Never fetch this host at all. */
   deny?: boolean;
+  /**
+   * Bodies this host serves IN PLACE of a plate, `{sha256 hex: label}` (e.g. mfc's anonymous "NSFW"
+   * tile). A match is stored nowhere and fails as `display-gated`. Absent ⇒ no body is refused.
+   */
+  placeholders?: Record<string, string>;
+  /** The host's images depend on a logged-in session: a placeholder here means the login died. */
+  loginGated?: boolean;
+  /** The session cookie of a `loginGated` host; an image response re-issuing it also means the login died. */
+  sessionCookie?: string;
 }
 
 /** The resolved table: the longest-suffix rule for a host, or an empty rule when none matches. */
@@ -86,6 +95,24 @@ export const DENIED_IMAGE_HOSTS: readonly string[] = ['otakumode.com'];
 const LANES: readonly string[] = ['http', 'impit', 'browser'];
 const EGRESSES: readonly string[] = ['direct', 'residential'];
 const UAS: readonly string[] = ['chrome', 'default'];
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+const PLACEHOLDER_LABEL = /^[\x21-\x7e]{1,64}$/;
+const COOKIE_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,128}$/;
+
+/** A `placeholders` map with its valid entries only (hash keys lowercased); undefined when none survive. */
+function validatePlaceholders(host: string, raw: unknown, warn: (message: string) => void): Record<string, string> | undefined {
+  if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) {
+    warn(`[IMAGE-POLICY] ignoring 'placeholders' on host ${sanitizeForLog(host)}: not a { sha256: label } object.`);
+    return undefined;
+  }
+  const out: Record<string, string> = {};
+  for (const [key, label] of Object.entries(raw as Record<string, unknown>)) {
+    const digest = key.trim().toLowerCase();
+    if (SHA256_HEX.test(digest) && typeof label === 'string' && PLACEHOLDER_LABEL.test(label)) out[digest] = label;
+    else warn(`[IMAGE-POLICY] ignoring placeholder '${sanitizeForLog(key.slice(0, 80))}' on host ${sanitizeForLog(host)}: needs a sha256 hex key and a short label.`);
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
 
 /**
  * Table key / lookup form of a host: lowercased, trimmed, leading dot and `www.` removed, and the
@@ -176,6 +203,12 @@ function validateRule(host: string, raw: unknown, warn: (message: string) => voi
     else if (field === 'accept' && typeof value === 'string' && isPlainHeaderValue(value.trim())) rule.accept = value.trim();
     else if (field === 'referer' && typeof value === 'boolean') rule.referer = value;
     else if (field === 'deny' && typeof value === 'boolean') rule.deny = value;
+    else if (field === 'loginGated' && typeof value === 'boolean') rule.loginGated = value;
+    else if (field === 'sessionCookie' && typeof value === 'string' && COOKIE_NAME.test(value)) rule.sessionCookie = value;
+    else if (field === 'placeholders') {
+      const placeholders = validatePlaceholders(host, value, warn);
+      if (placeholders) rule.placeholders = placeholders;
+    }
     else if (field === 'deny') {
       rule.deny = true;
       warn(`[IMAGE-POLICY] host ${sanitizeForLog(host)} has a non-boolean 'deny' — reading it as deny:true.`);
@@ -191,6 +224,9 @@ function validateRule(host: string, raw: unknown, warn: (message: string) => voi
   // that WRITES the browser lane can be caught here; one that inherits it is the decision's. A row
   // that also carries `deny` is not named: the decision answers `denied` before it resolves a lane,
   // so blaming the pairing would send the operator to fix a refusal that is the deny they wrote.
+  if (rule.sessionCookie !== undefined && rule.loginGated !== true) {
+    warn(`[IMAGE-POLICY] sessionCookie on host ${sanitizeForLog(host)} has no effect until the row sets loginGated:true.`);
+  }
   if (rule.lane === 'browser' && rule.ua === 'default' && !rule.deny) {
     warn(
       `[IMAGE-POLICY] host ${sanitizeForLog(host)} pairs lane:'browser' with ua:'default' — a browser tab always carries ` +
@@ -263,7 +299,17 @@ export function loadImageHostPolicy(
 
 /** The lane an image is fetched on, or the typed reason it is not fetched at all. */
 export type ImageLaneDecision =
-  | { ok: true; lane: ImageLane; egress: ImageEgress; referer?: string; ua: 'chrome' | 'default'; accept?: string }
+  | {
+      ok: true;
+      lane: ImageLane;
+      egress: ImageEgress;
+      referer?: string;
+      ua: 'chrome' | 'default';
+      accept?: string;
+      placeholders?: Readonly<Record<string, string>>;
+      loginGated?: true;
+      sessionCookie?: string;
+    }
   | { ok: false; reason: 'denied' | 'http-lane-residential' | 'off-store-residential' | 'browser-lane-default-ua'; detail?: string };
 
 /** The store's declared transport under the image lanes' names; undeclared ⇒ browser (ingest default). */
@@ -367,5 +413,9 @@ export function chooseImageLane(
     // ABSENT unless the table named one, so the lane sends its own archival default rather than a
     // value restated here — one place decides what an unconfigured host is asked for.
     ...(rule.accept !== undefined ? { accept: rule.accept } : {}),
+    // The matched row's own, never a parent's: a sibling host serves different placeholders.
+    ...(rule.placeholders !== undefined ? { placeholders: rule.placeholders } : {}),
+    ...(rule.loginGated === true ? { loginGated: true as const } : {}),
+    ...(rule.loginGated === true && rule.sessionCookie !== undefined ? { sessionCookie: rule.sessionCookie } : {}),
   };
 }

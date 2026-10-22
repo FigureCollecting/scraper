@@ -90,8 +90,6 @@ FROM base AS development
 
 # Copy package files
 COPY package*.json .npmrc ./
-# patches/ must be present before npm install so the patch-package postinstall applies
-COPY patches ./patches
 # plugin-contract manifest must be present so the file: dependency resolves at npm install
 COPY packages/plugin-contract/package.json ./packages/plugin-contract/
 
@@ -129,8 +127,6 @@ FROM base AS builder
 
 # Copy package files
 COPY package*.json .npmrc ./
-# patches/ must be present before npm install so the patch-package postinstall applies
-COPY patches ./patches
 # plugin-contract manifest must be present so the file: dependency resolves at npm install
 COPY packages/plugin-contract/package.json ./packages/plugin-contract/
 
@@ -157,8 +153,6 @@ FROM base AS production
 
 # Copy package files
 COPY package*.json .npmrc ./
-# patches/ must be present before npm install so the patch-package postinstall applies
-COPY patches ./patches
 # plugin-contract manifest must be present so the file: dependency resolves at npm install
 COPY packages/plugin-contract/package.json ./packages/plugin-contract/
 

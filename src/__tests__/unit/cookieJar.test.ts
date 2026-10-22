@@ -511,8 +511,9 @@ describe('CfCookieStore — stale / fresh transitions + view()', () => {
         mintedAt: '2026-09-06T00:00:00.000Z',
         expiresAt: '2026-09-07T00:00:00.000Z',
         stale: false,
+        sessionLost: false,
       },
-      { host: 'anitoysgk.com', cookieNames: ['cf_clearance'], userAgentPinned: false, loadedAt: new Date(clock).toISOString(), stale: false },
+      { host: 'anitoysgk.com', cookieNames: ['cf_clearance'], userAgentPinned: false, loadedAt: new Date(clock).toISOString(), stale: false, sessionLost: false },
     ]));
     const json = JSON.stringify(view);
     for (const v of VALUES) expect(json).not.toContain(v);

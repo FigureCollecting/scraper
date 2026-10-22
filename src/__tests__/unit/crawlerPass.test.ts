@@ -10,6 +10,7 @@
  */
 import { runCrawlerPass, type CrawlerConfig, type FetchLike, type HttpResponseLike } from '../../crawler/crawler';
 import { createMemoryLedgerStore, createEmptyLedger, type Ledger } from '../../crawler/ledger';
+import { phasesForMode } from '../../crawler/config';
 import { logger } from '../../utils/logger';
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
@@ -23,6 +24,8 @@ const waitFor = async (pred: () => boolean, timeoutMs = 3000): Promise<void> => 
     await new Promise((r) => setTimeout(r, 1));
   }
 };
+
+const defaultMode = 'both';
 
 const mkCfg = (over: Partial<CrawlerConfig> = {}): CrawlerConfig => ({
   scraperServiceUrl: 'http://scraper.test',
@@ -43,7 +46,19 @@ const mkCfg = (over: Partial<CrawlerConfig> = {}): CrawlerConfig => ({
   rangeIdsPerRun: 50,
   rangeFrontiers: {},
   seedSpacingMs: 10_000,
+  reobserveMinAgeMs: 12 * 60 * 60 * 1000,
+  maxReobservePerStore: 0,
+  storeReobserveCaps: {},
+  reobserveDryRun: false,
+  rangeReanchorMs: 24 * 60 * 60 * 1000,
+  rangeReanchorMaxDelta: 50_000,
+  rangeGapBudget: 0,
+  rangeGaps: {},
+  rangeGapDryRun: false,
   ...over,
+  // `mode` is a LABEL; `phases` is what runs. loadCrawlerConfig derives one from the other, and so
+  // does this helper, so a `mode` override keeps meaning exactly what it always meant here.
+  phases: over.phases ?? phasesForMode(over.mode ?? defaultMode),
 });
 
 const collectUrl = (siteId: string, id: string): string => `https://${siteId}.test/api/${id}`;
@@ -205,7 +220,7 @@ describe('runCrawlerPass — recent mode', () => {
 
     const l = store.files.get('orzgk')!;
     expect(Object.keys(l.enqueued).sort()).toEqual(['1a', '1b', '2a', '2b', '3a', '3b']);
-    expect(l.enqueued['2a']).toEqual({ at: iso(T0), collectUrl: collectUrl('orzgk', '2a') });
+    expect(l.enqueued['2a']).toEqual({ at: iso(T0), collectUrl: collectUrl('orzgk', '2a'), via: 'recent' });
     expect(l.recent).toEqual({ lastRunAt: iso(T0), lastNewCount: 6 });
     expect(l.backfill).toEqual({ cursor: null }); // recent-only never touches backfill state
     expect(l.updatedAt).toBe(iso(T0));
@@ -1068,7 +1083,7 @@ describe('runCrawlerPass — id-range backfill', () => {
 
   it('prefers the highest numeric itemId the ledger has seen over the env seed; ids already enqueued are skipped but still consume the walk', async () => {
     const fake = makeFake({ catalog: (s, p) => failed(s) });
-    const store = createMemoryLedgerStore({ mfc: ledgerWith('mfc', ['800', '799', 'not-a-number', '12'], T0 - 1000) });
+    const store = createMemoryLedgerStore({ mfc: ledgerWith('mfc', ['800', '799', 'not-a-number', '1e7', '12'], T0 - 1000) });
     const s = await runCrawlerPass(rangeOnly({ rangeIdsPerRun: 3, rangeFrontiers: { mfc: 500 } }), { fetch: fake.fetch, ledgerStore: store, now: clock().now });
 
     expect(fake.rangeCalls()).toEqual([['mfc', 800, 3]]);
@@ -1203,7 +1218,7 @@ describe('runCrawlerPass — id-range backfill', () => {
       expect(first.posted().length).toBe(5);
       expect(Object.keys(store.files.get('mfc')?.enqueued ?? {})).toEqual([]);
       expect(store.saveLog).toEqual([]);
-      expect(s1.stores[0]).toMatchObject({ errors: 5, enqueued: 0, rangeCursor: null });
+      expect(s1.stores[0]).toMatchObject({ errors: 5, enqueued: 0, rangeCursor: null, rangeSkipped: 'window-rejected' });
       expect(warn.mock.calls.some((c) => String(c[0]).includes('rejected'))).toBe(true);
 
       // Next run re-walks the SAME window — the ids are not below a cursor that nothing collected.
@@ -1229,6 +1244,20 @@ describe('runCrawlerPass — id-range backfill', () => {
     });
     expect(store.files.get('mfc')!.range!.cursor).toBe(497);
     expect(s.stores[0]).toMatchObject({ enqueued: 2, errors: 1, rangeWalked: 3, rangeCursor: 497 });
+  });
+
+  it('a window of known ids plus ONE refusal advances the cursor instead of re-walking it every run', async () => {
+    const store = createMemoryLedgerStore({
+      mfc: ledgerWith('mfc', ['500', '499', '498', '497'], T0 - 1000, { range: { cursor: 500, frontier: 500 } }),
+    });
+    const fake = makeFake({
+      catalog: (s) => failed(s),
+      ingest: (u) => (u.endsWith('/496') ? { status: 422, body: { success: false } } : { status: 202, body: { success: true, deduplicated: false } }),
+    });
+    const s = await runCrawlerPass(rangeOnly(), { fetch: fake.fetch, ledgerStore: store, now: clock().now });
+    expect(fake.posted()).toEqual([collectUrl('mfc', '496')]);
+    expect(store.files.get('mfc')!.range!.cursor).toBe(495);
+    expect(s.stores[0]).toMatchObject({ rangeWalked: 5, rangeCursor: 495, rangeSkipped: null, enqueued: 0, errors: 1 });
   });
 
   it('refuses a window that is not the descending run it asked for — no POST, no cursor movement', async () => {

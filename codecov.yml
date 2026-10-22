@@ -55,3 +55,4 @@ ignore:
   - "**/__mocks__/**"
   - "**/node_modules/**"
   - "**/dist/**"
+  - "src/gen/**"

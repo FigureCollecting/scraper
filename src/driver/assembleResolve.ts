@@ -26,6 +26,8 @@ import { isCloudflareChallenge } from '../services/engineServices/challengeDetec
 import { getChallengeCooldown, type ChallengeCooldown } from '../services/challengeCooldown.js';
 import { sanitizeForLog } from '../utils/security.js';
 import type { ProfileRegistry } from './profileRegistry.js';
+import type { HostClock } from '../services/hostClock.js';
+import { sendOnHostClock } from '../services/hostClockSend.js';
 import type { ExtractContext, ExtractedData, ExtractionRuleset, SearchFetch } from '@figurecollecting/scraper-plugin-contract';
 
 export interface ResolveServices {
@@ -78,6 +80,11 @@ export interface ResolveServices {
    * swallowed — this leg answers a caller, and an image lane cannot be allowed to fail that answer.
    */
   captureImages?: (records: ExtractedData[], url: string, ruleset: ExtractionRuleset) => void;
+  /**
+   * The shared per-host clock (QB-U30b) each id's detail fetch books on. Optional — defaults to the
+   * process clock (SCRAPE_HOST_CLOCK; off by default); tests inject one.
+   */
+  hostClock?: HostClock;
 }
 
 export interface ResolveItem {
@@ -174,12 +181,32 @@ export function assembleResolve(services: ResolveServices): Resolve {
           }
           // Record the attempt win or lose (the host was contacted either way — H1 records at
           // dispatch), completion-anchored like D8 so one map carries one consistent semantic.
-          const { html, statusCode } = await (caps.searchFetch
-            ? services.fetchDetail(url, caps.searchFetch)
-            : services.fetchDetail(url)
-          ).finally(() => {
-            if (host !== undefined) lastFetchedAt.set(host, now());
-          });
+          const fetchDetail = (): Promise<{ html: string; statusCode?: number }> =>
+            (caps.searchFetch ? services.fetchDetail(url, caps.searchFetch) : services.fetchDetail(url)).finally(() => {
+              if (host !== undefined) lastFetchedAt.set(host, now());
+            });
+          let page: { html: string; statusCode?: number };
+          if (host === undefined) {
+            page = await fetchDetail();
+          } else {
+            // THE HOST CLOCK (QB-U30b): each id's detail fetch also books the host's next slot on the
+            // shared clock and runs the send block, so it is spaced from the queue, the images and every
+            // other caller, not only from this call's previous fetch. A slot past the wait cap, or a
+            // cooldown that opened while it waited, leaves the id in `cooldown`, unfetched.
+            const sent = await sendOnHostClock(
+              { host, caller: 'resolve', veto: () => (cd.isOpen(host) ? 'cooling' : undefined) },
+              fetchDetail,
+              { ...(services.hostClock ? { clock: services.hostClock } : {}), now, sleep },
+            );
+            if (!sent.sent) {
+              // eslint-disable-next-line no-console
+              console.warn(`[HOST-CLOCK] ${sanitizeForLog(url)} left alone: ${sent.refused ? `its slot is ${sent.waitMs} ms away` : `${host} began cooling while it waited`}`);
+              cooldown.push(itemId);
+              continue;
+            }
+            page = sent.value;
+          }
+          const { html, statusCode } = page;
           // A detail body that IS a Cloudflare challenge is NOT a confirm — the browser lane never
           // sets a `challenge` flag, so detect it on the body here: OPEN the host's cooldown (so the
           // queue and the lookup fan-out then leave it alone) and fail THIS id. Checked BEFORE the

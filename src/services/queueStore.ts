@@ -46,6 +46,7 @@ import * as path from 'path';
 import { normalizeHost } from './challengeCooldown.js';
 import { sanitizeForLog } from '../utils/security.js';
 import type { QueuePriority, ItemStatus } from './scrapeQueue.js';
+import { isQueueLane, type HostLaneRow, type QueueLane } from './queueLane.js';
 
 /** The default directory — the mount point the fc-infra `scraper-queue` PVC provides. */
 export const DEFAULT_QUEUE_DIR = '/var/lib/scraper';
@@ -83,6 +84,11 @@ export type QueueItemState = 'pending' | 'leased' | 'parked';
  *                           store was opened; readable rows were carried over. STILL DURABLE.
  *   write_failed          — a write failed at runtime (a full disk, a revoked mount). The store
  *                           degrades to in-memory for the rest of the process life and keeps serving.
+ *   held                  — the engine came up without every plugin (one was refused or failed to
+ *                           load, no store registered, or the bootstrap threw), so the durable file was
+ *                           closed at startup without being restored: its rows (and open host
+ *                           cooldowns) wait for a start with a whole registry, and this process queues
+ *                           in memory (ScrapeQueue.holdQueueStore).
  */
 export type QueueStoreReason =
   | 'ok'
@@ -91,7 +97,8 @@ export type QueueStoreReason =
   | 'not_writable'
   | 'open_failed'
   | 'open_failed_recovered'
-  | 'write_failed';
+  | 'write_failed'
+  | 'held';
 
 /**
  * The persistable shape of a QueueItem — deliberately a SUBSET. No cookies (never stored), no
@@ -112,11 +119,27 @@ export interface PersistedQueueItem {
   maxRetries: number;
   /** `QueueItem.queuedAt` (epoch ms). */
   enqueuedAt: number;
+  /**
+   * When the item entered its DISPATCH CLASS (host + tier; QB-U19), epoch ms: its enqueue, re-stamped by
+   * a priority raise, never by a retry or a dedup enqueue. Absent = `enqueuedAt` (the row never changed
+   * class, or an older build wrote it and left the column NULL). POOL-SELECT ages R1 and R2 from it.
+   */
+  classEnteredAt?: number;
   state: QueueItemState;
   /** Epoch ms at which a lease expires. Only meaningful while state === 'leased'. */
   leaseUntil?: number;
   /** The last `ErrorType` this item failed with — enough to explain a restored item's attempt count. */
   lastErrorClass?: string;
+  /**
+   * The work class the item was enqueued for (QB-U1). Absent = no lane, counted as 'other'. A value
+   * on disk this build does not know reads back as absent here and as `unknownLane` (see `laneFromDisk`).
+   */
+  lane?: QueueLane;
+  /**
+   * A lane cell this build does not know (a newer build wrote it), as text. It COUNTS as no lane, but
+   * the row HAS a lane: the coalesce rule never relabels it and a salvage copy writes it back as text.
+   */
+  unknownLane?: string;
 }
 
 /** A persisted per-host challenge cooldown (mirrors challengeCooldown.ts's CooldownEntry). */
@@ -145,6 +168,16 @@ export interface QueueCounts {
   pending: number;
   leased: number;
   parked: number;
+}
+
+/** What {@link ScrapeQueueStore.pageIn} takes: every parked row unless narrowed. */
+export interface PageInOptions {
+  /** Leave these hosts' rows parked. */
+  skipHosts?: readonly string[];
+  /** Only this host's rows. */
+  host?: string;
+  /** Only rows of these priorities (an empty list: none). */
+  priorities?: readonly QueuePriority[];
 }
 
 export interface ScrapeQueueStore {
@@ -186,8 +219,12 @@ export interface ScrapeQueueStore {
   remove(id: string): void;
   /** Move a resident row out of the working set without losing it. */
   park(id: string): void;
-  /** Flip up to `limit` parked rows back to pending and return them, oldest first. */
-  pageIn(limit: number, opts?: { skipHosts?: readonly string[] }): PersistedQueueItem[];
+  /**
+   * Flip up to `limit` parked rows back to pending and return them, highest priority then oldest first.
+   * `skipHosts` leaves those hosts' rows parked; `host` takes only that host's rows; `priorities` only
+   * rows of those priorities (none for an empty list).
+   */
+  pageIn(limit: number, opts?: PageInOptions): PersistedQueueItem[];
   /**
    * Whether ANY row (pending, leased or parked) holds this dedup key. The queue's dedup path asks
    * this instead of holding a Set of parked ids — the whole point of parking is that depth lives on
@@ -205,8 +242,30 @@ export interface ScrapeQueueStore {
    * a fresh retry budget.
    */
   claimKey(mfcId: string): PersistedQueueItem | null;
-  /** Record a priority upgrade, so a restored item comes back at the priority it was raised to. */
-  setPriority(id: string, priority: QueuePriority): void;
+  /**
+   * Record a priority upgrade, so a restored item comes back at the priority it was raised to. A raise
+   * moves the row into another dispatch class, so the queue passes the instant it entered it
+   * (class_entered_at); without one the stamp is left as it is.
+   */
+  setPriority(id: string, priority: QueuePriority, classEnteredAt?: number): void;
+  /**
+   * One dispatch class's PARKED rows (normalized host + priority), oldest class entry first (then dedup
+   * key). Pool dispatch reads them so R1 and R2 see the whole class, not only the resident working set
+   * (QB-U19). idx_queue_class_age finds the class's rows (state, host); the order is a sort over them,
+   * so a call costs O(parked rows of the host). [] on the fallback and after close.
+   */
+  listParked(host: string, priority: QueuePriority): PersistedQueueItem[];
+  /**
+   * Label an UNLABELLED row (the queue's coalesce rule), so a restored item keeps the lane it adopted.
+   * A row that already carries a lane, one this build knows or not, is left as it is.
+   */
+  setLane(id: string, lane: QueueLane): void;
+  /**
+   * Rows in one state counted by (host, lane). A lane this build does not know counts as no lane.
+   * The queue reconciles its per-(host, lane) parked counters from this at boot; the index
+   * idx_queue_host_lane answers it without touching the table.
+   */
+  countByHostLane(state: QueueItemState): HostLaneRow[];
   /** Release EVERY lease back to pending. Called on SIGTERM so a planned rollout loses nothing. */
   releaseLeases(): number;
   /** Flip leases that expired on or before `now` back to pending and return them. */
@@ -249,6 +308,61 @@ CREATE TABLE IF NOT EXISTS host_cooldowns (
   opened_at INTEGER NOT NULL
 );
 `;
+
+/**
+ * SCHEMA STEPS — every change to a table that already exists on someone's disk.
+ *
+ * `schema_meta` RECORDS which steps a file has had (key, value, when). It does not GATE them: each
+ * step checks for the thing it adds (`PRAGMA table_info` for a column, `IF NOT EXISTS` for an index)
+ * and does nothing if it is already there. That is what makes a rollback safe in both directions:
+ *   - an OLDER build opens an upgraded file without noticing: it ignores the extra table, index and
+ *     column, and its INSERTs name their columns, so the rows it writes leave `lane` NULL;
+ *   - the NEW build re-opening a file an older build has worked finds the column present and skips
+ *     the ALTER, instead of throwing "duplicate column name" and sending a healthy queue to quarantine.
+ *
+ * `PRAGMA user_version` plays no part in this. It is the writability probe in `openQueueStore`, set to
+ * 1 by every build on every open, and it must never be read as a version.
+ */
+const SCHEMA_META = `
+CREATE TABLE IF NOT EXISTS schema_meta (
+  key        TEXT PRIMARY KEY,
+  value      TEXT NOT NULL,
+  applied_at INTEGER NOT NULL
+);
+`;
+
+/** The `schema_meta` record for the lane step. */
+const LANE_STEP = { key: 'queue_items.lane', value: '1' } as const;
+/** The `schema_meta` record for the class-entry step (QB-U19). */
+const CLASS_ENTRY_STEP = { key: 'queue_items.class_entered_at', value: '1' } as const;
+
+/**
+ * QB-U1: a nullable `lane` on every queue row, and the index the lane scheduler pages and counts
+ * through. The upsert keeps the FIRST applied_at on a re-open and only RAISES a record: one below this
+ * step's value (or not a number) is rewritten, and one a newer build wrote is left as it is, so after
+ * a rollback the record still says what the file has had.
+ */
+function applySchemaSteps(db: DatabaseSync, now: number): void {
+  db.exec(SCHEMA_META);
+  const columns = db.prepare('PRAGMA table_info(queue_items)').all() as unknown as Array<{ name: string }>;
+  if (!columns.some((c) => c.name === 'lane')) {
+    db.exec('ALTER TABLE queue_items ADD COLUMN lane TEXT');
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_queue_host_lane ON queue_items(state, host, lane, priority, enqueued_at)');
+  // QB-U19: when the row entered its dispatch class (POOL-SELECT ages from it). Nullable: a row an older
+  // build writes leaves it NULL, and a NULL reads as the row's enqueued_at.
+  if (!columns.some((c) => c.name === 'class_entered_at')) {
+    db.exec('ALTER TABLE queue_items ADD COLUMN class_entered_at INTEGER');
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_queue_class_age ON queue_items(state, host, lane, priority, class_entered_at)');
+  const record = db.prepare(
+    `INSERT INTO schema_meta (key, value, applied_at) VALUES (?, ?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, applied_at = excluded.applied_at
+     WHERE CAST(schema_meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)`
+  );
+  record.run(LANE_STEP.key, LANE_STEP.value, now);
+  record.run(CLASS_ENTRY_STEP.key, CLASS_ENTRY_STEP.value, now);
+}
 
 /**
  * ONE ROW PER DEDUP KEY, enforced by the schema rather than by every caller remembering to look
@@ -308,9 +422,41 @@ interface ItemRow {
   state: string;
   lease_until: number | null;
   last_error_class: string | null;
+  /** Absent altogether when salvage reads a file written before the column existed. */
+  lane?: unknown;
+  /** NULL when an older build wrote the row; absent when salvage reads a file without the column. */
+  class_entered_at?: number | null;
 }
 
-function rowToItem(row: ItemRow): PersistedQueueItem {
+/**
+ * A `lane` cell read back. NULL and an absent column are no lane. A value outside the vocabulary is a
+ * lane a newer build wrote: it reads as no lane here (an unknown label must never become a class of
+ * its own), and comes back as `unknownLane` so nothing in this build overwrites it: the coalesce rule
+ * never relabels the row, `setLane` only writes a NULL cell, and salvage copies it back as text (a
+ * text cell exactly; a non-text cell, which no build writes, as its String() form, still unknown).
+ */
+function laneFromDisk(raw: unknown, onUnknown: (value: string) => void): Pick<PersistedQueueItem, 'lane' | 'unknownLane'> {
+  if (raw === null || raw === undefined) return {};
+  if (isQueueLane(raw)) return { lane: raw };
+  const text = String(raw);
+  onUnknown(text);
+  return { unknownLane: text };
+}
+
+/** ONE warning per store for unknown lanes, however many rows carry one and however often they are read. */
+function warnUnknownLaneOnce(): (value: string) => void {
+  let warned = false;
+  return (value: string): void => {
+    if (warned) return;
+    warned = true;
+    console.warn(
+      `[SCRAPE QUEUE] queue store read an unknown lane '${sanitizeForLog(value)}' — read as no lane ('other'), ` +
+        'the row is left as it is; further unknown lanes are not logged'
+    );
+  };
+}
+
+function rowToItem(row: ItemRow, onUnknownLane: (value: string) => void): PersistedQueueItem {
   return {
     id: row.id,
     mfcId: row.mfc_id,
@@ -324,6 +470,11 @@ function rowToItem(row: ItemRow): PersistedQueueItem {
     state: row.state as QueueItemState,
     ...(row.lease_until !== null ? { leaseUntil: row.lease_until } : {}),
     ...(row.last_error_class !== null ? { lastErrorClass: row.last_error_class } : {}),
+    ...laneFromDisk(row.lane, onUnknownLane),
+    // NULL or absent (an older build's row) = the enqueue; carried only when the row changed class.
+    ...(typeof row.class_entered_at === 'number' && row.class_entered_at !== row.enqueued_at
+      ? { classEnteredAt: row.class_entered_at }
+      : {}),
   };
 }
 
@@ -365,6 +516,15 @@ export interface OpenQueueStoreOptions {
  * `createQueueStore` is the fail-safe wrapper every caller should use.
  */
 export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueStore {
+  return openSqliteStore(opts, warnUnknownLaneOnce());
+}
+
+/**
+ * `openQueueStore` with its unknown-lane warner handed in: ONE warning for this store, whichever read
+ * meets an unknown lane first. A recovery hands the same warner to the salvage read and to both of
+ * its handles, so a boot that salvages a file warns once, not once per handle.
+ */
+function openSqliteStore(opts: OpenQueueStoreOptions, onUnknownLane: (value: string) => void): ScrapeQueueStore {
   const dir = opts.dir ?? resolveQueueDir() ?? DEFAULT_QUEUE_DIR;
   const file = path.join(dir, QUEUE_DB_FILE);
   const db = new DatabaseSync(file);
@@ -380,6 +540,7 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
     db.exec('PRAGMA synchronous = FULL');
     db.exec('PRAGMA foreign_keys = ON');
     db.exec(SCHEMA);
+    applySchemaSteps(db, (opts.now ?? Date.now)());
     db.exec(DEDUP_KEY_CONSTRAINT);
     // Any handle that survived the SCHEMA exec has a real, readable database behind it.
     db.prepare('SELECT COUNT(*) AS n FROM queue_items').get();
@@ -388,6 +549,8 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
     // tables that already exist — and then throws on the FIRST real write, which is the boot
     // reconciliation. Failing here instead routes it to quarantine + salvage, where it belongs.
     // (`BEGIN IMMEDIATE` is not enough: SQLite defers the readonly error until a page is touched.)
+    // NOT A SCHEMA VERSION: every build, old and new, writes 1 here on every open, so the number says
+    // nothing about the file's shape. Schema steps are recorded in schema_meta (applySchemaSteps).
     db.exec('PRAGMA user_version = 1');
     // Applied AFTER the schema so creating the tables is never itself refused by the ceiling.
     maxPages = Math.max(1, Math.floor(opts.maxPageCount ?? pagesForMb(resolveMaxMb(), db)));
@@ -407,8 +570,8 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
   const stmt = {
     put: db.prepare(
       `INSERT INTO queue_items
-         (id, mfc_id, url, host, priority, status, session_id, attempts, max_retries, enqueued_at, state, lease_until, last_error_class)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+         (id, mfc_id, url, host, priority, status, session_id, attempts, max_retries, enqueued_at, state, lease_until, last_error_class, lane, class_entered_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
        ON CONFLICT DO NOTHING`
     ),
     lease: db.prepare(`UPDATE queue_items SET state = 'leased', lease_until = ? WHERE id = ?`),
@@ -438,7 +601,13 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
     dropExpiredCooldowns: db.prepare('DELETE FROM host_cooldowns WHERE until <= ?'),
     hasKey: db.prepare('SELECT 1 AS hit FROM queue_items WHERE mfc_id = ? LIMIT 1'),
     selKey: db.prepare('SELECT * FROM queue_items WHERE mfc_id = ? ORDER BY enqueued_at ASC LIMIT 1'),
-    setPriority: db.prepare('UPDATE queue_items SET priority = ? WHERE id = ?'),
+    setPriority: db.prepare('UPDATE queue_items SET priority = ?, class_entered_at = COALESCE(?, class_entered_at) WHERE id = ?'),
+    listParked: db.prepare(
+      `SELECT * FROM queue_items WHERE state = 'parked' AND host = ? AND priority = ?
+       ORDER BY COALESCE(class_entered_at, enqueued_at) ASC, mfc_id ASC`
+    ),
+    setLane: db.prepare('UPDATE queue_items SET lane = ? WHERE id = ? AND lane IS NULL'),
+    countByHostLane: db.prepare('SELECT host, lane, COUNT(*) AS n FROM queue_items WHERE state = ? GROUP BY host, lane'),
     clearItems: db.prepare('DELETE FROM queue_items'),
   } satisfies Record<string, StatementSync>;
 
@@ -462,6 +631,7 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
    */
   let degraded = false;
   let reason: QueueStoreReason = opts.reason ?? 'ok';
+  const toItem = (row: ItemRow): PersistedQueueItem => rowToItem(row, onUnknownLane);
   let loggedLogicFault = false;
   const degrade = (error: unknown): void => {
     if (degraded) return;
@@ -550,24 +720,31 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
     }
   };
 
-  const pageInStmt = (limit: number, skipHosts: readonly string[]): PersistedQueueItem[] => {
+  const PRIORITY_RANK = "CASE priority WHEN 'HOT' THEN 0 WHEN 'WARM' THEN 1 ELSE 2 END";
+  const pageInStmt = (limit: number, skipHosts: readonly string[], host: string | undefined, priorities: readonly QueuePriority[] | undefined): PersistedQueueItem[] => {
     // A host already at its in-memory cap is skipped IN SQL, so a capped host's backlog never
     // consumes the page-in budget only to be re-parked.
     const placeholders = skipHosts.map(() => '?').join(',');
-    const where = skipHosts.length
-      ? `state = 'parked' AND (host IS NULL OR host NOT IN (${placeholders}))`
-      : `state = 'parked'`;
+    const hostWhere =
+      host !== undefined
+        ? `state = 'parked' AND host = ?`
+        : skipHosts.length
+          ? `state = 'parked' AND (host IS NULL OR host NOT IN (${placeholders}))`
+          : `state = 'parked'`;
+    const where = priorities !== undefined ? `${hostWhere} AND priority IN (${priorities.map(() => '?').join(',')})` : hostWhere;
+    const params = [...(host !== undefined ? [host] : skipHosts), ...(priorities ?? [])];
     const rows = read(
       () =>
         db
-          .prepare(`SELECT * FROM queue_items WHERE ${where} ORDER BY enqueued_at ASC LIMIT ?`)
-          .all(...skipHosts, limit) as unknown as ItemRow[],
+          // Priority before age: a parked WARM row must not wait behind every older parked COLD one.
+          .prepare(`SELECT * FROM queue_items WHERE ${where} ORDER BY ${PRIORITY_RANK}, enqueued_at ASC LIMIT ?`)
+          .all(...params, limit) as unknown as ItemRow[],
       [] as ItemRow[]
     );
     if (rows.length === 0) return [];
     return batch(() => {
       for (const row of rows) write(() => stmt.fail.run(row.attempts, row.last_error_class, row.id));
-      return rows.map((r) => ({ ...rowToItem(r), state: 'pending' as const }));
+      return rows.map((r) => ({ ...toItem(r), state: 'pending' as const }));
     });
   };
 
@@ -601,7 +778,9 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
         item.enqueuedAt,
         item.state,
         item.leaseUntil ?? null,
-        item.lastErrorClass ?? null
+        item.lastErrorClass ?? null,
+        item.lane ?? item.unknownLane ?? null,
+        item.classEnteredAt ?? item.enqueuedAt
       ));
     },
 
@@ -621,9 +800,9 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
       write(() => stmt.park.run(id));
     },
 
-    pageIn(limit: number, opts?: { skipHosts?: readonly string[] }): PersistedQueueItem[] {
+    pageIn(limit: number, opts?: PageInOptions): PersistedQueueItem[] {
       if (closed || limit <= 0) return [];
-      return pageInStmt(limit, opts?.skipHosts ?? []);
+      return pageInStmt(limit, opts?.skipHosts ?? [], opts?.host, opts?.priorities);
     },
 
     hasKey(mfcId: string): boolean {
@@ -635,11 +814,36 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
       if (row === undefined) return null;
       // `fail` is exactly the transition wanted: back to pending, lease cleared, attempts preserved.
       write(() => stmt.fail.run(row.attempts, row.last_error_class, row.id));
-      return { ...rowToItem(row), state: 'pending' as const, leaseUntil: undefined };
+      return { ...toItem(row), state: 'pending' as const, leaseUntil: undefined };
     },
 
-    setPriority(id: string, priority: QueuePriority): void {
-      write(() => stmt.setPriority.run(priority, id));
+    setPriority(id: string, priority: QueuePriority, classEnteredAt?: number): void {
+      write(() => stmt.setPriority.run(priority, classEnteredAt ?? null, id));
+    },
+
+    setLane(id: string, lane: QueueLane): void {
+      write(() => stmt.setLane.run(lane, id));
+    },
+
+    listParked(host: string, priority: QueuePriority): PersistedQueueItem[] {
+      return read(() => (stmt.listParked.all(host, priority) as unknown as ItemRow[]).map(toItem), []);
+    },
+
+    countByHostLane(state: QueueItemState): HostLaneRow[] {
+      const rows = read(
+        () => stmt.countByHostLane.all(state) as unknown as Array<{ host: string | null; lane: unknown; n: number }>,
+        []
+      );
+      // An unknown lane folds into no lane, so it merges with that host's NULL row.
+      const merged = new Map<string, HostLaneRow>();
+      for (const row of rows) {
+        const { lane } = laneFromDisk(row.lane, onUnknownLane);
+        const key = JSON.stringify([row.host, lane ?? null]);
+        const prev = merged.get(key);
+        if (prev !== undefined) prev.n += Number(row.n);
+        else merged.set(key, { host: row.host, lane, n: Number(row.n) });
+      }
+      return [...merged.values()];
     },
 
     releaseLeases(): number {
@@ -656,7 +860,7 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
         const rows = read(() => stmt.selLeasedExpired.all(now) as unknown as ItemRow[], [] as ItemRow[]);
         if (rows.length === 0) return [];
         write(() => stmt.freeLeasedExpired.run(now));
-        return rows.map((r) => ({ ...rowToItem(r), state: 'pending' as const, leaseUntil: undefined }));
+        return rows.map((r) => ({ ...toItem(r), state: 'pending' as const, leaseUntil: undefined }));
       });
     },
 
@@ -700,9 +904,9 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
         write(() => stmt.dropExpiredCooldowns.run(now));
 
         return {
-          pending: pendingRows.map(rowToItem),
+          pending: pendingRows.map(toItem),
           leasedExpired: leasedExpiredRows.map((r) => ({
-            ...rowToItem(r),
+            ...toItem(r),
             state: 'pending' as const,
             leaseUntil: undefined,
           })),
@@ -773,6 +977,9 @@ export function createMemoryQueueStore(
     hasKey: () => false,
     claimKey: () => null,
     setPriority: () => {},
+    setLane: () => {},
+    listParked: () => [],
+    countByHostLane: () => [],
     releaseLeases: () => 0,
     reapExpiredLeases: () => [],
     saveCooldown: () => {},
@@ -863,7 +1070,11 @@ function quarantine(file: string, stamp: string): string | null {
  * {carried: 0, lost: 0}: there is nothing to enumerate, and `quarantinedPath` is what the operator
  * follows instead.
  */
-function salvage(quarantinedPath: string, into: ScrapeQueueStore): { carried: number; lost: number } {
+function salvage(
+  quarantinedPath: string,
+  into: ScrapeQueueStore,
+  onUnknownLane: (value: string) => void
+): { carried: number; lost: number } {
   let rows: ItemRow[] = [];
   let cooldowns: Array<{ host: string; until: number; reason: string; opened_at: number }> = [];
   try {
@@ -883,7 +1094,7 @@ function salvage(quarantinedPath: string, into: ScrapeQueueStore): { carried: nu
   }
   into.batch(() => {
     for (const row of rows) {
-      const item = rowToItem(row);
+      const item = rowToItem(row, onUnknownLane);
       // Nothing holds a lease across a process boundary, so an in-flight row comes back drivable.
       into.put({ ...item, state: item.state === 'leased' ? 'pending' : item.state, leaseUntil: undefined });
     }
@@ -956,11 +1167,13 @@ export function createQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueS
       try {
         // Salvage through a first handle, then CLOSE it and reopen, so the store we hand back reports
         // the MEASURED lostAtStartup rather than the zero we would have had to guess at open time.
-        const probe = openQueueStore({ ...opts, dir, reason: 'open_failed_recovered', quarantinedPath });
+        // One unknown-lane warner spans the salvage read and both handles: one boot, one warning.
+        const onUnknownLane = warnUnknownLaneOnce();
+        const probe = openSqliteStore({ ...opts, dir, reason: 'open_failed_recovered', quarantinedPath }, onUnknownLane);
         let carried = 0;
         let lost = 0;
         try {
-          ({ carried, lost } = salvage(quarantinedPath, probe));
+          ({ carried, lost } = salvage(quarantinedPath, probe, onUnknownLane));
         } finally {
           probe.close();
         }
@@ -969,7 +1182,10 @@ export function createQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueS
             `${sanitizeForLog(quarantinedPath)} and opened a fresh one — ` +
             `${carried} item(s) carried over, ${lost} lost`
         );
-        return openQueueStore({ ...opts, dir, reason: 'open_failed_recovered', quarantinedPath, lostAtStartup: lost });
+        return openSqliteStore(
+          { ...opts, dir, reason: 'open_failed_recovered', quarantinedPath, lostAtStartup: lost },
+          onUnknownLane
+        );
       } catch {
         // The fresh open failed too — the directory itself is the problem, not the file.
       }

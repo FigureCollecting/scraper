@@ -33,6 +33,7 @@ module.exports = {
     '!src/initiator/run.ts',  // process entrypoint (wiring only), like src/index.ts
     '!src/crawler/run.ts',    // process entrypoint (wiring only), like src/initiator/run.ts
     '!src/utils/logger.ts',
+    '!src/gen/**',            // buf codegen output (proto/), checked by the CI drift step instead
     '!src/__tests__/**',  // Exclude all test files and mocks
   ],
   coverageDirectory: 'coverage',

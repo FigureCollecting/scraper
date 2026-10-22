@@ -191,6 +191,7 @@ Detailed health check with browser pool status plus two operator views (additive
   | `open_failed` | false | SQLite refused the file and the retry failed too |
   | `open_failed_recovered` | **true** | The file was unusable, was moved aside to `quarantinedPath` (never deleted), and a fresh store opened; readable rows were salvaged into it |
   | `write_failed` | false | A write failed at runtime (full disk, revoked mount). The store degraded to in-memory for the rest of the process life and kept serving |
+  | `held` | false | The engine came up without every plugin (one failed to import, failed the plugin shape check or was refused while it registered — see `plugins.refused` — or no store registered at all, or the plugin bootstrap threw), so the file at `path` was closed at startup **without being restored**: a row whose store cannot be extracted would fail `EXTRACTION_UNAVAILABLE`, which is terminal, and be deleted. This process queues in memory; the rows wait for a start whose plugins all load. The file's open host cooldowns stay in it as well and are not applied by this process. `pending`, `leased` and `parked` read 0 here (they count the in-memory store); the log line `[SCRAPE QUEUE] durable queue HELD, not restored (<why>): …` names how many rows were left in the file |
 
   Startup emits exactly one greppable line whenever the store is not durable:
 
@@ -199,6 +200,8 @@ Detailed health check with browser pool status plus two operator views (additive
   ```
 
   **A pod that cannot attach its volume never reaches this code at all.** If a local-path claim cannot bind on the node the pod is scheduled to, the pod stays `Pending` and the container never starts — a scheduling signal visible in `kubectl describe pod`, not a `durable: false` reading.
+- `handsOff`: `[{siteId, hosts, tier, handsOff, denied, policyVersion}]` — the hands-off policies the rulesets plugin registered (plugin contract 0.17.0, `registerHandsOffPolicy`): the hosts Claude and its tools never contact (`handsOff: true`), permanently denied hosts (`denied: true`; `siteId: null` for a host-only entry), each with its robots.txt AI-bar `tier` and the policy version. A policy covers each listed host and its subdomains; the engine refuses a policy on a subdomain that is less strict than its parent's, so a listed decision is never lifted below it. Reading it sends no request anywhere. `[]` when no plugin registered a policy (a plugin older than 0.17.0, a plugin that failed to load, or before the plugins load); `plugins` below tells those apart. It survives the degraded (500) response. A plugin is loaded whole or not at all: if the registry refuses any call it makes while it loads, none of its stores, policies or routes are kept, so the list is never partial. Once a plugin has loaded its registration is closed: a call made after its `register()` resolved throws and takes no effect, so no policy is ever applied after the stores it guards went live. The robots summary, pins and route samples stay in the registry, never on this endpoint.
+- `plugins`: `{loaded: [{name, version}], refused: [{name, version}]}` — which plugins loaded at startup and which were refused (none of a refused plugin's registrations were kept). `refused` lists first the packages advertising the `scraper-ruleset` keyword that failed to import or are not a ScraperPlugin (named from their `package.json`), then the plugins the registry refused while they loaded. Names and versions only; why is in the pod log (`[PLUGIN LOADER] Failed to import candidate plugin …` / `[PLUGIN LOADER] Skipping …`, or `[PLUGIN BOOTSTRAP] Failed to register plugin …`). A refused plugin also holds the durable queue (`queueStore.reason: held`). Survives the degraded (500) response.
 - `residentialEgress`: `{configured, proxy?}` — whether a residential egress proxy (`RESIDENTIAL_PROXY_URL`) is wired. `proxy` (its `scheme://host:port`) appears only under `RESIDENTIAL_EGRESS_HEALTH_DETAIL=true`, since this endpoint is unauthenticated; credentials are stripped at the source either way, so a `user:password@` proxy never appears here. `{configured: false}` ⇒ every store declaring `egress: 'residential'` is refused (see *Residential egress* under Environment Variables).
 
 ### GET /version
@@ -359,6 +362,21 @@ engine-side would make that id unaddressable.
 **Errors:** `400` `seeds` other than `1`, or combined with another axis ·
 `422 { error: "unsupported", siteId, reason }` (unknown store, or it declares no seed lists) ·
 `502 { error: "catalog failed", siteId, reason }`.
+
+#### GET /catalog/rotating — rotating seed lists
+
+The company lists (contract 0.16.0 `retrieval.rotatingSeedLists`), on their own path so an engine
+that predates them answers 404 instead of serving a listing page. `?seeds=1` never lists them and
+`?seed=` never fetches them.
+
+**Query:** `store=<siteId>` (required); `list=<listId>` (optional — absent = discovery).
+
+**Discovery (200):** `{ siteId, rotatingSeedLists: [{ id, url, group, order }], count }`, declared
+order, nothing fetched; an entry whose `id` or `group` is outside `[A-Za-z0-9._-]` or is `__proto__` is
+dropped. **Fetch (200):** the `?seed=` body plus `group`. **Errors:** `400` bad
+input · `422` unsupported · `503` cooldown + `Retry-After` · `502 { error, siteId, reason, failure,
+blocked?, upstreamStatus? }` — `failure` is `deterministic` (parser throw, store 4xx, challenge) or
+`transient` (store 5xx, network, timeout); `blocked: true` for a challenge, 401, 403 or 429.
 
 ### Search query encoding (`retrieval.bySearch.queryEncoding`)
 `{q}` is url-encoded into the store's `bySearch.urlTemplate` by `encodeSearchQuery`
@@ -591,13 +609,41 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
 - **backfill** — resume the store's saved page cursor for up to `CRAWLER_BACKFILL_PAGES_PER_RUN`
   pages, new ids only. The cursor advances only when the page reported `hasMore: true` AND every
   new item on it was attempted (`nextPage` is ignored); a page cut short by the per-store cap, the
-  global budget, or a 5xx from `/ingest/scrape` is re-fetched next run.
+  global budget, or a 5xx from `/ingest/scrape` is re-fetched next run. A store named in
+  `CRAWLER_PAGE_POOL` (QB-U24) fetches the same pages in a pooled order instead of cursor, cursor+1, ...:
+  the L lowest UNVISITED pages at or above the cursor (L = `CRAWLER_PAGE_POOL_LOOKAHEAD`), picked by
+  POOL-SELECT with lower pages favoured, never two adjacent pages in a row and no monotone run; page 1
+  and the recent read stay first and sequential. The stop rules are unchanged (a cap or a stop ends the
+  pass, a cut-short page is re-read, an end is confirmed only on a later run, a confirmed end issues no
+  GET until its re-check is due). A page a cut-short pass finished above the cursor is kept as a visited
+  mark in `recent.pagePool` (expiring after `CRAWLER_PAGE_POOL_VISITED_TTL_H`); after k new ids arrive on
+  top (counted by the recent read, and carried in `recent.pagePool.drift` until a backfill saves, so a pass
+  stopped before its backfill hands it on), the bottom ceil(k / page size) marks of a run sitting on an
+  unvisited page are read again (one mark more when the pass had no recent read). Each pooled store's summary
+  carries `pagePicks`, the pages requested in order; the pass logs its seed. Every page number the pool
+  reads from the ledger (the marks, the cursor, the end candidate) must be an integer in [1, 100000]
+  (`MAX_LEDGER_PAGE`, 20 x the deepest declared listing); one that is not is dropped with ONE WARN per
+  store naming it (the cursor walks again from the top, the pool state is ignored, the candidate is cleared).
 - **id-range backfill** — for the stores named in `CRAWLER_RANGE_STORES` only: walk the store's
   SEQUENTIAL id space downward through `GET /catalog?store=&range=1&from=&count=`, up to
   `CRAWLER_RANGE_IDS_PER_RUN` ids per run. See *Id-range backfill* below.
+- **reobserve** — the RE-OBSERVATION lane: instead of the store's pages it walks the store's own
+  LEDGER and re-drives the N oldest-observed ids whose last observation is older than
+  `CRAWLER_REOBSERVE_MIN_AGE_H`, so an exhausted store keeps a live price/availability series
+  instead of freezing on the day it was walked. See *Re-observation lane* below.
 - **seed** (`CRAWLER_MODE=seed`) — an EXCLUSIVE pass that runs the seed phase and nothing else. See
   *Seed pass* below.
-- `both` (default) runs recent for every store, THEN backfill, THEN the id-range walk. Stores run in parallel under one
+- `CRAWLER_MODE` names a SUBSET of the phases: one token, or a csv (`both,reobserve`). `both`
+  (default) is recent+backfill. An UNRECOGNISED token is FATAL — the pass exits non-zero at config
+  time with a message naming the token and the accepted grammar, because a typo that merely warned
+  (`both,reobserv`) used to run discovery-only and leave the lane silently unarmed. An ABSENT or
+  EMPTY value is never fatal: it means `both`, so a blank env var cannot fail the CronJob every hour.
+  Duplicates and whitespace are normalised. `seed` stays exclusive — named alongside another phase
+  it is dropped with a WARN (every token there is one we recognise; the operator asked for two things
+  that cannot both happen), because its whole justification is a knowable, bounded cost.
+- `both` runs recent for every store, THEN backfill, THEN the id-range walk, and — when the mode
+  names it — the re-observation lane LAST, so discovery's claim on the global request budget is
+  exactly what it was before that lane existed. Stores run in parallel under one
   global request gate (concurrency, total budget over catalog GETs + ingest POSTs, spacing);
   pages within a store are sequential; the ledger is saved after every page.
 - Per catalog page: `503 cooldown` → the store is skipped for this run (no state change);
@@ -612,10 +658,12 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
   Cloudflare-gated one that stalls above ~15 items/hour. A GLOBAL `0` keeps its other meaning:
   a discovery-only dry run for every unnamed store (pages fetched, nothing POSTed).
 - The run ends with a `[CRAWLER] pass complete` JSON summary (per store: pagesFetched,
-  discovered, known, enqueued, deduplicated, reobserved, errors, skipped, backfillCursor,
+  discovered, known, enqueued, deduplicated, reobserved, reobserveLanded, reobserveSelected,
+  reobserveSkipped, reobserveFailed, reobserveCapApplied, reobserveLaneSkipped, errors, skipped, backfillCursor,
   exhaustCandidate, exhausted, capApplied, rangeWalked, rangeCursor, rangeFrontier, rangeSkipped,
   seedLists, seedStopped; plus totals, requestsIssued, budgetExhausted, enqueueCapOverrides,
-  totalRangeWalked, durationMs). A `seed` pass logs `[CRAWLER] seed pass complete` instead.
+  reobserveCapOverrides, totalReobserved, totalReobserveLanded, totalRangeWalked, durationMs). A `seed` pass logs
+  `[CRAWLER] seed pass complete` instead.
 - A `CRAWLER_STORE_ENQUEUE_CAPS` entry or a `CRAWLER_RANGE_STORES` entry naming a store that is not
   in `CRAWLER_STORES` does nothing, and is WARNed about by siteId at the start of the run — a range
   store must be named in BOTH.
@@ -623,7 +671,7 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
 | Variable | Default | Meaning |
 |---|---|---|
 | `SCRAPER_SERVICE_URL` | `http://localhost:3050` | The scraper's HTTP surface (the only thing the crawler talks to) |
-| `CRAWLER_MODE` | `both` | `recent`, `backfill`, `both` (recent then backfill), or `seed` (the declared seed lists ONLY) |
+| `CRAWLER_MODE` | `both` | `recent`, `backfill`, `both` (recent then backfill), `reobserve` (the re-observation lane), or `seed` (the declared seed lists ONLY — exclusive). A csv names a subset: `both,reobserve`. An unrecognised token FAILS the pass by name; empty or unset means `both` |
 | `CRAWLER_STORES` | `orzgk` | csv of siteIds; explicitly empty = no work (kill switch) |
 | `CRAWLER_LEDGER_DIR` | `/var/lib/ingest-crawler` | Directory of per-store ledger files |
 | `CRAWLER_RECENT_MAX_PAGES` | `3` | Max listing pages walked from page 1 per store per run |
@@ -639,7 +687,25 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
 | `CRAWLER_EXHAUSTED_RECHECK_MS` | `604800000` (7d) | Re-check an exhausted store's last cursor after this long |
 | `CRAWLER_RANGE_STORES` | *(none)* | csv of siteIds that walk their sequential id space; empty = no id-range walking at all |
 | `CRAWLER_RANGE_IDS_PER_RUN` | `50` | Max ids walked per store per run (the window asked of `/catalog?range=1`); clamped to the engine's `200`-id ceiling with a WARN |
+| `CRAWLER_RANGE_DESCENT_CAPS` | *(none)* | csv of `siteId:n` (`mfc:0`) lowering one store's DESCENT window below `CRAWLER_RANGE_IDS_PER_RUN`; a cap never raises it, and a store absent keeps it. `0` = no descent for that store: no window GET, no POST, its `range.cursor`, `range.frontier` and `range.seed` untouched (`rangeSkipped: "descent-cap"`), while the re-anchor, both gap sweeps and the lists step run as before. A malformed entry is ignored with a WARN naming it; an entry naming a store that is not id-range walked is ignored with a WARN |
 | `CRAWLER_RANGE_FRONTIER_<SITEID>` | *(none)* | Seed frontier for a store whose ledger has no numeric itemId yet; CHANGING it later re-seeds the walk from the new top. `<SITEID>` = the siteId uppercased with every non-alphanumeric character replaced by `_` |
+| `CRAWLER_RANGE_REANCHOR_H` | `24` | How often the frontier is moved up to the newest id the ledger has seen (never one the gap sweep wrote), recording the band it skipped as a KNOWN GAP. `0` = every run |
+| `CRAWLER_RANGE_REANCHOR_MAX_DELTA` | `50000` | The widest move one re-anchor may make. A wider one is refused with a WARN naming this knob and reported as `rangeReanchorRefused`, and it is tried again every run until the ledger or the knob changes. Raise it for a frontier frozen a long time. `0` refuses every move |
+| `CRAWLER_RANGE_GAP_BUDGET` | `0` | Gap sweep: ids one store may sweep per run (and therefore its POST ceiling), SEPARATE from the discovery cap. `0` = the sweep is OFF |
+| `CRAWLER_RANGE_GAPS` | *(none)* | csv of operator-declared bands, `siteId:lowId-highId` or `siteId:id` (one id is a band of width 1), adopted into the store's ledger once. A band reaching above the store's frontier is refused with a WARN |
+| `CRAWLER_RANGE_GAP_DRY_RUN` | `false` | Print the open bands and their widths and sweep nothing. `--dry-run` / `CRAWLER_DRY_RUN` arm this lane AND the re-observation lane |
+| `CRAWLER_LISTS_DRAIN_CAPS` | *(none)* | Company lists: csv of `siteId:cap` — the per-pass drain budget, and the switch: a store absent or at `0` runs no lists step at all. Only id-range stores (`CRAWLER_RANGE_STORES`). The drain also spends the global `CRAWLER_MAX_REQUESTS` ahead of the older gaps, the descent and re-observation: raise that by the drain cap when arming |
+| `CRAWLER_LISTS_WINDOW_UTC` | *(none = no list fetched)* | Company lists: `HH:MM-HH:MM` UTC window (may wrap midnight) in which ONE group may be fetched per pass. Malformed or zero-width = off, with a WARN. The backlog drains outside it |
+| `CRAWLER_LISTS_INTERVAL_H` | `160` | Company lists: a group is fetched at most once per this many hours. In-window passes per day × interval days should cover the group count (7 × 6.67 ≈ 46 < 54 for mfc); below that the least-recently-polled rotation stretches the cycle to groups ÷ passes per day days |
+| `CRAWLER_LISTS_SPACING_MS` | `10000` | Company lists: wait between two lists of one group; never below `10000` (raised with a WARN) |
+| `CRAWLER_PAGE_POOL` | *(none)* | Backfill page pool (QB-U24): `all`, or a csv of siteIds, whose backfill pass fetches its pages in a POOL-SELECT order (see **backfill** above). Empty or `off` = every store walks its cursor exactly as before. A malformed entry, or `all` / `off` inside a list, is ignored with a WARN; a store not crawled is ignored with a WARN |
+| `CRAWLER_PAGE_POOL_LOOKAHEAD` | `CRAWLER_BACKFILL_PAGES_PER_RUN` | Backfill page pool: how many of the lowest unvisited pages one pass shuffles and fetches. Never larger than `CRAWLER_BACKFILL_PAGES_PER_RUN` (lowered with a WARN): wider shuffles lose coverage under listing drift |
+| `CRAWLER_PAGE_POOL_VISITED_TTL_H` | `72` | Backfill page pool: hours a visited mark above the cursor is trusted |
+| `CRAWLER_LISTS_ALTERNATE` | *(none)* | Company lists: csv of siteIds whose passes that START inside `CRAWLER_LISTS_WINDOW_UTC` fetch EITHER the Latest Additions tap OR one company group, never both; each window opens with a lists pass (7 in-window passes = L T L T L T L, 4 groups a night). An entry `siteId:lists:tap` sets the ratio (`mfc:2:1` = L L T L L T L, 5 groups a night); a malformed ratio alternates 1:1 with a WARN. Only a store with a lists step (`CRAWLER_LISTS_DRAIN_CAPS`) and a mode running recent and backfill; any other name is ignored with a WARN. Empty = today's pass |
+| `CRAWLER_REOBSERVE_MIN_AGE_H` | `12` | Re-observation lane: an id is eligible once its last observation is this many hours old. The SAME value is the backoff window for an id whose last re-observation was refused, so `0` means both "age is no bar" and "no backoff at all" — a refused id is retried on the very next run |
+| `CRAWLER_MAX_REOBSERVE_PER_STORE` | `0` | Re-observation lane: global per-store ceiling on re-observations per run. `0` = the lane is OFF unless a store opts in below |
+| `CRAWLER_STORE_REOBSERVE_CAPS` | *(none)* | csv of `siteId:cap` (`goodsmileus:50,bbts:20`) — the lane's per-store budget, SEPARATE from `CRAWLER_STORE_ENQUEUE_CAPS`, so neither lane starves the other. A malformed entry is ignored with a WARN; the rest still apply |
+| `CRAWLER_REOBSERVE_DRY_RUN` | `false` | Print the re-observation selection and enqueue nothing. `--dry-run` on the command line does the same; `CRAWLER_DRY_RUN` is an accepted alias that WARNs it covers the OPT-IN lanes only (this one and the gap sweep), never discovery |
 
 **Ledger** — one file per store, `<CRAWLER_LEDGER_DIR>/<siteId>.json`, written as
 `<siteId>.json.tmp-<pid>` and renamed into place (a crash never leaves a torn file):
@@ -648,7 +714,9 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
 {
   "version": 1,
   "siteId": "orzgk",
-  "enqueued": { "<itemId>": { "at": "2026-09-06T12:00:00.000Z", "collectUrl": "https://..." } },
+  "enqueued": { "<itemId>": { "at": "2026-09-06T12:00:00.000Z", "collectUrl": "https://...",
+                              "reobserveFailedAt": "...", "reobserveFailures": 1,
+                              "via": "tap", "lastVia": "reobserve" } },
   "backfill": {
     "cursor": 12,
     "exhaustCandidateCursor": 12, "exhaustCandidateAt": "...",
@@ -665,6 +733,16 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
 simply has no `range` and is neither corrupt nor migrated (the file stays `version: 1`). A `range`
 that IS present must be well formed — a malformed cursor or frontier is **corrupt**, never a silent
 reset that would re-walk the whole id space nor a non-number reported as one.
+
+`via` names the source whose accepted POST CREATED the entry: `tap` (the recent listing of a store
+in `CRAWLER_RANGE_STORES`; for mfc that listing IS the Latest Additions tap), `recent` (any other
+store's recent listing), `backfill`, `descent` (the id-range walk), `gap`, `lists` or `seed`;
+`reobserve` only ever appears as a `lastVia`, and `target` is reserved. FIRST WRITER WINS: a later
+write to the same id (a recent re-observation, the re-observation lane) keeps `via`, or keeps it
+absent on an entry written before the field existed, and records itself as `lastVia`. Both are
+optional and the file stays `version: 1`. Entries are not validated on load, so any build loads and
+saves back a value it does not know untouched (an older build's recent re-observation still rebuilds
+the entry whole and drops both).
 
 A missing file is a fresh ledger. Unparseable JSON, a wrong `version`, a wrong `siteId`, or a
 malformed section is **corrupt**: the store is refused for the run (counted as an error) and the
@@ -690,15 +768,15 @@ named in `CRAWLER_RANGE_STORES` walk it, so the crawler never spends a request d
 store has no such axis; the walk runs LAST (after every store's recent and listing-backfill passes),
 because the newest ids always outrank the deep id space for the run's budget.
 
-- **Frontier** — the highest itemId in the store's ledger that reads as a positive integer, else the
-  operator's `CRAWLER_RANGE_FRONTIER_<SITEID>` seed. With neither, the walk is skipped with a WARN
+- **Frontier** — the highest itemId in the store's ledger that reads as a positive integer (never
+  one the gap sweep wrote), else the operator's `CRAWLER_RANGE_FRONTIER_<SITEID>` seed. With neither, the walk is skipped with a WARN
   (it is never started from a guess). The seed in force is recorded in the ledger as `range.seed`.
-- **Re-seeding** — the walk only ever descends, so ids minted ABOVE the frontier (and a seed set too
-  high or too low) are not something the walk corrects on its own. CHANGING
-  `CRAWLER_RANGE_FRONTIER_<SITEID>` restarts the walk from the new top, with a WARN: it is the
-  operator's lever, and it needs no PVC surgery. Ids already in the ledger are skipped without a POST,
-  so re-entering a band already walked costs windows, not fetches. On a store that HAS a listing axis,
-  new ids arrive through the recent phase and the frontier need never move.
+- **Re-seeding** — the walk only ever descends, so a seed set too high or too low is not something it
+  corrects on its own. CHANGING `CRAWLER_RANGE_FRONTIER_<SITEID>` restarts the walk from the new top,
+  with a WARN: it is the operator's lever, and it needs no PVC surgery. Ids already in the ledger are
+  skipped without a POST, so re-entering a band already walked costs windows, not fetches. Ids minted
+  ABOVE the frontier are a different problem, and the RE-ANCHOR below is what answers it — re-seeding
+  by hand is no longer the only lever.
 - **Window** — one `GET /catalog?store=&range=1&from=<cursor>&count=<CRAWLER_RANGE_IDS_PER_RUN>` per
   store per run. The engine synthesizes the `{ itemId, collectUrl }` pairs from the store's `byId`
   template, so every id flows through exactly the same ledger dedup, enqueue cap and global request
@@ -714,8 +792,10 @@ because the newest ids always outrank the deep id space for the run's budget.
   cursor and picked up next run: nothing is stranded, and nothing is ever re-walked. The walk ends at
   id 1, leaving `cursor: 0`; further runs make no request. A window `/ingest/scrape` rejected
   ENTIRELY (4xx for every id — typically no ruleset matches the store's `byId` url, an engine/ruleset
-  skew) leaves the cursor exactly where it was, with a WARN: that band would otherwise be spent
-  collecting nothing and is never walked again.
+  skew) leaves the cursor exactly where it was, with a WARN and `rangeSkipped: "window-rejected"`:
+  that band would otherwise be spent collecting nothing and is never walked again. A window that also
+  held ids already in the ledger is not refused entirely: the cursor moves past it, and each refused
+  id keeps its own row in the fetch-failure ledger.
 - **Durability** — the listing phases save the ledger after every page; the id-range walk saves once
   per WINDOW (its ids are one bounded batch). A pod killed mid-window (`activeDeadlineSeconds`, OOM,
   eviction) therefore re-walks that window on the next run: the POSTs it already made are coalesced
@@ -731,14 +811,242 @@ because the newest ids always outrank the deep id space for the run's budget.
   already gone, does not walk at all. Size them for it: `CRAWLER_MAX_REQUESTS` must cover the listing
   phases plus, per range store, one window GET and up to `CRAWLER_RANGE_IDS_PER_RUN` POSTs, and the
   store's cap must have that much headroom left. When it does not, `rangeSkipped` on the store
-  summary says which — `cap`, `budget`, `no-frontier`, `floor`, `cooldown`, `unsupported`, `failed`,
-  `window-malformed`, `store-stopped`, `not-run`, `not-configured` — and it is `null` on a run that
+  summary says which — `descent-cap`, `cap`, `budget`, `no-frontier`, `floor`, `cooldown`, `unsupported`, `failed`,
+  `window-malformed`, `window-rejected`, `store-stopped`, `not-run`, `not-configured` — and it is `null` on a run that
   actually asked for a window. The window GET itself is synthesized (no upstream fetch) but is still
   charged one slot of the global budget and one spacing interval.
 - **Throughput** — one window per run, at most `CRAWLER_RANGE_IDS_PER_RUN` (ceiling 200) ids. On an
   hourly CronJob that is at most 4,800 ids/day, so an id space the size of mfc's ~3.6M takes ~756
   days to walk once at the ceiling — and ~8 years at the `50`/run default. Size the knobs (and the
   expectations) accordingly: this axis is a slow continuous backfill, not a bulk import.
+
+**Frontier re-anchor and known-gap sweep** — the descent above starts at a frontier and walks DOWN,
+so every id the store mints AFTERWARDS sits above everything that walk will ever reach. The only thing
+watching that end of the id space is the recent phase's Latest Additions tap: for mfc that is ONE page
+with no pager, which sees whatever turned over since the last run and nothing else. Anything the store
+adds faster than that page turns over is invisible, and the descent never climbs back up to it. Two
+mechanisms close the hole, and NEITHER touches the descent's cursor.
+
+- **Re-anchor** — once per `CRAWLER_RANGE_REANCHOR_H` (default 24 h; `0` = every run) the frontier is
+  moved up to the highest numeric id the store's LEDGER holds that the gap sweep did NOT write. Above
+  the frontier that is what a listing (the tap) has shown us: every id the sweep writes carries
+  `sweptFrom` (the origin of its band), because it came from a synthesized byId window and
+  `/ingest/scrape` accepts such a url whether or not the item exists. The band between the old
+  frontier and the new one is recorded as a KNOWN GAP. It costs no request (it reads the ledger the
+  pass already loaded) and it is persisted on its own, so it still happens on a run whose descent does
+  nothing at all. The run summary reports `rangeReanchoredTo`: the id the frontier MOVED to this run,
+  `null` when it did not move. A move wider than `CRAWLER_RANGE_REANCHOR_MAX_DELTA` is refused with a
+  WARN and reported as `rangeReanchorRefused`. A store that has never walked has no frontier to move;
+  the descent seeds one instead.
+- **Known-gap bands** — `range.gaps` in the ledger, beside the cursor: `{ from, to, next, origin,
+  createdAt, updatedAt?, closedAt? }`, where `next` is the LOW-water mark the sweep has reached and
+  `origin` is `reanchor` or `operator`. Operators declare bands of their own with `CRAWLER_RANGE_GAPS`
+  (`mfc:3700000-3700400,mfc:123456` — a single id is a band of width 1); each is adopted ONCE, matched
+  on its endpoints against every band the store has, open or closed, so a declaration left in the
+  manifest after its band was filled does not re-open it every run. Closed bands are kept as the
+  record that the band was filled. A declaration naming a store that is not id-range walked is WARNed
+  and adopted nowhere. A declared band must lie at or below the store's frontier (checked after this
+  run's re-anchor): above it the re-anchor records bands from ids a listing has shown us, and a
+  declared band there is refused with a WARN on every run that finds it above the frontier. A store
+  with no frontier yet adopts nothing until its walk has one.
+- **Sweep** — `CRAWLER_RANGE_GAP_BUDGET` ids per store per run (default `0` = OFF), `reanchor` bands
+  before `operator` bands (the company lists run between the two tiers), oldest band first within each,
+  walking each band ASCENDING from its `next`. The window is the SAME
+  `GET /catalog?range=1&from=&count=` the descent uses — the sweep introduces no new URL shape, so
+  nothing new to check against a store's robots.txt — and is then REVERSED before enqueueing: the
+  engine serves a descending run, while a band is swept upward, and the cursor may only advance over a
+  prefix of what was actually handled. For the same reason the window must be EXACTLY the run that was
+  asked for, full length included: a short one (which the descent tolerates, since it may bottom out
+  at id 1) would leave the band's lowest ids out of the slice entirely. `next` advances by the ids
+  handled and the band is stamped `closedAt` once it passes `to`; a window `/ingest/scrape` refused
+  ENTIRELY leaves `next` exactly where it was, exactly as the descent leaves its cursor, and reports
+  `gapSkipped: "window-rejected"`. A window that also held ids already in the ledger advances past
+  its refused ids, each of which keeps its own row in the fetch-failure ledger: a re-anchor band is
+  mostly known ids by construction, and holding its cursor would re-drive the same refusal every run.
+- **Budget** — the sweep's budget is its OWN, so a discovery cap already spent by the descent cannot
+  starve it and it cannot breach that cap in return. Ids already in the ledger consume the run's
+  allowance even though they cost no request: without that, a band the tap had largely covered would
+  spend the whole run's GLOBAL budget on window GETs discovering as much. Raise
+  `CRAWLER_MAX_REQUESTS` by roughly the sweep's budget plus its window GETs when arming it, or the
+  sweep starves behind discovery and says so as `gapSkipped: "budget"`.
+- **Reporting** — `gapIdsSwept` (ids the band cursor MOVED over — a window the store refused entirely
+  moves nothing and is counted in `errors`, not here), `gapEnqueued` (POSTs the sweep landed, kept OUT
+  of `enqueued` because `enqueued` is what `capApplied` bounds), `gapBandsOpen` and `gapIdsRemaining`
+  (the backlog, read off the ledger and reported even on a store whose sweep is switched off),
+  `gapBudgetApplied` (the budget it actually ran under, 0 when it could not sweep) and `gapSkipped`
+  — `not-configured`, `not-run`, `no-gap`, `dry-run`, `store-stopped`, `budget`, `cooldown`,
+  `unsupported`, `failed`, `window-malformed`, `window-rejected` — `null` on a run that actually swept. Run level:
+  `totalGapIdsSwept` and `totalGapEnqueued`.
+- **Dry run** — `CRAWLER_RANGE_GAP_DRY_RUN=1` (or `--dry-run`) logs each store's open bands, their
+  widths and what is left of each, and makes no request at all: `gapSkipped: "dry-run"`.
+- **Arming it** — set the budget to what the store's egress lane can actually drain per hour, not to
+  the window ceiling. mfc rides the shared residential exit, so its sweep is a slow fill measured in
+  weeks, not a bulk import.
+
+**Company lists** (contract 0.16.0 `retrieval.rotatingSeedLists`; Ross 2026-09-22/25/26) — per-company
+lists replace the archive descent. The step runs inside the id-range phase, in this order: recent gaps
+(`reanchor` bands) → company lists → older gaps (`operator` bands) → descent. Each has its own budget;
+a stop in one lane (cooldown, challenge, sick scraper) stops every lane below it.
+- **Rotation** — per pass, inside `CRAWLER_LISTS_WINDOW_UTC` only: `GET /catalog/rotating?store=`
+  (discovery, no store request), then ONE due group (never attempted, or last attempted at least
+  `CRAWLER_LISTS_INTERVAL_H` ago): the one attempted longest ago, a never-attempted one first, `order`
+  breaking ties. So with fewer slots per interval than groups the cycle stretches; no group starves.
+  For mfc (54 companies, 7 in-window passes a night) a full cycle takes about 7.7 days; accepted as is.
+  Every list of the group via `GET /catalog/rotating?store=&list=`, `CRAWLER_LISTS_SPACING_MS` apart.
+  The seed pass (`?seeds=1`, `CRAWLER_MODE=seed`) never lists them.
+- **Dedupe** — the group's ids are unioned; ids the ledger knows, and ids already in the backlog
+  (another company's copy), are dropped; the rest join the backlog.
+- **Drain** — up to `CRAWLER_LISTS_DRAIN_CAPS` backlog ids per pass, oldest first, POSTed with
+  `priority: "COLD"`. For a store with the step on, the older gaps and the descent post COLD too; the
+  tap, the recent gaps and re-observation post WARM. WARM dispatches before COLD and COLD is FIFO, so
+  dispatch follows the lane order within a pass. Parked rows page in by priority, then age: a WARM id
+  waits for at most one freed slot when the host's resident set is all COLD. Accepted as is:
+  - across passes, an earlier pass's descent id dispatches before a later pass's list id (both COLD, FIFO);
+  - re-observation stays WARM, so a re-observed id dispatches ahead of the company lists.
+- **Failures** — an open attempt never re-asks a list that already answered. A deterministic failure
+  (parser throw, store 4xx) spends the group's slot once every list has answered; a transient one
+  (store 5xx, network, timeout) retries next pass, at most 3 times before the slot is spent. A BLOCKED
+  answer (challenge, 401, 403, 429) is the store refusing us: it records a strike, stops the store for
+  the pass and pauses list fetching until the end of that night's window (`pausedUntil`; delete it from
+  the state file to resume early), so one refusal costs one night. The slot is spent (outcome `blocked`)
+  only after 3 blocked passes running on the same group, so one refused list cannot freeze the rotation.
+  A slot spent that way is remembered (`spentBlocked`): the group's next refusal spends it at once, and
+  any pass booked as something other than `blocked` forgets it. Steady state for a company refused for
+  good: 3 list requests and 3 nights of list fetching in its first cycle, then 1 request and 1 night per
+  cycle. The backlog keeps draining while paused. A cooling host or a spent budget costs no slot.
+  Declared ids and groups must pass the catalog route's safe-name rule (`[A-Za-z0-9._-]+`, never
+  `__proto__`); the crawler skips any other entry.
+- **State** — `<CRAWLER_LEDGER_DIR>/<siteId>.lists.json`: per group `lastAttemptAt` (the slot),
+  `lastTriedAt`, `outcome`, `reason`, `seen` (distinct ids, an id on both lists once), `new`,
+  `enqueued`, `strikes`, `retries`, `blockedStrikes`, `spentBlocked`, and for the open attempt `answered` (its lists)
+  and `seenIds`; plus the backlog and `pausedUntil`. Its own file: the ledger loader drops
+  sections it does not know, so an older engine would erase it, and the weekly seed Job also writes the
+  ledger. An unparseable timestamp makes the file corrupt: refused, never overwritten.
+- **Reporting** — `listsGroup`, `listsOutcome` (`ok`, `partial`, `failed`, `transient`, `blocked`,
+  `interrupted`), `listsFetched`, `listsFailed`, `listsIdsSeen`, `listsIdsNew`, `listsEnqueued` (kept
+  out of `enqueued`), `listsPending`, `listsDrainApplied`, `listsSkipped` (`not-configured`, `not-run`,
+  `store-stopped`, `state-corrupt`, `state-failed`, `window-off`, `outside-window`, `paused`,
+  `none-due`, `alternation-tap`, `unsupported`, `cooldown`, `budget`, `failed`; `null` when a group was fetched) and
+  `listsDrainStopped`. Run level: `totalListsEnqueued`.
+- **Alternation** (`CRAWLER_LISTS_ALTERNATE`; Ross MS 2026-10-04) — for a named store, the kind of a pass
+  that starts inside the window is decided once, before the tap, from the lists state's `alternation`
+  marker `{lastInWindowKind, windowStart, at}`: no marker, or one from another window, = a LISTS pass (so
+  every window opens with lists, every night); otherwise the opposite of the last kind. A LISTS pass skips
+  the store's recent and backfill phases (both read the Latest Additions listing) and rotates as above; if
+  it issued no list GET (`none-due`, `paused`, `unsupported`, past the window) and the store is not stopped,
+  it taps after the id-range phase instead (`fallback-tap`); a list GET that was issued, answered or not,
+  costs the pass's tap. A TAP pass runs recent and backfill and asks for no group (`listsSkipped:
+  "alternation-tap"`). Both drain the backlog. The marker records the INTENDED kind (`lists` after a
+  fallback tap) and only the lists step's own save writes it, so a pass whose lists step did not run
+  (store stopped first) repeats its kind next pass: a tap pass stopped on its tap costs that night a
+  group. A pass that starts outside the window taps as today and never asks for a group, even if it
+  reaches the lists step inside the window; the marker is untouched. A lists state that cannot be read at
+  pass start turns alternation off for that pass (one WARN; today's pass). The marker is not validated on
+  load: a build without this knob keeps it, and a malformed one counts as absent. Store summary:
+  `alternation` = `off`, `outside-window`, `lists`, `tap` or `fallback-tap`.
+- **Alternation ratio** (`CRAWLER_LISTS_ALTERNATE=mfc:2:1`; Ross MS-1 (c) 2026-10-07) — `lists` lists
+  passes then `tap` tap passes, the cycle restarting at each window's first pass (a lists pass). A bare
+  siteId is 1:1 and writes the marker exactly as above; any other ratio adds the marker's `step` (the
+  1-based position of the last in-window pass in its cycle; a marker without one reads `lists` as step 1
+  and `tap` as the first tap step, and a step past a shortened cycle wraps). Each side is an integer 1-24;
+  anything else keeps the store at 1:1 with one WARN, and a repeated siteId keeps its first ratio. An
+  in-window pass's summary adds `alternationRatio` (`2:1`) and `alternationStep` (1-based); no other
+  summary line changes. A fallback tap keeps its step, so the cycle does not slip.
+  A bare 1:1 store also reads a marker's `step`, so switching a store from a ratio back to a bare name
+  mid-window can run two lists passes in a row once; a pass still never fetches both the tap and a list.
+- **Pass-strategy record** (QB-U36; Ross MS-1 2026-10-07, to assess the 2:1 trial) — for a store in
+  `CRAWLER_LISTS_ALTERNATE` (and only such a store: every other summary line is unchanged) each pass adds
+  these fields to the store summary, logs them as ONE line `[CRAWLER] pass-strategy {json}` and appends that
+  line to `<CRAWLER_LEDGER_DIR>/<siteId>.passes.ndjson`. The names are stable; a rename or a change of
+  meaning bumps `strategyVersion` (now `1`). The record adds no request to any store.
+
+  | Field | Meaning |
+  |---|---|
+  | `strategyVersion`, `siteId`, `at` | Record only: schema version, store, pass start (ISO-8601 UTC) |
+  | `strategy` | The pass's `alternation`: `lists`, `tap`, `fallback-tap`, `outside-window` or `off` |
+  | `strategyParams` | `{ratio, step}`: `alternationRatio` and `alternationStep`, both `null` outside the window or when off |
+  | `listsCompanies` | `[{entryId}]`: the company (lists group) read this pass; `[]` when none |
+  | `listsDomains` | The distinct domain ids of that group's lists (`[9, 1]` for an mfc company), from the list id's `-d<n>` |
+  | `listsPerList` | `[{listId, domainId, status, ids}]` per list of the group: `ok`, `failed`, or `skipped` (not fetched this pass: answered on an earlier pass, or not reached after a stop or a cooldown); `ids` = distinct ids with a url it offered |
+  | `idsDiscovered`, `idsNew`, `idsDup` | Distinct ids the tap's listing pages (recent and backfill) and the group's lists offered; of those, the ids neither the ledger, this run nor the lists backlog held; `idsDup = idsDiscovered - idsNew` |
+  | `challenges` | Challenge pages the tap or a company list answered (`reason: "challenge page"`) |
+  | `cooldowns` | The scraper's cooldown answers (503 with its `cooldown` envelope) to the tap or a company list |
+  | `listsStepMs` | Wall time of the lists step (rotate + drain); `0` when it did not run |
+  | `storePassMs` | Pass start to the end of the store's last discovery phase (the cross-store re-observe lane excluded) |
+  | `hostClock` | The store host's entry of OUR scraper's `/health/detailed` hostClock block, read ONCE per pass at pass end: `{host, floorMs, clocked, minGapMs60m, underFloor60m, sends60m, catalogListing, listingFetchP99Ms60m}` (`catalogListing` = `sends60m.catalogListing`). The host is the one the store's ledger urls name. `null` when the read fails (one WARN), the block is malformed, or no entry matches |
+
+  The ring keeps the last 30 days and at most 1 MiB (oldest lines dropped first, the newest always kept),
+  written through a tmp file and a rename on the ledger volume, so the history outlives the Job's pod. A
+  ring that cannot be read is left as found and the record lives in the log only (one WARN); lines that
+  are not records (a torn write) are dropped on the next append (one WARN). Query a store's history with
+  `jq -c '[.at, .strategy, .listsCompanies, .idsDiscovered, .idsNew, .idsDup, .challenges, .hostClock.underFloor60m]' mfc.passes.ndjson`.
+- **Stop switch** — remove the store from `CRAWLER_LISTS_DRAIN_CAPS` (no fetch, no drain); unset
+  `CRAWLER_LISTS_WINDOW_UTC` to stop fetching while the backlog drains. A crawler on this version
+  against an older engine loses only the priority (the old `/ingest/scrape` reads `url` alone), so every
+  lane lands WARM in FIFO order; an older engine answers `/catalog/rotating` 404 and nothing is fetched.
+
+**Re-observation lane** (`CRAWLER_MODE` names `reobserve`, e.g. `both,reobserve`) — discovery asks a
+store what EXISTS; this lane asks what the things we already know COST NOW. A store whose catalog is
+fully walked ("exhausted") is not a finished store: without this lane its prices and stock stay frozen
+at whatever was seen the day it was walked.
+
+- **What it walks** — the store's own LEDGER, not its pages: no `/catalog` GET is made at all. For
+  each store it takes the ids whose last observation (`enqueued[id].at`) is at least
+  `CRAWLER_REOBSERVE_MIN_AGE_H` old, OLDEST FIRST, up to that store's cap, and re-POSTs the absolute
+  item url the ledger already holds. That url is the store's byId url where the store declares that
+  axis, and the listing parser's own item link where it does not — which is why a store with **no
+  byId axis at all** (hobby-genki, bbts, gkloot, akimomo, anitoys) can be re-priced by this lane and
+  by nothing else we have.
+- **Its own budget** — `CRAWLER_STORE_REOBSERVE_CAPS` per store, else `CRAWLER_MAX_REOBSERVE_PER_STORE`
+  (default `0`, so the lane is OFF until the fleet config names a store). It is SEPARATE from the
+  discovery cap in both directions: a store whose discovery cap is spent still re-observes, and a
+  store whose re-observe cap is spent still discovers. A gated store (residential / clean-headful)
+  should carry a conservative cap — browser time is the fleet's scarcest resource, and every
+  re-observation spends it.
+- **Same pacing** — every POST goes through the same global request gate (concurrency, total request
+  budget, dispatch spacing) as discovery, and the scraper's per-host floors, cooldowns and honesty
+  gate downstream are untouched. The lane runs LAST, after every discovery phase.
+- **Fairness** — stores take turns one id at a time (round-robin), oldest first within a store, so a
+  global budget too small for every selection is split across stores rather than spent on the first.
+  No id is driven twice in one run — an id discovery already POSTed is skipped here.
+- **Ledger stamping** — a re-observation the scraper accepts stamps `at` with the new time, which
+  sends that id to the back of the oldest-first queue; that is what makes the lane rotate through a
+  catalog (250 known ids at a cap of 50 refresh every 5 runs). A deterministic refusal (4xx from
+  `/ingest/scrape`) records `reobserveFailedAt` / `reobserveFailures` instead and leaves `at` alone —
+  nothing was observed — and the id is then held back for one `CRAWLER_REOBSERVE_MIN_AGE_H` window so
+  a permanently-broken url cannot sit at the head of the queue every run. A 5xx (our own scraper
+  unwell) stops the store for the run and records nothing durable. Refusals also land in the fetch-
+  failure ledger exactly as discovery's do. The ledger is saved ONCE per store at the end of the lane
+  (the id-range axis's trade: a pod killed mid-lane re-drives those ids next run, and the queue
+  coalesces the duplicates).
+- **Counters, and whose number is whose** — per store: `reobserveSelected` (what the lane chose),
+  **`reobserveLanded`** (POSTs the lane landed — the number a live acceptance should read),
+  `reobserveFailed`, `reobserveSkipped` (too young, or inside a refusal backoff),
+  `reobserveCapApplied` (the ceiling the lane ACTUALLY ran under — `0` for a store it could not touch,
+  never the configured value) and `reobserveLaneSkipped` (why: `mode-off`, `not-configured`,
+  `store-out`, `ledger`, `store-stopped`, or `null` when the lane took the store on);
+  per run: `totalReobserveLanded`, `totalReobserved` and `reobserveCapOverrides`, plus a
+  `[CRAWLER] reobserve selection` line per store and one `[CRAWLER] reobserve lane complete` line
+  carrying the per-store split (its `landed` and `total` are the lane's own).
+  Two fields are deliberately NOT the lane's: `enqueued` counts accepted DISCOVERY POSTs only, so it
+  can never exceed `capApplied`, and a coalesced re-observation counts once in `reobserveLanded`
+  rather than in `deduplicated`. `reobserved` counts BOTH mechanisms — the recent phase's
+  `CRAWLER_REOBSERVE_AFTER_MS` window and this lane — which is what it has always meant.
+- **What a landing does and does not prove** — `POST /ingest/scrape` answers 202 the moment the url is
+  QUEUED; the store fetch happens later, in the scrape queue. So `reobserveLanded` counts accepted
+  enqueues, not confirmed observations, and a store that challenges or 403s every url still reports
+  landings while its real failures land in the fetch-failure ledger (the same semantics discovery has
+  always had). The ledger stamp follows the enqueue for the same reason. Treat the spine side —
+  `items_updated` moving for that store — as the acceptance test, not `reobserveLanded > 0` alone.
+- **Dry run** — `CRAWLER_REOBSERVE_DRY_RUN=1` (or `--dry-run`) logs each store's selection and
+  enqueues nothing, stamping no ledger. Use it before arming a gated store.
+- **Interaction with an enqueue cap of `0`** — that pulls a store out of the WHOLE run, this lane
+  included (its ledger is not even opened). The summary says so rather than implying a live lane:
+  `reobserveCapApplied: 0` with `reobserveLaneSkipped: "store-out"`. To run re-observation without
+  discovery, name only `reobserve` in `CRAWLER_MODE`.
+- Not to be confused with `CRAWLER_REOBSERVE_AFTER_MS`, which is the RECENT phase's much older
+  window: it re-POSTs a known item that happens to appear on listing pages 1..N. That path reaches
+  only the first pages of a listing and nothing else; this lane reaches the whole ledger.
 
 **Seed pass** (`CRAWLER_MODE=seed`) — a slow, bounded poll of the pages a store DECLARES, and the
 only phase that runs in this mode.
@@ -1168,6 +1476,8 @@ See `.env.example` for complete configuration template.
   - A file SQLite cannot open is **moved aside** with a timestamp suffix, never deleted, and a fresh store is opened; readable rows are salvaged out of the quarantined copy. The engine stays durable through this
   - A write that fails at runtime degrades the store to in-memory for the rest of the process and reports `write_failed`. Rows already on disk are not lost — the next start reconciles them. Only a **storage** fault does this (full disk, I/O error, the mount gone read-only); a constraint or statement fault is an engine bug, is reported once, and does **not** cost the process its durability
   - The queue holds **one row per dedup key**, enforced by a unique index. A row left `leased` by a process that died is CLAIMED by the next enqueue of that key rather than duplicated, so a hard kill cannot cause a second fetch inside the live lease or reset the item's attempt budget
+  - Each row carries an optional work-class `lane` (`new`, `company` or `gap`; no lane counts as `other`) for the lane scheduler, kept through restore, lease, page-in and salvage. When one URL is enqueued twice, an unlabelled row adopts the incoming label, a labelled row keeps its own, and a HOT row is never relabelled. A lane this build does not know (written by a newer build) counts as `other` and is never overwritten (a salvage copy keeps it as text). The REST `POST /ingest/scrape` never sets a lane
+  - Schema changes are recorded in a `schema_meta` table and each one is gated by a presence check, never by a number: an OLDER build opens an upgraded file as it is (the rows it writes have no lane), and the new build re-opening it changes nothing. A record is only ever raised, so after a rollback it still says what the file has had. `PRAGMA user_version` is only the writability probe, rewritten on every open
   - Default: `/var/lib/scraper`
 - `SCRAPE_QUEUE_MAX_MB`: Hard ceiling on the queue file, in MiB (`PRAGMA max_page_count`)
   - The queue must never be the thing that fills the volume it lives on: a full volume takes the write-ahead log down with it, which is far worse than a refused write
@@ -1182,17 +1492,40 @@ See `.env.example` for complete configuration template.
 - `SCRAPE_QUEUE_MAX_RESIDENT`: Cap on items held in the in-memory priority tiers; the overflow is written to disk as `parked` and paged back in as the tiers drain
   - Bounds both heap and the queue's O(n) work — `addToQueue` scores every item in a lane to place one, and the dispatch scan walks the lanes each time
   - The default sits ABOVE today's observed depth (normally < 500 at ~520–620 enqueues/hour against a ~600/hour drain), so on today's traffic nothing parks and behaviour is unchanged. It is a ceiling, not a new normal
+  - With `SCRAPE_POOL_SELECT` on, the cap counts the FIFO hosts' rows and the pooled hosts' rows apart: a pooled host's enqueue parks once the whole set is full, a FIFO host's only once FIFO rows fill it, so pooled rows, parked or resident, never count against the FIFO hosts' places. Pooled hosts read their parked rows at each pick and are not paged in by the shared page-in; a pooled host whose parked rows include a tier above every dispatchable row it holds gets one anchor row of that tier, so its HOT rows go first and its tiers stay in order. So the set can hold up to about twice the cap, plus up to one anchor per pooled host and tier (pinned under churn: FIFO rows at most the cap, the set at most 2 x the cap + 3 per pooled host). The bound leaves out what exceeds the cap under `off` too: a dedup enqueue at a higher priority claims a parked row whatever the cap, and a retry goes back into its tier. This bounds the working set only: it does not make a FIFO host's dispatch order identical to `off`
   - Unset/invalid → default
   - Default: `1000`
 - `SCRAPE_QUEUE_MAX_RESIDENT_PER_HOST`: Cap on RESIDENT items for one host
   - Without it, one store's burst (the crawler enqueues 50 per store) could fill the working set and leave every other store's items on disk behind a host that is itself paced to one request every few seconds
   - Unset/invalid → default
   - Default: `250`
+- `SCRAPE_LANE_MODE`: Whether a host's dispatch slot is shared between work classes (`src/services/laneScheduler.ts`)
+  - **Not wired yet**: the queue does not read this until the lane wiring lands, so setting it today changes nothing
+  - `off` dispatches exactly as today; `shadow` computes and counts the lane pick but dispatches as today; `on` lets the pick choose which class's item takes the host's slot
+  - The scheduler only chooses WHICH class goes next, never WHEN: the host's pacing floor stays the only clock, so no lane setting can make a host faster
+  - Unset/blank → `off`; any other value → one WARN and `off`
+  - Default: `off`
+- `SCRAPE_LANE_WEIGHTS`: Per-host class weights, hosts separated by `;`, e.g. `myfigurecollection.net=new:40,company:40,gap:20,other:10`
+  - **Not wired yet** (see `SCRAPE_LANE_MODE`)
+  - Classes: `new`, `company`, `gap` (Ross's split) and `other` (anything unlabeled, such as the spine retry job's re-drives, or labeled with a name this build does not know, so no work is ever invisible). Weights are whole numbers 0–100 and relative; a class left out gets 0. The host is matched like the queue keys hosts (lowercased, a leading `www.` stripped)
+  - Weighted fair queueing (stride scheduling). Only classes with work compete, so a dry class's share goes to the others in proportion. A class coming back from empty gets no saved-up burst: it re-enters level with the classes that kept their work. If every other class had work on the pick before the return and all keep it, while every pick is charged to the class it picked, then counted from the return, in the first n picks it gets at most its weight's share of n plus one, for every n, whatever the others did earlier. If some other class had no work on that pick and comes back with it, that class can carry stride debt from earlier, and the returning class can read more; no ceiling is proven for that case (short histories pinned in the tests reach share + 1.36 at 40/40/20/10 and share + 2.91 at 100/1/1/1). The bound covers only windows that start at the return. Weight `0` is a filler, served only when every positive-weight class is empty; several weight-0 classes with work share the slot evenly
+  - A class counts as having work while it has any queued item, resident or parked. One reported empty while it still has work (for example because the dispatcher's scan skipped its items for one pick) loses its place each time it comes back. Some repeated patterns of such omissions, not only every other pick, can leave it with little or no service (at 40/40/20/10: `company` and `gap` left out 2 picks in 3 get none; `other` left out 2 in 5 gets under 2 % of its share); others cost less (at 40/40/20/10 a class left out 1 pick in 3, 4, 5 or 10 still gets at least 3/4 of its fair share)
+  - A host is laned by one whole, well-formed entry or not at all, except through the gap named below. An entry with a malformed class list (an unknown or repeated class, a class without a weight, a weight outside 0–100 or not a whole number, no positive weight) is dropped with a WARN, and its host then dispatches exactly as today: every other entry for that host, before or after it, is ignored too
+  - An entry with no `=` that starts with a class name (such as the `gap:20,other:10` that a `;` typed for `,` cuts off `myfigurecollection.net=new:40,company:40;gap:20,other:10`) refuses the **whole** setting with a WARN: which host it belongs to cannot be told, so no host is laned. So a `;` typed for any `,` in a well-formed class list never lanes a host by part of that list
+  - Any other entry with no `=` (a host name alone, a host with `:` typed for `=`, text that does not start with a class name), or whose text before `=` is not a plain host name (a url, a port, a path, a trailing dot, a bad label, a non-ASCII letter), is dropped with a WARN that it is not read as any host's entry: the other entries are read as if it were not there, so it lanes no host and cannot unlane the one it meant. The gap: the refusal covers only a piece with no `=` that starts with a class name. A cut-off piece that does not (a `;` inserted inside a pair, as in `new:4;0,company:40`, or a piece that starts with a misspelt class) is only dropped, and its host is then laned by the part of its list before the `;`. A host named twice in well-formed entries keeps its last entry, with a WARN as each one replaces the one before, even an identical one
+  - **Reading the split.** While `other` has work, weights 40/40/20/10 give 36.4/36.4/18.2/9.1 of the slot, so the four-class shares (basis `all`) do not read 40/40/20 as they stand; the three classes' counts over all picks, normalised over the three, do while all four are backlogged. The scheduler also tallies the picks made while `other` had no work (basis `ross-three`, `new`/`company`/`gap` only). That basis reads nothing while `other` always has work, and a weight-0 `other` with work blanks it too although it takes no share. `targetLaneShares` gives the expected share for a set of classes with work, on either basis. It is a benchmark only while that set stays the same over many picks: when it changes pick by pick the realised shares can drift far from it, and no bound is claimed (in a repeating 4-pick pattern at 40/40/20/10 where each class has work on half the picks, `new` reads 17.5 points above it and `other` 13.3 below)
+  - Unset/blank → no host is laned
 - `CHALLENGE_COOLDOWN_MS`: Per-host cooldown window (ms) after a store serves a Cloudflare challenge/block
   - While a host is cooling, the scrape queue and lookup fan-out skip it without fetching, so repeat challenges don't degrade the egress IP's CF reputation
   - Open cooldowns are persisted with the queue (`SCRAPE_QUEUE_DIR`) and rehydrated at boot: a restart inside an open window is exactly when the engine is most likely to walk straight back into the challenge it just backed off from
   - Unset/invalid → default; any finite value is clamped to `[60000 (1 min), 86400000 (24 h)]`
   - Default: `1800000` (30 min)
+- `GATE_FAILURE_COOLDOWN_THRESHOLD`: Consecutive gate failures that open a host's cooldown (the window above)
+  - A gate failure is a 5xx, or an empty body (except an empty 404 / 410, the store's own "gone" answer), from a GATED host: one with stored cookies (`CF_COOKIE_FILE`), whose profile declares `access: 'cloudflare'`, or that fetches through the residential exit (`egress: 'residential'`). It also marks the stored cookies stale on `/health/detailed` (`cfCookies[].stale`), and a `/catalog` listing or seed page that is a gate failure is reported `failed`, never parsed
+  - Only a 2xx with a real body marks the host fresh, clears its cooldown and resets the run. `/lookup`, the `/catalog` listing and the declared-page axes read the status-aware impit / http lanes for that; a site there that sees no status (the browser lane) can never prove the host fresh — its body counts only when it is empty. In the ingest queue every lane surfaces a status; a fetch that still observed none (a browser navigation with no response) is judged by its body alone. A non-empty 403 or 404 neither adds to the run nor resets it
+  - The run lives in memory only: after a restart a restored cooldown comes back with a run of 0, and a clean fetch that lands while a window is open ends the run (the window and the stale mark stay). Either way the next window costs up to the threshold in refused fetches, not one
+  - Unset/invalid (not a whole number ≥ 1) → default
+  - Default: `5`
 - `CF_COOKIE_FILE`: Path to the stored-cookie file (hand-minted Cloudflare clearance / session cookies, keyed by host) — see **Stored Cloudflare cookies** below
   - Unset/blank (default): the jar is disabled and every lane behaves exactly as before
   - Example: `/var/run/fc/cf-cookies/cf-cookies.json` (a Secret mounted as a directory, so a refresh changes the file's mtime)
@@ -1229,6 +1562,11 @@ See `.env.example` for complete configuration template.
   - A catalog page is far larger than a search hit (orzgk pages run 1.5–2 MB), so it gets its own window
   - Unset/invalid → default; any value is clamped to `[1000, 120000]`
   - Default: `30000`
+
+- `SCRAPE_CATALOG_MAX_PAGES_GUARD`: `off` (default) | `all` | a csv of siteIds (QB-U24)
+  - For a guarded store, `GET /catalog?store=&page=p` with `p` above the last page the profile's `byListing.maxPages` allows (counted from `pageStart`) answers the usual exhausted page (`items: []`, `hasMore: false`) WITHOUT a store fetch, so the crawler confirms the end at zero store GETs (mfc, `maxPages: 1`: no more weekly page-2 GET)
+  - A store whose profile declares no usable `maxPages` is never guarded; a malformed entry, or a keyword inside a list, is ignored with a boot WARN
+  - The answers of the trailing hour are published per store as `maxPagesGuard.stores[].maxPagesGuarded60m` on `GET /health/detailed`
 
 - `IMAGE_HOST_POLICY_JSON`: Inline `{ host: rule }` table saying how each IMAGE host is fetched — see **Image bytes lanes** below
   - Unset/blank (default): the built-in table, which is the permaban alone
@@ -1412,7 +1750,7 @@ File format — a JSON object keyed by host; keys are normalized (lower-cased, l
 - `userAgent` (recommended): pinned for the host on every lane — it wins over the store's declared UA and the impit profile's. Without it the lane's default UA is sent, which usually voids `cf_clearance`.
 - `mintedAt` / `expiresAt` (optional, informational): surfaced on `/health/detailed` only.
 - Hot reload: the file's mtime is polled every 30 s (unref'd timer). A rewrite goes live without a restart and RESETS every stale mark. A malformed file keeps the last-good set (one warn); a missing file reads as empty.
-- Stale semantics: the engine never refreshes or retries a cookie. When a host the jar has cookies for STILL serves a challenge — at any of the existing cooldown sites (ingest honesty gate / extraction-throw door, `/lookup` search, `/catalog` listing, on any lane) — the host is marked `stale` once (`[CF-COOKIE] STALE <host> via <lane>: …` naming cookie NAMES only) and `/health/detailed` → `cfCookies[].stale` flips true with `staleSince` / `staleReason`. The existing storm protection is unchanged: one probe fetch per host per cooldown window, then the host cooldown fast-fails everything else. A clean body for that host marks it fresh again. A host the jar knows nothing about is never marked — its challenge is an egress matter, not a cookie one.
+- Stale semantics: the engine never refreshes or retries a cookie. When a host the jar has cookies for STILL serves a challenge — at any of the existing cooldown sites (ingest honesty gate / extraction-throw door, `/lookup` search, `/catalog` listing, on any lane) — the host is marked `stale` once (`[CF-COOKIE] STALE <host> via <lane>: …` naming cookie NAMES only) and `/health/detailed` → `cfCookies[].stale` flips true with `staleSince` / `staleReason`. The existing storm protection is unchanged: one probe fetch per host per cooldown window, then the host cooldown fast-fails everything else. A clean fetch for that host (a 2xx the lane saw, with a real body — see `GATE_FAILURE_COOLDOWN_THRESHOLD`) marks it fresh again. A host the jar knows nothing about is never marked — its challenge is an egress matter, not a cookie one.
 - Logs and the health view carry cookie NAMES only, never a value.
 
 **Fetch-failure ledger (`REPORT_FETCH_FAILURES`):**

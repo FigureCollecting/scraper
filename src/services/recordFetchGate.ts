@@ -19,6 +19,7 @@
  * the challenge path's business — it may still be recovered by a ruleset's own follow-up transport,
  * the amiami case — so the queue never runs this gate on one).
  */
+import type { GonePage } from '@figurecollecting/scraper-plugin-contract';
 import { sanitizeForLog } from '../utils/security.js';
 
 /**
@@ -67,6 +68,8 @@ export function isAmbiguousNotFoundHost(url: string): boolean {
 export interface RecordFetchMeta {
   status?: number;
   finalUrl?: string;
+  /** The body, read only to match a ruleset-declared gone page. */
+  html?: string;
 }
 
 /**
@@ -83,10 +86,12 @@ export class RecordFetchStatusError extends Error {
   readonly redirectedHome: boolean;
   /**
    * The store answered 404 AND it is one of the stores where that does not mean "gone" (see
-   * {@link AMBIGUOUS_NOT_FOUND_HOSTS}). The ledger books such a row as http_403 — reviewable and
-   * re-mintable — instead of gone_404, which would close a live item as removed.
+   * {@link AMBIGUOUS_NOT_FOUND_HOSTS}), or the response matched the ruleset's declared gone page.
+   * The ledger books such a row as http_403 — reviewable — instead of auto-closing it as removed.
    */
   readonly deniedOrGone: boolean;
+  /** The response matched the ruleset's declared gone page (ExtractionRuleset.gonePage). */
+  readonly declaredGone: boolean;
   /** The siteId of the ambiguous-404 store, when this is one — `undefined` otherwise. */
   readonly deniedOrGoneSite: string | undefined;
 
@@ -98,13 +103,18 @@ export class RecordFetchStatusError extends Error {
     redirectedHome?: boolean;
     /** The store's siteId, when its 404 is ambiguous — it NAMES the store in the ledger message. */
     deniedOrGoneSite?: string;
+    /** The response matched the ruleset's declared gone page. */
+    declaredGone?: boolean;
   }) {
     const redirectedHome = args.redirectedHome === true;
-    const deniedOrGone = args.deniedOrGoneSite !== undefined;
+    const declaredGone = args.declaredGone === true;
+    const deniedOrGone = args.deniedOrGoneSite !== undefined || declaredGone;
     // The exact operator-facing token: "<site> 404: denied-or-gone, session may need re-minting".
     const what = redirectedHome
       ? `redirected to the store home page ${sanitizeForLog(args.finalUrl ?? '')}`
-      : deniedOrGone
+      : declaredGone
+        ? `answered HTTP ${args.status} with the ruleset's declared gone page: gone-or-denied`
+        : deniedOrGone
         ? `answered ${args.deniedOrGoneSite} 404: denied-or-gone, session may need re-minting (an unentitled NSFW item and a missing item answer alike here)`
         : `answered HTTP ${args.status}`;
     super(`Record fetch for ${sanitizeForLog(args.url)} via ${args.transport} transport ${what}.`);
@@ -115,6 +125,7 @@ export class RecordFetchStatusError extends Error {
     this.finalUrl = args.finalUrl;
     this.redirectedHome = redirectedHome;
     this.deniedOrGone = deniedOrGone;
+    this.declaredGone = declaredGone;
     this.deniedOrGoneSite = args.deniedOrGoneSite;
   }
 }
@@ -126,10 +137,10 @@ function usableStatus(status: number | undefined): number | undefined {
     : undefined;
 }
 
-/** The path of a URL, `undefined` when it will not parse. Query and hash are irrelevant here. */
-function pathOf(url: string): string | undefined {
+/** The parsed URL, `undefined` when it will not parse. */
+function parse(url: string): URL | undefined {
   try {
-    return new URL(url).pathname;
+    return new URL(url);
   } catch {
     return undefined;
   }
@@ -141,18 +152,74 @@ function isHomePath(path: string): boolean {
 }
 
 /**
+ * Languages a store localizes into (ISO 639-1 and 639-2 B/T). An allowlist, not "any 2–3 letters":
+ * root-slug stores keep categories and products at /<slug>/, and /new/ or /so_ta is not a language.
+ */
+const LOCALE_LANGUAGES =
+  'ar|cs|da|de|el|en|es|fi|fr|he|hi|hu|id|it|ja|ko|ms|nl|no|pl|pt|ro|ru|sv|th|tl|tr|uk|vi|zh|' +
+  'ara|chi|deu|dut|eng|fra|fre|ger|ind|ita|jpn|kor|nld|pol|por|rus|spa|swe|tha|tur|vie|zho';
+
+/**
+ * A bare locale root: ONE known language segment (`/eng/`, `/en`, `/zh-cn/`, `/es-419`, `/zh-Hant/`)
+ * and nothing else, with at most a region (2 letters / 3 digits) or a real script subtag.
+ */
+const LOCALE_ROOT = new RegExp(
+  `^/(?:${LOCALE_LANGUAGES})(?:[-_](?:[a-z]{2}|\\d{3}|hans|hant|latn|cyrl|arab))?/?$`,
+  'i',
+);
+
+/** Same site: one host equals, or is a subdomain of, the other (`www.` bounces included). */
+function isSameSite(a: string, b: string): boolean {
+  return a === b || a.endsWith(`.${b}`) || b.endsWith(`.${a}`);
+}
+
+/**
  * Did an ITEM fetch end up on a home/landing page? True only when the requested URL asked for a
- * real path and the fetch finished on a bare root. The host is deliberately not compared: a bounce
- * to `www.` or to a regional front page is equally not the record. Unparseable input is never a
- * guess — it answers false.
+ * real path and the fetch finished on a bare root, or on a same-site locale root. The host is not
+ * compared for `/`: a bounce to `www.` or to a regional front page is equally not the record.
+ * Unparseable input is never a guess — it answers false.
  */
 export function isRedirectHome(requestedUrl: string, finalUrl: string | undefined): boolean {
   if (finalUrl === undefined || finalUrl === '') return false;
-  const requested = pathOf(requestedUrl);
-  const landed = pathOf(finalUrl);
+  const requested = parse(requestedUrl);
+  const landed = parse(finalUrl);
   if (requested === undefined || landed === undefined) return false;
-  if (isHomePath(requested)) return false;
-  return isHomePath(landed);
+  const requestedPath = requested.pathname;
+  if (isHomePath(requestedPath)) return false;
+  if (isHomePath(landed.pathname)) return true;
+  // A locale segment is only a home page on the store's OWN site, and only when the request was not
+  // already for one; elsewhere it is just a path.
+  return (
+    !LOCALE_ROOT.test(requestedPath) &&
+    LOCALE_ROOT.test(landed.pathname) &&
+    isSameSite(requested.hostname, landed.hostname)
+  );
+}
+
+/** The page `<title>` text with whitespace collapsed, `undefined` when there is none. */
+function titleOf(html: string): string | undefined {
+  const match = /<title\b[^>]*>([\s\S]*?)<\/title>/i.exec(html);
+  return match ? match[1].replace(/\s+/g, ' ').trim() : undefined;
+}
+
+/** A marker the declaration really set — a non-empty string. */
+function isMarker(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+/**
+ * Does this response match the ruleset's declared gone page? The status must be listed AND every
+ * declared marker must be present; a declaration with no marker never matches, so a bare status
+ * list can never turn a store's real outage into "gone". Rulesets are external code, so the shape
+ * is checked, not trusted.
+ */
+export function matchesGonePage(status: number, html: string | undefined, gonePage: GonePage | undefined): boolean {
+  if (gonePage === undefined || html === undefined) return false;
+  if (!Array.isArray(gonePage.statuses) || !gonePage.statuses.includes(status)) return false;
+  const { titleIncludes, bodyIncludes } = gonePage;
+  if (!isMarker(titleIncludes) && !isMarker(bodyIncludes)) return false;
+  if (isMarker(titleIncludes) && !(titleOf(html)?.includes(titleIncludes) ?? false)) return false;
+  return !isMarker(bodyIncludes) || html.includes(bodyIncludes);
 }
 
 /**
@@ -167,18 +234,23 @@ export function evaluateRecordFetch(
   url: string,
   meta: RecordFetchMeta,
   transport: string,
+  gonePage?: GonePage,
 ): RecordFetchStatusError | undefined {
   const status = usableStatus(meta.status);
   if (status !== undefined && status >= 400) {
+    // A ruleset-declared gone page wins over the status reading: the store's own template says
+    // the item is gone, whatever status it chose to serve it with.
+    const declaredGone = matchesGonePage(status, meta.html, gonePage);
     // Only a 404 is ambiguous, and only at the stores in the table. A 410 there is an explicit
     // Gone, and a 403 is already the class an entitlement failure belongs in.
-    const ambiguousSite = status === 404 ? ambiguousNotFoundSite(url) : undefined;
+    const ambiguousSite = status === 404 && !declaredGone ? ambiguousNotFoundSite(url) : undefined;
     return new RecordFetchStatusError({
       url,
       transport,
       status,
       ...(meta.finalUrl !== undefined ? { finalUrl: meta.finalUrl } : {}),
       ...(ambiguousSite !== undefined ? { deniedOrGoneSite: ambiguousSite } : {}),
+      ...(declaredGone ? { declaredGone: true } : {}),
     });
   }
   if (isRedirectHome(url, meta.finalUrl)) {

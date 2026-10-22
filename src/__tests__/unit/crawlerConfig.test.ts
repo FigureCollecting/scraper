@@ -35,13 +35,13 @@ describe('loadCrawlerConfig', () => {
     expect(loadCrawlerConfig({ CRAWLER_SEED_SPACING_MS: '-5' }).seedSpacingMs).toBe(10000);
   });
 
-  it('accepts recent / backfill / seed modes, defaulting anything else to both', () => {
+  it('accepts recent / backfill / seed modes; an ABSENT or empty value is both, an unknown one is fatal', () => {
     expect(loadCrawlerConfig({ CRAWLER_MODE: 'recent' }).mode).toBe('recent');
     expect(loadCrawlerConfig({ CRAWLER_MODE: 'backfill' }).mode).toBe('backfill');
     expect(loadCrawlerConfig({ CRAWLER_MODE: 'seed' }).mode).toBe('seed');
     expect(loadCrawlerConfig({ CRAWLER_MODE: 'both' }).mode).toBe('both');
-    expect(loadCrawlerConfig({ CRAWLER_MODE: 'whatever' }).mode).toBe('both');
     expect(loadCrawlerConfig({ CRAWLER_MODE: '' }).mode).toBe('both');
+    expect(() => loadCrawlerConfig({ CRAWLER_MODE: 'whatever' })).toThrow(/whatever/);
   });
 
   it('parses csv stores, trimming blanks and whitespace', () => {
@@ -193,5 +193,371 @@ describe('loadCrawlerConfig', () => {
     } finally {
       warn.mockRestore();
     }
+  });
+});
+
+/**
+ * RE-OBSERVATION LANE (D4). `CRAWLER_MODE` grows from a single token into a SUBSET of the phases,
+ * and the lane carries its own budget so it can never spend discovery's.
+ */
+describe('loadCrawlerConfig — the re-observation lane', () => {
+  it('defaults: mode both = the two discovery phases, and the lane is OFF for every store', () => {
+    const c = loadCrawlerConfig({});
+    expect(c.mode).toBe('both');
+    expect(c.phases).toEqual(['recent', 'backfill']);
+    expect(c.maxReobservePerStore).toBe(0);
+    expect(c.storeReobserveCaps).toEqual({});
+    expect(c.reobserveMinAgeMs).toBe(12 * 60 * 60 * 1000);
+    expect(c.reobserveDryRun).toBe(false);
+  });
+
+  it('keeps every legacy CRAWLER_MODE token meaning exactly what it meant', () => {
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'recent' }).phases).toEqual(['recent']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'backfill' }).phases).toEqual(['backfill']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'both' }).phases).toEqual(['recent', 'backfill']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'seed' }).phases).toEqual(['seed']);
+  });
+
+  it('CRAWLER_MODE may name any subset, in any order, deduplicated into canonical order', () => {
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'reobserve' }).phases).toEqual(['reobserve']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'reobserve' }).mode).toBe('reobserve');
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'both,reobserve' }).phases).toEqual(['recent', 'backfill', 'reobserve']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'both,reobserve' }).mode).toBe('recent,backfill,reobserve');
+    expect(loadCrawlerConfig({ CRAWLER_MODE: ' reobserve , recent ' }).phases).toEqual(['recent', 'reobserve']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'reobserve,reobserve' }).phases).toEqual(['reobserve']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'recent,backfill' }).mode).toBe('both');
+  });
+
+  it('FAILS on an unrecognised token, naming the token and the accepted grammar — never a silent discovery-only run', () => {
+    // A typo used to WARN and then run discovery-only, so `both,reobserv` armed nothing and the only
+    // trace was one line in an hourly log. The var's grammar grew a csv in this change, which is
+    // exactly when fail-closed is cheap: an unknown token is now fatal at config time.
+    for (const bad of ['reobserv', 'both,reobserv', 'nonsense,rubbish', 'reobserve;both', 'both reobserve', 'BOTH', 'Reobserve']) {
+      expect(() => loadCrawlerConfig({ CRAWLER_MODE: bad })).toThrow(/CRAWLER_MODE/);
+    }
+    // the message names the offending token AND what is accepted, so the fix needs no source dive
+    try {
+      loadCrawlerConfig({ CRAWLER_MODE: 'both,reobserv' });
+      throw new Error('expected a throw');
+    } catch (error) {
+      const message = (error as Error).message;
+      expect(message).toContain('reobserv');
+      expect(message).toContain('recent');
+      expect(message).toContain('backfill');
+      expect(message).toContain('reobserve');
+      expect(message).toContain('seed');
+      expect(message).toContain('both');
+    }
+  });
+
+  it('never dies on an EMPTY or absent value: an unset variable must not crash-loop the CronJob', () => {
+    // A CronJob whose env var is blank (or templated away) must still run the default pass. Only a
+    // value that says something we cannot honour is fatal.
+    expect(loadCrawlerConfig({}).phases).toEqual(['recent', 'backfill']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: '' }).phases).toEqual(['recent', 'backfill']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: '   ' }).phases).toEqual(['recent', 'backfill']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: ',,,' }).phases).toEqual(['recent', 'backfill']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: ' , both , ' }).phases).toEqual(['recent', 'backfill']);
+  });
+
+  it('tolerates duplicates and whitespace, which are not typos', () => {
+    expect(loadCrawlerConfig({ CRAWLER_MODE: ' both , reobserve , reobserve ' }).phases).toEqual(['recent', 'backfill', 'reobserve']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'both,both' }).phases).toEqual(['recent', 'backfill']);
+    expect(loadCrawlerConfig({ CRAWLER_MODE: 'reobserve,both' }).phases).toEqual(['recent', 'backfill', 'reobserve']);
+  });
+
+  it('keeps `seed` EXCLUSIVE: named with other phases it is dropped with a WARN, and the rest still run', () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      expect(loadCrawlerConfig({ CRAWLER_MODE: 'seed,reobserve' }).phases).toEqual(['reobserve']);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('seed'))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('CRAWLER_REOBSERVE_MIN_AGE_H is hours → ms, honours an explicit 0, and ignores junk', () => {
+    expect(loadCrawlerConfig({ CRAWLER_REOBSERVE_MIN_AGE_H: '6' }).reobserveMinAgeMs).toBe(6 * 60 * 60 * 1000);
+    expect(loadCrawlerConfig({ CRAWLER_REOBSERVE_MIN_AGE_H: '0' }).reobserveMinAgeMs).toBe(0);
+    expect(loadCrawlerConfig({ CRAWLER_REOBSERVE_MIN_AGE_H: 'x' }).reobserveMinAgeMs).toBe(12 * 60 * 60 * 1000);
+    expect(loadCrawlerConfig({ CRAWLER_REOBSERVE_MIN_AGE_H: '-3' }).reobserveMinAgeMs).toBe(12 * 60 * 60 * 1000);
+  });
+
+  it('parses CRAWLER_STORE_REOBSERVE_CAPS exactly like the enqueue caps, warning on a malformed entry', () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      const c = loadCrawlerConfig({ CRAWLER_STORE_REOBSERVE_CAPS: ' goodsmileus:50 , bbts:20 ,anitoys:0, nope ' });
+      expect(c.storeReobserveCaps).toEqual({ goodsmileus: 50, bbts: 20, anitoys: 0 });
+      expect(warn.mock.calls.some((call) => String(call[0]).includes('CRAWLER_STORE_REOBSERVE_CAPS'))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('CRAWLER_MAX_REOBSERVE_PER_STORE is the global default for the lane and stays 0 (off) unless set', () => {
+    expect(loadCrawlerConfig({ CRAWLER_MAX_REOBSERVE_PER_STORE: '25' }).maxReobservePerStore).toBe(25);
+    expect(loadCrawlerConfig({ CRAWLER_MAX_REOBSERVE_PER_STORE: '0' }).maxReobservePerStore).toBe(0);
+    expect(loadCrawlerConfig({ CRAWLER_MAX_REOBSERVE_PER_STORE: 'junk' }).maxReobservePerStore).toBe(0);
+  });
+
+  it('a `--dry-run` argv arms the same dry run as the env var (the CronJob operator has both)', () => {
+    expect(loadCrawlerConfig({}, ['node', 'run.js', '--dry-run']).reobserveDryRun).toBe(true);
+    expect(loadCrawlerConfig({}, ['node', 'run.js']).reobserveDryRun).toBe(false);
+    expect(loadCrawlerConfig({}, ['node', 'run.js', '--dry-run=please']).reobserveDryRun).toBe(false);
+  });
+
+  it('CRAWLER_REOBSERVE_DRY_RUN arms the dry run; CRAWLER_DRY_RUN is an alias that WARNs it covers this lane only', () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      expect(loadCrawlerConfig({ CRAWLER_REOBSERVE_DRY_RUN: '1' }).reobserveDryRun).toBe(true);
+      expect(loadCrawlerConfig({ CRAWLER_REOBSERVE_DRY_RUN: 'true' }).reobserveDryRun).toBe(true);
+      expect(loadCrawlerConfig({ CRAWLER_REOBSERVE_DRY_RUN: '0' }).reobserveDryRun).toBe(false);
+      expect(warn).not.toHaveBeenCalled();
+      expect(loadCrawlerConfig({ CRAWLER_DRY_RUN: '1' }).reobserveDryRun).toBe(true);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('CRAWLER_DRY_RUN'))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+  it('CRAWLER_RANGE_REANCHOR_H is hours → ms, defaults to a day, honours an explicit 0, and ignores junk', () => {
+    expect(loadCrawlerConfig({}).rangeReanchorMs).toBe(24 * 60 * 60 * 1000);
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_REANCHOR_H: '6' }).rangeReanchorMs).toBe(6 * 60 * 60 * 1000);
+    // 0 is "re-anchor every run", not "revert to a day": a cadence knob must not fail SLOW.
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_REANCHOR_H: '0' }).rangeReanchorMs).toBe(0);
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_REANCHOR_H: 'x' }).rangeReanchorMs).toBe(24 * 60 * 60 * 1000);
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_REANCHOR_H: '-3' }).rangeReanchorMs).toBe(24 * 60 * 60 * 1000);
+  });
+
+  it('CRAWLER_RANGE_REANCHOR_MAX_DELTA bounds one re-anchor: 50,000 by default, an explicit 0 honoured, junk ignored', () => {
+    expect(loadCrawlerConfig({}).rangeReanchorMaxDelta).toBe(50_000);
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_REANCHOR_MAX_DELTA: '120000' }).rangeReanchorMaxDelta).toBe(120_000);
+    // A safety bound at its most conservative setting must not revert to the generous default.
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_REANCHOR_MAX_DELTA: '0' }).rangeReanchorMaxDelta).toBe(0);
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_REANCHOR_MAX_DELTA: 'lots' }).rangeReanchorMaxDelta).toBe(50_000);
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_REANCHOR_MAX_DELTA: '-1' }).rangeReanchorMaxDelta).toBe(50_000);
+  });
+
+  it('CRAWLER_RANGE_GAP_BUDGET is the gap sweep own per-run budget and stays 0 (off) unless set', () => {
+    expect(loadCrawlerConfig({}).rangeGapBudget).toBe(0);
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_GAP_BUDGET: '100' }).rangeGapBudget).toBe(100);
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_GAP_BUDGET: '0' }).rangeGapBudget).toBe(0);
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_GAP_BUDGET: 'junk' }).rangeGapBudget).toBe(0);
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_GAP_BUDGET: '-5' }).rangeGapBudget).toBe(0);
+  });
+
+  it('parses CRAWLER_RANGE_GAPS into per-store bands, accepting a range and a single id', () => {
+    const c = loadCrawlerConfig({ CRAWLER_RANGE_GAPS: ' mfc:3765216-3801000 , mfc:123456 ,orzgk:10-12 ' });
+    expect(c.rangeGaps).toEqual({
+      mfc: [
+        { from: 3765216, to: 3801000 },
+        { from: 123456, to: 123456 },
+      ],
+      orzgk: [{ from: 10, to: 12 }],
+    });
+  });
+
+  it('drops a malformed CRAWLER_RANGE_GAPS entry with a WARN naming it, and keeps the well-formed ones', () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      const c = loadCrawlerConfig({ CRAWLER_RANGE_GAPS: 'mfc:10-12,mfc:20-19,mfc:0-5,mfc:abc,nope,mfc:1.5-9,bad site:1-2' });
+      expect(c.rangeGaps).toEqual({ mfc: [{ from: 10, to: 12 }] });
+      expect(warn.mock.calls.filter((call) => String(call[0]).includes('CRAWLER_RANGE_GAPS')).length).toBe(6);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('CRAWLER_RANGE_GAP_DRY_RUN arms the sweep dry run; --dry-run and CRAWLER_DRY_RUN arm BOTH lanes', () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      expect(loadCrawlerConfig({}).rangeGapDryRun).toBe(false);
+      expect(loadCrawlerConfig({ CRAWLER_RANGE_GAP_DRY_RUN: '1' }).rangeGapDryRun).toBe(true);
+      // Gating only ONE lane would be the worst kind of safety knob: a `--dry-run` the operator
+      // believed covered the pass while the sweep went on enqueueing.
+      expect(loadCrawlerConfig({}, ['node', 'run.js', '--dry-run']).rangeGapDryRun).toBe(true);
+      expect(loadCrawlerConfig({ CRAWLER_DRY_RUN: '1' }).rangeGapDryRun).toBe(true);
+      expect(loadCrawlerConfig({ CRAWLER_RANGE_GAP_DRY_RUN: '1' }).reobserveDryRun).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+describe('loadCrawlerConfig — the rotating company-lists step', () => {
+  const HOUR = 60 * 60 * 1000;
+  const quiet = () => jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+
+  it('is OFF by default: no window, no drain caps, a 160 h interval and a 10 s floor between lists', () => {
+    const c = loadCrawlerConfig({});
+    expect(c.listsWindow).toBeNull();
+    expect(c.listsDrainCaps).toEqual({});
+    expect(c.listsIntervalMs).toBe(160 * HOUR);
+    expect(c.listsSpacingMs).toBe(10_000);
+  });
+
+  it('parses CRAWLER_LISTS_WINDOW_UTC as HH:MM-HH:MM in minutes after midnight, a wrap past midnight included', () => {
+    expect(loadCrawlerConfig({ CRAWLER_LISTS_WINDOW_UTC: '15:30-22:30' }).listsWindow).toEqual({ startMin: 930, endMin: 1350 });
+    expect(loadCrawlerConfig({ CRAWLER_LISTS_WINDOW_UTC: ' 22:00-2:30 ' }).listsWindow).toEqual({ startMin: 1320, endMin: 150 });
+    expect(loadCrawlerConfig({ CRAWLER_LISTS_WINDOW_UTC: '' }).listsWindow).toBeNull();
+  });
+
+  it('a malformed or empty-width window is OFF, with a WARN naming the var — never always-on', () => {
+    const warn = quiet();
+    try {
+      for (const raw of ['25:00-01:00', '15:60-16:00', '15:30', '15:30-15:30', 'evening', '1530-2230']) {
+        warn.mockClear();
+        expect(loadCrawlerConfig({ CRAWLER_LISTS_WINDOW_UTC: raw }).listsWindow).toBeNull();
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining('CRAWLER_LISTS_WINDOW_UTC'), { value: raw });
+      }
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('CRAWLER_LISTS_INTERVAL_H is hours → ms; 0 or junk keeps 160 h (the interval is a floor on how often one group is polled)', () => {
+    expect(loadCrawlerConfig({ CRAWLER_LISTS_INTERVAL_H: '168' }).listsIntervalMs).toBe(168 * HOUR);
+    expect(loadCrawlerConfig({ CRAWLER_LISTS_INTERVAL_H: '0' }).listsIntervalMs).toBe(160 * HOUR);
+    expect(loadCrawlerConfig({ CRAWLER_LISTS_INTERVAL_H: 'weekly' }).listsIntervalMs).toBe(160 * HOUR);
+  });
+
+  it('parses CRAWLER_LISTS_DRAIN_CAPS like the other per-store caps, warning on a malformed entry', () => {
+    const warn = quiet();
+    try {
+      expect(loadCrawlerConfig({ CRAWLER_LISTS_DRAIN_CAPS: 'mfc:200, hpoi:0, bad' }).listsDrainCaps).toEqual({ mfc: 200, hpoi: 0 });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('CRAWLER_LISTS_DRAIN_CAPS'), { entry: 'bad' });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('CRAWLER_LISTS_ALTERNATE is empty by default: no store alternates the tap and the lists', () => {
+    expect(loadCrawlerConfig({}).listsAlternate).toEqual([]);
+    expect(loadCrawlerConfig({ CRAWLER_LISTS_ALTERNATE: '' }).listsAlternate).toEqual([]);
+  });
+
+  it('parses CRAWLER_LISTS_ALTERNATE as a csv of siteIds, once each, dropping an unsafe entry with a WARN naming the var', () => {
+    const warn = quiet();
+    try {
+      expect(loadCrawlerConfig({ CRAWLER_LISTS_ALTERNATE: ' mfc ,hpoi,mfc' }).listsAlternate).toEqual(['mfc', 'hpoi']);
+      expect(warn).not.toHaveBeenCalled();
+      expect(loadCrawlerConfig({ CRAWLER_LISTS_ALTERNATE: 'mfc,../etc,mfc:1,a b' }).listsAlternate).toEqual(['mfc']);
+      expect(warn).toHaveBeenCalledTimes(3);
+      for (const entry of ['../etc', 'mfc:1', 'a b']) {
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining('CRAWLER_LISTS_ALTERNATE'), { entry });
+      }
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('CRAWLER_LISTS_ALTERNATE carries no ratio by default, nor for a bare siteId (1:1)', () => {
+    expect(loadCrawlerConfig({}).listsAlternateRatios).toEqual({});
+    expect(loadCrawlerConfig({ CRAWLER_LISTS_ALTERNATE: 'mfc' }).listsAlternateRatios).toEqual({});
+  });
+
+  it('parses a ratio siteId:lists:tap (Ross MS-1 (c): mfc:2:1), the store alternated as for a bare name', () => {
+    const warn = quiet();
+    try {
+      const c = loadCrawlerConfig({ CRAWLER_LISTS_ALTERNATE: ' mfc:2:1 , hpoi:1:1,orz:24:24' });
+      expect(c.listsAlternate).toEqual(['mfc', 'hpoi', 'orz']);
+      expect(c.listsAlternateRatios).toEqual({ mfc: { lists: 2, tap: 1 }, hpoi: { lists: 1, tap: 1 }, orz: { lists: 24, tap: 24 } });
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('an invalid ratio fails safe to 1:1: the store still alternates, with ONE WARN naming the var and the entry', () => {
+    const bad = ['mfc:0:1', 'mfc:2:0', 'mfc:2', 'mfc:', 'mfc::', 'mfc:a:b', 'mfc:2:1:1', 'mfc:25:1', 'mfc:1:25', 'mfc:-1:1', 'mfc:1.5:1', 'mfc:1e1:1', 'mfc: 2:1', 'mfc:02:1x'];
+    for (const entry of bad) {
+      const warn = quiet();
+      try {
+        const c = loadCrawlerConfig({ CRAWLER_LISTS_ALTERNATE: entry });
+        expect([entry, c.listsAlternate]).toEqual([entry, ['mfc']]);
+        expect([entry, c.listsAlternateRatios]).toEqual([entry, {}]);
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining('CRAWLER_LISTS_ALTERNATE'), { entry });
+        expect(String(warn.mock.calls[0][0])).toContain('1:1');
+      } finally {
+        warn.mockRestore();
+      }
+    }
+  });
+
+  it('a ratio on an unsafe siteId drops the entry as before', () => {
+    const warn = quiet();
+    try {
+      const c = loadCrawlerConfig({ CRAWLER_LISTS_ALTERNATE: '../etc:2:1,:2:1' });
+      expect(c.listsAlternate).toEqual([]);
+      expect(c.listsAlternateRatios).toEqual({});
+      expect(warn).toHaveBeenCalledTimes(2);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('a repeated siteId keeps its FIRST ratio; a repeat that asks for a different one is named in a WARN', () => {
+    const warn = quiet();
+    try {
+      expect(loadCrawlerConfig({ CRAWLER_LISTS_ALTERNATE: 'mfc:2:1,mfc:2:1' }).listsAlternateRatios).toEqual({ mfc: { lists: 2, tap: 1 } });
+      expect(warn).not.toHaveBeenCalled();
+      const c = loadCrawlerConfig({ CRAWLER_LISTS_ALTERNATE: 'mfc:2:1,mfc,mfc:3:1' });
+      expect(c.listsAlternate).toEqual(['mfc']);
+      expect(c.listsAlternateRatios).toEqual({ mfc: { lists: 2, tap: 1 } });
+      expect(warn).toHaveBeenCalledTimes(2);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('CRAWLER_LISTS_ALTERNATE'), { entry: 'mfc' });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('CRAWLER_LISTS_ALTERNATE'), { entry: 'mfc:3:1' });
+      warn.mockClear();
+      expect(loadCrawlerConfig({ CRAWLER_LISTS_ALTERNATE: 'mfc,mfc:1:1' }).listsAlternateRatios).toEqual({});
+      expect(warn).not.toHaveBeenCalled();
+      expect(loadCrawlerConfig({ CRAWLER_LISTS_ALTERNATE: 'mfc:1:2,mfc:2:2' }).listsAlternateRatios).toEqual({ mfc: { lists: 1, tap: 2 } });
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('CRAWLER_LISTS_SPACING_MS may widen the gap between one group lists but never below 10 s', () => {
+    const warn = quiet();
+    try {
+      expect(loadCrawlerConfig({ CRAWLER_LISTS_SPACING_MS: '30000' }).listsSpacingMs).toBe(30_000);
+      expect(loadCrawlerConfig({ CRAWLER_LISTS_SPACING_MS: 'abc' }).listsSpacingMs).toBe(10_000);
+      warn.mockClear();
+      expect(loadCrawlerConfig({ CRAWLER_LISTS_SPACING_MS: '0' }).listsSpacingMs).toBe(10_000);
+      expect(loadCrawlerConfig({ CRAWLER_LISTS_SPACING_MS: '5000' }).listsSpacingMs).toBe(10_000);
+      expect(warn).toHaveBeenCalledTimes(2);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('CRAWLER_LISTS_SPACING_MS'), { requested: 5000, applied: 10_000 });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+describe('loadCrawlerConfig — the per-store descent caps (CRAWLER_RANGE_DESCENT_CAPS)', () => {
+  it('is empty when unset or blank: every store keeps CRAWLER_RANGE_IDS_PER_RUN', () => {
+    expect(loadCrawlerConfig({}).rangeDescentCaps).toEqual({});
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_DESCENT_CAPS: '' }).rangeDescentCaps).toEqual({});
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_DESCENT_CAPS: ' , ' }).rangeDescentCaps).toEqual({});
+  });
+
+  it('parses a csv of siteId:n, trimming whitespace and honouring 0 (the descent off)', () => {
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_DESCENT_CAPS: 'mfc:0' }).rangeDescentCaps).toEqual({ mfc: 0 });
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_DESCENT_CAPS: ' mfc:0 , hpoi:5 ' }).rangeDescentCaps).toEqual({ mfc: 0, hpoi: 5 });
+  });
+
+  it.each(['mfc:-1', 'mfc:x', 'mfc'])('drops a malformed %j with a WARN naming the var, and the other entries still apply', (bad) => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      expect(loadCrawlerConfig({ CRAWLER_RANGE_DESCENT_CAPS: `${bad},hpoi:5` }).rangeDescentCaps).toEqual({ hpoi: 5 });
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('CRAWLER_RANGE_DESCENT_CAPS'), { entry: bad });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('a repeated siteId takes its LAST value, in either direction', () => {
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_DESCENT_CAPS: 'mfc:0,mfc:5' }).rangeDescentCaps).toEqual({ mfc: 5 });
+    expect(loadCrawlerConfig({ CRAWLER_RANGE_DESCENT_CAPS: 'mfc:5,mfc:0' }).rangeDescentCaps).toEqual({ mfc: 0 });
   });
 });

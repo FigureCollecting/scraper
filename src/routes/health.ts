@@ -43,8 +43,31 @@
  *     operator needs it named; the flat form is what an alert rule keys on, and the canary item id
  *     is never exposed)
  *     and `cfCookies: [{host, cookieNames, userAgentPinned, loadedAt, mintedAt?, expiresAt?, stale,
- *     staleSince?, staleReason?}]` (the stored-cookie jar's per-host view — cookie NAMES only, never a
- *     value; `stale` = the host still served a challenge with its stored cookies → re-mint).
+ *     staleSince?, staleReason?, sessionLost, sessionLostSince?, sessionLostReason?}]` (the stored-cookie
+ *     jar's per-host view — cookie NAMES only, never a value; `stale` = the host still served a
+ *     challenge with its stored cookies → re-mint; `sessionLost` = a login-gated image host answered
+ *     as logged out, sticky until new cookie values load → re-mint the login), plus the flat
+ *     `cookieSessionLost: [host]` it mirrors,
+ *     and `handsOff: [{siteId, hosts, tier, handsOff, denied, policyVersion}]` (the hands-off
+ *     policies the rulesets plugin registered — the hosts Claude and its tools never contact — read
+ *     from our own system with zero upstream requests; `[]` when no plugin registered any), and
+ *     `plugins: {loaded: [{name, version}], refused: [{name, version}]}` (which plugins loaded at
+ *     startup and which were refused — it tells a plugin with no policy from a refused plugin, and
+ *     explains a queueStore `held`; why a plugin was refused stays in the pod log), and
+ *     `hostClock: {mode, hosts: [{host, floorMs, clocked, sends60m: {<caller>: n}, minGapMs60m,
+ *     underFloor60m, constrainedGaps60m, meanConstrainedGapMs60m, clockRefusals60m: {<caller>: n},
+ *     listingFetchP99Ms60m, lookupP95Ms60m, lastSendAt}]}` (the shared host clock's send-time
+ *     observer: per store host, the trailing hour of requests measured at the instant each was handed
+ *     to its transport — with the clock off too, so it is the live negative control for
+ *     SCRAPE_HOST_CLOCK; callers queue, image, catalogListing, catalogSeed, catalogRotating, resolve,
+ *     scrape, lookup, fetchBody, sessionPrime, pluginRoute), and
+ *     `maxPagesGuard: {mode, stores: [{siteId, maxPagesGuarded60m, lastGuardedAt}]}` (the engine's
+ *     SCRAPE_CATALOG_MAX_PAGES_GUARD: per store, the /catalog pages above the profile's maxPages it answered
+ *     exhausted WITHOUT a store fetch in the trailing hour), and
+ *     `pool: {scope, malformed, hosts: [{host, mode, picks60m, topBucketShare60m, uniformPicks60m,
+ *     agedPicks60m, agedShare60m, forcedPicks60m, agedCount, p99WaitH60m, maxWaitH60m, redraws60m,
+ *     scanFallbacks60m, retryPicks60m}]}` (the queue's POOL-SELECT dispatch per host, QB-U19: which
+ *     hosts SCRAPE_POOL_SELECT pools, and the trailing hour of their picks; zeros when off).
  *     A browser-pool-health failure still degrades to 500, now carrying { status:'degraded',
  *     challengeCooldowns, cfCookies, error } — both lists survive (neither lister can throw).
  */
@@ -59,6 +82,11 @@ import type { ImageCaptureStats } from '../services/images/imageCaptureHook.js';
 import type { SessionCanaryView } from '../services/sessionCanary.js';
 import type { CpuThrottlingView } from '../services/cpuThrottling.js';
 import type { QueueStoreView } from '../services/scrapeQueue.js';
+import type { HandsOffView } from '../services/extractionRegistry.js';
+import type { PluginsView } from '../services/pluginBootstrap.js';
+import type { HostClockView } from '../services/hostClock.js';
+import type { MaxPagesGuardView } from '../services/maxPagesGuard.js';
+import type { PoolView } from '../services/poolDispatch.js';
 
 export interface HealthDeps {
   /** The service version (package.json). */
@@ -135,12 +163,49 @@ export interface HealthDeps {
    * right up to the next repin, which drops the crawler's batch as a coverage hole. Never throws.
    */
   getQueueStore: () => QueueStoreView;
+  /**
+   * The hands-off policies the plugins registered (ExtractionRegistryImpl.handsOffView()): per policy
+   * its siteId (null for a host-only entry), hosts, robots tier, the handsOff decision, the denied
+   * flag and the policy version — never the robots summary, pins or route samples. `[]` before the
+   * plugins load and when no plugin registered any. Never throws.
+   */
+  listHandsOff: () => HandsOffView[];
+  /**
+   * Which plugins loaded at startup and which were refused (pluginBootstrap's pluginsView): names and
+   * versions only. Both lists empty before the plugins load. Never throws.
+   */
+  listPlugins: () => PluginsView;
+  /**
+   * The shared host clock's send-time observer (getHostClock().view(now), QB-U30a/U30b): `mode` (off |
+   * all | all-except | hosts) and, per store host, `{host, floorMs, clocked, sends60m: {<caller>: n},
+   * minGapMs60m, underFloor60m, constrainedGaps60m, meanConstrainedGapMs60m, clockRefusals60m:
+   * {<caller>: n}, listingFetchP99Ms60m, lookupP95Ms60m, lastSendAt}` over the trailing hour, measured
+   * at the instant each request was handed to its transport. It reads the same with the clock off (the
+   * live negative control). Counters only, under 1 KB per host; never throws.
+   */
+  getHostClock: () => HostClockView;
+  /**
+   * The engine's maxPages guard (getMaxPagesGuard().view(now), QB-U24): `mode` (off | all | stores) and, per
+   * store, `{siteId, maxPagesGuarded60m, lastGuardedAt}` — the listing pages above the profile's maxPages
+   * answered exhausted without a store fetch in the trailing hour. Counters only; never throws.
+   */
+  getMaxPagesGuard: () => MaxPagesGuardView;
+  /**
+   * The queue's POOL-SELECT dispatch (getScrapeQueue().getPoolView(now), QB-U19): SCRAPE_POOL_SELECT as
+   * parsed (`scope`, `malformed`) and, per host, `{host, mode: pool | fifo-excluded | fifo-off,
+   * picks60m, topBucketShare60m, uniformPicks60m, agedPicks60m, agedShare60m, forcedPicks60m, agedCount,
+   * p99WaitH60m, maxWaitH60m, redraws60m, scanFallbacks60m, retryPicks60m}` over the trailing hour.
+   * Zeros for a FIFO host (and every host when the knob is off). Counters only, never throws.
+   */
+  getPool: () => PoolView;
 }
 
 export function createHealthRoutes(deps: HealthDeps): Router {
   const router = Router();
 
   const healthResponse = () => ({ service: 'scraper', version: deps.version, status: 'healthy' });
+  // Flat, like mfcSessionStale: the hosts whose login is gone, for a rule to key on without a filter.
+  const sessionLostHosts = () => deps.listCfCookies().filter(view => view.sessionLost).map(view => view.host);
 
   // Root endpoint for health checks (Docker health checks hit this)
   router.get('/', (_req: Request, res: Response) => {
@@ -161,6 +226,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         browserPool,
         challengeCooldowns: deps.listChallengeCooldowns(),
         cfCookies: deps.listCfCookies(),
+        cookieSessionLost: sessionLostHosts(),
         residentialEgress: deps.getResidentialEgress(),
         browserLane: deps.getBrowserLane(),
         rawStore: deps.getRawStore(),
@@ -171,6 +237,11 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         sessionCanary: deps.getSessionCanary(),
         mfcSessionStale: deps.getSessionCanary().stale,
         cpuThrottling: deps.getCpuThrottling(),
+        handsOff: deps.listHandsOff(),
+        plugins: deps.listPlugins(),
+        hostClock: deps.getHostClock(),
+        maxPagesGuard: deps.getMaxPagesGuard(),
+        pool: deps.getPool(),
         timestamp: new Date().toISOString(),
       });
     } catch (error) {
@@ -179,6 +250,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         status: 'degraded',
         challengeCooldowns: deps.listChallengeCooldowns(),
         cfCookies: deps.listCfCookies(),
+        cookieSessionLost: sessionLostHosts(),
         residentialEgress: deps.getResidentialEgress(),
         browserLane: deps.getBrowserLane(),
         rawStore: deps.getRawStore(),
@@ -193,6 +265,14 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         // A throttled pod is exactly the pod whose browser pool is failing, so this
         // reading must survive the degraded response that reports it.
         cpuThrottling: deps.getCpuThrottling(),
+        // Which hosts are off limits matters most when the pod is sick and someone goes looking.
+        handsOff: deps.listHandsOff(),
+        plugins: deps.listPlugins(),
+        // Whether MFC is being sent to under its floor matters most when the pod is sick, too.
+        hostClock: deps.getHostClock(),
+        maxPagesGuard: deps.getMaxPagesGuard(),
+        // So do waits past the age cap and forced picks (the starvation alarm's inputs).
+        pool: deps.getPool(),
         error: error instanceof Error ? error.message : 'Unknown error',
       });
     }

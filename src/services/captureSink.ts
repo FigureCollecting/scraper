@@ -83,6 +83,20 @@ export interface RawCapture {
    */
   sourceClass?: string;
   contentLevel?: string;
+  /**
+   * Set only for a POST (absent = GET): the url alone cannot say which request these bytes answered.
+   * The object store is write-once by content, so on a dedup hit the first writer's metadata stands.
+   */
+  method?: 'POST';
+  /** Lowercase hex sha256 of the POST request body. */
+  requestBodySha256?: string;
+  /**
+   * Set only when the ruleset sent request headers (contract 0.15.0), GET or POST: they can change
+   * the answer (mandarake's getInfo refuses a POST without its Origin), so they belong beside the
+   * url, method and body. Lowercase hex sha256 of {@link canonicalRequestHeaders}. Engine-owned
+   * headers (UA, cookies, a store's declared decoration) are never part of it.
+   */
+  requestHeadersSha256?: string;
 }
 
 export interface RawCaptureInput {
@@ -102,6 +116,23 @@ export interface RawCaptureInput {
   role?: string;
   sourceClass?: string;
   contentLevel?: string;
+  /** A POST capture; its `requestBody` is hashed into `requestBodySha256`. */
+  method?: 'POST';
+  requestBody?: string;
+  /** The ruleset's request headers, hashed into `requestHeadersSha256` (none or empty ⇒ absent). */
+  requestHeaders?: Record<string, string>;
+}
+
+/**
+ * The canonical form a request's ruleset headers are hashed in: lowercase names, sorted, one
+ * `name:value` line each. Unambiguous because a name or value carrying CR/LF never gets this far.
+ */
+export function canonicalRequestHeaders(headers: Record<string, string>): string {
+  return Object.entries(headers)
+    .map(([name, value]) => [name.toLowerCase(), value] as const)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([name, value]) => `${name}:${value}\n`)
+    .join('');
 }
 
 /**
@@ -181,6 +212,13 @@ export function buildRawCapture(input: RawCaptureInput): RawCapture {
   if (input.role !== undefined) capture.role = input.role;
   if (input.sourceClass !== undefined) capture.sourceClass = input.sourceClass;
   if (input.contentLevel !== undefined) capture.contentLevel = input.contentLevel;
+  if (input.method === 'POST') {
+    capture.method = 'POST';
+    capture.requestBodySha256 = createHash('sha256').update(input.requestBody ?? '', 'utf8').digest('hex');
+  }
+  if (input.requestHeaders && Object.keys(input.requestHeaders).length > 0) {
+    capture.requestHeadersSha256 = createHash('sha256').update(canonicalRequestHeaders(input.requestHeaders), 'utf8').digest('hex');
+  }
   return capture;
 }
 

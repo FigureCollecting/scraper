@@ -36,9 +36,13 @@ import {
   imageTooLarge,
   isTimeoutError,
   overImageSizeCap,
+  placeholderRefusal,
   refusedFinalUrl,
   resolveImageAccept,
   resolveImageTimeout,
+  sessionCookieReissued,
+  splitSetCookieHeader,
+  withSessionFlag,
   type ImageBytesFetcher,
   type ImageBytesResult,
   type ImageFetchOptions,
@@ -338,40 +342,49 @@ export function createGatedTabBytesFetch(
           return { ok: false, reason: 'unsupported', detail: 'the navigation produced no main-frame document response' };
         }
         const status = response.status();
+        // Chrome joins repeated Set-Cookie lines with newlines; compared against the session the tab was given.
+        const setCookie = headerSubset(response, ['set-cookie'])['set-cookie'] ?? '';
+        const reissued = sessionCookieReissued(
+          splitSetCookieHeader(setCookie),
+          opts.sessionCookie,
+          opts.sessionCookie ? cookies?.[opts.sessionCookie] : undefined,
+        );
         if (status < 200 || status > 299) {
           const signals = headerSubset(response, BLOCK_SIGNAL_HEADERS);
-          return { ok: false, reason: 'http-status', status, ...(Object.keys(signals).length > 0 ? { signals } : {}) };
+          return withSessionFlag({ ok: false, reason: 'http-status', status, ...(Object.keys(signals).length > 0 ? { signals } : {}) }, reissued);
         }
         // The event-time buffer first; the served response is the fallback for a navigation whose
         // listener never got to read it.
         const bytes = (await buffered) ?? (await response.buffer().catch(() => undefined));
         if (!bytes) {
-          return { ok: false, reason: 'unsupported', detail: 'the response body was no longer retrievable from the browser' };
+          return withSessionFlag({ ok: false, reason: 'unsupported', detail: 'the response body was no longer retrievable from the browser' }, reissued);
         }
         const headers = headerSubset(response);
         // SIZE: the renderer has already buffered the body, so this is the ceiling on what leaves
         // the lane — an oversized document is dropped rather than handed on.
-        if (overImageSizeCap(headers['content-length'], maxBytes)) return imageTooLarge(headers['content-length'], maxBytes);
-        if (overImageSizeCap(bytes.byteLength, maxBytes)) return imageTooLarge(bytes.byteLength, maxBytes, bytes.byteLength);
+        if (overImageSizeCap(headers['content-length'], maxBytes)) return withSessionFlag(imageTooLarge(headers['content-length'], maxBytes), reissued);
+        if (overImageSizeCap(bytes.byteLength, maxBytes)) return withSessionFlag(imageTooLarge(bytes.byteLength, maxBytes, bytes.byteLength), reissued);
         const servedType = headers['content-type'];
         const classified = classifyImageBytes(servedType, bytes);
         if (!classified.image) {
-          return { ok: false, reason: 'not-image', status, bytesRead: bytes.byteLength, ...(servedType ? { contentType: servedType } : {}) };
+          return withSessionFlag({ ok: false, reason: 'not-image', status, bytesRead: bytes.byteLength, ...(servedType ? { contentType: servedType } : {}) }, reissued);
         }
         const finalUrl = response.url() || url;
         // A navigation follows redirects like every other lane — re-assert the ban, then the guard.
-        if (isDeniedImageUrl(finalUrl)) return refusedFinalUrl(finalUrl, 'is on the image deny list', bytes.byteLength);
+        if (isDeniedImageUrl(finalUrl)) return withSessionFlag(refusedFinalUrl(finalUrl, 'is on the image deny list', bytes.byteLength), reissued);
         if (opts.allowFinalUrl && !opts.allowFinalUrl(finalUrl)) {
-          return refusedFinalUrl(finalUrl, 'the caller\'s final-URL guard rejected', bytes.byteLength);
+          return withSessionFlag(refusedFinalUrl(finalUrl, 'the caller\'s final-URL guard rejected', bytes.byteLength), reissued);
         }
-        return {
+        const placeholder = placeholderRefusal(bytes, opts.placeholders, status);
+        if (placeholder) return withSessionFlag(placeholder, reissued);
+        return withSessionFlag({
           ok: true,
           bytes,
           contentType: classified.contentType as string,
           status,
           finalUrl,
           headers,
-        };
+        }, reissued);
       }, {
         // The gated key is the STORE's host — the session the clearance lives in — not the image
         // host, so the tab joins that store's gated browser and its per-host tab budget.
