@@ -13,13 +13,16 @@ import { existsSync } from 'node:fs';
 import type { SourceClass } from '@figurecollecting/scraper-plugin-contract';
 import { HostRateLimiter } from '../../driver/hostRateLimiter.js';
 import { flushRawCaptureSink } from '../s3ObjectStore.js';
+import { getRawCaptureSink } from '../s3ObjectStore.js';
 import { createImageHostLimiter, createImageCaptureHookFromEnv } from './assembleImageCapture.js';
+import { acquireRunLock } from './galleryLock.js';
 import { readWorklistFile } from './galleryWorklist.js';
 import {
-  createFetchObserver, createFileLedger, createMemoryLedger, createRecordingFetch, runGalleryCapture,
-  type GalleryLedger, type GalleryReport,
+  createFetchObserver, createFileLedger, createMemoryLedger, createRecordingFetch, followAllowedRedirects, runGalleryCapture,
+  type ConfirmingSink, type GalleryLedger, type GalleryReport,
 } from './galleryDriver.js';
 import { createHttpBytesFetch, type BytesFetchImpl } from './httpBytesFetch.js';
+import { imageHostRateFor } from './imageHostRates.js';
 import type { ImageBytesFetcher } from './imageBytes.js';
 import { paceImageBytesByHost } from './imageBytesPacing.js';
 import { createImageBytesRouter, type ImageCaptureHook } from './imageCaptureHook.js';
@@ -94,14 +97,20 @@ export function parseGalleryArgs(argv: readonly string[], env: NodeJS.ProcessEnv
 }
 
 export function galleryExitCode(r: GalleryReport): number {
+  if (r.stopped === 'interrupted') return 7;
   if (r.stopped === 'refused') return 4;
   if (r.stopped === 'paused' || r.stopped === 'paused-marker') return 3;
+  if (r.itemsWithFailures > 0) return 6;
   if (r.probe !== undefined && r.probe.verdict !== 'PASS') return 5;
   return 0;
 }
 
 export interface GalleryMainDeps {
   env?: NodeJS.ProcessEnv;
+  /** What confirms a put (default: the process's raw store sink, when it keeps the counters). */
+  sink?: ConfirmingSink;
+  /** Aborted by SIGTERM / SIGINT (the entry wires them): the run stops issuing requests and exits 7. */
+  signal?: AbortSignal;
   print?: (line: string) => void;
   now?: () => number;
   policy?: ImageHostPolicy;
@@ -127,26 +136,49 @@ export async function main(argv: readonly string[] = process.argv.slice(2), deps
     return 2;
   }
 
+  // No explicit rate row, no run: the limiter's own default eases up toward ~3.65 files/s, faster than the rate decided for this host.
+  // A dry run makes no request and is left alone.
+  if (!args.dryRun) {
+    const rateFor = imageHostRateFor(env, print);
+    const missing = args.allowedHosts.filter(h => rateFor(h) === undefined);
+    if (missing.length > 0) {
+      print(`REFUSED: no explicit rate row for ${missing.join(', ')} in IMAGE_HOST_RATE_JSON (e.g. {"${missing[0]}":{"intervalMs":333}}); a host with no decided rate is never fetched at the limiter default`);
+      return 2;
+    }
+  }
+  // One run at a time per ledger: a second makes no request.
+  let lock: ReturnType<typeof acquireRunLock> | undefined;
+  if (args.ledger !== undefined && !args.dryRun) {
+    lock = acquireRunLock(`${args.ledger}.lock`);
+    if (!lock.held) {
+      print(`LOCKED: another run holds ${args.ledger}.lock${lock.pid !== undefined ? ` (pid ${lock.pid})` : ''}; this one made no request`);
+      return 3;
+    }
+  }
+
   const flush = deps.flush ?? (() => flushRawCaptureSink({ env }));
   try {
     const ledger: GalleryLedger = args.ledger !== undefined ? createFileLedger(args.ledger) : createMemoryLedger();
     const observer = createFetchObserver({ pauseAfter: args.pauseAfter, now });
     const recording = createRecordingFetch(deps.baseFetch);
     const limiter: HostRateLimiter = createImageHostLimiter(env);
-    const fetchBytes = observer.wrap(
-      paceImageBytesByHost(createImageBytesRouter({ http: createHttpBytesFetch({ fetchImpl: recording.fetchImpl }) }), limiter),
-    );
+    // observer( follow-by-hand( paced( http lane over the manual-redirect transport ) ) ): every hop is paced and checked
+    const paced = paceImageBytesByHost(createImageBytesRouter({ http: createHttpBytesFetch({ fetchImpl: recording.fetchImpl }) }), limiter);
+    const fetchBytes = observer.wrap(followAllowedRedirects(paced, { allowedHosts: args.allowedHosts, locationOf: recording.takeLocation }));
     const policy = deps.policy ?? loadImageHostPolicy(env);
     const hook = (deps.makeHook ?? ((f, e) => createImageCaptureHookFromEnv({ ...e, IMAGE_MAX_PER_ITEM: '100' }, { fetchBytes: f, policy })))(fetchBytes, env);
 
+    const rawSink = getRawCaptureSink() as unknown as Partial<ConfirmingSink>;
+    const sink: ConfirmingSink | undefined = deps.sink ?? (typeof rawSink.stats === 'function' && typeof rawSink.flush === 'function' ? (rawSink as ConfirmingSink) : undefined);
     const report = await runGalleryCapture(
-      { hook, observer, policy, ledger, items: readWorklistFile(args.worklist), now, log: print, requests: () => recording.records },
+      { hook, ...(sink !== undefined ? { sink } : {}), observer, policy, ledger, items: readWorklistFile(args.worklist), now, log: print, requests: () => recording.records },
       {
         allowedHosts: args.allowedHosts, sourceClass: args.sourceClass, pauseAfter: args.pauseAfter, pauseMs: args.pauseMinutes * 60_000,
         ...(args.maxFiles !== undefined ? { maxFiles: args.maxFiles } : {}),
         ...(args.maxMinutes !== undefined ? { maxMs: args.maxMinutes * 60_000 } : {}),
         ...(args.probe !== undefined ? { probe: args.probe } : {}),
         resume: args.resume, dryRun: args.dryRun,
+        ...(deps.signal !== undefined ? { signal: deps.signal } : {}),
       },
     );
     await hook.drain();
@@ -166,5 +198,7 @@ export async function main(argv: readonly string[] = process.argv.slice(2), deps
     print(`gallery:capture failed: ${(e as Error).message}`);
     try { await flush(); } catch { /* the sink's own drain reports its losses */ }
     return 1;
+  } finally {
+    if (lock?.held) lock.release();
   }
 }

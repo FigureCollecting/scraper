@@ -17,8 +17,8 @@ import { buildImageHostPolicy } from '../../services/images/imageHostPolicy';
 import type { ImageBytesFetcher, ImageBytesResult } from '../../services/images/imageBytes';
 import { imageHostRateFor } from '../../services/images/imageHostRates';
 import {
-  classifyObservation, createFetchObserver, createFileLedger, createMemoryLedger, createRecordingFetch, judgeProbe, runGalleryCapture,
-  type FetchObservation, type GalleryLedger, type GalleryRunOptions,
+  classifyObservation, createFetchObserver, createFileLedger, createMemoryLedger, createRecordingFetch, followAllowedRedirects, judgeProbe, normalizeHost, runGalleryCapture,
+  type ConfirmingSink, type FetchObservation, type GalleryLedger, type GalleryRunOptions,
 } from '../../services/images/galleryDriver';
 import { parseWorklist, type WorklistItem } from '../../services/images/galleryWorklist';
 
@@ -59,16 +59,20 @@ function fakeHook(fetcher: ImageBytesFetcher, opts: { enabled?: boolean; failedP
   };
 }
 
+/** The key an item's files are settled under (`site/itemId`; the helper `item` below is site 'mfc'). */
+const K = (id: string) => `mfc/${id}`;
+const okSink = (): ConfirmingSink => ({ flush: async () => undefined, stats: () => ({ assetFailed: 0, dropped: 0, droppedBytes: 0, assetRefusedReserve: 0 }) });
+
 const baseOpts = (over: Partial<GalleryRunOptions> = {}): GalleryRunOptions => ({ allowedHosts: [STATIC], pauseAfter: 3, pauseMs: 6 * 3600_000, ...over });
 const noop = () => undefined;
 
-function run(items: WorklistItem[], script: (url: string) => ImageBytesResult, opts: Partial<GalleryRunOptions> = {}, extra: { ledger?: GalleryLedger; bad?: number; enabled?: boolean; failedPerCapture?: number; now?: () => number } = {}) {
+function run(items: WorklistItem[], script: (url: string) => ImageBytesResult, opts: Partial<GalleryRunOptions> = {}, extra: { sink?: ConfirmingSink; ledger?: GalleryLedger; bad?: number; enabled?: boolean; failedPerCapture?: number; now?: () => number } = {}) {
   const observer = createFetchObserver({ pauseAfter: opts.pauseAfter ?? 3, now: extra.now ?? (() => 0) });
   const inner: ImageBytesFetcher = async url => script(url);
   const fh = fakeHook(observer.wrap(inner), { enabled: extra.enabled, failedPerCapture: extra.failedPerCapture });
   const ledger = extra.ledger ?? createMemoryLedger();
   const report = runGalleryCapture(
-    { hook: fh.hook, observer, policy: POLICY, ledger, items: feed(items, extra.bad ?? 0), now: extra.now ?? (() => 0), log: noop, requests: () => [] },
+    { hook: fh.hook, sink: extra.sink ?? okSink(), observer, policy: POLICY, ledger, items: feed(items, extra.bad ?? 0), now: extra.now ?? (() => 0), log: noop, requests: () => [] },
     baseOpts(opts),
   );
   return { report, fh, ledger, observer };
@@ -119,23 +123,73 @@ describe('createFetchObserver', () => {
     expect(inner).toHaveBeenCalledTimes(3);
   });
 
-  it('a success resets the streak; gone, oversize and trouble neither count nor reset it', async () => {
-    const script: ImageBytesResult[] = [fail(403), fail(403), ok200(), fail(403), fail(404), fail(500), fail(403)];
+  it('a success resets the streak; gone and oversize neither count nor reset it', async () => {
+    const script: ImageBytesResult[] = [fail(403), fail(403), ok200(), fail(403), fail(404), { ok: false, reason: 'too-large' } as ImageBytesResult, fail(403)];
     const obs = createFetchObserver({ pauseAfter: 3, now: () => 0 });
     const f = obs.wrap(async () => script.shift()!);
     for (let i = 0; i < 7; i++) await f(U(i), {});
-    expect(obs.tripped()).toBeUndefined(); // two blocks, a success, then 403 / [404, 500 ignored] / 403 is only two again
+    expect(obs.tripped()).toBeUndefined(); // two blocks, a success, then 403 / [404, too-large ignored] / 403 is only two again
     await obs.wrap(async () => fail(429))(U(99), {});
     expect(obs.tripped()).toMatch(/3 consecutive/);
+  });
+
+  // S5: a dead or throttling origin is one streak, blocked or erring
+  it.each([
+    ['500s', () => fail(500)],
+    ['502s', () => fail(502)],
+    ['504s', () => fail(504)],
+    ['timeouts', () => ({ ok: false, reason: 'timeout' }) as ImageBytesResult],
+  ])('trips after N consecutive %s, exactly as a block does', async (_label, bad) => {
+    const inner = jest.fn(async () => bad());
+    const obs = createFetchObserver({ pauseAfter: 3, now: () => 0 });
+    const f = obs.wrap(inner);
+    await f(U(1), {}); await f(U(2), {});
+    expect(obs.tripped()).toBeUndefined();
+    await f(U(3), {});
+    expect(obs.tripped()).toMatch(/3 consecutive blocked or failed/);
+    expect(await f(U(4), {})).toMatchObject({ ok: false, reason: 'refused' });
+    expect(inner).toHaveBeenCalledTimes(3);
+  });
+
+  it('mixed blocks and errors are one streak, and a success breaks it', async () => {
+    const script: ImageBytesResult[] = [fail(429), fail(500), ok200(), fail(500), fail(403)];
+    const obs = createFetchObserver({ pauseAfter: 3, now: () => 0 });
+    const f = obs.wrap(async () => script.shift()!);
+    for (let i = 0; i < 5; i++) await f(U(i), {});
+    expect(obs.tripped()).toBeUndefined();
+    await obs.wrap(async () => fail(503))(U(9), {});
+    expect(obs.tripped()).toMatch(/3 consecutive/);
+  });
+
+  it('a thrown transport fault (a refused connection) counts too, and is still thrown', async () => {
+    const obs = createFetchObserver({ pauseAfter: 2, now: () => 0 });
+    const f = obs.wrap(async () => { throw new Error('ECONNREFUSED'); });
+    await expect(f(U(1), {})).rejects.toThrow('ECONNREFUSED');
+    await expect(f(U(2), {})).rejects.toThrow('ECONNREFUSED');
+    expect(obs.tripped()).toMatch(/2 consecutive/);
+    expect(obs.take().map(o => o.reason)).toEqual(['threw', 'threw']);
+  });
+
+  // S7: a stop is not a block and is not an observation
+  it('stop() refuses every later call without touching the network, records nothing, and never opens the breaker', async () => {
+    const inner = jest.fn(async () => ok200());
+    const obs = createFetchObserver({ pauseAfter: 1, now: () => 0 });
+    const f = obs.wrap(inner);
+    await f(U(1), {});
+    obs.stop('interrupted by a signal');
+    expect(await f(U(2), {})).toMatchObject({ ok: false, reason: 'refused', detail: expect.stringMatching(/interrupted/) });
+    expect(inner).toHaveBeenCalledTimes(1);
+    expect(obs.take().length).toBe(1);
+    expect(obs.tripped()).toBeUndefined();
   });
 });
 
 describe('the ledger', () => {
   it('remembers settled urls and a pause, in memory', () => {
     const l = createMemoryLedger();
-    expect(l.has(U(1))).toBe(false);
-    l.settle(U(1), 'stored');
-    expect(l.has(U(1))).toBe(true);
+    expect(l.has(K('1'), U(1))).toBe(false);
+    l.settle(K('1'), U(1), 'stored');
+    expect(l.has(K('1'), U(1))).toBe(true);
     expect(l.pausedUntil()).toBeUndefined();
     l.pause(1000, 'blocked');
     expect(l.pausedUntil()).toBe(1000);
@@ -143,16 +197,25 @@ describe('the ledger', () => {
     expect(l.pausedUntil()).toBeUndefined();
   });
 
+  // S1: a url settled for one item says nothing about another item that lists it
+  it('settles per (item, url): the same url under another item is still to do', () => {
+    const l = createMemoryLedger();
+    l.settle(K('1'), U(1), 'stored');
+    expect(l.has(K('2'), U(1))).toBe(false);
+    expect(l.has(K('1'), U(2))).toBe(false);
+  });
+
   it('is append-only JSONL on disk and a new process reads it back', () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), 'gallery-ledger-'));
     try {
       const file = path.join(dir, 'ledger.jsonl');
       const a = createFileLedger(file);
-      a.settle(U(1), 'stored'); a.settle(U(2), 'gone'); a.pause(9000, '3 consecutive blocked fetches');
+      a.settle(K('1'), U(1), 'stored'); a.settle(K('1'), U(2), 'gone'); a.pause(9000, '3 consecutive blocked fetches');
       const b = createFileLedger(file);
-      expect(b.has(U(1))).toBe(true);
-      expect(b.has(U(2))).toBe(true);
-      expect(b.has(U(3))).toBe(false);
+      expect(b.has(K('1'), U(1))).toBe(true);
+      expect(b.has(K('1'), U(2))).toBe(true);
+      expect(b.has(K('1'), U(3))).toBe(false);
+      expect(b.has(K('2'), U(1))).toBe(false);
       expect(b.pausedUntil()).toBe(9000);
       b.clearPause();
       expect(createFileLedger(file).pausedUntil()).toBeUndefined();
@@ -166,9 +229,10 @@ describe('the ledger', () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), 'gallery-ledger-'));
     try {
       const file = path.join(dir, 'ledger.jsonl');
-      writeFileSync(file, `{"u":"${U(1)}","s":"stored"}\n{"u":"${U(2)}","s":"sto\n[1,2]\n{"x":1}\n{"u":"${U(3)}","s":"gone"}\n`);
+      writeFileSync(file, `{"i":"mfc/1","u":"${U(1)}","s":"stored"}\n{"i":"mfc/1","u":"${U(2)}","s":"sto\n[1,2]\n{"x":1}\n{"i":"mfc/1","u":"${U(3)}","s":"gone"}\n{"u":"${U(4)}","s":"stored"}\n`);
       const l = createFileLedger(file);
-      expect([l.has(U(1)), l.has(U(2)), l.has(U(3))]).toEqual([true, false, true]);
+      // the url-only format of the first cut is skipped (fetched again; the store dedupes), a torn line too
+      expect([l.has(K('1'), U(1)), l.has(K('1'), U(2)), l.has(K('1'), U(3)), l.has(K('1'), U(4))]).toEqual([true, false, true, false]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -198,13 +262,13 @@ describe('runGalleryCapture', () => {
     const script = (u: string) => (u === U(1) ? ok200() : u === U(2) ? fail(404) : u === U(3) ? { ok: false, reason: 'too-large' } as ImageBytesResult : u === U(4) ? fail(500) : { ok: false, reason: 'timeout' } as ImageBytesResult);
     const { report, ledger } = run([item('1', [1, 2, 3, 4, 5])], script);
     const r = await report;
-    expect([1, 2, 3, 4, 5].map(n => ledger.has(U(n)))).toEqual([true, true, true, false, false]);
+    expect([1, 2, 3, 4, 5].map(n => ledger.has(K('1'), U(n)))).toEqual([true, true, true, false, false]);
     expect(r).toMatchObject({ stored: 1, gone: 1, oversize: 1, trouble: 2, blocked: 0 });
   });
 
   it('skips settled urls on a later run and keeps the others at their original positions', async () => {
     const ledger = createMemoryLedger();
-    ledger.settle(U(10), 'stored');
+    ledger.settle(K('1'), U(10), 'stored');
     const { report, fh } = run([item('1', [10, 11, 12])], () => ok200(), {}, { ledger });
     const r = await report;
     expect(fh.calls[0]!.urls).toEqual([U(11), U(12)]);
@@ -214,7 +278,7 @@ describe('runGalleryCapture', () => {
 
   it('does not call the hook for an item whose urls are all settled', async () => {
     const ledger = createMemoryLedger();
-    ledger.settle(U(10), 'stored');
+    ledger.settle(K('1'), U(10), 'stored');
     const { report, fh } = run([item('1', [10])], () => ok200(), {}, { ledger });
     await report;
     expect(fh.calls).toEqual([]);
@@ -259,7 +323,7 @@ describe('runGalleryCapture', () => {
       expect(r.pausedUntil).toBe(1000 + 6 * 3600_000);
       expect(ledger.pausedUntil()).toBe(1000 + 6 * 3600_000);
       expect(fh.calls.length).toBe(1);
-      expect([1, 2, 3, 4].some(n => ledger.has(U(n)))).toBe(false);
+      expect([1, 2, 3, 4].some(n => ledger.has(K('1'), U(n)))).toBe(false);
       expect(r.blocked).toBe(3);
     });
 
@@ -305,7 +369,7 @@ describe('runGalleryCapture', () => {
       const observer = createFetchObserver({ pauseAfter: 3, now: () => 0 });
       const fh = fakeHook(observer.wrap(async () => ok200()));
       const r = await runGalleryCapture(
-        { hook: fh.hook, observer, policy, ledger: createMemoryLedger(), items: feed([item('1', [1])]), now: () => 0, log: noop, requests: () => [] },
+        { hook: fh.hook, sink: okSink(), observer, policy, ledger: createMemoryLedger(), items: feed([item('1', [1])]), now: () => 0, log: noop, requests: () => [] },
         baseOpts({ allowedHosts: [STATIC] }),
       );
       expect(r.stopped).toBe('refused');
@@ -325,7 +389,7 @@ describe('runGalleryCapture', () => {
     it('does not settle that item (it is re-driven), so a stored-but-lost file is never forgotten', async () => {
       const { report, ledger } = run([item('1', [1, 2])], () => ok200(), {}, { failedPerCapture: 1 });
       const r = await report;
-      expect(ledger.has(U(1))).toBe(false);
+      expect(ledger.has(K('1'), U(1))).toBe(false);
       expect(r.stored).toBe(2);
       expect(r.itemsWithFailures).toBe(1);
     });
@@ -382,7 +446,7 @@ describe('probe mode through the driver', () => {
     const fh = fakeHook(observer.wrap(async url => { recorded.push({ url, sentHeaderNames: ['accept', 'user-agent', 'referer'], status: 200, redirected: false, setCookie: false }); return { ok: true, bytes: PNG(1), contentType: 'image/png', status: 200, finalUrl: url, headers: {} }; }));
     const many = Array.from({ length: 5 }, (_, i) => item(String(i + 1), [i * 10 + 1, i * 10 + 2, i * 10 + 3, i * 10 + 4]));
     const r = await runGalleryCapture(
-      { hook: fh.hook, observer, policy: POLICY, ledger: createMemoryLedger(), items: feed(many), now: () => 0, log: noop, requests: () => recorded },
+      { hook: fh.hook, sink: okSink(), observer, policy: POLICY, ledger: createMemoryLedger(), items: feed(many), now: () => 0, log: noop, requests: () => recorded },
       baseOpts({ probe: 6 }),
     );
     expect(r.mode).toBe('probe');
@@ -397,7 +461,7 @@ describe('probe mode through the driver', () => {
     const observer = createFetchObserver({ pauseAfter: 3, now: () => 0 });
     const fh = fakeHook(observer.wrap(async () => fail(403, { signals: { 'cf-mitigated': 'challenge' } })));
     const r = await runGalleryCapture(
-      { hook: fh.hook, observer, policy: POLICY, ledger: createMemoryLedger(), items: feed([item('1', [1, 2, 3, 4, 5])]), now: () => 0, log: noop, requests: () => [] },
+      { hook: fh.hook, sink: okSink(), observer, policy: POLICY, ledger: createMemoryLedger(), items: feed([item('1', [1, 2, 3, 4, 5])]), now: () => 0, log: noop, requests: () => [] },
       baseOpts({ probe: 20 }),
     );
     expect(r.probe?.verdict).toBe('FAIL');
@@ -408,8 +472,8 @@ describe('probe mode through the driver', () => {
     const ledger = createMemoryLedger();
     const observer = createFetchObserver({ pauseAfter: 3, now: () => 0 });
     const fh = fakeHook(observer.wrap(async url => ({ ok: true, bytes: PNG(2), contentType: 'image/png', status: 200, finalUrl: url, headers: {} })));
-    await runGalleryCapture({ hook: fh.hook, observer, policy: POLICY, ledger, items: feed([item('1', [1, 2])]), now: () => 0, log: noop, requests: () => [] }, baseOpts({ probe: 2 }));
-    expect(ledger.has(U(1))).toBe(false);
+    await runGalleryCapture({ hook: fh.hook, sink: okSink(), observer, policy: POLICY, ledger, items: feed([item('1', [1, 2])]), now: () => 0, log: noop, requests: () => [] }, baseOpts({ probe: 2 }));
+    expect(ledger.has(K('1'), U(1))).toBe(false);
   });
 });
 
@@ -442,7 +506,7 @@ describe('the real hook underneath (the NORMAL process, not a shortcut)', () => 
     return { hook, observer, sink, sent, waits, recording, clock };
   }
   const go = (r: ReturnType<typeof rig>, items: WorklistItem[], o: Partial<GalleryRunOptions> = {}) =>
-    runGalleryCapture({ hook: r.hook, observer: r.observer, policy: POLICY, ledger: createMemoryLedger(), items: feed(items), now: () => r.clock.t, log: noop, requests: () => r.recording.records }, baseOpts(o));
+    runGalleryCapture({ hook: r.hook, sink: okSink(), observer: r.observer, policy: POLICY, ledger: createMemoryLedger(), items: feed(items), now: () => r.clock.t, log: noop, requests: () => r.recording.records }, baseOpts(o));
 
   it('stores every entry of a 16-photo gallery through the sink, each as a gallery depiction at its position of its item', async () => {
     const r = rig();
@@ -523,5 +587,249 @@ describe('the worklist helper stays in step with the driver', () => {
     const parsed = parseWorklist(text);
     const { report } = run(parsed.items, () => ok200());
     expect((await report).stored).toBe(1);
+  });
+});
+
+describe('B2 (unit): a file is settled only once the sink has confirmed its put', () => {
+  /** A sink whose put outcomes the test scripts: `lose` moves its failure counter during the flush, as a failed put does. */
+  const scripted = (lose: () => boolean) => {
+    const c = { assetFailed: 0, dropped: 0, droppedBytes: 0, assetRefusedReserve: 0 };
+    const calls: string[] = [];
+    const sink: ConfirmingSink = { flush: async () => { calls.push('flush'); if (lose()) c.assetFailed += 1; }, stats: () => ({ ...c }) };
+    return { sink, calls };
+  };
+
+  it('flushes the sink after each item and before anything is settled', async () => {
+    const order: string[] = [];
+    const ledger = createMemoryLedger();
+    const settle = ledger.settle;
+    ledger.settle = (i, u, h) => { order.push('settle'); settle(i, u, h); };
+    const { sink } = scripted(() => false);
+    const flush = sink.flush;
+    sink.flush = async () => { order.push('flush'); await flush(); };
+    await run([item('1', [1, 2]), item('2', [3])], () => ok200(), {}, { sink, ledger }).report;
+    expect(order).toEqual(['flush', 'settle', 'settle', 'flush', 'settle']);
+  });
+
+  it.each([
+    ['assetFailed', { assetFailed: 1 }],
+    ['dropped', { dropped: 1 }],
+    ['droppedBytes', { droppedBytes: 1 }],
+    ['assetRefusedReserve', { assetRefusedReserve: 1 }],
+  ])('a put lost to the sink (%s) leaves the whole item unsettled, counts it, and the next item is unaffected', async (_which, delta) => {
+    const c = { assetFailed: 0, dropped: 0, droppedBytes: 0, assetRefusedReserve: 0 };
+    let n = 0;
+    const sink: ConfirmingSink = { flush: async () => { if (++n === 1) Object.assign(c, delta); }, stats: () => ({ ...c }) };
+    const ledger = createMemoryLedger();
+    const r = await run([item('1', [1, 2]), item('2', [3])], () => ok200(), {}, { sink, ledger }).report;
+    expect([ledger.has(K('1'), U(1)), ledger.has(K('1'), U(2)), ledger.has(K('2'), U(3))]).toEqual([false, false, true]);
+    expect(r).toMatchObject({ itemsWithFailures: 1, stored: 3 });
+  });
+
+  it('refuses to fetch at all when the sink cannot confirm a write (a dry run is left alone)', async () => {
+    const observer = createFetchObserver({ pauseAfter: 3, now: () => 0 });
+    const fh = fakeHook(observer.wrap(async () => ok200()));
+    const deps = { hook: fh.hook, observer, policy: POLICY, ledger: createMemoryLedger(), items: feed([item('1', [1])]), now: () => 0, log: noop, requests: () => [] };
+    const refused = await runGalleryCapture(deps, baseOpts());
+    expect(refused).toMatchObject({ stopped: 'refused' });
+    expect(refused.refusal).toMatch(/cannot confirm/);
+    expect(fh.calls).toEqual([]);
+    const dry = await runGalleryCapture({ ...deps, items: feed([item('1', [1])]) }, baseOpts({ dryRun: true }));
+    expect(dry).toMatchObject({ stopped: 'done', planned: 1 });
+  });
+
+  it('a probe flushes too, and still settles nothing', async () => {
+    const { sink, calls } = scripted(() => false);
+    const ledger = createMemoryLedger();
+    await run([item('1', [1, 2])], () => ok200(), { probe: 2 }, { sink, ledger }).report;
+    expect(calls).toEqual(['flush']);
+    expect(ledger.has(K('1'), U(1))).toBe(false);
+  });
+});
+
+describe('S1 (unit): an unfetched file the memo explains is settled for its own item', () => {
+  /** A hook that, like the real one, serves a url another item already fetched from its memo: no request, a `memo` skip. */
+  function memoHook(observer: ReturnType<typeof createFetchObserver>, extraSkip?: string) {
+    const fetched = new Set<string>();
+    const skipped: Record<string, number> = { memo: 0, cap: 0, sinkQueueFull: 0 };
+    const fetcher = observer.wrap(async () => ok200());
+    return {
+      async capture(req: { ruleset: { describeImages?: (f: Record<string, unknown>) => Array<{ url: string }> }; fields: Record<string, unknown> }) {
+        for (const r of req.ruleset.describeImages!(req.fields)) {
+          if (fetched.has(r.url)) { skipped.memo += 1; continue; }
+          if (extraSkip !== undefined && r.url === extraSkip) { skipped.cap += 1; continue; }
+          fetched.add(r.url);
+          await fetcher(r.url, {});
+        }
+      },
+      stats: () => ({ enabled: true, attempted: 0, stored: 0, deduped: 0, failed: 0, residentialBytesToday: 0, skipped: { ...skipped } }),
+    } as never;
+  }
+  const feedAll = (items: WorklistItem[]) => feed(items);
+
+  it('items sharing a picture are each settled for it, with one fetch', async () => {
+    const observer = createFetchObserver({ pauseAfter: 3, now: () => 0 });
+    const hook = memoHook(observer);
+    const ledger = createMemoryLedger();
+    const r = await runGalleryCapture({ hook, sink: okSink(), observer, policy: POLICY, ledger, items: feedAll([item('1', [1, 2]), item('2', [1]), item('3', [1, 3])]), now: () => 0, log: noop, requests: () => [] }, baseOpts());
+    expect(r).toMatchObject({ fetched: 3, stored: 3, items: 3, planned: 5 });
+    expect([ledger.has(K('1'), U(1)), ledger.has(K('2'), U(1)), ledger.has(K('3'), U(1)), ledger.has(K('3'), U(3))]).toEqual([true, true, true, true]);
+  });
+
+  it('a file left out for any other reason is not settled, and is planned again', async () => {
+    const observer = createFetchObserver({ pauseAfter: 3, now: () => 0 });
+    const hook = memoHook(observer, U(2));
+    const ledger = createMemoryLedger();
+    await runGalleryCapture({ hook, sink: okSink(), observer, policy: POLICY, ledger, items: feedAll([item('1', [1, 2])]), now: () => 0, log: noop, requests: () => [] }, baseOpts());
+    expect([ledger.has(K('1'), U(1)), ledger.has(K('1'), U(2))]).toEqual([true, false]);
+  });
+});
+
+describe('S2 (unit): the driver reports the entries the cap left out', () => {
+  it('sums them, and names the item in the log', async () => {
+    const logs: string[] = [];
+    const observer = createFetchObserver({ pauseAfter: 3, now: () => 0 });
+    const fh = fakeHook(observer.wrap(async () => ok200()));
+    async function* withCap() {
+      yield { ok: true as const, item: item('7', [1, 2]), dropped: 0, capped: 50 };
+      yield { ok: true as const, item: item('8', [3]), dropped: 0, capped: 0 };
+      yield { ok: true as const, item: item('9', [4]), dropped: 0, capped: 5 };
+    }
+    const r = await runGalleryCapture({ hook: fh.hook, sink: okSink(), observer, policy: POLICY, ledger: createMemoryLedger(), items: withCap(), now: () => 0, log: l => void logs.push(l), requests: () => [] }, baseOpts());
+    expect(r.entriesCapped).toBe(55);
+    expect(logs.filter(l => /over the .* cap left out/.test(l)).map(l => l.split(':')[0])).toEqual(['[gallery] mfc/7', '[gallery] mfc/9']);
+  });
+});
+
+describe('S3 and M34 (unit): one spelling of a host and of a url', () => {
+  it.each([['Static.Example.NET.', 'static.example.net'], [' static.example.net ', 'static.example.net'], ['static.example.net...', 'static.example.net']])('normalizeHost(%j)', (input, want) => {
+    expect(normalizeHost(input)).toBe(want);
+  });
+
+  it('an allow-list entry and a url host are compared in the same spelling (a trailing dot on either)', async () => {
+    const r = await run([item('1', [1])], () => ok200(), { allowedHosts: [`${STATIC}.`.toUpperCase()] }).report;
+    expect(r).toMatchObject({ stored: 1, notAllowedHost: 0 });
+    const dotted = item('2', [2]);
+    dotted.entries[0]!.src = `https://${STATIC}./upload/pictures/2022/10/14/2.jpeg`;
+    const r2 = await run([dotted], () => ok200()).report;
+    expect(r2).toMatchObject({ stored: 1, notAllowedHost: 0 });
+  });
+
+  it('judgeProbe takes a trailing-dot allow-list entry for the same host', () => {
+    const o: FetchObservation = { url: U(1), ok: true, status: 200, contentType: 'image/jpeg', bytes: 10, finalUrl: U(1), ms: 1 };
+    const req = { url: U(1), sentHeaderNames: ['accept'], status: 200, redirected: false, setCookie: false };
+    expect(judgeProbe({ observations: [o], requests: [req], allowedHosts: [`${STATIC}.`], wanted: 1 }).verdict).toBe('PASS');
+  });
+});
+
+describe('M03 (unit): a cloudflare mitigation is a block whatever the status', () => {
+  it.each([401, 403, 500, 502, 503])('status %i with cf-mitigated', status => {
+    expect(classifyObservation({ url: U(1), ok: false, status, reason: 'http-status', signals: { 'cf-mitigated': 'challenge' }, ms: 1 })).toBe('blocked');
+  });
+});
+
+describe('S7 (unit): an abort stops the run and says so', () => {
+  it('an abort before the next item stops there: later items are not started, the interrupted one is settled for what it confirmed', async () => {
+    const ac = new AbortController();
+    const observer = createFetchObserver({ pauseAfter: 3, now: () => 0 });
+    const fh = fakeHook(observer.wrap(async () => { ac.abort(); return ok200(); }));
+    const ledger = createMemoryLedger();
+    const r = await runGalleryCapture(
+      { hook: fh.hook, sink: okSink(), observer, policy: POLICY, ledger, items: feed([item('1', [1, 2]), item('2', [3])]), now: () => 0, log: noop, requests: () => [] },
+      baseOpts({ signal: ac.signal }),
+    );
+    expect(r.stopped).toBe('interrupted');
+    expect(fh.calls.map(c => c.itemId)).toEqual(['1']);
+    // the first file was fetched before the stop; the second was refused by the stopped observer, never requested
+    expect([ledger.has(K('1'), U(1)), ledger.has(K('1'), U(2)), ledger.has(K('2'), U(3))]).toEqual([true, false, false]);
+    expect(r.fetched).toBe(1);
+  });
+
+  it('an abort that has already happened refuses the first item and fetches nothing', async () => {
+    const ac = new AbortController();
+    ac.abort();
+    const { report, fh } = run([item('1', [1])], () => ok200(), { signal: ac.signal });
+    expect((await report).stopped).toBe('interrupted');
+    expect(fh.calls).toEqual([]);
+  });
+});
+
+describe('B1 (unit): followAllowedRedirects', () => {
+  const OK = (url: string): ImageBytesResult => ({ ok: true, bytes: PNG(1), contentType: 'image/png', status: 200, finalUrl: url, headers: {} });
+  const redirect = (status = 302): ImageBytesResult => ({ ok: false, reason: 'http-status', status }) as ImageBytesResult;
+  /** A paced fetcher over a script of url -> result, remembering the options each call got. */
+  function over(script: Record<string, ImageBytesResult>, locations: Record<string, string> = {}, allowed: string[] = [STATIC, 'other.example']) {
+    const calls: Array<{ url: string; referer?: string }> = [];
+    const paced: ImageBytesFetcher = async (url, o) => { calls.push({ url, ...(o?.referer !== undefined ? { referer: o.referer } : {}) }); return script[url] ?? ({ ok: false, reason: 'http-status', status: 404 } as ImageBytesResult); };
+    const taken = { ...locations };
+    return { calls, fetcher: followAllowedRedirects(paced, { allowedHosts: allowed, locationOf: u => { const l = taken[u]; delete taken[u]; return l; } }) };
+  }
+
+  it('passes a plain 200 through, and a non-redirect failure untouched', async () => {
+    const a = over({ [U(1)]: OK(U(1)) });
+    expect(await a.fetcher(U(1), {})).toMatchObject({ ok: true });
+    const b = over({ [U(2)]: { ok: false, reason: 'http-status', status: 403 } as ImageBytesResult });
+    expect(await b.fetcher(U(2), {})).toMatchObject({ ok: false, status: 403 });
+  });
+
+  it('follows a same-host hop, paced as a call of its own', async () => {
+    const a = over({ [U(1)]: redirect(301), [U(2)]: OK(U(2)) }, { [U(1)]: U(2) });
+    expect(await a.fetcher(U(1), { referer: 'https://page.example/item/1' })).toMatchObject({ ok: true, finalUrl: U(2) });
+    expect(a.calls.map(c => c.url)).toEqual([U(1), U(2)]);
+    expect(a.calls[1]!.referer).toBe('https://page.example/item/1');
+  });
+
+  it('refuses a hop to a host outside the allow-list before any request is sent to it', async () => {
+    const a = over({ [U(1)]: redirect(302) }, { [U(1)]: 'http://127.0.0.1:9/stolen.jpg' });
+    expect(await a.fetcher(U(1), {})).toMatchObject({ ok: false, reason: 'refused', detail: expect.stringMatching(/127\.0\.0\.1.*outside the allow-list/) });
+    expect(a.calls.length).toBe(1);
+  });
+
+  it.each([['a non-http scheme', 'ftp://static.example/a.jpg'], ['an unparseable Location', 'http://']])('refuses %s', async (_why, location) => {
+    const a = over({ [U(1)]: redirect(307) }, { [U(1)]: location });
+    expect(await a.fetcher(U(1), {})).toMatchObject({ ok: false, reason: 'refused' });
+    expect(a.calls.length).toBe(1);
+  });
+
+  it('a hop to ANOTHER allowed origin is followed and carries no Referer', async () => {
+    const other = 'https://other.example/a.jpg';
+    const a = over({ [U(1)]: redirect(302), [other]: OK(other) }, { [U(1)]: other });
+    expect(await a.fetcher(U(1), { referer: 'https://page.example/item/1' })).toMatchObject({ ok: true });
+    expect(a.calls[0]!.referer).toBe('https://page.example/item/1');
+    expect(a.calls[1]!.referer).toBeUndefined();
+  });
+
+  it('a redirect with no Location is the ordinary non-2xx it always was', async () => {
+    const a = over({ [U(1)]: redirect(302) });
+    expect(await a.fetcher(U(1), {})).toMatchObject({ ok: false, reason: 'http-status', status: 302 });
+  });
+
+  it('gives up after the hop limit', async () => {
+    const script: Record<string, ImageBytesResult> = {};
+    const loc: Record<string, string> = {};
+    for (let i = 1; i <= 12; i++) { script[U(i)] = redirect(302); loc[U(i)] = U(i + 1); }
+    const a = over(script, loc);
+    expect(await a.fetcher(U(1), {})).toMatchObject({ ok: false, reason: 'refused', detail: expect.stringMatching(/more than 5 redirects/) });
+    expect(a.calls.length).toBe(6);
+  });
+
+  it('refuses bytes whose final url is off the list even when no redirect was seen (defence in depth)', async () => {
+    const a = over({ [U(1)]: OK('https://elsewhere.example/x.jpg') });
+    expect(await a.fetcher(U(1), {})).toMatchObject({ ok: false, reason: 'refused', detail: expect.stringMatching(/elsewhere\.example.*outside the allow-list/) });
+  });
+});
+
+describe('B1 (unit): the recording transport never lets the runtime follow a redirect', () => {
+  it('asks for redirect: manual, keeps each 3xx Location once, and counts a 3xx as redirected', async () => {
+    const seen: Array<string | undefined> = [];
+    const rec = createRecordingFetch(async (url, init) => {
+      seen.push(init.redirect);
+      return { status: 302, url, headers: { get: (n: string) => (n.toLowerCase() === 'location' ? '/moved/a.jpg' : null) }, arrayBuffer: async () => new ArrayBuffer(0) };
+    });
+    await rec.fetchImpl(U(1), { headers: {} });
+    expect(seen).toEqual(['manual']);
+    expect(rec.records[0]).toMatchObject({ status: 302, redirected: true });
+    expect(rec.takeLocation(U(1))).toBe(`https://${STATIC}/moved/a.jpg`);
+    expect(rec.takeLocation(U(1))).toBeUndefined();
   });
 });

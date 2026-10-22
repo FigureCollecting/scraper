@@ -67,7 +67,7 @@ describe('parseGalleryArgs: the environment', () => {
 });
 
 describe('galleryExitCode', () => {
-  const base: GalleryReport = { mode: 'run', stopped: 'done', items: 0, planned: 0, fetched: 0, stored: 0, gone: 0, oversize: 0, blocked: 0, trouble: 0, skippedLedger: 0, notAllowedHost: 0, badLines: 0, itemsWithFailures: 0 };
+  const base: GalleryReport = { mode: 'run', stopped: 'done', items: 0, planned: 0, fetched: 0, stored: 0, gone: 0, oversize: 0, blocked: 0, trouble: 0, skippedLedger: 0, notAllowedHost: 0, badLines: 0, entriesCapped: 0, itemsWithFailures: 0 };
   it.each([
     [{ ...base }, 0],
     [{ ...base, stopped: 'limit' as const }, 0],
@@ -75,6 +75,14 @@ describe('galleryExitCode', () => {
     [{ ...base, stopped: 'paused' as const }, 3],
     [{ ...base, stopped: 'paused-marker' as const }, 3],
     [{ ...base, stopped: 'refused' as const }, 4],
+    // B2: the raw store did not confirm an item's files: never a clean exit, whatever else the run did
+    [{ ...base, itemsWithFailures: 1 }, 6],
+    [{ ...base, stopped: 'limit' as const, itemsWithFailures: 2 }, 6],
+    [{ ...base, stopped: 'paused' as const, itemsWithFailures: 1 }, 3],
+    [{ ...base, mode: 'probe' as const, itemsWithFailures: 1, probe: { verdict: 'PASS' as const, reasons: [], notes: [], evidence: [] } }, 6],
+    // S7: stopped by a signal
+    [{ ...base, stopped: 'interrupted' as const }, 7],
+    [{ ...base, stopped: 'interrupted' as const, itemsWithFailures: 1 }, 7],
     [{ ...base, mode: 'probe' as const, probe: { verdict: 'PASS' as const, reasons: [], notes: [], evidence: [] } }, 0],
     [{ ...base, mode: 'probe' as const, probe: { verdict: 'FAIL' as const, reasons: ['x'], notes: [], evidence: [] } }, 5],
     [{ ...base, mode: 'probe' as const, probe: { verdict: 'INCONCLUSIVE' as const, reasons: ['x'], notes: [], evidence: [] } }, 5],
@@ -121,6 +129,7 @@ describe('main', () => {
           stats: () => ({ enabled, reason: enabled ? undefined : 'PERSIST_RAW_IMAGES is not true', attempted: 0, stored: 0, deduped: 0, failed: 0, residentialBytesToday: 0, skipped: {} }),
         }) as never,
         flush: async () => { flushed.push('flushed'); },
+        sink: { flush: async () => undefined, stats: () => ({ assetFailed: 0, dropped: 0, droppedBytes: 0, assetRefusedReserve: 0 }) },
       },
     };
   };

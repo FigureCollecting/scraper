@@ -45,7 +45,7 @@ export interface BytesResponseLike {
 
 export type BytesFetchImpl = (
   url: string,
-  init: { headers: Record<string, string>; signal?: AbortSignal; redirect?: 'follow' },
+  init: { headers: Record<string, string>; signal?: AbortSignal; redirect?: 'follow' | 'manual' },
 ) => Promise<BytesResponseLike>;
 
 export interface HttpBytesFetchOptions {

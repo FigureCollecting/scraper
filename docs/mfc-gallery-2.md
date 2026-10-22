@@ -39,31 +39,53 @@ The scraper must not read the spine database, so the work list is a file the ope
 1. **Per-host rate seam** (`imageHostRates.ts`). `IMAGE_HOST_RATE_JSON='{"static.myfigurecollection.net":{"intervalMs":333}}'` (Ross, IMGRATE b: 3 files/s)
    feeds the image limiter (`assembleImageCapture.ts:171`, today `new HostRateLimiter(() => undefined)`: a 2,067 ms base
    that speeds up toward 274 ms). A row pins base = min = interval, so success never speeds it up; 429/503 still back it off.
-   IMGRATE is this one number.
+   IMGRATE is this one number. The row is REQUIRED: `gallery:capture` exits 2 (zero requests) unless every host in
+   `GALLERY_ALLOWED_HOSTS` has an explicit, readable row, because a host with no decided rate would run at the limiter default.
 2. **Host policy row** (config, `IMAGE_HOST_POLICY_JSON`): `{"static.myfigurecollection.net":{"lane":"http","egress":"direct"}}`.
    Without it an on-store host inherits MFC's declared transport (`imageHostPolicy.ts:300-303`). The http lane sends
    no cookies of its own (`httpBytesFetch.ts` header). The driver composes an http-only router, so any other lane is
    `unsupported`, and it also refuses to start unless the policy resolves every allowed host to http + direct.
-3. **Gallery driver** (`galleryDriver.ts`): reads the work list in file order; skips urls the ledger has settled; builds one
+3. **Gallery driver** (`galleryDriver.ts`): reads the work list in file order; skips (item, url) pairs the ledger has settled; builds one
    `ImageCaptureRequest` per item whose synthetic `describeImages` returns `{url, role:'gallery', position, sourceClass}`;
-   awaits `hook.capture()` (sequential, one item at a time); observes every fetch; settles stored / gone urls.
+   awaits `hook.capture()` (sequential, one item at a time); observes every fetch; then waits for the raw store sink to
+   FLUSH the item's puts and settles only what it confirmed (stored / gone / over the cap). The sink admits bytes to a queue
+   and puts them later, so "fetched" is not "stored": a put that fails leaves the whole item unsettled (it is fetched again,
+   counted in `itemsWithFailures`, exit 6).
    `IMAGE_MAX_PER_ITEM=100` for this process only. The item's `contentLevel` rides the ref (fail closed to `unknown`).
    `sourceClass` is config (`GALLERY_SOURCE_CLASS`). Ross ruled (desk GALSRC b): the MFC official gallery is `manufacturer_press`, set in the Job env below; the code default stays `unknown`, so a Job that forgets the setting claims nothing.
-4. **Auto-pause**: N consecutive blocked fetches (403, 429, 503, `cf-mitigated`, a 2xx that is not an image, a cooling
-   host) stop the run and write a pause marker (default 3 and 6 h); the next run refuses until it lapses or `--resume`.
+4. **Auto-pause**: N consecutive blocked or failed fetches (403, 429, 503, `cf-mitigated`, a 2xx that is not an image, a
+   cooling host, a refused redirect, and also any 5xx, a timeout or a dropped connection) stop the run and write a pause marker
+   (default 3 and 6 h); the next run refuses until it lapses or `--resume`. A success resets the streak; a 404/410 or an
+   over-size body is a verdict on one file and neither counts nor resets it.
+4a. **Redirects**: the runtime never follows one. The driver takes each hop by hand, over the paced fetcher (so every hop,
+   a same-host one included, waits for the host's turn), and ONLY to a host in `GALLERY_ALLOWED_HOSTS`. A hop anywhere else is
+   refused before a request is sent: nothing is fetched, stored or settled from outside the list, and it counts as a blocked
+   fetch. A cross-origin hop carries no Referer; more than 5 hops are refused. The probe still treats any redirect as a FAIL.
+4b. **One spelling of a url**: the work list carries the canonical form (host lower-case without a trailing dot, default port
+   gone, dot segments resolved, no fragment, %-escapes in one spelling) and the scraper applies it again; the ledger keys on it,
+   per item: `{"i":"site/itemId","u":url,"s":stored|gone|oversize}`. (The url-only lines of the first cut are ignored.) A gallery
+   over 100 entries keeps the first 100 by position and reports the rest (`entriesCapped`); it is never dropped whole.
 5. **Probe** (`--probe [N=20]`): the first N files of the work list through the real hook and sink, with evidence per
    request (status, type, size, header NAMES sent, set-cookie seen, cf-mitigated/cf-ray, redirect) and a verdict. PASS only if
    every request is a 200 image on the allowed host, no cookie or authorization header was sent, no challenge signal,
    no redirect off-host.
-6. **Entry**: `npm run gallery:capture` (Job/CronJob, same image as the scraper). Exit 0 done, 3 paused, 4 refused
-   (lane disabled or policy wrong), 5 probe failed, 2 bad arguments, 1 crash.
+6. **Entry**: `npm run gallery:capture` (Job/CronJob, same image as the scraper). Exit 0 done, 3 paused (or another run holds
+   the ledger), 4 refused (lane disabled or policy wrong), 5 probe failed, 6 the raw store did not confirm some item (not
+   settled; run again), 7 stopped by SIGTERM/SIGINT, 2 bad arguments or no rate row for an allowed host, 1 crash.
+7. **One run per ledger, and SIGTERM**: an O_EXCL `<ledger>.lock` holds the pid; a second run exits 3 with zero requests, and a
+   lock whose pid is gone is taken over. SIGTERM and SIGINT stop issuing requests at once, wait for the store to confirm what is
+   queued, settle only that, and exit 7.
 
 ## Politeness and failure behaviour
 
 - One request in flight, spaced by the host rate; no retries inside a run (a failed url is simply not settled and the next run
   tries it again, after the pause if one was set).
-- Settled = stored (or already stored by hash) or permanently gone (404/410) or over the size cap. Never settled: 403, 429,
-  5xx, timeouts, non-image 2xx, a sink failure in the item.
+- Settled = stored AND confirmed by the sink (or already stored by hash, or served from the hook's memo for an item that shares
+  the picture) or permanently gone (404/410) or over the size cap, per (item, url). Never settled: 403, 429, 5xx, timeouts,
+  non-image 2xx, an off-host redirect, a put the store did not confirm (and nothing at all when the process is killed first).
+- A kill mid-item fetches that whole item again on the next run (up to 99 duplicate requests; by design).
+- Known gap, follow-up FETCH-CAP-1 (not this PR): the 32 MiB cap limits what is stored, not what is buffered for a body with
+  no Content-Length or a gzip-encoded one. Size the Job's memory limit with that in mind.
 - Restart safe: the ledger is append-only JSONL; re-running the same work list fetches nothing already settled.
 - Hands-off: the deployed job is the only thing that ever contacts the static host. Nothing here is run from a workstation.
 
@@ -84,13 +106,15 @@ bulk run.
 
 ```
 # one-shot Job, scraper image, no npm in the image: node dist/...
+concurrencyPolicy: Forbid            # (CronJob) never two runs; the ledger lock is the second line of defence
+terminationGracePeriodSeconds: 60    # SIGTERM stops the run and drains the store's queue
 args: ["node","dist/services/images/galleryCaptureCli.js","--probe","20"]      # first run
 args: ["node","dist/services/images/galleryCaptureCli.js","--max-files","20000","--max-minutes","330"]   # staged real runs
 env:
   PERSIST_RAW_IMAGES: "true"            # the lane must be on; the driver refuses to fetch what would be dropped
   REPORT_CAPTURES: "true"               # + INGEST_BASE_URL, RAW_STORE_S3_* exactly as the scraper Deployment has them
   IMAGE_HOST_POLICY_JSON: '{"static.myfigurecollection.net":{"lane":"http","egress":"direct"}}'
-  IMAGE_HOST_RATE_JSON:   '{"static.myfigurecollection.net":{"intervalMs":333}}'      # desk IMGRATE b: 3 files/s, no speed-up
+  IMAGE_HOST_RATE_JSON:   '{"static.myfigurecollection.net":{"intervalMs":333}}'      # desk IMGRATE b: 3 files/s, no speed-up; REQUIRED, the run exits 2 without it
   GALLERY_ALLOWED_HOSTS: static.myfigurecollection.net   # REQUIRED: no host is built in (hands-off plan C1), the run exits 2 without one
   GALLERY_WORKLIST_PATH: /state/wl.jsonl     # from `npm run gallery:worklist` (fc-aggregation)
   GALLERY_LEDGER_PATH:   /state/ledger.jsonl
