@@ -60,8 +60,15 @@ The scraper must not read the spine database, so the work list is a file the ope
    **The store's own ceiling.** The sink SKIPS a body over `RAW_STORE_IMAGE_MAX_BYTES` and still calls it admitted (the Deployment
    sets 10485760; the lane's own fetch cap is 32 MiB). The Job must carry the same value (`RAW_STORE_IMAGE_MAX_BYTES`, copied from the
    Deployment; the run exits 2 without it), and a fetched body over it is settled `skipped:too_large`: counted in the report
-   (`skippedTooLarge`), never reported to the spine, never asked for again. Any other store-side skip (not an image, empty, lane off),
-   or a size skip the fetched sizes do not explain, is treated as a lost put.
+   (`skippedTooLarge`), never reported to the spine, never asked for again.
+   **A body the store will not keep.** The lane takes a declared `image/*` type verbatim; the sink does not, it sniffs the magic bytes and
+   skips what is empty or not JPEG, PNG, GIF, WebP or AVIF (an HTML hotlink or soft-404 page served as `image/jpeg`, a BMP, TIFF or HEIC
+   original). The observer applies the sink's own sniffer to each body, so the driver knows which file was skipped: it is settled
+   `skipped:not_image` (counted in `skippedNotImage`, never reported, never asked for again, the same for a sharing item), and it counts
+   toward the pause streak like a block (a host that answers this way three times in a row pauses the run; a good image resets the
+   count). The sink checks empty, then size, then type, and so does the driver: an HTML body over the ceiling is `skipped:too_large`.
+   A store-side skip the fetched bodies do not explain (the lane off, or more skips than there are bodies that qualify) is treated as a
+   lost put.
    `IMAGE_MAX_PER_ITEM=100` for this process only. The item's `contentLevel` rides the ref (fail closed to `unknown`).
    `sourceClass` is config (`GALLERY_SOURCE_CLASS`). Ross ruled (desk GALSRC b): the MFC official gallery is `manufacturer_press`, set in the Job env below; the code default stays `unknown`, so a Job that forgets the setting claims nothing.
 4. **Auto-pause**: N consecutive blocked or failed fetches (403, 429, 503, `cf-mitigated`, a 2xx that is not an image, a
@@ -73,12 +80,13 @@ The scraper must not read the spine database, so the work list is a file the ope
    refused before a request is sent: nothing is fetched, stored or settled from outside the list, and it counts as a blocked
    fetch. A cross-origin hop carries no Referer; more than 5 hops are refused; a hop to another scheme (`ftp:`, `ws:`) or whose
    Location carries credentials is refused, and the Location is never printed. The probe still treats any redirect as a FAIL.
-   **The allow-list is per ORIGIN.** `GALLERY_ALLOWED_HOSTS` entries are `host` or `host:port`. A host named without a port allows
-   only its default ports (https 443, http 80); `host:port` allows that port and no other. Another service on the same host name
-   (another port) is not on the list.
+   **The allow-list is per ORIGIN, scheme included.** `GALLERY_ALLOWED_HOSTS` entries are `[http://|https://]host[:port]`. A bare host is
+   https on 443; `host:port` is https on that port. Cleartext has to be asked for: `http://host` (port 80) or `http://host:port`, and the run
+   logs a WARNING at start naming every such entry. A bare host therefore does not follow an https -> http redirect, and another service on
+   the same host name (another port) is not on the list. The rate and policy rows stay keyed by host name.
 4b. **One spelling of a url**: the work list carries the canonical form (host lower-case without a trailing dot, default port
    gone, dot segments resolved, no fragment, %-escapes in one spelling) and the scraper applies it again; the ledger keys on it,
-   per item: `{"i":"site/itemId","u":url,"s":stored|gone|oversize|skipped:too_large}`. (The url-only lines of the first cut are
+   per item: `{"i":"site/itemId","u":url,"s":stored|gone|oversize|skipped:too_large|skipped:not_image}`. (The url-only lines of the first cut are
    ignored.) The form is IDEMPOTENT: a valid `%XX` is decoded once if it spells an unreserved character, a stray `%` (not followed
    by two hex digits) is a literal percent sign and is written `%25`, and nothing is decoded twice, so `x%4%31.jpeg` (the file
    `x%41.jpeg`) never collides with `xA.jpeg`. fc-aggregation carries the same function; both suites read the same vector file
@@ -86,15 +94,19 @@ The scraper must not read the spine database, so the work list is a file the ope
    A gallery over 100 entries keeps the first 100 by position and reports the rest (`entriesCapped`); it is never dropped whole.
 5. **Probe** (`--probe [N=20]`): the first N files of the work list through the real hook and sink, with evidence per
    request (status, type, size, header NAMES sent, set-cookie seen, cf-mitigated/cf-ray, redirect) and a verdict. PASS only if
-   every request is a 200 image on the allowed host, no cookie or authorization header was sent, no challenge signal,
-   no redirect off-host.
+   every request is a 200 image on the allowed origin, no cookie or authorization header was sent, no challenge signal,
+   no redirect off-host, AND the store kept every file: a probe puts its files through the real sink, so a body the store skipped (not an
+   image, over its ceiling) or a write it did not confirm makes the verdict FAIL. The exit code follows the printed verdict: 0 for PASS,
+   5 for anything else (including a probe that tripped the pause: the marker is written and the PAUSED line printed, but the code is 5).
 6. **Entry**: `npm run gallery:capture` (Job/CronJob, same image as the scraper). One meaning per exit code: 0 done (or a limit),
    1 crash, 2 bad arguments or config (no host named, no rate row for an allowed host, `RAW_STORE_IMAGE_MAX_BYTES` unset, a bad
-   allow-list entry), 3 paused (a block, a 5xx storm, or a live pause marker), 4 refused (lane off or the host policy is not plain
-   http + direct), 5 probe not a PASS, 6 the raw store did not confirm some item (unsettled; run again), 7 stopped by SIGTERM/SIGINT
+   allow-list entry, no lock location), 3 paused (a block, a 5xx storm, or a live pause marker), 4 refused (lane off or the host policy is not plain
+   http + direct), 5 probe not a PASS (a probe exits by its printed verdict: 0 or 5), 6 the raw store did not confirm some item of a real
+   run (unsettled; run again), 7 stopped by SIGTERM/SIGINT
    or by losing the lock, 8 LOCKED (another run holds the lease; this one made no request).
 7. **One run per host, on a lease; and SIGTERM**: the lock is `GALLERY_LOCK_PATH`, else `gallery-capture.lock` in the directory of
-   `GALLERY_LEDGER_PATH` (else of `--ledger`), NOT a file per ledger: a probe given its own `--ledger` cannot run beside a live run.
+   `GALLERY_LEDGER_PATH`. It never follows the `--ledger` flag: with neither variable set a run (a probe included) exits 2 before any request,
+   because a probe given its own `--ledger` in another directory would otherwise run beside a live run. A dry run needs no lock.
    The file holds `{token, hostname, startedAt, heartbeatAt}`; the owner refreshes `heartbeatAt` every 10 s; a lock is stale only when
    its heartbeat is older than 60 s, whoever wrote it. No pid is kept (node is PID 1 in every pod, so a pid check would call every
    dead pod's lock live). A SIGKILLed or OOM-killed run therefore leaves a lease that frees itself 60 s later: an immediate restart
@@ -110,7 +122,8 @@ The scraper must not read the spine database, so the work list is a file the ope
 - One request in flight, spaced by the host rate; no retries inside a run (a failed url is simply not settled and the next run
   tries it again, after the pause if one was set).
 - Settled = stored AND confirmed by the sink (or the same for a picture an earlier item got, in this run), or permanently gone
-  (404/410), or over the fetch cap (`oversize`), or over the store's ceiling (`skipped:too_large`), per (item, url). Never settled:
+  (404/410), or over the fetch cap (`oversize`), or over the store's ceiling (`skipped:too_large`), or a body the store will not keep
+  (`skipped:not_image`), per (item, url). Never settled:
   403, 429, 5xx, timeouts, non-image 2xx, an off-origin redirect, a put the store did not confirm (and nothing at all when the
   process is killed first).
 - A kill mid-item fetches that whole item again on the next run (up to 99 duplicate requests; by design).
@@ -146,8 +159,8 @@ env:
   IMAGE_HOST_POLICY_JSON: '{"static.myfigurecollection.net":{"lane":"http","egress":"direct"}}'
   IMAGE_HOST_RATE_JSON:   '{"static.myfigurecollection.net":{"intervalMs":333}}'      # desk IMGRATE b: 3 files/s, no speed-up; REQUIRED, the run exits 2 without it
   RAW_STORE_IMAGE_MAX_BYTES: "10485760"  # REQUIRED: the Deployment's value (the sink skips bodies over it); the run exits 2 without it
-  GALLERY_LOCK_PATH: /state/gallery-capture.lock   # one lease for the host, whatever ledger a run is given
-  GALLERY_ALLOWED_HOSTS: static.myfigurecollection.net   # REQUIRED: no host is built in (hands-off plan C1), the run exits 2 without one. host or host:port; a bare host = its default ports only
+  GALLERY_LOCK_PATH: /state/gallery-capture.lock   # REQUIRED unless GALLERY_LEDGER_PATH is set: one lease for the host, whatever ledger a run is given
+  GALLERY_ALLOWED_HOSTS: static.myfigurecollection.net   # REQUIRED: no host is built in (hands-off plan C1), the run exits 2 without one. [http://]host[:port]; a bare host = https on 443 only
   GALLERY_WORKLIST_PATH: /state/wl.jsonl     # from `npm run gallery:worklist` (fc-aggregation)
   GALLERY_LEDGER_PATH:   /state/ledger.jsonl
   GALLERY_SOURCE_CLASS:  manufacturer_press   # desk GALSRC b: the MFC official gallery
@@ -155,6 +168,6 @@ volumes: a small PVC at /state (the work list ~170 MB for the whole catalogue, t
 network: egress 443 to static.myfigurecollection.net and the raw store, plus the ingest listener, as the scraper has it
 ```
 
-Operator flow: run `gallery:worklist`, copy the file to the PVC, run the probe Job and read `PROBE PASS|FAIL` (exit 5 on
-anything but PASS), then run staged real Jobs until the list is done. A block pauses the Job (exit 3) and writes the marker;
+Operator flow: run `gallery:worklist`, copy the file to the PVC, run the probe Job and read `PROBE PASS|FAIL` (the exit code is
+0 for PASS and 5 for anything else), then run staged real Jobs until the list is done. A block pauses the Job (exit 3) and writes the marker;
 `--resume` clears it deliberately.
