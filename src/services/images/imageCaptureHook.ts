@@ -279,6 +279,12 @@ export interface ImageCaptureHook {
   /** Await every capture a caller fired and forgot — for tests and for a clean shutdown. */
   drain(): Promise<void>;
   stats(): ImageCaptureStats;
+  /**
+   * Make the hook forget these urls (and the content they resolved to), so the next capture of one fetches it again instead of
+   * answering from its memo. For a caller that learns AFTER admission that a put was lost (the gallery driver, which flushes the
+   * sink per item). Absent on a double that keeps no memo.
+   */
+  forget?(urls: readonly string[]): void;
 }
 
 /** The store's host, for the gated browser's session key. Empty when the page url does not parse. */
@@ -734,6 +740,9 @@ export function createImageCaptureHook(deps: ImageCaptureHookDeps): ImageCapture
     },
     async drain(): Promise<void> {
       while (inFlight.size > 0) await Promise.all([...inFlight]);
+    },
+    forget(urls: readonly string[]): void {
+      for (const url of urls) memo.forget(url);
     },
     stats(): ImageCaptureStats {
       return {

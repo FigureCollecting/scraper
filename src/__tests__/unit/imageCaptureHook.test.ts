@@ -842,6 +842,36 @@ describe('the image capture hook — memo-hit capture reports (I3)', () => {
     expect(r.url).toBe(SHARED);
   });
 
+  it('forget(): a url the caller learned was LOST is fetched again by the next item, not served from the memo or reported against a missing object', async () => {
+    const reports: StoredCaptureReport[] = [];
+    const { sink, captures } = storingSink();
+    const hook = build(sink, (r) => reports.push(r));
+
+    await item(hook, 'ITEM-A', 'https://store.test/products/lucy', [gallery(SHARED, 0)]);
+    hook.forget?.([SHARED]);
+    await item(hook, 'ITEM-B', 'https://store.test/products/nadia', [gallery(SHARED, 0)]);
+
+    expect(hook.stats().skipped.memo).toBe(0);                    // no memo hit
+    expect(captures.map((c) => c.sourceItem?.itemId)).toEqual(['ITEM-A', 'ITEM-B']); // B went through the sink itself
+    expect(reports).toHaveLength(0);                              // and nothing was reported from the memo
+  });
+
+  it('forget() also lets the same BYTES under another url reach the sink (the content address is forgotten with the url)', async () => {
+    const { sink, captures } = storingSink();
+    const hook = build(sink);
+    await item(hook, 'ITEM-A', 'https://store.test/products/lucy', [gallery(SHARED, 0)]);
+    hook.forget?.([SHARED]);
+    await item(hook, 'ITEM-B', 'https://store.test/products/nadia', [gallery(`${SHARED}?v=2`, 0)]);
+    expect(captures).toHaveLength(2);
+    expect(hook.stats().deduped).toBe(0);
+  });
+
+  it('forget() of a url it never held, or of nothing, is harmless', async () => {
+    const { sink } = storingSink();
+    const hook = build(sink);
+    expect(() => { hook.forget?.([]); hook.forget?.(['https://store.test/never.png']); }).not.toThrow();
+  });
+
   it('does not report on a memo hit for a url stored WITHOUT a descriptor — no guessed key', async () => {
     const reports: StoredCaptureReport[] = [];
     const { sink } = keylessSink();

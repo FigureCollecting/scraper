@@ -52,6 +52,16 @@ describe('createImageUrlMemo', () => {
     expect(memo.hasSha('1')).toBe(false);
   });
 
+  it('forget() takes a url out, with the content address it resolved to; other urls are untouched', () => {
+    const memo = createImageUrlMemo(10);
+    memo.remember('https://a/1.png', 'sha-1', { storageKey: 'k1', bytesLen: 1, fetchedAt: 't', url: 'https://a/1.png' });
+    memo.remember('https://a/2.png', 'sha-2');
+    memo.forget('https://a/1.png');
+    expect([memo.hasUrl('https://a/1.png'), memo.hasSha('sha-1'), memo.storedAssetFor('https://a/1.png')]).toEqual([false, false, undefined]);
+    expect([memo.hasUrl('https://a/2.png'), memo.hasSha('sha-2')]).toEqual([true, true]);
+    expect(() => memo.forget('https://a/never.png')).not.toThrow();
+  });
+
   describe('shaFor / storedAssetFor — what a memo-hit report is built from', () => {
     it('returns the sha a url resolved to, so a memo hit can report the SAME bytes', () => {
       const memo = createImageUrlMemo(10);

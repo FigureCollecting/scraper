@@ -367,7 +367,7 @@ function parseAssetMaxWaitMs(raw: string | undefined): number | undefined {
 }
 
 /** A positive byte ceiling from env, clamped so a typo cannot disable the ceiling. */
-function parseImageMaxBytes(raw: string | undefined): number | undefined {
+export function parseImageMaxBytes(raw: string | undefined): number | undefined {
   const n = parsePositive(raw);
   return n === undefined ? undefined : Math.min(n, MAX_CONFIGURABLE_IMAGE_BYTES);
 }

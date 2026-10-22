@@ -58,6 +58,12 @@ export interface ImageUrlMemo {
   storedAssetFor(url: string): StoredAsset | undefined;
   /** Record the outcome of one fetch. `stored` is the winner's PUT facts, present only on a real write. */
   remember(url: string, sha256: string, stored?: Omit<StoredAsset, 'sha256'>): void;
+  /**
+   * Take a url back out, with the content address it resolved to. The memo is written when the sink ADMITS bytes, before the put has
+   * happened; a caller that learns the put was lost calls this, so the next item sharing the url fetches it instead of being told the
+   * bytes are at rest (and having a depiction of a missing object reported for it).
+   */
+  forget(url: string): void;
 }
 
 /**
@@ -66,7 +72,7 @@ export interface ImageUrlMemo {
  * different keys — a url that changes on every deploy (`?v=`) can still resolve to bytes the bucket
  * already holds, and only the content hash sees that.
  */
-function lru<V>(max: number): { get(k: string): V | undefined; set(k: string, v: V): void } {
+function lru<V>(max: number): { get(k: string): V | undefined; set(k: string, v: V): void; delete(k: string): void } {
   const entries = new Map<string, V>();
   return {
     get(key: string): V | undefined {
@@ -76,6 +82,9 @@ function lru<V>(max: number): { get(k: string): V | undefined; set(k: string, v:
       entries.delete(key);
       entries.set(key, value);
       return value;
+    },
+    delete(key: string): void {
+      entries.delete(key);
     },
     set(key: string, value: V): void {
       if (max <= 0) return;
@@ -115,6 +124,11 @@ export function createImageUrlMemo(size: number): ImageUrlMemo {
         ...(stored?.contentType !== undefined ? { contentType: stored.contentType } : {}),
       });
       bySha.set(sha256, true);
+    },
+    forget(url: string): void {
+      const sha = byUrl.get(url)?.sha256;
+      byUrl.delete(url);
+      if (sha !== undefined) bySha.delete(sha);
     },
   };
 }
