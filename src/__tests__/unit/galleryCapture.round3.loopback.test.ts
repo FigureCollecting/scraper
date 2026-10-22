@@ -2,10 +2,10 @@
  * The gallery Job, run for real against loopback fixtures: the findings of the red team's THIRD round (MFC-GALLERY-2 fix round 3).
  * Same method as the earlier loopback files: the real entry as a child process, the real fetch, hook and sink against a fake S3.
  */
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { cliEnv, readLedger, runCli, startLoopback, writeWorklist, type Loopback } from '../helpers/galleryLoopback';
+import { cliEnv, readLedger, runCli, useLockDir, startLoopback, writeWorklist, type Loopback } from '../helpers/galleryLoopback';
 
 jest.setTimeout(120_000);
 
@@ -16,6 +16,7 @@ let ledger: string;
 beforeEach(async () => {
   lb = await startLoopback();
   dir = mkdtempSync(path.join(os.tmpdir(), 'gallery-loopback3-'));
+  useLockDir(dir);
   wl = path.join(dir, 'wl.jsonl');
   ledger = path.join(dir, 'ledger.jsonl');
 });
@@ -106,5 +107,38 @@ describe('R3-S1: a body the store will not keep is settled, not refetched for ev
     const run = await runCli([...base(), '--probe', '2'], envR());
     expect([verdict(run.out), run.code]).toEqual(['PASS', 0]);
     expect(existsSync(ledger) ? readLedger(ledger).filter(r => r.i !== undefined) : []).toEqual([]);
+  });
+});
+
+describe('R3-N3: no lock location, no run (the lock never follows the --ledger flag)', () => {
+  const lockless = (over: Record<string, string | undefined> = {}): NodeJS.ProcessEnv => envR({ GALLERY_LOCK_PATH: undefined, GALLERY_LEDGER_PATH: undefined, ...over });
+
+  it('exits 2 with zero requests when neither GALLERY_LOCK_PATH nor GALLERY_LEDGER_PATH is set; the lock is never made beside --ledger', async () => {
+    writeWorklist(lb, wl, [{ id: 1, paths: ['img/1.png'] }]);
+    const run = await runCli(base(), lockless());
+    expect(run.code).toBe(2);
+    expect(run.out).toMatch(/GALLERY_LOCK_PATH/);
+    expect(run.out).toMatch(/GALLERY_LEDGER_PATH/);
+    expect(lb.a).toHaveLength(0);
+    expect(existsSync(path.join(dir, 'gallery-capture.lock'))).toBe(false);
+    const probe = await runCli([...base(), '--probe', '1'], lockless());
+    expect(probe.code).toBe(2);
+    expect(lb.a).toHaveLength(0);
+  });
+
+  it('a dry run makes no request and needs no lock location', async () => {
+    writeWorklist(lb, wl, [{ id: 1, paths: ['img/1.png'] }]);
+    const run = await runCli([...base(), '--dry-run'], lockless());
+    expect(run.code).toBe(0);
+  });
+
+  it('GALLERY_LEDGER_PATH alone places the lock beside THAT ledger, whatever --ledger a run is given', async () => {
+    writeWorklist(lb, wl, [{ id: 1, paths: ['img/1.png'] }]);
+    const state = path.join(dir, 'state');
+    mkdirSync(state);
+    writeFileSync(path.join(state, 'gallery-capture.lock'), JSON.stringify({ token: 'abc', hostname: 'pod-a', startedAt: Date.now() - 600_000, heartbeatAt: Date.now() - 5_000 }));
+    const run = await runCli(base(), lockless({ GALLERY_LEDGER_PATH: path.join(state, 'ledger.jsonl') }));
+    expect(run.code).toBe(8);
+    expect(lb.a).toHaveLength(0);
   });
 });

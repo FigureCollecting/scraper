@@ -38,7 +38,7 @@ const USAGE =
   'usage: gallery:capture --worklist <file.jsonl> --ledger <file.jsonl> [--probe [N]] [--max-files N] [--max-minutes N] ' +
   '[--pause-after N] [--pause-minutes N] [--resume] [--dry-run] [--source-class <class>]  (env: GALLERY_WORKLIST_PATH, GALLERY_LEDGER_PATH, GALLERY_ALLOWED_HOSTS = host or host:port, GALLERY_LOCK_PATH)';
 
-/** The lease file, when nothing names it: beside the ledger, under one name, so every ledger of a host shares one lock. */
+/** The lease file's name beside GALLERY_LEDGER_PATH: one name, so every ledger kept there shares one lock. */
 const LOCK_FILE_NAME = 'gallery-capture.lock';
 export const EXIT_LOCKED = 8;
 
@@ -169,9 +169,15 @@ export async function main(argv: readonly string[] = process.argv.slice(2), deps
     print('REFUSED: RAW_STORE_IMAGE_MAX_BYTES is not set to a positive number of bytes (copy the scraper Deployment\'s value, e.g. 10485760): the raw store skips bodies over it, so the run must know the ceiling to say which files are at rest');
     return 2;
   }
-  // One run at a time per HOST, on a lease that does not depend on --ledger (a probe with its own ledger must not run beside a live run).
+  // One run at a time per HOST, on a lease that NEVER depends on the --ledger flag: a probe given its own ledger, in another directory, must
+  // not run beside a live run. The lock is where the Job env says (GALLERY_LOCK_PATH, else beside GALLERY_LEDGER_PATH); with neither, a run
+  // that could double up on the host does not start.
   let lock: ReturnType<typeof acquireRunLock> | undefined;
-  const lockPath = env.GALLERY_LOCK_PATH || (args.ledger === undefined ? undefined : path.join(path.dirname(env.GALLERY_LEDGER_PATH || args.ledger), LOCK_FILE_NAME));
+  const lockPath = env.GALLERY_LOCK_PATH || (env.GALLERY_LEDGER_PATH ? path.join(path.dirname(env.GALLERY_LEDGER_PATH), LOCK_FILE_NAME) : undefined);
+  if (!args.dryRun && lockPath === undefined) {
+    print(`REFUSED: no lock location: set GALLERY_LOCK_PATH (or GALLERY_LEDGER_PATH, beside which ${LOCK_FILE_NAME} is kept) in the Job env. Without one, a run given another --ledger could run beside a live one`);
+    return 2;
+  }
   if (lockPath !== undefined && !args.dryRun) {
     lock = acquireRunLock(lockPath);
     if (!lock.held) {

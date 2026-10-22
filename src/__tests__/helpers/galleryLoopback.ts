@@ -250,6 +250,12 @@ export function writeWorklist(lb: Loopback, file: string, specs: WorklistSpec[])
   writeFileSync(file, `${lines.join('\n')}\n`);
 }
 
+let lockDir: string | undefined;
+/** Where this test's lock lives (a run refuses to start without a lock location); call it in `beforeEach` with the test's temp directory. */
+export function useLockDir(dir: string | undefined): void {
+  lockDir = dir;
+}
+
 /** The env the real Job entry needs to run against the loopback: both hosts on the plain http lane, an explicit 100 ms rate row each, A's origin allowed. */
 export function cliEnv(lb: Loopback, over: Record<string, string | undefined> = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
@@ -268,6 +274,7 @@ export function cliEnv(lb: Loopback, over: Record<string, string | undefined> = 
     // the store's own size cap is part of the Job's env (the Deployment's value); the run refuses to start without it
     RAW_STORE_IMAGE_MAX_BYTES: '10485760',
     GALLERY_SOURCE_CLASS: 'manufacturer_press',
+    ...(lockDir !== undefined ? { GALLERY_LOCK_PATH: path.join(lockDir, 'gallery-capture.lock') } : {}),
     NODE_OPTIONS: '--dns-result-order=ipv4first',
   };
   for (const [k, v] of Object.entries(over)) {

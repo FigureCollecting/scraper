@@ -119,7 +119,7 @@ describe('main', () => {
     return {
       fetched, flushed,
       deps: {
-        env: { IMAGE_HOST_RATE_JSON: JSON.stringify({ [STATIC]: { intervalMs: 100 } }), GALLERY_ALLOWED_HOSTS: STATIC, RAW_STORE_IMAGE_MAX_BYTES: '10485760' } as NodeJS.ProcessEnv,
+        env: { IMAGE_HOST_RATE_JSON: JSON.stringify({ [STATIC]: { intervalMs: 100 } }), GALLERY_ALLOWED_HOSTS: STATIC, RAW_STORE_IMAGE_MAX_BYTES: '10485760', GALLERY_LOCK_PATH: path.join(dir, 'gallery-capture.lock') } as NodeJS.ProcessEnv,
         print: (s: string) => void out.push(s),
         policy: POLICY,
         baseFetch: async (url: string) => {
@@ -321,8 +321,31 @@ describe('main', () => {
     mkdirSync(other);
     writeFileSync(path.join(other, 'gallery-capture.lock'), lease());
     const d = deps();
-    const env = { ...d.deps.env, GALLERY_LEDGER_PATH: path.join(other, 'ledger.jsonl') } as NodeJS.ProcessEnv;
+    const env = { ...d.deps.env, GALLERY_LOCK_PATH: undefined, GALLERY_LEDGER_PATH: path.join(other, 'ledger.jsonl') } as NodeJS.ProcessEnv;
     expect(await main(['--worklist', work, '--ledger', ledger], { ...d.deps, env })).toBe(8);
+  });
+
+  it.each([
+    ['a run', ['--worklist', 'WORK', '--ledger', 'LEDGER']],
+    ['a probe', ['--worklist', 'WORK', '--ledger', 'LEDGER', '--probe', '2']],
+  ])('%s exits 2 with zero requests when neither GALLERY_LOCK_PATH nor GALLERY_LEDGER_PATH is set (no lock beside --ledger)', async (_why, argv) => {
+    const d = deps();
+    const env = { ...d.deps.env } as Record<string, string | undefined>;
+    delete env.GALLERY_LOCK_PATH;
+    delete env.GALLERY_LEDGER_PATH;
+    const real = argv.map(a => (a === 'WORK' ? work : a === 'LEDGER' ? ledger : a));
+    expect(await main(real, { ...d.deps, env: env as NodeJS.ProcessEnv })).toBe(2);
+    expect(out.join('\n')).toMatch(/GALLERY_LOCK_PATH.*GALLERY_LEDGER_PATH|GALLERY_LEDGER_PATH.*GALLERY_LOCK_PATH/);
+    expect(d.fetched).toEqual([]);
+    expect(existsSync(lockFile())).toBe(false);
+  });
+
+  it('a dry run needs no lock location', async () => {
+    const d = deps();
+    const env = { ...d.deps.env } as Record<string, string | undefined>;
+    delete env.GALLERY_LOCK_PATH;
+    delete env.GALLERY_LEDGER_PATH;
+    expect(await main(['--worklist', work, '--dry-run'], { ...d.deps, env: env as NodeJS.ProcessEnv })).toBe(0);
   });
 
   it('a dry run takes no lock', async () => {

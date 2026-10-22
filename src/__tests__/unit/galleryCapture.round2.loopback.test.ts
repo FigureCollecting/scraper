@@ -6,7 +6,7 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { cliEnv, readLedger, runCli, startCli, startLoopback, writeWorklist, type Loopback } from '../helpers/galleryLoopback';
+import { cliEnv, readLedger, runCli, useLockDir, startCli, startLoopback, writeWorklist, type Loopback } from '../helpers/galleryLoopback';
 
 jest.setTimeout(120_000);
 
@@ -18,6 +18,7 @@ let lockPath: string;
 beforeEach(async () => {
   lb = await startLoopback();
   dir = mkdtempSync(path.join(os.tmpdir(), 'gallery-loopback2-'));
+  useLockDir(dir);
   wl = path.join(dir, 'wl.jsonl');
   ledger = path.join(dir, 'ledger.jsonl');
   lockPath = path.join(dir, 'gallery-capture.lock');
