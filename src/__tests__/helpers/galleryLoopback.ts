@@ -269,8 +269,8 @@ export function cliEnv(lb: Loopback, over: Record<string, string | undefined> = 
     RAW_STORE_S3_PATH_STYLE: 'true',
     IMAGE_HOST_POLICY_JSON: JSON.stringify({ localhost: { lane: 'http', egress: 'direct' }, '127.0.0.1': { lane: 'http', egress: 'direct' } }),
     IMAGE_HOST_RATE_JSON: JSON.stringify({ localhost: { intervalMs: 100 }, '127.0.0.1': { intervalMs: 100 } }),
-    // an ORIGIN: the allowed host name and A's port (a bare host would allow only the default ports)
-    GALLERY_ALLOWED_HOSTS: `localhost:${lb.portA}`,
+    // an ORIGIN: scheme, host name and A's port. The loopback is cleartext http, so it has to be named as such (a bare host is https)
+    GALLERY_ALLOWED_HOSTS: `http://localhost:${lb.portA}`,
     // the store's own size cap is part of the Job's env (the Deployment's value); the run refuses to start without it
     RAW_STORE_IMAGE_MAX_BYTES: '10485760',
     GALLERY_SOURCE_CLASS: 'manufacturer_press',

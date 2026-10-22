@@ -157,19 +157,25 @@ const pathOf = (url: string): string => {
 /** One spelling of a host: trimmed, lowercased, no trailing root dot. The allow-list and every url are compared in it. */
 export const normalizeHost = (host: string): string => host.trim().toLowerCase().replace(/\.+$/, '');
 /**
- * One origin the run may fetch from: a host, and a port. A host named without a port means its DEFAULT ports (https 443, http 80);
- * `host:port` means that port and no other. A host name alone would also let a redirect reach any other service on the same host.
+ * One origin the run may fetch from: a SCHEME, a host and a port. An entry is `[http://|https://]host[:port]`:
+ *   `host`            https on 443 (a bare host is the secure one; cleartext has to be asked for)
+ *   `host:port`       https on that port
+ *   `http://host`     http on 80, `http://host:port` http on that port: cleartext, named on purpose, and logged as a warning at start
+ * A host name alone would also let a redirect reach any other service on the same host (another port), or downgrade https to http.
  */
-export interface AllowedOrigin { host: string; port?: number }
+export interface AllowedOrigin { scheme: 'http' | 'https'; host: string; port?: number }
 export function parseAllowedOrigin(entry: string): AllowedOrigin | undefined {
-  const m = /^([A-Za-z0-9._-]+)(?::([0-9]{1,5}))?$/.exec(entry.trim());
+  const m = /^(?:(https?):\/\/)?([A-Za-z0-9._-]+)(?::([0-9]{1,5}))?$/i.exec(entry.trim());
   if (m === null) return undefined;
-  const host = normalizeHost(m[1]!);
+  const host = normalizeHost(m[2]!);
   if (host === '') return undefined;
-  if (m[2] === undefined) return { host };
-  const port = Number(m[2]);
-  return port >= 1 && port <= 65535 ? { host, port } : undefined;
+  const scheme = m[1]?.toLowerCase() === 'http' ? 'http' : 'https';
+  if (m[3] === undefined) return { scheme, host };
+  const port = Number(m[3]);
+  return port >= 1 && port <= 65535 ? { scheme, host, port } : undefined;
 }
+/** The canonical text of an entry: `host[:port]` for https, `http://host[:port]` for http. */
+export const originEntryText = (o: AllowedOrigin): string => `${o.scheme === 'http' ? 'http://' : ''}${o.host}${o.port === undefined ? '' : `:${o.port}`}`;
 /** The compiled list; an entry that does not parse allows nothing (fail closed). */
 const compileAllowed = (entries: readonly string[]): AllowedOrigin[] => entries.flatMap(e => { const o = parseAllowedOrigin(e); return o === undefined ? [] : [o]; });
 /** The host names behind a list of origins: what the host policy, the rate rows and the probe preflight are keyed by. */
@@ -178,9 +184,10 @@ export function originAllowed(url: string, allowed: readonly AllowedOrigin[]): b
   let u: URL;
   try { u = new URL(url); } catch { return false; }
   if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+  const scheme = u.protocol === 'https:' ? 'https' : 'http';
   const host = normalizeHost(u.hostname);
   const explicit = u.port === '' ? undefined : Number(u.port); // WHATWG drops the scheme's own default port
-  return allowed.some(a => a.host === host && (a.port === undefined ? explicit === undefined : (explicit ?? (u.protocol === 'https:' ? 443 : 80)) === a.port));
+  return allowed.some(a => a.scheme === scheme && a.host === host && (a.port === undefined ? explicit === undefined : (explicit ?? (scheme === 'https' ? 443 : 80)) === a.port));
 }
 
 // ---------------------------------------------------------------------------

@@ -21,7 +21,7 @@ import { createImageHostLimiter, createImageCaptureHookFromEnv } from './assembl
 import { acquireRunLock, LOCK_HEARTBEAT_MS } from './galleryLock.js';
 import { readWorklistFile } from './galleryWorklist.js';
 import {
-  DEFAULT_OUTCOME_MEMORY, allowedHostnames, createFetchObserver, createFileLedger, createMemoryLedger, createRecordingFetch, followAllowedRedirects, gateOnStop, parseAllowedOrigin, runGalleryCapture,
+  DEFAULT_OUTCOME_MEMORY, allowedHostnames, createFetchObserver, createFileLedger, createMemoryLedger, createRecordingFetch, followAllowedRedirects, gateOnStop, originEntryText, parseAllowedOrigin, runGalleryCapture,
   type ConfirmingSink, type GalleryLedger, type GalleryReport,
 } from './galleryDriver.js';
 import { createHttpBytesFetch, type BytesFetchImpl } from './httpBytesFetch.js';
@@ -36,7 +36,7 @@ const MAX_PROBE = 200;
 const SOURCE_CLASSES: readonly string[] = ['manufacturer_press', 'retailer_studio', 'user_photo', 'unknown'];
 const USAGE =
   'usage: gallery:capture --worklist <file.jsonl> --ledger <file.jsonl> [--probe [N]] [--max-files N] [--max-minutes N] ' +
-  '[--pause-after N] [--pause-minutes N] [--resume] [--dry-run] [--source-class <class>]  (env: GALLERY_WORKLIST_PATH, GALLERY_LEDGER_PATH, GALLERY_ALLOWED_HOSTS = host or host:port, GALLERY_LOCK_PATH)';
+  '[--pause-after N] [--pause-minutes N] [--resume] [--dry-run] [--source-class <class>]  (env: GALLERY_WORKLIST_PATH, GALLERY_LEDGER_PATH, GALLERY_ALLOWED_HOSTS = [http://]host[:port] (bare = https), GALLERY_LOCK_PATH)';
 
 /** The lease file's name beside GALLERY_LEDGER_PATH: one name, so every ledger kept there shares one lock. */
 const LOCK_FILE_NAME = 'gallery-capture.lock';
@@ -66,8 +66,8 @@ function whole(flag: string, v: string | undefined, max: number): number {
 export function parseGalleryArgs(argv: readonly string[], env: NodeJS.ProcessEnv = process.env): GalleryArgs {
   const hosts = (env.GALLERY_ALLOWED_HOSTS ?? '').split(',').map(h => h.trim()).filter(h => h !== '').map(entry => {
     const origin = parseAllowedOrigin(entry);
-    if (origin === undefined) throw new Error(`${USAGE} (GALLERY_ALLOWED_HOSTS entry '${entry.slice(0, 80)}' is not a host or host:port)`);
-    return origin.port === undefined ? origin.host : `${origin.host}:${origin.port}`;
+    if (origin === undefined) throw new Error(`${USAGE} (GALLERY_ALLOWED_HOSTS entry '${entry.slice(0, 80)}' is not [http://|https://]host[:port])`);
+    return originEntryText(origin);
   });
   const out: GalleryArgs = {
     ...(env.GALLERY_WORKLIST_PATH ? { worklist: env.GALLERY_WORKLIST_PATH } : {}),
@@ -144,6 +144,10 @@ export async function main(argv: readonly string[] = process.argv.slice(2), deps
   const now = deps.now ?? Date.now;
   let args: GalleryArgs;
   try { args = parseGalleryArgs(argv, env); } catch (e) { print((e as Error).message); return 2; }
+  const cleartext = args.allowedHosts.filter(e => e.startsWith('http://'));
+  if (cleartext.length > 0) {
+    print(`WARNING: GALLERY_ALLOWED_HOSTS allows cleartext http for ${cleartext.join(', ')}: what is fetched from there crosses the network unencrypted. List an http:// entry only for a host that is not served over https`);
+  }
   if (args.allowedHosts.length === 0) { print(`${USAGE} (GALLERY_ALLOWED_HOSTS must name the image host(s) this run may fetch from)`); return 2; }
   if (args.worklist === undefined) { print(`${USAGE} (a work list is required)`); return 2; }
   if (!existsSync(args.worklist)) { print(`ERROR cannot read the work list ${args.worklist}`); return 2; }

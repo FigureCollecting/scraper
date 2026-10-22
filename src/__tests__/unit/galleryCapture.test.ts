@@ -390,9 +390,30 @@ describe('main', () => {
   });
 
   // N1: GALLERY_ALLOWED_HOSTS entries are origins
+  it('R3-N4: entries are [http://|https://]host[:port]; a bare host or host:port is https, and the form is normalised', () => {
+    const entries = (v: string) => parseGalleryArgs([], { GALLERY_ALLOWED_HOSTS: v } as NodeJS.ProcessEnv).allowedHosts;
+    expect(entries('A.example, HTTPS://b.example:8443, http://C.example:8080, http://d.example')).toEqual(['a.example', 'b.example:8443', 'http://c.example:8080', 'http://d.example']);
+    for (const bad of ['ftp://a.example', 'http://', 'http://a.example/x', 'https://a.example/']) {
+      expect(() => entries(bad)).toThrow(/GALLERY_ALLOWED_HOSTS/);
+    }
+  });
+
+  it('R3-N4: an http:// entry is logged as a WARNING at start (cleartext), a bare or https entry is not', async () => {
+    const d = deps();
+    const withHttp = { ...d.deps.env, GALLERY_ALLOWED_HOSTS: `${STATIC},http://${STATIC}` } as NodeJS.ProcessEnv;
+    await main(['--worklist', work, '--dry-run'], { ...d.deps, env: withHttp });
+    const warned = out.filter(l => /WARNING/.test(l) && /cleartext/i.test(l));
+    expect(warned).toHaveLength(1);
+    expect(warned[0]).toContain(`http://${STATIC}`);
+    expect(warned[0]).not.toContain(`https://`);
+    out.length = 0;
+    await main(['--worklist', work, '--dry-run'], { ...d.deps, env: { ...d.deps.env, GALLERY_ALLOWED_HOSTS: `${STATIC},https://${STATIC}:8443` } as NodeJS.ProcessEnv });
+    expect(out.filter(l => /WARNING/.test(l))).toEqual([]);
+  });
+
   it('GALLERY_ALLOWED_HOSTS takes host or host:port, and a malformed entry is a usage error', () => {
     expect(parseGalleryArgs([], { GALLERY_ALLOWED_HOSTS: 'A.example, b.example:8443' } as NodeJS.ProcessEnv).allowedHosts).toEqual(['a.example', 'b.example:8443']);
-    for (const bad of ['a.example:0', 'a.example:70000', 'a b', 'a.example/x', 'https://a.example']) {
+    for (const bad of ['a.example:0', 'a.example:70000', 'a b', 'a.example/x', 'ftp://a.example']) {
       expect(() => parseGalleryArgs([], { GALLERY_ALLOWED_HOSTS: bad } as NodeJS.ProcessEnv)).toThrow(/GALLERY_ALLOWED_HOSTS/);
     }
   });

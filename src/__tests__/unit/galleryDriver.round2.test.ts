@@ -145,32 +145,32 @@ describe('X15 (unit): the driver canonicalises whatever it is handed', () => {
 
 describe('N1 (unit): the allow-list is per ORIGIN', () => {
   it.each([
-    ['host', 'static.example', { host: 'static.example' }],
-    ['a host in capitals with a root dot', ' STATIC.Example. ', { host: 'static.example' }],
-    ['host:port', 'localhost:8080', { host: 'localhost', port: 8080 }],
-    ['a high port', 'img.example:65535', { host: 'img.example', port: 65535 }],
+    ['host', 'static.example', { scheme: 'https', host: 'static.example' }],
+    ['a host in capitals with a root dot', ' STATIC.Example. ', { scheme: 'https', host: 'static.example' }],
+    ['host:port', 'localhost:8080', { scheme: 'https', host: 'localhost', port: 8080 }],
+    ['a high port', 'img.example:65535', { scheme: 'https', host: 'img.example', port: 65535 }],
   ])('parses %s', (_why, entry, want) => {
     expect(parseAllowedOrigin(entry)).toEqual(want);
   });
 
-  it.each(['', 'localhost:0', 'localhost:65536', 'localhost:x', 'local host', 'a/b', 'http://localhost', 'user@host', ':80', 'host:80:90'])('rejects %j', entry => {
+  it.each(['', 'localhost:0', 'localhost:65536', 'localhost:x', 'local host', 'a/b', 'http://localhost/x', 'user@host', ':80', 'host:80:90'])('rejects %j', entry => {
     expect(parseAllowedOrigin(entry)).toBeUndefined();
   });
 
   const allowed = (...entries: string[]) => entries.map(e => parseAllowedOrigin(e)!);
   it.each([
     ['https default port', 'https://img.example/a.jpg', ['img.example'], true],
-    ['http default port', 'http://img.example/a.jpg', ['img.example'], true],
+    ['http default port needs an http:// entry', 'http://img.example/a.jpg', ['http://img.example'], true],
     ['an explicit default port', 'https://img.example:443/a.jpg', ['img.example'], true],
     ['another port on a bare host', 'https://img.example:8443/a.jpg', ['img.example'], false],
     ['https on the http default port number', 'https://img.example:80/a.jpg', ['img.example'], false],
-    ['the listed port', 'http://localhost:18471/a.jpg', ['localhost:18471'], true],
-    ['another port than the listed one', 'http://localhost:18472/a.jpg', ['localhost:18471'], false],
-    ['the default port when another is listed', 'http://localhost/a.jpg', ['localhost:18471'], false],
+    ['the listed port', 'http://localhost:18471/a.jpg', ['http://localhost:18471'], true],
+    ['another port than the listed one', 'http://localhost:18472/a.jpg', ['http://localhost:18471'], false],
+    ['the default port when another is listed', 'http://localhost/a.jpg', ['http://localhost:18471'], false],
     ['another host', 'https://other.example/a.jpg', ['img.example'], false],
     ['a subdomain', 'https://x.img.example/a.jpg', ['img.example'], false],
     ['a root dot and capitals', 'https://IMG.example./a.jpg', ['img.example'], true],
-    ['either of two entries', 'http://localhost:2/a.jpg', ['localhost:1', 'localhost:2'], true],
+    ['either of two entries', 'http://localhost:2/a.jpg', ['http://localhost:1', 'http://localhost:2'], true],
     ['not a url', 'img.example/a.jpg', ['img.example'], false],
     ['not http(s)', 'ftp://img.example/a.jpg', ['img.example'], false],
   ])('%s', (_why, url, entries, want) => {
@@ -180,7 +180,7 @@ describe('N1 (unit): the allow-list is per ORIGIN', () => {
   it('a redirect to another port of an allowed host is refused before a request', async () => {
     const calls: string[] = [];
     const paced: ImageBytesFetcher = async url => { calls.push(url); return { ok: false, reason: 'http-status', status: 302 } as ImageBytesResult; };
-    const f = followAllowedRedirects(paced, { allowedHosts: ['localhost:18471'], locationOf: () => 'http://localhost:18472/stolen.jpg' });
+    const f = followAllowedRedirects(paced, { allowedHosts: ['http://localhost:18471'], locationOf: () => 'http://localhost:18472/stolen.jpg' });
     expect(await f('http://localhost:18471/a.jpg', {})).toMatchObject({ ok: false, reason: 'refused', detail: expect.stringMatching(/outside the allow-list/) });
     expect(calls).toEqual(['http://localhost:18471/a.jpg']);
   });
@@ -188,7 +188,7 @@ describe('N1 (unit): the allow-list is per ORIGIN', () => {
   it('judgeProbe flags bytes from another port of the allowed host', () => {
     const v = judgeProbe({
       observations: [{ url: 'http://localhost:18471/a.jpg', ok: true, status: 200, contentType: 'image/png', bytes: 5, finalUrl: 'http://localhost:18472/a.jpg', ms: 1 }],
-      requests: [], allowedHosts: ['localhost:18471'], wanted: 1, exhausted: true,
+      requests: [], allowedHosts: ['http://localhost:18471'], wanted: 1, exhausted: true,
     });
     expect(v.verdict).toBe('FAIL');
   });

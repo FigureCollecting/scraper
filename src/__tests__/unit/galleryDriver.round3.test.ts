@@ -5,7 +5,8 @@
  */
 import type { ImageBytesResult } from '../../services/images/imageBytes';
 import { galleryExitCode } from '../../services/images/galleryCapture';
-import { classifyObservation, createFetchObserver, judgeProbe, runGalleryCapture, type FetchObservation } from '../../services/images/galleryDriver';
+import { classifyObservation, createFetchObserver, followAllowedRedirects, judgeProbe, originAllowed, parseAllowedOrigin, runGalleryCapture, type FetchObservation } from '../../services/images/galleryDriver';
+import type { ImageBytesFetcher } from '../../services/images/imageBytes';
 import { K, PNG, U, baseOpts, gdeps, item, memoHook, ok200, recordingLedger, scriptedSink } from '../helpers/galleryDriverDoubles';
 
 const body = (bytes: Buffer, contentType: string): ImageBytesResult => ({ ok: true, bytes, contentType, status: 200, finalUrl: 'x', headers: {} });
@@ -164,5 +165,64 @@ describe('R3-S1 (unit): the probe', () => {
     const r = await probeRun({ [U(2)]: html }, (_n, c) => { c.assetSkipped.notImage += 1; });
     expect(r.probe?.verdict).toBe('FAIL');
     expect(r.probe?.reasons.join(' ')).toMatch(/not an image/i);
+  });
+});
+
+describe('R3-N4 (unit): the scheme is part of the origin', () => {
+  it.each([
+    ['a bare host is https', 'img.example', { scheme: 'https', host: 'img.example' }],
+    ['host:port is https on that port', 'img.example:8443', { scheme: 'https', host: 'img.example', port: 8443 }],
+    ['an explicit https://', 'https://IMG.example.', { scheme: 'https', host: 'img.example' }],
+    ['an explicit https://host:port', 'https://img.example:8443', { scheme: 'https', host: 'img.example', port: 8443 }],
+    ['an explicit http://', 'http://img.example', { scheme: 'http', host: 'img.example' }],
+    ['http:// with a port', 'HTTP://localhost:18471', { scheme: 'http', host: 'localhost', port: 18471 }],
+  ])('parses %s', (_why, entry, want) => {
+    expect(parseAllowedOrigin(entry)).toEqual(want);
+  });
+
+  it.each(['ftp://img.example', 'ws://img.example', 'http://', 'https://', 'http://img.example/path', 'http://img.example?x=1', 'http://img.example#f', 'http://user@img.example', 'http://:80', 'http://img.example:0', 'http://img.example:70000', 'http:/img.example', 'http//img.example'])('rejects %j', entry => {
+    expect(parseAllowedOrigin(entry)).toBeUndefined();
+  });
+
+  const allowed = (...entries: string[]) => entries.map(e => parseAllowedOrigin(e)!);
+  it.each([
+    ['a bare host: https on its default port', 'https://img.example/a.jpg', ['img.example'], true],
+    ['a bare host: NOT cleartext http', 'http://img.example/a.jpg', ['img.example'], false],
+    ['a bare host: not another https port', 'https://img.example:8443/a.jpg', ['img.example'], false],
+    ['host:443 is https, so http on port 443 is not allowed', 'http://img.example:443/a.jpg', ['img.example:443'], false],
+    ['host:443 allows https on 443', 'https://img.example/a.jpg', ['img.example:443'], true],
+    ['host:8443 allows https on 8443', 'https://img.example:8443/a.jpg', ['img.example:8443'], true],
+    ['an http:// entry allows http on port 80', 'http://img.example/a.jpg', ['http://img.example'], true],
+    ['an http:// entry does not allow https', 'https://img.example/a.jpg', ['http://img.example'], false],
+    ['an http:// entry does not allow another port', 'http://img.example:8080/a.jpg', ['http://img.example'], false],
+    ['http://host:port allows exactly that', 'http://localhost:18471/a.jpg', ['http://localhost:18471'], true],
+    ['http://host:port not with https', 'https://localhost:18471/a.jpg', ['http://localhost:18471'], false],
+    ['both entries allow both', 'http://img.example/a.jpg', ['img.example', 'http://img.example'], true],
+  ])('%s', (_why, url, entries, want) => {
+    expect(originAllowed(url, allowed(...entries))).toBe(want);
+  });
+
+  it('an https -> http redirect on an allowed host is refused unless http:// is listed', async () => {
+    const calls: string[] = [];
+    const paced: ImageBytesFetcher = async url => {
+      calls.push(url);
+      return url.startsWith('https:') ? ({ ok: false, reason: 'http-status', status: 302 } as ImageBytesResult) : { ...ok200(1), finalUrl: url };
+    };
+    const to = () => 'http://img.example/b.jpg';
+    expect(await followAllowedRedirects(paced, { allowedHosts: ['img.example'], locationOf: to })('https://img.example/a.jpg', {}))
+      .toMatchObject({ ok: false, reason: 'refused', detail: expect.stringMatching(/outside the allow-list/) });
+    expect(calls).toEqual(['https://img.example/a.jpg']);
+    calls.length = 0;
+    const res = await followAllowedRedirects(paced, { allowedHosts: ['img.example', 'http://img.example'], locationOf: to })('https://img.example/a.jpg', {});
+    expect(res).toMatchObject({ ok: true });
+    expect(calls).toEqual(['https://img.example/a.jpg', 'http://img.example/b.jpg']);
+  });
+
+  it('the probe fails bytes that came over cleartext http from a host listed bare', () => {
+    const v = judgeProbe({
+      observations: [{ url: 'https://img.example/a.jpg', ok: true, status: 200, contentType: 'image/png', bytes: 5, finalUrl: 'http://img.example/a.jpg', ms: 1 }],
+      requests: [], allowedHosts: ['img.example'], wanted: 1, exhausted: true,
+    });
+    expect(v.verdict).toBe('FAIL');
   });
 });

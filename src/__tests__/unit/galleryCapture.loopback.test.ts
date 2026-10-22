@@ -64,7 +64,7 @@ describe('B1: the allow-list holds across redirects', () => {
 
   it('a hop to another allowed host is followed, and carries no Referer', async () => {
     writeWorklist(lb, wl, [{ id: 1, paths: ['redir/9.jpeg'] }]);
-    const r = await runCli(['--worklist', wl, '--ledger', ledger], cliEnv(lb, { GALLERY_ALLOWED_HOSTS: `localhost:${lb.portA},127.0.0.1:${lb.portB}` }));
+    const r = await runCli(['--worklist', wl, '--ledger', ledger], cliEnv(lb, { GALLERY_ALLOWED_HOSTS: `http://localhost:${lb.portA},http://127.0.0.1:${lb.portB}` }));
     expect(r.report).toMatchObject({ stored: 1, blocked: 0 });
     expect(lb.a[0]!.headers.referer).toBe('https://item-page.invalid/item/1');
     expect(lb.b.length).toBe(1);

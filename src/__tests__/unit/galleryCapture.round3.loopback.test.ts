@@ -142,3 +142,18 @@ describe('R3-N3: no lock location, no run (the lock never follows the --ledger f
     expect(lb.a).toHaveLength(0);
   });
 });
+
+describe('R3-N4: the scheme is part of the origin (real CLI)', () => {
+  it('a bare host:port is https: the loopback\'s http urls are not allowed; an http:// entry is, and is logged as a cleartext WARNING', async () => {
+    writeWorklist(lb, wl, [{ id: 1, paths: ['img/1.png', 'img/2.png'] }]);
+    const bare = await runCli(base(), envR({ GALLERY_ALLOWED_HOSTS: `localhost:${lb.portA}` }));
+    expect(bare.report).toMatchObject({ planned: 0, notAllowedHost: 2 });
+    expect(lb.a).toHaveLength(0);
+    expect(bare.out).not.toMatch(/WARNING/);
+
+    const http = await runCli(base(), envR({ GALLERY_ALLOWED_HOSTS: `http://localhost:${lb.portA}` }));
+    expect(http.code).toBe(0);
+    expect(http.report).toMatchObject({ planned: 2, stored: 2 });
+    expect(http.out).toMatch(/WARNING.*cleartext.*http:\/\/localhost:\d+/i);
+  });
+});

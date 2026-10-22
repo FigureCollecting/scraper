@@ -131,7 +131,7 @@ describe('R2-S3: a stop ends a redirect chain, including the hop already waiting
 describe('N1: the allow-list is per origin', () => {
   it('a redirect to another port of the allowed host is refused: no request, nothing stored or settled', async () => {
     writeWorklist(lb, wl, [{ id: 1, paths: ['redir-port/r1.jpeg'] }]);
-    const run = await runCli(base(), envR({ GALLERY_ALLOWED_HOSTS: `localhost:${lb.portA}` }));
+    const run = await runCli(base(), envR({ GALLERY_ALLOWED_HOSTS: `http://localhost:${lb.portA}` }));
     expect(run.code).toBe(0);
     expect(lb.a2).toHaveLength(0);
     expect(lb.puts).toHaveLength(0);
@@ -141,20 +141,20 @@ describe('N1: the allow-list is per origin', () => {
 
   it('a host named without a port allows only the default ports; a listed port allows exactly that one', async () => {
     writeWorklist(lb, wl, [{ id: 1, paths: ['img/p1.jpeg', 'img/p2.jpeg'] }]);
-    const bare = await runCli(base(), envR({ GALLERY_ALLOWED_HOSTS: 'localhost' }));
+    const bare = await runCli(base(), envR({ GALLERY_ALLOWED_HOSTS: 'http://localhost' }));
     expect(bare.report).toMatchObject({ notAllowedHost: 2, planned: 0 });
     expect(lb.a).toHaveLength(0);
-    const wrongPort = await runCli(base(), envR({ GALLERY_ALLOWED_HOSTS: `localhost:${lb.portA2}` }));
+    const wrongPort = await runCli(base(), envR({ GALLERY_ALLOWED_HOSTS: `http://localhost:${lb.portA2}` }));
     expect(wrongPort.report).toMatchObject({ notAllowedHost: 2, planned: 0 });
     expect(lb.a).toHaveLength(0);
-    const listed = await runCli(base(), envR({ GALLERY_ALLOWED_HOSTS: `localhost:${lb.portA}` }));
+    const listed = await runCli(base(), envR({ GALLERY_ALLOWED_HOSTS: `http://localhost:${lb.portA}` }));
     expect(listed.code).toBe(0);
     expect(listed.report).toMatchObject({ planned: 2, stored: 2 });
   });
 
   it('refuses a malformed allow-list entry (exit 2)', async () => {
     writeWorklist(lb, wl, [{ id: 1, paths: ['img/p1.jpeg'] }]);
-    for (const bad of ['localhost:0', 'localhost:99999', 'local host', 'localhost/path', 'http://localhost']) {
+    for (const bad of ['localhost:0', 'localhost:99999', 'local host', 'localhost/path', 'ftp://localhost', 'http://', 'http://localhost/path']) {
       const run = await runCli(base(), envR({ GALLERY_ALLOWED_HOSTS: bad }));
       expect(run.code).toBe(2);
     }
@@ -165,7 +165,7 @@ describe('N1: the allow-list is per origin', () => {
 describe('N2: credentials in a redirect Location', () => {
   it('a hop whose Location carries credentials is refused before any request, and the password is never printed', async () => {
     writeWorklist(lb, wl, [{ id: 1, paths: ['redir-userinfo/u1.jpeg'] }]);
-    const run = await runCli(base(), envR({ GALLERY_ALLOWED_HOSTS: `localhost:${lb.portA}` }));
+    const run = await runCli(base(), envR({ GALLERY_ALLOWED_HOSTS: `http://localhost:${lb.portA}` }));
     expect(run.code).toBe(0);
     expect(lb.a.map(s => s.path)).toEqual(['/redir-userinfo/u1.jpeg']);
     expect(run.out).not.toContain('hunter2');
