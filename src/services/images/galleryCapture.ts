@@ -21,7 +21,7 @@ import { createImageHostLimiter, createImageCaptureHookFromEnv } from './assembl
 import { acquireRunLock, LOCK_HEARTBEAT_MS } from './galleryLock.js';
 import { readWorklistFile } from './galleryWorklist.js';
 import {
-  allowedHostnames, createFetchObserver, createFileLedger, createMemoryLedger, createRecordingFetch, followAllowedRedirects, gateOnStop, parseAllowedOrigin, runGalleryCapture,
+  DEFAULT_OUTCOME_MEMORY, allowedHostnames, createFetchObserver, createFileLedger, createMemoryLedger, createRecordingFetch, followAllowedRedirects, gateOnStop, parseAllowedOrigin, runGalleryCapture,
   type ConfirmingSink, type GalleryLedger, type GalleryReport,
 } from './galleryDriver.js';
 import { createHttpBytesFetch, type BytesFetchImpl } from './httpBytesFetch.js';
@@ -214,6 +214,8 @@ export async function main(argv: readonly string[] = process.argv.slice(2), deps
         resume: args.resume, dryRun: args.dryRun,
         signal: stop.signal,
         ...(storeMaxBytes !== undefined ? { storeMaxBytes } : {}),
+        // four times the hook's memo, wherever IMAGE_MEMO_SIZE puts it
+        outcomeMemory: Math.max(DEFAULT_OUTCOME_MEMORY, 4 * (Number(env.IMAGE_MEMO_SIZE) > 0 ? Math.floor(Number(env.IMAGE_MEMO_SIZE)) : 0)),
       },
     );
     await hook.drain();

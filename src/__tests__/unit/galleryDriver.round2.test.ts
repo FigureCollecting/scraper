@@ -8,7 +8,7 @@ import { buildImageHostPolicy } from '../../services/images/imageHostPolicy';
 import type { ImageBytesFetcher, ImageBytesResult } from '../../services/images/imageBytes';
 import { imageHostRateFor } from '../../services/images/imageHostRates';
 import {
-  createFetchObserver, createMemoryLedger, followAllowedRedirects, gateOnStop, judgeProbe, originAllowed, parseAllowedOrigin, runGalleryCapture,
+  createFetchObserver, createMemoryLedger, createOutcomeMemory, followAllowedRedirects, gateOnStop, judgeProbe, originAllowed, parseAllowedOrigin, runGalleryCapture,
   type ConfirmingSink, type GalleryLedger, type GalleryRunOptions, type Settled,
 } from '../../services/images/galleryDriver';
 import type { WorklistItem } from '../../services/images/galleryWorklist';
@@ -112,6 +112,28 @@ describe('R2-B1a (unit): a memo hit settles a file only if its put was CONFIRMED
     await runGalleryCapture(gdeps(mh.hook, scriptedSink(() => undefined), observer, ledger, [item('1', [1]), item('2', [1])]), baseOpts());
     expect(how.get(`${K('1')} 1.jpeg`)).toBe('stored');
     expect(how.has(`${K('2')} 1.jpeg`)).toBe(false);
+  });
+});
+
+describe('the confirmed-outcome memory is bounded', () => {
+  it('evicts the oldest, renews what is hit, and holds nothing at size 0', () => {
+    const m = createOutcomeMemory(2);
+    m.set('a', 'stored'); m.set('b', 'stored');
+    expect(m.get('a')).toBe('stored'); // renews a
+    m.set('c', 'too_large');           // evicts b, the oldest
+    expect([m.get('a'), m.get('b'), m.get('c')]).toEqual(['stored', undefined, 'too_large']);
+    const zero = createOutcomeMemory(0);
+    zero.set('x', 'stored');
+    expect(zero.get('x')).toBeUndefined();
+  });
+
+  it('a memo hit whose outcome was evicted is a failure, not a guess: unsettled, counted, fetched again next run', async () => {
+    const observer = createFetchObserver({ pauseAfter: 9, now: () => 0 });
+    const mh = memoHook(observer);
+    const { ledger, how } = recordingLedger();
+    const r = await runGalleryCapture(gdeps(mh.hook, scriptedSink(() => undefined), observer, ledger, [item('1', [1]), item('2', [2]), item('3', [1])]), baseOpts({ outcomeMemory: 1 }));
+    expect([...how.keys()].sort()).toEqual([`${K('1')} 1.jpeg`, `${K('2')} 2.jpeg`]);
+    expect(r).toMatchObject({ itemsWithFailures: 1, stored: 2 });
   });
 });
 

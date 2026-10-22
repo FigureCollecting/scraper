@@ -175,18 +175,37 @@ export function originAllowed(url: string, allowed: readonly AllowedOrigin[]): b
   const explicit = u.port === '' ? undefined : Number(u.port); // WHATWG drops the scheme's own default port
   return allowed.some(a => a.host === host && (a.port === undefined ? explicit === undefined : (explicit ?? (u.protocol === 'https:' ? 443 : 80)) === a.port));
 }
-const hostOf = (url: string): string | undefined => {
-  try {
-    return normalizeHost(new URL(url).hostname);
-  } catch {
-    return undefined;
-  }
-};
 
 // ---------------------------------------------------------------------------
 // the ledger
 // ---------------------------------------------------------------------------
 /** `skipped:too_large`: the raw store skips a body over RAW_STORE_IMAGE_MAX_BYTES; the file is real but will never be at rest, and is not asked for again. */
+/**
+ * What the store CONFIRMED for a url during this run: the one thing a later item's memo hit can be settled on. Bounded (a run is millions
+ * of urls); it only has to outlast the hook's own bounded memo, which can serve a url only while it still holds it. A url this forgets is
+ * a memo hit with no known outcome, which is a failure (unsettled, fetched again next run), never a guess.
+ */
+export function createOutcomeMemory(max: number): { get(url: string): 'stored' | 'too_large' | undefined; set(url: string, v: 'stored' | 'too_large'): void } {
+  const m = new Map<string, 'stored' | 'too_large'>();
+  return {
+    get(url) {
+      const v = m.get(url);
+      if (v !== undefined) { m.delete(url); m.set(url, v); } // a url that keeps being hit stays
+      return v;
+    },
+    set(url, v) {
+      m.delete(url);
+      m.set(url, v);
+      while (m.size > max) {
+        const oldest = m.keys().next();
+        if (oldest.done) break;
+        m.delete(oldest.value);
+      }
+    },
+  };
+}
+export const DEFAULT_OUTCOME_MEMORY = 200_000;
+
 export type Settled = 'stored' | 'gone' | 'oversize' | 'skipped:too_large';
 /**
  * Settlement is per (item, url), not per url: an item that shares a picture with another still needs its OWN depiction reported
@@ -459,6 +478,8 @@ export interface GalleryRunOptions {
    * treated as a failure.
    */
   storeMaxBytes?: number;
+  /** How many confirmed urls to keep for memo-hit settlement (default 200,000: four times the hook's default memo). */
+  outcomeMemory?: number;
 }
 
 /**
@@ -540,7 +561,7 @@ export async function runGalleryCapture(deps: GalleryDeps, opts: GalleryRunOptio
   };
   const started = deps.now();
   const allowed = compileAllowed(opts.allowedHosts);
-  const outcome = new Map<string, 'stored' | 'too_large'>(); // what the store CONFIRMED for a url in this run
+  const outcome = createOutcomeMemory(opts.outcomeMemory ?? DEFAULT_OUTCOME_MEMORY); // what the store CONFIRMED for a url in this run
   const sourceClass: SourceClass = opts.sourceClass ?? 'unknown';
   const budget = opts.probe ?? opts.maxFiles;
 
