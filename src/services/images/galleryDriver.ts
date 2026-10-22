@@ -122,7 +122,7 @@ export function createFetchObserver(opts: { pauseAfter: number; now: () => numbe
           ? {
               url, ok: true, status: res.status, contentType: res.contentType, bytes: res.bytes.length, finalUrl: res.finalUrl, ms,
               // the sink decides by magic bytes, with the very function used here, so the two cannot disagree about what it keeps
-              ...(res.bytes.length === 0 || sniffImageType(res.bytes) === undefined ? { notImage: true } : {}),
+              ...(sniffImageType(res.bytes) === undefined ? { notImage: true } : {}), // an empty body has no magic bytes either
             }
           : {
               url, ok: false, reason: res.reason, ms,
@@ -678,8 +678,8 @@ export async function runGalleryCapture(deps: GalleryDeps, opts: GalleryRunOptio
       // qualify) is bytes that are not at rest and is treated as a lost put. The hook may send a body only once (same bytes under two urls),
       // so the sink counting FEWER skips than there are qualifying bodies is fine.
       const storeCap = opts.storeMaxBytes;
+      // (An empty body is not over any ceiling and has no magic bytes, so it falls out as not_image like the sink's own empty check.)
       const verdictOf = (o: FetchObservation): StoreVerdict => {
-        if (o.bytes === 0) return 'not_image';
         if (storeCap !== undefined && o.bytes !== undefined && o.bytes > storeCap) return 'too_large';
         return o.notImage === true ? 'not_image' : 'stored';
       };

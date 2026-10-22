@@ -195,6 +195,8 @@ describe('R3-N4 (unit): the scheme is part of the origin', () => {
     ['an http:// entry allows http on port 80', 'http://img.example/a.jpg', ['http://img.example'], true],
     ['an http:// entry does not allow https', 'https://img.example/a.jpg', ['http://img.example'], false],
     ['an http:// entry does not allow another port', 'http://img.example:8080/a.jpg', ['http://img.example'], false],
+    ['an http:// entry naming port 80 allows the default', 'http://img.example/a.jpg', ['http://img.example:80'], true],
+    ['an https entry naming port 443 allows the default', 'https://img.example/a.jpg', ['https://img.example:443'], true],
     ['http://host:port allows exactly that', 'http://localhost:18471/a.jpg', ['http://localhost:18471'], true],
     ['http://host:port not with https', 'https://localhost:18471/a.jpg', ['http://localhost:18471'], false],
     ['both entries allow both', 'http://img.example/a.jpg', ['img.example', 'http://img.example'], true],
