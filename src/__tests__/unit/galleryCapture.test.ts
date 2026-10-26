@@ -183,6 +183,31 @@ describe('main', () => {
     expect(reportOf()).toMatchObject({ stopped: 'paused-marker' });
   });
 
+  describe('--item on a run that never walked the list keeps that run\'s own exit code, with no "matched no item" line', () => {
+    it('a live pause marker: exit 3', async () => {
+      writeFileSync(ledger, JSON.stringify({ pause: Date.now() + 3600_000, why: 'test' }) + '\n');
+      const d = deps();
+      expect(await main(['--worklist', work, '--ledger', ledger, '--item', 'mfc/2'], d.deps)).toBe(3);
+      expect(out.join('\n')).toMatch(/PAUSED until/);
+      expect(out.join('\n')).not.toMatch(/matched no item/);
+      expect(d.fetched).toEqual([]);
+    });
+
+    it('the lane off: exit 4', async () => {
+      const d = deps(() => IMG, false);
+      expect(await main(['--worklist', work, '--ledger', ledger, '--item', 'mfc/2'], d.deps)).toBe(4);
+      expect(out.join('\n')).toMatch(/REFUSED: the image capture lane is off/);
+      expect(out.join('\n')).not.toMatch(/matched no item/);
+    });
+
+    it('an item the list does not hold, on a list walked to its end, is still exit 2', async () => {
+      const d = deps();
+      expect(await main(['--worklist', work, '--ledger', ledger, '--item', 'mfc/9'], d.deps)).toBe(2);
+      expect(out.join('\n')).toMatch(/--item mfc\/9 matched no item in the work list/);
+      expect(reportOf()).toMatchObject({ stopped: 'done', items: 0 });
+    });
+  });
+
   it('exits 4 when the image lane is off', async () => {
     const d = deps(() => IMG, false);
     expect(await main(['--worklist', work, '--ledger', ledger], d.deps)).toBe(4);

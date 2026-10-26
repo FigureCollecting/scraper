@@ -133,7 +133,8 @@ The scraper must not read the spine database, so the work list is a file the ope
    request (status, type, size, lane, egress (`direct` or `residential`, from the session that carried it), header NAMES sent, set-cookie
    seen, cf-mitigated/cf-ray, redirect) and a verdict; a residential probe notes how many requests the home line carried.
    **One item** (`--item site/itemId`, repeatable): only that item of the work list (a test figure fetched alone, e.g.
-   `--item mfc/1005999`); an item the list does not hold exits 2 with nothing fetched. PASS only if
+   `--item mfc/1005999`); an item the list does not hold exits 2 with nothing fetched (only a run that read the list to its end says
+   so: a refusal keeps exit 4 and a live pause marker exit 3). PASS only if
    every request is a 200 image on the allowed origin, no cookie or authorization header was sent, no challenge signal,
    no redirect off-host, AND the store kept every file: a probe puts its files through the real sink, so a body the store skipped (not an
    image, over its ceiling) or a write it did not confirm makes the verdict FAIL. The exit code follows the printed verdict: 0 for PASS,

@@ -377,7 +377,8 @@ export async function main(argv: readonly string[] = process.argv.slice(2), deps
         ? `STOPPED at the byte budget: ${report.bytesRead} of ${report.budget} bytes read (one more file may read up to ${meter.reserve}); what was not fetched stays unsettled for the next run`
         : "STOPPED: the capture hook's home-line day cap (IMAGE_RESIDENTIAL_BYTES_PER_DAY) skipped a file; what was not fetched stays unsettled for the next run");
     }
-    if (wanted !== undefined && matched === 0) {
+    // Only a list walked to its end can say an item is not in it: a refusal or a pause marker stops before the first line is read.
+    if (wanted !== undefined && matched === 0 && report.stopped === 'done') {
       print(`NOTE: --item ${[...wanted].join(', ')} matched no item in the work list; nothing was fetched`);
       return 2;
     }
