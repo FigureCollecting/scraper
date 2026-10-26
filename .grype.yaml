@@ -104,6 +104,23 @@ ignore:
       Node's bundled-npm internal (via npm's socks-proxy-agent chain); app dep fixed at 10.4.0.
       Not runtime-reachable.
 
+  # 2026-10-26: zod 3.25.76 (GHSA-mrhx-c7xc-m3w5 / CVE-2023-54404, DoS validating oversized constrained
+  # collections; fixed only in zod 4.6.6). zod is transitive only: puppeteer -> puppeteer-core ->
+  # chromium-bidi 17.0.2 (zod ^3.24.1), the WebDriver BiDi mapper. The scraper launches Chrome on
+  # puppeteer's default CDP protocol and never sets protocol 'webDriverBiDi' (puppeteer-core uses BiDi
+  # only on that option, or for Firefox by default), never calls puppeteer.connect, and nothing in
+  # src/ or packages/ imports zod. The fix needs the puppeteer + Chrome bump (its own unit; the image
+  # pins Chrome to puppeteer's revision). Grype has no expiry field; the matching .trivyignore entry
+  # expires on its own. REVIEW by 2026-11-09 (puppeteer + Chrome bump unit); remove this entry then.
+  - vulnerability: GHSA-mrhx-c7xc-m3w5
+    package:
+      name: zod
+      type: npm
+    reason: |
+      Transitive via puppeteer-core -> chromium-bidi (BiDi mapper), which is not used: the scraper runs
+      Chrome over CDP only, and nothing in src/ or packages/ imports zod. Fix is zod 4.6.6, reachable
+      only through the puppeteer + Chrome bump. Review by 2026-11-09 (puppeteer + Chrome bump unit).
+
   # 2026-08-08: Chrome binary CVEs. This is a HEADLESS, programmatically-driven scraper that
   # navigates controlled target URLs via Puppeteer and NEVER renders untrusted pages to an
   # interactive user, so the renderer-exploit chain (RCE via a malicious page a user visits)
