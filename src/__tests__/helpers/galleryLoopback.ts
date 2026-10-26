@@ -71,7 +71,8 @@ export function png(tag: string): Buffer {
   ]);
 }
 
-export type S3Mode = 'ok' | 'fail500' | { slowMs: number };
+/** `hold`: every PUT is answered only when the test calls `release()` (a run waiting for the store to confirm holds its lock until then). */
+export type S3Mode = 'ok' | 'fail500' | 'hold' | { slowMs: number };
 
 export interface Loopback {
   portA: number;
@@ -92,7 +93,7 @@ export interface Loopback {
   setS3(mode: S3Mode): void;
   /** `http://localhost:<portA>/<path>`. */
   urlA(p: string): string;
-  /** Answer every request on A's `hold/` path that is waiting (each is held until this is called). */
+  /** Answer every PUT the `hold` S3 mode is keeping, and answer later ones at once. */
   release(): void;
   close(): Promise<void>;
 }
@@ -104,7 +105,7 @@ function listen(server: http.Server): Promise<number> {
 export async function startLoopback(initialS3: S3Mode = 'ok'): Promise<Loopback> {
   const lb: Partial<Loopback> & { a: Seen[]; a2: Seen[]; b: Seen[]; s3: Seen[]; puts: Put[]; ing: string[] } = { a: [], a2: [], b: [], s3: [], puts: [], ing: [] };
   let s3mode: S3Mode = initialS3;
-  /** Answers of A's `hold/` requests, kept until the test calls release(): a run is inside that request for as long as the test needs. */
+  /** PUT answers the `hold` S3 mode keeps until the test calls release(). */
   const held: Array<() => void> = [];
   const seen = (req: http.IncomingMessage): Seen => ({ method: req.method ?? '', path: req.url ?? '', host: req.headers.host ?? '', headers: req.headers, t: clock() });
 
@@ -169,8 +170,6 @@ export async function startLoopback(initialS3: S3Mode = 'ok'): Promise<Loopback>
       // a declared length over the 32 MiB cap: refused before the body is read
       case 'big-cl': res.writeHead(200, { 'content-type': 'image/png', 'content-length': 40 * 1024 * 1024 }); res.write(png(`A:${rest}`)); setTimeout(() => res.destroy(), 300); return;
       case 'slow': return void setTimeout(img, 1500);
-      // answered only when the test calls lb.release(): the run that sent it is mid-request (and holds its lock) until then
-      case 'hold': return void held.push(img);
       default: res.writeHead(404); return void res.end();
     }
   });
@@ -216,7 +215,8 @@ export async function startLoopback(initialS3: S3Mode = 'ok'): Promise<Loopback>
         res.writeHead(200);
         res.end();
       };
-      if (typeof s3mode === 'object' && req.method === 'PUT') setTimeout(reply, s3mode.slowMs);
+      if (s3mode === 'hold' && req.method === 'PUT') held.push(reply);
+      else if (typeof s3mode === 'object' && req.method === 'PUT') setTimeout(reply, s3mode.slowMs);
       else reply();
     });
   });
@@ -233,7 +233,10 @@ export async function startLoopback(initialS3: S3Mode = 'ok'): Promise<Loopback>
 
   const [portA, portA2, portB, portS3, portIng] = await Promise.all([listen(A), listen(A2), listen(B), listen(S3), listen(ING)]);
   const servers = [A, A2, B, S3, ING];
-  const release = (): void => { for (const answer of held.splice(0)) answer(); };
+  const release = (): void => {
+    if (s3mode === 'hold') s3mode = 'ok';
+    for (const answer of held.splice(0)) answer();
+  };
   const closeAll = async (): Promise<void> => {
     held.length = 0;
     for (const s of servers) s.closeAllConnections();

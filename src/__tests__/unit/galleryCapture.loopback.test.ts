@@ -218,19 +218,20 @@ describe('S5: a 5xx storm pauses the run like a block does', () => {
 describe('S6: one run at a time', () => {
   const lockPath = (): string => path.join(dir, 'gallery-capture.lock');
   it('a second run on a live lease exits 8 with zero requests; the first is unharmed and releases the lock', async () => {
-    writeWorklist(lb, wl, [{ id: 1, paths: ['hold/1.jpeg', 'img/2.jpeg'] }]);
-    const first = startCli(['--worklist', wl, '--ledger', ledger], cliEnv(lb));
+    lb.setS3('hold');
+    writeWorklist(lb, wl, [{ id: 1, paths: ['img/1.jpeg'] }, { id: 2, paths: ['img/2.jpeg'] }]);
+    // the first run's first item waits for the store, which the test answers only when it releases it: that run holds its lock until then
+    const first = startCli(['--worklist', wl, '--ledger', ledger], cliEnv(lb, { RAW_STORE_IMAGE_PUT_TIMEOUT_MS: '600000' }));
     const t0 = Date.now();
-    while (lb.a.length < 1 && Date.now() - t0 < 30_000) await new Promise(r => setTimeout(r, 25));
-    // the first run is inside its first request, which the server answers only when released: its lease is live for all of the second
+    while (lb.puts.length < 1 && Date.now() - t0 < 100_000) await new Promise(r => setTimeout(r, 25));
     const second = await runCli(['--worklist', wl, '--ledger', ledger], cliEnv(lb));
     expect(second.code).toBe(8);
     expect(second.out).toMatch(/another run holds/);
-    expect(lb.a.length).toBe(1);
+    expect(lb.a.map(s => s.path)).toEqual(['/img/1.jpeg']);
     lb.release();
     const done = await first.done;
     expect(done.code).toBe(0);
-    expect(lb.a.map(s => s.path)).toEqual(['/hold/1.jpeg', '/img/2.jpeg']);
+    expect(lb.a.map(s => s.path)).toEqual(['/img/1.jpeg', '/img/2.jpeg']);
     expect(existsSync(lockPath())).toBe(false);
   });
 
