@@ -156,7 +156,7 @@ describe('createRecordingFetch over impit: the same records and redirect bookkee
     const impit = rec.wrapImpit(f.impit);
     const res = await impit.fetch(U(1), { method: 'GET', headers: { accept: '*/*', 'User-Agent': 'Mozilla/5.0 Chrome/124' } });
     expect(res.status).toBe(403);
-    expect(rec.records).toEqual([{ url: U(1), lane: 'impit', sentHeaderNames: ['accept', 'user-agent'], status: 403, redirected: false, setCookie: true, cfMitigated: 'challenge', cfRay: '8f00-IAD' }]);
+    expect(rec.records).toEqual([{ url: U(1), lane: 'impit', egress: 'direct', sentHeaderNames: ['accept', 'user-agent'], status: 403, redirected: false, setCookie: true, cfMitigated: 'challenge', cfRay: '8f00-IAD' }]);
     expect(JSON.stringify(rec.records)).not.toContain('SECRETVALUE');
   });
 
@@ -183,7 +183,7 @@ describe('createRecordingFetch over impit: the same records and redirect bookkee
     const rec = createRecordingFetch();
     const bare: ImpitLike = { fetch: async url => ({ url, text: async () => '' }) };
     await rec.wrapImpit(bare).fetch(U(1), { method: 'GET' });
-    expect(rec.records).toEqual([{ url: U(1), lane: 'impit', sentHeaderNames: [], status: 200, redirected: false, setCookie: false, cfMitigated: undefined, cfRay: undefined }]);
+    expect(rec.records).toEqual([{ url: U(1), lane: 'impit', egress: 'direct', sentHeaderNames: [], status: 200, redirected: false, setCookie: false, cfMitigated: undefined, cfRay: undefined }]);
   });
 
   it('the http lane records say lane http, so a probe shows which lane carried each request', async () => {

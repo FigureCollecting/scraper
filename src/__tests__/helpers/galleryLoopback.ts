@@ -90,6 +90,8 @@ export interface Loopback {
   puts: Put[];
   /** The ReportCapture bodies (latin1, so a test can look for ids and urls inside the protobuf). */
   ing: string[];
+  /** When the client let go of a body A was still sending (the `endless` routes): the request path and the time. */
+  closed: Array<{ path: string; t: number }>;
   setS3(mode: S3Mode): void;
   /** `http://localhost:<portA>/<path>`. */
   urlA(p: string): string;
@@ -103,7 +105,9 @@ function listen(server: http.Server): Promise<number> {
 }
 
 export async function startLoopback(initialS3: S3Mode = 'ok'): Promise<Loopback> {
-  const lb: Partial<Loopback> & { a: Seen[]; a2: Seen[]; b: Seen[]; s3: Seen[]; puts: Put[]; ing: string[] } = { a: [], a2: [], b: [], s3: [], puts: [], ing: [] };
+  const lb: Partial<Loopback> & { a: Seen[]; a2: Seen[]; b: Seen[]; s3: Seen[]; puts: Put[]; ing: string[]; closed: Array<{ path: string; t: number }> } = {
+    a: [], a2: [], b: [], s3: [], puts: [], ing: [], closed: [],
+  };
   let s3mode: S3Mode = initialS3;
   /** PUT answers the `hold` S3 mode keeps until the test calls release(). */
   const held: Array<() => void> = [];
@@ -167,6 +171,41 @@ export async function startLoopback(initialS3: S3Mode = 'ok'): Promise<Loopback>
       case 'gone': res.writeHead(404); return void res.end();
       case 'html': res.writeHead(200, { 'content-type': 'text/html' }); return void res.end('<html>age gate</html>');
       case 'cf': res.writeHead(403, { 'content-type': 'text/html', 'cf-mitigated': 'challenge' }); return void res.end('<html>Just a moment...</html>');
+      // a body of <bytes> with NO declared length (chunked), PNG magic first: only a read that counts can tell its size: bigstream/<bytes>/<tag>
+      case 'bigstream': {
+        let left = Number(rest.split('/')[0]);
+        res.writeHead(200, { 'content-type': 'image/png' });
+        res.on('error', () => undefined);
+        const head = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+        const pump = (): void => {
+          while (left > 0 && !res.destroyed) {
+            const n = Math.min(left, 1024 * 1024);
+            const piece = Buffer.alloc(n, 0x61);
+            if (left === Number(rest.split('/')[0])) head.copy(piece);
+            left -= n;
+            if (!res.write(piece)) return void res.once('drain', pump);
+          }
+          if (!res.destroyed) res.end();
+        };
+        return pump();
+      }
+      // a body that never ends (64 KiB every 5 ms, until the client lets go), the moment it does recorded in `closed`:
+      // endless/<status>/<tag> declares no length; endless-cl/<tag> is a 200 declaring 40 MiB, over the 32 MiB cap
+      case 'endless':
+      case 'endless-cl': {
+        const status = kind === 'endless' ? Number(rest.split('/')[0]) : 200;
+        res.writeHead(status, kind === 'endless' ? { 'content-type': 'text/html' } : { 'content-type': 'image/png', 'content-length': 40 * 1024 * 1024 });
+        res.on('error', () => undefined);
+        const piece = Buffer.alloc(64 * 1024, 0x61);
+        let left = kind === 'endless' ? Infinity : 40 * 1024 * 1024;
+        const timer = setInterval(() => {
+          if (res.destroyed || res.writableNeedDrain || left < piece.length) return;
+          left -= piece.length;
+          res.write(piece);
+        }, 5);
+        res.on('close', () => { clearInterval(timer); lb.closed.push({ path: req.url ?? '', t: clock() }); });
+        return;
+      }
       // a declared length over the 32 MiB cap: refused before the body is read
       case 'big-cl': res.writeHead(200, { 'content-type': 'image/png', 'content-length': 40 * 1024 * 1024 }); res.write(png(`A:${rest}`)); setTimeout(() => res.destroy(), 300); return;
       case 'slow': return void setTimeout(img, 1500);
@@ -258,11 +297,14 @@ export interface WorklistSpec {
   paths?: string[];
   /** Verbatim entries (a src may be any string). */
   entries?: Array<Record<string, unknown>>;
+  /** The item page (default `https://item-page.invalid/item/<id>`, a host no image is on). */
+  pageUrl?: string;
+  site?: string;
 }
 
 export function writeWorklist(lb: Loopback, file: string, specs: WorklistSpec[]): void {
   const lines = specs.map(s => JSON.stringify({
-    site: 'shop', itemId: String(s.id), pageUrl: `https://item-page.invalid/item/${s.id}`, rank: 0,
+    site: s.site ?? 'shop', itemId: String(s.id), pageUrl: s.pageUrl ?? `https://item-page.invalid/item/${s.id}`, rank: 0,
     ...(s.level !== undefined ? { contentLevel: s.level } : {}),
     entries: s.entries ?? (s.paths ?? []).map((p, i) => ({ position: i, src: lb.urlA(p), w: 600, h: 600 })),
   }));

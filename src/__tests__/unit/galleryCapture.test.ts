@@ -67,11 +67,12 @@ describe('parseGalleryArgs: the environment', () => {
 });
 
 describe('galleryExitCode', () => {
-  const base: GalleryReport = { mode: 'run', stopped: 'done', items: 0, planned: 0, fetched: 0, stored: 0, gone: 0, oversize: 0, skippedTooLarge: 0, skippedNotImage: 0, blocked: 0, trouble: 0, skippedLedger: 0, notAllowedHost: 0, badLines: 0, entriesCapped: 0, itemsWithFailures: 0 };
+  const base: GalleryReport = { mode: 'run', stopped: 'done', items: 0, planned: 0, fetched: 0, stored: 0, gone: 0, oversize: 0, placeholder: 0, skippedTooLarge: 0, skippedNotImage: 0, blocked: 0, trouble: 0, skippedLedger: 0, notAllowedHost: 0, badLines: 0, entriesCapped: 0, itemsWithFailures: 0, bytesRead: 0, budget: null };
   it.each([
     [{ ...base }, 0],
     [{ ...base, stopped: 'limit' as const }, 0],
     [{ ...base, stopped: 'time' as const }, 0],
+    [{ ...base, stopped: 'budget' as const }, 0],
     [{ ...base, stopped: 'paused' as const }, 3],
     [{ ...base, stopped: 'paused-marker' as const }, 3],
     [{ ...base, stopped: 'refused' as const }, 4],
@@ -180,6 +181,61 @@ describe('main', () => {
     expect(await main(['--worklist', work, '--ledger', ledger], next.deps)).toBe(3);
     expect(next.fetched).toEqual([]);
     expect(reportOf()).toMatchObject({ stopped: 'paused-marker' });
+  });
+
+  describe('a proxy named in the environment: refused before any request (exit 2), on every lane', () => {
+    it.each([
+      ['HTTP_PROXY'], ['http_proxy'], ['HTTPS_PROXY'], ['https_proxy'], ['ALL_PROXY'], ['all_proxy'], ['Https_Proxy'], ['NODE_USE_ENV_PROXY'],
+    ])('%s: the variable is named, its value never printed', async name => {
+      const d = deps();
+      const env = { ...d.deps.env, [name]: 'socks5://user:hunter2@proxy.invalid:1080' };
+      expect(await main(['--worklist', work, '--ledger', ledger], { ...d.deps, env })).toBe(2);
+      const text = out.join('\n');
+      expect(text).toMatch(new RegExp(`REFUSED: the environment sets ${name}\\b.*RESIDENTIAL_PROXY_URL`));
+      expect(text).not.toMatch(/hunter2|proxy\.invalid/);
+      expect(d.fetched).toEqual([]);
+      expect(text).not.toMatch(/GALLERY-REPORT/);
+    });
+
+    it('NODE_OPTIONS carrying --use-env-proxy is refused the same way, and every variable set is named', async () => {
+      const d = deps();
+      const env = { ...d.deps.env, NODE_OPTIONS: '--dns-result-order=ipv4first --use-env-proxy', ALL_PROXY: 'http://p.invalid:1' };
+      expect(await main(['--worklist', work, '--ledger', ledger], { ...d.deps, env })).toBe(2);
+      expect(out.join('\n')).toMatch(/REFUSED: the environment sets ALL_PROXY, NODE_OPTIONS \(--use-env-proxy\)/);
+      expect(d.fetched).toEqual([]);
+    });
+
+    it('NO_PROXY alone routes nothing and does not stop the run', async () => {
+      const d = deps();
+      const env = { ...d.deps.env, NO_PROXY: 'localhost', NODE_OPTIONS: '--dns-result-order=ipv4first' };
+      expect(await main(['--worklist', work, '--ledger', ledger], { ...d.deps, env })).toBe(0);
+      expect(d.fetched.length).toBe(3);
+    });
+  });
+
+  describe('--item on a run that never walked the list keeps that run\'s own exit code, with no "matched no item" line', () => {
+    it('a live pause marker: exit 3', async () => {
+      writeFileSync(ledger, JSON.stringify({ pause: Date.now() + 3600_000, why: 'test' }) + '\n');
+      const d = deps();
+      expect(await main(['--worklist', work, '--ledger', ledger, '--item', 'mfc/2'], d.deps)).toBe(3);
+      expect(out.join('\n')).toMatch(/PAUSED until/);
+      expect(out.join('\n')).not.toMatch(/matched no item/);
+      expect(d.fetched).toEqual([]);
+    });
+
+    it('the lane off: exit 4', async () => {
+      const d = deps(() => IMG, false);
+      expect(await main(['--worklist', work, '--ledger', ledger, '--item', 'mfc/2'], d.deps)).toBe(4);
+      expect(out.join('\n')).toMatch(/REFUSED: the image capture lane is off/);
+      expect(out.join('\n')).not.toMatch(/matched no item/);
+    });
+
+    it('an item the list does not hold, on a list walked to its end, is still exit 2', async () => {
+      const d = deps();
+      expect(await main(['--worklist', work, '--ledger', ledger, '--item', 'mfc/9'], d.deps)).toBe(2);
+      expect(out.join('\n')).toMatch(/--item mfc\/9 matched no item in the work list/);
+      expect(reportOf()).toMatchObject({ stopped: 'done', items: 0 });
+    });
   });
 
   it('exits 4 when the image lane is off', async () => {

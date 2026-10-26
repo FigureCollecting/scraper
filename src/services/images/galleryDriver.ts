@@ -15,16 +15,20 @@
  *   - a PROBE: the first N files through the real hook and sink, judged on evidence (no cookie sent, no challenge, no
  *     redirect, plain 200 images from the allowed host), so the first deployed run proves what the design assumes;
  *   - REFUSALS: it will not start with the lane off (it would fetch bytes only to drop them), nor unless the host
- *     policy puts every allowed host on the plain http lane or the impit lane, with direct egress. The residential exit is
- *     never used: a residential row is refused unless GALLERY_EGRESS=direct turns it direct ({@link withDirectEgress}), and
- *     every request is checked again at dispatch ({@link guardGalleryDispatch}).
+ *     policy puts every allowed host on the plain http lane or the impit lane, with direct egress, unless the run is permitted
+ *     residential egress (GALLERY_EGRESS=residential under a byte budget, GAL-RES). Otherwise a residential row is refused unless
+ *     GALLERY_EGRESS=direct turns it direct ({@link withDirectEgress}), and every request is checked again at dispatch
+ *     ({@link guardGalleryDispatch}): only the scraper's own residential exit, only on the impit lane, only to the declaring
+ *     store's own hosts;
+ *   - a BYTE BUDGET (galleryBytes.ts): with a meter that has one, the run stops between files before one that could cross it.
  */
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 import type { SourceClass } from '@figurecollecting/scraper-plugin-contract';
 import type { ImpitLike } from '../impitFetch.js';
+import type { GalleryByteMeter } from './galleryBytes.js';
 import { sniffImageType } from '../objectStoreCaptureSink.js';
 import type { BytesFetchImpl } from './httpBytesFetch.js';
-import { IMAGE_CHROME_UA, type ImageBytesFetcher, type ImageBytesResult } from './imageBytes.js';
+import { IMAGE_CHROME_UA, type ImageBytesFetcher, type ImageBytesResult, type ImageFetchOptions } from './imageBytes.js';
 import type { ImageCaptureHook } from './imageCaptureHook.js';
 import { chooseImageLane, type ImageHostPolicy, type ImageLane } from './imageHostPolicy.js';
 import { canonicalImageUrl, type WorklistItem } from './galleryWorklist.js';
@@ -47,12 +51,17 @@ export interface FetchObservation {
   signals?: Record<string, string>;
   ms: number;
 }
-export type ObservationClass = 'ok' | 'blocked' | 'gone' | 'oversize' | 'trouble' | 'notimage';
+export type ObservationClass = 'ok' | 'blocked' | 'gone' | 'oversize' | 'placeholder' | 'trouble' | 'notimage';
 
-/** What one fetch says about the host. Blocked, trouble and notimage count toward a pause; only a good image resets it. */
+/**
+ * What one fetch says about the host. Blocked, trouble and notimage count toward a pause; only a good image resets it. Gone, oversize
+ * and placeholder (a body the host's policy row lists as its `display_gated` plate, e.g. what MFC shows an anonymous visitor in place
+ * of a picture) are verdicts on one file: they neither count nor reset.
+ */
 export function classifyObservation(o: FetchObservation): ObservationClass {
   if (o.ok) return o.notImage === true ? 'notimage' : 'ok';
   if (o.signals?.['cf-mitigated'] !== undefined) return 'blocked';
+  if (o.reason === 'display-gated') return 'placeholder';
   if (o.reason === 'refused') return 'blocked';
   if (o.reason === 'not-image' && o.status !== undefined && o.status >= 200 && o.status <= 299) return 'blocked';
   if (o.reason === 'too-large') return 'oversize';
@@ -97,7 +106,7 @@ export function createFetchObserver(opts: { pauseAfter: number; now: () => numbe
   let trip: string | undefined;
   let stopped: string | undefined;
   // Blocked fetches AND fetches that erred (a 5xx, a timeout, a dropped connection) are one streak: a dead or throttling origin
-  // must not be asked for the rest of the list at the full pace. A success resets it; gone and oversize are verdicts on one url.
+  // must not be asked for the rest of the list at the full pace. A success resets it; gone, oversize and placeholder are verdicts on one url.
   const fail = (o: FetchObservation): void => {
     streak += 1;
     if (streak >= opts.pauseAfter) trip = `${streak} consecutive blocked or failed fetches (last: ${o.ok ? 'a body that is not an image' : (o.status ?? o.reason)} on ${pathOf(o.url)})`;
@@ -230,7 +239,7 @@ export function createOutcomeMemory(max: number): { get(url: string): StoreVerdi
 export const DEFAULT_OUTCOME_MEMORY = 200_000;
 const SETTLED_AS: Record<StoreVerdict, Settled> = { stored: 'stored', too_large: 'skipped:too_large', not_image: 'skipped:not_image' };
 
-export type Settled = 'stored' | 'gone' | 'oversize' | 'skipped:too_large' | 'skipped:not_image';
+export type Settled = 'stored' | 'gone' | 'oversize' | 'placeholder' | 'skipped:too_large' | 'skipped:not_image';
 /**
  * Settlement is per (item, url), not per url: an item that shares a picture with another still needs its OWN depiction reported
  * (the hook's memo hit does that without a second fetch), so a url settled for one item says nothing about the next. `item` is
@@ -271,7 +280,7 @@ export function createFileLedger(file: string): GalleryLedger {
       try {
         const r = JSON.parse(line) as Record<string, unknown>;
         if (r === null || typeof r !== 'object' || Array.isArray(r)) continue;
-        if (typeof r.i === 'string' && typeof r.u === 'string' && (r.s === 'stored' || r.s === 'gone' || r.s === 'oversize' || r.s === 'skipped:too_large' || r.s === 'skipped:not_image')) memory.settle(r.i, r.u, r.s);
+        if (typeof r.i === 'string' && typeof r.u === 'string' && (r.s === 'stored' || r.s === 'gone' || r.s === 'oversize' || r.s === 'placeholder' || r.s === 'skipped:too_large' || r.s === 'skipped:not_image')) memory.settle(r.i, r.u, r.s);
         else if ('pause' in r) {
           if (typeof r.pause === 'number') memory.pause(r.pause, String(r.why ?? ''));
           else if (r.pause === null) memory.clearPause();
@@ -298,6 +307,8 @@ export interface RequestRecord {
   url: string;
   /** Which transport carried it. On impit the wire also carries the impersonation profile's own browser headers (not listed here). */
   lane?: 'http' | 'impit';
+  /** Which exit it left through: the session's own (the residential exit's impit session, else this node's address). */
+  egress?: 'direct' | 'residential';
   sentHeaderNames: string[];
   status: number;
   redirected: boolean;
@@ -313,15 +324,15 @@ const REDIRECT_STATUSES: ReadonlySet<number> = new Set([301, 302, 303, 307, 308]
  * The transports of the gallery's lanes. Neither ever lets its runtime follow a redirect (`redirect: 'manual'`): a hop is a request
  * to a host the allow-list has not looked at, so {@link followAllowedRedirects} takes it by hand. Each 3xx's absolute Location is
  * kept for the follower to collect. `fetchImpl` is the http lane's transport; `wrapImpit` wraps the impit lane's session the same
- * way, into the same records and the same Location store.
+ * way, into the same records and the same Location store, recording the egress that session leaves through.
  */
 export function createRecordingFetch(inner: BytesFetchImpl = globalThis.fetch as unknown as BytesFetchImpl): {
-  fetchImpl: BytesFetchImpl; records: RequestRecord[]; takeLocation: (url: string) => string | undefined; wrapImpit: (impit: ImpitLike) => ImpitLike;
+  fetchImpl: BytesFetchImpl; records: RequestRecord[]; takeLocation: (url: string) => string | undefined; wrapImpit: (impit: ImpitLike, egress?: 'direct' | 'residential') => ImpitLike;
 } {
   const records: RequestRecord[] = [];
   const locations = new Map<string, string>();
   const norm = (u: string): string => { try { return new URL(u).toString(); } catch { return u; } };
-  const record = (lane: 'http' | 'impit', url: string, sent: Record<string, string> | undefined, status: number, finalUrl: string | undefined, header: (name: string) => string | undefined): void => {
+  const record = (lane: 'http' | 'impit', egress: 'direct' | 'residential', url: string, sent: Record<string, string> | undefined, status: number, finalUrl: string | undefined, header: (name: string) => string | undefined): void => {
     if (REDIRECT_STATUSES.has(status)) {
       const location = header('location');
       if (location !== undefined && location !== '') {
@@ -331,6 +342,7 @@ export function createRecordingFetch(inner: BytesFetchImpl = globalThis.fetch as
     records.push({
       url,
       lane,
+      egress,
       sentHeaderNames: Object.keys(sent ?? {}).map(h => h.toLowerCase()),
       status,
       redirected: REDIRECT_STATUSES.has(status) || (finalUrl !== undefined && norm(finalUrl) !== norm(url)),
@@ -342,15 +354,15 @@ export function createRecordingFetch(inner: BytesFetchImpl = globalThis.fetch as
   };
   const fetchImpl: BytesFetchImpl = async (url, init) => {
     const res = await inner(url, { ...init, redirect: 'manual' });
-    record('http', url, init.headers, res.status, res.url, name => res.headers.get(name) ?? undefined);
+    record('http', 'direct', url, init.headers, res.status, res.url, name => res.headers.get(name) ?? undefined);
     return res;
   };
-  const wrapImpit = (impit: ImpitLike): ImpitLike => ({
+  const wrapImpit = (impit: ImpitLike, egress: 'direct' | 'residential' = 'direct'): ImpitLike => ({
     async fetch(url, init) {
       const res = await impit.fetch(url, { ...init, redirect: 'manual' });
       const bag = res.headers as { get?: (name: string) => string | null } | undefined;
       // an impit build that reports no status is treated as a 2xx, as the impit bytes lane treats it
-      record('impit', url, init.headers, res.status ?? 200, res.url, name => (typeof bag?.get === 'function' ? bag.get(name) ?? undefined : undefined));
+      record('impit', egress, url, init.headers, res.status ?? 200, res.url, name => (typeof bag?.get === 'function' ? bag.get(name) ?? undefined : undefined));
       return res;
     },
   });
@@ -427,6 +439,8 @@ export interface ProbeEvidence {
   outcome: ObservationClass;
   /** The lane that carried the request (http or impit). */
   lane?: 'http' | 'impit';
+  /** The exit it left through (direct, or the residential exit). */
+  egress?: 'direct' | 'residential';
   sentHeaderNames?: string[];
   setCookie?: boolean;
   cfRay?: string;
@@ -447,8 +461,11 @@ export function judgeProbe(input: { observations: FetchObservation[]; requests: 
   const add = (text: string) => reasons.set(text, (reasons.get(text) ?? 0) + 1);
   const byUrl = new Map(requests.map(r => [r.url, r] as const));
 
+  let placeholders = 0;
   for (const o of observations) {
     if (o.signals?.['cf-mitigated'] !== undefined) add(`challenge: cf-mitigated ${o.signals['cf-mitigated']}`);
+    // the host's listed placeholder: the path carried the bytes, and the host withheld that one picture; a verdict on the file
+    if (classifyObservation(o) === 'placeholder') { placeholders++; continue; }
     if (!o.ok) {
       if (o.reason === 'not-image') add(`not an image: a ${o.status ?? '2xx'} answered with ${o.contentType ?? 'no content type'}`);
       else add(`status ${o.status ?? o.reason ?? 'unknown'} (${o.reason ?? 'failed'})`);
@@ -472,6 +489,11 @@ export function judgeProbe(input: { observations: FetchObservation[]; requests: 
   if (overImpit > 0) {
     notes.push(`${overImpit} request(s) went over impit: the wire also carried the impersonation profile's own browser headers (client hints, sec-fetch-*, accept-language, accept-encoding), which sentHeaderNames does not list; the session holds no cookie jar`);
   }
+  if (placeholders > 0) {
+    notes.push(`${placeholders} file(s) answered with the host's listed placeholder (display_gated: the picture is withheld from this anonymous view); never stored, and a real run settles each as placeholder`);
+  }
+  const overHome = requests.filter(r => r.egress === 'residential').length;
+  if (overHome > 0) notes.push(`${overHome} request(s) left through the residential exit (the home line), not this node's own address`);
 
   const evidence: ProbeEvidence[] = observations.map(o => {
     const r = byUrl.get(o.url);
@@ -482,6 +504,7 @@ export function judgeProbe(input: { observations: FetchObservation[]; requests: 
       ...(o.bytes !== undefined ? { bytes: o.bytes } : {}),
       ...(r ? {
         ...(r.lane !== undefined ? { lane: r.lane } : {}),
+        ...(r.egress !== undefined ? { egress: r.egress } : {}),
         sentHeaderNames: r.sentHeaderNames, setCookie: r.setCookie, redirected: r.redirected, ...(r.cfRay !== undefined ? { cfRay: r.cfRay } : {}),
       } : {}),
     };
@@ -489,6 +512,9 @@ export function judgeProbe(input: { observations: FetchObservation[]; requests: 
   const reasonList = [...reasons].map(([text, n]) => (n > 1 ? `${text} (x${n})` : text));
   if (reasonList.length > 0) return { verdict: 'FAIL', reasons: reasonList, notes, evidence };
   if (observations.length === 0) return { verdict: 'INCONCLUSIVE', reasons: ['no request was made'], notes, evidence };
+  if (placeholders === observations.length) {
+    return { verdict: 'INCONCLUSIVE', reasons: ['every file was the host\'s listed placeholder: the path carried bytes, but no picture'], notes, evidence };
+  }
   const unrecorded = observations.filter(o => o.ok && !byUrl.has(o.url)).length;
   if (unrecorded > 0) {
     return { verdict: 'INCONCLUSIVE', reasons: [`no request record for ${unrecorded} fetched file(s): what was sent cannot be shown, so "no cookies" is not proven`], notes, evidence };
@@ -531,6 +557,11 @@ export interface GalleryRunOptions {
   storeMaxBytes?: number;
   /** How many confirmed urls to keep for memo-hit settlement (default 200,000: four times the hook's default memo). */
   outcomeMemory?: number;
+  /**
+   * The run may fetch a host whose policy row says residential egress (GALLERY_EGRESS=residential, GAL-RES), through the scraper's own
+   * residential exit. Refused without a meter that holds a byte budget. Absent: a residential row is refused, as before.
+   */
+  residential?: boolean;
 }
 
 /**
@@ -549,6 +580,11 @@ export interface ConfirmingSink {
 type SinkStats = ReturnType<ConfirmingSink['stats']>;
 const lossOf = (s: SinkStats): number => s.assetFailed + s.dropped + s.droppedBytes + s.assetRefusedReserve;
 const skippedOf = (s: SinkStats | undefined, kind: 'tooLarge' | 'notImage' | 'empty' | 'disabled'): number => s?.assetSkipped?.[kind] ?? 0;
+/** One of the hook's skip counters, 0 when a hook (or a double) does not keep it. */
+const skipCount = (skipped: object | undefined, kind: string): number => {
+  const v = (skipped as Record<string, unknown> | undefined)?.[kind];
+  return typeof v === 'number' ? v : 0;
+};
 
 export interface GalleryDeps {
   hook: Pick<ImageCaptureHook, 'capture' | 'stats' | 'forget'>;
@@ -562,9 +598,11 @@ export interface GalleryDeps {
   log: (line: string) => void;
   /** The request records of both lanes (probe evidence). */
   requests: () => RequestRecord[];
+  /** What the lanes read (galleryBytes.ts). With a budget, the run stops between files before one that could cross it. */
+  meter?: GalleryByteMeter;
 }
 
-export type GalleryStop = 'done' | 'limit' | 'time' | 'paused' | 'paused-marker' | 'refused' | 'interrupted';
+export type GalleryStop = 'done' | 'limit' | 'time' | 'budget' | 'paused' | 'paused-marker' | 'refused' | 'interrupted';
 export interface GalleryReport {
   mode: 'run' | 'probe' | 'dry-run';
   stopped: GalleryStop;
@@ -578,6 +616,8 @@ export interface GalleryReport {
   stored: number;
   gone: number;
   oversize: number;
+  /** Pairs settled `placeholder`: the host answered with a body its policy row lists as a placeholder (never stored, never asked for again). */
+  placeholder: number;
   /** Pairs settled `skipped:too_large`: the raw store skips bodies over its own ceiling. */
   skippedTooLarge: number;
   /** Pairs settled `skipped:not_image`: the raw store skips a body that is empty or not JPEG, PNG, GIF, WebP or AVIF. */
@@ -591,6 +631,10 @@ export interface GalleryReport {
   entriesCapped: number;
   /** Items whose files the raw store did not confirm: not settled, fetched again on the next run. */
   itemsWithFailures: number;
+  /** Response body bytes the lanes read in this run (the meter's count; 0 without one). */
+  bytesRead: number;
+  /** GALLERY_MAX_BYTES, or null on a run with no byte budget. */
+  budget: number | null;
   probe?: ProbeVerdict;
 }
 
@@ -599,7 +643,8 @@ export interface GalleryReport {
 // ---------------------------------------------------------------------------
 /**
  * The lanes the gallery fetches on: the plain http lane, and impit (a browser TLS fingerprint with no cookie jar, no stored cookies
- * and no proxy; galleryImpitLane.ts). Never the browser lane: a tab keeps cookies and is not this driver's to drive.
+ * and no proxy but the scraper's residential exit on a residential run; galleryImpitLane.ts). Never the browser lane: a tab keeps cookies
+ * and is not this driver's to drive.
  */
 export const GALLERY_LANES: readonly ImageLane[] = ['http', 'impit'];
 
@@ -619,16 +664,23 @@ export function withDirectEgress(policy: ImageHostPolicy): ImageHostPolicy {
 
 /**
  * Checked on every request the gallery dispatches, redirect hops included (put it under the pacer), before the transport sees it:
- *   - a request that would leave through the residential exit or any proxy is refused (the preflight already refuses a policy that
- *     resolves to it; this is the same rule held at the wire);
+ *   - on a run not permitted residential egress, a request that would leave through the residential exit or any proxy is refused (the
+ *     preflight already refuses a policy that resolves to it; this is the same rule held at the wire);
+ *   - on a residential run (`residential` names the scraper's own exit, RESIDENTIAL_PROXY_URL), a proxied or residential request goes
+ *     out only if it is a residential request, through exactly that exit, on the impit lane, to a host the live capture's rule lets the
+ *     exit carry: the declaring store's own hosts, asked of the hook's own final-url guard for the url ABOUT to be requested, so a
+ *     redirect hop off the store is refused before the exit is dialled;
  *   - the only user agent a request may carry is the lanes' Chrome string (`IMAGE_CHROME_UA`, a row's ua:'chrome'); with none the
  *     transport's own stands (undici's, or the impit profile's Chrome). Any other is refused, so no setting can make the gallery
  *     identify as a crawler of any kind. (Which agents a host's robots file names is ruleset data; the engine names none.)
  */
-export function guardGalleryDispatch(inner: ImageBytesFetcher): ImageBytesFetcher {
+export function guardGalleryDispatch(inner: ImageBytesFetcher, residential?: { proxyUrl: string }): ImageBytesFetcher {
   return async (url, options) => {
     if (options?.egress === 'residential' || options?.proxyUrl !== undefined) {
-      return { ok: false, reason: 'refused', detail: "the gallery driver never uses the residential exit or any proxy: it fetches from this node's own address" };
+      const why = residential === undefined
+        ? "the gallery driver never uses the residential exit or any proxy: it fetches from this node's own address"
+        : residentialRefusal(url, options, residential.proxyUrl);
+      if (why !== undefined) return { ok: false, reason: 'refused', detail: why };
     }
     if (options?.userAgent !== undefined && options.userAgent !== IMAGE_CHROME_UA) {
       return { ok: false, reason: 'refused', detail: "the gallery driver sends the lanes' Chrome user agent or none, never another" };
@@ -637,19 +689,32 @@ export function guardGalleryDispatch(inner: ImageBytesFetcher): ImageBytesFetche
   };
 }
 
+/** Why a residential run's dispatch guard refuses a proxied or residential request, or undefined when it may go out. */
+function residentialRefusal(url: string, o: ImageFetchOptions, exit: string): string | undefined {
+  if (o.egress !== 'residential') return 'a proxy carries only a residential request; this one is not';
+  if (o.proxyUrl !== exit) return "a residential request leaves through the scraper's residential exit (RESIDENTIAL_PROXY_URL) and no other proxy, never without one";
+  if ((o as { lane?: string }).lane !== 'impit') return 'a residential request rides the impit lane only';
+  if (o.allowFinalUrl === undefined || !o.allowFinalUrl(url)) {
+    return `a residential request goes only to the declaring store's own hosts (the live capture's rule); ${describeOrigin(url)} is not one`;
+  }
+  return undefined;
+}
+
 /**
- * The host policy must put every allowed host on a gallery lane (http or impit) with direct egress: no browser, no home line.
- * The lane is the row's; the egress may be made direct by GALLERY_EGRESS=direct (main() then hands over {@link withDirectEgress}).
+ * The host policy must put every allowed host on a gallery lane (http or impit) with direct egress: no browser, no home line, unless
+ * the run is permitted residential egress, where a residential row stands (on impit: the policy itself refuses http with residential,
+ * and a residential image off the item page's store). The lane is the row's; the egress may be made direct by GALLERY_EGRESS=direct
+ * (main() then hands over {@link withDirectEgress}).
  */
-function preflight(policy: ImageHostPolicy, pageUrl: string, hosts: readonly string[]): string | undefined {
+function preflight(policy: ImageHostPolicy, pageUrl: string, hosts: readonly string[], residential: boolean): string | undefined {
   for (const host of hosts) {
     const d = chooseImageLane(pageUrl, `https://${host}/probe.jpg`, undefined, policy);
     if (!d.ok) return `the host policy refuses ${host}: ${d.reason}${d.detail ? ` (${d.detail})` : ''}`;
     if (!GALLERY_LANES.includes(d.lane)) {
       return `${host} resolves to lane ${d.lane}; the gallery driver fetches on the http or impit lane only — add IMAGE_HOST_POLICY_JSON {"${host}":{"lane":"http","egress":"direct"}} (or "lane":"impit")`;
     }
-    if (d.egress !== 'direct') {
-      return `${host} resolves to ${d.egress} egress; the gallery driver never uses the residential exit (the bytes would cross Ross's home line, which is his decision) — set GALLERY_EGRESS=direct to fetch it from this node's own address on its ${d.lane} lane`;
+    if (d.egress !== 'direct' && !residential) {
+      return `${host} resolves to ${d.egress} egress; the gallery driver uses the residential exit only when the Job sets GALLERY_EGRESS=residential with a byte budget (GALLERY_MAX_BYTES): the bytes cross Ross's home line, which is his decision — set GALLERY_EGRESS=direct to fetch it from this node's own address on its ${d.lane} lane`;
     }
   }
   return undefined;
@@ -658,8 +723,8 @@ function preflight(policy: ImageHostPolicy, pageUrl: string, hosts: readonly str
 export async function runGalleryCapture(deps: GalleryDeps, opts: GalleryRunOptions): Promise<GalleryReport> {
   const mode: GalleryReport['mode'] = opts.probe !== undefined ? 'probe' : opts.dryRun === true ? 'dry-run' : 'run';
   const report: GalleryReport = {
-    mode, stopped: 'done', items: 0, planned: 0, fetched: 0, stored: 0, gone: 0, oversize: 0, skippedTooLarge: 0, skippedNotImage: 0, blocked: 0, trouble: 0,
-    skippedLedger: 0, notAllowedHost: 0, badLines: 0, entriesCapped: 0, itemsWithFailures: 0,
+    mode, stopped: 'done', items: 0, planned: 0, fetched: 0, stored: 0, gone: 0, oversize: 0, placeholder: 0, skippedTooLarge: 0, skippedNotImage: 0, blocked: 0, trouble: 0,
+    skippedLedger: 0, notAllowedHost: 0, badLines: 0, entriesCapped: 0, itemsWithFailures: 0, bytesRead: 0, budget: deps.meter?.max ?? null,
   };
   const started = deps.now();
   const allowed = compileAllowed(opts.allowedHosts);
@@ -674,6 +739,9 @@ export async function runGalleryCapture(deps: GalleryDeps, opts: GalleryRunOptio
   }
   if (mode !== 'dry-run' && deps.sink === undefined) {
     return { ...report, stopped: 'refused', refusal: 'the raw store sink cannot confirm a write; refusing to settle files it has not stored' };
+  }
+  if (opts.residential === true && deps.meter?.max === undefined) {
+    return { ...report, stopped: 'refused', refusal: 'residential egress without a byte budget: the home line is never used without GALLERY_MAX_BYTES' };
   }
   if (opts.resume === true) deps.ledger.clearPause();
   const until = deps.ledger.pausedUntil();
@@ -700,8 +768,9 @@ export async function runGalleryCapture(deps: GalleryDeps, opts: GalleryRunOptio
       if (interrupted()) { report.stopped = 'interrupted'; exhausted = false; break; }
       if (opts.maxMs !== undefined && deps.now() - started >= opts.maxMs) { report.stopped = 'time'; exhausted = false; break; }
       if (budget !== undefined && report.planned >= budget) { report.stopped = 'limit'; exhausted = false; break; }
+      if (deps.meter?.spent() !== undefined) { report.stopped = 'budget'; exhausted = false; break; }
       if (!preflighted) {
-        const problem = preflight(deps.policy, item.pageUrl, allowedHostnames(opts.allowedHosts));
+        const problem = preflight(deps.policy, item.pageUrl, allowedHostnames(opts.allowedHosts), opts.residential === true);
         if (problem !== undefined) return { ...report, stopped: 'refused', refusal: problem };
         preflighted = true;
       }
@@ -747,9 +816,10 @@ export async function runGalleryCapture(deps: GalleryDeps, opts: GalleryRunOptio
       const sinkAfter = deps.sink?.stats();
       const obs = deps.observer.take();
 
-      // `failed` also counts fetch faults the observations already account for; what is left is the sink losing bytes
-      // we did fetch. Such an item is re-driven whole rather than settled, so a stored-but-lost file is never forgotten.
-      const accounted = obs.filter(o => !o.ok && (o.reason === 'http-status' || o.reason === 'timeout' || o.reason === 'threw')).length;
+      // `failed` also counts fetch faults the observations already account for (and a placeholder, which the hook files as a failure);
+      // what is left is the sink losing bytes we did fetch. Such an item is re-driven whole rather than settled, so a stored-but-lost
+      // file is never forgotten.
+      const accounted = obs.filter(o => !o.ok && (o.reason === 'http-status' || o.reason === 'timeout' || o.reason === 'threw' || o.reason === 'display-gated')).length;
       // The store SKIPS some bodies and still calls them admitted. It checks, in this order: empty, over its ceiling, not JPEG/PNG/GIF/WebP/AVIF
       // by magic bytes. The fetched sizes and the observer's sniff (the sink's own function) say which of this item's files it skipped and why,
       // so each is settled by its own verdict. A skip the fetched bodies do not account for (the lane off, or more skips than bodies that
@@ -787,6 +857,7 @@ export async function runGalleryCapture(deps: GalleryDeps, opts: GalleryRunOptio
         if (verdict !== undefined) deps.ledger.settle(itemKey, url, SETTLED_AS[verdict]);
         else if (c === 'gone') deps.ledger.settle(itemKey, url, 'gone');
         else if (c === 'oversize') deps.ledger.settle(itemKey, url, 'oversize');
+        else if (c === 'placeholder') deps.ledger.settle(itemKey, url, 'placeholder');
       }
       // Bytes the store lost are not at rest, whatever the hook's memo was told when it admitted them: take the urls out of it, so a
       // later item sharing one fetches it itself (and the store is asked again) rather than being told it is stored.
@@ -802,7 +873,8 @@ export async function runGalleryCapture(deps: GalleryDeps, opts: GalleryRunOptio
         const was = new Map(skips(before.skipped));
         const delta = (k: string, v: number): number => v - (was.get(k) ?? 0);
         const memoHits = skips(after.skipped).filter(([k]) => k === 'memo').reduce((n, [k, v]) => n + delta(k, v), 0);
-        const otherSkips = skips(after.skipped).filter(([k]) => k !== 'memo').reduce((n, [k, v]) => n + delta(k, v), 0);
+        // a placeholder is a skip the hook counts for a file it DID fetch (settled above), so it explains no unfetched one
+        const otherSkips = skips(after.skipped).filter(([k]) => k !== 'memo' && k !== 'displayGated').reduce((n, [k, v]) => n + delta(k, v), 0);
         if (unfetched.length > 0 && memoHits === unfetched.length && otherSkips === 0) {
           let unconfirmed = 0;
           for (const e of unfetched) {
@@ -827,12 +899,17 @@ export async function runGalleryCapture(deps: GalleryDeps, opts: GalleryRunOptio
         break;
       }
       if (interrupted()) { report.stopped = 'interrupted'; exhausted = false; break; }
+      // The byte budget has no room for another file (galleryBytes.ts), or the hook's own home-line day cap skipped a file of this item:
+      // either way, walking on would only skip the rest of the list.
+      const homeCapped = skipCount(after.skipped, 'residentialBudget') > skipCount(before.skipped, 'residentialBudget');
+      if (homeCapped || deps.meter?.spent() !== undefined) { report.stopped = 'budget'; exhausted = false; break; }
       if (mode !== 'probe' && opts.maxFiles !== undefined && report.fetched >= opts.maxFiles) { report.stopped = 'limit'; exhausted = false; break; }
       if (mode === 'probe' && report.fetched >= (opts.probe ?? 0)) { report.stopped = 'limit'; exhausted = false; break; }
     }
   } finally {
     opts.signal?.removeEventListener('abort', onAbort);
   }
+  report.bytesRead = deps.meter?.read() ?? 0;
 
   if (mode === 'probe') {
     const judged = judgeProbe({ observations: probeObservations, requests: deps.requests(), allowedHosts: opts.allowedHosts, wanted: opts.probe ?? 0, exhausted });

@@ -48,15 +48,49 @@ The scraper must not read the spine database, so the work list is a file the ope
    `unsupported`, and it also refuses to start unless the policy resolves every allowed host to http or impit with direct egress.
    **The impit lane (GAL-IMPIT).** The row's lane is honoured: `"lane":"impit"` fetches through the shared impit image transport
    (`impitBytesFetch.ts`) with the gallery's own session (`galleryImpitLane.ts`): impit's `chrome` profile, NO cookie jar (impit then
-   neither keeps nor sends a cookie), no stored cookies or minted UA from `CF_COOKIE_FILE`, no proxy, `followRedirects: false` (the
+   neither keeps nor sends a cookie), no stored cookies or minted UA from `CF_COOKIE_FILE`, no proxy (but the residential exit on a GAL-RES run), `followRedirects: false` (the
    driver follows by hand, as on the http lane), the http lane's 15 s per-image timeout. The session is built before the first impit
    request takes its pacing slot. The row's `ua` stands: `chrome` puts `IMAGE_CHROME_UA` over the profile's own, `default` lets the
-   profile's own Chrome UA and client hints speak. **Egress is always direct.** A residential row is refused (exit 4) unless the Job
-   sets `GALLERY_EGRESS=direct`, which keeps the row and makes its egress direct (named at start: `EGRESS <host>: ...`);
-   `GALLERY_EGRESS=residential` is refused outright (exit 4): the residential exit would put the bytes on Ross's home line, which is
-   his decision. Every request is also checked at dispatch (under the pacer): a proxy, residential egress, or any user agent other than
-   the lanes' Chrome string (`IMAGE_CHROME_UA`) is refused, so no setting can make the gallery identify as a crawler. A probe that used
-   impit adds a note: the wire also carried the profile's own browser headers, which the header-name evidence does not list.
+   profile's own Chrome UA and client hints speak. **Egress is direct unless the Job asks for the home line.** A residential row is
+   refused (exit 4) unless the Job sets `GALLERY_EGRESS`: `direct` keeps the row and makes its egress direct (named at start:
+   `EGRESS <host>: ...`); `residential` sends it through the home line under a byte budget (GAL-RES, below). Every request is also
+   checked at dispatch (under the pacer): a proxy or residential egress (on a residential run: anything but the rule in GAL-RES), or any
+   user agent other than the lanes' Chrome string (`IMAGE_CHROME_UA`), is refused, so no setting can make the gallery identify as a
+   crawler. A probe that used impit adds a note: the wire also carried the profile's own browser headers, which the header-name
+   evidence does not list.
+   **GAL-RES: the home line, under a byte budget** (Ross decides, desk GAL2). Cloudflare blocks the static host from the datacenter
+   address (two prod probes, 403 `cf-mitigated` on both lanes), as it does for the stores the scraper already reaches through the
+   residential exit. `GALLERY_EGRESS=residential` lets a residential row through that SAME exit, exactly as the live image capture
+   reaches it: the capture hook resolves `RESIDENTIAL_PROXY_URL` (`getResidentialProxyUrl`), `chooseImageLane` allows residential only for
+   an image on the item page's own store (its subdomains: `static.myfigurecollection.net` for a `myfigurecollection.net` page), and the
+   hook's final-url guard re-asserts it. The gallery's impit lane builds a second session (no cookie jar) with that exit as impit's
+   `proxyUrl`, as `defaultMakeImpit` does; it builds one for no other proxy. The dispatch guard lets a residential request out only
+   through that exit, on impit, to a url the hook's guard calls on-store, checked for every hop before the exit is dialled.
+   It needs `GALLERY_MAX_BYTES` (a positive whole number of bytes, at most 64 GiB; without it exit 4, malformed or above 64 GiB exit 2) and `RESIDENTIAL_PROXY_URL` (without it
+   exit 4). The byte meter (`galleryBytes.ts`) sits on both lanes' transports and counts every response BODY a lane reads: an image, a
+   body that is not one, a placeholder, a body cut at the cap. A response the lane does not read (a non-2xx, a declared length over the
+   cap, a redirect hop) is not counted, but it is not free: the origin sends its body anyway. Its body is cancelled as soon as the lane
+   returns, which closes that connection (ten unread 20 MiB 404s through a loopback exit throttled to 2 MB/s: 0.47 MiB, was 11.47 MiB).
+   On a budgeted run a body is read through its stream and cut at the first chunk past the 32 MiB per-file cap, and a request goes out
+   only while the budget still holds one reservation (the cap plus a 1 MiB chunk allowance; impit's chunks measured up to 504 KiB on
+   loopback). So the run stops between files, never in one, before a file that could cross the budget: `stopped:"budget"`, exit 0,
+   `STOPPED at the byte budget: <read> of <budget> bytes read`, the unfetched files unsettled for the next run, and what was read never
+   above the budget. It leaves up to one reservation (about 33 MiB) unused. `bytesRead` is the body bytes the lanes took from the
+   transport (decoded: a gzip body counts its full size). It does not count headers, TLS, or what a connection delivered of a body that
+   was not read or was read only to a cut, up to about one receive window each, so the home line carries somewhat more than `bytesRead`.
+   A budget below one reservation exits 2. The hook's own day cap on the exit (`IMAGE_RESIDENTIAL_BYTES_PER_DAY`)
+   is set to the budget for this process; an explicit lower value exits 2, and a skip by it stops the run the same way.
+   **The budget is per process.** The meter and the hook's day cap live in memory, and a new pod starts again at 0, so a Job that
+   retries can spend the budget once per pod. A residential Job must therefore never retry: `backoffLimit: 0`, and no
+   `podFailurePolicy` rule that ignores a failure (an `Ignore` on `DisruptionTarget` would bring an evicted pod back with a fresh
+   budget). Then one Job spends at most one budget. The start line
+   says `EGRESS <host>: residential, through the scraper's residential exit <scheme://host:port> ... budget <N> bytes`;
+   `GALLERY-REPORT` carries `bytesRead` (every run) and `budget` (null without one); a direct run may also set `GALLERY_MAX_BYTES`
+   (`BUDGET <N> bytes` at start). The pod must be allowed to reach the exit: fc-infra's egress-proxy admits only `app: scraper` on 1055.
+   **No proxy from the environment, on any lane.** impit honours `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` (either case) on a session
+   built without a proxy, and Node's fetch honours `HTTP(S)_PROXY` under `NODE_USE_ENV_PROXY` or `--use-env-proxy`; either would carry a
+   "direct" run through a proxy no guard sees. A run with any of them set (or `--use-env-proxy` in `NODE_OPTIONS`) exits 2 before any
+   request, naming the variable and never its value. The residential exit comes only from `RESIDENTIAL_PROXY_URL`.
 3. **Gallery driver** (`galleryDriver.ts`): reads the work list in file order; skips (item, url) pairs the ledger has settled; builds one
    `ImageCaptureRequest` per item whose synthetic `describeImages` returns `{url, role:'gallery', position, sourceClass}`;
    awaits `hook.capture()` (sequential, one item at a time); observes every fetch; then waits for the raw store sink to
@@ -80,12 +114,16 @@ The scraper must not read the spine database, so the work list is a file the ope
    count). The sink checks empty, then size, then type, and so does the driver: an HTML body over the ceiling is `skipped:too_large`.
    A store-side skip the fetched bodies do not explain (the lane off, or more skips than there are bodies that qualify) is treated as a
    lost put.
+   **A placeholder.** A body the host's policy row lists as its `display_gated` placeholder (the Job's row carries the 920-byte plate MFC
+   shows an anonymous visitor in place of a picture, and the gallery is always anonymous) is never stored. It is a verdict on that one
+   file: settled `placeholder`, counted in `placeholder`, never an item failure, never asked for again, and it neither counts toward the
+   pause nor resets it. Its bytes are still counted in `bytesRead`. A real block (403, a challenge) still counts toward the pause.
    `IMAGE_MAX_PER_ITEM=100` for this process only. The item's `contentLevel` rides the ref (fail closed to `unknown`).
    `sourceClass` is config (`GALLERY_SOURCE_CLASS`). Ross ruled (desk GALSRC b): the MFC official gallery is `manufacturer_press`, set in the Job env below; the code default stays `unknown`, so a Job that forgets the setting claims nothing.
 4. **Auto-pause**: N consecutive blocked or failed fetches (403, 429, 503, `cf-mitigated`, a 2xx that is not an image, a
    cooling host, a refused redirect, and also any 5xx, a timeout or a dropped connection) stop the run and write a pause marker
-   (default 3 and 6 h); the next run refuses until it lapses or `--resume`. A success resets the streak; a 404/410 or an
-   over-size body is a verdict on one file and neither counts nor resets it.
+   (default 3 and 6 h); the next run refuses until it lapses or `--resume`. A success resets the streak; a 404/410, an
+   over-size body or a listed placeholder is a verdict on one file and neither counts nor resets it.
 4a. **Redirects**: the runtime never follows one. The driver takes each hop by hand, over the paced fetcher (so every hop,
    a same-host one included, waits for the host's turn), and ONLY to an origin in `GALLERY_ALLOWED_HOSTS`. A hop anywhere else is
    refused before a request is sent: nothing is fetched, stored or settled from outside the list, and it counts as a blocked
@@ -97,23 +135,30 @@ The scraper must not read the spine database, so the work list is a file the ope
    the same host name (another port) is not on the list. The rate and policy rows stay keyed by host name.
 4b. **One spelling of a url**: the work list carries the canonical form (host lower-case without a trailing dot, default port
    gone, dot segments resolved, no fragment, %-escapes in one spelling) and the scraper applies it again; the ledger keys on it,
-   per item: `{"i":"site/itemId","u":url,"s":stored|gone|oversize|skipped:too_large|skipped:not_image}`. (The url-only lines of the first cut are
+   per item: `{"i":"site/itemId","u":url,"s":stored|gone|oversize|placeholder|skipped:too_large|skipped:not_image}`. (The url-only lines of the first cut are
    ignored.) The form is IDEMPOTENT: a valid `%XX` is decoded once if it spells an unreserved character, a stray `%` (not followed
    by two hex digits) is a literal percent sign and is written `%25`, and nothing is decoded twice, so `x%4%31.jpeg` (the file
    `x%41.jpeg`) never collides with `xA.jpeg`. fc-aggregation carries the same function; both suites read the same vector file
    (`src/__tests__/fixtures/galleryCanonicalVectors.json`, 62 vectors) and pin the same digest over a 4,000-url fixed-seed fuzz set.
    A gallery over 100 entries keeps the first 100 by position and reports the rest (`entriesCapped`); it is never dropped whole.
 5. **Probe** (`--probe [N=20]`): the first N files of the work list through the real hook and sink, with evidence per
-   request (status, type, size, lane, header NAMES sent, set-cookie seen, cf-mitigated/cf-ray, redirect) and a verdict. PASS only if
+   request (status, type, size, lane, egress (`direct` or `residential`, from the session that carried it), header NAMES sent, set-cookie
+   seen, cf-mitigated/cf-ray, redirect) and a verdict; a residential probe notes how many requests the home line carried.
+   **One item** (`--item site/itemId`, repeatable): only that item of the work list (a test figure fetched alone, e.g.
+   `--item mfc/1005999`); an item the list does not hold exits 2 with nothing fetched (only a run that read the list to its end says
+   so: a refusal keeps exit 4 and a live pause marker exit 3). PASS only if
    every request is a 200 image on the allowed origin, no cookie or authorization header was sent, no challenge signal,
    no redirect off-host, AND the store kept every file: a probe puts its files through the real sink, so a body the store skipped (not an
-   image, over its ceiling) or a write it did not confirm makes the verdict FAIL. The exit code follows the printed verdict: 0 for PASS,
+   image, over its ceiling) or a write it did not confirm makes the verdict FAIL. A listed placeholder is a note, not a FAIL (the path
+   carried it; the host withheld that one picture), but a probe whose every file was the placeholder is INCONCLUSIVE. The exit code follows the printed verdict: 0 for PASS,
    5 for anything else (including a probe that tripped the pause: the marker is written and the PAUSED line printed, but the code is 5).
-6. **Entry**: `npm run gallery:capture` (Job/CronJob, same image as the scraper). One meaning per exit code: 0 done (or a limit),
-   1 crash, 2 bad arguments or config (no host named, no rate row for an allowed host, `RAW_STORE_IMAGE_MAX_BYTES` unset, a bad
-   allow-list entry, no lock location), 3 paused (a block, a 5xx storm, or a live pause marker), 4 refused (lane off, an allowed host on the browser
-   lane or on residential egress, or `GALLERY_EGRESS=residential`), 5 probe not a PASS (a probe exits by its printed verdict: 0 or 5), 6 the raw store did not confirm some item of a real
-   run (unsettled; run again), 7 stopped by SIGTERM/SIGINT
+6. **Entry**: `npm run gallery:capture` (Job/CronJob, same image as the scraper). One meaning per exit code: 0 done (or a limit: files,
+   minutes, or the byte budget), 1 crash, 2 bad arguments or config (no host named, no rate row for an allowed host, `RAW_STORE_IMAGE_MAX_BYTES`
+   unset, a bad allow-list entry, no lock location, `GALLERY_MAX_BYTES` malformed, above 64 GiB or below one reservation, `IMAGE_RESIDENTIAL_BYTES_PER_DAY`
+   below it, an `--item` the list does not hold, a proxy variable in the environment), 3 paused (a block, a 5xx storm, or a live pause marker), 4 refused (lane off, an allowed
+   host on the browser lane or on residential egress the run is not permitted, `GALLERY_EGRESS=residential` without `GALLERY_MAX_BYTES` or
+   without `RESIDENTIAL_PROXY_URL`), 5 probe not a PASS (a probe exits by its printed verdict: 0 or 5), 6 the raw store did not confirm some
+   item of a real run (unsettled; run again), 7 stopped by SIGTERM/SIGINT
    or by losing the lock, 8 LOCKED (another run holds the lease; this one made no request).
 7. **One run per host, on a lease; and SIGTERM**: the lock is `GALLERY_LOCK_PATH`, else `gallery-capture.lock` in the directory of
    `GALLERY_LEDGER_PATH`. It never follows the `--ledger` flag: with neither variable set a run (a probe included) exits 2 before any request,
@@ -121,7 +166,7 @@ The scraper must not read the spine database, so the work list is a file the ope
    The file holds `{token, hostname, startedAt, heartbeatAt}`; the owner refreshes `heartbeatAt` every 10 s; a lock is stale only when
    its heartbeat is older than 60 s, whoever wrote it. No pid is kept (node is PID 1 in every pod, so a pid check would call every
    dead pod's lock live). A SIGKILLed or OOM-killed run therefore leaves a lease that frees itself 60 s later: an immediate restart
-   exits 8 and a Job with a `backoffLimit` simply tries again. Taking over a stale lock is serialised (a short-lived guard file; the
+   exits 8 and a Job with a `backoffLimit` simply tries again (a residential Job has none: see the budget above). Taking over a stale lock is serialised (a short-lived guard file; the
    holder re-reads the lock, removes it only if it is still the same stale lock, then creates its own atomically): of any number of
    runs that start together, exactly one holds. A run that finds its lock taken (it was frozen for over a minute) stops and exits 7.
    SIGTERM and SIGINT stop the run at once: the stop is checked when each request is DISPATCHED, under the pacer, so neither a later
@@ -133,13 +178,14 @@ The scraper must not read the spine database, so the work list is a file the ope
 - One request in flight, spaced by the host rate; no retries inside a run (a failed url is simply not settled and the next run
   tries it again, after the pause if one was set).
 - Settled = stored AND confirmed by the sink (or the same for a picture an earlier item got, in this run), or permanently gone
-  (404/410), or over the fetch cap (`oversize`), or over the store's ceiling (`skipped:too_large`), or a body the store will not keep
-  (`skipped:not_image`), per (item, url). Never settled:
+  (404/410), or over the fetch cap (`oversize`), or the host's listed placeholder (`placeholder`), or over the store's ceiling
+  (`skipped:too_large`), or a body the store will not keep (`skipped:not_image`), per (item, url). Never settled:
   403, 429, 5xx, timeouts, non-image 2xx, an off-origin redirect, a put the store did not confirm (and nothing at all when the
   process is killed first).
 - A kill mid-item fetches that whole item again on the next run (up to 99 duplicate requests; by design).
-- Known gap, follow-up FETCH-CAP-1 (not this PR): the 32 MiB cap limits what is stored, not what is buffered for a body with
-  no Content-Length or a gzip-encoded one. Size the Job's memory limit with that in mind.
+- Known gap, follow-up FETCH-CAP-1: on a run with no byte budget the 32 MiB cap limits what is stored, not what is buffered for a
+  body with no Content-Length or a gzip-encoded one. Size the Job's memory limit with that in mind. A budgeted run (GAL-RES) reads
+  every body through its stream and stops at the first chunk past the cap.
 - Restart safe: the ledger is append-only JSONL; re-running the same work list fetches nothing already settled.
 - Hands-off: the deployed job is the only thing that ever contacts the static host. Nothing here is run from a workstation.
 
@@ -147,7 +193,9 @@ The scraper must not read the spine database, so the work list is a file the ope
 
 1. Merge; roll the scraper image. 2. Mount the work list and a small PVC. 3. Probe Job (`--probe 20`) -> read the verdict.
    If challenged on the http lane, the next step is the impit lane with direct egress (GAL-IMPIT: the row's `"lane":"impit"` plus
-   `GALLERY_EGRESS=direct`); the residential exit stays refused by the driver until Ross decides on the home line. 4. Holdings only
+   `GALLERY_EGRESS=direct`). Challenged there too (2026-10-26), the home line is Ross's decision (desk GAL2): one test item first
+   (`--item`), then one full run under one budget (`GALLERY_EGRESS=residential`, `GALLERY_MAX_BYTES`, GAL-RES; desk GAL2 a: 8 GB),
+   in a Job that never retries (the budget is per process). 4. Holdings only
    (`--max-files` staged), then figures, then the rest. Desk IMGRATE sets `intervalMs`: Ross chose 333 = 3 files/s (holdings, 14,346 files, about 1.3 h;
    the whole catalogue, about 1.7M files, about 6.6 days).
 
@@ -170,7 +218,10 @@ env:
   REPORT_CAPTURES: "true"               # + INGEST_BASE_URL, RAW_STORE_S3_* exactly as the scraper Deployment has them
   IMAGE_HOST_POLICY_JSON: '{"static.myfigurecollection.net":{"lane":"http","egress":"direct"}}'
   # impit instead: '{"static.myfigurecollection.net":{"lane":"impit","egress":"residential","referer":false,"ua":"default",...}}' with
-  GALLERY_EGRESS: direct                # REQUIRED for a residential row (else exit 4); residential is never used by this driver
+  GALLERY_EGRESS: direct                # REQUIRED for a residential row (else exit 4): fetched from this node's own address
+  # the home line instead (GAL-RES, Ross's decision): GALLERY_EGRESS: residential, GALLERY_MAX_BYTES: "8000000000" (at most 64 GiB),
+  # RESIDENTIAL_PROXY_URL: the scraper Deployment's value; netpol: this pod -> egress-proxy :1055, and egress-proxy admitting it;
+  # backoffLimit: 0 and no podFailurePolicy Ignore rule (the budget is per process: a retried pod would get a fresh one)
   IMAGE_HOST_RATE_JSON:   '{"static.myfigurecollection.net":{"intervalMs":333}}'      # desk IMGRATE b: 3 files/s, no speed-up; REQUIRED, the run exits 2 without it
   RAW_STORE_IMAGE_MAX_BYTES: "10485760"  # REQUIRED: the Deployment's value (the sink skips bodies over it); the run exits 2 without it
   GALLERY_LOCK_PATH: /state/gallery-capture.lock   # REQUIRED unless GALLERY_LEDGER_PATH is set: one lease for the host, whatever ledger a run is given
