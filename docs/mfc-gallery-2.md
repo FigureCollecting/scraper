@@ -48,15 +48,37 @@ The scraper must not read the spine database, so the work list is a file the ope
    `unsupported`, and it also refuses to start unless the policy resolves every allowed host to http or impit with direct egress.
    **The impit lane (GAL-IMPIT).** The row's lane is honoured: `"lane":"impit"` fetches through the shared impit image transport
    (`impitBytesFetch.ts`) with the gallery's own session (`galleryImpitLane.ts`): impit's `chrome` profile, NO cookie jar (impit then
-   neither keeps nor sends a cookie), no stored cookies or minted UA from `CF_COOKIE_FILE`, no proxy, `followRedirects: false` (the
+   neither keeps nor sends a cookie), no stored cookies or minted UA from `CF_COOKIE_FILE`, no proxy (but the residential exit on a GAL-RES run), `followRedirects: false` (the
    driver follows by hand, as on the http lane), the http lane's 15 s per-image timeout. The session is built before the first impit
    request takes its pacing slot. The row's `ua` stands: `chrome` puts `IMAGE_CHROME_UA` over the profile's own, `default` lets the
-   profile's own Chrome UA and client hints speak. **Egress is always direct.** A residential row is refused (exit 4) unless the Job
-   sets `GALLERY_EGRESS=direct`, which keeps the row and makes its egress direct (named at start: `EGRESS <host>: ...`);
-   `GALLERY_EGRESS=residential` is refused outright (exit 4): the residential exit would put the bytes on Ross's home line, which is
-   his decision. Every request is also checked at dispatch (under the pacer): a proxy, residential egress, or any user agent other than
-   the lanes' Chrome string (`IMAGE_CHROME_UA`) is refused, so no setting can make the gallery identify as a crawler. A probe that used
-   impit adds a note: the wire also carried the profile's own browser headers, which the header-name evidence does not list.
+   profile's own Chrome UA and client hints speak. **Egress is direct unless the Job asks for the home line.** A residential row is
+   refused (exit 4) unless the Job sets `GALLERY_EGRESS`: `direct` keeps the row and makes its egress direct (named at start:
+   `EGRESS <host>: ...`); `residential` sends it through the home line under a byte budget (GAL-RES, below). Every request is also
+   checked at dispatch (under the pacer): a proxy or residential egress (on a residential run: anything but the rule in GAL-RES), or any
+   user agent other than the lanes' Chrome string (`IMAGE_CHROME_UA`), is refused, so no setting can make the gallery identify as a
+   crawler. A probe that used impit adds a note: the wire also carried the profile's own browser headers, which the header-name
+   evidence does not list.
+   **GAL-RES: the home line, under a byte budget** (Ross decides, desk GAL2). Cloudflare blocks the static host from the datacenter
+   address (two prod probes, 403 `cf-mitigated` on both lanes), as it does for the stores the scraper already reaches through the
+   residential exit. `GALLERY_EGRESS=residential` lets a residential row through that SAME exit, exactly as the live image capture
+   reaches it: the capture hook resolves `RESIDENTIAL_PROXY_URL` (`getResidentialProxyUrl`), `chooseImageLane` allows residential only for
+   an image on the item page's own store (its subdomains: `static.myfigurecollection.net` for a `myfigurecollection.net` page), and the
+   hook's final-url guard re-asserts it. The gallery's impit lane builds a second session (no cookie jar) with that exit as impit's
+   `proxyUrl`, as `defaultMakeImpit` does; it builds one for no other proxy. The dispatch guard lets a residential request out only
+   through that exit, on impit, to a url the hook's guard calls on-store, checked for every hop before the exit is dialled.
+   It needs `GALLERY_MAX_BYTES` (a positive whole number; without it exit 4, malformed exit 2) and `RESIDENTIAL_PROXY_URL` (without it
+   exit 4). The byte meter (`galleryBytes.ts`) sits on both lanes' transports and counts every response BODY a lane reads: an image, a
+   body that is not one, a placeholder, a body cut at the cap; a 403 or a declared length over the cap is never read and costs nothing.
+   On a budgeted run a body is read through its stream and cut at the first chunk past the 32 MiB per-file cap, and a request goes out
+   only while the budget still holds one reservation (the cap plus a 1 MiB chunk allowance; impit's chunks measured up to 504 KiB on
+   loopback). So the run stops between files, never in one, before a file that could cross the budget: `stopped:"budget"`, exit 0,
+   `STOPPED at the byte budget: <read> of <budget> bytes read`, the unfetched files unsettled for the next run, and what was read never
+   above the budget. It leaves up to one reservation (about 33 MiB) unused, and it does not count headers, TLS, or what the socket
+   buffered past a cut. A budget below one reservation exits 2. The hook's own day cap on the exit (`IMAGE_RESIDENTIAL_BYTES_PER_DAY`)
+   is set to the budget for this process; an explicit lower value exits 2, and a skip by it stops the run the same way. The start line
+   says `EGRESS <host>: residential, through the scraper's residential exit <scheme://host:port> ... budget <N> bytes`;
+   `GALLERY-REPORT` carries `bytesRead` (every run) and `budget` (null without one); a direct run may also set `GALLERY_MAX_BYTES`
+   (`BUDGET <N> bytes` at start). The pod must be allowed to reach the exit: fc-infra's egress-proxy admits only `app: scraper` on 1055.
 3. **Gallery driver** (`galleryDriver.ts`): reads the work list in file order; skips (item, url) pairs the ledger has settled; builds one
    `ImageCaptureRequest` per item whose synthetic `describeImages` returns `{url, role:'gallery', position, sourceClass}`;
    awaits `hook.capture()` (sequential, one item at a time); observes every fetch; then waits for the raw store sink to
@@ -104,16 +126,21 @@ The scraper must not read the spine database, so the work list is a file the ope
    (`src/__tests__/fixtures/galleryCanonicalVectors.json`, 62 vectors) and pin the same digest over a 4,000-url fixed-seed fuzz set.
    A gallery over 100 entries keeps the first 100 by position and reports the rest (`entriesCapped`); it is never dropped whole.
 5. **Probe** (`--probe [N=20]`): the first N files of the work list through the real hook and sink, with evidence per
-   request (status, type, size, lane, header NAMES sent, set-cookie seen, cf-mitigated/cf-ray, redirect) and a verdict. PASS only if
+   request (status, type, size, lane, egress (`direct` or `residential`, from the session that carried it), header NAMES sent, set-cookie
+   seen, cf-mitigated/cf-ray, redirect) and a verdict; a residential probe notes how many requests the home line carried.
+   **One item** (`--item site/itemId`, repeatable): only that item of the work list (a test figure fetched alone, e.g.
+   `--item mfc/1005999`); an item the list does not hold exits 2 with nothing fetched. PASS only if
    every request is a 200 image on the allowed origin, no cookie or authorization header was sent, no challenge signal,
    no redirect off-host, AND the store kept every file: a probe puts its files through the real sink, so a body the store skipped (not an
    image, over its ceiling) or a write it did not confirm makes the verdict FAIL. The exit code follows the printed verdict: 0 for PASS,
    5 for anything else (including a probe that tripped the pause: the marker is written and the PAUSED line printed, but the code is 5).
-6. **Entry**: `npm run gallery:capture` (Job/CronJob, same image as the scraper). One meaning per exit code: 0 done (or a limit),
-   1 crash, 2 bad arguments or config (no host named, no rate row for an allowed host, `RAW_STORE_IMAGE_MAX_BYTES` unset, a bad
-   allow-list entry, no lock location), 3 paused (a block, a 5xx storm, or a live pause marker), 4 refused (lane off, an allowed host on the browser
-   lane or on residential egress, or `GALLERY_EGRESS=residential`), 5 probe not a PASS (a probe exits by its printed verdict: 0 or 5), 6 the raw store did not confirm some item of a real
-   run (unsettled; run again), 7 stopped by SIGTERM/SIGINT
+6. **Entry**: `npm run gallery:capture` (Job/CronJob, same image as the scraper). One meaning per exit code: 0 done (or a limit: files,
+   minutes, or the byte budget), 1 crash, 2 bad arguments or config (no host named, no rate row for an allowed host, `RAW_STORE_IMAGE_MAX_BYTES`
+   unset, a bad allow-list entry, no lock location, `GALLERY_MAX_BYTES` malformed or below one reservation, `IMAGE_RESIDENTIAL_BYTES_PER_DAY`
+   below it, an `--item` the list does not hold), 3 paused (a block, a 5xx storm, or a live pause marker), 4 refused (lane off, an allowed
+   host on the browser lane or on residential egress the run is not permitted, `GALLERY_EGRESS=residential` without `GALLERY_MAX_BYTES` or
+   without `RESIDENTIAL_PROXY_URL`), 5 probe not a PASS (a probe exits by its printed verdict: 0 or 5), 6 the raw store did not confirm some
+   item of a real run (unsettled; run again), 7 stopped by SIGTERM/SIGINT
    or by losing the lock, 8 LOCKED (another run holds the lease; this one made no request).
 7. **One run per host, on a lease; and SIGTERM**: the lock is `GALLERY_LOCK_PATH`, else `gallery-capture.lock` in the directory of
    `GALLERY_LEDGER_PATH`. It never follows the `--ledger` flag: with neither variable set a run (a probe included) exits 2 before any request,
@@ -138,8 +165,9 @@ The scraper must not read the spine database, so the work list is a file the ope
   403, 429, 5xx, timeouts, non-image 2xx, an off-origin redirect, a put the store did not confirm (and nothing at all when the
   process is killed first).
 - A kill mid-item fetches that whole item again on the next run (up to 99 duplicate requests; by design).
-- Known gap, follow-up FETCH-CAP-1 (not this PR): the 32 MiB cap limits what is stored, not what is buffered for a body with
-  no Content-Length or a gzip-encoded one. Size the Job's memory limit with that in mind.
+- Known gap, follow-up FETCH-CAP-1: on a run with no byte budget the 32 MiB cap limits what is stored, not what is buffered for a
+  body with no Content-Length or a gzip-encoded one. Size the Job's memory limit with that in mind. A budgeted run (GAL-RES) reads
+  every body through its stream and stops at the first chunk past the cap.
 - Restart safe: the ledger is append-only JSONL; re-running the same work list fetches nothing already settled.
 - Hands-off: the deployed job is the only thing that ever contacts the static host. Nothing here is run from a workstation.
 
@@ -147,7 +175,8 @@ The scraper must not read the spine database, so the work list is a file the ope
 
 1. Merge; roll the scraper image. 2. Mount the work list and a small PVC. 3. Probe Job (`--probe 20`) -> read the verdict.
    If challenged on the http lane, the next step is the impit lane with direct egress (GAL-IMPIT: the row's `"lane":"impit"` plus
-   `GALLERY_EGRESS=direct`); the residential exit stays refused by the driver until Ross decides on the home line. 4. Holdings only
+   `GALLERY_EGRESS=direct`). Challenged there too (2026-10-26), the home line is Ross's decision (desk GAL2): one test item first
+   (`--item`), then at most 1.5 GB a night (`GALLERY_EGRESS=residential`, `GALLERY_MAX_BYTES`, GAL-RES). 4. Holdings only
    (`--max-files` staged), then figures, then the rest. Desk IMGRATE sets `intervalMs`: Ross chose 333 = 3 files/s (holdings, 14,346 files, about 1.3 h;
    the whole catalogue, about 1.7M files, about 6.6 days).
 
@@ -170,7 +199,9 @@ env:
   REPORT_CAPTURES: "true"               # + INGEST_BASE_URL, RAW_STORE_S3_* exactly as the scraper Deployment has them
   IMAGE_HOST_POLICY_JSON: '{"static.myfigurecollection.net":{"lane":"http","egress":"direct"}}'
   # impit instead: '{"static.myfigurecollection.net":{"lane":"impit","egress":"residential","referer":false,"ua":"default",...}}' with
-  GALLERY_EGRESS: direct                # REQUIRED for a residential row (else exit 4); residential is never used by this driver
+  GALLERY_EGRESS: direct                # REQUIRED for a residential row (else exit 4): fetched from this node's own address
+  # the home line instead (GAL-RES, Ross's decision): GALLERY_EGRESS: residential, GALLERY_MAX_BYTES: "1500000000",
+  # RESIDENTIAL_PROXY_URL: the scraper Deployment's value; netpol: this pod -> egress-proxy :1055, and egress-proxy admitting it
   IMAGE_HOST_RATE_JSON:   '{"static.myfigurecollection.net":{"intervalMs":333}}'      # desk IMGRATE b: 3 files/s, no speed-up; REQUIRED, the run exits 2 without it
   RAW_STORE_IMAGE_MAX_BYTES: "10485760"  # REQUIRED: the Deployment's value (the sink skips bodies over it); the run exits 2 without it
   GALLERY_LOCK_PATH: /state/gallery-capture.lock   # REQUIRED unless GALLERY_LEDGER_PATH is set: one lease for the host, whatever ledger a run is given

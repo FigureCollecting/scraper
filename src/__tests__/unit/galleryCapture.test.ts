@@ -67,11 +67,12 @@ describe('parseGalleryArgs: the environment', () => {
 });
 
 describe('galleryExitCode', () => {
-  const base: GalleryReport = { mode: 'run', stopped: 'done', items: 0, planned: 0, fetched: 0, stored: 0, gone: 0, oversize: 0, skippedTooLarge: 0, skippedNotImage: 0, blocked: 0, trouble: 0, skippedLedger: 0, notAllowedHost: 0, badLines: 0, entriesCapped: 0, itemsWithFailures: 0 };
+  const base: GalleryReport = { mode: 'run', stopped: 'done', items: 0, planned: 0, fetched: 0, stored: 0, gone: 0, oversize: 0, skippedTooLarge: 0, skippedNotImage: 0, blocked: 0, trouble: 0, skippedLedger: 0, notAllowedHost: 0, badLines: 0, entriesCapped: 0, itemsWithFailures: 0, bytesRead: 0, budget: null };
   it.each([
     [{ ...base }, 0],
     [{ ...base, stopped: 'limit' as const }, 0],
     [{ ...base, stopped: 'time' as const }, 0],
+    [{ ...base, stopped: 'budget' as const }, 0],
     [{ ...base, stopped: 'paused' as const }, 3],
     [{ ...base, stopped: 'paused-marker' as const }, 3],
     [{ ...base, stopped: 'refused' as const }, 4],
