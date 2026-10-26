@@ -79,7 +79,11 @@ The scraper must not read the spine database, so the work list is a file the ope
    transport (decoded: a gzip body counts its full size). It does not count headers, TLS, or what a connection delivered of a body that
    was not read or was read only to a cut, up to about one receive window each, so the home line carries somewhat more than `bytesRead`.
    A budget below one reservation exits 2. The hook's own day cap on the exit (`IMAGE_RESIDENTIAL_BYTES_PER_DAY`)
-   is set to the budget for this process; an explicit lower value exits 2, and a skip by it stops the run the same way. The start line
+   is set to the budget for this process; an explicit lower value exits 2, and a skip by it stops the run the same way.
+   **The budget is per process.** The meter and the hook's day cap live in memory, and a new pod starts again at 0, so a Job that
+   retries can spend the budget once per pod. A residential Job must therefore never retry: `backoffLimit: 0`, and no
+   `podFailurePolicy` rule that ignores a failure (an `Ignore` on `DisruptionTarget` would bring an evicted pod back with a fresh
+   budget). Then one Job spends at most one budget. The start line
    says `EGRESS <host>: residential, through the scraper's residential exit <scheme://host:port> ... budget <N> bytes`;
    `GALLERY-REPORT` carries `bytesRead` (every run) and `budget` (null without one); a direct run may also set `GALLERY_MAX_BYTES`
    (`BUDGET <N> bytes` at start). The pod must be allowed to reach the exit: fc-infra's egress-proxy admits only `app: scraper` on 1055.
@@ -162,7 +166,7 @@ The scraper must not read the spine database, so the work list is a file the ope
    The file holds `{token, hostname, startedAt, heartbeatAt}`; the owner refreshes `heartbeatAt` every 10 s; a lock is stale only when
    its heartbeat is older than 60 s, whoever wrote it. No pid is kept (node is PID 1 in every pod, so a pid check would call every
    dead pod's lock live). A SIGKILLed or OOM-killed run therefore leaves a lease that frees itself 60 s later: an immediate restart
-   exits 8 and a Job with a `backoffLimit` simply tries again. Taking over a stale lock is serialised (a short-lived guard file; the
+   exits 8 and a Job with a `backoffLimit` simply tries again (a residential Job has none: see the budget above). Taking over a stale lock is serialised (a short-lived guard file; the
    holder re-reads the lock, removes it only if it is still the same stale lock, then creates its own atomically): of any number of
    runs that start together, exactly one holds. A run that finds its lock taken (it was frozen for over a minute) stops and exits 7.
    SIGTERM and SIGINT stop the run at once: the stop is checked when each request is DISPATCHED, under the pacer, so neither a later
@@ -190,7 +194,8 @@ The scraper must not read the spine database, so the work list is a file the ope
 1. Merge; roll the scraper image. 2. Mount the work list and a small PVC. 3. Probe Job (`--probe 20`) -> read the verdict.
    If challenged on the http lane, the next step is the impit lane with direct egress (GAL-IMPIT: the row's `"lane":"impit"` plus
    `GALLERY_EGRESS=direct`). Challenged there too (2026-10-26), the home line is Ross's decision (desk GAL2): one test item first
-   (`--item`), then at most 1.5 GB a night (`GALLERY_EGRESS=residential`, `GALLERY_MAX_BYTES`, GAL-RES). 4. Holdings only
+   (`--item`), then one full run under one budget (`GALLERY_EGRESS=residential`, `GALLERY_MAX_BYTES`, GAL-RES; desk GAL2 a: 8 GB),
+   in a Job that never retries (the budget is per process). 4. Holdings only
    (`--max-files` staged), then figures, then the rest. Desk IMGRATE sets `intervalMs`: Ross chose 333 = 3 files/s (holdings, 14,346 files, about 1.3 h;
    the whole catalogue, about 1.7M files, about 6.6 days).
 
@@ -214,8 +219,9 @@ env:
   IMAGE_HOST_POLICY_JSON: '{"static.myfigurecollection.net":{"lane":"http","egress":"direct"}}'
   # impit instead: '{"static.myfigurecollection.net":{"lane":"impit","egress":"residential","referer":false,"ua":"default",...}}' with
   GALLERY_EGRESS: direct                # REQUIRED for a residential row (else exit 4): fetched from this node's own address
-  # the home line instead (GAL-RES, Ross's decision): GALLERY_EGRESS: residential, GALLERY_MAX_BYTES: "1500000000",
-  # RESIDENTIAL_PROXY_URL: the scraper Deployment's value; netpol: this pod -> egress-proxy :1055, and egress-proxy admitting it
+  # the home line instead (GAL-RES, Ross's decision): GALLERY_EGRESS: residential, GALLERY_MAX_BYTES: "8000000000" (at most 64 GiB),
+  # RESIDENTIAL_PROXY_URL: the scraper Deployment's value; netpol: this pod -> egress-proxy :1055, and egress-proxy admitting it;
+  # backoffLimit: 0 and no podFailurePolicy Ignore rule (the budget is per process: a retried pod would get a fresh one)
   IMAGE_HOST_RATE_JSON:   '{"static.myfigurecollection.net":{"intervalMs":333}}'      # desk IMGRATE b: 3 files/s, no speed-up; REQUIRED, the run exits 2 without it
   RAW_STORE_IMAGE_MAX_BYTES: "10485760"  # REQUIRED: the Deployment's value (the sink skips bodies over it); the run exits 2 without it
   GALLERY_LOCK_PATH: /state/gallery-capture.lock   # REQUIRED unless GALLERY_LEDGER_PATH is set: one lease for the host, whatever ledger a run is given
