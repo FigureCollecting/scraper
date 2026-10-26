@@ -89,18 +89,6 @@ jobs:
       - name: Run unit tests with coverage
         run: npm run test:ci -- --coverage
 
-      - name: Upload coverage to Codecov
-        # org-only: no Codecov token is configured, so an upload from a fork push has
-        # nothing to authenticate with and only logs an error. PRs from forks still
-        # upload: repository_owner is the base repo's owner.
-        if: github.repository_owner == 'FigureCollecting'
-        uses: codecov/codecov-action@v7
-        with:
-          files: ./coverage/lcov.info
-          flags: scraper
-          fail_ci_if_error: false
-          verbose: true
-
   build:
     name: Build Application
     runs-on: ubuntu-latest

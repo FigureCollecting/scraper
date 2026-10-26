@@ -1115,7 +1115,7 @@ The scraper includes comprehensive test coverage with 26 test suites and contain
 
 - **Total Test Suites**: 26 suites
 - **Total Tests**: ~760 passing tests
-- **Code Coverage**: 80%+ (Codecov quality gate)
+- **Code Coverage**: enforced by `coverageThreshold` in `jest.config.cjs` (a drop fails the test run)
 - **Testing Framework**: Jest 30 + TypeScript + Supertest 7 + testcontainers
 - **Mocking Strategy**: Complete Puppeteer API mocking
 - **Containerized Testing**: Docker-based test execution with coverage extraction
@@ -1321,7 +1321,7 @@ a comment block) sits at the top of `build.yml`, `security-scan.yml` and
   The gate compares branch names case-insensitively, so do not name a feature
   branch `Develop` or `MAIN`.
 - **Publishing (GHCR images, the npm plugin-contract package, GitHub releases,
-  image SBOM/attestations) and Codecov uploads happen only from the org**; those
+  image SBOM/attestations) happen only from the org**; those
   jobs and steps are skipped on forks.
 
 ### Testing Documentation

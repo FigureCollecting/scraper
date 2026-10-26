@@ -42,6 +42,16 @@ module.exports = {
     'lcov',
     'html'
   ],
+  // Coverage minimum: a run that falls below any of these fails (measured 2026-10-25:
+  // statements 97.85, branches 94.36, functions 96.00, lines 98.44; floored). Raise when coverage rises.
+  coverageThreshold: {
+    global: {
+      statements: 97,
+      branches: 94,
+      functions: 96,
+      lines: 98
+    }
+  },
   setupFilesAfterEnv: ['<rootDir>/src/__tests__/setup.ts'],
   testTimeout: 30000,
   maxWorkers: 4,
