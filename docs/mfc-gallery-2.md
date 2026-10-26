@@ -68,13 +68,17 @@ The scraper must not read the spine database, so the work list is a file the ope
    through that exit, on impit, to a url the hook's guard calls on-store, checked for every hop before the exit is dialled.
    It needs `GALLERY_MAX_BYTES` (a positive whole number; without it exit 4, malformed exit 2) and `RESIDENTIAL_PROXY_URL` (without it
    exit 4). The byte meter (`galleryBytes.ts`) sits on both lanes' transports and counts every response BODY a lane reads: an image, a
-   body that is not one, a placeholder, a body cut at the cap; a 403 or a declared length over the cap is never read and costs nothing.
+   body that is not one, a placeholder, a body cut at the cap. A response the lane does not read (a non-2xx, a declared length over the
+   cap, a redirect hop) is not counted, but it is not free: the origin sends its body anyway. Its body is cancelled as soon as the lane
+   returns, which closes that connection (ten unread 20 MiB 404s through a loopback exit throttled to 2 MB/s: 0.47 MiB, was 11.47 MiB).
    On a budgeted run a body is read through its stream and cut at the first chunk past the 32 MiB per-file cap, and a request goes out
    only while the budget still holds one reservation (the cap plus a 1 MiB chunk allowance; impit's chunks measured up to 504 KiB on
    loopback). So the run stops between files, never in one, before a file that could cross the budget: `stopped:"budget"`, exit 0,
    `STOPPED at the byte budget: <read> of <budget> bytes read`, the unfetched files unsettled for the next run, and what was read never
-   above the budget. It leaves up to one reservation (about 33 MiB) unused, and it does not count headers, TLS, or what the socket
-   buffered past a cut. A budget below one reservation exits 2. The hook's own day cap on the exit (`IMAGE_RESIDENTIAL_BYTES_PER_DAY`)
+   above the budget. It leaves up to one reservation (about 33 MiB) unused. `bytesRead` is the body bytes the lanes took from the
+   transport (decoded: a gzip body counts its full size). It does not count headers, TLS, or what a connection delivered of a body that
+   was not read or was read only to a cut, up to about one receive window each, so the home line carries somewhat more than `bytesRead`.
+   A budget below one reservation exits 2. The hook's own day cap on the exit (`IMAGE_RESIDENTIAL_BYTES_PER_DAY`)
    is set to the budget for this process; an explicit lower value exits 2, and a skip by it stops the run the same way. The start line
    says `EGRESS <host>: residential, through the scraper's residential exit <scheme://host:port> ... budget <N> bytes`;
    `GALLERY-REPORT` carries `bytesRead` (every run) and `budget` (null without one); a direct run may also set `GALLERY_MAX_BYTES`

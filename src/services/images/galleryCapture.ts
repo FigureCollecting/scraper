@@ -30,7 +30,7 @@ import { getResidentialProxyUrl, redactProxyUrl } from '../residentialEgress.js'
 import { flushRawCaptureSink, parseImageMaxBytes } from '../s3ObjectStore.js';
 import { getRawCaptureSink } from '../s3ObjectStore.js';
 import { createImageHostLimiter, createImageCaptureHookFromEnv } from './assembleImageCapture.js';
-import { createByteMeter, meterFetch, meterImpit } from './galleryBytes.js';
+import { createByteMeter, meterFetch, meterImpit, releaseUnreadAfter } from './galleryBytes.js';
 import { acquireRunLock, LOCK_HEARTBEAT_MS } from './galleryLock.js';
 import { readWorklistFile } from './galleryWorklist.js';
 import {
@@ -294,7 +294,7 @@ export async function main(argv: readonly string[] = process.argv.slice(2), deps
     const ledger: GalleryLedger = args.ledger !== undefined ? createFileLedger(args.ledger) : createMemoryLedger();
     const observer = createFetchObserver({ pauseAfter: args.pauseAfter, now });
     // Each lane's transport is metered (galleryBytes.ts) under the recorder: every body a lane reads is counted, and on a budgeted run
-    // read through its stream and cut past the per-file cap.
+    // read through its stream and cut past the per-file cap. A body the lane did not read is cancelled as the lane returns.
     const recording = createRecordingFetch(meterFetch(deps.baseFetch ?? (globalThis.fetch as unknown as BytesFetchImpl), meter));
     const limiter: HostRateLimiter = createImageHostLimiter(env);
     // observer( follow-by-hand( paced( stop gate( dispatch guard( http | impit lane, each over a recorded, metered, manual-redirect transport ) ) ) ) ):
@@ -309,7 +309,7 @@ export async function main(argv: readonly string[] = process.argv.slice(2), deps
       ...(residentialProxy !== undefined ? { residentialProxy } : {}),
       maxBytes: capBytes,
     });
-    const lanes = createImageBytesRouter({ http: createHttpBytesFetch({ fetchImpl: recording.fetchImpl, maxBytes: capBytes }), impit });
+    const lanes = releaseUnreadAfter(createImageBytesRouter({ http: createHttpBytesFetch({ fetchImpl: recording.fetchImpl, maxBytes: capBytes }), impit }), meter);
     const guarded = guardGalleryDispatch(lanes, residentialProxy !== undefined ? { proxyUrl: residentialProxy } : undefined);
     const paced = impitReadyFirst(paceImageBytesByHost(gateOnStop(guarded, () => observer.stopped() ?? meter.spent()), limiter), impit);
     const fetchBytes = observer.wrap(followAllowedRedirects(paced, { allowedHosts: args.allowedHosts, locationOf: recording.takeLocation }));

@@ -5,7 +5,7 @@
  */
 import type { ImpitLike, ImpitResponseLike } from '../../services/impitFetch';
 import {
-  READ_CHUNK_ALLOWANCE, createByteMeter, meterFetch, meterImpit, readCapped,
+  READ_CHUNK_ALLOWANCE, createByteMeter, meterFetch, meterImpit, readCapped, releaseUnreadAfter,
 } from '../../services/images/galleryBytes';
 import type { BytesFetchImpl, BytesResponseLike } from '../../services/images/httpBytesFetch';
 
@@ -114,10 +114,27 @@ describe('meterFetch (the http lane transport)', () => {
     expect(m.read()).toBe(321);
   });
 
-  it('a response the lane never reads (a 403) costs nothing', async () => {
+  it('a response the lane never reads (a 403) is not counted, and once released its body is cancelled: the connection is let go', async () => {
     const m = createByteMeter({ max: 10 ** 9, capBytes: 1000 });
-    await meterFetch(async () => httpRes({ status: 403 }), m)('u', { headers: {} });
+    const s = chunked([500, 500]);
+    await meterFetch(async () => httpRes({ status: 403, body: s.stream }), m)('u', { headers: {} });
+    expect(s.cancelled()).toBe(false);
+    m.releaseUnread();
+    expect(s.cancelled()).toBe(true);
+    expect(s.pulled()).toBe(0);
     expect(m.read()).toBe(0);
+  });
+
+  it('a body the lane read is never cancelled on release, on a run with or without a budget', async () => {
+    for (const max of [undefined, 10 ** 9]) {
+      const m = createByteMeter({ ...(max !== undefined ? { max } : {}), capBytes: 1000 });
+      const s = chunked([300]);
+      const res = await meterFetch(async () => httpRes({ body: s.stream, arrayBuffer: async () => new ArrayBuffer(300) }), m)('u', { headers: {} });
+      await res.arrayBuffer();
+      m.releaseUnread();
+      expect(s.cancelled()).toBe(false);
+      expect(m.read()).toBe(300);
+    }
   });
 
   it('with a budget it reads the body stream, stops past the cap, and counts the chunks it took', async () => {
@@ -188,6 +205,20 @@ describe('meterImpit (the impit lane session)', () => {
     expect(s.cancelled()).toBe(true);
   });
 
+  it('a response the lane never reads is cancelled on release; one read through bytes() or text() is not', async () => {
+    const m = createByteMeter({ capBytes: 1000 });
+    const unread = chunked([500]);
+    const viaBytes = chunked([500]);
+    const viaText = chunked([500]);
+    await meterImpit(session(impitRes({ status: 404, body: unread.stream })), m).fetch('u', { method: 'GET' });
+    await (await meterImpit(session(impitRes({ body: viaBytes.stream, bytes: async () => new Uint8Array(4) })), m).fetch('u', { method: 'GET' })).bytes!();
+    await (await meterImpit(session(impitRes({ body: viaText.stream })), m).fetch('u', { method: 'GET' })).text();
+    m.releaseUnread();
+    expect(unread.cancelled()).toBe(true);
+    expect(viaBytes.cancelled()).toBe(false);
+    expect(viaText.cancelled()).toBe(false);
+  });
+
   it('with a budget, a response whose body getter is not a stream (or throws) falls back to its own method, counted', async () => {
     const m = createByteMeter({ max: 10 ** 9, capBytes: 1000 });
     const plain = await meterImpit(session(impitRes({ body: 'not a stream', bytes: async () => new Uint8Array(5) })), m).fetch('u', { method: 'GET' });
@@ -197,5 +228,48 @@ describe('meterImpit (the impit lane session)', () => {
     const viaGetter = await meterImpit(session(throwing), m).fetch('u', { method: 'GET' });
     expect((await viaGetter.arrayBuffer!()).byteLength).toBe(6);
     expect(m.read()).toBe(11);
+  });
+});
+
+describe('releaseUnreadAfter (bodies the lane did not read are let go when the lane returns)', () => {
+  it('cancels, after the lane returns, the body of every response it did not read, once; a later dispatch leaves earlier ones alone', async () => {
+    const m = createByteMeter({ max: 10 ** 9, capBytes: 1000 });
+    const first = chunked([500]);
+    const second = chunked([500]);
+    let res: ReadableStream<Uint8Array> = first.stream;
+    let cancelledInside: boolean | undefined;
+    const lane = releaseUnreadAfter(async () => {
+      await meterFetch(async () => httpRes({ status: 404, body: res }), m)('u', { headers: {} });
+      cancelledInside = first.cancelled();
+      return { ok: false, reason: 'http-status', status: 404 };
+    }, m);
+    expect(await lane('u')).toEqual({ ok: false, reason: 'http-status', status: 404 });
+    expect(cancelledInside).toBe(false);
+    expect(first.cancelled()).toBe(true);
+    res = second.stream;
+    await lane('u');
+    expect(second.cancelled()).toBe(true);
+  });
+
+  it('lets go when the lane throws, too, and the error still reaches the caller', async () => {
+    const m = createByteMeter({ capBytes: 1000 });
+    const s = chunked([500]);
+    const lane = releaseUnreadAfter(async () => {
+      await meterImpit(session(impitRes({ status: 403, body: s.stream })), m).fetch('u', { method: 'GET' });
+      throw new Error('lane broke');
+    }, m);
+    await expect(lane('u')).rejects.toThrow('lane broke');
+    expect(s.cancelled()).toBe(true);
+  });
+
+  it('a response with no body stream, or whose cancel fails, is passed over without failing the dispatch', async () => {
+    const m = createByteMeter({ capBytes: 1000 });
+    const failing = new ReadableStream<Uint8Array>({ cancel() { throw new Error('the transport is already gone'); } });
+    const lane = releaseUnreadAfter(async () => {
+      await meterFetch(async () => httpRes({ status: 404, body: null }), m)('u', { headers: {} });
+      await meterImpit(session(impitRes({ status: 404, body: failing })), m).fetch('u', { method: 'GET' });
+      return { ok: false, reason: 'http-status', status: 404 };
+    }, m);
+    await expect(lane('u')).resolves.toMatchObject({ status: 404 });
   });
 });

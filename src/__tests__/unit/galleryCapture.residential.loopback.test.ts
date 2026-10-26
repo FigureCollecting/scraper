@@ -117,6 +117,17 @@ describe('the residential exit, through the real Job entry', () => {
     expect(r.report).toMatchObject({ fetched: 2, stored: 1, oversize: 1, bytesRead: pngLen('img/2.jpeg') });
   });
 
+  it('a body the lane does not read (a 404, a declared length over the cap) is let go at once: its connection through the exit closes before the next answer', async () => {
+    items([{ id: 1, paths: ['endless/404/a', 'slow/b.jpeg', 'endless-cl/c', 'slow/d.jpeg'] }]);
+    const r = await runCli(base(), resEnv());
+    expect(r.report).toMatchObject({ fetched: 4, stored: 2, gone: 1, oversize: 1, bytesRead: pngLen('slow/b.jpeg') + pngLen('slow/d.jpeg') });
+    const asked = (p: string): number => lb.a.find(s => s.path === p)!.t;
+    const closed = (p: string): number | undefined => lb.closed.find(c => c.path === p)?.t;
+    // each slow answer is sent 1.5 s after its request: an unread body still open then was held, not let go
+    expect(closed('/endless/404/a')).toBeLessThan(asked('/slow/b.jpeg') + 1500);
+    expect(closed('/endless-cl/c')).toBeLessThan(asked('/slow/d.jpeg') + 1500);
+  });
+
   it('an off-host redirect is refused before any request to its target: the exit is never asked for it', async () => {
     items([{ id: 1, paths: ['img/1.jpeg', 'redir/2.jpeg', 'img/3.jpeg'] }]);
     const r = await runCli(base(), resEnv());

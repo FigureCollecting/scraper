@@ -284,6 +284,16 @@ describe('S9: what the real entry wires', () => {
     expect(lb.a.length).toBe(4);
   });
 
+  it('a body the http lane does not read (a 404, a declared length over the cap) is let go at once, not held open for the rest of the run', async () => {
+    writeWorklist(lb, wl, [{ id: 1, paths: ['endless/404/a', 'slow/b.jpeg', 'endless-cl/c', 'slow/d.jpeg'] }]);
+    const r = await runCli(['--worklist', wl, '--ledger', ledger], cliEnv(lb));
+    expect(r.report).toMatchObject({ fetched: 4, stored: 2, gone: 1, oversize: 1 });
+    const asked = (p: string): number => lb.a.find(s => s.path === p)!.t;
+    const closed = (p: string): number | undefined => lb.closed.find(c => c.path === p)?.t;
+    expect(closed('/endless/404/a')).toBeLessThan(asked('/slow/b.jpeg') + 1500);
+    expect(closed('/endless-cl/c')).toBeLessThan(asked('/slow/d.jpeg') + 1500);
+  });
+
   it('a declared body over the size cap is refused unread and settled oversize', async () => {
     writeWorklist(lb, wl, [{ id: 1, paths: ['big-cl/1.jpeg', 'img/2.jpeg'] }]);
     const r = await runCli(['--worklist', wl, '--ledger', ledger], cliEnv(lb));

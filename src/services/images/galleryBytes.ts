@@ -3,7 +3,9 @@
  *
  * The meter sits between each lane and its transport (the http lane's fetch, the impit lane's session), so it sees every body a lane
  * takes, whatever the lane then decides about it: an image stored, a body that turned out not to be an image, a placeholder, a body cut
- * at the size cap. A response the lane never reads (a 403, a declared length over the cap) costs nothing, as on the wire.
+ * at the size cap. A response the lane never reads (a non-2xx, a declared length over the cap) is not counted, but it is not free: the
+ * origin sends its body anyway. So when the lane returns, {@link releaseUnreadAfter} cancels the body of every response it did not read,
+ * which closes that connection; until then the transport takes in what the connection delivers, up to about one receive window.
  *
  * With no budget it only counts, through the response's own body method, so a run without GALLERY_MAX_BYTES reads exactly as before.
  * With a budget (GALLERY_MAX_BYTES, required on residential egress) two things change:
@@ -13,9 +15,12 @@
  *     the run stops between files, before one that could cross the budget, never in the middle of one, and what it read never exceeds
  *     the budget. The price is that up to one reservation of the budget is left unused.
  *
- * bytesRead counts response BODY bytes taken from the transport. Headers, TLS and what the socket had buffered past a cut are below it.
+ * bytesRead counts the response BODY bytes the lanes took from the transport (decoded, so a compressed body counts its full size). Not
+ * counted: headers, TLS, and what a connection delivered of a body the lane did not read or read only to a cut (up to about one receive
+ * window each). Those bytes reach the transport below any reader, so the run cannot see them.
  */
 import type { ImpitLike, ImpitResponseLike } from '../impitFetch.js';
+import type { ImageBytesFetcher } from './imageBytes.js';
 import type { BytesFetchImpl, BytesResponseLike } from './httpBytesFetch.js';
 
 /**
@@ -35,11 +40,16 @@ export interface GalleryByteMeter {
   add(n: number): void;
   /** Why no further request may go out (the budget has no room for one more reservation), or undefined. */
   spent(): string | undefined;
+  /** Remember a response the metered transport handed out, by its body stream; `touched()` says whether the lane has asked for its body. */
+  track(stream: () => ReadableStream<Uint8Array> | undefined, touched: () => boolean): void;
+  /** Cancel the body of every response handed out since the last release that the lane never asked for, and forget them all. */
+  releaseUnread(): void;
 }
 
 export function createByteMeter(opts: { max?: number; capBytes: number; allowance?: number }): GalleryByteMeter {
   const reserve = opts.capBytes + (opts.allowance ?? READ_CHUNK_ALLOWANCE);
   let read = 0;
+  let handedOut: Array<{ stream: () => ReadableStream<Uint8Array> | undefined; touched: () => boolean }> = [];
   return {
     max: opts.max,
     capBytes: opts.max === undefined ? undefined : opts.capBytes,
@@ -50,6 +60,29 @@ export function createByteMeter(opts: { max?: number; capBytes: number; allowanc
       if (opts.max === undefined || read + reserve <= opts.max) return undefined;
       return `byte budget reached: ${read} of ${opts.max} bytes read, and one more request may read up to ${reserve}`;
     },
+    track(stream, touched) { handedOut.push({ stream, touched }); },
+    releaseUnread() {
+      const done = handedOut;
+      handedOut = [];
+      // a cancel that fails (the transport already closed the body) leaves nothing to let go of
+      for (const h of done) if (!h.touched()) void h.stream()?.cancel().catch(() => undefined);
+    },
+  };
+}
+
+/**
+ * The lanes, letting go of what they did not read: when a dispatch returns (or throws), the body of every response it was handed and
+ * did not read (a non-2xx, a declared length over the cap, a redirect hop) is cancelled, which closes that connection at once instead
+ * of leaving it open, still receiving, until the process ends. Only bodies the lane never asked for are touched, so this can never cut
+ * one a lane reads; with one request in flight, everything handed out since the last release belongs to this dispatch.
+ */
+export function releaseUnreadAfter(inner: ImageBytesFetcher, meter: GalleryByteMeter): ImageBytesFetcher {
+  return async (url, options) => {
+    try {
+      return await inner(url, options);
+    } finally {
+      meter.releaseUnread();
+    }
   };
 }
 
@@ -92,11 +125,14 @@ export function meterFetch(inner: BytesFetchImpl, meter: GalleryByteMeter): Byte
   return async (url, init) => {
     const res = await inner(url, init);
     const cap = meter.capBytes;
+    let touched = false;
+    meter.track(() => streamOf(res), () => touched);
     const metered: BytesResponseLike = {
       status: res.status,
       ...(res.url !== undefined ? { url: res.url } : {}),
       headers: res.headers,
       arrayBuffer: async () => {
+        touched = true;
         const body = cap !== undefined ? streamOf(res) : undefined;
         if (body !== undefined && cap !== undefined) return arrayBufferOf(await readCapped(body, cap, n => meter.add(n)));
         const ab = await res.arrayBuffer();
@@ -114,23 +150,27 @@ export function meterImpit(impit: ImpitLike, meter: GalleryByteMeter): ImpitLike
     async fetch(url, init) {
       const res = await impit.fetch(url, init);
       const cap = meter.capBytes;
+      const body = cap !== undefined ? streamOf(res) : undefined;
+      let touched = false;
+      meter.track(() => body ?? streamOf(res), () => touched);
       const out: { -readonly [K in keyof ImpitResponseLike]: ImpitResponseLike[K] } = {
-        text: () => res.text(),
+        text: () => { touched = true; return res.text(); },
         ...(res.status !== undefined ? { status: res.status } : {}),
         ...(res.headers !== undefined ? { headers: res.headers } : {}),
         ...(res.url !== undefined ? { url: res.url } : {}),
       };
-      const body = cap !== undefined ? streamOf(res) : undefined;
       if (body !== undefined && cap !== undefined) {
-        out.bytes = async () => new Uint8Array(await readCapped(body, cap, n => meter.add(n)));
+        out.bytes = async () => { touched = true; return new Uint8Array(await readCapped(body, cap, n => meter.add(n))); };
       } else if (typeof res.bytes === 'function') {
         out.bytes = async () => {
+          touched = true;
           const b = await res.bytes!();
           meter.add(b.byteLength);
           return b;
         };
       } else if (typeof res.arrayBuffer === 'function') {
         out.arrayBuffer = async () => {
+          touched = true;
           const ab = await res.arrayBuffer!();
           meter.add(ab.byteLength);
           return ab;

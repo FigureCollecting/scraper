@@ -90,6 +90,8 @@ export interface Loopback {
   puts: Put[];
   /** The ReportCapture bodies (latin1, so a test can look for ids and urls inside the protobuf). */
   ing: string[];
+  /** When the client let go of a body A was still sending (the `endless` routes): the request path and the time. */
+  closed: Array<{ path: string; t: number }>;
   setS3(mode: S3Mode): void;
   /** `http://localhost:<portA>/<path>`. */
   urlA(p: string): string;
@@ -103,7 +105,9 @@ function listen(server: http.Server): Promise<number> {
 }
 
 export async function startLoopback(initialS3: S3Mode = 'ok'): Promise<Loopback> {
-  const lb: Partial<Loopback> & { a: Seen[]; a2: Seen[]; b: Seen[]; s3: Seen[]; puts: Put[]; ing: string[] } = { a: [], a2: [], b: [], s3: [], puts: [], ing: [] };
+  const lb: Partial<Loopback> & { a: Seen[]; a2: Seen[]; b: Seen[]; s3: Seen[]; puts: Put[]; ing: string[]; closed: Array<{ path: string; t: number }> } = {
+    a: [], a2: [], b: [], s3: [], puts: [], ing: [], closed: [],
+  };
   let s3mode: S3Mode = initialS3;
   /** PUT answers the `hold` S3 mode keeps until the test calls release(). */
   const held: Array<() => void> = [];
@@ -184,6 +188,23 @@ export async function startLoopback(initialS3: S3Mode = 'ok'): Promise<Loopback>
           if (!res.destroyed) res.end();
         };
         return pump();
+      }
+      // a body that never ends (64 KiB every 5 ms, until the client lets go), the moment it does recorded in `closed`:
+      // endless/<status>/<tag> declares no length; endless-cl/<tag> is a 200 declaring 40 MiB, over the 32 MiB cap
+      case 'endless':
+      case 'endless-cl': {
+        const status = kind === 'endless' ? Number(rest.split('/')[0]) : 200;
+        res.writeHead(status, kind === 'endless' ? { 'content-type': 'text/html' } : { 'content-type': 'image/png', 'content-length': 40 * 1024 * 1024 });
+        res.on('error', () => undefined);
+        const piece = Buffer.alloc(64 * 1024, 0x61);
+        let left = kind === 'endless' ? Infinity : 40 * 1024 * 1024;
+        const timer = setInterval(() => {
+          if (res.destroyed || res.writableNeedDrain || left < piece.length) return;
+          left -= piece.length;
+          res.write(piece);
+        }, 5);
+        res.on('close', () => { clearInterval(timer); lb.closed.push({ path: req.url ?? '', t: clock() }); });
+        return;
       }
       // a declared length over the 32 MiB cap: refused before the body is read
       case 'big-cl': res.writeHead(200, { 'content-type': 'image/png', 'content-length': 40 * 1024 * 1024 }); res.write(png(`A:${rest}`)); setTimeout(() => res.destroy(), 300); return;
