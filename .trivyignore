@@ -1,0 +1,11 @@
+# Trivy ignore list; read from the repo root by `trivy fs` / `trivy image` (security-scan.yml).
+#
+# CVE-2023-54404 / GHSA-mrhx-c7xc-m3w5: zod 3.25.76 (fixed only in zod 4.6.6) -- DoS when validating
+# oversized constrained collections. zod is a transitive dependency only: puppeteer -> puppeteer-core
+# -> chromium-bidi 17.0.2 (zod ^3.24.1), the WebDriver BiDi mapper. The scraper launches Chrome with
+# puppeteer's default CDP protocol and never sets protocol 'webDriverBiDi' (puppeteer-core selects
+# BiDi only on that option, or for Firefox by default); it never calls puppeteer.connect; and nothing
+# in src/ or packages/ imports zod. The fix needs the puppeteer + Chrome bump, which is its own unit
+# (the image pins Chrome to puppeteer's revision).
+# Verified 2026-10-26; review by 2026-11-09 (puppeteer + Chrome bump unit). Expires on that date.
+CVE-2023-54404 exp:2026-11-09
