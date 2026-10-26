@@ -299,14 +299,42 @@ describe('GALLERY_EGRESS=residential under a byte budget (main, in process)', ()
       expect(reportOf()).toMatchObject({ stopped: 'done', fetched: 4, stored: 1, oversize: 1, blocked: 1, skippedNotImage: 1, bytesRead: html.length + 300 });
     });
 
-    it('a placeholder body is refused (display-gated, never stored) and still counted: the home line carried it', async () => {
-      writeFileSync(work, [line('1', [1]), line('2', [2])].join('\n') + '\n');
-      const r = rig({ env: { GALLERY_MAX_BYTES: '100000' }, rows: { [STATIC]: { ...ROW, placeholders: { [sha256(pngOfSize(U(1), 300))]: 'display_gated' } } } });
-      // Exit 6 and itemsWithFailures 1 are the driver's handling of a display-gated answer on EVERY lane before GAL-RES (the hook counts it
-      // as failed, the driver files an unexplained failure as an unconfirmed put); reported, not changed here.
-      expect(await run(r)).toBe(6);
-      expect(r.stored).toEqual([U(2)]);
-      expect(reportOf()).toMatchObject({ fetched: 2, stored: 1, trouble: 1, itemsWithFailures: 1, bytesRead: 600 });
+    it('a placeholder body is a verdict on that one file: settled placeholder, never stored, counted (its bytes too), never fetched again', async () => {
+      writeFileSync(work, [line('1', [1, 2]), line('2', [3])].join('\n') + '\n');
+      const rows = { [STATIC]: { ...ROW, placeholders: { [sha256(pngOfSize(U(1), 300))]: 'display_gated' } } };
+      const r = rig({ env: { GALLERY_MAX_BYTES: '100000' }, rows });
+      expect(await run(r)).toBe(0);
+      expect(r.stored).toEqual([U(2), U(3)]);
+      expect(reportOf()).toMatchObject({ stopped: 'done', fetched: 3, stored: 2, placeholder: 1, trouble: 0, blocked: 0, itemsWithFailures: 0, bytesRead: 900 });
+      expect(settled().map(x => [x.i, x.u, x.s])).toEqual([['mfc/1', U(1), 'placeholder'], ['mfc/1', U(2), 'stored'], ['mfc/2', U(3), 'stored']]);
+      out.length = 0;
+      const again = rig({ env: { GALLERY_MAX_BYTES: '100000' }, rows });
+      expect(await run(again)).toBe(0);
+      expect(again.calls).toEqual([]);
+      expect(reportOf()).toMatchObject({ fetched: 0, skippedLedger: 3 });
+    });
+
+    it('three placeholders in a row do not pause the run (three 403s still do: above)', async () => {
+      writeFileSync(work, [line('1', [1, 2, 3, 4]), line('2', [5])].join('\n') + '\n');
+      const gatedShas = Object.fromEntries([1, 2, 3].map(n => [sha256(pngOfSize(U(n), 300)), 'display_gated']));
+      const r = rig({ env: { GALLERY_MAX_BYTES: '100000' }, rows: { [STATIC]: { ...ROW, placeholders: gatedShas } } });
+      expect(await run(r)).toBe(0);
+      expect(r.calls.map(c => c.url)).toEqual([U(1), U(2), U(3), U(4), U(5)]);
+      expect(reportOf()).toMatchObject({ stopped: 'done', placeholder: 3, stored: 2, itemsWithFailures: 0 });
+      expect(out.join('\n')).not.toMatch(/PAUSED/);
+    });
+
+    it('a probe that meets a placeholder PASSes with a note when the other files are good images; all placeholders is INCONCLUSIVE (exit 5)', async () => {
+      const one = rig({ env: { GALLERY_MAX_BYTES: '100000' }, rows: { [STATIC]: { ...ROW, placeholders: { [sha256(pngOfSize(U(1), 300))]: 'display_gated' } } } });
+      expect(await run(one, ['--probe', '3'])).toBe(0);
+      expect(out.join('\n')).toMatch(/PROBE PASS/);
+      expect(out.join('\n')).toMatch(/note: 1 file\(s\) answered with the host's listed placeholder/);
+      out.length = 0;
+      writeFileSync(work, line('1', [1, 2]) + '\n');
+      const gatedShas = Object.fromEntries([1, 2].map(n => [sha256(pngOfSize(U(n), 300)), 'display_gated']));
+      const all = rig({ env: { GALLERY_MAX_BYTES: '100000' }, rows: { [STATIC]: { ...ROW, placeholders: gatedShas } } });
+      expect(await run(all, ['--probe', '2'])).toBe(5);
+      expect(out.join('\n')).toMatch(/PROBE INCONCLUSIVE: every file was the host's listed placeholder/);
     });
 
     it('also caps a DIRECT run when it is set (the stop is the same), and a direct run without it reports bytesRead with budget null', async () => {

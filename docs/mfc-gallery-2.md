@@ -110,12 +110,16 @@ The scraper must not read the spine database, so the work list is a file the ope
    count). The sink checks empty, then size, then type, and so does the driver: an HTML body over the ceiling is `skipped:too_large`.
    A store-side skip the fetched bodies do not explain (the lane off, or more skips than there are bodies that qualify) is treated as a
    lost put.
+   **A placeholder.** A body the host's policy row lists as its `display_gated` placeholder (the Job's row carries the 920-byte plate MFC
+   shows an anonymous visitor in place of a picture, and the gallery is always anonymous) is never stored. It is a verdict on that one
+   file: settled `placeholder`, counted in `placeholder`, never an item failure, never asked for again, and it neither counts toward the
+   pause nor resets it. Its bytes are still counted in `bytesRead`. A real block (403, a challenge) still counts toward the pause.
    `IMAGE_MAX_PER_ITEM=100` for this process only. The item's `contentLevel` rides the ref (fail closed to `unknown`).
    `sourceClass` is config (`GALLERY_SOURCE_CLASS`). Ross ruled (desk GALSRC b): the MFC official gallery is `manufacturer_press`, set in the Job env below; the code default stays `unknown`, so a Job that forgets the setting claims nothing.
 4. **Auto-pause**: N consecutive blocked or failed fetches (403, 429, 503, `cf-mitigated`, a 2xx that is not an image, a
    cooling host, a refused redirect, and also any 5xx, a timeout or a dropped connection) stop the run and write a pause marker
-   (default 3 and 6 h); the next run refuses until it lapses or `--resume`. A success resets the streak; a 404/410 or an
-   over-size body is a verdict on one file and neither counts nor resets it.
+   (default 3 and 6 h); the next run refuses until it lapses or `--resume`. A success resets the streak; a 404/410, an
+   over-size body or a listed placeholder is a verdict on one file and neither counts nor resets it.
 4a. **Redirects**: the runtime never follows one. The driver takes each hop by hand, over the paced fetcher (so every hop,
    a same-host one included, waits for the host's turn), and ONLY to an origin in `GALLERY_ALLOWED_HOSTS`. A hop anywhere else is
    refused before a request is sent: nothing is fetched, stored or settled from outside the list, and it counts as a blocked
@@ -127,7 +131,7 @@ The scraper must not read the spine database, so the work list is a file the ope
    the same host name (another port) is not on the list. The rate and policy rows stay keyed by host name.
 4b. **One spelling of a url**: the work list carries the canonical form (host lower-case without a trailing dot, default port
    gone, dot segments resolved, no fragment, %-escapes in one spelling) and the scraper applies it again; the ledger keys on it,
-   per item: `{"i":"site/itemId","u":url,"s":stored|gone|oversize|skipped:too_large|skipped:not_image}`. (The url-only lines of the first cut are
+   per item: `{"i":"site/itemId","u":url,"s":stored|gone|oversize|placeholder|skipped:too_large|skipped:not_image}`. (The url-only lines of the first cut are
    ignored.) The form is IDEMPOTENT: a valid `%XX` is decoded once if it spells an unreserved character, a stray `%` (not followed
    by two hex digits) is a literal percent sign and is written `%25`, and nothing is decoded twice, so `x%4%31.jpeg` (the file
    `x%41.jpeg`) never collides with `xA.jpeg`. fc-aggregation carries the same function; both suites read the same vector file
@@ -141,7 +145,8 @@ The scraper must not read the spine database, so the work list is a file the ope
    so: a refusal keeps exit 4 and a live pause marker exit 3). PASS only if
    every request is a 200 image on the allowed origin, no cookie or authorization header was sent, no challenge signal,
    no redirect off-host, AND the store kept every file: a probe puts its files through the real sink, so a body the store skipped (not an
-   image, over its ceiling) or a write it did not confirm makes the verdict FAIL. The exit code follows the printed verdict: 0 for PASS,
+   image, over its ceiling) or a write it did not confirm makes the verdict FAIL. A listed placeholder is a note, not a FAIL (the path
+   carried it; the host withheld that one picture), but a probe whose every file was the placeholder is INCONCLUSIVE. The exit code follows the printed verdict: 0 for PASS,
    5 for anything else (including a probe that tripped the pause: the marker is written and the PAUSED line printed, but the code is 5).
 6. **Entry**: `npm run gallery:capture` (Job/CronJob, same image as the scraper). One meaning per exit code: 0 done (or a limit: files,
    minutes, or the byte budget), 1 crash, 2 bad arguments or config (no host named, no rate row for an allowed host, `RAW_STORE_IMAGE_MAX_BYTES`
@@ -169,8 +174,8 @@ The scraper must not read the spine database, so the work list is a file the ope
 - One request in flight, spaced by the host rate; no retries inside a run (a failed url is simply not settled and the next run
   tries it again, after the pause if one was set).
 - Settled = stored AND confirmed by the sink (or the same for a picture an earlier item got, in this run), or permanently gone
-  (404/410), or over the fetch cap (`oversize`), or over the store's ceiling (`skipped:too_large`), or a body the store will not keep
-  (`skipped:not_image`), per (item, url). Never settled:
+  (404/410), or over the fetch cap (`oversize`), or the host's listed placeholder (`placeholder`), or over the store's ceiling
+  (`skipped:too_large`), or a body the store will not keep (`skipped:not_image`), per (item, url). Never settled:
   403, 429, 5xx, timeouts, non-image 2xx, an off-origin redirect, a put the store did not confirm (and nothing at all when the
   process is killed first).
 - A kill mid-item fetches that whole item again on the next run (up to 99 duplicate requests; by design).

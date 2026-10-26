@@ -51,12 +51,17 @@ export interface FetchObservation {
   signals?: Record<string, string>;
   ms: number;
 }
-export type ObservationClass = 'ok' | 'blocked' | 'gone' | 'oversize' | 'trouble' | 'notimage';
+export type ObservationClass = 'ok' | 'blocked' | 'gone' | 'oversize' | 'placeholder' | 'trouble' | 'notimage';
 
-/** What one fetch says about the host. Blocked, trouble and notimage count toward a pause; only a good image resets it. */
+/**
+ * What one fetch says about the host. Blocked, trouble and notimage count toward a pause; only a good image resets it. Gone, oversize
+ * and placeholder (a body the host's policy row lists as its `display_gated` plate, e.g. what MFC shows an anonymous visitor in place
+ * of a picture) are verdicts on one file: they neither count nor reset.
+ */
 export function classifyObservation(o: FetchObservation): ObservationClass {
   if (o.ok) return o.notImage === true ? 'notimage' : 'ok';
   if (o.signals?.['cf-mitigated'] !== undefined) return 'blocked';
+  if (o.reason === 'display-gated') return 'placeholder';
   if (o.reason === 'refused') return 'blocked';
   if (o.reason === 'not-image' && o.status !== undefined && o.status >= 200 && o.status <= 299) return 'blocked';
   if (o.reason === 'too-large') return 'oversize';
@@ -101,7 +106,7 @@ export function createFetchObserver(opts: { pauseAfter: number; now: () => numbe
   let trip: string | undefined;
   let stopped: string | undefined;
   // Blocked fetches AND fetches that erred (a 5xx, a timeout, a dropped connection) are one streak: a dead or throttling origin
-  // must not be asked for the rest of the list at the full pace. A success resets it; gone and oversize are verdicts on one url.
+  // must not be asked for the rest of the list at the full pace. A success resets it; gone, oversize and placeholder are verdicts on one url.
   const fail = (o: FetchObservation): void => {
     streak += 1;
     if (streak >= opts.pauseAfter) trip = `${streak} consecutive blocked or failed fetches (last: ${o.ok ? 'a body that is not an image' : (o.status ?? o.reason)} on ${pathOf(o.url)})`;
@@ -234,7 +239,7 @@ export function createOutcomeMemory(max: number): { get(url: string): StoreVerdi
 export const DEFAULT_OUTCOME_MEMORY = 200_000;
 const SETTLED_AS: Record<StoreVerdict, Settled> = { stored: 'stored', too_large: 'skipped:too_large', not_image: 'skipped:not_image' };
 
-export type Settled = 'stored' | 'gone' | 'oversize' | 'skipped:too_large' | 'skipped:not_image';
+export type Settled = 'stored' | 'gone' | 'oversize' | 'placeholder' | 'skipped:too_large' | 'skipped:not_image';
 /**
  * Settlement is per (item, url), not per url: an item that shares a picture with another still needs its OWN depiction reported
  * (the hook's memo hit does that without a second fetch), so a url settled for one item says nothing about the next. `item` is
@@ -275,7 +280,7 @@ export function createFileLedger(file: string): GalleryLedger {
       try {
         const r = JSON.parse(line) as Record<string, unknown>;
         if (r === null || typeof r !== 'object' || Array.isArray(r)) continue;
-        if (typeof r.i === 'string' && typeof r.u === 'string' && (r.s === 'stored' || r.s === 'gone' || r.s === 'oversize' || r.s === 'skipped:too_large' || r.s === 'skipped:not_image')) memory.settle(r.i, r.u, r.s);
+        if (typeof r.i === 'string' && typeof r.u === 'string' && (r.s === 'stored' || r.s === 'gone' || r.s === 'oversize' || r.s === 'placeholder' || r.s === 'skipped:too_large' || r.s === 'skipped:not_image')) memory.settle(r.i, r.u, r.s);
         else if ('pause' in r) {
           if (typeof r.pause === 'number') memory.pause(r.pause, String(r.why ?? ''));
           else if (r.pause === null) memory.clearPause();
@@ -456,8 +461,11 @@ export function judgeProbe(input: { observations: FetchObservation[]; requests: 
   const add = (text: string) => reasons.set(text, (reasons.get(text) ?? 0) + 1);
   const byUrl = new Map(requests.map(r => [r.url, r] as const));
 
+  let placeholders = 0;
   for (const o of observations) {
     if (o.signals?.['cf-mitigated'] !== undefined) add(`challenge: cf-mitigated ${o.signals['cf-mitigated']}`);
+    // the host's listed placeholder: the path carried the bytes, and the host withheld that one picture; a verdict on the file
+    if (classifyObservation(o) === 'placeholder') { placeholders++; continue; }
     if (!o.ok) {
       if (o.reason === 'not-image') add(`not an image: a ${o.status ?? '2xx'} answered with ${o.contentType ?? 'no content type'}`);
       else add(`status ${o.status ?? o.reason ?? 'unknown'} (${o.reason ?? 'failed'})`);
@@ -481,6 +489,9 @@ export function judgeProbe(input: { observations: FetchObservation[]; requests: 
   if (overImpit > 0) {
     notes.push(`${overImpit} request(s) went over impit: the wire also carried the impersonation profile's own browser headers (client hints, sec-fetch-*, accept-language, accept-encoding), which sentHeaderNames does not list; the session holds no cookie jar`);
   }
+  if (placeholders > 0) {
+    notes.push(`${placeholders} file(s) answered with the host's listed placeholder (display_gated: the picture is withheld from this anonymous view); never stored, and a real run settles each as placeholder`);
+  }
   const overHome = requests.filter(r => r.egress === 'residential').length;
   if (overHome > 0) notes.push(`${overHome} request(s) left through the residential exit (the home line), not this node's own address`);
 
@@ -501,6 +512,9 @@ export function judgeProbe(input: { observations: FetchObservation[]; requests: 
   const reasonList = [...reasons].map(([text, n]) => (n > 1 ? `${text} (x${n})` : text));
   if (reasonList.length > 0) return { verdict: 'FAIL', reasons: reasonList, notes, evidence };
   if (observations.length === 0) return { verdict: 'INCONCLUSIVE', reasons: ['no request was made'], notes, evidence };
+  if (placeholders === observations.length) {
+    return { verdict: 'INCONCLUSIVE', reasons: ['every file was the host\'s listed placeholder: the path carried bytes, but no picture'], notes, evidence };
+  }
   const unrecorded = observations.filter(o => o.ok && !byUrl.has(o.url)).length;
   if (unrecorded > 0) {
     return { verdict: 'INCONCLUSIVE', reasons: [`no request record for ${unrecorded} fetched file(s): what was sent cannot be shown, so "no cookies" is not proven`], notes, evidence };
@@ -602,6 +616,8 @@ export interface GalleryReport {
   stored: number;
   gone: number;
   oversize: number;
+  /** Pairs settled `placeholder`: the host answered with a body its policy row lists as a placeholder (never stored, never asked for again). */
+  placeholder: number;
   /** Pairs settled `skipped:too_large`: the raw store skips bodies over its own ceiling. */
   skippedTooLarge: number;
   /** Pairs settled `skipped:not_image`: the raw store skips a body that is empty or not JPEG, PNG, GIF, WebP or AVIF. */
@@ -707,7 +723,7 @@ function preflight(policy: ImageHostPolicy, pageUrl: string, hosts: readonly str
 export async function runGalleryCapture(deps: GalleryDeps, opts: GalleryRunOptions): Promise<GalleryReport> {
   const mode: GalleryReport['mode'] = opts.probe !== undefined ? 'probe' : opts.dryRun === true ? 'dry-run' : 'run';
   const report: GalleryReport = {
-    mode, stopped: 'done', items: 0, planned: 0, fetched: 0, stored: 0, gone: 0, oversize: 0, skippedTooLarge: 0, skippedNotImage: 0, blocked: 0, trouble: 0,
+    mode, stopped: 'done', items: 0, planned: 0, fetched: 0, stored: 0, gone: 0, oversize: 0, placeholder: 0, skippedTooLarge: 0, skippedNotImage: 0, blocked: 0, trouble: 0,
     skippedLedger: 0, notAllowedHost: 0, badLines: 0, entriesCapped: 0, itemsWithFailures: 0, bytesRead: 0, budget: deps.meter?.max ?? null,
   };
   const started = deps.now();
@@ -800,9 +816,10 @@ export async function runGalleryCapture(deps: GalleryDeps, opts: GalleryRunOptio
       const sinkAfter = deps.sink?.stats();
       const obs = deps.observer.take();
 
-      // `failed` also counts fetch faults the observations already account for; what is left is the sink losing bytes
-      // we did fetch. Such an item is re-driven whole rather than settled, so a stored-but-lost file is never forgotten.
-      const accounted = obs.filter(o => !o.ok && (o.reason === 'http-status' || o.reason === 'timeout' || o.reason === 'threw')).length;
+      // `failed` also counts fetch faults the observations already account for (and a placeholder, which the hook files as a failure);
+      // what is left is the sink losing bytes we did fetch. Such an item is re-driven whole rather than settled, so a stored-but-lost
+      // file is never forgotten.
+      const accounted = obs.filter(o => !o.ok && (o.reason === 'http-status' || o.reason === 'timeout' || o.reason === 'threw' || o.reason === 'display-gated')).length;
       // The store SKIPS some bodies and still calls them admitted. It checks, in this order: empty, over its ceiling, not JPEG/PNG/GIF/WebP/AVIF
       // by magic bytes. The fetched sizes and the observer's sniff (the sink's own function) say which of this item's files it skipped and why,
       // so each is settled by its own verdict. A skip the fetched bodies do not account for (the lane off, or more skips than bodies that
@@ -840,6 +857,7 @@ export async function runGalleryCapture(deps: GalleryDeps, opts: GalleryRunOptio
         if (verdict !== undefined) deps.ledger.settle(itemKey, url, SETTLED_AS[verdict]);
         else if (c === 'gone') deps.ledger.settle(itemKey, url, 'gone');
         else if (c === 'oversize') deps.ledger.settle(itemKey, url, 'oversize');
+        else if (c === 'placeholder') deps.ledger.settle(itemKey, url, 'placeholder');
       }
       // Bytes the store lost are not at rest, whatever the hook's memo was told when it admitted them: take the urls out of it, so a
       // later item sharing one fetches it itself (and the store is asked again) rather than being told it is stored.
@@ -855,7 +873,8 @@ export async function runGalleryCapture(deps: GalleryDeps, opts: GalleryRunOptio
         const was = new Map(skips(before.skipped));
         const delta = (k: string, v: number): number => v - (was.get(k) ?? 0);
         const memoHits = skips(after.skipped).filter(([k]) => k === 'memo').reduce((n, [k, v]) => n + delta(k, v), 0);
-        const otherSkips = skips(after.skipped).filter(([k]) => k !== 'memo').reduce((n, [k, v]) => n + delta(k, v), 0);
+        // a placeholder is a skip the hook counts for a file it DID fetch (settled above), so it explains no unfetched one
+        const otherSkips = skips(after.skipped).filter(([k]) => k !== 'memo' && k !== 'displayGated').reduce((n, [k, v]) => n + delta(k, v), 0);
         if (unfetched.length > 0 && memoHits === unfetched.length && otherSkips === 0) {
           let unconfirmed = 0;
           for (const e of unfetched) {

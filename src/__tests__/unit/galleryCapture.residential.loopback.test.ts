@@ -156,14 +156,32 @@ describe('the residential exit, through the real Job entry', () => {
     expect(lb.a[2]!.t - lb.a[1]!.t).toBeGreaterThanOrEqual(1400);
   });
 
-  it('a listed placeholder is refused (never stored), and the bytes it cost are counted', async () => {
-    items([{ id: 1, paths: ['img/ph.jpeg'] }, { id: 2, paths: ['img/2.jpeg'] }]);
+  it('a listed placeholder is a verdict on that one file: settled, never stored, its bytes counted, and the next run asks for nothing', async () => {
+    items([{ id: 1, paths: ['img/g1.jpeg', 'img/ph.jpeg', 'img/g2.jpeg'] }, { id: 2, paths: ['img/2.jpeg'] }]);
     const sha = createHash('sha256').update(png('A:ph.jpeg')).digest('hex');
-    const r = await runCli(base(), resEnv({ IMAGE_HOST_POLICY_JSON: JSON.stringify({ localhost: { ...ROW, placeholders: { [sha]: 'display_gated' } } }) }));
-    // exit 6 / itemsWithFailures: the driver's pre-GAL-RES handling of a display-gated answer on every lane (reported, not changed here)
-    expect(r.code).toBe(6);
-    expect(r.report).toMatchObject({ fetched: 2, stored: 1, itemsWithFailures: 1, bytesRead: pngLen('img/ph.jpeg') + pngLen('img/2.jpeg') });
-    expect(lb.puts.filter(p => p.replied).map(p => p.meta['x-amz-meta-url'])).toEqual([url('img/2.jpeg')]);
+    const env = resEnv({ IMAGE_HOST_POLICY_JSON: JSON.stringify({ localhost: { ...ROW, placeholders: { [sha]: 'display_gated' } } }) });
+    const r = await runCli(base(), env);
+    expect(r.code).toBe(0);
+    expect(r.report).toMatchObject({
+      fetched: 4, stored: 3, placeholder: 1, trouble: 0, itemsWithFailures: 0,
+      bytesRead: ['img/g1.jpeg', 'img/ph.jpeg', 'img/g2.jpeg', 'img/2.jpeg'].reduce((n, p) => n + pngLen(p), 0),
+    });
+    expect(lb.puts.filter(p => p.replied).map(p => p.meta['x-amz-meta-url']).sort()).toEqual([url('img/2.jpeg'), url('img/g1.jpeg'), url('img/g2.jpeg')]);
+    expect(readLedger(ledger).map(x => [x.u, x.s])).toContainEqual([url('img/ph.jpeg'), 'placeholder']);
+    const again = await runCli(base(), env);
+    expect(again.code).toBe(0);
+    expect(again.report).toMatchObject({ fetched: 0, skippedLedger: 4 });
+    expect(lb.a).toHaveLength(4);
+  });
+
+  it('three placeholders in a row neither pause the run nor stop the item after them', async () => {
+    items([{ id: 1, paths: ['img/a.jpeg'] }, { id: 2, paths: ['img/g.jpeg', 'img/p1.jpeg', 'img/p2.jpeg', 'img/p3.jpeg'] }, { id: 3, paths: ['img/z.jpeg'] }]);
+    const shas = Object.fromEntries(['p1.jpeg', 'p2.jpeg', 'p3.jpeg'].map(p => [createHash('sha256').update(png(`A:${p}`)).digest('hex'), 'display_gated']));
+    const r = await runCli(base(), resEnv({ IMAGE_HOST_POLICY_JSON: JSON.stringify({ localhost: { ...ROW, placeholders: shas } }) }));
+    expect(r.code).toBe(0);
+    expect(r.out).not.toMatch(/PAUSED/);
+    expect(r.report).toMatchObject({ stopped: 'done', fetched: 6, stored: 3, placeholder: 3, itemsWithFailures: 0 });
+    expect(lb.a.map(s => s.path)).toEqual(['/img/a.jpeg', '/img/g.jpeg', '/img/p1.jpeg', '/img/p2.jpeg', '/img/p3.jpeg', '/img/z.jpeg']);
   });
 
   it('three challenged fetches pause the run (exit 3); no fourth request goes through the exit', async () => {
