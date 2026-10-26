@@ -3,12 +3,15 @@
  *
  * Composes the gallery driver from the pieces the ingest image lane already uses: the same capture hook (the same
  * sink and spine reporter built from the same env), the same host policy table, the same per-host pacing wrapper with
- * the limiter's rate taken from IMAGE_HOST_RATE_JSON, and a plain-http-only bytes router — so any other lane is
- * `unsupported` by construction, not by configuration. Nothing here fetches an image itself.
+ * the limiter's rate taken from IMAGE_HOST_RATE_JSON, and a bytes router over two lanes only: plain http, and impit
+ * (galleryImpitLane.ts: chrome profile, no cookie jar, no stored cookies, no proxy) — so the browser lane is `unsupported`
+ * by construction, not by configuration. The policy row picks the lane; the egress is always direct: a residential row is
+ * refused unless GALLERY_EGRESS=direct overrides it to direct, and GALLERY_EGRESS=residential is refused outright (the home
+ * line is Ross's decision). Nothing here fetches an image itself.
  *
  * Exit codes (one meaning each): 0 done (or a limit reached), 1 the run crashed, 2 bad arguments, input or config (nothing ran),
- * 3 paused (a block, a failure storm, or a live pause marker), 4 refused (lane off or the host policy is not plain http + direct),
- * 5 probe not a PASS (a probe exits by its printed verdict: 0 or 5), 6 the raw store did not confirm some item's files (unsettled, run again), 7 stopped by SIGTERM/SIGINT or by
+ * 3 paused (a block, a failure storm, or a live pause marker), 4 refused (lane off, the host policy puts an allowed host on the
+ * browser lane or on residential egress, or GALLERY_EGRESS=residential), 5 probe not a PASS (a probe exits by its printed verdict: 0 or 5), 6 the raw store did not confirm some item's files (unsettled, run again), 7 stopped by SIGTERM/SIGINT or by
  * losing the lock, 8 LOCKED (another run holds the lease; this one made no request).
  */
 import { existsSync } from 'node:fs';
@@ -21,9 +24,11 @@ import { createImageHostLimiter, createImageCaptureHookFromEnv } from './assembl
 import { acquireRunLock, LOCK_HEARTBEAT_MS } from './galleryLock.js';
 import { readWorklistFile } from './galleryWorklist.js';
 import {
-  DEFAULT_OUTCOME_MEMORY, allowedHostnames, createFetchObserver, createFileLedger, createMemoryLedger, createRecordingFetch, followAllowedRedirects, gateOnStop, originEntryText, parseAllowedOrigin, runGalleryCapture,
+  DEFAULT_OUTCOME_MEMORY, allowedHostnames, createFetchObserver, createFileLedger, createMemoryLedger, createRecordingFetch, followAllowedRedirects, gateOnStop, guardGalleryDispatch, originEntryText, parseAllowedOrigin,
+  runGalleryCapture, withDirectEgress,
   type ConfirmingSink, type GalleryLedger, type GalleryReport,
 } from './galleryDriver.js';
+import { createGalleryImpitFetch, galleryImpitFactory, impitReadyFirst, type GalleryImpitFactory } from './galleryImpitLane.js';
 import { createHttpBytesFetch, type BytesFetchImpl } from './httpBytesFetch.js';
 import { imageHostRateFor } from './imageHostRates.js';
 import type { ImageBytesFetcher } from './imageBytes.js';
@@ -36,7 +41,7 @@ const MAX_PROBE = 200;
 const SOURCE_CLASSES: readonly string[] = ['manufacturer_press', 'retailer_studio', 'user_photo', 'unknown'];
 const USAGE =
   'usage: gallery:capture --worklist <file.jsonl> --ledger <file.jsonl> [--probe [N]] [--max-files N] [--max-minutes N] ' +
-  '[--pause-after N] [--pause-minutes N] [--resume] [--dry-run] [--source-class <class>]  (env: GALLERY_WORKLIST_PATH, GALLERY_LEDGER_PATH, GALLERY_ALLOWED_HOSTS = [http://]host[:port] (bare = https), GALLERY_LOCK_PATH)';
+  '[--pause-after N] [--pause-minutes N] [--resume] [--dry-run] [--source-class <class>]  (env: GALLERY_WORKLIST_PATH, GALLERY_LEDGER_PATH, GALLERY_ALLOWED_HOSTS = [http://]host[:port] (bare = https), GALLERY_LOCK_PATH, GALLERY_EGRESS = direct)';
 
 /** The lease file's name beside GALLERY_LEDGER_PATH: one name, so every ledger kept there shares one lock. */
 const LOCK_FILE_NAME = 'gallery-capture.lock';
@@ -54,6 +59,8 @@ export interface GalleryArgs {
   sourceClass: SourceClass;
   resume: boolean;
   dryRun: boolean;
+  /** GALLERY_EGRESS: `direct` turns a residential policy row direct; `residential` is parsed only to be refused (exit 4). */
+  egress?: 'direct' | 'residential';
 }
 
 function whole(flag: string, v: string | undefined, max: number): number {
@@ -83,6 +90,13 @@ export function parseGalleryArgs(argv: readonly string[], env: NodeJS.ProcessEnv
   if (env.GALLERY_SOURCE_CLASS) {
     if (!SOURCE_CLASSES.includes(env.GALLERY_SOURCE_CLASS)) throw new Error(`${USAGE} (GALLERY_SOURCE_CLASS must be one of ${SOURCE_CLASSES.join(', ')})`);
     out.sourceClass = env.GALLERY_SOURCE_CLASS as SourceClass;
+  }
+  const egress = env.GALLERY_EGRESS?.trim().toLowerCase();
+  if (egress) {
+    if (egress !== 'direct' && egress !== 'residential') {
+      throw new Error(`${USAGE} (GALLERY_EGRESS must be direct, or unset to take each host's egress from its policy row)`);
+    }
+    out.egress = egress;
   }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
@@ -130,8 +144,10 @@ export interface GalleryMainDeps {
   policy?: ImageHostPolicy;
   /** The http lane's transport (default: the global fetch). */
   baseFetch?: BytesFetchImpl;
-  /** The capture hook over the composed fetcher (default: the env-built one, 100 images per item). */
-  makeHook?: (fetchBytes: ImageBytesFetcher, env: NodeJS.ProcessEnv) => ImageCaptureHook;
+  /** The impit lane's session (default: the real impit, chrome profile, no cookie jar, no proxy, no redirect following). */
+  makeImpit?: GalleryImpitFactory;
+  /** The capture hook over the composed fetcher and the run's policy (default: the env-built one, 100 images per item). */
+  makeHook?: (fetchBytes: ImageBytesFetcher, env: NodeJS.ProcessEnv, policy: ImageHostPolicy) => ImageCaptureHook;
   /** Drain the raw store sink before exit (default: flushRawCaptureSink). */
   flush?: () => Promise<unknown>;
   /** How often the lease is refreshed (default 10 s). */
@@ -144,6 +160,10 @@ export async function main(argv: readonly string[] = process.argv.slice(2), deps
   const now = deps.now ?? Date.now;
   let args: GalleryArgs;
   try { args = parseGalleryArgs(argv, env); } catch (e) { print((e as Error).message); return 2; }
+  if (args.egress === 'residential') {
+    print("REFUSED: GALLERY_EGRESS=residential: the gallery driver never uses the residential exit (the image bytes would cross Ross's home line, which is his decision); unset it, or set GALLERY_EGRESS=direct. No request was made");
+    return 4;
+  }
   const cleartext = args.allowedHosts.filter(e => e.startsWith('http://'));
   if (cleartext.length > 0) {
     print(`WARNING: GALLERY_ALLOWED_HOSTS allows cleartext http for ${cleartext.join(', ')}: what is fetched from there crosses the network unencrypted. List an http:// entry only for a host that is not served over https`);
@@ -208,12 +228,26 @@ export async function main(argv: readonly string[] = process.argv.slice(2), deps
     const observer = createFetchObserver({ pauseAfter: args.pauseAfter, now });
     const recording = createRecordingFetch(deps.baseFetch);
     const limiter: HostRateLimiter = createImageHostLimiter(env);
-    // observer( follow-by-hand( paced( http lane over the manual-redirect transport ) ) ): every hop is paced and checked
-    // gateOnStop sits under the pacer: a request already waiting for its slot is refused when its wait ends, if the run has been stopped
-    const paced = paceImageBytesByHost(gateOnStop(createImageBytesRouter({ http: createHttpBytesFetch({ fetchImpl: recording.fetchImpl }) }), observer.stopped), limiter);
+    // observer( follow-by-hand( paced( stop gate( dispatch guard( http | impit lane, each over a recorded manual-redirect transport ) ) ) ) ):
+    // every hop is paced and checked. gateOnStop sits under the pacer: a request already waiting for its slot is refused when its wait
+    // ends, if the run has been stopped. The guard refuses, per request, any proxy or residential egress and any UA but the lanes' Chrome string.
+    // impitReadyFirst sits over the pacer: impit's session is built before an impit request takes its slot.
+    const impit = createGalleryImpitFetch({ makeImpit: deps.makeImpit ?? galleryImpitFactory(), wrap: recording.wrapImpit });
+    const lanes = createImageBytesRouter({ http: createHttpBytesFetch({ fetchImpl: recording.fetchImpl }), impit });
+    const paced = impitReadyFirst(paceImageBytesByHost(gateOnStop(guardGalleryDispatch(lanes), observer.stopped), limiter), impit);
     const fetchBytes = observer.wrap(followAllowedRedirects(paced, { allowedHosts: args.allowedHosts, locationOf: recording.takeLocation }));
-    const policy = deps.policy ?? loadImageHostPolicy(env);
-    const hook = (deps.makeHook ?? ((f, e) => createImageCaptureHookFromEnv({ ...e, IMAGE_MAX_PER_ITEM: '100' }, { fetchBytes: f, policy })))(fetchBytes, env);
+    // The policy row picks each host's lane. GALLERY_EGRESS=direct keeps the row and makes its egress direct; the hook and the driver's
+    // preflight both see the policy given here, and each host it changes is named before the run starts.
+    const rows = deps.policy ?? loadImageHostPolicy(env);
+    const policy = args.egress === 'direct' ? withDirectEgress(rows) : rows;
+    if (args.egress === 'direct') {
+      for (const host of allowedHostnames(args.allowedHosts)) {
+        if (rows.ruleFor(host).egress === 'residential') {
+          print(`EGRESS ${host}: the policy row says residential; GALLERY_EGRESS=direct fetches it from this node's own address, on the lane the row names, never through the home line`);
+        }
+      }
+    }
+    const hook = (deps.makeHook ?? ((f, e, p) => createImageCaptureHookFromEnv({ ...e, IMAGE_MAX_PER_ITEM: '100' }, { fetchBytes: f, policy: p })))(fetchBytes, env, policy);
 
     const rawSink = getRawCaptureSink() as unknown as Partial<ConfirmingSink>;
     const sink: ConfirmingSink | undefined = deps.sink ?? (typeof rawSink.stats === 'function' && typeof rawSink.flush === 'function' ? (rawSink as ConfirmingSink) : undefined);

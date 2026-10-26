@@ -11,6 +11,8 @@ import {
 import type { WorklistItem } from '../../services/images/galleryWorklist';
 
 export const STATIC = 'static.myfigurecollection.net';
+/** AI crawler user agents and robots tokens (the policy table's list and kin). Tests may name them; engine source may not. */
+export const AI_CRAWLER_UA = /claude|anthropic|gptbot|chatgpt|oai-searchbot|ccbot|bytespider|amazonbot|google-extended|meta-external|applebot-extended|perplexity|cohere-ai|diffbot/i;
 export const U = (n: number | string) => `https://${STATIC}/upload/pictures/2022/10/14/${n}.jpeg`;
 export const PAGE = (id: string) => `https://myfigurecollection.net/item/${id}`;
 export const PNG = (n: number, size = 11) => Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, n, n, n]), Buffer.alloc(Math.max(0, size - 11))]);

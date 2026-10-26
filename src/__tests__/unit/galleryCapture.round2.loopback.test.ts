@@ -221,26 +221,34 @@ describe('R2-S1: the lock is a lease, not a pid', () => {
 
 describe('N3: the lock protects the host, not one ledger file', () => {
   it('a probe with its own --ledger cannot run beside a live run', async () => {
-    writeWorklist(lb, wl, [{ id: 1, paths: ['slow/1.jpeg', 'img/2.jpeg'] }]);
-    const first = startCli(base(), envR());
+    lb.setS3('hold');
+    writeWorklist(lb, wl, [{ id: 1, paths: ['img/1.jpeg'] }, { id: 2, paths: ['img/2.jpeg'] }]);
+    // the first run's first item waits for the store, which the test answers only when it releases it: that run holds its lock until then
+    const first = startCli(base(), envR({ RAW_STORE_IMAGE_PUT_TIMEOUT_MS: '600000' }));
     const t0 = Date.now();
-    while (lb.a.length < 1 && Date.now() - t0 < 30_000) await new Promise(r => setTimeout(r, 25));
+    while (lb.puts.length < 1 && Date.now() - t0 < 100_000) await new Promise(r => setTimeout(r, 25));
     const probe = await runCli(['--worklist', wl, '--ledger', path.join(dir, 'probe-ledger.jsonl'), '--probe', '2'], envR());
     expect(probe.code).toBe(8);
-    expect(lb.a.length).toBeLessThanOrEqual(1);
+    expect(lb.a.map(s => s.path)).toEqual(['/img/1.jpeg']);
+    lb.release();
     expect((await first.done).code).toBe(0);
+    expect(lb.a.map(s => s.path)).toEqual(['/img/1.jpeg', '/img/2.jpeg']);
   });
 
   it('GALLERY_LOCK_PATH moves the lock', async () => {
-    writeWorklist(lb, wl, [{ id: 1, paths: ['slow/1.jpeg'] }]);
+    lb.setS3('hold');
+    writeWorklist(lb, wl, [{ id: 1, paths: ['img/1.jpeg'] }]);
     const elsewhere = path.join(dir, 'elsewhere.lock');
-    const first = startCli(base(), envR({ GALLERY_LOCK_PATH: elsewhere }));
+    // the first run's first item waits for the store, which the test answers only when it releases it: that run holds its lock until then
+    const first = startCli(base(), envR({ GALLERY_LOCK_PATH: elsewhere, RAW_STORE_IMAGE_PUT_TIMEOUT_MS: '600000' }));
     const t0 = Date.now();
-    while (!existsSync(elsewhere) && Date.now() - t0 < 30_000) await new Promise(r => setTimeout(r, 25));
+    while (lb.puts.length < 1 && Date.now() - t0 < 100_000) await new Promise(r => setTimeout(r, 25));
     expect(existsSync(elsewhere)).toBe(true);
     expect(existsSync(lockPath)).toBe(false);
     const second = await runCli(base(), envR({ GALLERY_LOCK_PATH: elsewhere }));
     expect(second.code).toBe(8);
+    expect(lb.a.length).toBe(1);
+    lb.release();
     expect((await first.done).code).toBe(0);
     expect(existsSync(elsewhere)).toBe(false);
   });

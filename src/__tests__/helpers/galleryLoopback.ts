@@ -15,6 +15,7 @@ import { createHash } from 'node:crypto';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import zlib from 'node:zlib';
 
 export interface Seen {
@@ -70,7 +71,8 @@ export function png(tag: string): Buffer {
   ]);
 }
 
-export type S3Mode = 'ok' | 'fail500' | { slowMs: number };
+/** `hold`: every PUT is answered only when the test calls `release()` (a run waiting for the store to confirm holds its lock until then). */
+export type S3Mode = 'ok' | 'fail500' | 'hold' | { slowMs: number };
 
 export interface Loopback {
   portA: number;
@@ -91,6 +93,8 @@ export interface Loopback {
   setS3(mode: S3Mode): void;
   /** `http://localhost:<portA>/<path>`. */
   urlA(p: string): string;
+  /** Answer every PUT the `hold` S3 mode is keeping, and answer later ones at once. */
+  release(): void;
   close(): Promise<void>;
 }
 
@@ -101,6 +105,8 @@ function listen(server: http.Server): Promise<number> {
 export async function startLoopback(initialS3: S3Mode = 'ok'): Promise<Loopback> {
   const lb: Partial<Loopback> & { a: Seen[]; a2: Seen[]; b: Seen[]; s3: Seen[]; puts: Put[]; ing: string[] } = { a: [], a2: [], b: [], s3: [], puts: [], ing: [] };
   let s3mode: S3Mode = initialS3;
+  /** PUT answers the `hold` S3 mode keeps until the test calls release(). */
+  const held: Array<() => void> = [];
   const seen = (req: http.IncomingMessage): Seen => ({ method: req.method ?? '', path: req.url ?? '', host: req.headers.host ?? '', headers: req.headers, t: clock() });
 
   const A = http.createServer((req, res) => {
@@ -116,6 +122,12 @@ export async function startLoopback(initialS3: S3Mode = 'ok'): Promise<Loopback>
     };
     switch (kind) {
       case 'img': return img();
+      // a picture whose response sets a cookie: a client that keeps cookies would send it back on its next request
+      case 'cookie': {
+        const b = png(`A:${rest}`);
+        res.writeHead(200, { 'content-type': 'image/png', 'content-length': b.length, 'set-cookie': `__cf_bm=LOOPBACKSET${rest.length}; Path=/; HttpOnly` });
+        return void res.end(b);
+      }
       // a redirect to an OFF-HOST target (127.0.0.1 is not the allowed host `localhost`)
       case 'redir': res.writeHead(302, { location: `http://127.0.0.1:${(B.address() as { port: number }).port}/stolen/${rest}` }); return void res.end();
       // a redirect to ANOTHER PORT on the allowed host name (a different origin)
@@ -203,7 +215,8 @@ export async function startLoopback(initialS3: S3Mode = 'ok'): Promise<Loopback>
         res.writeHead(200);
         res.end();
       };
-      if (typeof s3mode === 'object' && req.method === 'PUT') setTimeout(reply, s3mode.slowMs);
+      if (s3mode === 'hold' && req.method === 'PUT') held.push(reply);
+      else if (typeof s3mode === 'object' && req.method === 'PUT') setTimeout(reply, s3mode.slowMs);
       else reply();
     });
   });
@@ -220,7 +233,12 @@ export async function startLoopback(initialS3: S3Mode = 'ok'): Promise<Loopback>
 
   const [portA, portA2, portB, portS3, portIng] = await Promise.all([listen(A), listen(A2), listen(B), listen(S3), listen(ING)]);
   const servers = [A, A2, B, S3, ING];
+  const release = (): void => {
+    if (s3mode === 'hold') s3mode = 'ok';
+    for (const answer of held.splice(0)) answer();
+  };
   const closeAll = async (): Promise<void> => {
+    held.length = 0;
     for (const s of servers) s.closeAllConnections();
     await Promise.all(servers.map(s => new Promise<void>(resolve => s.close(() => resolve()))));
   };
@@ -228,6 +246,7 @@ export async function startLoopback(initialS3: S3Mode = 'ok'): Promise<Loopback>
     portA, portA2, portB, portS3, portIng,
     setS3: (m: S3Mode) => { s3mode = m; },
     urlA: (p: string) => `http://localhost:${portA}/${p}`,
+    release,
     close: closeAll,
   }) as Loopback;
 }
@@ -336,6 +355,22 @@ export async function runCli(args: string[], env: NodeJS.ProcessEnv): Promise<{ 
   const r = await startCli(args, env).done;
   const line = /^GALLERY-REPORT (.*)$/m.exec(r.out);
   return { code: r.code, out: r.out, report: line ? JSON.parse(line[1]!) as Record<string, unknown> : undefined };
+}
+
+const DISPATCH_CLOCK = path.join(__dirname, 'galleryDispatchClock.mjs');
+export interface Dispatch { t: number; lane: 'http' | 'impit'; url: string }
+/**
+ * The env for a CLI run that logs, from inside the Job process, the moment each request is handed to its transport
+ * (galleryDispatchClock.mjs). Spacing measured there is what the per-host limiter controls; a server's arrival times also carry
+ * each request's own connection setup, which only the first request to a host pays.
+ */
+export function withDispatchClock(env: NodeJS.ProcessEnv, file: string): NodeJS.ProcessEnv {
+  return { ...env, GALLERY_TEST_DISPATCH_LOG: file, NODE_OPTIONS: `${env.NODE_OPTIONS ?? ''} --import ${pathToFileURL(DISPATCH_CLOCK).href}`.trim() };
+}
+/** The dispatches a run logged, in order (empty when it logged none). */
+export function readDispatches(file: string): Dispatch[] {
+  if (!existsSync(file)) return [];
+  return readFileSync(file, 'utf8').split('\n').filter(l => l.trim() !== '').map(l => JSON.parse(l) as Dispatch);
 }
 
 /** The ledger's records, parsed. */

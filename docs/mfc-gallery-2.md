@@ -44,8 +44,19 @@ The scraper must not read the spine database, so the work list is a file the ope
    because a host with no decided rate would run at the limiter default.
 2. **Host policy row** (config, `IMAGE_HOST_POLICY_JSON`): `{"static.myfigurecollection.net":{"lane":"http","egress":"direct"}}`.
    Without it an on-store host inherits MFC's declared transport (`imageHostPolicy.ts:300-303`). The http lane sends
-   no cookies of its own (`httpBytesFetch.ts` header). The driver composes an http-only router, so any other lane is
-   `unsupported`, and it also refuses to start unless the policy resolves every allowed host to http + direct.
+   no cookies of its own (`httpBytesFetch.ts` header). The driver composes a router over two lanes, so the browser lane is
+   `unsupported`, and it also refuses to start unless the policy resolves every allowed host to http or impit with direct egress.
+   **The impit lane (GAL-IMPIT).** The row's lane is honoured: `"lane":"impit"` fetches through the shared impit image transport
+   (`impitBytesFetch.ts`) with the gallery's own session (`galleryImpitLane.ts`): impit's `chrome` profile, NO cookie jar (impit then
+   neither keeps nor sends a cookie), no stored cookies or minted UA from `CF_COOKIE_FILE`, no proxy, `followRedirects: false` (the
+   driver follows by hand, as on the http lane), the http lane's 15 s per-image timeout. The session is built before the first impit
+   request takes its pacing slot. The row's `ua` stands: `chrome` puts `IMAGE_CHROME_UA` over the profile's own, `default` lets the
+   profile's own Chrome UA and client hints speak. **Egress is always direct.** A residential row is refused (exit 4) unless the Job
+   sets `GALLERY_EGRESS=direct`, which keeps the row and makes its egress direct (named at start: `EGRESS <host>: ...`);
+   `GALLERY_EGRESS=residential` is refused outright (exit 4): the residential exit would put the bytes on Ross's home line, which is
+   his decision. Every request is also checked at dispatch (under the pacer): a proxy, residential egress, or any user agent other than
+   the lanes' Chrome string (`IMAGE_CHROME_UA`) is refused, so no setting can make the gallery identify as a crawler. A probe that used
+   impit adds a note: the wire also carried the profile's own browser headers, which the header-name evidence does not list.
 3. **Gallery driver** (`galleryDriver.ts`): reads the work list in file order; skips (item, url) pairs the ledger has settled; builds one
    `ImageCaptureRequest` per item whose synthetic `describeImages` returns `{url, role:'gallery', position, sourceClass}`;
    awaits `hook.capture()` (sequential, one item at a time); observes every fetch; then waits for the raw store sink to
@@ -93,15 +104,15 @@ The scraper must not read the spine database, so the work list is a file the ope
    (`src/__tests__/fixtures/galleryCanonicalVectors.json`, 62 vectors) and pin the same digest over a 4,000-url fixed-seed fuzz set.
    A gallery over 100 entries keeps the first 100 by position and reports the rest (`entriesCapped`); it is never dropped whole.
 5. **Probe** (`--probe [N=20]`): the first N files of the work list through the real hook and sink, with evidence per
-   request (status, type, size, header NAMES sent, set-cookie seen, cf-mitigated/cf-ray, redirect) and a verdict. PASS only if
+   request (status, type, size, lane, header NAMES sent, set-cookie seen, cf-mitigated/cf-ray, redirect) and a verdict. PASS only if
    every request is a 200 image on the allowed origin, no cookie or authorization header was sent, no challenge signal,
    no redirect off-host, AND the store kept every file: a probe puts its files through the real sink, so a body the store skipped (not an
    image, over its ceiling) or a write it did not confirm makes the verdict FAIL. The exit code follows the printed verdict: 0 for PASS,
    5 for anything else (including a probe that tripped the pause: the marker is written and the PAUSED line printed, but the code is 5).
 6. **Entry**: `npm run gallery:capture` (Job/CronJob, same image as the scraper). One meaning per exit code: 0 done (or a limit),
    1 crash, 2 bad arguments or config (no host named, no rate row for an allowed host, `RAW_STORE_IMAGE_MAX_BYTES` unset, a bad
-   allow-list entry, no lock location), 3 paused (a block, a 5xx storm, or a live pause marker), 4 refused (lane off or the host policy is not plain
-   http + direct), 5 probe not a PASS (a probe exits by its printed verdict: 0 or 5), 6 the raw store did not confirm some item of a real
+   allow-list entry, no lock location), 3 paused (a block, a 5xx storm, or a live pause marker), 4 refused (lane off, an allowed host on the browser
+   lane or on residential egress, or `GALLERY_EGRESS=residential`), 5 probe not a PASS (a probe exits by its printed verdict: 0 or 5), 6 the raw store did not confirm some item of a real
    run (unsettled; run again), 7 stopped by SIGTERM/SIGINT
    or by losing the lock, 8 LOCKED (another run holds the lease; this one made no request).
 7. **One run per host, on a lease; and SIGTERM**: the lock is `GALLERY_LOCK_PATH`, else `gallery-capture.lock` in the directory of
@@ -135,7 +146,8 @@ The scraper must not read the spine database, so the work list is a file the ope
 ## Rollout (nothing applied by this unit)
 
 1. Merge; roll the scraper image. 2. Mount the work list and a small PVC. 3. Probe Job (`--probe 20`) -> read the verdict.
-   If challenged, the fallback is the residential lane at a lower rate (a policy row, not code). 4. Holdings only
+   If challenged on the http lane, the next step is the impit lane with direct egress (GAL-IMPIT: the row's `"lane":"impit"` plus
+   `GALLERY_EGRESS=direct`); the residential exit stays refused by the driver until Ross decides on the home line. 4. Holdings only
    (`--max-files` staged), then figures, then the rest. Desk IMGRATE sets `intervalMs`: Ross chose 333 = 3 files/s (holdings, 14,346 files, about 1.3 h;
    the whole catalogue, about 1.7M files, about 6.6 days).
 
@@ -157,6 +169,8 @@ env:
   PERSIST_RAW_IMAGES: "true"            # the lane must be on; the driver refuses to fetch what would be dropped
   REPORT_CAPTURES: "true"               # + INGEST_BASE_URL, RAW_STORE_S3_* exactly as the scraper Deployment has them
   IMAGE_HOST_POLICY_JSON: '{"static.myfigurecollection.net":{"lane":"http","egress":"direct"}}'
+  # impit instead: '{"static.myfigurecollection.net":{"lane":"impit","egress":"residential","referer":false,"ua":"default",...}}' with
+  GALLERY_EGRESS: direct                # REQUIRED for a residential row (else exit 4); residential is never used by this driver
   IMAGE_HOST_RATE_JSON:   '{"static.myfigurecollection.net":{"intervalMs":333}}'      # desk IMGRATE b: 3 files/s, no speed-up; REQUIRED, the run exits 2 without it
   RAW_STORE_IMAGE_MAX_BYTES: "10485760"  # REQUIRED: the Deployment's value (the sink skips bodies over it); the run exits 2 without it
   GALLERY_LOCK_PATH: /state/gallery-capture.lock   # REQUIRED unless GALLERY_LEDGER_PATH is set: one lease for the host, whatever ledger a run is given
