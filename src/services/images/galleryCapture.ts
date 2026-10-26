@@ -187,6 +187,19 @@ export interface GalleryMainDeps {
   readAllowanceBytes?: number;
 }
 
+/**
+ * The environment's proxy settings, by NAME (a value may carry credentials and is never printed). impit honours HTTP_PROXY, HTTPS_PROXY
+ * and ALL_PROXY, in either case, on every session built without a proxy of its own, and Node's fetch honours HTTP(S)_PROXY under
+ * NODE_USE_ENV_PROXY or --use-env-proxy. Either would carry a request past the dispatch guard while the evidence says direct.
+ * NO_PROXY only exempts hosts, so it is not one of them.
+ */
+const ENV_PROXY_NAMES = new Set(['http_proxy', 'https_proxy', 'all_proxy', 'node_use_env_proxy']);
+export function envProxyVariables(env: NodeJS.ProcessEnv): string[] {
+  const named = Object.keys(env).filter(k => ENV_PROXY_NAMES.has(k.toLowerCase())).sort();
+  if (/(^|\s)--use-env-proxy(\s|=|$)/.test(env.NODE_OPTIONS ?? '')) named.push('NODE_OPTIONS (--use-env-proxy)');
+  return named;
+}
+
 /** Only the work-list entries of the named items (a bad line still passes, to be counted); `onMatch` is told of each one kept. */
 async function* onlyItems<T extends { ok: true; item: { site: string; itemId: string } } | { ok: false }>(
   source: AsyncIterable<T>, wanted: ReadonlySet<string>, onMatch: () => void,
@@ -204,6 +217,11 @@ export async function main(argv: readonly string[] = process.argv.slice(2), deps
   const now = deps.now ?? Date.now;
   let args: GalleryArgs;
   try { args = parseGalleryArgs(argv, env); } catch (e) { print((e as Error).message); return 2; }
+  const proxied = envProxyVariables(env);
+  if (proxied.length > 0) {
+    print(`REFUSED: the environment sets ${proxied.join(', ')}: impit or Node's fetch would send this run's requests through that proxy, past the dispatch guard, while the evidence says direct. The residential exit comes only from RESIDENTIAL_PROXY_URL; unset ${proxied.length > 1 ? 'them' : 'it'} in the Job env. No request was made`);
+    return 2;
+  }
   // The home line (GAL-RES): only with a byte cap, and only through the scraper's own residential exit, the one the capture hook resolves.
   if (args.egress === 'residential' && args.maxBytes === undefined) {
     print("REFUSED: GALLERY_EGRESS=residential needs GALLERY_MAX_BYTES, the response bytes this run may read: the image bytes cross Ross's home line, which is his decision, and never without a cap. No request was made");

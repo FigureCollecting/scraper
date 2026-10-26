@@ -83,6 +83,10 @@ The scraper must not read the spine database, so the work list is a file the ope
    says `EGRESS <host>: residential, through the scraper's residential exit <scheme://host:port> ... budget <N> bytes`;
    `GALLERY-REPORT` carries `bytesRead` (every run) and `budget` (null without one); a direct run may also set `GALLERY_MAX_BYTES`
    (`BUDGET <N> bytes` at start). The pod must be allowed to reach the exit: fc-infra's egress-proxy admits only `app: scraper` on 1055.
+   **No proxy from the environment, on any lane.** impit honours `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` (either case) on a session
+   built without a proxy, and Node's fetch honours `HTTP(S)_PROXY` under `NODE_USE_ENV_PROXY` or `--use-env-proxy`; either would carry a
+   "direct" run through a proxy no guard sees. A run with any of them set (or `--use-env-proxy` in `NODE_OPTIONS`) exits 2 before any
+   request, naming the variable and never its value. The residential exit comes only from `RESIDENTIAL_PROXY_URL`.
 3. **Gallery driver** (`galleryDriver.ts`): reads the work list in file order; skips (item, url) pairs the ledger has settled; builds one
    `ImageCaptureRequest` per item whose synthetic `describeImages` returns `{url, role:'gallery', position, sourceClass}`;
    awaits `hook.capture()` (sequential, one item at a time); observes every fetch; then waits for the raw store sink to
@@ -142,7 +146,7 @@ The scraper must not read the spine database, so the work list is a file the ope
 6. **Entry**: `npm run gallery:capture` (Job/CronJob, same image as the scraper). One meaning per exit code: 0 done (or a limit: files,
    minutes, or the byte budget), 1 crash, 2 bad arguments or config (no host named, no rate row for an allowed host, `RAW_STORE_IMAGE_MAX_BYTES`
    unset, a bad allow-list entry, no lock location, `GALLERY_MAX_BYTES` malformed or below one reservation, `IMAGE_RESIDENTIAL_BYTES_PER_DAY`
-   below it, an `--item` the list does not hold), 3 paused (a block, a 5xx storm, or a live pause marker), 4 refused (lane off, an allowed
+   below it, an `--item` the list does not hold, a proxy variable in the environment), 3 paused (a block, a 5xx storm, or a live pause marker), 4 refused (lane off, an allowed
    host on the browser lane or on residential egress the run is not permitted, `GALLERY_EGRESS=residential` without `GALLERY_MAX_BYTES` or
    without `RESIDENTIAL_PROXY_URL`), 5 probe not a PASS (a probe exits by its printed verdict: 0 or 5), 6 the raw store did not confirm some
    item of a real run (unsettled; run again), 7 stopped by SIGTERM/SIGINT

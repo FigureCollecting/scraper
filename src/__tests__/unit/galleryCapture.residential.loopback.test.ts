@@ -199,6 +199,42 @@ describe('the residential exit, through the real Job entry', () => {
   });
 });
 
+describe('a proxy in the environment would carry a run past every guard: refused before any request (exit 2)', () => {
+  /** The image urls name the closed port: only a proxy could deliver them. */
+  const direct = (lane: 'http' | 'impit', over: Record<string, string | undefined>): NodeJS.ProcessEnv => resEnv({
+    IMAGE_HOST_POLICY_JSON: JSON.stringify({ localhost: { ...ROW, lane } }), GALLERY_EGRESS: 'direct', GALLERY_MAX_BYTES: undefined,
+    RESIDENTIAL_PROXY_URL: undefined, ...over,
+  });
+
+  it('ALL_PROXY on a direct impit run (impit would honour it): nothing reaches the proxy or the image host', async () => {
+    items([{ id: 1, paths: ['img/1.jpeg', 'img/2.jpeg'] }]);
+    const r = await runCli(base('--probe', '2'), direct('impit', { ALL_PROXY: socks.url }));
+    expect(r.code).toBe(2);
+    expect(r.out).toMatch(/REFUSED: the environment sets ALL_PROXY/);
+    expect(r.out).not.toContain(socks.url);
+    expect(socks.connects).toEqual([]);
+    expect(lb.a).toEqual([]);
+  });
+
+  it('HTTP_PROXY with NODE_USE_ENV_PROXY=1 on a direct http run (Node\'s fetch would honour it): nothing reaches the proxy or the image host', async () => {
+    items([{ id: 1, paths: ['img/1.jpeg'] }]);
+    const r = await runCli(base(), direct('http', { HTTP_PROXY: `http://127.0.0.1:${lb.portB}`, NODE_USE_ENV_PROXY: '1' }));
+    expect(r.code).toBe(2);
+    expect(r.out).toMatch(/REFUSED: the environment sets HTTP_PROXY, NODE_USE_ENV_PROXY/);
+    expect(lb.b).toEqual([]);
+    expect(lb.a).toEqual([]);
+  });
+
+  it('a lower-case https_proxy on a residential run: the exit is never dialled', async () => {
+    items([{ id: 1, paths: ['img/1.jpeg'] }]);
+    const r = await runCli(base(), resEnv({ https_proxy: socks.url }));
+    expect(r.code).toBe(2);
+    expect(r.out).toMatch(/REFUSED: the environment sets https_proxy/);
+    expect(socks.connects).toEqual([]);
+    expect(lb.a).toEqual([]);
+  });
+});
+
 describe('refused before the exit is ever dialled', () => {
   it('GALLERY_EGRESS=residential without GALLERY_MAX_BYTES: exit 4', async () => {
     items([{ id: 1, paths: ['img/1.jpeg'] }]);
