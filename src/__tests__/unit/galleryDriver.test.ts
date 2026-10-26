@@ -363,7 +363,7 @@ describe('runGalleryCapture', () => {
     it.each([
       ['no row: the static host would inherit the store lane', buildImageHostPolicy({}), /lane/i],
       ['a browser row', buildImageHostPolicy({ [STATIC]: { lane: 'browser' } }), /http/i],
-      ['an impit row', buildImageHostPolicy({ [STATIC]: { lane: 'impit', egress: 'direct' } }), /http/i],
+      // (an impit row with direct egress is a gallery lane since GAL-IMPIT: galleryImpitLane.test.ts)
       ['a residential row', buildImageHostPolicy({ [STATIC]: { lane: 'impit', egress: 'residential' } }), /direct|http/i],
     ])('refuses to start on %s', async (_label, policy, why) => {
       const observer = createFetchObserver({ pauseAfter: 3, now: () => 0 });
@@ -576,7 +576,7 @@ describe('createRecordingFetch', () => {
     const rec = createRecordingFetch(async url => ({ status: 200, url: url + '?moved', headers: { get: (n: string) => ({ 'set-cookie': 'a=b; Path=/', 'cf-ray': 'abc-123', 'cf-mitigated': null } as Record<string, string | null>)[n.toLowerCase()] ?? null }, arrayBuffer: async () => new ArrayBuffer(0) }));
     const res = await rec.fetchImpl(U(1), { headers: { Accept: 'image/*', Cookie: 'sid=SECRETVALUE' } });
     expect(res.status).toBe(200);
-    expect(rec.records).toEqual([{ url: U(1), sentHeaderNames: ['accept', 'cookie'], status: 200, redirected: true, setCookie: true, cfMitigated: undefined, cfRay: 'abc-123' }]);
+    expect(rec.records).toEqual([{ url: U(1), lane: 'http', sentHeaderNames: ['accept', 'cookie'], status: 200, redirected: true, setCookie: true, cfMitigated: undefined, cfRay: 'abc-123' }]);
     expect(JSON.stringify(rec.records)).not.toContain('SECRETVALUE');
     expect(JSON.stringify(rec.records)).not.toContain('a=b');
   });

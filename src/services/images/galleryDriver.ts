@@ -15,15 +15,18 @@
  *   - a PROBE: the first N files through the real hook and sink, judged on evidence (no cookie sent, no challenge, no
  *     redirect, plain 200 images from the allowed host), so the first deployed run proves what the design assumes;
  *   - REFUSALS: it will not start with the lane off (it would fetch bytes only to drop them), nor unless the host
- *     policy puts every allowed host on the plain http lane with direct egress.
+ *     policy puts every allowed host on the plain http lane or the impit lane, with direct egress. The residential exit is
+ *     never used: a residential row is refused unless GALLERY_EGRESS=direct turns it direct ({@link withDirectEgress}), and
+ *     every request is checked again at dispatch ({@link guardGalleryDispatch}).
  */
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 import type { SourceClass } from '@figurecollecting/scraper-plugin-contract';
+import type { ImpitLike } from '../impitFetch.js';
 import { sniffImageType } from '../objectStoreCaptureSink.js';
 import type { BytesFetchImpl } from './httpBytesFetch.js';
-import type { ImageBytesFetcher, ImageBytesResult } from './imageBytes.js';
+import { IMAGE_CHROME_UA, type ImageBytesFetcher, type ImageBytesResult } from './imageBytes.js';
 import type { ImageCaptureHook } from './imageCaptureHook.js';
-import { chooseImageLane, type ImageHostPolicy } from './imageHostPolicy.js';
+import { chooseImageLane, type ImageHostPolicy, type ImageLane } from './imageHostPolicy.js';
 import { canonicalImageUrl, type WorklistItem } from './galleryWorklist.js';
 
 // ---------------------------------------------------------------------------
@@ -289,10 +292,12 @@ export function createFileLedger(file: string): GalleryLedger {
 }
 
 // ---------------------------------------------------------------------------
-// what the http lane sent and got back (probe evidence: names and flags, never values)
+// what each lane sent and got back (probe evidence: names and flags, never values)
 // ---------------------------------------------------------------------------
 export interface RequestRecord {
   url: string;
+  /** Which transport carried it. On impit the wire also carries the impersonation profile's own browser headers (not listed here). */
+  lane?: 'http' | 'impit';
   sentHeaderNames: string[];
   status: number;
   redirected: boolean;
@@ -305,41 +310,56 @@ const MAX_RECORDS = 1000;
 const REDIRECT_STATUSES: ReadonlySet<number> = new Set([301, 302, 303, 307, 308]);
 
 /**
- * The transport of the gallery's http lane. It NEVER lets the runtime follow a redirect (`redirect: 'manual'`): a hop is a request
+ * The transports of the gallery's lanes. Neither ever lets its runtime follow a redirect (`redirect: 'manual'`): a hop is a request
  * to a host the allow-list has not looked at, so {@link followAllowedRedirects} takes it by hand. Each 3xx's absolute Location is
- * kept for the follower to collect.
+ * kept for the follower to collect. `fetchImpl` is the http lane's transport; `wrapImpit` wraps the impit lane's session the same
+ * way, into the same records and the same Location store.
  */
-export function createRecordingFetch(inner: BytesFetchImpl = globalThis.fetch as unknown as BytesFetchImpl): { fetchImpl: BytesFetchImpl; records: RequestRecord[]; takeLocation: (url: string) => string | undefined } {
+export function createRecordingFetch(inner: BytesFetchImpl = globalThis.fetch as unknown as BytesFetchImpl): {
+  fetchImpl: BytesFetchImpl; records: RequestRecord[]; takeLocation: (url: string) => string | undefined; wrapImpit: (impit: ImpitLike) => ImpitLike;
+} {
   const records: RequestRecord[] = [];
   const locations = new Map<string, string>();
   const norm = (u: string): string => { try { return new URL(u).toString(); } catch { return u; } };
-  const fetchImpl: BytesFetchImpl = async (url, init) => {
-    const res = await inner(url, { ...init, redirect: 'manual' });
-    if (REDIRECT_STATUSES.has(res.status)) {
-      const location = res.headers.get('location');
-      if (location !== null && location !== '') {
+  const record = (lane: 'http' | 'impit', url: string, sent: Record<string, string> | undefined, status: number, finalUrl: string | undefined, header: (name: string) => string | undefined): void => {
+    if (REDIRECT_STATUSES.has(status)) {
+      const location = header('location');
+      if (location !== undefined && location !== '') {
         try { locations.set(url, new URL(location, url).href); } catch { /* an unparseable Location is no hop */ }
       }
     }
-    const rec: RequestRecord = {
+    records.push({
       url,
-      sentHeaderNames: Object.keys(init.headers ?? {}).map(h => h.toLowerCase()),
-      status: res.status,
-      redirected: REDIRECT_STATUSES.has(res.status) || (res.url !== undefined && norm(res.url) !== norm(url)),
-      setCookie: res.headers.get('set-cookie') !== null,
-      cfMitigated: res.headers.get('cf-mitigated') ?? undefined,
-      cfRay: res.headers.get('cf-ray') ?? undefined,
-    };
-    records.push(rec);
+      lane,
+      sentHeaderNames: Object.keys(sent ?? {}).map(h => h.toLowerCase()),
+      status,
+      redirected: REDIRECT_STATUSES.has(status) || (finalUrl !== undefined && norm(finalUrl) !== norm(url)),
+      setCookie: header('set-cookie') !== undefined,
+      cfMitigated: header('cf-mitigated'),
+      cfRay: header('cf-ray'),
+    });
     if (records.length > MAX_RECORDS) records.shift();
+  };
+  const fetchImpl: BytesFetchImpl = async (url, init) => {
+    const res = await inner(url, { ...init, redirect: 'manual' });
+    record('http', url, init.headers, res.status, res.url, name => res.headers.get(name) ?? undefined);
     return res;
   };
+  const wrapImpit = (impit: ImpitLike): ImpitLike => ({
+    async fetch(url, init) {
+      const res = await impit.fetch(url, { ...init, redirect: 'manual' });
+      const bag = res.headers as { get?: (name: string) => string | null } | undefined;
+      // an impit build that reports no status is treated as a 2xx, as the impit bytes lane treats it
+      record('impit', url, init.headers, res.status ?? 200, res.url, name => (typeof bag?.get === 'function' ? bag.get(name) ?? undefined : undefined));
+      return res;
+    },
+  });
   const takeLocation = (url: string): string | undefined => {
     const location = locations.get(url);
     locations.delete(url);
     return location;
   };
-  return { fetchImpl, records, takeLocation };
+  return { fetchImpl, records, takeLocation, wrapImpit };
 }
 
 /** Hops one image may take before it is refused. */
@@ -405,6 +425,8 @@ export interface ProbeEvidence {
   bytes?: number;
   ms: number;
   outcome: ObservationClass;
+  /** The lane that carried the request (http or impit). */
+  lane?: 'http' | 'impit';
   sentHeaderNames?: string[];
   setCookie?: boolean;
   cfRay?: string;
@@ -446,6 +468,10 @@ export function judgeProbe(input: { observations: FetchObservation[]; requests: 
     if (r.setCookie) setCookies++;
   }
   if (setCookies > 0) notes.push(`Set-Cookie seen on ${setCookies} response(s); nothing was sent back, so it is information only`);
+  const overImpit = requests.filter(r => r.lane === 'impit').length;
+  if (overImpit > 0) {
+    notes.push(`${overImpit} request(s) went over impit: the wire also carried the impersonation profile's own browser headers (client hints, sec-fetch-*, accept-language, accept-encoding), which sentHeaderNames does not list; the session holds no cookie jar`);
+  }
 
   const evidence: ProbeEvidence[] = observations.map(o => {
     const r = byUrl.get(o.url);
@@ -454,7 +480,10 @@ export function judgeProbe(input: { observations: FetchObservation[]; requests: 
       ...(o.status !== undefined ? { status: o.status } : {}),
       ...(o.contentType !== undefined ? { contentType: o.contentType } : {}),
       ...(o.bytes !== undefined ? { bytes: o.bytes } : {}),
-      ...(r ? { sentHeaderNames: r.sentHeaderNames, setCookie: r.setCookie, redirected: r.redirected, ...(r.cfRay !== undefined ? { cfRay: r.cfRay } : {}) } : {}),
+      ...(r ? {
+        ...(r.lane !== undefined ? { lane: r.lane } : {}),
+        sentHeaderNames: r.sentHeaderNames, setCookie: r.setCookie, redirected: r.redirected, ...(r.cfRay !== undefined ? { cfRay: r.cfRay } : {}),
+      } : {}),
     };
   });
   const reasonList = [...reasons].map(([text, n]) => (n > 1 ? `${text} (x${n})` : text));
@@ -531,7 +560,7 @@ export interface GalleryDeps {
   items: AsyncIterable<{ ok: true; item: WorklistItem; dropped: number; capped?: number } | { ok: false; line: number; error: string }>;
   now: () => number;
   log: (line: string) => void;
-  /** The http lane's request records (probe evidence). */
+  /** The request records of both lanes (probe evidence). */
   requests: () => RequestRecord[];
 }
 
@@ -565,13 +594,62 @@ export interface GalleryReport {
   probe?: ProbeVerdict;
 }
 
-/** The host policy must put every allowed host on the plain http lane with direct egress: no cookies, no browser, no home line. */
+// ---------------------------------------------------------------------------
+// which lane, which egress
+// ---------------------------------------------------------------------------
+/**
+ * The lanes the gallery fetches on: the plain http lane, and impit (a browser TLS fingerprint with no cookie jar, no stored cookies
+ * and no proxy; galleryImpitLane.ts). Never the browser lane: a tab keeps cookies and is not this driver's to drive.
+ */
+export const GALLERY_LANES: readonly ImageLane[] = ['http', 'impit'];
+
+/**
+ * GALLERY_EGRESS=direct: the policy as the operator wrote it, except that a row's residential egress becomes direct. Every other
+ * field of the row (lane, ua, referer, placeholders, deny) stands, so the gallery still fetches a host the way its row says, from
+ * this node's own address instead of through the home line. Nothing here can turn egress residential.
+ */
+export function withDirectEgress(policy: ImageHostPolicy): ImageHostPolicy {
+  return {
+    ruleFor(host) {
+      const rule = policy.ruleFor(host);
+      return rule.egress === 'residential' ? { ...rule, egress: 'direct' } : rule;
+    },
+  };
+}
+
+/**
+ * Checked on every request the gallery dispatches, redirect hops included (put it under the pacer), before the transport sees it:
+ *   - a request that would leave through the residential exit or any proxy is refused (the preflight already refuses a policy that
+ *     resolves to it; this is the same rule held at the wire);
+ *   - the only user agent a request may carry is the lanes' Chrome string (`IMAGE_CHROME_UA`, a row's ua:'chrome'); with none the
+ *     transport's own stands (undici's, or the impit profile's Chrome). Any other is refused, so no setting can make the gallery
+ *     identify as a crawler of any kind. (Which agents a host's robots file names is ruleset data; the engine names none.)
+ */
+export function guardGalleryDispatch(inner: ImageBytesFetcher): ImageBytesFetcher {
+  return async (url, options) => {
+    if (options?.egress === 'residential' || options?.proxyUrl !== undefined) {
+      return { ok: false, reason: 'refused', detail: "the gallery driver never uses the residential exit or any proxy: it fetches from this node's own address" };
+    }
+    if (options?.userAgent !== undefined && options.userAgent !== IMAGE_CHROME_UA) {
+      return { ok: false, reason: 'refused', detail: "the gallery driver sends the lanes' Chrome user agent or none, never another" };
+    }
+    return inner(url, options);
+  };
+}
+
+/**
+ * The host policy must put every allowed host on a gallery lane (http or impit) with direct egress: no browser, no home line.
+ * The lane is the row's; the egress may be made direct by GALLERY_EGRESS=direct (main() then hands over {@link withDirectEgress}).
+ */
 function preflight(policy: ImageHostPolicy, pageUrl: string, hosts: readonly string[]): string | undefined {
   for (const host of hosts) {
     const d = chooseImageLane(pageUrl, `https://${host}/probe.jpg`, undefined, policy);
     if (!d.ok) return `the host policy refuses ${host}: ${d.reason}${d.detail ? ` (${d.detail})` : ''}`;
-    if (d.lane !== 'http' || d.egress !== 'direct') {
-      return `${host} resolves to lane ${d.lane} with ${d.egress} egress; the gallery driver needs the plain http lane with direct egress — add IMAGE_HOST_POLICY_JSON {"${host}":{"lane":"http","egress":"direct"}}`;
+    if (!GALLERY_LANES.includes(d.lane)) {
+      return `${host} resolves to lane ${d.lane}; the gallery driver fetches on the http or impit lane only — add IMAGE_HOST_POLICY_JSON {"${host}":{"lane":"http","egress":"direct"}} (or "lane":"impit")`;
+    }
+    if (d.egress !== 'direct') {
+      return `${host} resolves to ${d.egress} egress; the gallery driver never uses the residential exit (the bytes would cross Ross's home line, which is his decision) — set GALLERY_EGRESS=direct to fetch it from this node's own address on its ${d.lane} lane`;
     }
   }
   return undefined;

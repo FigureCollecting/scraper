@@ -116,6 +116,12 @@ export async function startLoopback(initialS3: S3Mode = 'ok'): Promise<Loopback>
     };
     switch (kind) {
       case 'img': return img();
+      // a picture whose response sets a cookie: a client that keeps cookies would send it back on its next request
+      case 'cookie': {
+        const b = png(`A:${rest}`);
+        res.writeHead(200, { 'content-type': 'image/png', 'content-length': b.length, 'set-cookie': `__cf_bm=LOOPBACKSET${rest.length}; Path=/; HttpOnly` });
+        return void res.end(b);
+      }
       // a redirect to an OFF-HOST target (127.0.0.1 is not the allowed host `localhost`)
       case 'redir': res.writeHead(302, { location: `http://127.0.0.1:${(B.address() as { port: number }).port}/stolen/${rest}` }); return void res.end();
       // a redirect to ANOTHER PORT on the allowed host name (a different origin)
