@@ -8,7 +8,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { AI_CRAWLER_UA } from '../helpers/galleryDriverDoubles';
-import { cliEnv, readLedger, runCli, startLoopback, useLockDir, writeWorklist, type Loopback } from '../helpers/galleryLoopback';
+import { cliEnv, readDispatches, readLedger, runCli, startLoopback, useLockDir, withDispatchClock, writeWorklist, type Loopback } from '../helpers/galleryLoopback';
 
 jest.setTimeout(120_000);
 
@@ -63,12 +63,15 @@ describe('the impit lane through the real Job entry', () => {
 
   it('a same-host redirect chain is followed by hand, every hop paced at the host rate', async () => {
     writeWorklist(lb, wl, [{ id: 1, paths: ['redir-chain/2/p.jpeg', 'img/q.jpeg'] }]);
-    const r = await runCli(['--worklist', wl, '--ledger', ledger], impitEnv());
+    const clock = path.join(dir, 'dispatch.jsonl');
+    const r = await runCli(['--worklist', wl, '--ledger', ledger], withDispatchClock(impitEnv(), clock));
     expect(r.report).toMatchObject({ stored: 2 });
     expect(lb.a.map(s => s.path)).toEqual(['/redir-chain/2/p.jpeg', '/redir-chain/1/p.jpeg', '/img/p.jpeg', '/img/q.jpeg']);
-    const gaps = lb.a.slice(1).map((h, i) => h.t - lb.a[i]!.t);
-    // a 100 ms row. The session is built before the first request takes its slot: built after it, the first two requests reached
-    // the host 55 to 74 ms apart (measured); now every gap is the interval plus a little connect jitter
+    // a 100 ms row, measured at the moment each request reaches impit's fetch inside the Job process. The session is built before
+    // the first request takes its slot: built after it, the first two requests reached the host 55 to 74 ms apart (measured)
+    const sent = readDispatches(clock).filter(d => d.url.startsWith(lb.urlA('')));
+    expect(sent.map(d => `${d.lane} ${new URL(d.url).pathname}`)).toEqual(lb.a.map(s => `impit ${s.path}`));
+    const gaps = sent.slice(1).map((d, i) => d.t - sent[i]!.t);
     for (const g of gaps) expect(g).toBeGreaterThanOrEqual(85);
   });
 

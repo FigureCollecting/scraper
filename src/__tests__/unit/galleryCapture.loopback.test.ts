@@ -7,7 +7,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
-import { cliEnv, readLedger, runCli, useLockDir, startCli, startLoopback, writeWorklist, type Loopback } from '../helpers/galleryLoopback';
+import { cliEnv, readDispatches, readLedger, runCli, useLockDir, startCli, startLoopback, withDispatchClock, writeWorklist, type Loopback } from '../helpers/galleryLoopback';
 
 jest.setTimeout(120_000);
 
@@ -53,12 +53,16 @@ describe('B1: the allow-list holds across redirects', () => {
 
   it('every hop of a same-host redirect chain goes through the per-host limiter', async () => {
     writeWorklist(lb, wl, [{ id: 1, paths: ['redir-chain/3/p.jpeg'] }]);
-    const r = await runCli(['--worklist', wl, '--ledger', ledger], cliEnv(lb));
+    const clock = path.join(dir, 'dispatch.jsonl');
+    const r = await runCli(['--worklist', wl, '--ledger', ledger], withDispatchClock(cliEnv(lb), clock));
     expect(r.report).toMatchObject({ stored: 1 });
     const hops = lb.a.filter(s => s.path.startsWith('/redir-chain') || s.path.startsWith('/img/p.jpeg'));
     expect(hops.length).toBe(4);
-    const gaps = hops.slice(1).map((h, i) => h.t - hops[i]!.t);
-    // a 100 ms row; the server sees dispatch-to-dispatch spacing plus a little connect jitter (the red team measured 324 to 334 against 333)
+    // a 100 ms row, measured where the limiter acts: the moment each hop is handed to the transport, inside the Job process. The
+    // server's arrival gaps also carry connection setup that only the first hop pays (on a loaded CI runner: 52 ms at this row).
+    const sent = readDispatches(clock).filter(d => d.url.startsWith(lb.urlA('')));
+    expect(sent.map(d => `${d.lane} ${new URL(d.url).pathname}`)).toEqual(hops.map(h => `http ${h.path}`));
+    const gaps = sent.slice(1).map((d, i) => d.t - sent[i]!.t);
     for (const g of gaps) expect(g).toBeGreaterThanOrEqual(75);
   });
 
@@ -214,16 +218,19 @@ describe('S5: a 5xx storm pauses the run like a block does', () => {
 describe('S6: one run at a time', () => {
   const lockPath = (): string => path.join(dir, 'gallery-capture.lock');
   it('a second run on a live lease exits 8 with zero requests; the first is unharmed and releases the lock', async () => {
-    writeWorklist(lb, wl, [{ id: 1, paths: ['slow/1.jpeg', 'img/2.jpeg'] }]);
+    writeWorklist(lb, wl, [{ id: 1, paths: ['hold/1.jpeg', 'img/2.jpeg'] }]);
     const first = startCli(['--worklist', wl, '--ledger', ledger], cliEnv(lb));
     const t0 = Date.now();
     while (lb.a.length < 1 && Date.now() - t0 < 30_000) await new Promise(r => setTimeout(r, 25));
+    // the first run is inside its first request, which the server answers only when released: its lease is live for all of the second
     const second = await runCli(['--worklist', wl, '--ledger', ledger], cliEnv(lb));
     expect(second.code).toBe(8);
     expect(second.out).toMatch(/another run holds/);
-    expect(lb.a.length).toBeLessThanOrEqual(1);
+    expect(lb.a.length).toBe(1);
+    lb.release();
     const done = await first.done;
     expect(done.code).toBe(0);
+    expect(lb.a.map(s => s.path)).toEqual(['/hold/1.jpeg', '/img/2.jpeg']);
     expect(existsSync(lockPath())).toBe(false);
   });
 

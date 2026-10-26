@@ -221,26 +221,32 @@ describe('R2-S1: the lock is a lease, not a pid', () => {
 
 describe('N3: the lock protects the host, not one ledger file', () => {
   it('a probe with its own --ledger cannot run beside a live run', async () => {
-    writeWorklist(lb, wl, [{ id: 1, paths: ['slow/1.jpeg', 'img/2.jpeg'] }]);
+    writeWorklist(lb, wl, [{ id: 1, paths: ['hold/1.jpeg', 'img/2.jpeg'] }]);
     const first = startCli(base(), envR());
     const t0 = Date.now();
     while (lb.a.length < 1 && Date.now() - t0 < 30_000) await new Promise(r => setTimeout(r, 25));
+    // the live run is inside its first request, which the server answers only when released: it holds the lock for all of the probe
     const probe = await runCli(['--worklist', wl, '--ledger', path.join(dir, 'probe-ledger.jsonl'), '--probe', '2'], envR());
     expect(probe.code).toBe(8);
-    expect(lb.a.length).toBeLessThanOrEqual(1);
+    expect(lb.a.length).toBe(1);
+    lb.release();
     expect((await first.done).code).toBe(0);
+    expect(lb.a.map(s => s.path)).toEqual(['/hold/1.jpeg', '/img/2.jpeg']);
   });
 
   it('GALLERY_LOCK_PATH moves the lock', async () => {
-    writeWorklist(lb, wl, [{ id: 1, paths: ['slow/1.jpeg'] }]);
+    writeWorklist(lb, wl, [{ id: 1, paths: ['hold/1.jpeg'] }]);
     const elsewhere = path.join(dir, 'elsewhere.lock');
     const first = startCli(base(), envR({ GALLERY_LOCK_PATH: elsewhere }));
     const t0 = Date.now();
-    while (!existsSync(elsewhere) && Date.now() - t0 < 30_000) await new Promise(r => setTimeout(r, 25));
+    while (lb.a.length < 1 && Date.now() - t0 < 30_000) await new Promise(r => setTimeout(r, 25));
+    // the first run is inside its held request, so it holds the moved lock for all of the second run
     expect(existsSync(elsewhere)).toBe(true);
     expect(existsSync(lockPath)).toBe(false);
     const second = await runCli(base(), envR({ GALLERY_LOCK_PATH: elsewhere }));
     expect(second.code).toBe(8);
+    expect(lb.a.length).toBe(1);
+    lb.release();
     expect((await first.done).code).toBe(0);
     expect(existsSync(elsewhere)).toBe(false);
   });
