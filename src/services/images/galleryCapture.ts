@@ -15,8 +15,8 @@
  * Nothing here fetches an image itself.
  *
  * Exit codes (one meaning each): 0 done (or a limit reached: files, minutes or the byte budget), 1 the run crashed, 2 bad arguments,
- * input or config (nothing ran; a GALLERY_MAX_BYTES that is not a positive whole number or is below what one request may read, an
- * IMAGE_RESIDENTIAL_BYTES_PER_DAY below it, an --item the work list does not hold), 3 paused (a block, a failure storm, or a live pause
+ * input or config (nothing ran; a GALLERY_MAX_BYTES that is not a positive whole number, is above 64 GiB or is below what one request may read, an
+ * IMAGE_RESIDENTIAL_BYTES_PER_DAY below it, an --item the work list does not hold, a proxy variable in the environment), 3 paused (a block, a failure storm, or a live pause
  * marker), 4 refused (lane off, the host policy puts an allowed host on the browser lane or on residential egress the run is not
  * permitted, or GALLERY_EGRESS=residential without GALLERY_MAX_BYTES or without a residential exit), 5 probe not a PASS (a probe exits by
  * its printed verdict: 0 or 5), 6 the raw store did not confirm some item's files (unsettled, run again), 7 stopped by SIGTERM/SIGINT or
@@ -85,6 +85,9 @@ function whole(flag: string, v: string | undefined, max: number): number {
 }
 
 /** argv + env -> options; throws a usage error (the CLI exits 2) on anything it does not understand. */
+/** The largest GALLERY_MAX_BYTES a run accepts: 64 GiB. */
+export const MAX_BYTES_CEILING = 64 * 1024 ** 3;
+
 export function parseGalleryArgs(argv: readonly string[], env: NodeJS.ProcessEnv = process.env): GalleryArgs {
   const hosts = (env.GALLERY_ALLOWED_HOSTS ?? '').split(',').map(h => h.trim()).filter(h => h !== '').map(entry => {
     const origin = parseAllowedOrigin(entry);
@@ -119,6 +122,8 @@ export function parseGalleryArgs(argv: readonly string[], env: NodeJS.ProcessEnv
     if (!/^[0-9]+$/.test(maxBytes) || n < 1 || !Number.isSafeInteger(n)) {
       throw new Error(`${USAGE} (GALLERY_MAX_BYTES must be a positive whole number of bytes, got '${maxBytes.slice(0, 40)}')`);
     }
+    // A sanity ceiling: a typo with three zeros too many must not pass as a budget.
+    if (n > MAX_BYTES_CEILING) throw new Error(`${USAGE} (GALLERY_MAX_BYTES (${n}) is above the ${MAX_BYTES_CEILING}-byte (64 GiB) ceiling)`);
     out.maxBytes = n;
   }
   for (let i = 0; i < argv.length; i++) {

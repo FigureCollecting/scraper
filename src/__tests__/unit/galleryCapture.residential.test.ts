@@ -137,6 +137,19 @@ describe('GALLERY_EGRESS=residential under a byte budget (main, in process)', ()
       expect(r.calls).toEqual([]);
     });
 
+    it('has a ceiling of 64 GiB: one byte over is a usage error (exit 2, no session, no request), the ceiling itself is accepted', async () => {
+      const ceiling = 64 * 1024 ** 3;
+      expect(parseGalleryArgs([], { GALLERY_MAX_BYTES: String(ceiling) } as NodeJS.ProcessEnv).maxBytes).toBe(ceiling);
+      for (const value of [String(ceiling + 1), '9007199254740991']) {
+        out.length = 0;
+        const r = rig({ env: { GALLERY_MAX_BYTES: value } });
+        expect(await run(r)).toBe(2);
+        expect(out.join('\n')).toMatch(new RegExp(`GALLERY_MAX_BYTES \\(${value}\\) is above the ${ceiling}-byte \\(64 GiB\\) ceiling`));
+        expect(r.made).toEqual([]);
+        expect(r.calls).toEqual([]);
+      }
+    });
+
     it('below one request\'s reservation (the per-file cap plus one chunk) is refused: exit 2, the run could not make a single request', async () => {
       const r = rig({ env: { GALLERY_MAX_BYTES: String(RESERVE - 1) } });
       expect(await run(r)).toBe(2);
