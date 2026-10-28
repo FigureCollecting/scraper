@@ -11,7 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { AI_CRAWLER_UA } from '../helpers/galleryDriverDoubles';
 import {
-  cliEnv, png, readDispatches, readLedger, runCli, startCli, startLoopback, useLockDir, withDispatchClock, writeWorklist, type Loopback,
+  cliEnv, png, probeEvidence, readDispatches, readLedger, runCli, startCli, startLoopback, useLockDir, withDispatchClock, writeWorklist, type Loopback,
 } from '../helpers/galleryLoopback';
 import { closedPort, startSocks5, type Socks5Loopback } from '../helpers/socks5Loopback';
 
@@ -199,7 +199,7 @@ describe('the residential exit, through the real Job entry', () => {
     expect(r.code).toBe(0);
     expect(r.out).toMatch(/PROBE PASS/);
     expect(r.out).toMatch(/note: 2 request\(s\) left through the residential exit/);
-    const ev = JSON.parse(/^PROBE-EVIDENCE (.*)$/m.exec(r.out)![1]!) as Array<Record<string, unknown>>;
+    const ev = probeEvidence(r.raw);
     expect(ev.map(e => [e.lane, e.egress, e.status])).toEqual([['impit', 'residential', 200], ['impit', 'residential', 200]]);
   });
 

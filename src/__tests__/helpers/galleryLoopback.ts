@@ -348,12 +348,42 @@ export function cliEnv(lb: Loopback, over: Record<string, string | undefined> = 
 const REPO = path.resolve(__dirname, '../../..');
 const ENTRY = 'src/services/images/galleryCaptureCli.ts';
 
+/**
+ * What an operator reads in the Job's log: each JSON line (the Job writes nothing else, LG-ADOPT-2) as its msg, and any
+ * other line (stderr, a line still being written) as it is.
+ */
+export function operatorView(raw: string): string {
+  return raw.split('\n').map(line => {
+    try {
+      const parsed = JSON.parse(line) as { msg?: unknown };
+      return typeof parsed.msg === 'string' ? parsed.msg : line;
+    } catch {
+      return line;
+    }
+  }).join('\n');
+}
+
+/** A probe's evidence, one gallery.probe_evidence line per request, as the Job wrote its fields (snake_case). */
+export function probeEvidence(raw: string): Array<Record<string, unknown>> {
+  return raw.split('\n').flatMap(line => {
+    try {
+      const parsed = JSON.parse(line) as Record<string, unknown>;
+      return parsed.event === 'gallery.probe_evidence' ? [parsed] : [];
+    } catch {
+      return [];
+    }
+  });
+}
+
 export interface CliRun {
   child: ChildProcess;
+  /** The operator's view of stdout and stderr together (operatorView). */
   out: () => string;
+  /** Stdout and stderr together, as written. */
+  raw: () => string;
   /** Resolves with the matching line's text once it has been printed. */
   waitFor(re: RegExp, ms?: number): Promise<string>;
-  done: Promise<{ code: number | null; signal: NodeJS.Signals | null; out: string }>;
+  done: Promise<{ code: number | null; signal: NodeJS.Signals | null; out: string; raw: string }>;
 }
 
 /** Start the real Job entry. Nothing it prints is ever dropped: `out()` is stdout and stderr together. */
@@ -364,7 +394,7 @@ export function startCli(args: string[], env: NodeJS.ProcessEnv): CliRun {
   const feed = (d: Buffer): void => {
     buf += d.toString('utf8');
     for (const w of [...waiters]) {
-      const m = w.re.exec(buf);
+      const m = w.re.exec(operatorView(buf));
       if (m) {
         clearTimeout(w.timer);
         waiters.splice(waiters.indexOf(w), 1);
@@ -374,17 +404,18 @@ export function startCli(args: string[], env: NodeJS.ProcessEnv): CliRun {
   };
   child.stdout!.on('data', feed);
   child.stderr!.on('data', feed);
-  const done = new Promise<{ code: number | null; signal: NodeJS.Signals | null; out: string }>(resolve => {
+  const done = new Promise<{ code: number | null; signal: NodeJS.Signals | null; out: string; raw: string }>(resolve => {
     child.on('close', (code, signal) => {
       for (const w of waiters) { clearTimeout(w.timer); w.reject(new Error(`the CLI ended before ${w.re}: ${buf.slice(-400)}`)); }
-      resolve({ code, signal, out: buf });
+      resolve({ code, signal, out: operatorView(buf), raw: buf });
     });
   });
   return {
     child,
-    out: () => buf,
+    out: () => operatorView(buf),
+    raw: () => buf,
     waitFor: (re, ms = 30_000) => new Promise<string>((resolve, reject) => {
-      const m = re.exec(buf);
+      const m = re.exec(operatorView(buf));
       if (m) return resolve(m[0]);
       const timer = setTimeout(() => reject(new Error(`timed out waiting for ${re}: ${buf.slice(-400)}`)), ms);
       waiters.push({ re, resolve, reject, timer });
@@ -393,10 +424,10 @@ export function startCli(args: string[], env: NodeJS.ProcessEnv): CliRun {
   };
 }
 
-export async function runCli(args: string[], env: NodeJS.ProcessEnv): Promise<{ code: number | null; out: string; report: Record<string, unknown> | undefined }> {
+export async function runCli(args: string[], env: NodeJS.ProcessEnv): Promise<{ code: number | null; out: string; raw: string; report: Record<string, unknown> | undefined }> {
   const r = await startCli(args, env).done;
   const line = /^GALLERY-REPORT (.*)$/m.exec(r.out);
-  return { code: r.code, out: r.out, report: line ? JSON.parse(line[1]!) as Record<string, unknown> : undefined };
+  return { code: r.code, out: r.out, raw: r.raw, report: line ? JSON.parse(line[1]!) as Record<string, unknown> : undefined };
 }
 
 const DISPATCH_CLOCK = path.join(__dirname, 'galleryDispatchClock.mjs');

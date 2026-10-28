@@ -21,13 +21,28 @@ export interface Logger {
   error: (message: string, error?: any) => void;
 }
 
+/**
+ * Where a line goes instead of the console once a batch job routes this logger (telemetry.ts
+ * routeLegacyLogger): the level, the message as written, and its data (or the Error), already
+ * sanitised here. The server never routes it, so its lines stay as they are.
+ */
+export type LineRoute = (level: 'debug' | 'info' | 'warn' | 'error', message: string, data?: unknown, namespace?: string) => void;
+
 class DebugLogger implements Logger {
   private enabledNamespaces: Set<string>;
   private tokenDebug: boolean;
+  private routed: LineRoute | undefined;
 
   constructor() {
     this.enabledNamespaces = this.parseDebugEnv();
     this.tokenDebug = process.env.SERVICE_AUTH_TOKEN_DEBUG === 'true';
+  }
+
+  /** Send every line to `next` instead of the console (undefined: the console again). Returns the previous route. */
+  route(next: LineRoute | undefined): LineRoute | undefined {
+    const previous = this.routed;
+    this.routed = next;
+    return previous;
   }
 
   private parseDebugEnv(): Set<string> {
@@ -112,6 +127,7 @@ class DebugLogger implements Logger {
 
     const timestamp = new Date().toISOString();
     const sanitizedData = redactValue(this.sanitizeData(data));
+    if (this.routed) { this.routed('debug', `[${namespace}] ${message}`, sanitizedData, namespace); return; }
 
     console.log(`[${timestamp}] [DEBUG] [${namespace}]${this.traceTag()} ${message}`,
       sanitizedData ? JSON.stringify(sanitizedData, null, 2) : '');
@@ -120,6 +136,7 @@ class DebugLogger implements Logger {
   info(message: string, data?: any): void {
     const timestamp = new Date().toISOString();
     const sanitizedData = redactValue(this.sanitizeData(data));
+    if (this.routed) { this.routed('info', message, sanitizedData); return; }
 
     console.log(`[${timestamp}] [INFO]${this.traceTag()} ${message}`,
       sanitizedData ? JSON.stringify(sanitizedData, null, 2) : '');
@@ -128,6 +145,7 @@ class DebugLogger implements Logger {
   warn(message: string, data?: any): void {
     const timestamp = new Date().toISOString();
     const sanitizedData = redactValue(this.sanitizeData(data));
+    if (this.routed) { this.routed('warn', message, sanitizedData); return; }
 
     console.warn(`[${timestamp}] [WARN]${this.traceTag()} ${message}`,
       sanitizedData ? JSON.stringify(sanitizedData, null, 2) : '');
@@ -135,6 +153,8 @@ class DebugLogger implements Logger {
 
   error(message: string, error?: any): void {
     const timestamp = new Date().toISOString();
+
+    if (this.routed) { this.routed('error', message, error instanceof Error ? error : redactValue(this.sanitizeData(error))); return; }
 
     // Handle Error objects specially
     let errorData: any;

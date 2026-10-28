@@ -35,6 +35,7 @@ import {
 } from '@figurecollecting/ingest-contract';
 import { sanitizeForLog } from '../utils/security.js';
 import type { FetchReasonClass } from './failureClassifier.js';
+import { outboundRpcHook } from './outboundRpc.js';
 
 /** WHAT was being fetched — decides the shape of the canonical target. */
 export type FetchKindName = 'record' | 'listing' | 'search' | 'image';
@@ -193,7 +194,7 @@ export class FailureReporter {
   constructor(options: FailureReporterOptions) {
     this.client =
       options.client ??
-      createClient(SpineIngest, createConnectTransport({ baseUrl: options.baseUrl ?? '', httpVersion: '1.1' }));
+      createClient(SpineIngest, createConnectTransport({ baseUrl: options.baseUrl ?? '', httpVersion: '1.1', interceptors: [outboundRpcHook] }));
     this.timeoutMs = options.timeoutMs ?? DEFAULT_REPORT_TIMEOUT_MS;
     this.retryDelayMs = options.retryDelayMs ?? 1_000;
     this.now = options.now ?? Date.now;
