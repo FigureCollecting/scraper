@@ -237,6 +237,7 @@ Operator flow: run `gallery:worklist`, copy the file to the PVC, run the probe J
 0 for PASS and 5 for anything else), then run staged real Jobs until the list is done. A block pauses the Job (exit 3) and writes the marker;
 `--resume` clears it deliberately.
 
-The Job's log is JSON lines in fc-shared's shape, one trace per run: each line the run prints (`PROBE PASS`, `GALLERY-REPORT {...}`,
+The Job's log is JSON lines in fc-shared's shape: the run is one trace, and each item it captures is its own trace (`item.capture`,
+linked to the run by `fc.run_id`), so an item's lines and its capture reports carry that item's `trace_id`. Each line the run prints (`PROBE PASS`, `GALLERY-REPORT {...}`,
 `REFUSED: ...`) is the `msg` of a `gallery.note` line, a probe's evidence is one `gallery.probe_evidence` line per request with its
 fields, and the closing `job.end` line carries the exit code and the report's counts (a crashed run: `code=error` and `err`).

@@ -5,7 +5,8 @@
  * Every such transport carries `outboundRpcHook`, built in whenever the transport is: in the server, and before
  * a job's run starts (the raw store's capture reporter is a process-wide singleton). The hook reads what is
  * installed AT CALL TIME, so a transport built before the run still writes the run's rpc.out lines and sends the
- * run's traceparent. Nothing installed (the server, a test outside a run): the call passes straight through.
+ * traceparent of whatever is active, the run or one of its items. Nothing installed (the server, a test outside a run):
+ * the call passes straight through.
  *
  * Deliberately free of fc-shared's node-only server subpaths: the server imports this file, and telemetry.ts
  * (which the server never loads) is what installs into it.
