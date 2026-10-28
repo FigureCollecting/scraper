@@ -8,7 +8,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { AI_CRAWLER_UA } from '../helpers/galleryDriverDoubles';
-import { cliEnv, readDispatches, readLedger, runCli, startLoopback, useLockDir, withDispatchClock, writeWorklist, type Loopback } from '../helpers/galleryLoopback';
+import { cliEnv, probeEvidence, readDispatches, readLedger, runCli, startLoopback, useLockDir, withDispatchClock, writeWorklist, type Loopback } from '../helpers/galleryLoopback';
 
 jest.setTimeout(120_000);
 
@@ -89,9 +89,9 @@ describe('the impit lane through the real Job entry', () => {
     const r = await runCli(['--worklist', wl, '--ledger', ledger, '--probe', '2'], impitEnv());
     expect(r.code).toBe(0);
     expect(r.out).toMatch(/PROBE PASS/);
-    const ev = JSON.parse(/^PROBE-EVIDENCE (.*)$/m.exec(r.out)![1]!) as Array<Record<string, unknown>>;
+    const ev = probeEvidence(r.raw);
     expect(ev.map(e => e.lane)).toEqual(['impit', 'impit']);
-    expect(ev.every(e => e.status === 200 && e.redirected === false && !(e.sentHeaderNames as string[]).includes('cookie'))).toBe(true);
+    expect(ev.every(e => e.status === 200 && e.redirected === false && !(JSON.parse(String(e.sent_header_names)) as string[]).includes('cookie'))).toBe(true);
   });
 
   it('a challenged probe FAILs (exit 5), pauses at the third request and sends no fourth', async () => {

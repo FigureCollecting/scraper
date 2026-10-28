@@ -36,7 +36,7 @@ import { readWorklistFile } from './galleryWorklist.js';
 import {
   DEFAULT_OUTCOME_MEMORY, allowedHostnames, createFetchObserver, createFileLedger, createMemoryLedger, createRecordingFetch, followAllowedRedirects, gateOnStop, guardGalleryDispatch, originEntryText, parseAllowedOrigin,
   runGalleryCapture, withDirectEgress,
-  type ConfirmingSink, type GalleryLedger, type GalleryReport,
+  type ConfirmingSink, type GalleryLedger, type GalleryReport, type ProbeEvidence,
 } from './galleryDriver.js';
 import { createGalleryImpitFetch, galleryImpitFactory, impitReadyFirst, type GalleryImpitFactory } from './galleryImpitLane.js';
 import { createHttpBytesFetch, type BytesFetchImpl } from './httpBytesFetch.js';
@@ -190,7 +190,14 @@ export interface GalleryMainDeps {
   imageCapBytes?: number;
   /** The chunk a capped read may take past the cap (default READ_CHUNK_ALLOWANCE, 1 MiB). */
   readAllowanceBytes?: number;
+  /** Told the run's report once the run is over, before it is printed (the Job's job.end line carries its counts). */
+  onReport?: (report: GalleryReport) => void;
+  /** Where a probe's evidence goes (default: one PROBE-EVIDENCE line through `print`, the whole list as JSON). */
+  evidence?: (entries: ProbeEvidence[]) => void;
 }
+
+/** How a crashed run's one line starts (exit 1): the Job writes that line as its job.end error instead. */
+export const GALLERY_FAILED = 'gallery:capture failed: ';
 
 /**
  * The environment's proxy settings, by NAME (a value may carry credentials and is never printed). impit honours HTTP_PROXY, HTTPS_PROXY
@@ -385,12 +392,14 @@ export async function main(argv: readonly string[] = process.argv.slice(2), deps
     );
     await hook.drain();
     await flush();
+    deps.onReport?.(report);
     const { probe, ...summary } = report;
     print(`GALLERY-REPORT ${JSON.stringify(summary)}`);
     if (probe !== undefined) {
       print(`PROBE ${probe.verdict}${probe.reasons.length > 0 ? `: ${probe.reasons.join('; ')}` : ''}`);
       for (const n of probe.notes) print(`  note: ${n}`);
-      print(`PROBE-EVIDENCE ${JSON.stringify(probe.evidence)}`);
+      if (deps.evidence !== undefined) deps.evidence(probe.evidence);
+      else print(`PROBE-EVIDENCE ${JSON.stringify(probe.evidence)}`);
     }
     if (report.refusal !== undefined) print(`REFUSED: ${report.refusal}`);
     if (report.stopped === 'paused') print(`PAUSED until ${new Date(report.pausedUntil!).toISOString()}: ${report.pauseReason}`);
@@ -407,7 +416,7 @@ export async function main(argv: readonly string[] = process.argv.slice(2), deps
     }
     return galleryExitCode(report);
   } catch (e) {
-    print(`gallery:capture failed: ${(e as Error).message}`);
+    print(`${GALLERY_FAILED}${(e as Error).message}`);
     try { await flush(); } catch { /* the sink's own drain reports its losses */ }
     return 1;
   } finally {

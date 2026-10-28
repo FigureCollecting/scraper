@@ -581,6 +581,11 @@ nothing from `src/driver/*`.
   a healthy store with no matches. The run ends with an `[INITIATOR] pass complete` JSON summary
   plus a per-store line: discovered, enqueued, deduplicated, errors, skipped, lookupAttempts,
   lookupRetries, lookupFailures. The pass-level `lookupFailures` is the per-store sum.
+- **Log shape**: every line is one JSON object in fc-shared's shape (service `ingest-initiator`): the
+  `[INITIATOR]` prefix is the `tag` field, the text is `msg`, a summary's keys are the line's own
+  fields in snake_case. The run opens with `job.start` and closes with ONE `job.end` carrying the
+  pass's counts (`code=error` and `err` when the pass cannot run); every line carries the run's
+  `trace_id`, and the lookups and enqueues carry its `traceparent` to in-cluster hosts only.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -664,6 +669,11 @@ service's own `GET /catalog?store=&page=` (a store's newest-first listing) and
   seedLists, seedStopped; plus totals, requestsIssued, budgetExhausted, enqueueCapOverrides,
   reobserveCapOverrides, totalReobserved, totalReobserveLanded, totalRangeWalked, durationMs). A `seed` pass logs
   `[CRAWLER] seed pass complete` instead.
+- **Log shape**: as the initiator's (service `ingest-crawler`, the seed CronJob included): JSON lines,
+  `tag` `CRAWLER`, ONE `job.end` with the pass's counts (mode, pagesFetched, discovered, enqueued,
+  reobserved, errors, ...), the run's `trace_id` on every line and its `traceparent` on the calls to the
+  scraper and the ingest server. A field longer than 1000 characters is cut (the pass summary's
+  `stores` list can be); each store's own summary line carries its fields in full.
 - A `CRAWLER_STORE_ENQUEUE_CAPS` entry or a `CRAWLER_RANGE_STORES` entry naming a store that is not
   in `CRAWLER_STORES` does nothing, and is WARNed about by siteId at the start of the run — a range
   store must be named in BOTH.

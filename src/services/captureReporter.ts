@@ -41,6 +41,7 @@ import {
 } from '@figurecollecting/ingest-contract';
 import type { CaptureLane } from './captureSink.js';
 import { sanitizeForLog } from '../utils/security.js';
+import { outboundRpcHook } from './outboundRpc.js';
 
 /** Default per-call deadline. A ledger write is small; it must never hold a capture path open. */
 export const DEFAULT_REPORT_TIMEOUT_MS = 10_000;
@@ -172,7 +173,7 @@ export class CaptureReporter {
   constructor(options: CaptureReporterOptions) {
     this.client =
       options.client ??
-      createClient(SpineIngest, createConnectTransport({ baseUrl: options.baseUrl ?? '', httpVersion: '1.1' }));
+      createClient(SpineIngest, createConnectTransport({ baseUrl: options.baseUrl ?? '', httpVersion: '1.1', interceptors: [outboundRpcHook] }));
     this.timeoutMs = options.timeoutMs ?? DEFAULT_REPORT_TIMEOUT_MS;
     this.retryDelayMs = options.retryDelayMs ?? 1_000;
     this.now = options.now ?? Date.now;
