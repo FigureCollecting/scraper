@@ -1,13 +1,16 @@
 /**
  * The ingest-initiator CronJob's run, on fc-shared's server logging (telemetry.ts). ONE pass is ONE run: one root trace, a
  * job.start line, the pass's own lines, the ingest-server rpc.out lines, and ONE job.end line with the pass's counts (or
- * code=error and err, the error rethrown unchanged). Every lookup and enqueue sent to our own scraper carries the run's W3C
- * traceparent (in-cluster hosts only).
+ * code=error and err, the error rethrown unchanged).
+ *
+ * ONE TRACE PER ITEM: each discovered url the pass dispatches (POST /ingest/scrape) is its own root trace, linked to the run
+ * (itemTracer), so that POST, its lines and its failure report carry the item's W3C traceparent. The lookups, the pass's
+ * discovery, stay on the run's trace. In-cluster hosts only.
  *
  * run.ts is the run-directly wrapper; the pass's logic (and its tests) stays in ./config and ./initiator.
  */
 import { createFailureReporterFromEnv } from '../services/failureReporter.js';
-import { INGEST_INITIATOR, runJobProcess, tracedFetch, type Logger } from '../telemetry.js';
+import { INGEST_INITIATOR, itemTracer, runJobProcess, tracedFetch, type Logger } from '../telemetry.js';
 import { logger } from '../utils/logger.js';
 import { loadInitiatorConfig } from './config.js';
 import { runInitiatorPass, type FetchLike, type RunSummary } from './initiator.js';
@@ -33,7 +36,7 @@ export function initiatorCounts(s: RunSummary): Record<string, number | boolean>
 export async function runInitiatorJob(options: InitiatorJobOptions = {}): Promise<RunSummary> {
   const env = options.env ?? process.env;
   const httpFetch: FetchLike = tracedFetch(options.fetchImpl ?? fetch);
-  return runJobProcess(INGEST_INITIATOR, async () => {
+  return runJobProcess(INGEST_INITIATOR, async (_logger, run) => {
     const config = loadInitiatorConfig(env);
     logger.info('[INITIATOR] pass starting', {
       scraperServiceUrl: config.scraperServiceUrl,
@@ -54,6 +57,7 @@ export async function runInitiatorJob(options: InitiatorJobOptions = {}): Promis
     const summary = await runInitiatorPass(config, {
       fetch: httpFetch,
       ...(reporter ? { reportFailure: (report) => reporter.report(report) } : {}),
+      traceItem: itemTracer(run),
     });
     // Every emit point is fire-and-forget and the process exits the instant the run resolves, which
     // aborts an open socket: drain INSIDE the run, so the last report lands before job.end.

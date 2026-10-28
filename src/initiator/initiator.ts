@@ -48,6 +48,7 @@ import { createRequestGate, type RequestGate } from './requestGate.js';
 import { logger } from '../utils/logger.js';
 import { classifyFetchFailure } from '../services/failureClassifier.js';
 import type { FetchFailureReport, ReportFetchFailure } from '../services/failureReporter.js';
+import type { TraceItem } from '../telemetry.js';
 import type { InitiatorConfig } from './config.js';
 
 export type { InitiatorConfig } from './config.js';
@@ -80,6 +81,11 @@ export interface InitiatorDeps {
    * one retry a store gets stays silent, because the producer has not stopped trying yet.
    */
   reportFailure?: ReportFetchFailure;
+  /**
+   * ONE TRACE PER ITEM (job.ts: fc-shared run.item): each discovered url the pass dispatches — its POST /ingest/scrape,
+   * its lines and its failure report — runs as its own trace. The lookups stay on the run's. Absent = inline.
+   */
+  traceItem?: TraceItem;
 }
 
 export interface StoreSummary {
@@ -503,13 +509,7 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
     }
   }
 
-  const enqueueOne = async ({ siteId, url }: { siteId: string; url: string }): Promise<void> => {
-    const ss = perStore.get(siteId);
-    if (!ss) return;
-    if (pastDeadline()) {
-      droppedUrls++;
-      return;
-    }
+  const dispatchOne = async (ss: StoreSummary, siteId: string, url: string): Promise<void> => {
     try {
       const r = await gate.run(() => httpPostJson(deps.fetch, ingestUrl, { url }, config.requestTimeoutMs));
       if (r.status === 'budget-exhausted') {
@@ -552,6 +552,18 @@ export async function runInitiatorPass(config: InitiatorConfig, deps: InitiatorD
         message: error instanceof Error ? error.message : String(error),
       });
     }
+  };
+
+  const traceItem: TraceItem = deps.traceItem ?? ((_site, fn) => fn());
+  /** ONE dispatched url, as its own trace (traceItem): the unit of the initiator's work. A url dropped at the deadline is none. */
+  const enqueueOne = async ({ siteId, url }: { siteId: string; url: string }): Promise<void> => {
+    const ss = perStore.get(siteId);
+    if (!ss) return;
+    if (pastDeadline()) {
+      droppedUrls++;
+      return;
+    }
+    await traceItem(siteId, () => dispatchOne(ss, siteId, url));
   };
   await Promise.all(flat.map((item) => enqueueOne(item)));
 

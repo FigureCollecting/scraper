@@ -84,6 +84,7 @@ import { addDrift, dropExposedMarks, isLedgerPage, lowestUnvisited, MAX_LEDGER_P
 import { logger } from '../utils/logger.js';
 import { classifyFetchFailure } from '../services/failureClassifier.js';
 import type { FetchFailureReport, ReportFetchFailure } from '../services/failureReporter.js';
+import type { TraceItem } from '../telemetry.js';
 import type { CrawlerConfig, CrawlerMode } from './config.js';
 import type { Ledger, LedgerEntry, LedgerGapBand, LedgerGapOrigin, LedgerRange, LedgerStore, LedgerVia } from './ledger.js';
 import { isSafeRotatingName } from '../utils/rotatingName.js';
@@ -153,6 +154,11 @@ export interface CrawlerDeps {
   readHostClock?: HostClockReader;
   /** PASS-STRATEGY: the ring file each alternated store's record is appended to (run.ts: beside the ledgers). */
   passRing?: PassRingStore;
+  /**
+   * ONE TRACE PER ITEM (job.ts: fc-shared run.item): each catalogue item's enqueue — its POST /ingest/scrape, its lines
+   * and its failure report — runs as its own trace. The catalog pages stay on the run's. Absent = inline.
+   */
+  traceItem?: TraceItem;
 }
 
 /** What one declared seed list yielded this run (mode `seed` only), in the order the lists were polled. */
@@ -1106,7 +1112,7 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
   const fetchPage = (st: StoreState, page: number, phase: 'recent' | 'backfill'): Promise<PageOutcome> =>
     fetchCatalog(st, catalogUrl(st.siteId, page), { page }, phase);
 
-  const postOne = async (st: StoreState, collectUrl: string, itemId: string, priority?: 'COLD'): Promise<PostOutcome> => {
+  const enqueueItem = async (st: StoreState, collectUrl: string, itemId: string, priority?: 'COLD'): Promise<PostOutcome> => {
     let r: GateResult<HttpResponseLike>;
     // No priority = the queue's default (WARM): every lane but the lists drain posts exactly what it always did.
     const payload = priority ? { url: collectUrl, priority } : { url: collectUrl };
@@ -1142,6 +1148,12 @@ export async function runCrawlerPass(config: CrawlerConfig, deps: CrawlerDeps): 
     });
     return 'rejected';
   };
+
+  const traceItem: TraceItem = deps.traceItem ?? ((_site, fn) => fn());
+
+  /** ONE catalogue item's enqueue, as its own trace (traceItem): the unit of the crawler's work. */
+  const postOne = (st: StoreState, collectUrl: string, itemId: string, priority?: 'COLD'): Promise<PostOutcome> =>
+    traceItem(st.siteId, () => enqueueItem(st, collectUrl, itemId, priority));
 
   // --- page processing --------------------------------------------------------------------------
 

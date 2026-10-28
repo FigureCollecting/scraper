@@ -2,12 +2,16 @@
  * The ingest-crawler CronJob's run (and ingest-seed-mfc's: the same entry with CRAWLER_MODE=seed), on fc-shared's server
  * logging (telemetry.ts). ONE pass is ONE run: one root trace, a job.start line, the pass's own lines, the ingest-server
  * rpc.out lines, and ONE job.end line with the pass's counts, or with code=error and err when the pass cannot run (the error
- * is rethrown unchanged). Every call to our own scraper carries the run's W3C traceparent (in-cluster hosts only).
+ * is rethrown unchanged).
+ *
+ * ONE TRACE PER ITEM: each catalogue item's enqueue (POST /ingest/scrape) is its own root trace, linked to the run
+ * (itemTracer), so that POST, its lines and its failure report carry the item's W3C traceparent and the scraper continues
+ * the item, not the run. The catalog pages, a pass's discovery, stay on the run's trace. In-cluster hosts only.
  *
  * run.ts is the run-directly wrapper; all the pass's logic (and its tests) stays in ./config, ./ledger and ./crawler.
  */
 import { createFailureReporterFromEnv } from '../services/failureReporter.js';
-import { INGEST_CRAWLER, runJobProcess, tracedFetch, type Logger } from '../telemetry.js';
+import { INGEST_CRAWLER, itemTracer, runJobProcess, tracedFetch, type Logger } from '../telemetry.js';
 import { logger } from '../utils/logger.js';
 import { loadCrawlerConfig } from './config.js';
 import { runCrawlerPass, type CrawlerSummary, type FetchLike } from './crawler.js';
@@ -40,7 +44,7 @@ export function crawlerCounts(s: CrawlerSummary): Record<string, string | number
 export async function runCrawlerJob(options: CrawlerJobOptions = {}): Promise<CrawlerSummary> {
   const env = options.env ?? process.env;
   const httpFetch: FetchLike = tracedFetch(options.fetchImpl ?? fetch);
-  return runJobProcess(INGEST_CRAWLER, async () => {
+  return runJobProcess(INGEST_CRAWLER, async (_logger, run) => {
     const config = loadCrawlerConfig(env, options.argv ?? process.argv);
     logger.info('[CRAWLER] pass starting', {
       scraperServiceUrl: config.scraperServiceUrl,
@@ -87,10 +91,11 @@ export async function runCrawlerJob(options: CrawlerJobOptions = {}): Promise<Cr
       readHostClock: createHealthHostClockReader(config.scraperServiceUrl, httpFetch, config.requestTimeoutMs),
       passRing: createFilePassRingStore(config.ledgerDir),
       ...(reporter ? { reportFailure: (report) => reporter.report(report) } : {}),
+      traceItem: itemTracer(run),
     });
     // Every emit point is fire-and-forget and the process exits the instant the run resolves, which
-    // aborts an open socket: drain INSIDE the run, so the last report lands and its rpc.out line is
-    // on the run's trace, before job.end.
+    // aborts an open socket: drain INSIDE the run, so the last report lands (its rpc.out line on the
+    // run's or its item's trace) before job.end.
     if (reporter) await reporter.drain();
     return summary;
   }, crawlerCounts, { env, ...(options.logger === undefined ? {} : { logger: options.logger }) });

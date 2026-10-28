@@ -21,6 +21,13 @@
 //                         console calls, the ingest-server rpc.out lines all go
 //                         through it), and runCountedJob: one root trace, one
 //                         job.start line, one job.end line with the run's counts.
+//   itemTracer            ONE TRACE PER ITEM (Ross's choice, fc-shared run.item):
+//                         a unit of the run's work is a NEW root trace linked to
+//                         the run (span link + fc.run_id), so its lines and its
+//                         in-cluster calls carry the item's ids, not the run's.
+//                         A log line has no run id field (fc-shared 1.8.0 writes
+//                         trace_id/span_id only): an item's line reaches its run
+//                         through the item span's fc.run_id.
 //   traceHeaders,         the active span's W3C traceparent for a fetch to an
 //   tracedFetch           in-cluster host (the propagation allowlist decides);
 //                         a store or any other host gets none.
@@ -34,7 +41,7 @@ import { DEFAULT_SECRET_VALUE_PATTERNS, type RedactOptions } from '@figurecollec
 import { installOutboundRpcInterceptors } from './services/outboundRpc.js';
 import { logger as legacyLogger } from './utils/logger.js';
 
-export type { Logger, Tracing };
+export type { JobRun, Logger, Tracing };
 
 type Env = Record<string, string | undefined>;
 type Fields = Record<string, unknown>;
@@ -153,6 +160,25 @@ export function tracedFetch(fetchImpl: typeof fetch): (url: string, init?: JobRe
 }
 
 // ---------------------------------------------------------------------------
+// One trace per item.
+// ---------------------------------------------------------------------------
+
+/**
+ * Run `fn`, one unit of a pass's work for store `site`, as its own trace. What a pass's deps take (the crawler's and
+ * the initiator's enqueue, the gallery's item); absent, the pass runs the unit inline, in the caller's trace.
+ */
+export type TraceItem = <T>(site: string, fn: () => Promise<T>) => Promise<T>;
+
+/**
+ * fc-shared run.item as a TraceItem: each call is a NEW root span (`name`, default fc-shared's item.enqueue; kind
+ * PRODUCER) linked to the run, with fc.run_id and fc.site. Lines written and in-cluster requests made inside it carry
+ * the item's trace; a failed item is an error span and its error is rethrown unchanged for the pass to handle.
+ */
+export function itemTracer(run: JobRun, name?: string): TraceItem {
+  return (site, fn) => run.item(fn, { ...(name === undefined ? {} : { name }), attributes: { 'fc.site': site } });
+}
+
+// ---------------------------------------------------------------------------
 // One start line and one end line per run.
 // ---------------------------------------------------------------------------
 
@@ -205,12 +231,13 @@ export interface JobProcessOptions {
 /**
  * The whole of one CronJob/Job run. Tracing starts (a run whose tracing cannot start still runs, and
  * says so once); for the run, the legacy logger, stray console calls and the ingest-server Connect
- * calls (rpc.out, with the run's traceparent) all write through the job logger; runCountedJob brackets
- * `fn` with job.start and job.end. Everything is put back before it returns or rethrows.
+ * calls (rpc.out, with the active run's or item's traceparent) all write through the job logger;
+ * runCountedJob brackets `fn` with job.start and job.end, and hands it the run to open items on
+ * (itemTracer). Everything is put back before it returns or rethrows.
  */
 export async function runJobProcess<T>(
   service: string,
-  fn: (logger: Logger) => Promise<T>,
+  fn: (logger: Logger, run: JobRun) => Promise<T>,
   counts: (result: T) => Fields,
   options: JobProcessOptions = {},
 ): Promise<T> {
@@ -228,7 +255,7 @@ export async function runJobProcess<T>(
   const restoreConsole = installConsoleBridge(logger);
   const restoreRpc = installOutboundRpcInterceptors([rpcClientInterceptor({ logger })]);
   try {
-    return await runCountedJob(service, () => fn(logger), counts, { logger, env });
+    return await runCountedJob(service, run => fn(logger, run), counts, { logger, env });
   } finally {
     restoreRpc();
     restoreConsole();

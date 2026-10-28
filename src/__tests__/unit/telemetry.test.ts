@@ -4,23 +4,26 @@
  *   - one JSON object per line in the estate's shape, service named for the job;
  *   - one job.start and one job.end per run, the end line carrying the run's counts; a failed run is
  *     still one start and one end, code=error, the error rethrown unchanged;
- *   - every line of the run (the legacy logger's, a stray console call's, an rpc.out) carries the ONE
- *     run trace id, and tracing that cannot start never stops the run;
- *   - a call to an in-cluster service carries the run's W3C traceparent, a call anywhere else none;
+ *   - the run's own lines (the legacy logger's, a stray console call's, an rpc.out) carry the run trace
+ *     id, and tracing that cannot start never stops the run;
+ *   - ONE TRACE PER ITEM: an item (itemTracer, fc-shared run.item) is a new root trace linked to the run
+ *     (fc.run_id), and every line and in-cluster call made inside it carries the ITEM's ids;
+ *   - a call to an in-cluster service carries the active (run or item) W3C traceparent, a call anywhere else none;
  *   - no cookie, cf_clearance, token or proxy credential value in any line; a URL loses its userinfo,
  *     query and fragment.
  * Every request here goes to a server this test starts on localhost; nothing reaches a store.
  */
-import { context, propagation, trace } from '@opentelemetry/api';
+import { SpanKind, SpanStatusCode, context, propagation, trace } from '@opentelemetry/api';
 import { TracerProvider } from '@opentelemetry/sdk-trace';
+import { startTracing } from '@figurecollecting/fc-shared/server/tracing';
 import { logger as legacy } from '../../utils/logger';
 import { FailureReporter } from '../../services/failureReporter';
 import { CaptureReporter } from '../../services/captureReporter';
 import {
-  GALLERY_CAPTURE, INGEST_CRAWLER, INGEST_INITIATOR, createServiceLogger, legacyLine, routeLegacyLogger, runJobProcess,
-  serviceName, startServiceTracing, traceHeaders, tracedFetch,
+  GALLERY_CAPTURE, INGEST_CRAWLER, INGEST_INITIATOR, createServiceLogger, itemTracer, legacyLine, routeLegacyLogger, runJobProcess,
+  serviceName, startServiceTracing, traceHeaders, tracedFetch, type JobRun,
 } from '../../telemetry';
-import { HEX32, fakeSpine, type Line } from '../helpers/jobTelemetry';
+import { HEX32, fakeSpine, keepingExporter, type Line } from '../helpers/jobTelemetry';
 
 function captured(service = INGEST_CRAWLER, env: Record<string, string> = {}) {
   const out: string[] = [];
@@ -339,6 +342,13 @@ describe('telemetry: runJobProcess', () => {
     }
   });
 
+  it('hands fn the run, so a pass can open its items on it', async () => {
+    const c = captured();
+    let runId: string | undefined;
+    await runJobProcess(INGEST_CRAWLER, async (_logger, run) => { runId = run.runId; }, () => ({}), { logger: c.logger, env: {} });
+    expect(runId).toBe(c.lines()[0]?.trace_id);
+  });
+
   it('a reporter with no base URL still swallows its failure inside a run: the run goes on, the drop is one bridged warn line', async () => {
     const failures = new FailureReporter({ retryDelayMs: 0 });
     const captures = new CaptureReporter({ retryDelayMs: 0 });
@@ -352,5 +362,101 @@ describe('telemetry: runJobProcess', () => {
     const lines = c.lines();
     expect(lines[lines.length - 1]).toMatchObject({ event: 'job.end', code: 'ok' });
     expect(lines.filter(l => l.event === 'app.console' && l.level === 'warn').map(l => l.tag)).toEqual(['FAILURE LEDGER', 'CAPTURE LEDGER']);
+  });
+});
+
+describe('telemetry: one trace per item (itemTracer, fc-shared run.item)', () => {
+  const SCRAPER_INGEST = 'http://scraper.fc.svc.cluster.local:3050/ingest/scrape';
+
+  /** runJobProcess with spans kept in memory: its own tracing start returns this running handle, and its shutdown flushes it. */
+  async function tracedRun(body: (run: JobRun, c: ReturnType<typeof captured>) => Promise<void>) {
+    const exporter = keepingExporter();
+    startTracing(INGEST_CRAWLER, { exporter, env: {} });
+    const c = captured();
+    await runJobProcess(INGEST_CRAWLER, async (_logger, run) => body(run, c), () => ({}), { logger: c.logger, env: {} });
+    return { lines: c.lines(), spans: exporter.spans };
+  }
+
+  it('each item is a NEW root trace (item.enqueue, PRODUCER) linked to the run, with fc.run_id and fc.site; its lines and in-cluster calls carry the item, the run\'s carry the run', async () => {
+    const sent: Array<{ url: string; traceparent: string | undefined }> = [];
+    const traced = tracedFetch((async (url: string | URL | Request, init?: RequestInit) => {
+      sent.push({ url: String(url), traceparent: (init?.headers as Record<string, string>).traceparent });
+      return new Response('{}');
+    }) as typeof fetch);
+    const itemIds: string[] = [];
+    const { lines, spans } = await tracedRun(async run => {
+      legacy.info('[CRAWLER] pass starting');
+      const item = itemTracer(run);
+      for (const site of ['shop', 'other']) {
+        const got = await item(site, async () => {
+          itemIds.push(trace.getActiveSpan()!.spanContext().traceId);
+          legacy.warn('[CRAWLER] ingest rejected', { siteId: site });
+          await traced(SCRAPER_INGEST, { method: 'POST' });
+          await traced(`https://${site}.example/item/1`);
+          return site.length;
+        });
+        expect(got).toBe(site.length);
+      }
+      legacy.info('[CRAWLER] pass complete');
+    });
+
+    const run = spans.find(s => s.name === 'job.ingest-crawler')!;
+    const runId = run.spanContext().traceId;
+    const items = spans.filter(s => s.name === 'item.enqueue');
+    expect(items.map(s => s.spanContext().traceId)).toEqual(itemIds);
+    expect(new Set([runId, ...itemIds]).size).toBe(3);
+    for (const [i, s] of items.entries()) {
+      expect(s.parentSpanContext).toBeUndefined();
+      expect(s.kind).toBe(SpanKind.PRODUCER);
+      expect(s.status.code).toBe(SpanStatusCode.OK);
+      expect(s.attributes).toEqual({ 'fc.site': ['shop', 'other'][i], 'fc.run_id': runId });
+      expect(s.links.map(l => l.context.spanId)).toEqual([run.spanContext().spanId]);
+      expect(s.links.map(l => l.context.traceId)).toEqual([runId]);
+    }
+
+    // trace_id finds one item; the run's own lines (start, pass, end) keep the run's id
+    expect(lines.map(l => [l.msg, l.trace_id])).toEqual([
+      ['ingest-crawler started', runId], ['pass starting', runId],
+      ['ingest rejected', itemIds[0]], ['ingest rejected', itemIds[1]],
+      ['pass complete', runId], ['ingest-crawler finished', runId],
+    ]);
+    // the in-cluster call carries its ITEM's traceparent; a store gets none
+    expect(sent).toEqual([
+      { url: SCRAPER_INGEST, traceparent: `00-${itemIds[0]}-${items[0]!.spanContext().spanId}-01` },
+      { url: 'https://shop.example/item/1', traceparent: undefined },
+      { url: SCRAPER_INGEST, traceparent: `00-${itemIds[1]}-${items[1]!.spanContext().spanId}-01` },
+      { url: 'https://other.example/item/1', traceparent: undefined },
+    ]);
+  });
+
+  it('a named item takes its name; a failed item is an error span, rethrown unchanged, and the run decides what it means', async () => {
+    const boom = new Error('the store went away');
+    const { lines, spans } = await tracedRun(async run => {
+      await expect(itemTracer(run, 'item.capture')('shop', async () => { throw boom; })).rejects.toBe(boom);
+    });
+    const failed = spans.filter(s => s.name === 'item.capture');
+    expect(failed.map(s => [s.status.code, s.attributes['fc.site']])).toEqual([[SpanStatusCode.ERROR, 'shop']]);
+    expect(spans.some(s => s.name === 'item.enqueue')).toBe(false);
+    expect(lines[lines.length - 1]).toMatchObject({ event: 'job.end', code: 'ok' });
+  });
+
+  it('a reporter called inside an item sends the ITEM\'s traceparent to the ingest server, and its rpc.out line is on the item', async () => {
+    const spine = await fakeSpine();
+    try {
+      const failures = new FailureReporter({ baseUrl: spine.url, retryDelayMs: 0 });
+      let itemId = '';
+      const { lines } = await tracedRun(async run => {
+        await itemTracer(run)('shop', async () => {
+          itemId = trace.getActiveSpan()!.spanContext().traceId;
+          await failures.report({ site: 'shop', kind: 'record', origin: 'crawler', reasonClass: 'ruleset', target: 'https://shop.example/p/1', message: 'x' } as never);
+        });
+      });
+      const runId = String(lines[0]?.trace_id);
+      expect(itemId).not.toBe(runId);
+      expect(String(spine.calls[0]?.headers.traceparent)).toMatch(new RegExp(`^00-${itemId}-[0-9a-f]{16}-01$`));
+      expect(lines.filter(l => l.event === 'rpc.out').map(l => l.trace_id)).toEqual([itemId]);
+    } finally {
+      await spine.close();
+    }
   });
 });

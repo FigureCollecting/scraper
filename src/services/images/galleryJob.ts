@@ -4,14 +4,17 @@
  * A run is ONE root trace: a job.start line, each line the run prints as one gallery.note line (a refusal, a lock, a lost
  * lease or a warning at warn), a probe's evidence as one gallery.probe_evidence line per request with its fields, and ONE
  * job.end line carrying the exit code and the report's counts. A crashed run (exit 1) is written once, as job.end's error,
- * and rejects, so the entry exits 1. The capture and failure ledgers' calls to the ingest server carry the run's
- * traceparent (runJobProcess installs the client interceptor); no image request carries one.
+ * and rejects, so the entry exits 1.
+ *
+ * ONE TRACE PER ITEM: each worklist item the run captures is its own root trace (item.capture, linked to the run by
+ * itemTracer), so its lines and the capture and failure ledgers' calls to the ingest server it makes carry the ITEM's
+ * traceparent (runJobProcess installs the client interceptor). No image request carries one.
  */
-import { GALLERY_CAPTURE, runJobProcess, type Logger } from '../../telemetry.js';
+import { GALLERY_CAPTURE, itemTracer, runJobProcess, type Logger } from '../../telemetry.js';
 import { GALLERY_FAILED, main, type GalleryMainDeps } from './galleryCapture.js';
 import type { GalleryReport, ProbeEvidence } from './galleryDriver.js';
 
-export type GalleryJobDeps = Omit<GalleryMainDeps, 'print' | 'onReport' | 'evidence'> & {
+export type GalleryJobDeps = Omit<GalleryMainDeps, 'print' | 'onReport' | 'evidence' | 'traceItem'> & {
   /** Default: the gallery-capture logger on stdout. */
   logger?: Logger;
 };
@@ -35,7 +38,7 @@ function evidenceFields({ setCookie, ...rest }: ProbeEvidence): Record<string, u
 export async function runGalleryJob(argv: readonly string[], deps: GalleryJobDeps = {}): Promise<number> {
   const { logger: given, ...mainDeps } = deps;
   let report: GalleryReport | undefined;
-  return runJobProcess(GALLERY_CAPTURE, async logger => {
+  return runJobProcess(GALLERY_CAPTURE, async (logger, run) => {
     let crashed: string | undefined;
     const code = await main(argv, {
       ...mainDeps,
@@ -45,6 +48,7 @@ export async function runGalleryJob(argv: readonly string[], deps: GalleryJobDep
       },
       onReport: r => { report = r; },
       evidence: entries => { for (const entry of entries) logger.info(evidenceFields(entry), 'probe evidence'); },
+      traceItem: itemTracer(run, 'item.capture'),
     });
     if (crashed !== undefined) throw new Error(crashed);
     return code;
