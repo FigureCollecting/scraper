@@ -33,8 +33,10 @@
  *   - INTERNAL         -> at most one delayed retry, logged loudly
  *   - anything else    -> no retry
  */
-import { Code, ConnectError, createClient, type Client } from '@connectrpc/connect';
+import { Code, ConnectError, createClient, type Client, type Interceptor } from '@connectrpc/connect';
 import { createConnectTransport } from '@connectrpc/connect-node';
+import { context, propagation, type TextMapSetter } from '@opentelemetry/api';
+import { withPropagationTarget } from '@figurecollecting/fc-shared/server/tracing';
 import { create } from '@bufbuild/protobuf';
 import {
   SpineIngest,
@@ -53,6 +55,19 @@ const UNAVAILABLE_MAX_TRIES = 3;
 /** Total tries for INTERNAL: the first call plus exactly one delayed retry. */
 const INTERNAL_MAX_TRIES = 2;
 
+const headerSetter: TextMapSetter<Headers> = { set: (carrier, key, value) => carrier.set(key, value) };
+
+/**
+ * The active trace on every call (LG-QUEUE-1): W3C traceparent, tracestate and baggage through the process's
+ * propagator, which sends them to in-cluster targets only (src/tracing.ts). Nothing else puts them there:
+ * connect-node imports node:http as a namespace, which the http auto-instrumentation never patches in this ESM
+ * service, so without this the spine saw no trace at all on an Ingest call (measured).
+ */
+export const traceContextInterceptor: Interceptor = next => req => {
+  propagation.inject(withPropagationTarget(context.active(), req.url), req.header, headerSetter);
+  return next(req);
+};
+
 export interface IngestEmitterOptions {
   /** Spine ingest server base URL, e.g. http://fc-aggregation:50051 */
   baseUrl: string;
@@ -70,7 +85,7 @@ export class IngestEmitter {
   constructor(options: IngestEmitterOptions) {
     // Connect over HTTP/1.1 — Linkerd meshes h1 natively (mTLS); the spine
     // ingest server serves cleartext HTTP/1.1. See the TRANSPORT note in the header.
-    const transport = createConnectTransport({ baseUrl: options.baseUrl, httpVersion: '1.1' });
+    const transport = createConnectTransport({ baseUrl: options.baseUrl, httpVersion: '1.1', interceptors: [traceContextInterceptor] });
     this.client = createClient(SpineIngest, transport);
     this.timeoutMs = options.timeoutMs ?? DEFAULT_INGEST_TIMEOUT_MS;
     this.retryDelayMs = options.retryDelayMs ?? 1_000;
