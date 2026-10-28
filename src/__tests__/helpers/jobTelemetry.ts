@@ -3,6 +3,8 @@
  * fetch that records what it was asked, and the real entrypoint run as a child process. Every server listens on localhost
  * and every answer is canned: nothing here reaches a store or any other live site.
  */
+import { ExportResultCode } from '@opentelemetry/core';
+import type { ReadableSpan, SpanExporter } from '@opentelemetry/sdk-trace';
 import { spawn } from 'node:child_process';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -106,4 +108,23 @@ export function stdoutLines(stdout: string): Line[] {
       throw new Error(`not a JSON line: ${l.slice(0, 200)}`);
     }
   });
+}
+
+/** The trace id a W3C traceparent header carries, or undefined when there is none. */
+export function traceIdOf(traceparent: unknown): string | undefined {
+  return /^00-([0-9a-f]{32})-[0-9a-f]{16}-01$/.exec(String(traceparent))?.[1];
+}
+
+/**
+ * A span exporter that keeps every span it is handed, through shutdown (InMemorySpanExporter empties itself on shutdown,
+ * and a job's run shuts its tracing down before it returns). Give it to fc-shared startTracing before the run.
+ */
+export function keepingExporter(): SpanExporter & { spans: ReadableSpan[] } {
+  const spans: ReadableSpan[] = [];
+  return {
+    spans,
+    export: (batch, done) => { spans.push(...batch); done({ code: ExportResultCode.SUCCESS }); },
+    shutdown: async () => undefined,
+    forceFlush: async () => undefined,
+  };
 }

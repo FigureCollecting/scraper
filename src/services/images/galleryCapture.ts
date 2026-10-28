@@ -45,6 +45,7 @@ import { DEFAULT_MAX_IMAGE_BYTES, type ImageBytesFetcher } from './imageBytes.js
 import { paceImageBytesByHost } from './imageBytesPacing.js';
 import { createImageBytesRouter, type ImageCaptureHook } from './imageCaptureHook.js';
 import { loadImageHostPolicy, type ImageHostPolicy } from './imageHostPolicy.js';
+import type { TraceItem } from '../../telemetry.js';
 
 const DEFAULT_PROBE = 20;
 const MAX_PROBE = 200;
@@ -194,6 +195,8 @@ export interface GalleryMainDeps {
   onReport?: (report: GalleryReport) => void;
   /** Where a probe's evidence goes (default: one PROBE-EVIDENCE line through `print`, the whole list as JSON). */
   evidence?: (entries: ProbeEvidence[]) => void;
+  /** Each captured item as its own trace (the Job: fc-shared run.item). Default: inline, in the caller's trace. */
+  traceItem?: TraceItem;
 }
 
 /** How a crashed run's one line starts (exit 1): the Job writes that line as its job.end error instead. */
@@ -375,6 +378,7 @@ export async function main(argv: readonly string[] = process.argv.slice(2), deps
     const report = await runGalleryCapture(
       {
         hook, ...(sink !== undefined ? { sink } : {}), observer, policy, ledger, now, log: print, requests: () => recording.records, meter,
+        ...(deps.traceItem !== undefined ? { traceItem: deps.traceItem } : {}),
         items: wanted === undefined ? listed : onlyItems(listed, wanted, () => { matched++; }),
       },
       {

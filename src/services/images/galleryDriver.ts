@@ -32,6 +32,7 @@ import { IMAGE_CHROME_UA, type ImageBytesFetcher, type ImageBytesResult, type Im
 import type { ImageCaptureHook } from './imageCaptureHook.js';
 import { chooseImageLane, type ImageHostPolicy, type ImageLane } from './imageHostPolicy.js';
 import { canonicalImageUrl, type WorklistItem } from './galleryWorklist.js';
+import type { TraceItem } from '../../telemetry.js';
 
 // ---------------------------------------------------------------------------
 // observing the fetches
@@ -600,6 +601,8 @@ export interface GalleryDeps {
   requests: () => RequestRecord[];
   /** What the lanes read (galleryBytes.ts). With a budget, the run stops between files before one that could cross it. */
   meter?: GalleryByteMeter;
+  /** ONE TRACE PER ITEM (galleryJob.ts: fc-shared run.item): each item the run captures is its own trace. Absent = inline. */
+  traceItem?: TraceItem;
 }
 
 export type GalleryStop = 'done' | 'limit' | 'time' | 'budget' | 'paused' | 'paused-marker' | 'refused' | 'interrupted';
@@ -732,6 +735,7 @@ export async function runGalleryCapture(deps: GalleryDeps, opts: GalleryRunOptio
   const count = (v: StoreVerdict): void => { if (v === 'stored') report.stored++; else if (v === 'too_large') report.skippedTooLarge++; else report.skippedNotImage++; };
   const sourceClass: SourceClass = opts.sourceClass ?? 'unknown';
   const budget = opts.probe ?? opts.maxFiles;
+  const traceItem: TraceItem = deps.traceItem ?? ((_site, fn) => fn());
 
   const lane = deps.hook.stats();
   if (!lane.enabled) {
@@ -793,100 +797,104 @@ export async function runGalleryCapture(deps: GalleryDeps, opts: GalleryRunOptio
       report.planned += todo.length;
       if (mode === 'dry-run') continue;
 
-      const before = deps.hook.stats();
-      const sinkBefore = deps.sink?.stats();
-      await deps.hook.capture({
-        site: item.site,
-        itemId: item.itemId,
-        pageUrl: item.pageUrl,
-        fields: {},
-        ruleset: {
-          describeImages: () => todo.map(e => ({
-            url: e.src, role: 'gallery' as const, position: e.position, sourceClass,
-            // Never defaulted to general: an item whose level is not known is gated as the most restrictive.
-            contentLevel: item.contentLevel ?? ('unknown' as const),
-          })),
-        },
-        origin: 'ingest',
-      });
-      // The put runs on the sink's workers after capture() has returned: wait for every one of this item's before any of its files
-      // is settled, so a put that fails (or a process that dies) leaves the file unsettled and fetched again, never lost.
-      if (deps.sink !== undefined) await deps.sink.flush();
-      const after = deps.hook.stats();
-      const sinkAfter = deps.sink?.stats();
-      const obs = deps.observer.take();
+      // ONE TRACE PER ITEM: its lines and the capture and failure reports it files carry the item's trace (an image host gets none).
+      const { before, after } = await traceItem(item.site, async () => {
+        const before = deps.hook.stats();
+        const sinkBefore = deps.sink?.stats();
+        await deps.hook.capture({
+          site: item.site,
+          itemId: item.itemId,
+          pageUrl: item.pageUrl,
+          fields: {},
+          ruleset: {
+            describeImages: () => todo.map(e => ({
+              url: e.src, role: 'gallery' as const, position: e.position, sourceClass,
+              // Never defaulted to general: an item whose level is not known is gated as the most restrictive.
+              contentLevel: item.contentLevel ?? ('unknown' as const),
+            })),
+          },
+          origin: 'ingest',
+        });
+        // The put runs on the sink's workers after capture() has returned: wait for every one of this item's before any of its files
+        // is settled, so a put that fails (or a process that dies) leaves the file unsettled and fetched again, never lost.
+        if (deps.sink !== undefined) await deps.sink.flush();
+        const after = deps.hook.stats();
+        const sinkAfter = deps.sink?.stats();
+        const obs = deps.observer.take();
 
-      // `failed` also counts fetch faults the observations already account for (and a placeholder, which the hook files as a failure);
-      // what is left is the sink losing bytes we did fetch. Such an item is re-driven whole rather than settled, so a stored-but-lost
-      // file is never forgotten.
-      const accounted = obs.filter(o => !o.ok && (o.reason === 'http-status' || o.reason === 'timeout' || o.reason === 'threw' || o.reason === 'display-gated')).length;
-      // The store SKIPS some bodies and still calls them admitted. It checks, in this order: empty, over its ceiling, not JPEG/PNG/GIF/WebP/AVIF
-      // by magic bytes. The fetched sizes and the observer's sniff (the sink's own function) say which of this item's files it skipped and why,
-      // so each is settled by its own verdict. A skip the fetched bodies do not account for (the lane off, or more skips than bodies that
-      // qualify) is bytes that are not at rest and is treated as a lost put. The hook may send a body only once (same bytes under two urls),
-      // so the sink counting FEWER skips than there are qualifying bodies is fine.
-      const storeCap = opts.storeMaxBytes;
-      // (An empty body is not over any ceiling and has no magic bytes, so it falls out as not_image like the sink's own empty check.)
-      const verdictOf = (o: FetchObservation): StoreVerdict => {
-        if (storeCap !== undefined && o.bytes !== undefined && o.bytes > storeCap) return 'too_large';
-        return o.notImage === true ? 'not_image' : 'stored';
-      };
-      const fetchedOk = obs.filter(o => o.ok);
-      const sizeSkips = fetchedOk.filter(o => verdictOf(o) === 'too_large').length;
-      const typeSkips = fetchedOk.filter(o => verdictOf(o) === 'not_image').length;
-      const delta = (k: 'tooLarge' | 'notImage' | 'empty' | 'disabled'): number => skippedOf(sinkAfter, k) - skippedOf(sinkBefore, k);
-      const unexplainedSkip = delta('disabled') > 0 || delta('tooLarge') > sizeSkips || delta('notImage') + delta('empty') > typeSkips;
-      const sinkLost = after.failed - before.failed - accounted > 0
-        || (sinkAfter !== undefined && sinkBefore !== undefined && lossOf(sinkAfter) > lossOf(sinkBefore))
-        || unexplainedSkip;
-      if (sinkLost) report.itemsWithFailures++;
+        // `failed` also counts fetch faults the observations already account for (and a placeholder, which the hook files as a failure);
+        // what is left is the sink losing bytes we did fetch. Such an item is re-driven whole rather than settled, so a stored-but-lost
+        // file is never forgotten.
+        const accounted = obs.filter(o => !o.ok && (o.reason === 'http-status' || o.reason === 'timeout' || o.reason === 'threw' || o.reason === 'display-gated')).length;
+        // The store SKIPS some bodies and still calls them admitted. It checks, in this order: empty, over its ceiling, not JPEG/PNG/GIF/WebP/AVIF
+        // by magic bytes. The fetched sizes and the observer's sniff (the sink's own function) say which of this item's files it skipped and why,
+        // so each is settled by its own verdict. A skip the fetched bodies do not account for (the lane off, or more skips than bodies that
+        // qualify) is bytes that are not at rest and is treated as a lost put. The hook may send a body only once (same bytes under two urls),
+        // so the sink counting FEWER skips than there are qualifying bodies is fine.
+        const storeCap = opts.storeMaxBytes;
+        // (An empty body is not over any ceiling and has no magic bytes, so it falls out as not_image like the sink's own empty check.)
+        const verdictOf = (o: FetchObservation): StoreVerdict => {
+          if (storeCap !== undefined && o.bytes !== undefined && o.bytes > storeCap) return 'too_large';
+          return o.notImage === true ? 'not_image' : 'stored';
+        };
+        const fetchedOk = obs.filter(o => o.ok);
+        const sizeSkips = fetchedOk.filter(o => verdictOf(o) === 'too_large').length;
+        const typeSkips = fetchedOk.filter(o => verdictOf(o) === 'not_image').length;
+        const delta = (k: 'tooLarge' | 'notImage' | 'empty' | 'disabled'): number => skippedOf(sinkAfter, k) - skippedOf(sinkBefore, k);
+        const unexplainedSkip = delta('disabled') > 0 || delta('tooLarge') > sizeSkips || delta('notImage') + delta('empty') > typeSkips;
+        const sinkLost = after.failed - before.failed - accounted > 0
+          || (sinkAfter !== undefined && sinkBefore !== undefined && lossOf(sinkAfter) > lossOf(sinkBefore))
+          || unexplainedSkip;
+        if (sinkLost) report.itemsWithFailures++;
 
-      const observed = new Set<string>();
-      for (const o of obs) {
-        report.fetched++;
-        const url = canonicalImageUrl(o.url) ?? o.url;
-        observed.add(url);
-        const c = classifyObservation(o);
-        if (c !== 'ok' && c !== 'notimage') report[c]++;
-        const verdict = o.ok && !sinkLost ? verdictOf(o) : undefined;
-        if (verdict !== undefined) {
-          outcome.set(url, verdict);
-          count(verdict);
-        }
-        if (mode === 'probe') { probeObservations.push(o); continue; }
-        if (verdict !== undefined) deps.ledger.settle(itemKey, url, SETTLED_AS[verdict]);
-        else if (c === 'gone') deps.ledger.settle(itemKey, url, 'gone');
-        else if (c === 'oversize') deps.ledger.settle(itemKey, url, 'oversize');
-        else if (c === 'placeholder') deps.ledger.settle(itemKey, url, 'placeholder');
-      }
-      // Bytes the store lost are not at rest, whatever the hook's memo was told when it admitted them: take the urls out of it, so a
-      // later item sharing one fetches it itself (and the store is asked again) rather than being told it is stored.
-      if (sinkLost) deps.hook.forget?.([...observed]);
-
-      // A file this item lists that no fetch was made for, because the hook already held its bytes from another item (a MEMO hit:
-      // no request, but this item's own depiction is reported). Only when the memo explains every unfetched file and nothing else
-      // was skipped is it settled, and then only for a file whose put THIS run saw the store confirm; a memo hit nothing confirmed is a
-      // failure (unsettled, fetched again next run). A file left out for any other reason stays unsettled and is planned again.
-      if (mode !== 'probe' && !sinkLost) {
-        const unfetched = todo.filter(e => !observed.has(e.src));
-        const skips = (counts: object): Array<[string, number]> => Object.entries(counts).map(([k, v]) => [k, typeof v === 'number' ? v : 0]);
-        const was = new Map(skips(before.skipped));
-        const delta = (k: string, v: number): number => v - (was.get(k) ?? 0);
-        const memoHits = skips(after.skipped).filter(([k]) => k === 'memo').reduce((n, [k, v]) => n + delta(k, v), 0);
-        // a placeholder is a skip the hook counts for a file it DID fetch (settled above), so it explains no unfetched one
-        const otherSkips = skips(after.skipped).filter(([k]) => k !== 'memo' && k !== 'displayGated').reduce((n, [k, v]) => n + delta(k, v), 0);
-        if (unfetched.length > 0 && memoHits === unfetched.length && otherSkips === 0) {
-          let unconfirmed = 0;
-          for (const e of unfetched) {
-            const known = outcome.get(e.src);
-            if (known === undefined) { unconfirmed++; continue; }
-            deps.ledger.settle(itemKey, e.src, SETTLED_AS[known]);
-            count(known);
+        const observed = new Set<string>();
+        for (const o of obs) {
+          report.fetched++;
+          const url = canonicalImageUrl(o.url) ?? o.url;
+          observed.add(url);
+          const c = classifyObservation(o);
+          if (c !== 'ok' && c !== 'notimage') report[c]++;
+          const verdict = o.ok && !sinkLost ? verdictOf(o) : undefined;
+          if (verdict !== undefined) {
+            outcome.set(url, verdict);
+            count(verdict);
           }
-          if (unconfirmed > 0) report.itemsWithFailures++;
+          if (mode === 'probe') { probeObservations.push(o); continue; }
+          if (verdict !== undefined) deps.ledger.settle(itemKey, url, SETTLED_AS[verdict]);
+          else if (c === 'gone') deps.ledger.settle(itemKey, url, 'gone');
+          else if (c === 'oversize') deps.ledger.settle(itemKey, url, 'oversize');
+          else if (c === 'placeholder') deps.ledger.settle(itemKey, url, 'placeholder');
         }
-      }
-      deps.log(`[gallery] ${itemKey}: ${obs.length} fetched, ${report.stored} stored so far, ${report.blocked} blocked`);
+        // Bytes the store lost are not at rest, whatever the hook's memo was told when it admitted them: take the urls out of it, so a
+        // later item sharing one fetches it itself (and the store is asked again) rather than being told it is stored.
+        if (sinkLost) deps.hook.forget?.([...observed]);
+
+        // A file this item lists that no fetch was made for, because the hook already held its bytes from another item (a MEMO hit:
+        // no request, but this item's own depiction is reported). Only when the memo explains every unfetched file and nothing else
+        // was skipped is it settled, and then only for a file whose put THIS run saw the store confirm; a memo hit nothing confirmed is a
+        // failure (unsettled, fetched again next run). A file left out for any other reason stays unsettled and is planned again.
+        if (mode !== 'probe' && !sinkLost) {
+          const unfetched = todo.filter(e => !observed.has(e.src));
+          const skips = (counts: object): Array<[string, number]> => Object.entries(counts).map(([k, v]) => [k, typeof v === 'number' ? v : 0]);
+          const was = new Map(skips(before.skipped));
+          const delta = (k: string, v: number): number => v - (was.get(k) ?? 0);
+          const memoHits = skips(after.skipped).filter(([k]) => k === 'memo').reduce((n, [k, v]) => n + delta(k, v), 0);
+          // a placeholder is a skip the hook counts for a file it DID fetch (settled above), so it explains no unfetched one
+          const otherSkips = skips(after.skipped).filter(([k]) => k !== 'memo' && k !== 'displayGated').reduce((n, [k, v]) => n + delta(k, v), 0);
+          if (unfetched.length > 0 && memoHits === unfetched.length && otherSkips === 0) {
+            let unconfirmed = 0;
+            for (const e of unfetched) {
+              const known = outcome.get(e.src);
+              if (known === undefined) { unconfirmed++; continue; }
+              deps.ledger.settle(itemKey, e.src, SETTLED_AS[known]);
+              count(known);
+            }
+            if (unconfirmed > 0) report.itemsWithFailures++;
+          }
+        }
+        deps.log(`[gallery] ${itemKey}: ${obs.length} fetched, ${report.stored} stored so far, ${report.blocked} blocked`);
+        return { before, after };
+      });
 
       const trip = deps.observer.tripped();
       if (trip !== undefined) {
