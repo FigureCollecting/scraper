@@ -31,8 +31,10 @@ import { resourceFromAttributes } from '@opentelemetry/resources';
 import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from '@opentelemetry/semantic-conventions';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
 import { SimpleSpanProcessor, SpanExporter, ReadableSpan } from '@opentelemetry/sdk-trace-base';
-import { ExportResult, ExportResultCode } from '@opentelemetry/core';
+import type { TextMapPropagator } from '@opentelemetry/api';
+import { CompositePropagator, ExportResult, ExportResultCode, W3CBaggagePropagator, W3CTraceContextPropagator } from '@opentelemetry/core';
 import { redactAttributes } from '@figurecollecting/fc-shared';
+import { AllowlistPropagator, createHostAllowlist, propagationHostsFromEnv } from '@figurecollecting/fc-shared/server/tracing';
 
 /**
  * A SpanExporter that ships nothing. Paired with a real SimpleSpanProcessor it
@@ -97,6 +99,29 @@ export function shouldEnableTracing(env: NodeJS.ProcessEnv = process.env): boole
   return true;
 }
 
+/**
+ * Hosts an outgoing request may carry W3C trace headers to: fc-shared's propagation allowlist, the rule the
+ * scraper's jobs use (OTEL_PROPAGATION_ALLOWLIST, default *.svc.cluster.local, *.svc, localhost), plus the spine
+ * ingest server this service calls (INGEST_BASE_URL), whatever its name.
+ */
+export function propagationHosts(env: NodeJS.ProcessEnv = process.env): string[] {
+  const ingest = env.INGEST_BASE_URL?.trim();
+  return [...propagationHostsFromEnv(env), ...(ingest ? [ingest] : [])];
+}
+
+/**
+ * The service's propagator: W3C traceparent, tracestate and baggage injected for allowlisted hosts only; inbound
+ * extraction is never restricted. Without it the undici (global fetch) and http auto-instrumentation put them on
+ * every outgoing request, third-party hosts included (measured, LG-QUEUE-1): internal trace ids in someone else's
+ * logs, and an unusual fingerprint to a bot check. impit and Chrome are not instrumented (measured too).
+ */
+export function outboundPropagator(env: NodeJS.ProcessEnv = process.env): TextMapPropagator {
+  return new AllowlistPropagator(
+    new CompositePropagator({ propagators: [new W3CTraceContextPropagator(), new W3CBaggagePropagator()] }),
+    createHostAllowlist(propagationHosts(env))
+  );
+}
+
 let sdk: NodeSDK | undefined;
 
 /**
@@ -120,6 +145,7 @@ export function startTracing(env: NodeJS.ProcessEnv = process.env): NodeSDK | un
     ...(endpoint
       ? { traceExporter: new RedactingSpanExporter(new OTLPTraceExporter()) }
       : { spanProcessors: [new SimpleSpanProcessor(new NoopSpanExporter())] }),
+    textMapPropagator: outboundPropagator(env),
     instrumentations: [getNodeAutoInstrumentations()],
   });
 
