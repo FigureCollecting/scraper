@@ -47,6 +47,8 @@ import { getCfCookieStore, markStaleIfStored, markFreshIfStored, type CfCookieSt
 import { observeGate } from './gateSignal.js';
 import { getRawCaptureSink } from './s3ObjectStore.js';
 import { createIngestEmitterFromEnv } from './ingestEmitter.js';
+import { ROOT_CONTEXT, context } from '@opentelemetry/api';
+import { enqueueTraceparent, restoredTraceparent, withTraceparent } from './queueTrace.js';
 import { impitFetchBodyDetailed } from './impitFetch.js';
 import { httpFetchBodyDetailed } from './engineLookup.js';
 import { buildProfileRegistry, ProfileRegistry } from '../driver/profileRegistry.js';
@@ -160,6 +162,11 @@ export interface QueueItem {
   lane?: QueueLane;
   /** A lane on disk this build does not know (a newer build wrote it): counted as 'other', never relabeled. */
   unknownLane?: string;
+  /**
+   * The W3C traceparent the item is processed under (LG-QUEUE-1, queueTrace.ts): its enqueuer's trace, or a new
+   * root trace. Kept across retries, dedup enqueues and restarts (queue_items.traceparent). Absent with tracing off.
+   */
+  traceparent?: string;
   /** Promise resolvers for waiting callers */
   resolvers: Array<{
     resolve: (data: ScrapedData) => void;
@@ -1366,6 +1373,7 @@ export class ScrapeQueue {
     // Create new queue item
     const id = `${mfcId}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     const queuedAt = Date.now();
+    const traceparent = enqueueTraceparent();
 
     // Determine effective priority
     // Items with cookies go to HOT, unless explicitly COLD
@@ -1390,6 +1398,7 @@ export class ScrapeQueue {
       waitingUserIds: [userId],
       resolvers: [],
       ...(lane !== undefined ? { lane } : {}),
+      ...(traceparent !== undefined ? { traceparent } : {}),
     };
 
     // Create promise for first caller
@@ -1672,6 +1681,7 @@ export class ScrapeQueue {
       state,
       ...(item.errorType !== undefined ? { lastErrorClass: item.errorType } : {}),
       ...(item.lane !== undefined ? { lane: item.lane } : {}),
+      ...(item.traceparent !== undefined ? { traceparent: item.traceparent } : {}),
     };
   }
 
@@ -1751,6 +1761,7 @@ export class ScrapeQueue {
 
   /** A persisted row as a live QueueItem (no cookies, no waiting users; resolvers if this process parked it). */
   private itemFromPersisted(row: PersistedQueueItem): QueueItem {
+    const traceparent = restoredTraceparent(row.traceparent);
     return {
       id: row.id,
       mfcId: row.mfcId,
@@ -1767,6 +1778,7 @@ export class ScrapeQueue {
       resolvers: this.parkedResolvers.get(row.mfcId) ?? [],
       ...(row.lane !== undefined ? { lane: row.lane } : {}),
       ...(row.unknownLane !== undefined ? { unknownLane: row.unknownLane } : {}),
+      ...(traceparent !== undefined ? { traceparent } : {}),
     };
   }
 
@@ -2016,7 +2028,16 @@ export class ScrapeQueue {
     console.log('[SCRAPE QUEUE] Processing started');
   }
 
-  private async processNext(): Promise<void> {
+  /**
+   * One dispatch-loop step, run in NO trace whoever called it (LG-QUEUE-1). The loop re-arms itself with setTimeout,
+   * which carries the caller's context forward: without this the request that woke an idle queue stayed the active
+   * trace for every item after it. Each item then runs in its own trace (dispatchNext).
+   */
+  private processNext(): Promise<void> {
+    return context.with(ROOT_CONTEXT, () => this.dispatchNext());
+  }
+
+  private async dispatchNext(): Promise<void> {
     // Double-lock guard: prevent concurrent processing
     // Lock 1: Check processingItem (set when actively scraping)
     if (this.processingItem !== null) {
@@ -2076,31 +2097,35 @@ export class ScrapeQueue {
     const prevLastRequestTime = this.lastRequestTime;
     this.lastRequestTime = now;
 
-    const poolAvailable = BrowserPool.getPoolSize();
-    console.log(`[SCRAPE QUEUE] Processing ${item.mfcId} (${item.priority}, attempt ${item.retryCount + 1}/${item.maxRetries + 1}, delay=${this.currentDelay}ms, pool=${poolAvailable}/${BrowserPool.getPoolCapacity()})`);
-
     let fastFailedOnCooldown = false;
-    try {
-      // Extraction is plugin-only: an ingest emitter must be configured AND
-      // a plugin ruleset must match the item's URL. Anything else is a
-      // clean, non-retryable item failure (never a crash, never silent).
-      const ruleset = this.ingestEmitter ? this.lookupRuleset(item.url) : undefined;
+    // The item's own trace (LG-QUEUE-1): its Ingest call and everything done and logged for it carry the trace it
+    // was enqueued under; one with none runs in no trace, never the loop's.
+    await withTraceparent(item.traceparent, async () => {
+      const poolAvailable = BrowserPool.getPoolSize();
+      console.log(`[SCRAPE QUEUE] Processing ${item.mfcId} (${item.priority}, attempt ${item.retryCount + 1}/${item.maxRetries + 1}, delay=${this.currentDelay}ms, pool=${poolAvailable}/${BrowserPool.getPoolCapacity()})`);
 
-      if (this.ingestEmitter && ruleset) {
-        const fields = await this.processViaIngest(item, ruleset);
-        this.handleSuccess(item, fields);
-      } else {
-        const reason = !this.ingestEmitter
-          ? 'no ingest emitter configured (INGEST_BASE_URL unset)'
-          : `no plugin ruleset matches ${item.url}`;
-        throw new Error(`EXTRACTION_UNAVAILABLE: ${reason}`);
+      try {
+        // Extraction is plugin-only: an ingest emitter must be configured AND
+        // a plugin ruleset must match the item's URL. Anything else is a
+        // clean, non-retryable item failure (never a crash, never silent).
+        const ruleset = this.ingestEmitter ? this.lookupRuleset(item.url) : undefined;
+
+        if (this.ingestEmitter && ruleset) {
+          const fields = await this.processViaIngest(item, ruleset);
+          this.handleSuccess(item, fields);
+        } else {
+          const reason = !this.ingestEmitter
+            ? 'no ingest emitter configured (INGEST_BASE_URL unset)'
+            : `no plugin ruleset matches ${item.url}`;
+          throw new Error(`EXTRACTION_UNAVAILABLE: ${reason}`);
+        }
+
+      } catch (error: any) {
+        // Handle failure
+        fastFailedOnCooldown = error instanceof ChallengeCooldownError;
+        this.handleFailure(item, error);
       }
-
-    } catch (error: any) {
-      // Handle failure
-      fastFailedOnCooldown = error instanceof ChallengeCooldownError;
-      this.handleFailure(item, error);
-    }
+    });
 
     this.processingItem = null;
 

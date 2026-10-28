@@ -140,6 +140,11 @@ export interface PersistedQueueItem {
    * the row HAS a lane: the coalesce rule never relabels it and a salvage copy writes it back as text.
    */
   unknownLane?: string;
+  /**
+   * The W3C traceparent the item is processed under (LG-QUEUE-1): its enqueuer's trace, or the new root trace it was
+   * given. Absent = none (a row an older build wrote, or tracing off).
+   */
+  traceparent?: string;
 }
 
 /** A persisted per-host challenge cooldown (mirrors challengeCooldown.ts's CooldownEntry). */
@@ -335,6 +340,8 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 const LANE_STEP = { key: 'queue_items.lane', value: '1' } as const;
 /** The `schema_meta` record for the class-entry step (QB-U19). */
 const CLASS_ENTRY_STEP = { key: 'queue_items.class_entered_at', value: '1' } as const;
+/** The `schema_meta` record for the item-trace step (LG-QUEUE-1). */
+const TRACE_STEP = { key: 'queue_items.traceparent', value: '1' } as const;
 
 /**
  * QB-U1: a nullable `lane` on every queue row, and the index the lane scheduler pages and counts
@@ -355,6 +362,10 @@ function applySchemaSteps(db: DatabaseSync, now: number): void {
     db.exec('ALTER TABLE queue_items ADD COLUMN class_entered_at INTEGER');
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_queue_class_age ON queue_items(state, host, lane, priority, class_entered_at)');
+  // LG-QUEUE-1: the item's trace. Nullable: a row an older build writes leaves it NULL (no trace).
+  if (!columns.some((c) => c.name === 'traceparent')) {
+    db.exec('ALTER TABLE queue_items ADD COLUMN traceparent TEXT');
+  }
   const record = db.prepare(
     `INSERT INTO schema_meta (key, value, applied_at) VALUES (?, ?, ?)
      ON CONFLICT(key) DO UPDATE SET value = excluded.value, applied_at = excluded.applied_at
@@ -362,6 +373,7 @@ function applySchemaSteps(db: DatabaseSync, now: number): void {
   );
   record.run(LANE_STEP.key, LANE_STEP.value, now);
   record.run(CLASS_ENTRY_STEP.key, CLASS_ENTRY_STEP.value, now);
+  record.run(TRACE_STEP.key, TRACE_STEP.value, now);
 }
 
 /**
@@ -426,6 +438,8 @@ interface ItemRow {
   lane?: unknown;
   /** NULL when an older build wrote the row; absent when salvage reads a file without the column. */
   class_entered_at?: number | null;
+  /** NULL when an older build wrote the row; absent when salvage reads a file without the column. */
+  traceparent?: string | null;
 }
 
 /**
@@ -475,6 +489,7 @@ function rowToItem(row: ItemRow, onUnknownLane: (value: string) => void): Persis
     ...(typeof row.class_entered_at === 'number' && row.class_entered_at !== row.enqueued_at
       ? { classEnteredAt: row.class_entered_at }
       : {}),
+    ...(typeof row.traceparent === 'string' ? { traceparent: row.traceparent } : {}),
   };
 }
 
@@ -570,8 +585,8 @@ function openSqliteStore(opts: OpenQueueStoreOptions, onUnknownLane: (value: str
   const stmt = {
     put: db.prepare(
       `INSERT INTO queue_items
-         (id, mfc_id, url, host, priority, status, session_id, attempts, max_retries, enqueued_at, state, lease_until, last_error_class, lane, class_entered_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         (id, mfc_id, url, host, priority, status, session_id, attempts, max_retries, enqueued_at, state, lease_until, last_error_class, lane, class_entered_at, traceparent)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
        ON CONFLICT DO NOTHING`
     ),
     lease: db.prepare(`UPDATE queue_items SET state = 'leased', lease_until = ? WHERE id = ?`),
@@ -780,7 +795,8 @@ function openSqliteStore(opts: OpenQueueStoreOptions, onUnknownLane: (value: str
         item.leaseUntil ?? null,
         item.lastErrorClass ?? null,
         item.lane ?? item.unknownLane ?? null,
-        item.classEnteredAt ?? item.enqueuedAt
+        item.classEnteredAt ?? item.enqueuedAt,
+        item.traceparent ?? null
       ));
     },
 
