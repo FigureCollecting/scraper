@@ -31,6 +31,7 @@ import * as http from 'node:http';
 import type { AddressInfo, Socket } from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { context, trace } from '@opentelemetry/api';
 import { Code, ConnectError, type ConnectRouter, type HandlerContext } from '@connectrpc/connect';
 import { connectNodeAdapter } from '@connectrpc/connect-node';
@@ -41,7 +42,7 @@ import { startTracing, type Tracing } from '@figurecollecting/fc-shared/server/t
 import { ScrapeQueue, resetScrapeQueue } from '../../services/scrapeQueue';
 import { createExtractionRegistry, type ExtractionRegistryImpl } from '../../services/extractionRegistry';
 import { IngestEmitter } from '../../services/ingestEmitter';
-import { openQueueStore } from '../../services/queueStore';
+import { QUEUE_DB_FILE, openQueueStore } from '../../services/queueStore';
 import { keepingExporter, traceIdOf } from '../helpers/jobTelemetry';
 
 const HOSTS = ['shop-a.example.test', 'shop-b.example.test', 'shop-c.example.test', 'shop-d.example.test'];
@@ -291,6 +292,63 @@ describe('ScrapeQueue: one trace per item (LG-QUEUE-1)', () => {
       expect(old).toMatch(/^[0-9a-f]{32}$/);
       expect(old).not.toBe(a.traceId);
       expect(seenWhileProcessing.get('o1')).toBe(old);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('restores a row whose stored traceparent is malformed as a NEW root trace of its own: never continued, never a crash', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scrape-queue-trace-'));
+    // What a damaged or hand-edited file might hold. None of these parses (fc-shared parseTraceparent), so none may
+    // be continued or carried into the item: each item is processed under a new root trace, as a row with no trace is.
+    const id32 = '4bf92f3577b34da6a3ce929d0e0e4736';
+    const MALFORMED: Array<[string, string]> = [
+      ['garbage', 'not-a-traceparent'],
+      ['empty', ''],
+      ['zero-trace', `00-${'0'.repeat(32)}-00f067aa0ba902b7-01`],
+      ['zero-span', `00-${id32}-${'0'.repeat(16)}-01`],
+      ['version-ff', `ff-${id32}-00f067aa0ba902b7-01`],
+      ['upper-case', `00-${id32.toUpperCase()}-00F067AA0BA902B7-01`],
+      ['header-injection', `00-${id32}-00f067aa0ba902b7-01\r\nx-injected: 1`],
+      ['overlong', `00-${id32}-00f067aa0ba902b7-01${'0'.repeat(65_536)}`],
+    ];
+    const ids = [...MALFORMED.map(([id]) => id), 'integer', 'blob'];
+    try {
+      const store = openQueueStore({ dir });
+      MALFORMED.forEach(([id, traceparent], i) => {
+        const u = url(HOSTS[i % HOSTS.length], id);
+        store.put({ id, mfcId: u, url: u, priority: 'WARM', attempts: 0, maxRetries: 3, enqueuedAt: Date.now() + i, state: 'pending', traceparent });
+      });
+      for (const id of ['integer', 'blob']) {
+        const u = url(HOSTS[1], id);
+        store.put({ id, mfcId: u, url: u, priority: 'WARM', attempts: 0, maxRetries: 3, enqueuedAt: Date.now() + 20, state: 'pending' });
+      }
+      store.close();
+      // Two values no build writes: an integer (the TEXT column stores it as the text "42") and a blob (kept as bytes).
+      const db = new DatabaseSync(path.join(dir, QUEUE_DB_FILE));
+      db.prepare("UPDATE queue_items SET traceparent = 42 WHERE id = 'integer'").run();
+      db.prepare("UPDATE queue_items SET traceparent = x'00ff' WHERE id = 'blob'").run();
+      db.close();
+
+      // Restored inside a span (a boot span, say): a new root is a root, never a child of whatever is active.
+      queue = wire(new ScrapeQueue(false), spine);
+      queue.setQueueStore(openQueueStore({ dir }));
+      const boot = inTrace('boot', () => queue!.restoreFromStore());
+      expect(boot.result.pending).toBe(ids.length);
+      await until(() => spine.calls.length === ids.length);
+
+      // Per item: the trace its one Ingest call carried, and the trace the code run for it saw.
+      const called = Object.fromEntries(ids.map(id => [id, traceOfCall(spine, id).map(t => t ?? 'no trace')]));
+      expect(called).toEqual(Object.fromEntries(ids.map(id => [id, [expect.stringMatching(/^[0-9a-f]{32}$/)]])));
+      const restored = ids.map(id => called[id][0]);
+      expect(Object.fromEntries(ids.map(id => [id, seenWhileProcessing.get(id)]))).toEqual(Object.fromEntries(ids.map((id, i) => [id, restored[i]])));
+      // Each its own trace: not the stored one (repaired or not), not the boot span's, not another item's.
+      expect(new Set([...restored, id32, boot.traceId]).size).toBe(ids.length + 2);
+
+      await tracing.forceFlush();
+      const roots = exporter.spans.filter(s => s.name === 'scrape.enqueue' && restored.includes(s.spanContext().traceId));
+      expect(roots).toHaveLength(ids.length);
+      for (const root of roots) expect(root.parentSpanContext).toBeUndefined();
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
