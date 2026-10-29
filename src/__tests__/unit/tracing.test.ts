@@ -1,4 +1,6 @@
-import { ROOT_CONTEXT, SpanKind, propagation, trace, type Context, type SpanContext } from '@opentelemetry/api';
+import { ROOT_CONTEXT, SpanKind, context, propagation, trace, type Context, type SpanContext } from '@opentelemetry/api';
+import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
+import { currentRunId, withTraceparent } from '@figurecollecting/fc-shared/server/job';
 import { withPropagationTarget } from '@figurecollecting/fc-shared/server/tracing';
 import { outboundPropagator, propagationHosts, shouldEnableTracing } from '../../tracing';
 
@@ -100,5 +102,70 @@ describe('outboundPropagator', () => {
     });
     expect(trace.getSpanContext(ctx)?.traceId).toBe('0af7651916cd43dd8448eb211c80319c');
     expect(outboundPropagator({}).fields()).toEqual(expect.arrayContaining(['traceparent', 'tracestate', 'baggage']));
+  });
+});
+
+describe('outboundPropagator: the run id (fc.run_id baggage), with the same allowlist', () => {
+  const RUN = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
+  const TP = '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01';
+  const env = { INGEST_BASE_URL: 'http://spine.internal:50051' };
+  const contextManager = new AsyncLocalStorageContextManager();
+  const getter = { get: (c: Record<string, string>, k: string) => c[k], keys: (c: Record<string, string>) => Object.keys(c) };
+
+  beforeAll(() => {
+    contextManager.enable();
+    context.setGlobalContextManager(contextManager);
+  });
+  afterAll(() => {
+    context.disable();
+    contextManager.disable();
+  });
+
+  /** A context in run RUN (fc-shared's run key, as the queue restores it) whose baggage holds `entries`. */
+  const inRun = (entries: Record<string, { value: string }>): Context =>
+    withTraceparent(TP, () => propagation.setBaggage(context.active(), propagation.createBaggage(entries)), { runId: RUN });
+  const injected = (ctx: Context, target: string): Record<string, string> => {
+    const carrier: Record<string, string> = {};
+    outboundPropagator(env).inject(withPropagationTarget(ctx, target), carrier, { set: (c, k, v) => { c[k] = v; } });
+    return carrier;
+  };
+
+  it.each([
+    ['an in-cluster service', 'http://scraper.fc.svc.cluster.local:3050/ingest/scrape'],
+    ['the configured spine', 'http://spine.internal:50051/ingest.v1.SpineIngest/Ingest'],
+  ])('sends the active run to %s as the first baggage entry fc.run_id, beside traceparent', (_what, target) => {
+    expect(injected(inRun({ k: { value: 'v' } }), target)).toEqual({ traceparent: TP, baggage: `fc.run_id=${RUN},k=v` });
+  });
+
+  it.each([
+    ['a store page', 'https://www.amiami.com/eng/detail/?gcode=FIGURE-1'],
+    ['an image CDN', 'https://img.amiami.com/images/product/main/1.jpg'],
+    ['a loopback IP', 'http://127.0.0.1:3050/'],
+  ])('sends %s neither the run nor anything else', (_what, target) => {
+    expect(injected(inRun({ k: { value: 'v' } }), target)).toEqual({});
+  });
+
+  it('never forwards an fc.run_id baggage entry when no run is active (a forged or stale inbound one)', () => {
+    const forged = propagation.setBaggage(trace.setSpanContext(ROOT_CONTEXT, { traceId: '4bf92f3577b34da6a3ce929d0e0e4736', spanId: '00f067aa0ba902b7', traceFlags: 1, isRemote: true }),
+      propagation.createBaggage({ 'fc.run_id': { value: RUN }, k: { value: 'v' } }));
+    expect(injected(forged, 'http://scraper.fc.svc.cluster.local:3050/ingest/scrape')).toEqual({ traceparent: TP, baggage: 'k=v' });
+  });
+
+  it("serves an inbound request in the run its baggage names, and drops the raw entry from the request's baggage", () => {
+    const ctx = outboundPropagator({}).extract(ROOT_CONTEXT, { traceparent: TP, baggage: `fc.run_id=${RUN},k=v` }, getter);
+    expect(context.with(ctx, currentRunId)).toBe(RUN);
+    expect(trace.getSpanContext(ctx)?.traceId).toBe('4bf92f3577b34da6a3ce929d0e0e4736');
+    expect(propagation.getBaggage(ctx)?.getAllEntries()).toEqual([['k', { value: 'v' }]]);
+  });
+
+  it.each([
+    ['uppercase', RUN.toUpperCase()],
+    ['31 hex', RUN.slice(1)],
+    ['all zero', '0'.repeat(32)],
+    ['with a property', `${RUN};p=1`],
+  ])('serves an inbound request whose fc.run_id is malformed (%s) in no run, and still drops the entry', (_what, value) => {
+    const ctx = outboundPropagator({}).extract(ROOT_CONTEXT, { traceparent: TP, baggage: `fc.run_id=${value},k=v` }, getter);
+    expect(context.with(ctx, currentRunId)).toBeUndefined();
+    expect(propagation.getBaggage(ctx)?.getEntry('fc.run_id')).toBeUndefined();
   });
 });
