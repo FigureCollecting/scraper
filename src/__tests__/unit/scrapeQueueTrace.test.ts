@@ -36,12 +36,19 @@ import { context, trace } from '@opentelemetry/api';
 import { Code, ConnectError, type ConnectRouter, type HandlerContext } from '@connectrpc/connect';
 import { connectNodeAdapter } from '@connectrpc/connect-node';
 import { create } from '@bufbuild/protobuf';
-import { SpineIngest, WriteStatsSchema, type ExtractedData as WireExtractedData } from '@figurecollecting/ingest-contract';
+import {
+  FetchFailureAckSchema,
+  SpineIngest,
+  WriteStatsSchema,
+  type ExtractedData as WireExtractedData,
+  type FetchFailure,
+} from '@figurecollecting/ingest-contract';
 import type { ExtractionRuleset } from '@figurecollecting/scraper-plugin-contract';
 import { startTracing, type Tracing } from '@figurecollecting/fc-shared/server/tracing';
 import { ScrapeQueue, resetScrapeQueue } from '../../services/scrapeQueue';
 import { createExtractionRegistry, type ExtractionRegistryImpl } from '../../services/extractionRegistry';
 import { IngestEmitter } from '../../services/ingestEmitter';
+import { FailureReporter } from '../../services/failureReporter';
 import { QUEUE_DB_FILE, openQueueStore } from '../../services/queueStore';
 import { keepingExporter, traceIdOf } from '../helpers/jobTelemetry';
 
@@ -59,11 +66,14 @@ interface SpineCall {
 interface Spine {
   url: string;
   calls: SpineCall[];
+  /** The ReportFetchFailure calls (the failure ledger), kept apart from the Ingest calls. */
+  failures: SpineCall[];
   close: () => Promise<void>;
 }
 
 async function startSpine(fail: (call: SpineCall, n: number) => boolean = () => false): Promise<Spine> {
   const calls: SpineCall[] = [];
+  const failures: SpineCall[] = [];
   const routes = (router: ConnectRouter): void => {
     router.service(SpineIngest, {
       ingest: (req: WireExtractedData, ctx: HandlerContext) => {
@@ -71,6 +81,10 @@ async function startSpine(fail: (call: SpineCall, n: number) => boolean = () => 
         calls.push(call);
         if (fail(call, calls.length)) throw new ConnectError('spine down', Code.Unavailable);
         return create(WriteStatsSchema, { sourceId: 'src-1', claims: { emitted: 1, inserted: 1 } });
+      },
+      reportFetchFailure: (req: FetchFailure, ctx: HandlerContext) => {
+        failures.push({ itemId: req.source?.itemId ?? '', traceparent: ctx.requestHeader.get('traceparent') });
+        return create(FetchFailureAckSchema, {});
       },
     });
   };
@@ -84,6 +98,7 @@ async function startSpine(fail: (call: SpineCall, n: number) => boolean = () => 
   return {
     url: `http://localhost:${(server.address() as AddressInfo).port}`,
     calls,
+    failures,
     close: async () => {
       for (const socket of sockets) socket.destroy();
       await new Promise<void>(resolve => server.close(() => resolve()));
@@ -352,5 +367,23 @@ describe('ScrapeQueue: one trace per item (LG-QUEUE-1)', () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("reports each item's terminal failure (ReportFetchFailure) in that item's trace, through the one reporter the queue holds", async () => {
+    // As the server wires it (LG-QUEUE-2): one FailureReporter for the queue's life, made before any item and in no
+    // item's trace. The hosts match no ruleset, so each item fails for good on its first dispatch.
+    queue = wire(new ScrapeQueue(false), spine);
+    queue.setFailureReporter(new FailureReporter({ baseUrl: spine.url, retryDelayMs: 1 }));
+    const unmatched = (id: string): string => `https://unmatched-${id}.example.test/item/${id}`;
+    const a = inTrace('POST a', () => queue!.enqueue('fail-a', { url: unmatched('fail-a') }));
+    const b = inTrace('POST b', () => queue!.enqueue('fail-b', { url: unmatched('fail-b') }));
+    const c = queue.enqueue('fail-c', { url: unmatched('fail-c') }); // no trace: the item gets a new root of its own
+    await Promise.allSettled([a.result.promise, b.result.promise, c.promise]);
+    await until(() => spine.failures.length === 3);
+
+    const reported = Object.fromEntries(spine.failures.map(f => [f.itemId, traceIdOf(f.traceparent)]));
+    expect(reported).toEqual({ 'fail-a': a.traceId, 'fail-b': b.traceId, 'fail-c': expect.stringMatching(/^[0-9a-f]{32}$/) });
+    expect([a.traceId, b.traceId]).not.toContain(reported['fail-c']);
+    expect(spine.calls).toEqual([]); // nothing reached Ingest: every report above is a failure's
   });
 });

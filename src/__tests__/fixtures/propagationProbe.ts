@@ -73,23 +73,34 @@ async function main(): Promise<void> {
       }).on('error', reject);
     });
 
+  // The spine clients are made outside the trace, as the server makes them (once, before any item); only their calls
+  // are made inside it.
+  const spines = ['127.0.0.1', 'localhost'].map(host => {
+    const base = `http://${host}:${port}`;
+    return {
+      base,
+      emitter: new IngestEmitter({ baseUrl: base, retryDelayMs: 1 }),
+      captures: new CaptureReporter({ baseUrl: base, retryDelayMs: 1 }),
+      failures: new FailureReporter({ baseUrl: base, retryDelayMs: 1 }),
+    };
+  });
+
   await context.with(active, async () => {
-    for (const host of ['127.0.0.1', 'localhost']) {
-      const base = `http://${host}:${port}`;
+    for (const { base, emitter, captures, failures } of spines) {
       await (await fetch(`${base}/fetch`)).text();
       await get(`${base}/http`);
       await (await impit.fetch(`${base}/impit`)).text();
-      await new IngestEmitter({ baseUrl: base, retryDelayMs: 1 }).send({
+      await emitter.send({
         source: { site: 'probe', itemId: '1', extractedAt: '2026-10-28T00:00:00Z' },
         fields: {},
         warnings: [],
       });
       const sha = 'ab'.repeat(32);
-      await new CaptureReporter({ baseUrl: base, retryDelayMs: 1 }).report({
+      await captures.report({
         site: 'probe', itemId: '1', url: `${base}/img/1.png`, lane: 'asset', sha256: sha, bytesLen: 1,
         storageKey: `raw-img/sha256/ab/${sha}.png`, fetchedAt: '2026-10-28T00:00:00Z', alreadyStored: false,
       });
-      await new FailureReporter({ baseUrl: base, retryDelayMs: 1 }).report({
+      await failures.report({
         site: 'probe', itemId: '1', target: `${base}/item/1`, kind: 'record', origin: 'ingest', reasonClass: 'timeout',
       });
     }

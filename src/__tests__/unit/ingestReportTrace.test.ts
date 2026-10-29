@@ -32,7 +32,7 @@ import { FailureReporter, resetFetchFailureReportStats, type FetchFailureReport 
 import { installOutboundRpcInterceptors } from '../../services/outboundRpc';
 import { buildRawCapture } from '../../services/captureSink';
 import { ObjectStoreCaptureSink, type ObjectStore } from '../../services/objectStoreCaptureSink';
-import { keepingExporter } from '../helpers/jobTelemetry';
+import { keepingExporter, traceIdOf } from '../helpers/jobTelemetry';
 
 interface SpineCall {
   method: 'ReportCapture' | 'ReportFetchFailure';
@@ -98,10 +98,26 @@ const failureReport = (itemId: string): FetchFailureReport => ({
   reasonClass: 'timeout',
 });
 
-/** The two ledger calls, each through its real reporter and transport, to the spine at `base`. */
-const LEDGER: Array<[SpineCall['method'], (base: string, itemId: string) => Promise<void>]> = [
-  ['ReportCapture', (base, itemId) => new CaptureReporter({ baseUrl: base, retryDelayMs: 0 }).report(captureReport(itemId))],
-  ['ReportFetchFailure', (base, itemId) => new FailureReporter({ baseUrl: base, retryDelayMs: 0 }).report(failureReport(itemId))],
+/**
+ * The two ledger calls, each through its real reporter and transport, to the spine at `base`. The reporter is made
+ * when this is called and returns the send: the tests make it outside the item's span, as the server makes its
+ * reporters once and reuses them for every item, so a reporter that took its trace from where it was made shows.
+ */
+const LEDGER: Array<[SpineCall['method'], (base: string) => (itemId: string) => Promise<void>]> = [
+  [
+    'ReportCapture',
+    base => {
+      const reporter = new CaptureReporter({ baseUrl: base, retryDelayMs: 0 });
+      return itemId => reporter.report(captureReport(itemId));
+    },
+  ],
+  [
+    'ReportFetchFailure',
+    base => {
+      const reporter = new FailureReporter({ baseUrl: base, retryDelayMs: 0 });
+      return itemId => reporter.report(failureReport(itemId));
+    },
+  ],
 ];
 
 /** Run fn inside a new active span (an item's processing); returns the span's trace and span ids with fn's promise. */
@@ -145,28 +161,49 @@ const callFor = (method: SpineCall['method'], itemId: string): SpineCall => {
 };
 
 describe("ledger calls to the spine carry the item's trace (LG-QUEUE-2)", () => {
-  it.each(LEDGER)("%s to an in-cluster spine carries the active item's traceparent", async (method, send) => {
-    const item = await inItem(() => send(`http://localhost:${spine.port}`, 'in-cluster'));
+  it.each(LEDGER)("%s to an in-cluster spine carries the active item's traceparent", async (method, reporterAt) => {
+    const send = reporterAt(`http://localhost:${spine.port}`);
+    const item = await inItem(() => send('in-cluster'));
 
     expect(callFor(method, 'in-cluster').traceparent).toBe(`00-${item.traceId}-${item.spanId}-01`);
   });
 
-  it.each(LEDGER)('%s to a spine off the propagation allowlist carries no traceparent', async (method, send) => {
-    await inItem(() => send(`http://127.0.0.1:${spine.port}`, 'off-list'));
+  it.each(LEDGER)("one %s reporter, made in another trace, sends each item's call in that item's own trace, items in flight together", async (method, reporterAt) => {
+    // engineLookup builds its reporter when it is first wired, which can be inside the first request's trace.
+    const made = trace.getTracer('test').startActiveSpan('first request', span => {
+      try {
+        return { send: reporterAt(`http://localhost:${spine.port}`), traceId: span.spanContext().traceId };
+      } finally {
+        span.end();
+      }
+    });
+    const ids = ['shared-1', 'shared-2', 'shared-3'];
+    const items = await Promise.all(ids.map(id => inItem(() => made.send(id))));
+
+    expect(Object.fromEntries(ids.map(id => [id, traceIdOf(callFor(method, id).traceparent)]))).toEqual(
+      Object.fromEntries(ids.map((id, i) => [id, items[i].traceId])),
+    );
+    expect(items.map(item => item.traceId)).not.toContain(made.traceId);
+  });
+
+  it.each(LEDGER)('%s to a spine off the propagation allowlist carries no traceparent', async (method, reporterAt) => {
+    const send = reporterAt(`http://127.0.0.1:${spine.port}`);
+    await inItem(() => send('off-list'));
 
     expect(callFor(method, 'off-list').traceparent).toBeNull();
   });
 
-  it.each(LEDGER)('%s made in no trace carries no traceparent', async (method, send) => {
-    await send(`http://localhost:${spine.port}`, 'no-trace');
+  it.each(LEDGER)('%s made in no trace carries no traceparent', async (method, reporterAt) => {
+    await reporterAt(`http://localhost:${spine.port}`)('no-trace');
 
     expect(callFor(method, 'no-trace').traceparent).toBeNull();
   });
 
-  it.each(LEDGER)("%s in a batch job carries its rpc.out CLIENT span, a child of the item's, not the item's own", async (method, send) => {
+  it.each(LEDGER)("%s in a batch job carries its rpc.out CLIENT span, a child of the item's, not the item's own", async (method, reporterAt) => {
     const restore = installOutboundRpcInterceptors([rpcClientInterceptor({ logger: createLogger({ service: 'scraper-ledger-trace-test', env: {}, sink: () => undefined }) })]);
     try {
-      const item = await inItem(() => send(`http://localhost:${spine.port}`, 'in-job'));
+      const send = reporterAt(`http://localhost:${spine.port}`);
+      const item = await inItem(() => send('in-job'));
       await tracing.forceFlush();
 
       const client = exporter.spans.find(s => s.kind === SpanKind.CLIENT && s.name === `ingest.v1.SpineIngest/${method}` && s.spanContext().traceId === item.traceId);
