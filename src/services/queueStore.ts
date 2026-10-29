@@ -145,6 +145,12 @@ export interface PersistedQueueItem {
    * given. Absent = none (a row an older build wrote, or tracing off).
    */
   traceparent?: string;
+  /**
+   * The run the item was enqueued in (fc-shared currentRunId, LG-RUNID), restored with the traceparent so the item's
+   * lines carry its run_id. Absent = none (enqueued outside a run, or a row an older build wrote). Text is carried as
+   * read; fc-shared's withTraceparent ignores one that is not a run id.
+   */
+  runId?: string;
 }
 
 /** A persisted per-host challenge cooldown (mirrors challengeCooldown.ts's CooldownEntry). */
@@ -342,6 +348,8 @@ const LANE_STEP = { key: 'queue_items.lane', value: '1' } as const;
 const CLASS_ENTRY_STEP = { key: 'queue_items.class_entered_at', value: '1' } as const;
 /** The `schema_meta` record for the item-trace step (LG-QUEUE-1). */
 const TRACE_STEP = { key: 'queue_items.traceparent', value: '1' } as const;
+/** The `schema_meta` record for the item-run step (LG-RUNID). */
+const RUN_ID_STEP = { key: 'queue_items.run_id', value: '1' } as const;
 
 /**
  * QB-U1: a nullable `lane` on every queue row, and the index the lane scheduler pages and counts
@@ -366,6 +374,10 @@ function applySchemaSteps(db: DatabaseSync, now: number): void {
   if (!columns.some((c) => c.name === 'traceparent')) {
     db.exec('ALTER TABLE queue_items ADD COLUMN traceparent TEXT');
   }
+  // LG-RUNID: the run the item was enqueued in. Nullable: a row an older build writes leaves it NULL (no run).
+  if (!columns.some((c) => c.name === 'run_id')) {
+    db.exec('ALTER TABLE queue_items ADD COLUMN run_id TEXT');
+  }
   const record = db.prepare(
     `INSERT INTO schema_meta (key, value, applied_at) VALUES (?, ?, ?)
      ON CONFLICT(key) DO UPDATE SET value = excluded.value, applied_at = excluded.applied_at
@@ -374,6 +386,7 @@ function applySchemaSteps(db: DatabaseSync, now: number): void {
   record.run(LANE_STEP.key, LANE_STEP.value, now);
   record.run(CLASS_ENTRY_STEP.key, CLASS_ENTRY_STEP.value, now);
   record.run(TRACE_STEP.key, TRACE_STEP.value, now);
+  record.run(RUN_ID_STEP.key, RUN_ID_STEP.value, now);
 }
 
 /**
@@ -440,6 +453,8 @@ interface ItemRow {
   class_entered_at?: number | null;
   /** NULL when an older build wrote the row; absent when salvage reads a file without the column. */
   traceparent?: string | null;
+  /** NULL when an older build wrote the row or it was enqueued outside a run; absent when salvage reads an older file. */
+  run_id?: unknown;
 }
 
 /**
@@ -490,6 +505,8 @@ function rowToItem(row: ItemRow, onUnknownLane: (value: string) => void): Persis
       ? { classEnteredAt: row.class_entered_at }
       : {}),
     ...(typeof row.traceparent === 'string' ? { traceparent: row.traceparent } : {}),
+    // Text only: a cell no build writes (a blob) is no run.
+    ...(typeof row.run_id === 'string' ? { runId: row.run_id } : {}),
   };
 }
 
@@ -585,8 +602,8 @@ function openSqliteStore(opts: OpenQueueStoreOptions, onUnknownLane: (value: str
   const stmt = {
     put: db.prepare(
       `INSERT INTO queue_items
-         (id, mfc_id, url, host, priority, status, session_id, attempts, max_retries, enqueued_at, state, lease_until, last_error_class, lane, class_entered_at, traceparent)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         (id, mfc_id, url, host, priority, status, session_id, attempts, max_retries, enqueued_at, state, lease_until, last_error_class, lane, class_entered_at, traceparent, run_id)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
        ON CONFLICT DO NOTHING`
     ),
     lease: db.prepare(`UPDATE queue_items SET state = 'leased', lease_until = ? WHERE id = ?`),
@@ -796,7 +813,8 @@ function openSqliteStore(opts: OpenQueueStoreOptions, onUnknownLane: (value: str
         item.lastErrorClass ?? null,
         item.lane ?? item.unknownLane ?? null,
         item.classEnteredAt ?? item.enqueuedAt,
-        item.traceparent ?? null
+        item.traceparent ?? null,
+        item.runId ?? null
       ));
     },
 

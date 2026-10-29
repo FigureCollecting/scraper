@@ -48,7 +48,7 @@ import { observeGate } from './gateSignal.js';
 import { getRawCaptureSink } from './s3ObjectStore.js';
 import { createIngestEmitterFromEnv } from './ingestEmitter.js';
 import { ROOT_CONTEXT, context } from '@opentelemetry/api';
-import { enqueueTraceparent, restoredTraceparent, withTraceparent } from './queueTrace.js';
+import { currentRunId, enqueueTraceparent, restoredTraceparent, withTraceparent } from './queueTrace.js';
 import { impitFetchBodyDetailed } from './impitFetch.js';
 import { httpFetchBodyDetailed } from './engineLookup.js';
 import { buildProfileRegistry, ProfileRegistry } from '../driver/profileRegistry.js';
@@ -167,6 +167,11 @@ export interface QueueItem {
    * root trace. Kept across retries, dedup enqueues and restarts (queue_items.traceparent). Absent with tracing off.
    */
   traceparent?: string;
+  /**
+   * The run the item was enqueued in (fc-shared currentRunId, LG-RUNID), handed back with the traceparent so the item's
+   * lines carry its run_id. Kept like the traceparent (queue_items.run_id). Absent when enqueued outside a run.
+   */
+  runId?: string;
   /** Promise resolvers for waiting callers */
   resolvers: Array<{
     resolve: (data: ScrapedData) => void;
@@ -1374,6 +1379,7 @@ export class ScrapeQueue {
     const id = `${mfcId}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     const queuedAt = Date.now();
     const traceparent = enqueueTraceparent();
+    const runId = currentRunId();
 
     // Determine effective priority
     // Items with cookies go to HOT, unless explicitly COLD
@@ -1399,6 +1405,7 @@ export class ScrapeQueue {
       resolvers: [],
       ...(lane !== undefined ? { lane } : {}),
       ...(traceparent !== undefined ? { traceparent } : {}),
+      ...(runId !== undefined ? { runId } : {}),
     };
 
     // Create promise for first caller
@@ -1682,6 +1689,7 @@ export class ScrapeQueue {
       ...(item.errorType !== undefined ? { lastErrorClass: item.errorType } : {}),
       ...(item.lane !== undefined ? { lane: item.lane } : {}),
       ...(item.traceparent !== undefined ? { traceparent: item.traceparent } : {}),
+      ...(item.runId !== undefined ? { runId: item.runId } : {}),
     };
   }
 
@@ -1779,6 +1787,7 @@ export class ScrapeQueue {
       ...(row.lane !== undefined ? { lane: row.lane } : {}),
       ...(row.unknownLane !== undefined ? { unknownLane: row.unknownLane } : {}),
       ...(traceparent !== undefined ? { traceparent } : {}),
+      ...(row.runId !== undefined ? { runId: row.runId } : {}),
     };
   }
 
@@ -2099,7 +2108,7 @@ export class ScrapeQueue {
 
     let fastFailedOnCooldown = false;
     // The item's own trace (LG-QUEUE-1): its Ingest call and everything done and logged for it carry the trace it
-    // was enqueued under; one with none runs in no trace, never the loop's.
+    // was enqueued under; one with none runs in no trace, never the loop's. Its run comes back with it (LG-RUNID).
     await withTraceparent(item.traceparent, async () => {
       const poolAvailable = BrowserPool.getPoolSize();
       console.log(`[SCRAPE QUEUE] Processing ${item.mfcId} (${item.priority}, attempt ${item.retryCount + 1}/${item.maxRetries + 1}, delay=${this.currentDelay}ms, pool=${poolAvailable}/${BrowserPool.getPoolCapacity()})`);
@@ -2125,7 +2134,7 @@ export class ScrapeQueue {
         fastFailedOnCooldown = error instanceof ChallengeCooldownError;
         this.handleFailure(item, error);
       }
-    });
+    }, { runId: item.runId });
 
     this.processingItem = null;
 
