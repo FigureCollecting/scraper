@@ -34,6 +34,7 @@ import { SimpleSpanProcessor, SpanExporter, ReadableSpan } from '@opentelemetry/
 import type { TextMapPropagator } from '@opentelemetry/api';
 import { CompositePropagator, ExportResult, ExportResultCode, W3CBaggagePropagator, W3CTraceContextPropagator } from '@opentelemetry/core';
 import { redactAttributes } from '@figurecollecting/fc-shared';
+import { resolveServiceIdentity } from '@figurecollecting/fc-shared/server/log';
 import { AllowlistPropagator, createHostAllowlist, propagationHostsFromEnv } from '@figurecollecting/fc-shared/server/tracing';
 
 /**
@@ -136,7 +137,8 @@ export function startTracing(env: NodeJS.ProcessEnv = process.env): NodeSDK | un
   sdk = new NodeSDK({
     resource: resourceFromAttributes({
       [ATTR_SERVICE_NAME]: env.OTEL_SERVICE_NAME || 'scraper',
-      [ATTR_SERVICE_VERSION]: process.env.npm_package_version || 'dev',
+      // fc-shared's rule, as on the jobs' log lines and spans: SERVICE_VERSION, else npm_package_version, else 'unknown'.
+      [ATTR_SERVICE_VERSION]: resolveServiceIdentity(env).version,
     }),
     // With a collector endpoint -> export via OTLP (OTLPTraceExporter reads the
     // endpoint from the env). Without one -> keep the provider RECORDING (real
