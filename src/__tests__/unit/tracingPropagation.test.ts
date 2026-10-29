@@ -42,7 +42,10 @@ const w3c = (s: Seen) => ({ traceparent: s.traceparent, tracestate: s.tracestate
 const NONE = { traceparent: null, tracestate: null, baggage: null };
 
 beforeAll(async () => {
-  const run = await runEntry('src/__tests__/fixtures/propagationProbe.ts', { NODE_ENV: 'production' });
+  // The ingest route's queue imports @figurecollecting/scraper-plugin-contract at runtime. tsconfig.test.json maps it to
+  // packages/plugin-contract/src, as jest's moduleNameMapper does, so the probe never needs the contract's built dist
+  // (CI's unit-test job does not build it).
+  const run = await runEntry('src/__tests__/fixtures/propagationProbe.ts', { NODE_ENV: 'production', TSX_TSCONFIG_PATH: 'tsconfig.test.json' });
   const line = run.stdout.split('\n').find(l => l.startsWith('PROBE_RESULT '));
   if (run.code !== 0 || line === undefined) throw new Error(`probe exited ${run.code}: ${run.stdout.slice(-600)} ${run.stderr.slice(-600)}`);
   seen = JSON.parse(line.slice('PROBE_RESULT '.length)) as Seen[];
