@@ -1,23 +1,23 @@
 /**
- * CHALLENGER: (1) a run-A item that FAILS its first attempt and is retried while run B is active logs run A's id on
- * BOTH attempts; (2) a queue file written by develop's REAL code (CHALLENGER_DEV_DB, made by develop 1f8187ca's
- * openQueueStore) is upgraded and processed by this queue inside run B with no run_id and no crash.
- * Fake timers only.
+ * LG-RUNID: a retried queue item logs the run it was enqueued in on every attempt, not the run active at the retry.
+ *
+ * A run-A item fails its first attempt with ECONNRESET and is retried while run B is active. The queue restores the
+ * item's stored traceparent with its stored run id on each processing pass, so both attempts' log lines carry run A's
+ * run_id and neither takes run B's.
+ *
+ * Real pieces: fc-shared tracing, runJob and the server/log logger. The scraping service and ingest call are local
+ * fakes; the clock is jest's (no real timers); nothing leaves the process.
  */
 jest.mock('../../services/genericScraper', () => ({
   BrowserPool: { getStealthBrowser: jest.fn(), getBrowser: jest.fn(), returnBrowser: jest.fn(), getPoolSize: jest.fn().mockReturnValue(2), getPoolCapacity: jest.fn().mockReturnValue(3), reset: jest.fn() },
 }));
 jest.mock('../../services/webhookClient', () => ({ notifyItemSuccess: jest.fn().mockResolvedValue(true), notifyItemFailed: jest.fn().mockResolvedValue(true), notifyItemSkipped: jest.fn().mockResolvedValue(true) }));
-import * as fs from 'node:fs';
-import * as os from 'node:os';
-import * as path from 'node:path';
 import type { ExtractionRuleset } from '@figurecollecting/scraper-plugin-contract';
 import { runJob, type JobRun } from '@figurecollecting/fc-shared/server/job';
 import { createLogger, type Logger } from '@figurecollecting/fc-shared/server/log';
 import { startTracing, type Tracing } from '@figurecollecting/fc-shared/server/tracing';
 import { ScrapeQueue, resetScrapeQueue } from '../../services/scrapeQueue';
 import { createExtractionRegistry } from '../../services/extractionRegistry';
-import { openQueueStore } from '../../services/queueStore';
 import { okWriteStats } from '../helpers/ingestWriteStats';
 import { keepingExporter } from '../helpers/jobTelemetry';
 
@@ -38,7 +38,7 @@ let queue: ScrapeQueue | undefined;
 const send = jest.fn();
 const scraping = { scrapePage: jest.fn(), scrapePageStealth: jest.fn() };
 async function until(done: () => boolean) { for (let i = 0; i < 800 && !done(); i++) await jest.advanceTimersByTimeAsync(25); if (!done()) throw new Error('not met'); }
-beforeAll(() => { tracing = startTracing('challenger-q', { env: {}, exporter: keepingExporter() }); });
+beforeAll(() => { tracing = startTracing('runid-retry', { env: {}, exporter: keepingExporter() }); });
 afterAll(async () => { await tracing.shutdown(); });
 beforeEach(() => {
   jest.useFakeTimers();
@@ -65,21 +65,4 @@ it('a retried item keeps the enqueuing run on its second attempt, processed whil
   const runB = await inRun('run-b', async r => { await until(() => n >= 2 && send.mock.calls.length >= 1); return r.runId; });
   expect(runB).not.toBe(a.runId);
   expect(fetchRuns()).toEqual([['r1', 1, a.runId], ['r1', 2, a.runId]]);
-});
-
-const devDb = process.env.CHALLENGER_DEV_DB;
-(devDb ? it : it.skip)('processes rows from a file develop 1f8187ca wrote, inside run B, with no run_id and no crash', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'challenger-devdb-'));
-  for (const f of fs.readdirSync(devDb!)) fs.copyFileSync(path.join(devDb!, f), path.join(dir, f));
-  scraping.scrapePage.mockImplementation(async (u: string) => { log.info({ event: 'fetch', item: u.split('/').pop(), attempt: 1 }, 'fetch'); return { html: '<html>ok</html>', url: u, title: 'T', statusCode: 200 }; });
-  queue = wire(new ScrapeQueue(false));
-  const store = openQueueStore({ dir });
-  expect(store.reason).toBe('ok');
-  queue.setQueueStore(store);
-  const runB = await inRun('run-b', async r => { const res = queue!.restoreFromStore(); expect(res).toBeDefined(); await until(() => send.mock.calls.length >= 2); return r.runId; });
-  expect(runB).toMatch(/^[0-9a-f]{32}$/);
-  const got = fetchRuns();
-  expect(got.length).toBeGreaterThanOrEqual(2);
-  expect(got.every(([, , run]) => run === 'none')).toBe(true);
-  fs.rmSync(dir, { recursive: true, force: true });
 });

@@ -1,6 +1,12 @@
 /**
- * CHALLENGER: items over the resident cap go STRAIGHT to disk as parked (enqueue's park branch) and are paged in later;
- * each keeps the run it was enqueued in (or none), processed while run B is active. Fake timers only.
+ * LG-RUNID: an item parked on enqueue keeps the run it was enqueued in when it is paged in under another run.
+ *
+ * With SCRAPE_QUEUE_MAX_RESIDENT=1 the enqueues over the cap go straight to disk as parked rows. A new queue then
+ * restores them inside run B and pages them in; each item logs run A's run_id, and an item enqueued outside any run
+ * logs none. The test first checks that rows really parked, so the park branch is what is exercised.
+ *
+ * Real pieces: fc-shared tracing, runJob and the server/log logger, the durable queue store on a temp dir. The
+ * scraping service and ingest call are local fakes; the clock is jest's (no real timers); nothing leaves the process.
  */
 jest.mock('../../services/genericScraper', () => ({
   BrowserPool: { getStealthBrowser: jest.fn(), getBrowser: jest.fn(), returnBrowser: jest.fn(), getPoolSize: jest.fn().mockReturnValue(2), getPoolCapacity: jest.fn().mockReturnValue(3), reset: jest.fn() },
@@ -28,7 +34,7 @@ let tracing: Tracing;
 const send = jest.fn();
 const scraping = { scrapePage: jest.fn(), scrapePageStealth: jest.fn() };
 async function until(done: () => boolean) { for (let i = 0; i < 800 && !done(); i++) await jest.advanceTimersByTimeAsync(25); if (!done()) throw new Error('not met'); }
-beforeAll(() => { tracing = startTracing('challenger-park', { env: {}, exporter: keepingExporter() }); });
+beforeAll(() => { tracing = startTracing('runid-park', { env: {}, exporter: keepingExporter() }); });
 afterAll(async () => { await tracing.shutdown(); });
 
 it('parked-on-enqueue items keep their own run (or none) when paged in under run B', async () => {
@@ -43,7 +49,7 @@ it('parked-on-enqueue items keep their own run (or none) when paged in under run
   r.registerSite({ siteId: 'c', name: 'c', domains: HOSTS, rateLimit: { domain: HOSTS[0], baseDelayMs: 1, minDelayMs: 1, maxDelayMs: 10, backoffMultiplier: 1.5, recoveryDivisor: 1.5, successThreshold: 3 }, requiresBrowser: false, allowedCookies: [] });
   const rs: ExtractionRuleset = { siteId: 'c', version: '1.0.0', extract: (_h: string, u: string) => ({ source: { site: 'c', itemId: u, url: u, extractedAt: '2026-10-29T00:00:00Z', rulesetVersion: '1.0.0' }, fields: { name: u }, warnings: [] }), validate: () => ({ valid: true, errors: [], warnings: [] }) };
   r.registerRuleset(rs);
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'challenger-park-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'runid-park-'));
   const queue = new ScrapeQueue(true); // test mode: nothing dispatches while we enqueue
   queue.setPluginRegistry(r); queue.setIngestEmitter({ send }); queue.setScrapingService(scraping);
   const store = openQueueStore({ dir });
