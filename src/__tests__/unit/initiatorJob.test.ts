@@ -60,6 +60,32 @@ describe('runInitiatorJob', () => {
     await runInitiatorJob({ env: e, logger: createServiceLogger(INGEST_INITIATOR, { env: e, sink: () => undefined }), fetchImpl: scraper.fetchImpl });
     expect(scraper.calls.map(c => [c.method, c.headers.traceparent])).toEqual([['GET', undefined], ['POST', undefined]]);
   });
+
+  it('every call to our own scraper carries the run as baggage fc.run_id: the lookup and each dispatched url\'s enqueue', async () => {
+    const scraper = recordingFetch(url => (url.includes('/lookup')
+      ? json(200, { results: [{ siteId: 'shop', candidates: [{ url: 'https://shop.example/p/1' }, { url: 'https://shop.example/p/2' }] }] })
+      : json(202, { success: true, deduplicated: false })));
+    const out: string[] = [];
+    await runInitiatorJob({ env: env(), logger: createServiceLogger(INGEST_INITIATOR, { env: env(), sink: l => out.push(l) }), fetchImpl: scraper.fetchImpl });
+    const lines = parseLines(out);
+    const runId = String(lines[0]?.run_id);
+    expect(runId).toMatch(HEX32);
+    expect(lines.every(l => l.run_id === runId)).toBe(true);
+    expect(scraper.calls.map(c => `${c.method} ${new URL(c.url).pathname}`)).toEqual(['GET /lookup', 'POST /ingest/scrape', 'POST /ingest/scrape']);
+    expect(scraper.calls.map(c => c.headers.baggage)).toEqual([`fc.run_id=${runId}`, `fc.run_id=${runId}`, `fc.run_id=${runId}`]);
+    expect(new Set(scraper.calls.map(c => traceIdOf(c.headers.traceparent))).size).toBe(3);
+  });
+
+  it('a scraper address outside the cluster gets no baggage either, on the lookup or on an item\'s enqueue', async () => {
+    const scraper = recordingFetch(url => (url.includes('/lookup')
+      ? json(200, { results: [{ siteId: 'shop', candidates: [{ url: 'https://shop.example/p/1' }] }] })
+      : json(202, {})));
+    const e = env({ SCRAPER_SERVICE_URL: 'http://scraper.example.com:3050' });
+    const out: string[] = [];
+    await runInitiatorJob({ env: e, logger: createServiceLogger(INGEST_INITIATOR, { env: e, sink: l => out.push(l) }), fetchImpl: scraper.fetchImpl });
+    expect(String(parseLines(out)[0]?.run_id)).toMatch(HEX32);
+    expect(scraper.calls.map(c => [c.method, c.headers.baggage, c.headers.traceparent])).toEqual([['GET', undefined, undefined], ['POST', undefined, undefined]]);
+  });
 });
 
 describe('runInitiatorJob: the failure ledger and the defaults', () => {
@@ -137,7 +163,7 @@ describe('runInitiatorJob: the failure ledger and the defaults', () => {
 });
 
 describe('the initiator entrypoint (src/initiator/run.ts, what the CronJob runs)', () => {
-  it('writes only JSON lines from job.start to job.end, exits 0; our scraper sees the run\'s traceparent on the lookup, the item\'s on its enqueue', async () => {
+  it('writes only JSON lines from job.start to job.end, exits 0; our scraper sees the run\'s traceparent on the lookup, the item\'s on its enqueue, the run id on both', async () => {
     const scraper = await localServer(call => (call.path.startsWith('/lookup')
       ? { status: 200, type: 'application/json', body: JSON.stringify({ results: [{ siteId: 'shop', candidates: [{ url: 'https://shop.example/p/1' }] }] }) }
       : { status: 202, type: 'application/json', body: '{}' }));
@@ -155,6 +181,8 @@ describe('the initiator entrypoint (src/initiator/run.ts, what the CronJob runs)
       const item = traceIdOf(scraper.calls[1]?.headers.traceparent);
       expect(item).toMatch(HEX32);
       expect(item).not.toBe(runId);
+      expect(lines[0]?.run_id).toBe(runId);
+      expect(scraper.calls.map(c => c.headers.baggage)).toEqual([`fc.run_id=${runId}`, `fc.run_id=${runId}`]);
     } finally {
       await scraper.close();
     }
