@@ -90,6 +90,26 @@ describe('runCrawlerJob', () => {
     expect(r.lines.find(l => l.msg === 'ingest rejected')?.trace_id).not.toBe(r.lines[0]?.trace_id);
   });
 
+  it('every call to our own scraper carries the run as baggage fc.run_id: the catalog GET and each item\'s enqueue (one run id, three trace ids)', async () => {
+    const scraper = recordingFetch(url => (url.includes('/catalog') ? catalogOf(['1', '2']) : json(202, { success: true, deduplicated: false })));
+    const r = await run(env(), scraper.fetchImpl);
+    expect(r.thrown).toBeUndefined();
+    const runId = String(r.lines[0]?.run_id);
+    expect(runId).toMatch(HEX32);
+    expect(r.lines.every(l => l.run_id === runId)).toBe(true);
+    expect(scraper.calls.map(c => `${c.method} ${new URL(c.url).pathname}`)).toEqual(['GET /catalog', 'POST /ingest/scrape', 'POST /ingest/scrape']);
+    expect(scraper.calls.map(c => c.headers.baggage)).toEqual([`fc.run_id=${runId}`, `fc.run_id=${runId}`, `fc.run_id=${runId}`]);
+    expect(new Set(scraper.calls.map(c => traceIdOf(c.headers.traceparent))).size).toBe(3);
+  });
+
+  it('a scraper address outside the cluster gets no baggage either: the run id goes only where traceparent goes', async () => {
+    const scraper = recordingFetch(url => (url.includes('/catalog') ? catalogOf(['1']) : json(202, {})));
+    const r = await run(env({ SCRAPER_SERVICE_URL: 'http://scraper.example.com:3050' }), scraper.fetchImpl);
+    expect(r.thrown).toBeUndefined();
+    expect(String(r.lines[0]?.run_id)).toMatch(HEX32);
+    expect(scraper.calls.map(c => [c.method, c.headers.baggage, c.headers.traceparent])).toEqual([['GET', undefined, undefined], ['POST', undefined, undefined]]);
+  });
+
   it('a refused enqueue is ITS item\'s trace: the POST, its warn line, its failure report and that report\'s rpc.out share one trace id', async () => {
     const spine = await fakeSpine();
     try {
@@ -184,7 +204,7 @@ describe('the crawler entrypoint (src/crawler/run.ts, what the CronJob runs)', (
   beforeEach(() => { dir = mkdtempSync(path.join(os.tmpdir(), 'crawler-entry-')); });
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
-  it('writes only JSON lines, job.start first and job.end last; our scraper sees the run\'s traceparent on the catalog, the item\'s on its enqueue', async () => {
+  it('writes only JSON lines, job.start first and job.end last; our scraper sees the run\'s traceparent on the catalog, the item\'s on its enqueue, the run id on both', async () => {
     const scraper = await localServer(call => (call.path.startsWith('/catalog')
       ? { status: 200, type: 'application/json', body: JSON.stringify({ siteId: 'shop', items: [{ itemId: '1', collectUrl: 'https://shop.example/p/1' }], hasMore: false }) }
       : { status: 202, type: 'application/json', body: '{}' }));
@@ -205,6 +225,8 @@ describe('the crawler entrypoint (src/crawler/run.ts, what the CronJob runs)', (
       const item = traceIdOf(scraper.calls[1]?.headers.traceparent);
       expect(item).toMatch(HEX32);
       expect(item).not.toBe(runId);
+      expect(lines[0]?.run_id).toBe(runId);
+      expect(scraper.calls.map(c => c.headers.baggage)).toEqual([`fc.run_id=${runId}`, `fc.run_id=${runId}`]);
     } finally {
       await scraper.close();
     }

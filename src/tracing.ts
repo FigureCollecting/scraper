@@ -32,10 +32,10 @@ import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from '@opentelemetry/semantic
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
 import { SimpleSpanProcessor, SpanExporter, ReadableSpan } from '@opentelemetry/sdk-trace-base';
 import type { TextMapPropagator } from '@opentelemetry/api';
-import { CompositePropagator, ExportResult, ExportResultCode, W3CBaggagePropagator, W3CTraceContextPropagator } from '@opentelemetry/core';
+import { ExportResult, ExportResultCode } from '@opentelemetry/core';
 import { redactAttributes } from '@figurecollecting/fc-shared';
 import { resolveServiceIdentity } from '@figurecollecting/fc-shared/server/log';
-import { AllowlistPropagator, createHostAllowlist, propagationHostsFromEnv } from '@figurecollecting/fc-shared/server/tracing';
+import { createHostAllowlist, fcTextMapPropagator, propagationHostsFromEnv } from '@figurecollecting/fc-shared/server/tracing';
 
 /**
  * A SpanExporter that ships nothing. Paired with a real SimpleSpanProcessor it
@@ -111,16 +111,15 @@ export function propagationHosts(env: NodeJS.ProcessEnv = process.env): string[]
 }
 
 /**
- * The service's propagator: W3C traceparent, tracestate and baggage injected for allowlisted hosts only; inbound
- * extraction is never restricted. Without it the undici (global fetch) and http auto-instrumentation put them on
- * every outgoing request, third-party hosts included (measured, LG-QUEUE-1): internal trace ids in someone else's
- * logs, and an unusual fingerprint to a bot check. impit and Chrome are not instrumented (measured too).
+ * The service's propagator, fc-shared's stack (fcTextMapPropagator, as its jobs' startTracing registers): W3C
+ * traceparent, tracestate and baggage injected for allowlisted hosts only, the active run first in the baggage as
+ * fc.run_id; inbound extraction is never restricted, and an inbound fc.run_id becomes the request's run (LG-RUNID).
+ * Without the allowlist the undici (global fetch) and http auto-instrumentation put them on every outgoing request,
+ * third-party hosts included (measured, LG-QUEUE-1): internal trace ids in someone else's logs, and an unusual
+ * fingerprint to a bot check. impit and Chrome are not instrumented (measured too).
  */
 export function outboundPropagator(env: NodeJS.ProcessEnv = process.env): TextMapPropagator {
-  return new AllowlistPropagator(
-    new CompositePropagator({ propagators: [new W3CTraceContextPropagator(), new W3CBaggagePropagator()] }),
-    createHostAllowlist(propagationHosts(env))
-  );
+  return fcTextMapPropagator(createHostAllowlist(propagationHosts(env)));
 }
 
 let sdk: NodeSDK | undefined;

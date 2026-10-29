@@ -143,9 +143,9 @@ export function routeLegacyLogger(target: Logger): () => void {
 // ---------------------------------------------------------------------------
 
 /**
- * `headers` plus the active span's W3C traceparent when `url` is an in-cluster host
- * (OTEL_PROPAGATION_ALLOWLIST, default *.svc.cluster.local, *.svc, localhost). Any other host, or no
- * tracing, gets the headers unchanged: a store never sees our trace ids.
+ * `headers` plus the active span's W3C traceparent, and the active run as baggage fc.run_id, when `url` is an
+ * in-cluster host (OTEL_PROPAGATION_ALLOWLIST, default *.svc.cluster.local, *.svc, localhost). Any other host, or no
+ * tracing, gets the headers unchanged: a store never sees our trace or run ids.
  */
 export function traceHeaders(url: string, headers: Record<string, string> = {}): Record<string, string> {
   const carrier: Record<string, string> = { ...headers };
