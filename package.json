@@ -31,7 +31,7 @@
     "@bufbuild/protobuf": "^2.16.0",
     "@connectrpc/connect": "^2.1.2",
     "@connectrpc/connect-node": "^2.2.0",
-    "@figurecollecting/fc-shared": "1.8.0",
+    "@figurecollecting/fc-shared": "1.9.0",
     "@figurecollecting/ingest-contract": "^0.6.0",
     "@figurecollecting/scraper-plugin-contract": "file:packages/plugin-contract",
     "@opentelemetry/api": "^1.9.1",

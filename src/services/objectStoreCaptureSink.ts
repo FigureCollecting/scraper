@@ -109,7 +109,7 @@
 import { gzip } from 'node:zlib';
 import { promisify } from 'node:util';
 import { ROOT_CONTEXT, context } from '@opentelemetry/api';
-import { currentTraceparent, withTraceparent } from '@figurecollecting/fc-shared/server/job';
+import { currentRunId, currentTraceparent, withTraceparent } from '@figurecollecting/fc-shared/server/job';
 import type { CaptureAdmission, CaptureSink, RawCapture } from './captureSink.js';
 import { CAPTURE_ADMITTED } from './captureSink.js';
 import type { ReportStoredCapture, StoredCaptureReport } from './captureReporter.js';
@@ -599,6 +599,11 @@ interface QueuedOp {
    * reported, under it. Undefined when there was none (tracing off, or no active span).
    */
   readonly traceparent: string | undefined;
+  /**
+   * The run active when the capture was admitted (fc-shared currentRunId, LG-RUNID): handed back with the traceparent so
+   * the capture's lines keep their run_id. Undefined outside a run; never the run active when a worker takes it.
+   */
+  readonly runId: string | undefined;
 }
 
 /** A body's length, or 0 for a malformed capture (the worker will count that). */
@@ -1072,7 +1077,13 @@ export class ObjectStoreCaptureSink implements CaptureSink {
     }
     this.startLagSampling();
     this.queuedBytes += bytes;
-    (lane === 'page' ? this.pageQueue : this.assetQueue).push({ run, enqueuedAt: Date.now(), bytes, traceparent: currentTraceparent() });
+    (lane === 'page' ? this.pageQueue : this.assetQueue).push({
+      run,
+      enqueuedAt: Date.now(),
+      bytes,
+      traceparent: currentTraceparent(),
+      runId: currentRunId(),
+    });
     // `.catch` for the same reason the queue's other fire-and-forget call sites have
     // one: an unhandled rejection out here would take the process with it, and this
     // lane is insurance — it is never allowed to be the thing that kills a scraper.
@@ -1085,6 +1096,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
    * One worker: take ops until both queues are empty, then release any flush() waiters. Each op runs in the trace it
    * was admitted in (LG-QUEUE-2), so its store calls and its ReportCapture carry that item's trace; one admitted in no
    * trace runs in none. Without this every op ran in the trace of the capture that started the worker (measured).
+   * The run comes back the same way (LG-RUNID): the op's lines carry the run_id it was admitted in, or none.
    */
   private async work(): Promise<void> {
     this.inFlight += 1;
@@ -1096,7 +1108,7 @@ export class ObjectStoreCaptureSink implements CaptureSink {
         // the concurrency, so a dequeued capture gives its bytes back immediately.
         this.queuedBytes -= job.bytes;
         this.record(this.queueWaits, Date.now() - job.enqueuedAt);
-        await withTraceparent(job.traceparent, job.run); // storePage/storeAsset own their try/catch — this cannot reject
+        await withTraceparent(job.traceparent, job.run, { runId: job.runId }); // storePage/storeAsset own their try/catch — this cannot reject
       }
     } finally {
       this.inFlight -= 1;

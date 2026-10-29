@@ -1,6 +1,6 @@
 // ============================================================================
 // telemetry.ts — the scraper's ONE seam onto fc-shared's node-only server
-// subpaths (fc-shared 1.8.0), for the batch jobs: ingest-crawler (and
+// subpaths (fc-shared 1.9.0), for the batch jobs: ingest-crawler (and
 // ingest-seed-mfc, the same entry), ingest-initiator and gallery-capture.
 // The HTTP server never loads this file: its own tracing is src/tracing.ts,
 // which takes only fc-shared's propagation allowlist, and its queue and raw
@@ -27,9 +27,9 @@
 //                         a unit of the run's work is a NEW root trace linked to
 //                         the run (span link + fc.run_id), so its lines and its
 //                         in-cluster calls carry the item's ids, not the run's.
-//                         A log line has no run id field (fc-shared 1.8.0 writes
-//                         trace_id/span_id only): an item's line reaches its run
-//                         through the item span's fc.run_id.
+//                         Every line of the run and its items also carries
+//                         run_id, the run's trace id (fc-shared 1.9.0), so an
+//                         item's line names its run as well as its own trace.
 //   traceHeaders,         the active span's W3C traceparent for a fetch to an
 //   tracedFetch           in-cluster host (the propagation allowlist decides);
 //                         a store or any other host gets none.

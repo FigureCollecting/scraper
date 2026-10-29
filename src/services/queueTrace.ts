@@ -5,7 +5,8 @@
  * The queue keeps the trace with the item, in memory and in its durable row, and processes the item under it
  * (withTraceparent), so the item's Ingest call and every line written while it is processed carry it, across
  * retries and restarts. fc-shared's queue pair does the carrying: currentTraceparent stores it, withTraceparent
- * restores it (@figurecollecting/fc-shared/server/job, 1.8.0).
+ * restores it (@figurecollecting/fc-shared/server/job, 1.9.0). The run the item was enqueued in goes with it
+ * (LG-RUNID): currentRunId stores it, withTraceparent's runId restores it, so the item's lines keep their run_id.
  *
  * Enqueueing opens a PRODUCER span, `scrape.enqueue`, in the active trace and stores ITS traceparent: the
  * enqueuer's trace when there is one, and the root of a NEW trace when there is none. A row written before items
@@ -16,7 +17,7 @@
 import { ROOT_CONTEXT, SpanKind, context, trace } from '@opentelemetry/api';
 import { currentTraceparent, parseTraceparent } from '@figurecollecting/fc-shared/server/job';
 
-export { withTraceparent } from '@figurecollecting/fc-shared/server/job';
+export { currentRunId, withTraceparent } from '@figurecollecting/fc-shared/server/job';
 
 export const QUEUE_TRACER_NAME = 'scraper/queue';
 export const ENQUEUE_SPAN_NAME = 'scrape.enqueue';
