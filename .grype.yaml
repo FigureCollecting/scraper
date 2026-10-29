@@ -135,3 +135,19 @@ ignore:
       Headless controlled scraper; no untrusted-page rendering to a user. CfT Chrome lags
       Chrome-stable so version-chasing cannot keep the gate green. Residual binary CVEs
       accepted by policy. Review 2026-11.
+
+  # 2026-10-29: decode-uri-component 0.2.2 (GHSA-qr28-fpjm-wq7f / CVE-2026-118664, quadratic-time DoS in
+  # the fallback decoder; fixed in 0.5.1). Same finding and reasoning as the matching .trivyignore entry:
+  # the only path is minio 8.0.7 -> query-string 7.1.3, minio calls only query-string.stringify (which
+  # never decodes), and no compatible fix exists (decode-uri-component >=0.4.0 and query-string >=8 are
+  # ESM-only and break their callers). Pinned to 0.2.2 so a version change re-surfaces the finding.
+  # Grype has no expiry field; the .trivyignore entry expires 2026-11-12. Remove this entry then.
+  - vulnerability: GHSA-qr28-fpjm-wq7f
+    package:
+      name: decode-uri-component
+      version: 0.2.2
+      type: npm
+    reason: |
+      Transitive via minio -> query-string 7.1.3, which calls the decoder only when parsing; minio only
+      calls query-string.stringify, and nothing in src/ or packages/ imports either package. Fixed
+      versions are ESM-only and break query-string 7 and minio. Review by 2026-11-12.
