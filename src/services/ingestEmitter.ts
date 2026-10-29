@@ -61,7 +61,9 @@ const headerSetter: TextMapSetter<Headers> = { set: (carrier, key, value) => car
  * The active trace on every call (LG-QUEUE-1): W3C traceparent, tracestate and baggage through the process's
  * propagator, which sends them to in-cluster targets only (src/tracing.ts). Nothing else puts them there:
  * connect-node imports node:http as a namespace, which the http auto-instrumentation never patches in this ESM
- * service, so without this the spine saw no trace at all on an Ingest call (measured).
+ * service, so without this the spine saw no trace at all on an Ingest call (measured). The ledger reporters'
+ * ReportCapture and ReportFetchFailure transports carry it too (LG-QUEUE-2), outermost: a batch job's client
+ * interceptor, installed inside it through outboundRpcHook, then puts its own rpc.out span there instead.
  */
 export const traceContextInterceptor: Interceptor = next => req => {
   propagation.inject(withPropagationTarget(context.active(), req.url), req.header, headerSetter);

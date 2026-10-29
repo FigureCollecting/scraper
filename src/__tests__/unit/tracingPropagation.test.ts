@@ -12,6 +12,8 @@ import { runEntry } from '../helpers/jobTelemetry';
 const PROBE_TRACE_ID = '4bf92f3577b34da6a3ce929d0e0e4736';
 const INBOUND_TRACE_ID = '0af7651916cd43dd8448eb211c80319c';
 const INGEST_PATH = '/ingest.v1.SpineIngest/Ingest';
+const REPORT_CAPTURE_PATH = '/ingest.v1.SpineIngest/ReportCapture';
+const REPORT_FAILURE_PATH = '/ingest.v1.SpineIngest/ReportFetchFailure';
 
 interface Seen {
   path: string;
@@ -39,11 +41,11 @@ beforeAll(async () => {
 }, 90_000);
 
 describe('scraper service tracing: outgoing W3C headers go to in-cluster hosts only', () => {
-  it.each([['/fetch'], ['/http'], [INGEST_PATH]])('sends a third-party host nothing on %s (no traceparent, tracestate or baggage)', path => {
+  it.each([['/fetch'], ['/http'], [INGEST_PATH], [REPORT_CAPTURE_PATH], [REPORT_FAILURE_PATH]])('sends a third-party host nothing on %s (no traceparent, tracestate or baggage)', path => {
     expect(w3c(at('127.0.0.1', path))).toEqual(NONE);
   });
 
-  it.each([['/fetch'], ['/http'], [INGEST_PATH]])('sends an in-cluster host the active trace on %s', path => {
+  it.each([['/fetch'], ['/http'], [INGEST_PATH], [REPORT_CAPTURE_PATH], [REPORT_FAILURE_PATH]])('sends an in-cluster host the active trace on %s', path => {
     const s = at('localhost', path);
     expect(s.traceparent).toMatch(new RegExp(`^00-${PROBE_TRACE_ID}-[0-9a-f]{16}-01$`));
     expect(s.tracestate).toBe('fc=probe');
