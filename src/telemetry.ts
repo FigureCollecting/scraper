@@ -3,8 +3,9 @@
 // subpaths (fc-shared 1.8.0), for the batch jobs: ingest-crawler (and
 // ingest-seed-mfc, the same entry), ingest-initiator and gallery-capture.
 // The HTTP server never loads this file: its own tracing is src/tracing.ts,
-// which takes only fc-shared's propagation allowlist, and its queue carries
-// item traces with the server/job traceparent pair (services/queueTrace.ts).
+// which takes only fc-shared's propagation allowlist, and its queue and raw
+// capture sink carry item traces with the server/job traceparent pair
+// (services/queueTrace.ts, services/objectStoreCaptureSink.ts).
 //
 //   createServiceLogger   server/log createLogger: one JSON object per stdout
 //                         line in the estate's shape, every value through

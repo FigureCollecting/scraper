@@ -31,17 +31,25 @@ import * as http from 'node:http';
 import type { AddressInfo, Socket } from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { context, trace } from '@opentelemetry/api';
 import { Code, ConnectError, type ConnectRouter, type HandlerContext } from '@connectrpc/connect';
 import { connectNodeAdapter } from '@connectrpc/connect-node';
 import { create } from '@bufbuild/protobuf';
-import { SpineIngest, WriteStatsSchema, type ExtractedData as WireExtractedData } from '@figurecollecting/ingest-contract';
+import {
+  FetchFailureAckSchema,
+  SpineIngest,
+  WriteStatsSchema,
+  type ExtractedData as WireExtractedData,
+  type FetchFailure,
+} from '@figurecollecting/ingest-contract';
 import type { ExtractionRuleset } from '@figurecollecting/scraper-plugin-contract';
 import { startTracing, type Tracing } from '@figurecollecting/fc-shared/server/tracing';
 import { ScrapeQueue, resetScrapeQueue } from '../../services/scrapeQueue';
 import { createExtractionRegistry, type ExtractionRegistryImpl } from '../../services/extractionRegistry';
 import { IngestEmitter } from '../../services/ingestEmitter';
-import { openQueueStore } from '../../services/queueStore';
+import { FailureReporter } from '../../services/failureReporter';
+import { QUEUE_DB_FILE, openQueueStore } from '../../services/queueStore';
 import { keepingExporter, traceIdOf } from '../helpers/jobTelemetry';
 
 const HOSTS = ['shop-a.example.test', 'shop-b.example.test', 'shop-c.example.test', 'shop-d.example.test'];
@@ -58,11 +66,14 @@ interface SpineCall {
 interface Spine {
   url: string;
   calls: SpineCall[];
+  /** The ReportFetchFailure calls (the failure ledger), kept apart from the Ingest calls. */
+  failures: SpineCall[];
   close: () => Promise<void>;
 }
 
 async function startSpine(fail: (call: SpineCall, n: number) => boolean = () => false): Promise<Spine> {
   const calls: SpineCall[] = [];
+  const failures: SpineCall[] = [];
   const routes = (router: ConnectRouter): void => {
     router.service(SpineIngest, {
       ingest: (req: WireExtractedData, ctx: HandlerContext) => {
@@ -70,6 +81,10 @@ async function startSpine(fail: (call: SpineCall, n: number) => boolean = () => 
         calls.push(call);
         if (fail(call, calls.length)) throw new ConnectError('spine down', Code.Unavailable);
         return create(WriteStatsSchema, { sourceId: 'src-1', claims: { emitted: 1, inserted: 1 } });
+      },
+      reportFetchFailure: (req: FetchFailure, ctx: HandlerContext) => {
+        failures.push({ itemId: req.source?.itemId ?? '', traceparent: ctx.requestHeader.get('traceparent') });
+        return create(FetchFailureAckSchema, {});
       },
     });
   };
@@ -83,6 +98,7 @@ async function startSpine(fail: (call: SpineCall, n: number) => boolean = () => 
   return {
     url: `http://localhost:${(server.address() as AddressInfo).port}`,
     calls,
+    failures,
     close: async () => {
       for (const socket of sockets) socket.destroy();
       await new Promise<void>(resolve => server.close(() => resolve()));
@@ -294,5 +310,80 @@ describe('ScrapeQueue: one trace per item (LG-QUEUE-1)', () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('restores a row whose stored traceparent is malformed as a NEW root trace of its own: never continued, never a crash', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scrape-queue-trace-'));
+    // What a damaged or hand-edited file might hold. None of these parses (fc-shared parseTraceparent), so none may
+    // be continued or carried into the item: each item is processed under a new root trace, as a row with no trace is.
+    const id32 = '4bf92f3577b34da6a3ce929d0e0e4736';
+    const MALFORMED: Array<[string, string]> = [
+      ['garbage', 'not-a-traceparent'],
+      ['empty', ''],
+      ['zero-trace', `00-${'0'.repeat(32)}-00f067aa0ba902b7-01`],
+      ['zero-span', `00-${id32}-${'0'.repeat(16)}-01`],
+      ['version-ff', `ff-${id32}-00f067aa0ba902b7-01`],
+      ['upper-case', `00-${id32.toUpperCase()}-00F067AA0BA902B7-01`],
+      ['header-injection', `00-${id32}-00f067aa0ba902b7-01\r\nx-injected: 1`],
+      ['overlong', `00-${id32}-00f067aa0ba902b7-01${'0'.repeat(65_536)}`],
+    ];
+    const ids = [...MALFORMED.map(([id]) => id), 'integer', 'blob'];
+    try {
+      const store = openQueueStore({ dir });
+      MALFORMED.forEach(([id, traceparent], i) => {
+        const u = url(HOSTS[i % HOSTS.length], id);
+        store.put({ id, mfcId: u, url: u, priority: 'WARM', attempts: 0, maxRetries: 3, enqueuedAt: Date.now() + i, state: 'pending', traceparent });
+      });
+      for (const id of ['integer', 'blob']) {
+        const u = url(HOSTS[1], id);
+        store.put({ id, mfcId: u, url: u, priority: 'WARM', attempts: 0, maxRetries: 3, enqueuedAt: Date.now() + 20, state: 'pending' });
+      }
+      store.close();
+      // Two values no build writes: an integer (the TEXT column stores it as the text "42") and a blob (kept as bytes).
+      const db = new DatabaseSync(path.join(dir, QUEUE_DB_FILE));
+      db.prepare("UPDATE queue_items SET traceparent = 42 WHERE id = 'integer'").run();
+      db.prepare("UPDATE queue_items SET traceparent = x'00ff' WHERE id = 'blob'").run();
+      db.close();
+
+      // Restored inside a span (a boot span, say): a new root is a root, never a child of whatever is active.
+      queue = wire(new ScrapeQueue(false), spine);
+      queue.setQueueStore(openQueueStore({ dir }));
+      const boot = inTrace('boot', () => queue!.restoreFromStore());
+      expect(boot.result.pending).toBe(ids.length);
+      await until(() => spine.calls.length === ids.length);
+
+      // Per item: the trace its one Ingest call carried, and the trace the code run for it saw.
+      const called = Object.fromEntries(ids.map(id => [id, traceOfCall(spine, id).map(t => t ?? 'no trace')]));
+      expect(called).toEqual(Object.fromEntries(ids.map(id => [id, [expect.stringMatching(/^[0-9a-f]{32}$/)]])));
+      const restored = ids.map(id => called[id][0]);
+      expect(Object.fromEntries(ids.map(id => [id, seenWhileProcessing.get(id)]))).toEqual(Object.fromEntries(ids.map((id, i) => [id, restored[i]])));
+      // Each its own trace: not the stored one (repaired or not), not the boot span's, not another item's.
+      expect(new Set([...restored, id32, boot.traceId]).size).toBe(ids.length + 2);
+
+      await tracing.forceFlush();
+      const roots = exporter.spans.filter(s => s.name === 'scrape.enqueue' && restored.includes(s.spanContext().traceId));
+      expect(roots).toHaveLength(ids.length);
+      for (const root of roots) expect(root.parentSpanContext).toBeUndefined();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports each item's terminal failure (ReportFetchFailure) in that item's trace, through the one reporter the queue holds", async () => {
+    // As the server wires it (LG-QUEUE-2): one FailureReporter for the queue's life, made before any item and in no
+    // item's trace. The hosts match no ruleset, so each item fails for good on its first dispatch.
+    queue = wire(new ScrapeQueue(false), spine);
+    queue.setFailureReporter(new FailureReporter({ baseUrl: spine.url, retryDelayMs: 1 }));
+    const unmatched = (id: string): string => `https://unmatched-${id}.example.test/item/${id}`;
+    const a = inTrace('POST a', () => queue!.enqueue('fail-a', { url: unmatched('fail-a') }));
+    const b = inTrace('POST b', () => queue!.enqueue('fail-b', { url: unmatched('fail-b') }));
+    const c = queue.enqueue('fail-c', { url: unmatched('fail-c') }); // no trace: the item gets a new root of its own
+    await Promise.allSettled([a.result.promise, b.result.promise, c.promise]);
+    await until(() => spine.failures.length === 3);
+
+    const reported = Object.fromEntries(spine.failures.map(f => [f.itemId, traceIdOf(f.traceparent)]));
+    expect(reported).toEqual({ 'fail-a': a.traceId, 'fail-b': b.traceId, 'fail-c': expect.stringMatching(/^[0-9a-f]{32}$/) });
+    expect([a.traceId, b.traceId]).not.toContain(reported['fail-c']);
+    expect(spine.calls).toEqual([]); // nothing reached Ingest: every report above is a failure's
   });
 });

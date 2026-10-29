@@ -5,7 +5,8 @@
  * node:http is what lets the http instrumentation patch node:http in this ESM process, as in the server), and makes
  * the kinds of outgoing requests the service makes from inside an active trace that also carries tracestate and
  * baggage: global fetch (undici: store pages, image bytes), node:http (CommonJS clients such as the object store's),
- * impit (the native TLS-impersonation lane) and the spine Ingest call (Connect over HTTP/1.1). They all go to a local
+ * impit (the native TLS-impersonation lane) and the spine's Ingest, ReportCapture and ReportFetchFailure calls (Connect
+ * over HTTP/1.1, through the real emitter and ledger reporters). They all go to a local
  * server that records the W3C headers each request arrived with. 127.0.0.1 stands in for a store, CDN or image host
  * (not on the propagation allowlist), localhost for an in-cluster host (on it).
  *
@@ -19,6 +20,8 @@ import type { AddressInfo } from 'node:net';
 import { ROOT_CONTEXT, context, createTraceState, propagation, trace } from '@opentelemetry/api';
 import { Impit } from 'impit';
 import { IngestEmitter } from '../../services/ingestEmitter.js';
+import { CaptureReporter } from '../../services/captureReporter.js';
+import { FailureReporter } from '../../services/failureReporter.js';
 
 const PROBE_TRACE_ID = '4bf92f3577b34da6a3ce929d0e0e4736';
 const INBOUND_TRACE_ID = '0af7651916cd43dd8448eb211c80319c';
@@ -70,16 +73,35 @@ async function main(): Promise<void> {
       }).on('error', reject);
     });
 
+  // The spine clients are made outside the trace, as the server makes them (once, before any item); only their calls
+  // are made inside it.
+  const spines = ['127.0.0.1', 'localhost'].map(host => {
+    const base = `http://${host}:${port}`;
+    return {
+      base,
+      emitter: new IngestEmitter({ baseUrl: base, retryDelayMs: 1 }),
+      captures: new CaptureReporter({ baseUrl: base, retryDelayMs: 1 }),
+      failures: new FailureReporter({ baseUrl: base, retryDelayMs: 1 }),
+    };
+  });
+
   await context.with(active, async () => {
-    for (const host of ['127.0.0.1', 'localhost']) {
-      const base = `http://${host}:${port}`;
+    for (const { base, emitter, captures, failures } of spines) {
       await (await fetch(`${base}/fetch`)).text();
       await get(`${base}/http`);
       await (await impit.fetch(`${base}/impit`)).text();
-      await new IngestEmitter({ baseUrl: base, retryDelayMs: 1 }).send({
+      await emitter.send({
         source: { site: 'probe', itemId: '1', extractedAt: '2026-10-28T00:00:00Z' },
         fields: {},
         warnings: [],
+      });
+      const sha = 'ab'.repeat(32);
+      await captures.report({
+        site: 'probe', itemId: '1', url: `${base}/img/1.png`, lane: 'asset', sha256: sha, bytesLen: 1,
+        storageKey: `raw-img/sha256/ab/${sha}.png`, fetchedAt: '2026-10-28T00:00:00Z', alreadyStored: false,
+      });
+      await failures.report({
+        site: 'probe', itemId: '1', target: `${base}/item/1`, kind: 'record', origin: 'ingest', reasonClass: 'timeout',
       });
     }
   });
