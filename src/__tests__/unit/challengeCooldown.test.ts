@@ -82,11 +82,11 @@ describe('challengeCooldown — per-host CF cooldown (time-injectable)', () => {
     expect(cd.list()[0].host).toBe('coolhost.example.test'); // canonical key stored
   });
 
-  it('logs [COOLDOWN] opened <host> for <m> min (<reason>)', () => {
+  it('logs [COOLDOWN] opened <host> for <m> min (streak <n>, <reason>)', () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
     const cd = new ChallengeCooldown({ now: () => 1, windowMs: 2 * MIN });
     cd.open(HOST, 'search challenge page');
-    expect(warn).toHaveBeenCalledWith('[COOLDOWN] opened coolhost.example.test for 2 min (search challenge page)');
+    expect(warn).toHaveBeenCalledWith('[COOLDOWN] opened coolhost.example.test for 2 min (streak 1, search challenge page)');
     warn.mockRestore();
   });
 
@@ -148,6 +148,128 @@ describe('challengeCooldown — per-host CF cooldown (time-injectable)', () => {
       const cd = new ChallengeCooldown({ now: () => 0, windowMs: 5 * MIN });
       cd.open(HOST, 'r');
       expect(cd.remaining(HOST)).toBe(5 * MIN);
+    });
+  });
+
+  describe('escalation while a host keeps challenging (base x 2^(streak-1), capped)', () => {
+    const SIX_H = 6 * 60 * MIN;
+    let warn: jest.SpyInstance;
+    beforeEach(() => {
+      warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    });
+    afterEach(() => {
+      delete process.env.CHALLENGE_COOLDOWN_MAX_MS;
+      warn.mockRestore();
+    });
+
+    /** Open, read the window it set, then step the clock past it (the window lapses, no clean fetch). */
+    function openAndLapse(cd: ChallengeCooldown, clock: { t: number }): number {
+      cd.open(HOST, 'challenge page');
+      const w = cd.remaining(HOST);
+      clock.t += w;
+      return w;
+    }
+
+    it('three opens with no clean fetch in between give 30, 60, 120 min and name the streak', () => {
+      const clock = { t: 1_000_000 };
+      const cd = new ChallengeCooldown({ now: () => clock.t });
+      expect([openAndLapse(cd, clock), openAndLapse(cd, clock), openAndLapse(cd, clock)]).toEqual([
+        DEFAULT,
+        2 * DEFAULT,
+        4 * DEFAULT,
+      ]);
+      expect(cd.streak(HOST)).toBe(3);
+      expect(warn).toHaveBeenCalledWith('[COOLDOWN] opened coolhost.example.test for 60 min (streak 2, challenge page)');
+      expect(warn).toHaveBeenCalledWith('[COOLDOWN] opened coolhost.example.test for 120 min (streak 3, challenge page)');
+    });
+
+    it('a clean fetch (clear) resets the streak, so the next open is back to the base window', () => {
+      const clock = { t: 1_000_000 };
+      const cd = new ChallengeCooldown({ now: () => clock.t });
+      openAndLapse(cd, clock);
+      openAndLapse(cd, clock);
+      expect(cd.clear(HOST)).toBe(true);
+      expect(cd.streak(HOST)).toBe(0);
+      expect(openAndLapse(cd, clock)).toBe(DEFAULT);
+    });
+
+    it('the window is capped at CHALLENGE_COOLDOWN_MAX_MS (default 6 h): 30, 60, 120, 240, 360, 360', () => {
+      const clock = { t: 0 };
+      const cd = new ChallengeCooldown({ now: () => clock.t });
+      const windows = Array.from({ length: 6 }, () => openAndLapse(cd, clock));
+      expect(windows).toEqual([DEFAULT, 2 * DEFAULT, 4 * DEFAULT, 8 * DEFAULT, SIX_H, SIX_H]);
+    });
+
+    it('a straggler challenge while the window is still live re-extends at the same level, never escalates', () => {
+      const clock = { t: 0 };
+      const cd = new ChallengeCooldown({ now: () => clock.t });
+      cd.open(HOST, 'challenge page');
+      clock.t += 10 * MIN;
+      cd.open(HOST, 'search challenge page'); // an in-flight lookup came back challenged
+      expect(cd.streak(HOST)).toBe(1);
+      expect(cd.remaining(HOST)).toBe(DEFAULT);
+    });
+
+    it('restore keeps the streak, derived from the entry window (until - openedAt)', () => {
+      const clock = { t: 10_000_000 };
+      const cd = new ChallengeCooldown({ now: () => clock.t });
+      const openedAt = clock.t - 10 * MIN;
+      expect(cd.restore([{ host: 'WWW.' + HOST, until: openedAt + 4 * DEFAULT, reason: 'r', openedAt }])).toBe(1);
+      expect(cd.streak(HOST)).toBe(3);
+      clock.t = openedAt + 4 * DEFAULT; // the restored window lapses, the host challenges again
+      cd.open(HOST, 'r');
+      expect(cd.remaining(HOST)).toBe(8 * DEFAULT);
+      expect(cd.streak(HOST)).toBe(4);
+    });
+
+    it('restore of a base-window (or shorter) entry is streak 1', () => {
+      const cd = new ChallengeCooldown({ now: () => 0 });
+      cd.restore([{ host: HOST, until: 30 * MIN, reason: 'r', openedAt: 10 * MIN }]);
+      expect(cd.streak(HOST)).toBe(1);
+    });
+
+    it('a valid CHALLENGE_COOLDOWN_MAX_MS sets the cap', () => {
+      process.env.CHALLENGE_COOLDOWN_MAX_MS = String(60 * MIN);
+      const clock = { t: 0 };
+      const cd = new ChallengeCooldown({ now: () => clock.t });
+      expect([openAndLapse(cd, clock), openAndLapse(cd, clock), openAndLapse(cd, clock)]).toEqual([DEFAULT, 60 * MIN, 60 * MIN]);
+    });
+
+    it.each([['not-a-number'], [''], ['   ']])('an invalid or empty CHALLENGE_COOLDOWN_MAX_MS (%p) falls back to 6 h', (raw) => {
+      process.env.CHALLENGE_COOLDOWN_MAX_MS = raw;
+      const clock = { t: 0 };
+      const cd = new ChallengeCooldown({ now: () => clock.t });
+      const windows = Array.from({ length: 6 }, () => openAndLapse(cd, clock));
+      expect(windows[5]).toBe(SIX_H);
+    });
+
+    it('a cap below the base window means no escalation (the base wins), and above 24 h clamps to 24 h', () => {
+      const clock = { t: 0 };
+      const low = new ChallengeCooldown({ now: () => clock.t, maxWindowMs: 5 * MIN });
+      expect([openAndLapse(low, clock), openAndLapse(low, clock)]).toEqual([DEFAULT, DEFAULT]);
+      const high = new ChallengeCooldown({ now: () => clock.t, windowMs: 12 * 60 * MIN, maxWindowMs: 100 * 60 * MIN });
+      expect([openAndLapse(high, clock), openAndLapse(high, clock), openAndLapse(high, clock)]).toEqual([12 * 60 * MIN, MAX, MAX]);
+    });
+
+    it('an explicit maxWindowMs beats the env', () => {
+      process.env.CHALLENGE_COOLDOWN_MAX_MS = String(60 * MIN);
+      const clock = { t: 0 };
+      const cd = new ChallengeCooldown({ now: () => clock.t, maxWindowMs: 2 * 60 * MIN });
+      expect([openAndLapse(cd, clock), openAndLapse(cd, clock), openAndLapse(cd, clock)]).toEqual([DEFAULT, 60 * MIN, 120 * MIN]);
+    });
+
+    it('a gate-failure run opens through the same escalation', () => {
+      const clock = { t: 0 };
+      const cd = new ChallengeCooldown({ now: () => clock.t, gateFailureThreshold: 1 });
+      expect(cd.recordGateFailure(HOST, 'empty body').opened?.until).toBe(DEFAULT);
+      clock.t += DEFAULT;
+      const second = cd.recordGateFailure(HOST, 'empty body').opened;
+      expect(second?.until).toBe(clock.t + 2 * DEFAULT);
+      expect(cd.streak(HOST)).toBe(2);
+    });
+
+    it('streak is 0 for a host that never challenged', () => {
+      expect(new ChallengeCooldown({ now: () => 0 }).streak(HOST)).toBe(0);
     });
   });
 

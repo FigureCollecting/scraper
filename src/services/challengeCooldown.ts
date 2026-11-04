@@ -22,6 +22,12 @@ const MAX_WINDOW_MS = 24 * 60 * 60_000;
 /** Default window when nothing (arg or env) says otherwise — 30 minutes. */
 const DEFAULT_WINDOW_MS = 30 * 60_000;
 /**
+ * Default ceiling for an ESCALATED window — 6 hours. A host that keeps challenging gets the base
+ * window doubled on each re-open (30 → 60 → 120 → 240 → 360 min), so it takes one challenged request
+ * every few hours instead of two an hour.
+ */
+const DEFAULT_MAX_ESCALATED_MS = 6 * 60 * 60_000;
+/**
  * Default run of CONSECUTIVE gate failures (an empty body or a 5xx from a gated host — see
  * gateSignal) that opens a host's cooldown. Conservative: one busy 5xx is not a refused gate.
  */
@@ -45,6 +51,21 @@ function resolveWindowFromEnv(): number {
   const raw = process.env.CHALLENGE_COOLDOWN_MS;
   if (raw === undefined || raw.trim() === '') return DEFAULT_WINDOW_MS;
   return clampWindow(Number(raw));
+}
+
+/**
+ * The escalation ceiling: an explicit value beats CHALLENGE_COOLDOWN_MAX_MS; unset / empty /
+ * non-numeric → 6 h. Clamped like a window, and never below the base window (a cap under the base
+ * just means "do not escalate").
+ */
+function resolveMaxWindow(explicit: number | undefined, baseMs: number): number {
+  let ms = explicit;
+  if (ms === undefined) {
+    const raw = process.env.CHALLENGE_COOLDOWN_MAX_MS;
+    ms = raw === undefined || raw.trim() === '' ? DEFAULT_MAX_ESCALATED_MS : Number(raw);
+  }
+  const clamped = Number.isFinite(ms) ? clampWindow(ms) : DEFAULT_MAX_ESCALATED_MS;
+  return Math.max(baseMs, clamped);
 }
 
 /** A positive whole number, else the default — a garbage threshold degrades to sane, never to 0 or 1. */
@@ -98,6 +119,8 @@ export interface ChallengeCooldownOptions {
   now?: () => number;
   /** Explicit window (ms). Beats the env; clamped to [1 min, 24 h]. Default: env or 30 min. */
   windowMs?: number;
+  /** Ceiling for the escalated window (ms). Beats CHALLENGE_COOLDOWN_MAX_MS; default 6 h; never below the base. */
+  maxWindowMs?: number;
   /** Optional durable sink. Absent ⇒ the register is memory-only, exactly as before. */
   persistence?: CooldownPersistence;
   /** Consecutive gate failures that open a host's cooldown. Beats the env; invalid → 5. */
@@ -132,6 +155,12 @@ export class ChallengeCooldown {
   private readonly entries = new Map<string, CooldownEntry>();
   private readonly now: () => number;
   private readonly windowMs: number;
+  private readonly maxWindowMs: number;
+  /**
+   * Per-host run of cooldowns opened with no clean fetch in between (1 = first open). Kept past the
+   * window's lapse so the next challenge escalates; only `clear()` (a clean fetch) ends it.
+   */
+  private readonly streaks = new Map<string, number>();
   private persistence: CooldownPersistence | null;
   /** Per-host run of consecutive gate failures (memory-only: a restart starts every run at 0). */
   private readonly gateFailures = new Map<string, number>();
@@ -140,6 +169,7 @@ export class ChallengeCooldown {
   constructor(opts: ChallengeCooldownOptions = {}) {
     this.now = opts.now ?? Date.now;
     this.windowMs = clampWindow(opts.windowMs ?? resolveWindowFromEnv());
+    this.maxWindowMs = resolveMaxWindow(opts.maxWindowMs, this.windowMs);
     this.persistence = opts.persistence ?? null;
     this.gateFailureThreshold =
       opts.gateFailureThreshold !== undefined ? validThreshold(opts.gateFailureThreshold) : resolveGateThresholdFromEnv();
@@ -180,21 +210,46 @@ export class ChallengeCooldown {
       if (entry.until <= now) continue;
       const key = normalizeHost(entry.host);
       this.entries.set(key, { ...entry, host: key });
+      // No schema change: the streak is read back off the entry's own window (base × 2^(streak-1)).
+      const doublings = Math.round(Math.log2(Math.max(1, (entry.until - entry.openedAt) / this.windowMs)));
+      this.streaks.set(key, 1 + doublings);
       loaded++;
     }
     return loaded;
   }
 
-  /** Open (or re-extend) the cooldown for `host`; logs the opened line. Returns the recorded entry. */
+  /**
+   * Open (or re-extend) the cooldown for `host`; logs the opened line. Returns the recorded entry.
+   *
+   * ESCALATION: a host that challenges again after its window lapsed, with no clean fetch in between,
+   * opens for twice the previous window (base × 2^(streak-1), capped at the max). A challenge that
+   * lands while the window is still live (a fetch already in flight) re-extends at the SAME level, so
+   * concurrent stragglers cannot ratchet the streak.
+   */
   open(host: string, reason: string): CooldownEntry {
     const key = normalizeHost(host);
     const now = this.now();
-    const entry: CooldownEntry = { host: key, until: now + this.windowMs, reason, openedAt: now };
+    const prior = this.entries.get(key);
+    const live = prior !== undefined && now < prior.until;
+    const streak = live ? this.streak(key) : this.streak(key) + 1;
+    this.streaks.set(key, streak);
+    const windowMs = this.windowForStreak(streak);
+    const entry: CooldownEntry = { host: key, until: now + windowMs, reason, openedAt: now };
     this.entries.set(key, entry);
     this.persist((p) => p.saveCooldown(entry));
     // eslint-disable-next-line no-console
-    console.warn(`[COOLDOWN] opened ${key} for ${Math.round(this.windowMs / 60_000)} min (${reason})`);
+    console.warn(`[COOLDOWN] opened ${key} for ${Math.round(windowMs / 60_000)} min (streak ${streak}, ${reason})`);
     return entry;
+  }
+
+  /** base × 2^(streak-1), capped at the max. The exponent is bounded so a long streak cannot overflow. */
+  private windowForStreak(streak: number): number {
+    return Math.min(this.maxWindowMs, this.windowMs * 2 ** Math.min(streak - 1, 32));
+  }
+
+  /** How many cooldowns `host` has opened with no clean fetch in between (0 when none). */
+  streak(host: string): number {
+    return this.streaks.get(normalizeHost(host)) ?? 0;
   }
 
   /** Whether `host` is currently cooling (an entry exists and has not yet reached `until`). */
@@ -210,9 +265,13 @@ export class ChallengeCooldown {
     return Math.max(0, entry.until - this.now());
   }
 
-  /** Drop `host`'s cooldown. Returns true (and logs the cleared line) if an entry was removed. */
+  /**
+   * Drop `host`'s cooldown and end its escalation streak (only a clean fetch calls this). Returns
+   * true (and logs the cleared line) if an entry was removed.
+   */
   clear(host: string): boolean {
     const key = normalizeHost(host);
+    this.streaks.delete(key);
     if (!this.entries.delete(key)) return false;
     this.persist((p) => p.removeCooldown(key));
     // eslint-disable-next-line no-console
@@ -223,7 +282,7 @@ export class ChallengeCooldown {
   /**
    * One more CONSECUTIVE gate failure for `host` (gateSignal: an empty body or a 5xx from a gated
    * host). When the run reaches the threshold, the host's cooldown opens exactly as a challenge opens
-   * it — same window, same persistence, same fast-fail for every queued item. The run is NOT reset by
+   * it — same escalating window, same persistence, same fast-fail for every queued item. The run is NOT reset by
    * opening: only a clean fetch ends it, so the first probe after the window lapses re-opens at once
    * if the gate is still refusing. A failure while the window is live (a fetch already in flight)
    * does not re-open it, so stragglers cannot stretch the window. Returns the run length, and the

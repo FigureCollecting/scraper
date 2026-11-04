@@ -164,6 +164,32 @@ describe('ScrapeQueue × challenge cooldown', () => {
     warn.mockRestore();
   });
 
+  it('ESCALATE: a host that challenges again after its window lapses is left alone twice as long', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const http = jest.fn().mockResolvedValue(CHALLENGE_HTML);
+    const send = jest.fn().mockResolvedValue(emptyStats());
+    queue = buildQueue({ http, send });
+
+    const first = 'https://coolhost.example.test/product/1';
+    queue.enqueue(first, { url: first }).promise.catch(() => {});
+    await advanceUntil(() => queue.getStats().failed === 1);
+    expect(cd.remaining('coolhost.example.test')).toBe(MIN);
+
+    cdNow += MIN; // the window lapses with no clean fetch in between
+    const second = 'https://coolhost.example.test/product/2';
+    queue.enqueue(second, { url: second }).promise.catch(() => {});
+    await advanceUntil(() => queue.getStats().failed === 2);
+
+    expect(http).toHaveBeenCalledTimes(2);
+    expect(cd.remaining('coolhost.example.test')).toBe(2 * MIN);
+    const opened = warn.mock.calls.map((c) => String(c[0])).filter((l) => l.startsWith('[COOLDOWN] opened'));
+    expect(opened).toEqual([
+      expect.stringContaining('for 1 min (streak 1,'),
+      expect.stringContaining('for 2 min (streak 2,'),
+    ]);
+    warn.mockRestore();
+  });
+
   it('FAST-FAIL: a second item for a cooling host fails immediately WITHOUT fetching, reason names the minutes left', async () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
     cd.open('coolhost.example.test', 'challenge page'); // host already cooling (opened by an earlier attempt)
