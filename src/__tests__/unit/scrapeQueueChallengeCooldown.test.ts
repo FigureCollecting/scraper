@@ -214,6 +214,8 @@ describe('ScrapeQueue × challenge cooldown', () => {
     expect(skipped).toContain('https://coolhost.example.test/product/999');
     expect(skipped).toContain('coolhost.example.test cooling');
     expect(skipped).toContain('min left');
+    // the fast-fail is counted apart from challenged fetches, so the fleet check can tell them apart
+    expect(cd.history()).toEqual([expect.objectContaining({ host: 'coolhost.example.test', challenged60m: 1, queueFastFails60m: 1 })]);
     warn.mockRestore();
   });
 

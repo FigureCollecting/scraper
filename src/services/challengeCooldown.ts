@@ -105,6 +105,50 @@ export interface CooldownView {
 }
 
 /**
+ * One host's LAST cooldown window, open or closed (what /health/detailed lists as `challengeHistory`).
+ * A window that already closed is otherwise invisible: a host challenged at the top of the hour and
+ * clear by the next check looked exactly like a host that was never challenged. The two hour counters
+ * split real challenged responses from no-network queue fast-fails, which the log tallies mix.
+ */
+export interface CooldownHistoryView {
+  host: string;
+  /** Whether the last window is still live. */
+  open: boolean;
+  /** When the last window was opened (ISO, on the injected clock). */
+  lastOpenedAt: string;
+  /** How long the last window was, in whole minutes (the escalated length). */
+  lastWindowMin: number;
+  lastReason: string;
+  /** The escalation streak the last open reached. */
+  streak: number;
+  /** When a clean fetch last cleared the host (ISO), or null if it has not since the last open. */
+  lastClearedAt: string | null;
+  /** Challenged responses (each open or re-extend) in the trailing 60 min. */
+  challenged60m: number;
+  /** Queue items failed fast on this cooldown, with no request sent, in the trailing 60 min. */
+  queueFastFails60m: number;
+}
+
+/** The trailing window the history counters cover — 60 minutes. */
+const HISTORY_COUNTER_MS = 60 * 60_000;
+
+interface HostHistory {
+  openedAt: number;
+  until: number;
+  reason: string;
+  streak: number;
+  clearedAt: number | null;
+  /** Timestamps inside the trailing hour (pruned on every write, so the arrays stay bounded). */
+  challenged: number[];
+  skips: number[];
+}
+
+/** The timestamps still inside the trailing hour at `now`. */
+function withinHour(times: readonly number[], now: number): number[] {
+  return times.filter((t) => now - t < HISTORY_COUNTER_MS);
+}
+
+/**
  * The durable sink a cooldown is written through to (queueStore). BOOKKEEPING ONLY: the register's
  * own decision never depends on it, and a throwing sink is swallowed — a failed write must not
  * re-open a cooling host to traffic.
@@ -161,6 +205,8 @@ export class ChallengeCooldown {
    * window's lapse so the next challenge escalates; only `clear()` (a clean fetch) ends it.
    */
   private readonly streaks = new Map<string, number>();
+  /** Per-host last window + trailing-hour counters (memory-only; survives clear, unlike `entries`). */
+  private readonly hostHistory = new Map<string, HostHistory>();
   private persistence: CooldownPersistence | null;
   /** Per-host run of consecutive gate failures (memory-only: a restart starts every run at 0). */
   private readonly gateFailures = new Map<string, number>();
@@ -213,6 +259,10 @@ export class ChallengeCooldown {
       // No schema change: the streak is read back off the entry's own window (base × 2^(streak-1)).
       const doublings = Math.round(Math.log2(Math.max(1, (entry.until - entry.openedAt) / this.windowMs)));
       this.streaks.set(key, 1 + doublings);
+      this.hostHistory.set(key, {
+        openedAt: entry.openedAt, until: entry.until, reason: entry.reason, streak: 1 + doublings,
+        clearedAt: null, challenged: [], skips: [],
+      });
       loaded++;
     }
     return loaded;
@@ -236,6 +286,12 @@ export class ChallengeCooldown {
     const windowMs = this.windowForStreak(streak);
     const entry: CooldownEntry = { host: key, until: now + windowMs, reason, openedAt: now };
     this.entries.set(key, entry);
+    const prev = this.hostHistory.get(key);
+    this.hostHistory.set(key, {
+      openedAt: now, until: entry.until, reason, streak, clearedAt: null,
+      challenged: [...withinHour(prev?.challenged ?? [], now), now],
+      skips: withinHour(prev?.skips ?? [], now),
+    });
     this.persist((p) => p.saveCooldown(entry));
     // eslint-disable-next-line no-console
     console.warn(`[COOLDOWN] opened ${key} for ${Math.round(windowMs / 60_000)} min (streak ${streak}, ${reason})`);
@@ -273,6 +329,8 @@ export class ChallengeCooldown {
     const key = normalizeHost(host);
     this.streaks.delete(key);
     if (!this.entries.delete(key)) return false;
+    // Every entry has a history row (open and restore write both), so this read always finds one.
+    this.hostHistory.get(key)!.clearedAt = this.now();
     this.persist((p) => p.removeCooldown(key));
     // eslint-disable-next-line no-console
     console.warn(`[COOLDOWN] cleared ${key}`);
@@ -304,6 +362,33 @@ export class ChallengeCooldown {
   /** The current run of consecutive gate failures for `host` (0 when none). */
   gateFailureCount(host: string): number {
     return this.gateFailures.get(normalizeHost(host)) ?? 0;
+  }
+
+  /**
+   * One more queue item failed fast on `host`'s cooldown (no request sent). Counted apart from the
+   * challenged responses so the two are never read as one. A host with no history is ignored.
+   */
+  recordSkip(host: string): void {
+    const h = this.hostHistory.get(normalizeHost(host));
+    if (h === undefined) return;
+    const now = this.now();
+    h.skips = [...withinHour(h.skips, now), now];
+  }
+
+  /** Every host's last window, open or closed, with its trailing-hour counters. */
+  history(): CooldownHistoryView[] {
+    const now = this.now();
+    return [...this.hostHistory.entries()].map(([host, h]) => ({
+      host,
+      open: now < h.until,
+      lastOpenedAt: new Date(h.openedAt).toISOString(),
+      lastWindowMin: Math.round((h.until - h.openedAt) / 60_000),
+      lastReason: h.reason,
+      streak: h.streak,
+      lastClearedAt: h.clearedAt === null ? null : new Date(h.clearedAt).toISOString(),
+      challenged60m: withinHour(h.challenged, now).length,
+      queueFastFails60m: withinHour(h.skips, now).length,
+    }));
   }
 
   /** The currently-open cooldowns as observability views (expired-but-unremoved entries excluded). */

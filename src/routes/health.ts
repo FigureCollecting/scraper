@@ -13,6 +13,9 @@
  *     `browserLane: {launchMode, residentialTimezone, directTimezone, processTimezone,
  *     navigationTimeoutMs, gatedBrowsers}`,
  *     `challengeCooldowns: [{host, remainingMs, reason}]` (the per-host CF cooldowns currently open),
+ *     `challengeHistory: [{host, open, lastOpenedAt, lastWindowMin, lastReason, streak, lastClearedAt,
+ *     challenged60m, queueFastFails60m}]` (each host's LAST window, open or closed, so a window that
+ *     closed before the check still shows, and real challenged responses counted apart from fast-fails),
  *     `rawStore: {configured, stats?}` (the raw-capture sink's counters — page + asset lanes,
  *     plus its admission queue: `queued` (with its lane split `queuedPages` / `queuedAssets`, so
  *     images parked behind pages read differently from pages backed up), `inFlight`, `dropped`, `assetRefusedReserve` (images
@@ -72,7 +75,7 @@
  *     challengeCooldowns, cfCookies, error } — both lists survive (neither lister can throw).
  */
 import { Router, type Request, type Response } from 'express';
-import type { CooldownView } from '../services/challengeCooldown.js';
+import type { CooldownHistoryView, CooldownView } from '../services/challengeCooldown.js';
 import type { CfCookieHostView } from '../services/cookieJar.js';
 import type { BrowserLaneView } from '../services/genericScraper.js';
 import type { RawStoreView } from '../services/s3ObjectStore.js';
@@ -95,6 +98,8 @@ export interface HealthDeps {
   getBrowserPoolHealth: () => Promise<unknown>;
   /** Currently-open per-host challenge cooldowns (getChallengeCooldown().list()). */
   listChallengeCooldowns: () => CooldownView[];
+  /** Each host's last window, open or closed (getChallengeCooldown().history()). */
+  listChallengeHistory: () => CooldownHistoryView[];
   /** The stored-cookie jar's per-host view (getCfCookieStore().view()) — names and flags, never values. */
   listCfCookies: () => CfCookieHostView[];
   /**
@@ -225,6 +230,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         ...healthResponse(),
         browserPool,
         challengeCooldowns: deps.listChallengeCooldowns(),
+        challengeHistory: deps.listChallengeHistory(),
         cfCookies: deps.listCfCookies(),
         cookieSessionLost: sessionLostHosts(),
         residentialEgress: deps.getResidentialEgress(),
@@ -249,6 +255,7 @@ export function createHealthRoutes(deps: HealthDeps): Router {
         ...healthResponse(),
         status: 'degraded',
         challengeCooldowns: deps.listChallengeCooldowns(),
+        challengeHistory: deps.listChallengeHistory(),
         cfCookies: deps.listCfCookies(),
         cookieSessionLost: sessionLostHosts(),
         residentialEgress: deps.getResidentialEgress(),

@@ -2236,6 +2236,7 @@ export class ScrapeQueue {
       if (host !== undefined && cooldown.isOpen(host)) {
         const minsLeft = Math.max(1, Math.ceil(cooldown.remaining(host) / 60_000));
         console.warn(`[COOLDOWN] skipped ${sanitizeForLog(item.url)} (${host} cooling, ${minsLeft} min left)`);
+        cooldown.recordSkip(host);
         throw new ChallengeCooldownError(host, cooldown.remaining(host));
       }
       // THE TRANSPORT HAND-OFF (QB-U30a): the capturing fetch below hands the record's request to its
