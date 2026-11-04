@@ -30,6 +30,7 @@ const build = (over: Partial<HealthDeps> = {}) => {
     version: '9.9.9',
     getBrowserPoolHealth: async () => ({ available: 2, capacity: 3, healthy: true }),
     listChallengeCooldowns: () => [],
+    listChallengeHistory: () => [],
     listCfCookies: () => [],
     getResidentialEgress: () => ({ configured: false }),
     getBrowserLane: () => ({ launchMode: 'headless', residentialTimezone: null, directTimezone: null, processTimezone: null, navigationTimeoutMs: 20000, gatedBrowsers: [] }),
@@ -119,6 +120,37 @@ describe('createHealthRoutes', () => {
     expect(res.body.challengeCooldowns).toEqual([
       { host: 'coolhost.example.test', remainingMs: 1_740_000, reason: 'search challenge page' },
     ]);
+  });
+
+  describe('challengeHistory (the last window per host, open or closed)', () => {
+    const row = {
+      host: 'solarisjapan.example.test',
+      open: false,
+      lastOpenedAt: '2026-11-04T01:00:12.000Z',
+      lastWindowMin: 120,
+      lastReason: 'challenge page via impersonate transport (extracted, not recovered)',
+      streak: 3,
+      lastClearedAt: null,
+      challenged60m: 1,
+      queueFastFails60m: 4,
+    };
+
+    it('GET /health/detailed lists challengeHistory next to challengeCooldowns', async () => {
+      const res = await request(build({ listChallengeHistory: () => [row] })).get('/health/detailed');
+      expect(res.status).toBe(200);
+      expect(res.body.challengeCooldowns).toEqual([]);
+      expect(res.body.challengeHistory).toEqual([row]);
+    });
+
+    it('keeps challengeHistory on the degraded (500) response', async () => {
+      const app = build({
+        getBrowserPoolHealth: async () => { throw new Error('pool down'); },
+        listChallengeHistory: () => [row],
+      });
+      const res = await request(app).get('/health/detailed');
+      expect(res.status).toBe(500);
+      expect(res.body.challengeHistory).toEqual([row]);
+    });
   });
 
   /**

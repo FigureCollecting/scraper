@@ -61,6 +61,7 @@ app.use('/', createHealthRoutes({
   version: packageJson.version,
   getBrowserPoolHealth: () => BrowserPool.getHealth(),
   listChallengeCooldowns: () => getChallengeCooldown().list(),
+  listChallengeHistory: () => getChallengeCooldown().history(),
   listCfCookies: () => getCfCookieStore().view(),
   getResidentialEgress: () => residentialEgressView(),
   getBrowserLane: () => browserLaneView(),

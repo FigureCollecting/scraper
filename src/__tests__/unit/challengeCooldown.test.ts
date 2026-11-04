@@ -273,6 +273,93 @@ describe('challengeCooldown — per-host CF cooldown (time-injectable)', () => {
     });
   });
 
+  describe('history: what the last window per host was, even after it closed', () => {
+    let warn: jest.SpyInstance;
+    beforeEach(() => {
+      warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    });
+    afterEach(() => warn.mockRestore());
+
+    const iso = (ms: number) => new Date(ms).toISOString();
+
+    it('is empty for a register that never opened', () => {
+      expect(new ChallengeCooldown({ now: () => 0 }).history()).toEqual([]);
+    });
+
+    it('an open window is listed with when, how long, why, its streak and the hour counters', () => {
+      const t = Date.UTC(2026, 10, 3, 1, 0, 0);
+      const cd = new ChallengeCooldown({ now: () => t });
+      cd.open(HOST, 'challenge page via impersonate transport');
+      expect(cd.history()).toEqual([
+        {
+          host: HOST,
+          open: true,
+          lastOpenedAt: iso(t),
+          lastWindowMin: 30,
+          lastReason: 'challenge page via impersonate transport',
+          streak: 1,
+          lastClearedAt: null,
+          challenged60m: 1,
+          queueFastFails60m: 0,
+        },
+      ]);
+    });
+
+    it('a lapsed and cleared window stays listed, closed, with the streak it reached and when it cleared', () => {
+      const clock = { t: Date.UTC(2026, 10, 3, 1, 0, 0) };
+      const cd = new ChallengeCooldown({ now: () => clock.t });
+      cd.open(HOST, 'r1');
+      clock.t += DEFAULT;
+      cd.open(HOST, 'r2'); // streak 2, 60 min
+      const openedAt = clock.t;
+      clock.t += 2 * DEFAULT;
+      cd.clear(HOST);
+      expect(cd.list()).toEqual([]);
+      expect(cd.history()).toEqual([
+        expect.objectContaining({
+          host: HOST,
+          open: false,
+          lastOpenedAt: iso(openedAt),
+          lastWindowMin: 60,
+          lastReason: 'r2',
+          streak: 2,
+          lastClearedAt: iso(clock.t),
+          challenged60m: 0, // both opens are now more than an hour old
+        }),
+      ]);
+    });
+
+    it('counts challenged fetches and queue fast-fails over the trailing 60 min only', () => {
+      const clock = { t: 0 };
+      const cd = new ChallengeCooldown({ now: () => clock.t });
+      cd.open(HOST, 'r');
+      cd.recordSkip(HOST);
+      clock.t += 59 * MIN;
+      cd.open(HOST, 'straggler'); // still live: re-extends, counts as a challenged fetch
+      cd.recordSkip('WWW.' + HOST);
+      cd.recordSkip(HOST);
+      expect(cd.history()[0]).toEqual(expect.objectContaining({ challenged60m: 2, queueFastFails60m: 3 }));
+      clock.t += 1 * MIN; // the first open and the first skip are now exactly an hour old
+      expect(cd.history()[0]).toEqual(expect.objectContaining({ challenged60m: 1, queueFastFails60m: 2 }));
+    });
+
+    it('a skip for a host with no history is ignored', () => {
+      const cd = new ChallengeCooldown({ now: () => 0 });
+      cd.recordSkip(HOST);
+      expect(cd.history()).toEqual([]);
+    });
+
+    it('restore lists the restored window (counters start at 0 after a restart)', () => {
+      const t = Date.UTC(2026, 10, 3, 1, 0, 0);
+      const cd = new ChallengeCooldown({ now: () => t });
+      const openedAt = t - 10 * MIN;
+      cd.restore([{ host: HOST, until: openedAt + 2 * DEFAULT, reason: 'restored', openedAt }]);
+      expect(cd.history()).toEqual([
+        expect.objectContaining({ open: true, lastOpenedAt: iso(openedAt), lastWindowMin: 60, streak: 2, challenged60m: 0 }),
+      ]);
+    });
+  });
+
   describe('ChallengeCooldownError', () => {
     it('carries host + remainingMs and names the remaining minutes in its message', () => {
       const err = new ChallengeCooldownError(HOST, 90_000); // 1.5 min → ceil 2
