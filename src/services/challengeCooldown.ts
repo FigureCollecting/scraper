@@ -28,6 +28,12 @@ const DEFAULT_WINDOW_MS = 30 * 60_000;
  */
 const DEFAULT_MAX_ESCALATED_MS = 6 * 60 * 60_000;
 /**
+ * A streak wears off after this long with no challenge past the window's end — 24 hours. A host that
+ * challenges once a week is treated as challenging for the first time, not climbing to 6 h, while a
+ * host that keeps challenging (queue traffic re-hits it as the window lapses) still escalates.
+ */
+const STREAK_DECAY_MS = 24 * 60 * 60_000;
+/**
  * Default run of CONSECUTIVE gate failures (an empty body or a 5xx from a gated host — see
  * gateSignal) that opens a host's cooldown. Conservative: one busy 5xx is not a refused gate.
  */
@@ -202,7 +208,8 @@ export class ChallengeCooldown {
   private readonly maxWindowMs: number;
   /**
    * Per-host run of cooldowns opened with no clean fetch in between (1 = first open). Kept past the
-   * window's lapse so the next challenge escalates; only `clear()` (a clean fetch) ends it.
+   * window's lapse so the next challenge escalates; `clear()` (a clean queue fetch) ends it, and so
+   * does 24 h with no challenge after the window closed (STREAK_DECAY_MS).
    */
   private readonly streaks = new Map<string, number>();
   /** Per-host last window + trailing-hour counters (memory-only; survives clear, unlike `entries`). */
@@ -271,8 +278,9 @@ export class ChallengeCooldown {
   /**
    * Open (or re-extend) the cooldown for `host`; logs the opened line. Returns the recorded entry.
    *
-   * ESCALATION: a host that challenges again after its window lapsed, with no clean fetch in between,
-   * opens for twice the previous window (base × 2^(streak-1), capped at the max). A challenge that
+   * ESCALATION: a host that challenges again after its window lapsed, with no clean fetch in between
+   * and within 24 h of the window's end, opens for twice the previous window (base × 2^(streak-1),
+   * capped at the max); later than that it opens at the base again (streak 1). A challenge that
    * lands while the window is still live (a fetch already in flight) re-extends at the SAME level, so
    * concurrent stragglers cannot ratchet the streak.
    */
@@ -281,7 +289,12 @@ export class ChallengeCooldown {
     const now = this.now();
     const prior = this.entries.get(key);
     const live = prior !== undefined && now < prior.until;
-    const streak = live ? this.streak(key) : this.streak(key) + 1;
+    // Decay is measured from the window's END, not from the challenge start, on purpose: a host that
+    // challenges about once a day always re-challenges under 24 h after its window closed, so it keeps
+    // climbing to the ceiling. That leans toward backing off, which is the polite side: a store that
+    // challenges daily is telling us to slow down. Tests pin it; do not shorten the decay to "fix" it.
+    const decayed = prior !== undefined && now - prior.until >= STREAK_DECAY_MS;
+    const streak = live ? this.streak(key) : decayed ? 1 : this.streak(key) + 1;
     this.streaks.set(key, streak);
     const windowMs = this.windowForStreak(streak);
     const entry: CooldownEntry = { host: key, until: now + windowMs, reason, openedAt: now };

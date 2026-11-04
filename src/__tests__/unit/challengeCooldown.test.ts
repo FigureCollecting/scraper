@@ -268,6 +268,85 @@ describe('challengeCooldown — per-host CF cooldown (time-injectable)', () => {
       expect(cd.streak(HOST)).toBe(2);
     });
 
+    describe('the streak wears off after 24 h with no challenge past the window', () => {
+      const DAY = 24 * 60 * MIN;
+
+      it('a host challenged once a week stays at the base window: 30 min every time', () => {
+        const clock = { t: 0 };
+        const cd = new ChallengeCooldown({ now: () => clock.t });
+        const windows = Array.from({ length: 6 }, () => {
+          cd.open(HOST, 'challenge page');
+          const w = cd.remaining(HOST);
+          clock.t += 7 * DAY;
+          return w;
+        });
+        expect(windows).toEqual([DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT]);
+        expect(cd.streak(HOST)).toBe(1);
+      });
+
+      it('a challenge less than 24 h after the window closed still escalates', () => {
+        const clock = { t: 0 };
+        const cd = new ChallengeCooldown({ now: () => clock.t });
+        openAndLapse(cd, clock);
+        clock.t += DAY - 1;
+        cd.open(HOST, 'challenge page');
+        expect(cd.remaining(HOST)).toBe(2 * DEFAULT);
+        expect(cd.streak(HOST)).toBe(2);
+      });
+
+      it('a host challenged once a day keeps climbing to the 6 h ceiling (deliberate: decay counts from the window end)', () => {
+        const clock = { t: 0 };
+        const cd = new ChallengeCooldown({ now: () => clock.t });
+        // Challenges start exactly 24 h apart, so each gap from the window's end is under 24 h.
+        const windows = Array.from({ length: 6 }, () => {
+          cd.open(HOST, 'challenge page');
+          const w = cd.remaining(HOST);
+          clock.t += DAY;
+          return w;
+        });
+        expect(windows).toEqual([DEFAULT, 2 * DEFAULT, 4 * DEFAULT, 8 * DEFAULT, 12 * DEFAULT, 12 * DEFAULT]);
+        expect(cd.streak(HOST)).toBe(6);
+        // A 36 h gap between challenge starts leaves 30 h past the 6 h window: the streak has worn off.
+        clock.t += 12 * 60 * MIN;
+        cd.open(HOST, 'challenge page');
+        expect(cd.remaining(HOST)).toBe(DEFAULT);
+        expect(cd.streak(HOST)).toBe(1);
+      });
+
+      it('a challenge 24 h or more after a 6 h window closed opens at the base, streak 1, and logs it', () => {
+        const clock = { t: 0 };
+        const cd = new ChallengeCooldown({ now: () => clock.t });
+        for (let i = 0; i < 5; i++) openAndLapse(cd, clock);
+        expect(cd.streak(HOST)).toBe(5);
+        clock.t += DAY;
+        cd.open(HOST, 'challenge page');
+        expect(cd.remaining(HOST)).toBe(DEFAULT);
+        expect(cd.streak(HOST)).toBe(1);
+        expect(cd.history()[0].streak).toBe(1);
+        expect(warn).toHaveBeenLastCalledWith('[COOLDOWN] opened coolhost.example.test for 30 min (streak 1, challenge page)');
+      });
+
+      it('a restored window wears off the same way', () => {
+        const clock = { t: 10_000_000 };
+        const cd = new ChallengeCooldown({ now: () => clock.t });
+        const openedAt = clock.t - 10 * MIN;
+        cd.restore([{ host: HOST, until: openedAt + 4 * DEFAULT, reason: 'r', openedAt }]);
+        clock.t = openedAt + 4 * DEFAULT + DAY;
+        cd.open(HOST, 'r');
+        expect(cd.remaining(HOST)).toBe(DEFAULT);
+        expect(cd.streak(HOST)).toBe(1);
+      });
+
+      it('a gate-failure run after a quiet day opens at the base too', () => {
+        const clock = { t: 0 };
+        const cd = new ChallengeCooldown({ now: () => clock.t, gateFailureThreshold: 1 });
+        cd.recordGateFailure(HOST, 'empty body');
+        clock.t += DEFAULT + DAY;
+        expect(cd.recordGateFailure(HOST, 'empty body').opened?.until).toBe(clock.t + DEFAULT);
+        expect(cd.streak(HOST)).toBe(1);
+      });
+    });
+
     it('streak is 0 for a host that never challenged', () => {
       expect(new ChallengeCooldown({ now: () => 0 }).streak(HOST)).toBe(0);
     });
