@@ -289,6 +289,10 @@ export class ChallengeCooldown {
     const now = this.now();
     const prior = this.entries.get(key);
     const live = prior !== undefined && now < prior.until;
+    // Decay is measured from the window's END, not from the challenge start, on purpose: a host that
+    // challenges about once a day always re-challenges under 24 h after its window closed, so it keeps
+    // climbing to the ceiling. That leans toward backing off, which is the polite side: a store that
+    // challenges daily is telling us to slow down. Tests pin it; do not shorten the decay to "fix" it.
     const decayed = prior !== undefined && now - prior.until >= STREAK_DECAY_MS;
     const streak = live ? this.streak(key) : decayed ? 1 : this.streak(key) + 1;
     this.streaks.set(key, streak);

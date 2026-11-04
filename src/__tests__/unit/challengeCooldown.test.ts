@@ -294,6 +294,25 @@ describe('challengeCooldown — per-host CF cooldown (time-injectable)', () => {
         expect(cd.streak(HOST)).toBe(2);
       });
 
+      it('a host challenged once a day keeps climbing to the 6 h ceiling (deliberate: decay counts from the window end)', () => {
+        const clock = { t: 0 };
+        const cd = new ChallengeCooldown({ now: () => clock.t });
+        // Challenges start exactly 24 h apart, so each gap from the window's end is under 24 h.
+        const windows = Array.from({ length: 6 }, () => {
+          cd.open(HOST, 'challenge page');
+          const w = cd.remaining(HOST);
+          clock.t += DAY;
+          return w;
+        });
+        expect(windows).toEqual([DEFAULT, 2 * DEFAULT, 4 * DEFAULT, 8 * DEFAULT, 12 * DEFAULT, 12 * DEFAULT]);
+        expect(cd.streak(HOST)).toBe(6);
+        // A 36 h gap between challenge starts leaves 30 h past the 6 h window: the streak has worn off.
+        clock.t += 12 * 60 * MIN;
+        cd.open(HOST, 'challenge page');
+        expect(cd.remaining(HOST)).toBe(DEFAULT);
+        expect(cd.streak(HOST)).toBe(1);
+      });
+
       it('a challenge 24 h or more after a 6 h window closed opens at the base, streak 1, and logs it', () => {
         const clock = { t: 0 };
         const cd = new ChallengeCooldown({ now: () => clock.t });
