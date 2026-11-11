@@ -125,6 +125,8 @@ export interface PersistedCooldown {
   until: number;
   reason: string;
   openedAt: number;
+  /** The transport that saw the challenge; absent on rows written before lanes were stored. */
+  lane?: string;
 }
 
 /** What a startup reconciliation found. */
@@ -246,9 +248,21 @@ CREATE TABLE IF NOT EXISTS host_cooldowns (
   host      TEXT PRIMARY KEY,
   until     INTEGER NOT NULL,
   reason    TEXT NOT NULL,
-  opened_at INTEGER NOT NULL
+  opened_at INTEGER NOT NULL,
+  lane      TEXT
 );
 `;
+
+/**
+ * A file written before cooldowns carried their lane has host_cooldowns WITHOUT the `lane` column
+ * (`CREATE TABLE IF NOT EXISTS` leaves it as it was). Add it, nullable, so those rows restore with
+ * no lane. An older build reading a migrated file still works: it names its columns on write and
+ * ignores the extra one on read.
+ */
+function addCooldownLaneColumn(db: DatabaseSync): void {
+  const cols = db.prepare('PRAGMA table_info(host_cooldowns)').all() as unknown as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === 'lane')) db.exec('ALTER TABLE host_cooldowns ADD COLUMN lane TEXT');
+}
 
 /**
  * ONE ROW PER DEDUP KEY, enforced by the schema rather than by every caller remembering to look
@@ -381,6 +395,7 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
     db.exec('PRAGMA foreign_keys = ON');
     db.exec(SCHEMA);
     db.exec(DEDUP_KEY_CONSTRAINT);
+    addCooldownLaneColumn(db);
     // Any handle that survived the SCHEMA exec has a real, readable database behind it.
     db.prepare('SELECT COUNT(*) AS n FROM queue_items').get();
     // PROVE IT IS WRITABLE, not merely openable. A database that has lost its write permission opens
@@ -430,8 +445,8 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
     releaseAll: db.prepare(`UPDATE queue_items SET state = 'pending', lease_until = NULL WHERE state = 'leased'`),
     countByState: db.prepare('SELECT state, COUNT(*) AS n FROM queue_items GROUP BY state'),
     saveCooldown: db.prepare(
-      `INSERT INTO host_cooldowns (host, until, reason, opened_at) VALUES (?,?,?,?)
-       ON CONFLICT(host) DO UPDATE SET until = excluded.until, reason = excluded.reason, opened_at = excluded.opened_at`
+      `INSERT INTO host_cooldowns (host, until, reason, opened_at, lane) VALUES (?,?,?,?,?)
+       ON CONFLICT(host) DO UPDATE SET until = excluded.until, reason = excluded.reason, opened_at = excluded.opened_at, lane = excluded.lane`
     ),
     removeCooldown: db.prepare('DELETE FROM host_cooldowns WHERE host = ?'),
     selCooldowns: db.prepare('SELECT * FROM host_cooldowns WHERE until > ? ORDER BY until ASC'),
@@ -661,7 +676,7 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
     },
 
     saveCooldown(entry: PersistedCooldown): void {
-      write(() => stmt.saveCooldown.run(normalizeHost(entry.host), entry.until, entry.reason, entry.openedAt));
+      write(() => stmt.saveCooldown.run(normalizeHost(entry.host), entry.until, entry.reason, entry.openedAt, entry.lane ?? null));
     },
 
     removeCooldown(host: string): void {
@@ -696,6 +711,7 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
           until: number;
           reason: string;
           opened_at: number;
+          lane: string | null;
         }>;
         write(() => stmt.dropExpiredCooldowns.run(now));
 
@@ -713,6 +729,7 @@ export function openQueueStore(opts: OpenQueueStoreOptions = {}): ScrapeQueueSto
             until: c.until,
             reason: c.reason,
             openedAt: c.opened_at,
+            ...(c.lane != null ? { lane: c.lane } : {}),
           })),
         };
       });
@@ -865,7 +882,7 @@ function quarantine(file: string, stamp: string): string | null {
  */
 function salvage(quarantinedPath: string, into: ScrapeQueueStore): { carried: number; lost: number } {
   let rows: ItemRow[] = [];
-  let cooldowns: Array<{ host: string; until: number; reason: string; opened_at: number }> = [];
+  let cooldowns: Array<{ host: string; until: number; reason: string; opened_at: number; lane?: string | null }> = [];
   try {
     const old = new DatabaseSync(quarantinedPath, { readOnly: true });
     try {
@@ -888,7 +905,7 @@ function salvage(quarantinedPath: string, into: ScrapeQueueStore): { carried: nu
       into.put({ ...item, state: item.state === 'leased' ? 'pending' : item.state, leaseUntil: undefined });
     }
     for (const c of cooldowns) {
-      into.saveCooldown({ host: c.host, until: c.until, reason: c.reason, openedAt: c.opened_at });
+      into.saveCooldown({ host: c.host, until: c.until, reason: c.reason, openedAt: c.opened_at, ...(c.lane != null ? { lane: c.lane } : {}) });
     }
   });
   const after = into.counts();

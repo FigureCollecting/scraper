@@ -68,6 +68,8 @@ export interface CooldownEntry {
   reason: string;
   /** Epoch ms the cooldown was opened. */
   openedAt: number;
+  /** The transport that saw the challenge (browser / impersonate / http …); absent when unnamed. */
+  lane?: string;
 }
 
 /** The observability view of one open cooldown (what /health/detailed lists). */
@@ -185,7 +187,20 @@ export class ChallengeCooldown {
     const key = normalizeHost(host);
     const now = this.now();
     const windowMs = this.windowFor(key, lane, now);
-    const entry: CooldownEntry = { host: key, until: now + windowMs, reason, openedAt: now };
+    // A shorter lane never cuts a longer window that is still running (a 3 h browser window, or a
+    // high impit step, must not drop to 30 minutes because an http-lane fetch also saw the
+    // challenge). The running entry is kept whole, lane and length included, so the impit ladder
+    // still steps from it once it expires.
+    const prev = this.entries.get(key);
+    if (prev !== undefined && prev.until >= now + windowMs) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[COOLDOWN] kept ${key} (${Math.round((prev.until - now) / 60_000)} min left, longer than the ` +
+          `${Math.round(windowMs / 60_000)} min a ${lane ?? 'unnamed'} challenge opens) (${reason})`,
+      );
+      return prev;
+    }
+    const entry: CooldownEntry = { host: key, until: now + windowMs, reason, openedAt: now, ...(lane !== undefined ? { lane } : {}) };
     this.entries.set(key, entry);
     this.persist((p) => p.saveCooldown(entry));
     // eslint-disable-next-line no-console
@@ -196,18 +211,19 @@ export class ChallengeCooldown {
   /**
    * The window for a challenge on `key` seen through `lane`:
    *   - browser     → a fixed 3 hours.
-   *   - impersonate → escalating. With no entry (never opened, or cleared by a clean fetch) the
-   *     first 30 minutes; with the previous window still live it is the same incident, so the same
-   *     length again; with the previous window EXPIRED and never cleared (no clean fetch since) it
-   *     doubles, capped at 6 hours. The step is read from the previous entry's own length
-   *     (until − openedAt), which is persisted, so a restart inside a live window keeps the ladder.
-   *   - anything else → the configured window (arg / env / 30 min).
+   *   - impersonate → escalating. With no previous IMPIT entry (never opened, cleared by a clean
+   *     fetch, or the last window came from another lane) the first 30 minutes; with the previous
+   *     impit window still live it is the same incident, so the same length again; with it EXPIRED
+   *     and never cleared (no clean fetch since) it doubles, capped at 6 hours. The step is read
+   *     from the previous entry's own lane and length (until − openedAt), both persisted, so a
+   *     restart inside a live window keeps the ladder.
+   *   - anything else (http, unknown, unnamed) → the configured window (arg / env / 30 min).
    */
   private windowFor(key: string, lane: string | undefined, now: number): number {
     if (lane === 'browser') return BROWSER_LANE_WINDOW_MS;
     if (lane !== 'impersonate') return this.windowMs;
     const prev = this.entries.get(key);
-    if (prev === undefined) return IMPIT_BACKOFF_BASE_MS;
+    if (prev === undefined || prev.lane !== 'impersonate') return IMPIT_BACKOFF_BASE_MS;
     const prevWindow = prev.until - prev.openedAt;
     const next = now < prev.until ? prevWindow : prevWindow * 2;
     return Math.min(IMPIT_BACKOFF_CAP_MS, Math.max(IMPIT_BACKOFF_BASE_MS, next));

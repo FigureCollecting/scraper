@@ -261,6 +261,35 @@ describe('queueStore — host cooldowns', () => {
     expect(cooldowns[0]).toMatchObject({ until: 90_000, reason: 'second' });
   });
 
+  it('the lane a cooldown was opened on survives a restart; a row without one restores without one', () => {
+    const dir = tmpDir();
+    const first = open(dir);
+    first.saveCooldown({ host: 'i.example', until: 100_000, reason: 'r', openedAt: 1_000, lane: 'impersonate' });
+    first.saveCooldown({ host: 'n.example', until: 100_000, reason: 'r', openedAt: 1_000 });
+    first.close();
+
+    expect(open(dir).restore(50_000).cooldowns).toEqual([
+      { host: 'i.example', until: 100_000, reason: 'r', openedAt: 1_000, lane: 'impersonate' },
+      { host: 'n.example', until: 100_000, reason: 'r', openedAt: 1_000 },
+    ]);
+  });
+
+  it('a file written before lanes were stored gains the lane column and keeps its cooldowns', () => {
+    const dir = tmpDir();
+    const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
+    const raw = new DatabaseSync(path.join(dir, QUEUE_DB_FILE));
+    raw.exec('CREATE TABLE host_cooldowns (host TEXT PRIMARY KEY, until INTEGER NOT NULL, reason TEXT NOT NULL, opened_at INTEGER NOT NULL)');
+    raw.prepare('INSERT INTO host_cooldowns VALUES (?,?,?,?)').run('old.example', 100_000, 'r', 1_000);
+    raw.close();
+
+    const store = open(dir);
+    store.saveCooldown({ host: 'new.example', until: 100_000, reason: 'r', openedAt: 2_000, lane: 'browser' });
+    expect(store.restore(50_000).cooldowns).toEqual([
+      { host: 'old.example', until: 100_000, reason: 'r', openedAt: 1_000 },
+      { host: 'new.example', until: 100_000, reason: 'r', openedAt: 2_000, lane: 'browser' },
+    ]);
+  });
+
   it('removeCooldown drops the host', () => {
     const dir = tmpDir();
     const store = open(dir);
@@ -412,7 +441,8 @@ describe('queueStore — fallback reasons', () => {
     first.put(ITEM({ id: 'a', mfcId: 'a', url: 'https://s.example/a' }));
     first.put(ITEM({ id: 'b', mfcId: 'b', url: 'https://s.example/b' }));
     first.lease('b', 60_000);
-    first.saveCooldown({ host: 'cool.example', until: 900_000, reason: 'challenge page', openedAt: 1_000 });
+    first.saveCooldown({ host: 'cool.example', until: 900_000, reason: 'challenge page', openedAt: 1_000, lane: 'impersonate' });
+    first.saveCooldown({ host: 'plain.example', until: 950_000, reason: 'challenge page', openedAt: 1_000 });
     first.close();
 
     // The FIRST open fails on a WRITE (the journal-mode pragma), so a main database that READS
@@ -427,7 +457,8 @@ describe('queueStore — fallback reasons', () => {
     expect(store.lostAtStartup).toBe(0);
     // Both items are back, and the leased one comes over DRIVABLE — no process holds that lease now.
     expect(restored.pending.map((i) => i.id).sort()).toEqual(['a', 'b']);
-    expect(restored.cooldowns.map((c) => c.host)).toEqual(['cool.example']);
+    expect(restored.cooldowns.map((c) => c.host)).toEqual(['cool.example', 'plain.example']);
+    expect(restored.cooldowns.map((c) => c.lane)).toEqual(['impersonate', undefined]); // salvage carries the lane too
   });
 
   it('quarantines a DIRECTORY sitting where the db file belongs, and recovers', () => {

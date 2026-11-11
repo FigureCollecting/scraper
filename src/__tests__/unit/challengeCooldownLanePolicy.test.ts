@@ -102,13 +102,122 @@ describe('challengeCooldown — per-lane window policy', () => {
       expect(e.until - e.openedAt).toBe(30 * MIN);
     });
 
-    it('survives a restart inside a live window: the restored window length is the next step\'s base', () => {
+    it('survives a restart inside a live window: the restored impit window length is the next step\'s base', () => {
       let t = 1_000_000;
       const cd = new ChallengeCooldown({ now: () => t });
-      cd.restore([{ host: HOST, openedAt: t - 10 * MIN, until: t - 10 * MIN + 60 * MIN, reason: 'r' }]);
+      cd.restore([{ host: HOST, openedAt: t - 10 * MIN, until: t - 10 * MIN + 60 * MIN, reason: 'r', lane: 'impersonate' }]);
       t += 50 * MIN; // the restored 60-minute window has expired
       const e = cd.open(HOST, 'r', 'impersonate');
       expect(e.until - e.openedAt).toBe(120 * MIN);
+    });
+
+    it('a restored row with no lane (written before lanes were stored) is not an impit step', () => {
+      let t = 1_000_000;
+      const cd = new ChallengeCooldown({ now: () => t });
+      cd.restore([{ host: HOST, openedAt: t - 10 * MIN, until: t - 10 * MIN + 60 * MIN, reason: 'r' }]);
+      t += 50 * MIN;
+      const e = cd.open(HOST, 'r', 'impersonate');
+      expect(e.until - e.openedAt).toBe(30 * MIN);
+    });
+
+    it('an expired BROWSER window is not an impit step: the next impit challenge opens 30 min, not 6 h (A2)', () => {
+      let t = 1_000_000;
+      const cd = new ChallengeCooldown({ now: () => t });
+      t = cd.open(HOST, 'detail challenge page', 'browser').until;
+      const e = cd.open(HOST, 'search challenge page', 'impersonate');
+      expect(e.until - e.openedAt).toBe(30 * MIN);
+    });
+
+    it('two impit challenges after expiry step once: 60, then 60 again (A3)', () => {
+      let t = 1_000_000;
+      const cd = new ChallengeCooldown({ now: () => t });
+      t = cd.open(HOST, 'r', 'impersonate').until;
+      const a = cd.open(HOST, 'r', 'impersonate');
+      const b = cd.open(HOST, 'r', 'impersonate');
+      expect([(a.until - a.openedAt) / MIN, (b.until - b.openedAt) / MIN]).toEqual([60, 60]);
+    });
+  });
+
+  describe('a shorter lane never cuts a longer live window (F2)', () => {
+    it('a live 3 h browser window survives a later http-lane challenge (A1)', () => {
+      let t = 1_000_000;
+      const cd = new ChallengeCooldown({ now: () => t });
+      cd.open(HOST, 'detail challenge page', 'browser');
+      t += MIN;
+      const kept = cd.open(HOST, 'search challenge page', 'http');
+      expect(cd.remaining(HOST)).toBe(3 * HOUR - MIN);
+      expect(kept).toMatchObject({ lane: 'browser', reason: 'detail challenge page' });
+      expect(warn.mock.calls.map((c) => String(c[0]))).toContainEqual(
+        `[COOLDOWN] kept ${HOST} (179 min left, longer than the 30 min a http challenge opens) (search challenge page)`,
+      );
+    });
+
+    it('a live 6 h impit step survives a later http challenge, and the ladder still steps from it (A1b)', () => {
+      let t = 1_000_000;
+      const cd = new ChallengeCooldown({ now: () => t });
+      for (let i = 0; i < 5; i++) t = cd.open(HOST, 'r', 'impersonate').until;
+      cd.open(HOST, 'r', 'impersonate'); // live 6 h
+      t += MIN;
+      cd.open(HOST, 'r', 'http');
+      expect(cd.remaining(HOST)).toBe(6 * HOUR - MIN);
+      t += 6 * HOUR;
+      const next = cd.open(HOST, 'r', 'impersonate');
+      expect(next.until - next.openedAt).toBe(6 * HOUR);
+    });
+
+    it('an unnamed-lane challenge inside a live browser window is kept too, and the log says so', () => {
+      let t = 1_000_000;
+      const cd = new ChallengeCooldown({ now: () => t });
+      cd.open(HOST, 'r', 'browser');
+      t += MIN;
+      cd.open(HOST, 'queue challenge');
+      expect(cd.remaining(HOST)).toBe(3 * HOUR - MIN);
+      expect(warn.mock.calls.map((c) => String(c[0]))).toContainEqual(
+        `[COOLDOWN] kept ${HOST} (179 min left, longer than the 30 min a unnamed challenge opens) (queue challenge)`,
+      );
+    });
+
+    it('a longer lane still replaces a shorter live window', () => {
+      let t = 1_000_000;
+      const cd = new ChallengeCooldown({ now: () => t });
+      cd.open(HOST, 'r', 'http');
+      t += MIN;
+      const e = cd.open(HOST, 'r', 'browser');
+      expect(e).toMatchObject({ lane: 'browser', openedAt: t, until: t + 3 * HOUR });
+    });
+  });
+
+  describe('the entry records its lane', () => {
+    it('open returns and persists the lane; an unnamed lane is left off', () => {
+      const saved: unknown[] = [];
+      const cd = new ChallengeCooldown({
+        now: () => 5,
+        persistence: { saveCooldown: (e) => saved.push(e), removeCooldown: () => {} },
+      });
+      cd.open('a.test', 'r', 'impersonate');
+      cd.open('b.test', 'r');
+      expect(saved).toEqual([
+        { host: 'a.test', until: 5 + 30 * MIN, reason: 'r', openedAt: 5, lane: 'impersonate' },
+        { host: 'b.test', until: 5 + 30 * MIN, reason: 'r', openedAt: 5 },
+      ]);
+    });
+  });
+
+  describe('env and lane names (A5, A6)', () => {
+    it('a 24 h CHALLENGE_COOLDOWN_MS reaches http, unknown and unnamed lanes but not browser or impersonate', () => {
+      process.env.CHALLENGE_COOLDOWN_MS = String(24 * HOUR);
+      const cd = new ChallengeCooldown({ now: () => 1 });
+      expect(cd.open('b.test', 'r', 'browser').until - 1).toBe(3 * HOUR);
+      expect(cd.open('i.test', 'r', 'impersonate').until - 1).toBe(30 * MIN);
+      expect(cd.open('h.test', 'r', 'http').until - 1).toBe(24 * HOUR);
+      expect(cd.open('u.test', 'r', 'unknown').until - 1).toBe(24 * HOUR);
+      expect(cd.open('n.test', 'r').until - 1).toBe(24 * HOUR);
+    });
+
+    it('lane names are exact: "Browser" and "impit" get the configured window', () => {
+      const cd = new ChallengeCooldown({ now: () => 1, windowMs: 2 * MIN });
+      expect(cd.open('x.test', 'r', 'Browser').until - 1).toBe(2 * MIN);
+      expect(cd.open('y.test', 'r', 'impit').until - 1).toBe(2 * MIN);
     });
   });
 
