@@ -185,9 +185,12 @@ export function assembleResolve(services: ResolveServices): Resolve {
           // queue and the lookup fan-out then leave it alone) and fail THIS id. Checked BEFORE the
           // status gate so a 200 interstitial that rendered opens the cooldown too, not only a 5xx.
           if (isCloudflareChallenge(html)) {
-            if (host !== undefined) cd.open(host, 'detail challenge page');
+            // fetchDetail is the pooled BROWSER lane, so the browser window applies.
+            if (host !== undefined) cd.open(host, 'detail challenge page', 'browser');
             throw new Error('detail fetch returned a Cloudflare challenge page');
           }
+          // Not a challenge: the host let us through, so reset its back-off (as the queue does).
+          if (host !== undefined) cd.noteSuccess(host);
           // A 4xx/5xx page (gone / error) is NOT a confirm — extract would happily parse the error
           // body into empty fields WITHOUT throwing, so gate on status explicitly.
           if (statusCode !== undefined && statusCode >= 400) {

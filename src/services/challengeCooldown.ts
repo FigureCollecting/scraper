@@ -23,6 +23,17 @@ const MAX_WINDOW_MS = 24 * 60 * 60_000;
 const DEFAULT_WINDOW_MS = 30 * 60_000;
 
 /**
+ * BROWSER LANE window — 3 hours. A challenge the real browser could not clear means Cloudflare
+ * scored this egress + browser pair; walking back in after 30 minutes only adds failed challenges
+ * to the IP's record (the browser-lane stores sat in back-to-back 30-minute windows from 11-03).
+ */
+export const BROWSER_LANE_WINDOW_MS = 3 * 60 * 60_000;
+/** IMPERSONATE (impit) LANE back-off: the first window, doubled per repeat challenge... */
+export const IMPIT_BACKOFF_BASE_MS = 30 * 60_000;
+/** ...up to this cap — 6 hours. */
+export const IMPIT_BACKOFF_CAP_MS = 6 * 60 * 60_000;
+
+/**
  * Coerce a requested window (ms) into the allowed band. A finite value is clamped to
  * [1 min, 24 h]; a non-finite value (NaN / Infinity — e.g. a garbage env string) falls back to the
  * 30-minute default rather than clamping, so misconfiguration degrades to "sane default", never 0.
@@ -79,7 +90,11 @@ export interface CooldownPersistence {
 export interface ChallengeCooldownOptions {
   /** Injectable clock (default Date.now) — tests pass a controllable function. */
   now?: () => number;
-  /** Explicit window (ms). Beats the env; clamped to [1 min, 24 h]. Default: env or 30 min. */
+  /**
+   * Explicit window (ms) for a challenge seen on a lane with no policy of its own (http, or none
+   * named). Beats the env; clamped to [1 min, 24 h]. Default: env or 30 min. The browser and
+   * impersonate lanes use their own windows (see open).
+   */
   windowMs?: number;
   /** Optional durable sink. Absent ⇒ the register is memory-only, exactly as before. */
   persistence?: CooldownPersistence;
@@ -161,16 +176,52 @@ export class ChallengeCooldown {
     return loaded;
   }
 
-  /** Open (or re-extend) the cooldown for `host`; logs the opened line. Returns the recorded entry. */
-  open(host: string, reason: string): CooldownEntry {
+  /**
+   * Open (or re-extend) the cooldown for `host`; logs the opened line. Returns the recorded entry.
+   * `lane` is the transport that saw the challenge and picks the window (see windowFor); an
+   * unnamed lane gets the configured window, exactly as before lanes were passed.
+   */
+  open(host: string, reason: string, lane?: string): CooldownEntry {
     const key = normalizeHost(host);
     const now = this.now();
-    const entry: CooldownEntry = { host: key, until: now + this.windowMs, reason, openedAt: now };
+    const windowMs = this.windowFor(key, lane, now);
+    const entry: CooldownEntry = { host: key, until: now + windowMs, reason, openedAt: now };
     this.entries.set(key, entry);
     this.persist((p) => p.saveCooldown(entry));
     // eslint-disable-next-line no-console
-    console.warn(`[COOLDOWN] opened ${key} for ${Math.round(this.windowMs / 60_000)} min (${reason})`);
+    console.warn(`[COOLDOWN] opened ${key} for ${Math.round(windowMs / 60_000)} min (${reason})`);
     return entry;
+  }
+
+  /**
+   * The window for a challenge on `key` seen through `lane`:
+   *   - browser     → a fixed 3 hours.
+   *   - impersonate → escalating. With no entry (never opened, or cleared by a clean fetch) the
+   *     first 30 minutes; with the previous window still live it is the same incident, so the same
+   *     length again; with the previous window EXPIRED and never cleared (no clean fetch since) it
+   *     doubles, capped at 6 hours. The step is read from the previous entry's own length
+   *     (until − openedAt), which is persisted, so a restart inside a live window keeps the ladder.
+   *   - anything else → the configured window (arg / env / 30 min).
+   */
+  private windowFor(key: string, lane: string | undefined, now: number): number {
+    if (lane === 'browser') return BROWSER_LANE_WINDOW_MS;
+    if (lane !== 'impersonate') return this.windowMs;
+    const prev = this.entries.get(key);
+    if (prev === undefined) return IMPIT_BACKOFF_BASE_MS;
+    const prevWindow = prev.until - prev.openedAt;
+    const next = now < prev.until ? prevWindow : prevWindow * 2;
+    return Math.min(IMPIT_BACKOFF_CAP_MS, Math.max(IMPIT_BACKOFF_BASE_MS, next));
+  }
+
+  /**
+   * A clean (non-challenge) fetch from `host`: drop its EXPIRED entry, which also resets the
+   * impersonate lane's back-off. A still-LIVE window is never dropped — it was opened while this
+   * fetch was in flight, and clearing it would let the next request walk into the challenge.
+   * Returns true when an entry was removed.
+   */
+  noteSuccess(host: string): boolean {
+    if (this.isOpen(host)) return false;
+    return this.clear(host);
   }
 
   /** Whether `host` is currently cooling (an entry exists and has not yet reached `until`). */

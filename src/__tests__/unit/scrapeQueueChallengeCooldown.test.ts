@@ -249,4 +249,47 @@ describe('ScrapeQueue × challenge cooldown', () => {
     expect(queue.getStats().completed).toBe(1);
     expect(cd.isOpen('coolhost.example.test')).toBe(true); // hostA's cooldown untouched
   });
+
+  describe('per-lane window (ANCF a)', () => {
+    const IMPIT_HOST = 'impithost.example.test';
+    function buildImpitQueue(impersonate: jest.Mock, send: jest.Mock, ruleset = makeRuleset('impitstore', 'x')): ScrapeQueue {
+      const q = new ScrapeQueue(false);
+      q.setPluginRegistry(makeRegistry(ruleset, IMPIT_HOST, { transport: 'impersonate' }));
+      q.setIngestEmitter({ send });
+      q.setScrapingService(makeScrapingStub());
+      q.setIngestTransports({ impersonate });
+      q.setChallengeCooldown(cd);
+      return q;
+    }
+
+    it('an impit-lane challenge that persists nothing opens 30 min; the next one after expiry opens 60 min', async () => {
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      const impersonate = jest.fn().mockResolvedValue(CHALLENGE_HTML);
+      queue = buildImpitQueue(impersonate, jest.fn().mockResolvedValue(emptyStats()));
+
+      const first = queue.enqueue(`https://${IMPIT_HOST}/product/1`, { url: `https://${IMPIT_HOST}/product/1` });
+      first.promise.catch(() => {});
+      await advanceUntil(() => queue.getStats().failed === 1);
+      expect(cd.remaining(IMPIT_HOST)).toBe(30 * MIN);
+
+      cdNow += 30 * MIN; // expired, no clean fetch in between
+      const second = queue.enqueue(`https://${IMPIT_HOST}/product/2`, { url: `https://${IMPIT_HOST}/product/2` });
+      second.promise.catch(() => {});
+      await advanceUntil(() => queue.getStats().failed === 2);
+      expect(impersonate).toHaveBeenCalledTimes(2);
+      expect(cd.remaining(IMPIT_HOST)).toBe(60 * MIN);
+    });
+
+    it('an impit-lane challenge whose extraction THROWS also opens the lane\'s 30-minute first step', async () => {
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      jest.spyOn(console, 'error').mockImplementation(() => {});
+      const throwing: ExtractionRuleset = { ...makeRuleset('impitstore', 'x'), extract: () => { throw new Error('Unexpected token <'); } };
+      queue = buildImpitQueue(jest.fn().mockResolvedValue(CHALLENGE_HTML), jest.fn(), throwing);
+
+      const r = queue.enqueue(`https://${IMPIT_HOST}/product/3`, { url: `https://${IMPIT_HOST}/product/3` });
+      r.promise.catch(() => {});
+      await advanceUntil(() => queue.getStats().failed === 1);
+      expect(cd.remaining(IMPIT_HOST)).toBe(30 * MIN);
+    });
+  });
 });

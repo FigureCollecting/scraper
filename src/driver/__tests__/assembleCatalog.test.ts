@@ -447,3 +447,54 @@ describe('resolveCatalogStoreTimeoutMs — pure env → ms resolver (CATALOG_STO
     expect(resolveCatalogStoreTimeoutMs(env('999999'))).toBe(120000);
   });
 });
+
+/**
+ * Per-lane window (ANCF a): the listing axis names the store's search transport when it opens the
+ * host's cooldown, so a browser-lane challenge cools 3 hours and an impit-lane challenge escalates
+ * 30 → 60 → … min; a clean listing after an expired window resets the impit ladder.
+ */
+describe('assembleCatalog × per-lane cooldown window', () => {
+  const CHALLENGE = '<html><head><title>Just a moment...</title></head><body>cf</body></html>';
+  const MIN = 60_000;
+  const BROWSERSTORE = caps(
+    'browserstore',
+    'www.browserstore.test',
+    { byListing: { urlTemplate: 'https://www.browserstore.test/new?page={page}', order: 'newest' } },
+    { searchFetch: { transport: 'browser', access: 'cloudflare' } },
+  );
+  const profiles = buildProfileRegistry([BROWSERSTORE, APISTORE]);
+  const rules = (url: string) => (url.includes('browserstore') ? stub('browserstore', () => ({ items: [{ itemId: 'b1' }] })) : stub('apistore', () => ({ items: [{ itemId: 'a1' }] })));
+  let warn: jest.SpyInstance;
+  beforeEach(() => { warn = jest.spyOn(console, 'warn').mockImplementation(() => {}); });
+  afterEach(() => warn.mockRestore());
+
+  it('a browser-lane challenge opens a 3-hour window', async () => {
+    const cd = new ChallengeCooldown({ now: () => 1000, windowMs: MIN });
+    const { catalog } = build({ profiles, getRulesetForUrl: rules, challengeCooldown: cd, fetchSearch: jest.fn(async () => CHALLENGE) });
+
+    expect(await catalog.catalog('browserstore')).toEqual({ status: 'failed', siteId: 'browserstore', reason: 'challenge page' });
+    expect(cd.remaining('browserstore.test')).toBe(180 * MIN);
+  });
+
+  it('an impit-lane challenge escalates 30 → 60 min, and a clean listing after expiry resets it to 30', async () => {
+    let t = 1000;
+    let body = CHALLENGE;
+    const cd = new ChallengeCooldown({ now: () => t, windowMs: MIN });
+    const { catalog } = build({ profiles, getRulesetForUrl: rules, challengeCooldown: cd, fetchSearch: jest.fn(async () => body) });
+
+    await catalog.catalog('apistore');
+    expect(cd.remaining('api.apistore.test')).toBe(30 * MIN);
+    t += 30 * MIN;
+    await catalog.catalog('apistore');
+    expect(cd.remaining('api.apistore.test')).toBe(60 * MIN);
+
+    t += 60 * MIN;
+    body = '[]';
+    expect(await catalog.catalog('apistore')).toMatchObject({ status: 'ok' });
+    expect(cd.list()).toEqual([]);
+
+    body = CHALLENGE;
+    await catalog.catalog('apistore');
+    expect(cd.remaining('api.apistore.test')).toBe(30 * MIN);
+  });
+});

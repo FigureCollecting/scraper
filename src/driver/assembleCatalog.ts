@@ -250,10 +250,12 @@ export function assembleCatalog(services: CatalogServices): Catalog {
         if (isCloudflareChallenge(body)) {
           // eslint-disable-next-line no-console
           console.warn(`[catalog] ${sanitizeForLog(siteId)} seed ${sanitizeForLog(listId)} failed: challenge page`);
-          cd.open(host, 'seed list challenge page');
+          cd.open(host, 'seed list challenge page', transport.transport ?? 'http');
           markStaleIfStored(cfStore, url, host, transport.transport ?? 'http', 'seed list challenge page');
           return { status: 'failed', siteId, reason: 'challenge page' };
         }
+        // A clean body resets the host's back-off (an expired, never-cleared window).
+        cd.noteSuccess(host);
         markFreshIfStored(cfStore, url, host);
         // UNTRUSTED plugin output, guarded exactly as the listing axis guards it. `hasMore` and
         // `nextPage` are NOT read at all: a seed list is one declared page, so a parser claiming a
@@ -360,13 +362,16 @@ export function assembleCatalog(services: CatalogServices): Catalog {
         if (isCloudflareChallenge(body)) {
           // eslint-disable-next-line no-console
           console.warn(`[catalog] ${sanitizeForLog(siteId)} page ${pageNo} failed: challenge page`);
-          cd.open(host, 'catalog challenge page');
+          // The lane picks the window: browser 3 h, impersonate escalating, http the configured one.
+          cd.open(host, 'catalog challenge page', transport.transport ?? 'http');
           // STORED-COOKIE STALE signal: a host WITH stored cookies still challenged → dead cookie,
           // marked once via the lane that fetched (a host without stored cookies is never marked).
           markStaleIfStored(cfStore, url, host, transport.transport ?? 'http', 'catalog challenge page');
           return { status: 'failed', siteId, reason: 'challenge page' };
         }
-        // A clean listing for a host WITH stored cookies is the FRESH signal (clears a stale mark).
+        // A clean listing resets the host's back-off (an expired, never-cleared window), and for a
+        // host WITH stored cookies it is the FRESH signal (clears a stale mark).
+        cd.noteSuccess(host);
         markFreshIfStored(cfStore, url, host);
         // UNTRUSTED plugin output: a non-object page → no items; a non-array `items` → none; each
         // item must be an object with a non-empty string itemId (else dropped); paging signals are

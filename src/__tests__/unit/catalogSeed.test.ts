@@ -297,3 +297,39 @@ describe('assembleCatalog — seed (fetch one declared list)', () => {
     await expect(assembleCatalog(svc).seed('examplestore', 'new-arrivals')).resolves.toMatchObject({ status: 'failed', reason: 'bad selector' });
   });
 });
+
+describe('assembleCatalog — seed × per-lane cooldown window (ANCF a)', () => {
+  const CHALLENGE = '<title>Just a moment...</title><script>window._cf_chl_opt';
+  const MIN = 60_000;
+  const lane = (transport: 'browser' | 'impersonate'): StoreCapabilities => ({ ...STORE, searchFetch: { transport } });
+
+  it('a browser-lane seed challenge opens a 3-hour window', async () => {
+    const cd = new ChallengeCooldown({ now: () => NOW, windowMs: MIN });
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    await assembleCatalog(services({ stores: [lane('browser')], cooldown: cd, body: CHALLENGE })).seed('examplestore', 'new-arrivals');
+    expect(cd.remaining('example.test')).toBe(180 * MIN);
+  });
+
+  it('a seed challenge on a store whose searchFetch names no transport uses the configured (http) window', async () => {
+    const cd = new ChallengeCooldown({ now: () => NOW, windowMs: 2 * MIN });
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const noLane: StoreCapabilities = { ...STORE, searchFetch: { headers: { 'X-Api': 'k' } } };
+    await assembleCatalog(services({ stores: [noLane], cooldown: cd, body: CHALLENGE })).seed('examplestore', 'new-arrivals');
+    expect(cd.remaining('example.test')).toBe(2 * MIN);
+  });
+
+  it('an impit-lane seed challenge opens the 30-minute first step; a clean seed after expiry clears the entry', async () => {
+    let t = NOW;
+    const cd = new ChallengeCooldown({ now: () => t, windowMs: MIN });
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    await assembleCatalog(services({ stores: [lane('impersonate')], cooldown: cd, body: CHALLENGE })).seed('examplestore', 'new-arrivals');
+    expect(cd.remaining('example.test')).toBe(30 * MIN);
+
+    t += 30 * MIN;
+    const out = await assembleCatalog(services({ stores: [lane('impersonate')], cooldown: cd })).seed('examplestore', 'new-arrivals');
+    expect(out).toMatchObject({ status: 'ok' });
+    expect(cd.noteSuccess('example.test')).toBe(false); // already cleared by the clean seed
+    await assembleCatalog(services({ stores: [lane('impersonate')], cooldown: cd, body: CHALLENGE })).seed('examplestore', 'new-arrivals');
+    expect(cd.remaining('example.test')).toBe(30 * MIN);
+  });
+});

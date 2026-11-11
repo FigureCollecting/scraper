@@ -1193,6 +1193,9 @@ See `.env.example` for complete configuration template.
   - Open cooldowns are persisted with the queue (`SCRAPE_QUEUE_DIR`) and rehydrated at boot: a restart inside an open window is exactly when the engine is most likely to walk straight back into the challenge it just backed off from
   - Unset/invalid → default; any finite value is clamped to `[60000 (1 min), 86400000 (24 h)]`
   - Default: `1800000` (30 min)
+  - Applies to the `http` lane only. The window depends on the lane that saw the challenge:
+    - `browser`: a fixed 3 hours
+    - `impersonate` (impit): 30 min, then 60, 120, 240, capped at 6 h, for each repeat challenge after the previous window expired with no clean fetch in between; a clean fetch resets it to 30 min
 - `CF_COOKIE_FILE`: Path to the stored-cookie file (hand-minted Cloudflare clearance / session cookies, keyed by host) — see **Stored Cloudflare cookies** below
   - Unset/blank (default): the jar is disabled and every lane behaves exactly as before
   - Example: `/var/run/fc/cf-cookies/cf-cookies.json` (a Secret mounted as a directory, so a refresh changes the file's mtime)

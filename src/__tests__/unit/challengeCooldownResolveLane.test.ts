@@ -215,3 +215,54 @@ describe('challenge cooldown — /lookup detail plan + /resolve confirm leg (F1)
     expect(getChallengeCooldown().isOpen(BAR)).toBe(true);
   });
 });
+
+describe('challenge cooldown — /resolve per-lane window (ANCF a)', () => {
+  beforeEach(() => {
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+
+  it('a detail challenge rides the browser lane, so it opens a 3-hour window', async () => {
+    const cd = new ChallengeCooldown({ now: () => 42, windowMs: MIN });
+    await assembleResolve({
+      profiles: buildProfileRegistry([BARSTORE]),
+      getRulesetForUrl: () => rulesetFor('bar'),
+      fetchDetail: jest.fn(async () => ({ html: CHALLENGE_HTML, statusCode: 200 })),
+      challengeCooldown: cd,
+    }).resolve('bar', ['9']);
+    expect(cd.remaining(BAR)).toBe(180 * MIN);
+  });
+
+  it('a clean detail after the window expired clears the entry', async () => {
+    let t = 42;
+    const cd = new ChallengeCooldown({ now: () => t, windowMs: MIN });
+    cd.open(BAR, 'challenge page', 'impersonate');
+    t += 30 * MIN;
+    const out = await assembleResolve({
+      profiles: buildProfileRegistry([BARSTORE]),
+      getRulesetForUrl: () => rulesetFor('bar'),
+      fetchDetail: jest.fn(async () => ({ html: CLEAN_HTML, statusCode: 200 })),
+      challengeCooldown: cd,
+      now: () => t,
+      sleep: async () => {},
+    }).resolve('bar', ['1']);
+    expect(out.results).toHaveLength(1);
+    expect(cd.noteSuccess(BAR)).toBe(false); // already cleared by the clean detail
+  });
+
+  it('a byId url with no parseable host: a challenge still fails the id, a clean body still confirms, and no cooldown is touched', async () => {
+    const cd = new ChallengeCooldown({ now: () => 42, windowMs: MIN });
+    const RELATIVE = capsOf('rel', 'rel.example.test', { byId: { urlTemplate: 'item/{id}', idKind: 'store-internal' } });
+    const fetchDetail = jest.fn(async () => ({ html: CHALLENGE_HTML, statusCode: 200 }));
+    const resolve = assembleResolve({
+      profiles: buildProfileRegistry([RELATIVE]),
+      getRulesetForUrl: () => rulesetFor('rel'),
+      fetchDetail,
+      challengeCooldown: cd,
+    });
+
+    expect((await resolve.resolve('rel', ['1'])).failed).toEqual(['1']);
+    fetchDetail.mockResolvedValue({ html: CLEAN_HTML, statusCode: 200 });
+    expect((await resolve.resolve('rel', ['2'])).results).toHaveLength(1);
+    expect(cd.list()).toEqual([]);
+  });
+});

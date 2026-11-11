@@ -772,3 +772,48 @@ describe('assembleLookup — per-candidate collectUrl (the collect-ready URL; `u
     expect(r.candidates).toBeUndefined();
   });
 });
+
+describe('assembleLookup × per-lane cooldown window (ANCF a)', () => {
+  const CHALLENGE = '<html><head><title>Just a moment...</title></head><body><script>window._cf_chl_opt={}</script></body></html>';
+  const MIN = 60_000;
+
+  it('a browser-lane search challenge opens 3 hours; an impit-lane one opens the 30-minute first step', async () => {
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const cd = new ChallengeCooldown({ now: () => 1000, windowMs: MIN });
+    const { lookup } = build({
+      profiles: buildProfileRegistry([
+        { ...GOODSMILEUS, searchFetch: { transport: 'browser' } },
+        { ...SOLARIS, searchFetch: { transport: 'impersonate' } },
+      ]),
+      challengeCooldown: cd,
+      fetchSearch: jest.fn(async () => CHALLENGE),
+    });
+
+    await lookup.lookup('tomie');
+
+    expect(cd.remaining('goodsmileus.com')).toBe(180 * MIN);
+    expect(cd.remaining('solarisjapan.com')).toBe(30 * MIN);
+  });
+
+  it('a clean search after an expired impit window resets the back-off to 30 minutes', async () => {
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    let t = 1000;
+    let body = CHALLENGE;
+    const cd = new ChallengeCooldown({ now: () => t, windowMs: MIN });
+    const { lookup } = build({
+      profiles: buildProfileRegistry([{ ...SOLARIS, searchFetch: { transport: 'impersonate' } }]),
+      challengeCooldown: cd,
+      fetchSearch: jest.fn(async () => body),
+    });
+
+    await lookup.lookup('tomie'); // 30 min
+    t += 30 * MIN;
+    body = '{}';
+    await lookup.lookup('tomie'); // clean
+    t += MIN;
+    body = CHALLENGE;
+    await lookup.lookup('tomie');
+
+    expect(cd.remaining('solarisjapan.com')).toBe(30 * MIN);
+  });
+});

@@ -332,7 +332,7 @@ export function assembleLookup(services: LookupServices): Lookup {
           if (isCloudflareChallenge(body)) {
             // eslint-disable-next-line no-console
             console.warn(`[lookup] ${sanitizeForLog(p.siteId)} search failed: challenge page`);
-            cd.open(p.host, 'search challenge page');
+            cd.open(p.host, 'search challenge page', transport.transport ?? 'http');
             // STORED-COOKIE STALE signal: a host WITH stored cookies still challenged → dead cookie,
             // marked once via the lane that fetched (a host without stored cookies is never marked).
             markStaleIfStored(cfStore, p.url, normalizeHost(p.host), transport.transport ?? 'http', 'search challenge page');
@@ -350,7 +350,9 @@ export function assembleLookup(services: LookupServices): Lookup {
             });
             return null;
           }
-          // A clean body for a host WITH stored cookies is the FRESH signal (clears a stale mark).
+          // A clean body resets the host's back-off (an expired, never-cleared window), and for a
+          // host WITH stored cookies it is the FRESH signal (clears a stale mark).
+          cd.noteSuccess(p.host);
           markFreshIfStored(cfStore, p.url, normalizeHost(p.host));
           let candidates = await ruleset.extractCandidates(body, p.url);
           // Substring-store identity post-filter (record-mode): the store matched only the single
