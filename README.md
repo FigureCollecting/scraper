@@ -18,7 +18,7 @@ A web scraping microservice with browser automation, browser pooling, priority q
 - **Label Registry**: Regex-based MFC label pattern matching
 - **Robust Error Handling**: Handles timeouts, challenges, and extraction failures
 - **RESTful API**: HTTP interface with scraping, sync, and management endpoints
-- **Docker Ready**: Optimized container with Chrome for Testing on Ubuntu 24.04
+- **Docker Ready**: Optimized container with stable Google Chrome on Ubuntu 26.04
 - **Comprehensive Testing**: 760+ tests across 26 suites with Jest, Supertest, and testcontainers
 
 ## Ethical Use & Legal Compliance
@@ -1091,7 +1091,7 @@ npx jest performance.test.ts
 
 ### Docker
 
-The service uses a multi-stage Dockerfile with Ubuntu 24.04 base and Chrome for Testing 146:
+The service uses a multi-stage Dockerfile with an Ubuntu 26.04 base and a pinned, sha256-verified stable Google Chrome (157.0.8103.50):
 
 ```bash
 # Development (with hot reload, port 3080)
@@ -1108,7 +1108,7 @@ docker run -p 3050:3050 -e PORT=3050 --shm-size=2gb scraper:prod
 ```
 
 **Available stages:**
-- `base`: Ubuntu 24.04 with Chrome for Testing 146 and Puppeteer dependencies
+- `base`: Ubuntu 26.04 with stable Google Chrome 157.0.8103.50 and Puppeteer dependencies
 - `development`: Includes devDependencies and tsx for hot reload
 - `test`: Test environment for CI/CD
 - `builder`: Compiles TypeScript to JavaScript
