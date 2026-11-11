@@ -22,7 +22,7 @@
  *     zone, because the interstitial's cross-origin frame reads the process zone; a non-UTC process
  *     clears with or without an override. `RESIDENTIAL_EGRESS_TIMEZONE` / `DIRECT_EGRESS_TIMEZONE`
  *     remain as optional per-page cosmetics (browserTimezone.ts), unset by default and by the deploy.
- *   - NO cosmetic overrides in clean-headful mode: the lane does not rewrite the UA of a Chrome 152
+ *   - NO cosmetic overrides in clean-headful mode: the lane does not rewrite the UA of a current Chrome
  *     to a stale `Chrome/127` string (client hints would contradict it, and Cloudflare binds the
  *     clearance it issues to the UA), and does not override the device metrics of a window that
  *     already has the size the flags asked for. A store that DECLARES a UA still gets it.
@@ -293,9 +293,11 @@ const CLEAN_HEADFUL_ARGS = [
   // TLS 1.3 0-RTT off. The one exception to "NOTHING else" above, and it is not a stealth flag: it
   // closes a Chromium livelock that took the residential gated browser down on 2026-09-10.
   //
-  // PROVEN. Chrome for Testing enables `EnableTLS13EarlyData` through the compiled-in field-trial
-  // testing config (net/base/features.cc has it FEATURE_DISABLED_BY_DEFAULT, so branded Chrome does
-  // not), so this browser offered early data on every RESUMED connection. hobby-genki.com and
+  // PROVEN on the image's previous browser. Chrome for Testing enables `EnableTLS13EarlyData` through
+  // the compiled-in field-trial testing config (net/base/features.cc has it
+  // FEATURE_DISABLED_BY_DEFAULT, so branded Chrome does not), so that browser offered early data on
+  // every RESUMED connection. The image now ships branded stable Chrome; the flag stays as a guard
+  // against a field trial turning it on. hobby-genki.com and
   // www.suruga-ya.jp both advertise `max_early_data_size` (14336) and then reject the early data;
   // BoringSSL answers SSL_ERROR_EARLY_DATA_REJECTED (15) and net maps it to ERR_EARLY_DATA_REJECTED
   // (-178). Measured in prod: the network service logged that handshake failure ~10,700 times a
@@ -311,8 +313,9 @@ const CLEAN_HEADFUL_ARGS = [
   // never asked to offer 0-RTT, so the reject is unreachable at EVERY layer, whichever one looped.
   //
   // Costs one round trip on resumed connections and nothing else. Fingerprint-SAFE, measured on
-  // Chrome 152.0.7977.54 rather than argued: puppeteer already passes a `--disable-features=`
-  // switch of its own and MERGES this token into it, so Chrome receives exactly ONE such switch
+  // Chrome for Testing 152.0.7977.54 (before the move to stable Chrome 157) rather than argued:
+  // puppeteer already passes a `--disable-features=` switch of its own and MERGES this token into
+  // it, so Chrome receives exactly ONE such switch
   // either way; and the INITIAL ClientHello — the one a Cloudflare challenge is served and scored
   // on — is byte-identical with and without the flag, because with no PSK there is no `early_data`
   // extension (0x002a) to drop. Only a resumption ClientHello to an origin advertising 0-RTT loses
@@ -1465,7 +1468,7 @@ export async function scrapeGeneric(url: string, config: ScrapeConfig): Promise<
     await applyEgressTimezone(page, false);
 
     // COSMETICS, headless profile only. In clean-headful mode the browser IS a current, real Chrome,
-    // so every one of these makes it look LESS real: a Chrome/127 UA under Chrome 152 client hints, a
+    // so every one of these makes it look LESS real: a Chrome/127 UA under current Chrome client hints, a
     // 1280x720 device-metrics override against the 1280x900 window the flags opened, and CDP-set
     // Accept-Encoding/Connection that disagree with what this Chrome actually negotiates. A UA the
     // CALLER declares is still honoured in both profiles.
