@@ -322,5 +322,36 @@ describe('ScrapeQueue × challenge cooldown', () => {
       expect(impersonate).toHaveBeenCalledTimes(1);
       expect(cd.remaining(IMPIT_HOST)).toBe(120 * MIN);
     });
+
+    it('a plain 503 (not a CF page) is not clean: it leaves the expired impit window, so the back-off continues', async () => {
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      jest.spyOn(console, 'error').mockImplementation(() => {});
+      const impersonate = jest.fn().mockResolvedValue({ body: '<html><body><h1>503 Service Unavailable</h1></body></html>', status: 503 });
+      queue = buildImpitQueue(impersonate, jest.fn().mockResolvedValue(healthyStats()));
+      cdNow = cd.open(IMPIT_HOST, 'r', 'impersonate').until;
+      cdNow = cd.open(IMPIT_HOST, 'r', 'impersonate').until; // 60-minute step, expired
+
+      const r = queue.enqueue(`https://${IMPIT_HOST}/p/503`, { url: `https://${IMPIT_HOST}/p/503` });
+      r.promise.catch(() => {});
+      await advanceUntil(() => queue.getStats().failed === 1);
+      expect(impersonate).toHaveBeenCalled();
+      expect((console.warn as jest.Mock).mock.calls.map((c) => String(c[0]))).not.toContain(`[COOLDOWN] cleared ${IMPIT_HOST}`);
+      const next = cd.open(IMPIT_HOST, 'r', 'impersonate');
+      expect(next.until - next.openedAt).toBe(120 * MIN);
+    });
+
+    it('a 2xx clean page still clears the expired impit window and resets the back-off', async () => {
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      const impersonate = jest.fn().mockResolvedValue({ body: FIXTURE_HTML, status: 200 });
+      queue = buildImpitQueue(impersonate, jest.fn().mockResolvedValue(healthyStats()));
+      cdNow = cd.open(IMPIT_HOST, 'r', 'impersonate').until;
+      cdNow = cd.open(IMPIT_HOST, 'r', 'impersonate').until;
+
+      const r = queue.enqueue(`https://${IMPIT_HOST}/p/ok`, { url: `https://${IMPIT_HOST}/p/ok` });
+      await advanceUntil(() => queue.getStats().completed === 1 || queue.getStats().failed === 1);
+      await r.promise;
+      const next = cd.open(IMPIT_HOST, 'r', 'impersonate');
+      expect(next.until - next.openedAt).toBe(30 * MIN);
+    });
   });
 });

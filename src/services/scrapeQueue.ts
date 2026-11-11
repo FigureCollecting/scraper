@@ -1858,8 +1858,11 @@ export class ScrapeQueue {
     // The same clean body is the STORED-COOKIE FRESH signal (CfCookieStore): a host WITH stored
     // cookies that served a real page has a live cookie — clear its stale mark. Same isOpen guard,
     // for the same reason: a window (and stale mark) opened while this fetch was in flight survives.
+    // The clear needs a CLEAN page — not a challenge AND a 2xx (a lane that reports no status counts
+    // as 2xx) — the same rule as /resolve: a plain 503 or 404 must not restart an escalated impit
+    // back-off at 30 minutes. The FRESH mark keeps its original (non-challenge) rule.
     if (host !== undefined && !page.challenge && !cooldown.isOpen(host)) {
-      cooldown.clear(host);
+      if (page.status === undefined || (page.status >= 200 && page.status < 300)) cooldown.clear(host);
       markFreshIfStored(this.getCfCookieStoreRef(), item.url, host);
     }
     // SESSION CANARY: this fetch is already an observation. On a store whose 404 may be an
