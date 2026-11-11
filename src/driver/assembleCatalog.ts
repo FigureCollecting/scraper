@@ -356,7 +356,7 @@ export function assembleCatalog(services: CatalogServices): Catalog {
     // A challenge body is NOT an empty shelf: parsing it would report the list as yielding
     // nothing, which on a SLOW-cadence axis is a silence nobody would question for a week.
     if (isCloudflareChallenge(body)) {
-      cd.open(host, `${label} list challenge page`);
+      cd.open(host, `${label} list challenge page`, transport.transport ?? 'http');
       markStaleIfStored(cfStore, url, host, transport.transport ?? 'http', `${label} list challenge page`);
       return fail('challenge page', { failure: 'deterministic', blocked: true });
     }
@@ -537,7 +537,8 @@ export function assembleCatalog(services: CatalogServices): Catalog {
         if (isCloudflareChallenge(body)) {
           // eslint-disable-next-line no-console
           console.warn(`[catalog] ${sanitizeForLog(siteId)} page ${pageNo} failed: challenge page`);
-          cd.open(host, 'catalog challenge page');
+          // The lane matters: a browser-lane challenge opens at least 3 h.
+          cd.open(host, 'catalog challenge page', transport.transport ?? 'http');
           // STORED-COOKIE STALE signal: a host WITH stored cookies still challenged → dead cookie,
           // marked once via the lane that fetched (a host without stored cookies is never marked).
           markStaleIfStored(cfStore, url, host, transport.transport ?? 'http', 'catalog challenge page');

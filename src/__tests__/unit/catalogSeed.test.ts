@@ -298,3 +298,19 @@ describe('assembleCatalog — seed (fetch one declared list)', () => {
     await expect(assembleCatalog(svc).seed('examplestore', 'new-arrivals')).resolves.toMatchObject({ status: 'failed', reason: 'bad selector' });
   });
 });
+
+describe('assembleCatalog — seed × browser floor (ANCF a)', () => {
+  const CHALLENGE = '<title>Just a moment...</title><script>window._cf_chl_opt';
+  const MIN = 60_000;
+
+  it('a browser-lane seed challenge opens 3 h; a store with no named transport keeps the streak window', async () => {
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const browserCd = new ChallengeCooldown({ now: () => NOW });
+    await assembleCatalog(services({ stores: [{ ...STORE, searchFetch: { transport: 'browser' } }], cooldown: browserCd, body: CHALLENGE })).seed('examplestore', 'new-arrivals');
+    expect(browserCd.remaining('example.test')).toBe(180 * MIN);
+
+    const plainCd = new ChallengeCooldown({ now: () => NOW });
+    await assembleCatalog(services({ stores: [{ ...STORE, searchFetch: { headers: { 'X-Api': 'k' } } }], cooldown: plainCd, body: CHALLENGE })).seed('examplestore', 'new-arrivals');
+    expect(plainCd.remaining('example.test')).toBe(30 * MIN);
+  });
+});

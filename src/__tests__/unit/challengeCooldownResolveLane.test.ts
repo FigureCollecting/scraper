@@ -215,3 +215,56 @@ describe('challenge cooldown — /lookup detail plan + /resolve confirm leg (F1)
     expect(getChallengeCooldown().isOpen(BAR)).toBe(true);
   });
 });
+
+describe('challenge cooldown — /resolve on the browser lane (ANCF a)', () => {
+  const CHROME_1020 =
+    '<html><head><meta name="color-scheme" content="light dark"></head><body>' +
+    '<pre style="word-wrap: break-word; white-space: pre-wrap;">error code: 1020</pre></body></html>';
+  const resolveWith = (cd: ChallengeCooldown, html: string, statusCode: number, now = () => 42) =>
+    assembleResolve({
+      profiles: buildProfileRegistry([BARSTORE]),
+      getRulesetForUrl: () => rulesetFor('bar'),
+      fetchDetail: jest.fn(async () => ({ html, statusCode })),
+      challengeCooldown: cd,
+      now,
+      sleep: async () => {},
+    }).resolve('bar', ['9']);
+  beforeEach(() => {
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+
+  it('a detail challenge rides the browser lane, so it opens 3 h', async () => {
+    const cd = new ChallengeCooldown({ now: () => 42 });
+    expect((await resolveWith(cd, CHALLENGE_HTML, 200)).failed).toEqual(['9']);
+    expect(cd.remaining(BAR)).toBe(180 * MIN);
+  });
+
+  it('Chrome\'s rendering of a plain-text "error code: 1020" 403 is a challenge: the id fails and the host cools 3 h', async () => {
+    const cd = new ChallengeCooldown({ now: () => 42 });
+    expect((await resolveWith(cd, CHROME_1020, 403)).failed).toEqual(['9']);
+    expect(cd.remaining(BAR)).toBe(180 * MIN);
+  });
+
+  it('an HTTP 503 detail (not a CF page) fails the id and leaves an escalated streak alone (B1)', async () => {
+    let t = 42;
+    const cd = new ChallengeCooldown({ now: () => t });
+    t = cd.open(BAR, 'r', 'impersonate').until;
+    t = cd.open(BAR, 'r', 'impersonate').until; // streak 2, expired, never cleared
+    expect((await resolveWith(cd, '<html><body><h1>503 Service Unavailable</h1></body></html>', 503, () => t)).failed).toEqual(['9']);
+    const next = cd.open(BAR, 'r', 'impersonate');
+    expect(next.until - next.openedAt).toBe(120 * MIN);
+  });
+
+  it('a byId url with no parseable host: a challenge still fails the id, and no cooldown is touched', async () => {
+    const cd = new ChallengeCooldown({ now: () => 42 });
+    const RELATIVE = capsOf('rel', 'rel.example.test', { byId: { urlTemplate: 'item/{id}', idKind: 'store-internal' } });
+    const out = await assembleResolve({
+      profiles: buildProfileRegistry([RELATIVE]),
+      getRulesetForUrl: () => rulesetFor('rel'),
+      fetchDetail: jest.fn(async () => ({ html: CHALLENGE_HTML, statusCode: 200 })),
+      challengeCooldown: cd,
+    }).resolve('rel', ['1']);
+    expect(out.failed).toEqual(['1']);
+    expect(cd.list()).toEqual([]);
+  });
+});

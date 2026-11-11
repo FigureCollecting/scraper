@@ -448,3 +448,50 @@ describe('resolveCatalogStoreTimeoutMs — pure env → ms resolver (CATALOG_STO
     expect(resolveCatalogStoreTimeoutMs(env('999999'))).toBe(120000);
   });
 });
+
+/**
+ * ANCF a: the listing axis names the store's transport when it opens the host's cooldown (a
+ * browser-lane challenge opens at least 3 h), and Cloudflare's plain-text block (`error code: 1020`)
+ * is a challenge, never an "end of catalog" page.
+ */
+describe('assembleCatalog × browser floor and plain-text block', () => {
+  const CHALLENGE = '<html><head><title>Just a moment...</title></head><body>cf</body></html>';
+  const MIN = 60_000;
+  const BROWSERSTORE = caps(
+    'browserstore',
+    'www.browserstore.test',
+    { byListing: { urlTemplate: 'https://www.browserstore.test/new?page={page}', order: 'newest' } },
+    { searchFetch: { transport: 'browser', access: 'cloudflare' } },
+  );
+  const profiles = buildProfileRegistry([BROWSERSTORE, APISTORE]);
+  const rules = (url: string) => (url.includes('browserstore') ? stub('browserstore', () => ({ items: [{ itemId: 'b1' }] })) : stub('apistore', () => ({ items: [] })));
+  beforeEach(() => { jest.spyOn(console, 'warn').mockImplementation(() => {}); });
+
+  it('a browser-lane listing challenge opens a 3-hour window', async () => {
+    const cd = new ChallengeCooldown({ now: () => 1000 });
+    const { catalog } = build({ profiles, getRulesetForUrl: rules, challengeCooldown: cd, fetchSearch: jest.fn(async () => CHALLENGE) });
+    expect(await catalog.catalog('browserstore')).toEqual({ status: 'failed', siteId: 'browserstore', reason: 'challenge page' });
+    expect(cd.remaining('browserstore.test')).toBe(180 * MIN);
+  });
+
+  it('an impit-lane listing challenge keeps the 30-minute first step', async () => {
+    const cd = new ChallengeCooldown({ now: () => 1000 });
+    const { catalog } = build({ profiles, getRulesetForUrl: rules, challengeCooldown: cd, fetchSearch: jest.fn(async () => CHALLENGE) });
+    await catalog.catalog('apistore');
+    expect(cd.remaining('api.apistore.test')).toBe(30 * MIN);
+  });
+
+  it('a plain-text "error code: 1020" listing is a challenge (B2): failed, never parsed, and the cooldown steps', async () => {
+    let t = 1000;
+    let body = CHALLENGE;
+    const cd = new ChallengeCooldown({ now: () => t });
+    const extractListing = jest.fn(() => ({ items: [] }));
+    const { catalog } = build({ profiles, getRulesetForUrl: () => stub('apistore', extractListing), challengeCooldown: cd, fetchSearch: jest.fn(async () => body) });
+    await catalog.catalog('apistore'); // 30
+    t += 30 * MIN;
+    body = 'error code: 1020';
+    expect(await catalog.catalog('apistore')).toEqual({ status: 'failed', siteId: 'apistore', reason: 'challenge page' });
+    expect(extractListing).not.toHaveBeenCalled();
+    expect(cd.remaining('api.apistore.test')).toBe(60 * MIN);
+  });
+});

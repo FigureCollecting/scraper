@@ -774,3 +774,24 @@ describe('assembleLookup — per-candidate collectUrl (the collect-ready URL; `u
     expect(r.candidates).toBeUndefined();
   });
 });
+
+describe('assembleLookup × browser floor (ANCF a)', () => {
+  const CHALLENGE = '<html><head><title>Just a moment...</title></head><body><script>window._cf_chl_opt={}</script></body></html>';
+  const MIN = 60_000;
+
+  it('a browser-lane search challenge opens 3 h; an impit-lane one opens the 30-minute first step', async () => {
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const cd = new ChallengeCooldown({ now: () => 1000 });
+    const { lookup } = build({
+      profiles: buildProfileRegistry([
+        { ...GOODSMILEUS, searchFetch: { transport: 'browser' } },
+        { ...SOLARIS, searchFetch: { transport: 'impersonate' } },
+      ]),
+      challengeCooldown: cd,
+      fetchSearch: jest.fn(async () => CHALLENGE),
+    });
+    await lookup.lookup('tomie');
+    expect(cd.remaining('goodsmileus.com')).toBe(180 * MIN);
+    expect(cd.remaining('solarisjapan.com')).toBe(30 * MIN);
+  });
+});
