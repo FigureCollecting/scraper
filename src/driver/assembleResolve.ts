@@ -189,13 +189,14 @@ export function assembleResolve(services: ResolveServices): Resolve {
             if (host !== undefined) cd.open(host, 'detail challenge page', 'browser');
             throw new Error('detail fetch returned a Cloudflare challenge page');
           }
-          // Not a challenge: the host let us through, so reset its back-off (as the queue does).
-          if (host !== undefined) cd.noteSuccess(host);
           // A 4xx/5xx page (gone / error) is NOT a confirm — extract would happily parse the error
           // body into empty fields WITHOUT throwing, so gate on status explicitly.
           if (statusCode !== undefined && statusCode >= 400) {
             throw new Error(`detail fetch returned HTTP ${statusCode}`);
           }
+          // Neither a challenge nor an error page: the host let us through, so reset its back-off.
+          // Only here — a 503 or 403 must not restart an escalated ladder at 30 minutes.
+          if (host !== undefined) cd.noteSuccess(host);
           // The courtesy-gap anchor: the instant the PRIMARY detail fetch completed (D8), so a
           // same-host ctx.scraping.fetchBody follow-up waits the store's gap against THIS fetch.
           const primaryFetchedAt = now();

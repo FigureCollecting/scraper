@@ -291,5 +291,36 @@ describe('ScrapeQueue × challenge cooldown', () => {
       await advanceUntil(() => queue.getStats().failed === 1);
       expect(cd.remaining(IMPIT_HOST)).toBe(30 * MIN);
     });
+
+    it('an undeclared-transport store rides the browser lane, so its challenge opens 3 h (Q1)', async () => {
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      const HOSTB = 'browserhost.example.test';
+      const q = new ScrapeQueue(false);
+      q.setPluginRegistry(makeRegistry(makeRuleset('bstore', 'x'), HOSTB));
+      q.setIngestEmitter({ send: jest.fn().mockResolvedValue(emptyStats()) });
+      const page = { html: CHALLENGE_HTML, url: `https://${HOSTB}/p/1`, title: 'x', statusCode: 403 };
+      q.setScrapingService({ scrapePage: jest.fn().mockResolvedValue(page), scrapePageStealth: jest.fn().mockResolvedValue(page) } as any);
+      q.setChallengeCooldown(cd);
+      queue = q;
+      const r = q.enqueue(`https://${HOSTB}/p/1`, { url: `https://${HOSTB}/p/1` });
+      r.promise.catch(() => {});
+      await advanceUntil(() => q.getStats().failed === 1);
+      expect(cd.remaining(HOSTB)).toBe(180 * MIN);
+    });
+
+    it('an impit 403 "error code: 1020" block is a challenge: it steps the back-off instead of clearing it (Q2)', async () => {
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      jest.spyOn(console, 'error').mockImplementation(() => {});
+      const impersonate = jest.fn().mockResolvedValue({ body: 'error code: 1020', status: 403 });
+      queue = buildImpitQueue(impersonate, jest.fn().mockResolvedValue(emptyStats()));
+      cdNow = cd.open(IMPIT_HOST, 'r', 'impersonate').until;
+      cdNow = cd.open(IMPIT_HOST, 'r', 'impersonate').until; // 60-minute step, expired
+
+      const r = queue.enqueue(`https://${IMPIT_HOST}/p/9`, { url: `https://${IMPIT_HOST}/p/9` });
+      r.promise.catch(() => {});
+      await advanceUntil(() => queue.getStats().failed === 1);
+      expect(impersonate).toHaveBeenCalledTimes(1);
+      expect(cd.remaining(IMPIT_HOST)).toBe(120 * MIN);
+    });
   });
 });

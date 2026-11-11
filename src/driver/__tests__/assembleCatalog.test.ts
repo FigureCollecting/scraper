@@ -497,4 +497,19 @@ describe('assembleCatalog × per-lane cooldown window', () => {
     await catalog.catalog('apistore');
     expect(cd.remaining('api.apistore.test')).toBe(30 * MIN);
   });
+
+  it('a CF plain-text "error code: 1020" block on the impit lane continues the back-off instead of resetting it (N2/B2)', async () => {
+    let t = 1000;
+    let body = CHALLENGE;
+    const cd = new ChallengeCooldown({ now: () => t, windowMs: MIN });
+    const { catalog } = build({ profiles, getRulesetForUrl: rules, challengeCooldown: cd, fetchSearch: jest.fn(async () => body) });
+
+    await catalog.catalog('apistore'); // 30
+    t += 30 * MIN;
+    await catalog.catalog('apistore'); // 60
+    t += 60 * MIN;
+    body = 'error code: 1020';
+    expect(await catalog.catalog('apistore')).toEqual({ status: 'failed', siteId: 'apistore', reason: 'challenge page' });
+    expect(cd.remaining('api.apistore.test')).toBe(120 * MIN);
+  });
 });

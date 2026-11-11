@@ -295,6 +295,22 @@ describe('createImpitFetch — session-prime (jar-carried clearance, prime-once,
     expect(g.targets()).toBe(3);        // first target + (stale target + retried target)
   });
 
+  it('a primed host answering CF\'s plain-text "error code: 1020" block is NOT re-primed (a firewall rule, not a stale clearance)', async () => {
+    let primes = 0;
+    let targets = 0;
+    const make = (): ImpitLike => ({
+      fetch: async (url) => {
+        if (isPrime(url)) { primes++; return { text: async () => 'homepage' }; }
+        targets++;
+        return { text: async () => 'error code: 1020' };
+      },
+    });
+    const body = await createImpitFetch(make)(TARGET, { browser: 'chrome142', prime: { url: PRIME_URL } });
+    expect(body).toBe('error code: 1020');
+    expect(primes).toBe(1);
+    expect(targets).toBe(1);
+  });
+
   /** A gate a homepage prime can NEVER clear (prime seeds the jar, but the target still challenges). */
   function unclearableJarImpit() {
     let primes = 0;

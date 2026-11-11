@@ -249,6 +249,24 @@ describe('challenge cooldown — /resolve per-lane window (ANCF a)', () => {
     expect(cd.noteSuccess(BAR)).toBe(false); // already cleared by the clean detail
   });
 
+  it('an HTTP 503 detail (not a CF page) fails the id and does NOT reset an escalated impit back-off (F1/B1)', async () => {
+    let t = 42;
+    const cd = new ChallengeCooldown({ now: () => t, windowMs: MIN });
+    t = cd.open(BAR, 'r', 'impersonate').until;
+    t = cd.open(BAR, 'r', 'impersonate').until; // 60-minute step, expired, never cleared
+    const out = await assembleResolve({
+      profiles: buildProfileRegistry([BARSTORE]),
+      getRulesetForUrl: () => rulesetFor('bar'),
+      fetchDetail: jest.fn(async () => ({ html: '<html><body><h1>503 Service Unavailable</h1></body></html>', statusCode: 503 })),
+      challengeCooldown: cd,
+      now: () => t,
+      sleep: async () => {},
+    }).resolve('bar', ['1']);
+    expect(out.failed).toEqual(['1']);
+    const next = cd.open(BAR, 'r', 'impersonate');
+    expect(next.until - next.openedAt).toBe(120 * MIN);
+  });
+
   it('a byId url with no parseable host: a challenge still fails the id, a clean body still confirms, and no cooldown is touched', async () => {
     const cd = new ChallengeCooldown({ now: () => 42, windowMs: MIN });
     const RELATIVE = capsOf('rel', 'rel.example.test', { byId: { urlTemplate: 'item/{id}', idKind: 'store-internal' } });

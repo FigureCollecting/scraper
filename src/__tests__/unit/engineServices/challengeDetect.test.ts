@@ -223,6 +223,30 @@ describe('isCloudflareChallenge', () => {
     });
   });
 
+  describe('Cloudflare plain-text block body → true (N2)', () => {
+    // A CF firewall rule (1020) or rate limit (1015) on an API path answers 403/429 with a bare
+    // text/plain body, `error code: 1020`. It is a block, never content.
+    it.each(['error code: 1020', 'error code: 1015\n', '  error code: 1010  '])('flags the raw body %j', (body) => {
+      expect(isCloudflareChallenge(body)).toBe(true);
+    });
+
+    it('flags the same body as Chrome renders a text/plain response', () => {
+      const html =
+        '<html><head><meta name="color-scheme" content="light dark"></head><body>' +
+        '<pre style="word-wrap: break-word; white-space: pre-wrap;">error code: 1020</pre></body></html>';
+      expect(isCloudflareChallenge(html)).toBe(true);
+    });
+
+    it.each([
+      ['a page that quotes the string', '<html><body><p>If you see error code: 1020, contact support.</p></body></html>'],
+      ['trailing text after the code', 'error code: 1020 (see docs)'],
+      ['a non-CF three-digit code', 'error code: 404'],
+      ['a JSON error body', '{"error":"error code: 1020"}'],
+    ])('does NOT flag %s', (_label, body) => {
+      expect(isCloudflareChallenge(body)).toBe(false);
+    });
+  });
+
   describe('degenerate input → false', () => {
     it('returns false for an empty string', () => {
       expect(isCloudflareChallenge('')).toBe(false);
