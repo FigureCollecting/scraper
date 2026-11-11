@@ -84,12 +84,26 @@ const BLOCK_TITLE = /<title>[^<]*(?:Attention Required! \| Cloudflare|used Cloud
 const BLOCK_MARKER = 'cf-error-details';
 
 /**
+ * CF's PLAIN-TEXT block body: a firewall rule (1020) or rate limit (1015) on a non-HTML path answers
+ * 403/429 with a bare `text/plain` body, `error code: 1020`, and none of the markers above. Matched
+ * only when it is the WHOLE document, either raw (impit / http lanes) or as Chrome renders a
+ * text/plain response (`<pre>` inside an otherwise empty page), so a page that merely quotes the
+ * string never matches. Bodies of 512 bytes or more are rejected before the regex runs.
+ */
+const PLAIN_TEXT_BLOCK = /^\s*(?:<html><head>(?:<meta[^>]*>)?<\/head><body><pre[^>]*>)?\s*error code: 1\d{3}\s*(?:<\/pre><\/body><\/html>)?\s*$/;
+
+/** Whether `body` is Cloudflare's plain-text block (`error code: 1xxx`) and nothing else. */
+export function isCloudflarePlainTextBlock(body: string): boolean {
+  return typeof body === 'string' && body.length < 512 && PLAIN_TEXT_BLOCK.test(body);
+}
+
+/**
  * Whether `html` is a Cloudflare interstitial — a managed-JS / IUAM challenge OR a block / rate-limit
  * error page — rather than real content. Conservative: true only when a challenge-specific token is
  * present, OR a challenge script global is present (never the challenge token in a URL), OR the
  * challenge loader path is present, OR the challenge <title> is present, OR the IUAM body copy is
- * present, OR a CF block/rate-limit error-page marker is present. Non-string / empty input is never
- * a challenge.
+ * present, OR a CF block/rate-limit error-page marker is present, OR the body is CF's plain-text
+ * block. Non-string / empty input is never a challenge.
  */
 export function isCloudflareChallenge(html: string): boolean {
   if (typeof html !== 'string' || html.length === 0) return false;
@@ -100,5 +114,6 @@ export function isCloudflareChallenge(html: string): boolean {
   if (html.includes(IUAM_BODY_COPY)) return true;
   if (BLOCK_TITLE.test(html)) return true;
   if (html.includes(BLOCK_MARKER)) return true;
+  if (isCloudflarePlainTextBlock(html)) return true;
   return false;
 }

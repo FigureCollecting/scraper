@@ -8,7 +8,7 @@
  */
 import type { FetchBodyDetail, FetchRequest } from './engineServices/capturingFetch.js';
 import { CookieJar } from 'tough-cookie';
-import { isCloudflareChallenge } from './engineServices/challengeDetect.js';
+import { isCloudflareChallenge, isCloudflarePlainTextBlock } from './engineServices/challengeDetect.js';
 import { processHostClockPacer, type HostClockPacer } from './hostClockSend.js';
 import { getCfCookieStore, type CfCookieSource } from './cookieJar.js';
 import { normalizeHost } from './challengeCooldown.js';
@@ -174,8 +174,12 @@ function hostOf(url: string): string | undefined {
 function looksLikeChallenge(body: string): boolean {
   // Delegate to the shared, conservative detector (engineServices/challengeDetect) rather than keep
   // a second copy of the markers; 'Just a moment' (loose) and 'cf-mitigated' remain impit's own
-  // extra triggers so this stays a strict SUPERSET of the shared detector — never narrower —
+  // extra triggers so this stays a SUPERSET of the shared detector (bar the plain-text block below),
   // preserving the pre-existing re-prime sensitivity.
+  // CF's plain-text block (`error code: 1020`) is a firewall rule, not a stale clearance: a re-prime
+  // cannot clear it and would cost the store two more requests, so it never triggers one (as before
+  // the shared detector learned to flag it).
+  if (isCloudflarePlainTextBlock(body)) return false;
   return isCloudflareChallenge(body) || body.includes('Just a moment') || body.includes('cf-mitigated');
 }
 

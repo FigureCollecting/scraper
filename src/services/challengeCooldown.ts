@@ -34,6 +34,13 @@ const DEFAULT_MAX_ESCALATED_MS = 6 * 60 * 60_000;
  */
 const STREAK_DECAY_MS = 24 * 60 * 60_000;
 /**
+ * BROWSER-LANE floor — 3 hours. A challenge the real browser could not clear means Cloudflare scored
+ * this egress + browser pair; walking back in after 30 minutes only adds failed challenges to the
+ * IP's record (the browser-lane stores sat in back-to-back 30-minute windows from 11-03). Applied as
+ * a minimum on top of the streak's window, never instead of it.
+ */
+export const BROWSER_LANE_MIN_WINDOW_MS = 3 * 60 * 60_000;
+/**
  * Default run of CONSECUTIVE gate failures (an empty body or a 5xx from a gated host — see
  * gateSignal) that opens a host's cooldown. Conservative: one busy 5xx is not a refused gate.
  */
@@ -283,8 +290,11 @@ export class ChallengeCooldown {
    * capped at the max); later than that it opens at the base again (streak 1). A challenge that
    * lands while the window is still live (a fetch already in flight) re-extends at the SAME level, so
    * concurrent stragglers cannot ratchet the streak.
+   *
+   * `lane` is the transport that saw the challenge: on `browser` the window is at least 3 h. A
+   * challenge whose window would end before the live one is ignored (the live window is kept).
    */
-  open(host: string, reason: string): CooldownEntry {
+  open(host: string, reason: string, lane?: string): CooldownEntry {
     const key = normalizeHost(host);
     const now = this.now();
     const prior = this.entries.get(key);
@@ -296,10 +306,25 @@ export class ChallengeCooldown {
     const decayed = prior !== undefined && now - prior.until >= STREAK_DECAY_MS;
     const streak = live ? this.streak(key) : decayed ? 1 : this.streak(key) + 1;
     this.streaks.set(key, streak);
-    const windowMs = this.windowForStreak(streak);
+    // BROWSER-LANE FLOOR: a challenge the real browser could not clear opens at least 3 h; above the
+    // floor the host climbs the same streak ladder as every other lane.
+    const windowMs = Math.max(this.windowForStreak(streak), lane === 'browser' ? BROWSER_LANE_MIN_WINDOW_MS : 0);
+    const prev = this.hostHistory.get(key);
+    // NEVER SHORTEN a live window: when the running one outlasts what this challenge would open (an
+    // http-lane hit inside a browser host's 3 h window), keep it whole and write nothing — the
+    // challenge still counts in the host's trailing-hour history.
+    if (live && prior.until >= now + windowMs) {
+      // A live entry always has its history (open and restore write both), as clear() relies on too.
+      prev!.challenged = [...withinHour(prev!.challenged, now), now];
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[COOLDOWN] kept ${key} (${Math.round((prior.until - now) / 60_000)} min left, longer than the ` +
+          `${Math.round(windowMs / 60_000)} min a ${lane ?? 'unnamed'} challenge opens) (${reason})`,
+      );
+      return prior;
+    }
     const entry: CooldownEntry = { host: key, until: now + windowMs, reason, openedAt: now };
     this.entries.set(key, entry);
-    const prev = this.hostHistory.get(key);
     this.hostHistory.set(key, {
       openedAt: now, until: entry.until, reason, streak, clearedAt: null,
       challenged: [...withinHour(prev?.challenged ?? [], now), now],

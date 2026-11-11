@@ -18,7 +18,7 @@ A web scraping microservice with browser automation, browser pooling, priority q
 - **Label Registry**: Regex-based MFC label pattern matching
 - **Robust Error Handling**: Handles timeouts, challenges, and extraction failures
 - **RESTful API**: HTTP interface with scraping, sync, and management endpoints
-- **Docker Ready**: Optimized container with Chrome for Testing on Ubuntu 24.04
+- **Docker Ready**: Optimized container with stable Google Chrome on Ubuntu 26.04
 - **Comprehensive Testing**: 760+ tests across 26 suites with Jest, Supertest, and testcontainers
 
 ## Ethical Use & Legal Compliance
@@ -1409,7 +1409,7 @@ npx jest performance.test.ts
 
 ### Docker
 
-The service uses a multi-stage Dockerfile with Ubuntu 24.04 base and Chrome for Testing 146:
+The service uses a multi-stage Dockerfile with an Ubuntu 26.04 base and a pinned, sha256-verified stable Google Chrome (157.0.8103.50):
 
 ```bash
 # Development (with hot reload, port 3080)
@@ -1426,7 +1426,7 @@ docker run -p 3050:3050 -e PORT=3050 --shm-size=2gb scraper:prod
 ```
 
 **Available stages:**
-- `base`: Ubuntu 24.04 with Chrome for Testing 146 and Puppeteer dependencies
+- `base`: Ubuntu 26.04 with stable Google Chrome 157.0.8103.50 and Puppeteer dependencies
 - `development`: Includes devDependencies and tsx for hot reload
 - `test`: Test environment for CI/CD
 - `builder`: Compiles TypeScript to JavaScript
@@ -1530,6 +1530,9 @@ See `.env.example` for complete configuration template.
   - Open cooldowns are persisted with the queue (`SCRAPE_QUEUE_DIR`) and rehydrated at boot: a restart inside an open window is exactly when the engine is most likely to walk straight back into the challenge it just backed off from
   - Unset/invalid → default; any finite value is clamped to `[60000 (1 min), 86400000 (24 h)]`
   - Default: `1800000` (30 min)
+  - This is the BASE: a host that keeps challenging doubles it on each new window (30 → 60 → 120 → 240 → 360 min, ceiling `CHALLENGE_COOLDOWN_MAX_MS`, default 6 h) until a clean queue fetch, or 24 h with no challenge after a window ends
+  - A challenge seen on the `browser` lane opens at least 3 h (the larger of the host's escalated window and 3 h)
+  - A challenge never shortens a window that is still running on the same host
 - `GATE_FAILURE_COOLDOWN_THRESHOLD`: Consecutive gate failures that open a host's cooldown (the window above)
   - A gate failure is a 5xx, or an empty body (except an empty 404 / 410, the store's own "gone" answer), from a GATED host: one with stored cookies (`CF_COOKIE_FILE`), whose profile declares `access: 'cloudflare'`, or that fetches through the residential exit (`egress: 'residential'`). It also marks the stored cookies stale on `/health/detailed` (`cfCookies[].stale`), and a `/catalog` listing or seed page that is a gate failure is reported `failed`, never parsed
   - Only a 2xx with a real body marks the host fresh, clears its cooldown and resets the run. `/lookup`, the `/catalog` listing and the declared-page axes read the status-aware impit / http lanes for that; a site there that sees no status (the browser lane) can never prove the host fresh — its body counts only when it is empty. In the ingest queue every lane surfaces a status; a fetch that still observed none (a browser navigation with no response) is judged by its body alone. A non-empty 403 or 404 neither adds to the run nor resets it

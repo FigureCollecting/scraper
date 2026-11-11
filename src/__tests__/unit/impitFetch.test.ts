@@ -282,6 +282,31 @@ describe('createImpitFetch — session-prime (jar-carried clearance, prime-once,
     return { make, primes: () => primes, targets: () => targets, expire: () => { valid = false; } };
   }
 
+  it('a plain-text 1020 on a primed host is NOT re-primed: one prime, one target (a firewall rule, not a stale clearance)', async () => {
+    const calls: string[] = [];
+    const make = (): ImpitLike => ({
+      fetch: async (url) => {
+        calls.push(url);
+        return { text: async () => (isPrime(url) ? 'homepage' : 'error code: 1020'), status: isPrime(url) ? 200 : 403 } as never;
+      },
+    });
+    const d = await createImpitFetchDetailed(make)(TARGET, { browser: 'chrome142', prime: { url: PRIME_URL } });
+    expect(d.body).toBe('error code: 1020');
+    expect(calls).toEqual([PRIME_URL, TARGET]);
+  });
+
+  it('a JS challenge on a primed host still re-primes once', async () => {
+    const calls: string[] = [];
+    const make = (): ImpitLike => ({
+      fetch: async (url) => {
+        calls.push(url);
+        return { text: async () => (isPrime(url) ? 'homepage' : CHALLENGE) };
+      },
+    });
+    await createImpitFetchDetailed(make)(TARGET, { browser: 'chrome142', prime: { url: PRIME_URL } });
+    expect(calls).toEqual([PRIME_URL, TARGET, PRIME_URL, TARGET]);
+  });
+
   it('re-primes when a still-"primed" host returns a fresh challenge (clearance went stale mid-session)', async () => {
     const g = expiringJarGatedImpit();
     const impitFetch = createImpitFetch(g.make); // default TTL (marker still fresh) — only challenge-detection can save it

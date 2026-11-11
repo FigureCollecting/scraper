@@ -1,10 +1,10 @@
 # =============================================================================
-# BASE STAGE - Secure Ubuntu 26.04 + Node 24.22.1 LTS + Chrome 152.0.7977.54
+# BASE STAGE - Secure Ubuntu 26.04 + Node 24.22.1 LTS + Google Chrome 157.0.8103.50
 # =============================================================================
 FROM ubuntu:26.04 AS base
 
 # Cache-bust ARG to invalidate Docker layers when dependencies change
-ARG CACHE_BUST=2026-10-29-node-24.22.1-chrome-152.0.7977.54-estate
+ARG CACHE_BUST=2026-11-11-node-24.22.1-chrome-stable-157.0.8103.50
 
 # Update all packages for latest security patches (openssl, gnupg, glibc)
 # Install Node.js 24 using official binaries (avoids NodeSource CVE false positives)
@@ -67,19 +67,27 @@ RUN apt-get update && apt-get upgrade -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# Download and install Chrome for Testing (152.0.7977.54) - the exact build puppeteer 25.9.0 pins in PUPPETEER_REVISIONS.
-# Verified: puppeteer 25.9.0 drives 152 with identical fixture extraction vs 151 (A/B tested).
-RUN apt-get update && apt-get install -y wget unzip \
-    && wget -q https://storage.googleapis.com/chrome-for-testing-public/152.0.7977.54/linux64/chrome-linux64.zip \
-    && unzip chrome-linux64.zip \
-    && mv chrome-linux64 /opt/chrome \
-    && rm chrome-linux64.zip \
-    && chmod +x /opt/chrome/chrome \
-    && apt-get remove -y wget unzip \
-    && rm -rf /var/lib/apt/lists/*
+# Install the regular stable Google Chrome for linux amd64 (157.0.8103.50) - the branded build real
+# visitors run, not Chrome for Testing. Pinned to one exact .deb and verified by sha256 (the value
+# in Google's apt index dists/stable/main/binary-amd64/Packages, rechecked on a fresh download).
+# puppeteer 25.17.0 pins the same 157.0.8103.50. repo_add_once=false stops the package adding
+# Google's apt source, so no later `apt-get upgrade` can move Chrome off the pin. Both launch
+# profiles pass --no-sandbox, so the setuid bit on chrome-sandbox is dropped.
+ARG CHROME_VERSION=157.0.8103.50-1
+ARG CHROME_SHA256=92148bd14dc05823a64061c2fafcf20d4d82b3fc56f5831206f16d2ac9ee3f79
+RUN apt-get update \
+    && echo 'repo_add_once="false"' > /etc/default/google-chrome \
+    && curl -fsSL -o /tmp/google-chrome.deb \
+       "https://dl.google.com/linux/chrome/deb/pool/main/g/google-chrome-stable/google-chrome-stable_${CHROME_VERSION}_amd64.deb" \
+    && echo "${CHROME_SHA256}  /tmp/google-chrome.deb" | sha256sum -c - \
+    && apt-get install -y --no-install-recommends /tmp/google-chrome.deb \
+    && rm -f /tmp/google-chrome.deb /etc/apt/sources.list.d/google-chrome*.list \
+    && chmod u-s /opt/google/chrome/chrome-sandbox \
+    && rm -rf /var/lib/apt/lists/* \
+    && /opt/google/chrome/chrome --version
 
 # Set Chrome path for Puppeteer and skip download
-ENV PUPPETEER_EXECUTABLE_PATH=/opt/chrome/chrome
+ENV PUPPETEER_EXECUTABLE_PATH=/opt/google/chrome/chrome
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 ENV PUPPETEER_SKIP_DOWNLOAD=true
 

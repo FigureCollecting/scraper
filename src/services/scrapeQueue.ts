@@ -2353,7 +2353,7 @@ export class ScrapeQueue {
         const lane = page.transport ?? 'unknown';
         const reason = `challenge page via ${lane} transport (extraction failed)`;
         if (host !== undefined) {
-          cooldown.open(host, reason);
+          cooldown.open(host, reason, lane);
           // STORED-COOKIE STALE signal: a host WITH stored cookies still got challenged → its cookie
           // is dead (the engine cannot re-mint; /health/detailed flags it for the operator). A host
           // without stored cookies is never marked. Storm protection above is unchanged.
@@ -2381,7 +2381,7 @@ export class ScrapeQueue {
       const lane = page.transport ?? 'unknown';
       const reason = `challenge page via ${lane} transport (extracted, not recovered)`;
       if (host !== undefined && lifted === undefined) {
-        cooldown.open(host, reason);
+        cooldown.open(host, reason, lane);
         markStaleIfStored(this.getCfCookieStoreRef(), item.url, host, lane, reason);
       }
       console.error(
@@ -2436,7 +2436,7 @@ export class ScrapeQueue {
             const lane = page.transport ?? 'unknown';
             const reason = `challenge page via ${lane} transport`;
             if (host !== undefined) {
-              cooldown.open(host, reason);
+              cooldown.open(host, reason, lane);
               // STORED-COOKIE STALE signal (see the extraction-throw door above): only a host the
               // store has cookies for is marked, once.
               markStaleIfStored(this.getCfCookieStoreRef(), item.url, host, lane, reason);

@@ -5,7 +5,7 @@
  */
 import { readFileSync } from 'fs';
 import { join } from 'path';
-import { isCloudflareChallenge } from '../../../services/engineServices/challengeDetect';
+import { isCloudflareChallenge, isCloudflarePlainTextBlock } from '../../../services/engineServices/challengeDetect';
 
 /** Load a real captured HTML fixture (verbatim store bytes) from the shared fixtures dir. */
 const fixture = (name: string): string =>
@@ -220,6 +220,47 @@ describe('isCloudflareChallenge', () => {
         '<html><head><title>Blocked Colors — Nendoroid Store</title></head><body>' +
         '<p>Attention: limited stock. This colorway sold out and was blocked from reorders.</p></body></html>';
       expect(isCloudflareChallenge(html)).toBe(false);
+    });
+  });
+
+  describe('Cloudflare plain-text block body (ANCF a; edges from the challenger)', () => {
+    // A CF firewall rule (1020) or rate limit (1015) on a non-HTML path answers 403/429 with a bare
+    // text/plain body, `error code: 1020`. It is a block, never content — but only as the WHOLE body.
+    const CHROME157 =
+      '<html><head><meta name="color-scheme" content="light dark"></head><body>' +
+      '<pre style="word-wrap: break-word; white-space: pre-wrap;">error code: 1020</pre></body></html>';
+    it.each([
+      ['raw', 'error code: 1020', true],
+      ['raw + newline', 'error code: 1015\n', true],
+      ['padded', '  error code: 1010  ', true],
+      ['Chrome 157 text/plain render', CHROME157, true],
+      ['5 digits', 'error code: 10200', false],
+      ['2xxx', 'error code: 2020', false],
+      ['a non-CF 3-digit code', 'error code: 404', false],
+      ['uppercase', 'Error code: 1020', false],
+      ['quoted in a product page', '<html><body><h1>Figure</h1><p>error code: 1020</p></body></html>', false],
+      ['a page that IS a short <pre>', '<html><head></head><body><pre>error code: 1020 is our SKU</pre></body></html>', false],
+      ['JSON wrapper', '{"error":"error code: 1020"}', false],
+      ['prefix text', 'blocked\nerror code: 1020', false],
+      ['suffix text', 'error code: 1020\nRay ID: 8a1b', false],
+      ['two meta tags', '<html><head><meta a><meta b></head><body><pre>error code: 1020</pre></body></html>', false],
+      ['padding to 600 chars', ' '.repeat(600) + 'error code: 1020', false],
+      ['empty', '', false],
+    ])('%s', (_name, body, want) => {
+      expect(isCloudflarePlainTextBlock(body as string)).toBe(want);
+      expect(isCloudflareChallenge(body as string)).toBe(want);
+    });
+
+    it('rejects a huge page that merely ends with the text, in bounded time', () => {
+      const big = '<html>' + 'x'.repeat(2_000_000) + 'error code: 1020</html>';
+      const t0 = Date.now();
+      expect(isCloudflarePlainTextBlock(big)).toBe(false);
+      expect(isCloudflarePlainTextBlock(' '.repeat(500) + 'error code: 102')).toBe(false);
+      expect(Date.now() - t0).toBeLessThan(200);
+    });
+
+    it('a non-string is not a block', () => {
+      expect(isCloudflarePlainTextBlock(undefined as unknown as string)).toBe(false);
     });
   });
 
