@@ -573,7 +573,7 @@ export interface WaitForReadiness {
 export interface SearchFetch {
   transport?: SearchTransport;
   /**
-   * Impersonation profile for `transport: 'impersonate'` (the impit browser, e.g. 'chrome142').
+   * Impersonation profile for `transport: 'impersonate'` (the impit browser, e.g. 'chrome151').
    * A LIVE TUNABLE — bump it when Cloudflare tightens and an older profile's TLS fingerprint stops
    * passing (chrome110 already went stale). The engine supplies a recent default if omitted.
    */

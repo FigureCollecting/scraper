@@ -14,7 +14,7 @@ import { getCfCookieStore, type CfCookieSource } from './cookieJar.js';
 import { normalizeHost } from './challengeCooldown.js';
 
 /** Default impersonation profile. A LIVE TUNABLE — chrome110 already went stale to Cloudflare; keep recent. */
-export const DEFAULT_PROFILE = 'chrome142';
+export const DEFAULT_PROFILE = 'chrome151';
 
 /** Per-request timeout (ms) used when IMPIT_TIMEOUT_MS is unset/invalid, and the clamp any override rides within. */
 const DEFAULT_TIMEOUT_MS = 30000;
@@ -83,7 +83,7 @@ export interface CookieJarLike {
 }
 
 export interface ImpitFetchOptions {
-  /** Impersonation profile (impit browser), e.g. 'chrome142'. Defaults to a recent engine value. */
+  /** Impersonation profile (impit browser), e.g. 'chrome151'. Defaults to a recent engine value. */
   browser?: string;
   headers?: Record<string, string>;
   userAgent?: string;
@@ -419,5 +419,5 @@ const defaultImpitFetchers = createImpitFetchers();
 /** The engine's default status-aware impit fetcher (the ingest path's impersonate lane). */
 export const impitFetchBodyDetailed = defaultImpitFetchers.detailed;
 
-/** The engine's default impit fetcher (real native impit, per-profile cookie jar, chrome142 default profile). */
+/** The engine's default impit fetcher (real native impit, per-profile cookie jar, chrome151 default profile). */
 export const impitFetchBody = defaultImpitFetchers.body;
