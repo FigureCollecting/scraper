@@ -23,7 +23,7 @@ jest.mock('impit', () => ({
 import { createImpitFetch, createImpitFetchDetailed, createImpitFetchers, resolveImpitTimeoutMs, type ImpitLike, type CookieJarLike } from '../../services/impitFetch';
 
 describe('createImpitFetch', () => {
-  it('fetches via impit with the default chrome142 profile and returns the body text', async () => {
+  it('fetches via impit with the default chrome151 profile and returns the body text', async () => {
     const calls: Array<{ browser: string; url: string; init: any }> = [];
     const fake = (browser: string): ImpitLike => ({
       fetch: async (url, init) => { calls.push({ browser, url, init }); return { text: async () => '{"items":[]}' }; },
@@ -33,7 +33,7 @@ describe('createImpitFetch', () => {
     const body = await impitFetch('https://api.amiami.com/api/v1.0/items?s_keywords=tomie');
 
     expect(body).toBe('{"items":[]}');
-    expect(calls[0].browser).toBe('chrome142'); // engine default profile
+    expect(calls[0].browser).toBe('chrome151'); // engine default profile
     expect(calls[0].url).toBe('https://api.amiami.com/api/v1.0/items?s_keywords=tomie');
     expect(calls[0].init.method).toBe('GET');
   });
