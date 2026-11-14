@@ -141,7 +141,8 @@ ignore:
   # the only path is minio 8.0.7 -> query-string 7.1.3, minio calls only query-string.stringify (which
   # never decodes), and no compatible fix exists (decode-uri-component >=0.4.0 and query-string >=8 are
   # ESM-only and break their callers). Pinned to 0.2.2 so a version change re-surfaces the finding.
-  # Grype has no expiry field; the .trivyignore entry expires 2026-11-12. Remove this entry then.
+  # Re-verified 2026-11-14 (minio 8.0.7 still latest, same path). Grype has no expiry field; the
+  # .trivyignore entry expires 2026-12-14. Remove this entry then.
   - vulnerability: GHSA-qr28-fpjm-wq7f
     package:
       name: decode-uri-component
@@ -150,4 +151,4 @@ ignore:
     reason: |
       Transitive via minio -> query-string 7.1.3, which calls the decoder only when parsing; minio only
       calls query-string.stringify, and nothing in src/ or packages/ imports either package. Fixed
-      versions are ESM-only and break query-string 7 and minio. Review by 2026-11-12.
+      versions are ESM-only and break query-string 7 and minio. Review by 2026-12-14.
