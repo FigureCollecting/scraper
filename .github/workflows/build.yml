@@ -59,6 +59,11 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN || secrets.GITHUB_TOKEN }}
 
+      # decode-uri-component 0.5.1 (package.json override) is ESM-only; the same guarded rewrite the
+      # Dockerfile runs, so the suites test the tree the image ships.
+      - name: Patch query-string for decode-uri-component 0.5.1
+        run: node tools/patch-query-string.mjs
+
       - name: Run linter
         run: npm run lint || true
 

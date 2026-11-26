@@ -23,8 +23,10 @@ module.exports = {
   // MSW v2 ships ESM-only deps that jest does not transform by default; the
   // transform above handles js/mjs/cjs, and this whitelist lets those specific
   // packages through (everything else in node_modules stays untransformed).
+  // decode-uri-component 0.5.1 is ESM-only (package.json override); the patched query-string
+  // requires its .default, so jest must transform it too.
   transformIgnorePatterns: [
-    '/node_modules/(?!(msw|@mswjs|@open-draft|@bundled-es-modules|until-async|rettime|strict-event-emitter|headers-polyfill|outvariant|is-node-process|tough-cookie|graphql)/)'
+    '/node_modules/(?!(decode-uri-component|msw|@mswjs|@open-draft|@bundled-es-modules|until-async|rettime|strict-event-emitter|headers-polyfill|outvariant|is-node-process|tough-cookie|graphql)/)'
   ],
   collectCoverageFrom: [
     'src/**/*.ts',
