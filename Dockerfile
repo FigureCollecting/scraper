@@ -100,11 +100,15 @@ FROM base AS development
 COPY package*.json .npmrc ./
 # plugin-contract manifest must be present so the file: dependency resolves at npm install
 COPY packages/plugin-contract/package.json ./packages/plugin-contract/
+# decode-uri-component 0.5.1 (package.json override) is ESM-only: this guarded rewrite makes
+# query-string 7's require() take its .default; it runs after every npm ci below.
+COPY tools/patch-query-string.mjs ./tools/
 
 # Install all dependencies (Puppeteer won't download Chrome due to ENV vars)
 RUN npm config set fetch-timeout 300000 && npm config set fetch-retry-maxtimeout 300000
 RUN --mount=type=secret,id=node_auth_token \
-    NODE_AUTH_TOKEN="$(cat /run/secrets/node_auth_token)" timeout 600 npm ci --no-audit --no-fund
+    NODE_AUTH_TOKEN="$(cat /run/secrets/node_auth_token)" timeout 600 npm ci --no-audit --no-fund \
+    && node tools/patch-query-string.mjs
 
 # Remove any Chrome that might have been downloaded by Puppeteer
 RUN rm -rf /root/.cache/puppeteer \
@@ -137,11 +141,13 @@ FROM base AS builder
 COPY package*.json .npmrc ./
 # plugin-contract manifest must be present so the file: dependency resolves at npm install
 COPY packages/plugin-contract/package.json ./packages/plugin-contract/
+COPY tools/patch-query-string.mjs ./tools/
 
 # Install all dependencies for build
 RUN npm config set fetch-timeout 300000 && npm config set fetch-retry-maxtimeout 300000
 RUN --mount=type=secret,id=node_auth_token \
-    NODE_AUTH_TOKEN="$(cat /run/secrets/node_auth_token)" timeout 600 npm ci --no-audit --no-fund
+    NODE_AUTH_TOKEN="$(cat /run/secrets/node_auth_token)" timeout 600 npm ci --no-audit --no-fund \
+    && node tools/patch-query-string.mjs
 
 # Remove any Chrome that might have been downloaded by Puppeteer
 RUN rm -rf /root/.cache/puppeteer \
@@ -163,11 +169,14 @@ FROM base AS production
 COPY package*.json .npmrc ./
 # plugin-contract manifest must be present so the file: dependency resolves at npm install
 COPY packages/plugin-contract/package.json ./packages/plugin-contract/
+COPY tools/patch-query-string.mjs ./tools/
 
-# Install only production dependencies
+# Install only production dependencies, patch query-string, and drop the script from the runtime image
 RUN npm config set fetch-timeout 300000 && npm config set fetch-retry-maxtimeout 300000
 RUN --mount=type=secret,id=node_auth_token \
-    NODE_AUTH_TOKEN="$(cat /run/secrets/node_auth_token)" timeout 600 npm ci --no-audit --no-fund --omit=dev
+    NODE_AUTH_TOKEN="$(cat /run/secrets/node_auth_token)" timeout 600 npm ci --no-audit --no-fund --omit=dev \
+    && node tools/patch-query-string.mjs \
+    && rm -r tools
 
 # Remove any Chrome that might have been downloaded by Puppeteer
 RUN rm -rf /root/.cache/puppeteer \

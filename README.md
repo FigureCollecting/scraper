@@ -1172,6 +1172,7 @@ src/__tests__/
 ```bash
 # Install dependencies
 npm install
+node tools/patch-query-string.mjs   # after every install (decode-uri-component 0.5.1 is ESM-only)
 
 # Run all tests
 npm test
@@ -1370,6 +1371,7 @@ See `.env.example` for all configuration options including:
 ```bash
 # Install dependencies
 npm install
+node tools/patch-query-string.mjs   # after every install (decode-uri-component 0.5.1 is ESM-only)
 
 # Start development server (uses tsx for fast startup)
 npm run dev
