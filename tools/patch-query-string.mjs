@@ -1,11 +1,11 @@
-// patch-query-string.mjs — run once after every `npm ci` (Dockerfile builder and production
-// stages, CI). Usage: node tools/patch-query-string.mjs [app-root]   (default: the cwd)
+// patch-query-string.mjs — run once after every `npm ci` or `npm install` (Dockerfile development,
+// test, builder and production stages, CI, local setup). Usage: node tools/patch-query-string.mjs [app-root]   (default: the cwd)
 // package.json overrides decode-uri-component to 0.5.1 (GHSA-qr28-fpjm-wq7f), which is ESM-only:
 // query-string 7's require() then returns the module namespace and parse throws "decodeComponent
 // is not a function". This rewrites that one require to take .default. It fails loudly (exit 1,
 // file untouched) unless the expected line occurs exactly once, and after writing it parses and
 // stringifies through the patched module, restoring the original file if that fails. Drop it
-// with the override once minio stops pulling query-string 7 (src/grype-reachability.test.ts).
+// with the override once minio stops pulling query-string 7 (src/__tests__/unit/queryStringPatch.test.ts).
 import { readFileSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';

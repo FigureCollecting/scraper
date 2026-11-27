@@ -200,4 +200,22 @@ describe('decode-uri-component 0.5.1 override and the query-string require patch
       expect(existsSync(path.join(f.app, 'node_modules', QS, 'index.js'))).toBe(true);
     });
   });
+
+  describe('documentation', () => {
+    const readme = readFileSync(path.join(ROOT, 'README.md'), 'utf8');
+    const header = readFileSync(PATCH, 'utf8').split('\n').slice(0, 12).join('\n');
+
+    it('tells every README install step to run the patch', () => {
+      const installs = count(readme, '```bash\n# Install dependencies\nnpm install\n');
+      expect(installs).toBeGreaterThan(0);
+      expect(count(readme, 'npm install\nnode tools/patch-query-string.mjs')).toBe(installs);
+    });
+
+    it('names the development stage and a test file that exists', () => {
+      expect(header).toMatch(/development/);
+      const named = header.match(/src\/[\w/.-]+\.test\.ts/g) ?? [];
+      expect(named.length).toBeGreaterThan(0);
+      for (const f of named) expect(existsSync(path.join(ROOT, f))).toBe(true);
+    });
+  });
 });
